@@ -431,10 +431,11 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
     }
 
     let mut history = Vec::new();
+    let mut line_history = crate::repl::History::load();
     loop {
         config.output.display_separator();
         let input = match repl.as_mut() {
-            Some(r) => r.read_input(&prompt_str),
+            Some(r) => r.read_input(&prompt_str, &mut line_history),
             None => Some(config.output.get_user_input()),
         };
         let input = match input {
@@ -444,6 +445,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
         if input.is_empty() {
             continue;
         }
+        line_history.add(&input);
         if input == "/q" || input == "exit" {
             break;
         }

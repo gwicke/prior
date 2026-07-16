@@ -90,7 +90,14 @@ pub fn render_help() -> String {
     }
     s.push_str("\nKey bindings:\n");
     s.push_str("  Enter        submit line\n");
+    s.push_str("  Shift-Enter  newline (multi-line); needs the terminal's Kitty\n");
+    s.push_str("                keyboard protocol ON (wezterm: enable_kitty_keyboard=true;\n");
+    s.push_str("                alacritty/kitty enable it by default)\n");
+    s.push_str("  Ctrl-J       newline (reliable on every terminal)\n");
     s.push_str("  Esc          cancel current line\n");
+    s.push_str("  Up/Down      history (or move across lines)\n");
+    s.push_str("  Alt-B/Alt-F  word left / right\n");
+    s.push_str("  Ctrl-U/K     delete to line start / end\n");
     s.push_str("  Ctrl-C       exit\n");
     s.push_str("  /q, exit     quit session\n");
     s

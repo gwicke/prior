@@ -671,14 +671,41 @@ visible frame; **never** clear scrollback:
       are not yet column-aligned or width-wrapped; long lines overflow. Fix with
       a padded/aligned layout + `wrap()` (Stage 0) and redraw on resize (Stage 6).
 
-### Stage 4 — Multi-line editing
-- [ ] Arrows, `Home`/`End`, `Backspace`/`Delete`, word-left/right (`Alt-B`/`Alt-F`).
-- [ ] `<Shift-Enter>` inserts newline via Kitty layer; `<Enter>` submits;
-      bracketed paste (`Event::Paste`) inserts verbatim; input box expands
-      (multi-row) and pushes session content up via scroll.
-- [ ] History `Up`/`Down` (in-memory + append to `~/.config/picocode/history`).
-- [ ] **Unit tests** (`repl.rs` line editor): insert; cursor move across lines;
-      delete/backspace at boundaries; word-boundary wrap; paste insertion.
+### Stage 4 — Multi-line editing — ✅ DONE
+> Implemented 2026-07-16. Build green, **no warnings**; 54 lib tests pass
+> (incl. 12 new `repl` tests: insert/backspace/delete boundaries, cross-line
+> move, word boundaries, `Ctrl-U`/`Ctrl-K`, `layout` word-wrap + prompt offset +
+> hard-newline split, `render_input` multi-row cursor positioning, `History`
+> navigation with draft restore). Pty smoke (deepseek): basic editing + `Esc`
+> cancel + `/q` exits 0; `<Shift-Enter>` (`\x1b[13;2u`) inserts a newline
+> (stays in editor, no LLM submit) — confirmed via Kitty `>1u`/`>4u` flags.
+- [x] Arrows, `Home`/`End`, `Backspace`/`Delete`, word-left/right (`Alt-B`/`Alt-F`):
+      pure `LineEditor` (flat `Vec<char>` + char-index cursor) in `src/repl.rs`.
+- [x] `<Shift-Enter>` inserts newline via Kitty layer (`TermGuard` now emits the
+      **correct** via crossterm `PushKeyboardEnhancementFlags(
+      DISAMBIGUATE_ESCAPE_CODES | REPORT_ALL_KEYS_AS_ESCAPE_CODES)` (emits `[>9u`) — this is
+      what actually makes wezterm/alacritty/kitty send `Shift+Enter` as `[13;2u`
+      (Enter+SHIFT). `Ctrl-J` (LF) is a terminal-agnostic newline fallback; both are
+      documented in `/help`. `<Enter>` submits; bracketed paste (`Event::Paste`)
+
+      **Empirical (2026-07-16, wezterm):** wezterm's `enable_kitty_keyboard`
+      defaults to **false**, and the app's `[>9u` push does NOT override that
+      config — `Shift+Enter` only disambiguates once the user sets the config true.
+      So `Ctrl-J` is the reliable newline for users who won't change terminal settings.
+      inserts verbatim via `insert_str`; input box expands (multi-row) and the
+      terminal's natural scroll pushes session content up.
+- [x] History `Up`/`Down` (`src/repl.rs::History`): in-memory + appended to
+      `~/.config/picocode/history` (`$HOME/.config/picocode/history`); `Up`
+      navigates when already on the first/last logical line, else moves the
+      cursor across lines; in-progress line restored when paging past newest.
+- [x] **Unit tests** (`repl.rs`): insert; cross-line cursor move; boundary
+      backspace/delete; word-boundary `layout` wrap + prompt offset; paste
+      insertion; `render_input` multi-row cursor positioning; `History` nav.
+- [~] Rendering uses `layout()` word-wrap (prompt offset on row 0, CJK
+      char-wrap) + a save/restore renderer (`[s`/`[u`) so each redraw is
+      idempotent and reclaims the `/model` picker's screen cleanly. Visual
+      alignment of wrapped rows is still basic (ties to the Stage 3 `/model`
+      alignment follow-up + Stage 6 resize redraw).
 
 ### Stage 5 — Signals (Ctrl-C / Esc / Ctrl-Z / SIGCONT)
 - [ ] Concurrent stdin reader thread → `mpsc`: routes `Esc` (cancel), `Ctrl-C`
@@ -719,6 +746,13 @@ visible frame; **never** clear scrollback:
   APIs expose no pricing). It is smaller/more stable than a full model catalog and
   only needed for configured providers. Follow-up: optionally generate it from each
   provider's published price page at build time (mirroring pi's generator).
+- **TODO (later investigation):** `Shift+Enter` newline currently depends on the
+  terminal's Kitty keyboard protocol (wezterm `enable_kitty_keyboard`) or the
+  `Ctrl-J` fallback. **pi handles `Shift+Enter` as newline with *no* Kitty
+  dependency** — investigate how (likely raw-byte reading / a different
+  enhancement handshake / bracketed-paste or modifier inference) and adopt it so
+  `Shift+Enter` works out-of-the-box on terminals that don't enable Kitty. See
+  `pi/packages/coding-agent/src/...` interactive input handling.
 
 ## 7. Decisions & corrections log
 
