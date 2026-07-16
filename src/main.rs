@@ -135,7 +135,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|p| picocode::persona::get_persona(p));
 
-    let agent = create_agent(AgentConfig {
+    let agent_config = AgentConfig {
         provider: provider.clone(),
         model,
         output,
@@ -150,8 +150,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.agent_prompt.clone(),
             config.agent_prompt_file.clone(),
         )?,
-    })
-    .await?;
+        thinking_level: None,
+    };
+    let agent = create_agent(agent_config.clone()).await?;
 
     match command {
         Commands::Recipe { name: _ } => {
@@ -185,7 +186,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                agent.run_interactive().await?;
+                picocode::agent::run_interactive(agent_config).await?;
             }
         }
     }

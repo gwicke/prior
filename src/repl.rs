@@ -171,6 +171,55 @@ impl Repl {
             }
         }
     }
+
+    /// Render a single-column selection list and let the user pick one entry.
+    /// `options` are display strings. Returns `Some(index)` on Enter, `None` on
+    /// Esc (cancel). Used by `/model` (and any future picker).
+    pub fn select(&mut self, title: &str, options: &[String]) -> Option<usize> {
+        if options.is_empty() {
+            return None;
+        }
+        let mut sel: usize = 0;
+        let redraw = |sel: usize| -> std::io::Result<()> {
+            let mut s = String::from("\x1b[0J"); // clear from cursor down
+            s.push_str(title);
+            s.push('\n');
+            for (i, o) in options.iter().enumerate() {
+                if i == sel {
+                    s.push_str("> ");
+                } else {
+                    s.push_str("  ");
+                }
+                s.push_str(o);
+                s.push('\n');
+            }
+            io::stdout().write_all(s.as_bytes())?;
+            io::stdout().flush()
+        };
+        let _ = redraw(sel);
+        loop {
+            match event::read() {
+                Ok(Event::Key(key)) => match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if sel + 1 < options.len() {
+                            sel += 1;
+                            let _ = redraw(sel);
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if sel > 0 {
+                            sel -= 1;
+                            let _ = redraw(sel);
+                        }
+                    }
+                    KeyCode::Enter => return Some(sel),
+                    KeyCode::Esc => return None,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Write the current `prompt` + `buf` to the terminal, placing the visible

@@ -6,6 +6,9 @@ use crate::tools::{
 };
 use crate::Output;
 use crate::Result;
+use crate::model_catalog;
+use crate::slash;
+use crate::thinking;
 use rig::agent::{Agent, AgentBuilder, CancelSignal, PromptHook};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{CompletionModel, Prompt, ToolDefinition};
@@ -22,49 +25,29 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
-    async fn run_interactive(self: Box<Self>) -> Result<()>;
+    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
 }
 
 #[async_trait]
 impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
-    async fn run_interactive(self: Box<Self>) -> Result<()> {
-        self.output.display_header(
-            &self.provider,
-            &self.model,
-            self.yolo,
-            self.tool_call_limit,
-            self.persona_name.as_deref(),
-        );
-        let prompt = "> ".to_string();
-        let use_repl = std::io::stdin().is_terminal() && !self.quiet;
-        let mut repl = if use_repl { Some(Repl::new()) } else { None };
-        if let Some(r) = repl.as_mut() {
-            let _ = r.start();
+    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String> {
+        self.output.display_thinking("Thinking...");
+        let mut builder = self
+            .agent
+            .prompt(input)
+            .with_hook(LoggingHook {
+                output: self.output.clone(),
+            })
+            .multi_turn(self.tool_call_limit);
+        if let Some(h) = history {
+            builder = builder.with_history(h);
         }
-        let mut history = Vec::new();
-        loop {
-            self.output.display_separator();
-            let input = match repl.as_mut() {
-                Some(r) => r.read_input(&prompt),
-                None => Some(self.output.get_user_input()),
-            };
-            let input = match input {
-                Some(s) => s,
-                None => continue,
-            };
-            if input.is_empty() {
-                continue;
-            }
-            if input == "/q" || input == "exit" {
-                break;
-            }
-            self.output.display_separator();
-
-            let response = self.prompt(&input, Some(&mut history)).await?;
-            self.output.display_text(&response);
-        }
-        Ok(())
+        let response = builder
+            .await
+            .map_err(|e| crate::PicocodeError::Other(e.to_string()))?;
+        self.output.stop_thinking();
+        Ok(response.to_string())
     }
 
     async fn run_once(&self, input: String) -> Result<String> {
@@ -100,15 +83,16 @@ pub struct CodeAgent<M: CompletionModel> {
     model: String,
     yolo: bool,
     persona_name: Option<String>,
-    quiet: bool,
 }
 
+#[derive(Clone)]
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
     pub output: Arc<dyn Output>,
     pub yolo: bool,
     pub quiet: bool,
+    pub thinking_level: Option<String>,
     pub tool_call_limit: usize,
     pub system_message_extension: Option<String>,
     pub persona_prompt: Option<String>,
@@ -120,6 +104,7 @@ pub struct AgentConfig {
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
+    let think_json = thinking::mapping_opt(&provider, config.thinking_level.as_deref());
 
     macro_rules! build {
         ($client:expr) => {{
@@ -132,6 +117,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.persona_prompt,
                 config.bash_auto_allow.unwrap_or_default(),
                 config.agent_prompt,
+                think_json,
             );
 
             Box::new(CodeAgent::new(
@@ -141,7 +127,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.provider,
                 model,
                 config.yolo,
-                config.quiet,
                 config.persona_name,
             ))
         }};
@@ -312,6 +297,7 @@ fn build_rig_agent<M: CompletionModel>(
     persona_prompt: Option<String>,
     bash_auto_allow: Vec<String>,
     agent_prompt: Option<String>,
+    additional_params: Option<serde_json::Value>,
 ) -> Agent<M> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -335,6 +321,10 @@ fn build_rig_agent<M: CompletionModel>(
         .tool(GlobFiles)
         .tool(GrepText)
         .tool(ListDir);
+
+    if let Some(params) = additional_params {
+        builder = builder.additional_params(params);
+    }
 
     builder = builder
         .tool(guard(MakeDir, yolo, output.clone(), None))
@@ -425,6 +415,162 @@ fn guard<T: Tool>(
     }
 }
 
+/// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
+/// so slash commands that change model/provider/thinking can rebuild the agent
+/// via `create_agent` (required because `CodeAgent<M>` is generic over the
+/// provider's completion-model type).
+pub async fn run_interactive(config: AgentConfig) -> Result<()> {
+    let mut config = config;
+    let mut agent = create_agent(config.clone()).await?;
+
+    let prompt_str = "> ".to_string();
+    let use_repl = std::io::stdin().is_terminal() && !config.quiet;
+    let mut repl = if use_repl { Some(Repl::new()) } else { None };
+    if let Some(r) = repl.as_mut() {
+        let _ = r.start();
+    }
+
+    let mut history = Vec::new();
+    loop {
+        config.output.display_separator();
+        let input = match repl.as_mut() {
+            Some(r) => r.read_input(&prompt_str),
+            None => Some(config.output.get_user_input()),
+        };
+        let input = match input {
+            Some(s) => s,
+            None => continue,
+        };
+        if input.is_empty() {
+            continue;
+        }
+        if input == "/q" || input == "exit" {
+            break;
+        }
+
+        // Slash dispatch (input already known to start with '/').
+        if let Some(rest) = input.strip_prefix('/') {
+            match slash::parse_slash(rest) {
+                slash::SlashIntent::Help => {
+                    config.output.display_text(&slash::render_help());
+                }
+                slash::SlashIntent::Model => {
+                    if let Some((provider, model)) =
+                        select_model(&config, repl.as_mut()).await
+                    {
+                        let mut new_cfg = config.clone();
+                        new_cfg.provider = provider;
+                        new_cfg.model = model;
+                        match create_agent(new_cfg.clone()).await {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                config = new_cfg;
+                                config.output.display_header(
+                                    &config.provider,
+                                    &config.model,
+                                    config.yolo,
+                                    config.tool_call_limit,
+                                    config.persona_name.as_deref(),
+                                );
+                            }
+                            Err(e) => config
+                                .output
+                                .display_text(&format!("Cannot switch model: {}", e)),
+                        }
+                    }
+                }
+                slash::SlashIntent::Thinking(arg) => {
+                    if arg.is_empty() {
+                        let cur = config.thinking_level.as_deref().unwrap_or("off");
+                        config
+                            .output
+                            .display_text(&format!("thinking level: {}", cur));
+                    } else {
+                        match arg.parse::<thinking::ThinkingLevel>() {
+                            Ok(level) => {
+                                let mut new_cfg = config.clone();
+                                new_cfg.thinking_level = Some(level.as_str().to_string());
+                                match create_agent(new_cfg.clone()).await {
+                                    Ok(new_agent) => {
+                                        agent = new_agent;
+                                        config = new_cfg;
+                                        config.output.display_text(&format!(
+                                            "thinking level -> {}",
+                                            level.as_str()
+                                        ));
+                                    }
+                                    Err(e) => config
+                                        .output
+                                        .display_text(&format!("Cannot set thinking: {}", e)),
+                                }
+                            }
+                            Err(e) => config.output.display_text(&e),
+                        }
+                    }
+                }
+                slash::SlashIntent::Unknown(cmd) => {
+                    config.output.display_text(&format!(
+                        "Unknown command: /{}. Type /help for a list.",
+                        cmd
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Normal prompt.
+        let response = agent.prompt(&input, Some(&mut history)).await?;
+        config.output.display_text(&response);
+    }
+    Ok(())
+}
+
+/// Render the `/model` selector and return the chosen `(provider, model)`.
+/// Uses the REPL list picker when a TTY is active, otherwise a numbered list.
+async fn select_model(config: &AgentConfig, repl: Option<&mut Repl>) -> Option<(String, String)> {
+    let entries = model_catalog::catalog().await;
+    if entries.is_empty() {
+        config
+            .output
+            .display_text("No models available (no provider API keys found).");
+        return None;
+    }
+    let options: Vec<String> = entries
+        .iter()
+        .map(model_catalog::format_option)
+        .collect();
+
+
+    let idx = match repl {
+        Some(r) => r.select("Select a model (up/down, Enter, Esc to cancel):", &options),
+        None => {
+            let mut s = String::from("Models:\n");
+            for (i, o) in options.iter().enumerate() {
+                s.push_str(&format!("  {}: {}\n", i + 1, o));
+            }
+            config.output.display_text(&s);
+            let choice = config.output.get_user_input();
+            choice
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| {
+                    if n >= 1 && n <= entries.len() {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+        }
+    };
+
+    idx.map(|i| {
+        let e = &entries[i];
+        let model = e.id.splitn(2, '/').nth(1).unwrap_or(&e.id).to_string();
+        (e.provider.clone(), model)
+    })
+}
+
 impl<M: CompletionModel + 'static> CodeAgent<M> {
     pub fn new(
         agent: Agent<M>,
@@ -433,7 +579,6 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         provider: String,
         model: String,
         yolo: bool,
-        quiet: bool,
         persona_name: Option<String>,
     ) -> Self {
         Self {
@@ -444,28 +589,6 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             model,
             yolo,
             persona_name,
-            quiet,
         }
-    }
-
-    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String> {
-        self.output.display_thinking("Thinking...");
-        let mut builder = self
-            .agent
-            .prompt(input)
-            .with_hook(LoggingHook {
-                output: self.output.clone(),
-            })
-            .multi_turn(self.tool_call_limit);
-
-        if let Some(h) = history {
-            builder = builder.with_history(h);
-        }
-
-        let response = builder
-            .await
-            .map_err(|e| crate::PicocodeError::Other(e.to_string()))?;
-        self.output.stop_thinking();
-        Ok(response.to_string())
     }
 }

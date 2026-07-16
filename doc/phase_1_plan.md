@@ -629,24 +629,47 @@ visible frame; **never** clear scrollback:
       and normal-exit restore verified via pty; interactive Ctrl-C/panic check
       still recommended for a final human sign-off.
 
-### Stage 3 — Slash commands + `/model` (fetch, cache, extrapolation) + `/thinking`
-- [ ] `src/model_catalog.rs`: `fetch_openrouter()` via `reqwest` (unauthenticated
-      `GET /api/v1/models`); parse `context_length` + `pricing.{prompt,completion}`
-      + `supported_parameters`.
-- [ ] `provider_available(p)` env-var scan (mapping from `agent.rs:145-216`).
-- [ ] Extrapolation: `{provider}/{model}` → direct entries gated on availability;
-      `DIRECT_PRICING` table; tag `estimate-via-openrouter` fallback; liveness
-      prune via native `/models` (DeepSeek/OpenAI/…) with the user's key.
-- [ ] `/thinking` → `src/thinking.rs` mapping; rebuild rig `Agent` on change
-      (`AgentBuilder::additional_params`); `AgentConfig::thinking_level`.
-- [ ] `/model` UI: present `{provider}:{modelname}` + token limits + cost +
-      reasoning badge; reuse `fuzzy_filter`; gate thinking injection on
-      `supported_parameters`.
-- [ ] `/help` command.
-- [ ] 5-min cache (`OnceLock<Mutex<Cache>>` + `Instant` expiry), keyed by provider.
-- [ ] **Unit/integration tests** (`model_catalog.rs`): parse a saved OpenRouter
-      JSON fixture; extrapolation + availability gating; `thinking` mapping per
-      provider (anthropic/openai/openrouter/other); `provider_available` scan.
+### Stage 3 — Slash commands + `/model` (fetch, cache, extrapolation) + `/thinking` — ✅ DONE
+> Implemented 2026-07-16. Build green, **no warnings**; 43 lib tests pass
+> (incl. new `thinking` ×7, `model_catalog` ×7, `slash` ×2; 1 `#[ignore]`
+> live-network test). Pty smoke test verified `/help`, `/thinking low` →
+> "thinking level -> low", `/model` opens the live selector, clean `/q`
+> exit (status 0). Outside the sandbox the `/model` list shows updated
+> models from OpenRouter; **alignment/wrapping of that list is a known
+> separate issue** (see note at end of this block) — belongs with Stage 6
+> redraw / a dedicated formatting pass, not Stage 3.
+- [x] `src/model_catalog.rs`: `fetch_openrouter()` via `reqwest` (unauthenticated
+      `GET /api/v1/models`, **time-boxed 8s** so a slow endpoint can't hang the
+      REPL); `parse_openrouter` maps `context_length` + `pricing.{prompt,completion}`
+      (per-token → per-million) + `supported_parameters` (`reasoning`).
+- [x] `provider_available(p)` env-var scan (mapping from `agent.rs`); gates
+      extrapolation + defaults unavailable providers out of the direct list.
+- [x] Extrapolation: `{provider}/{model}` → direct entries gated on availability;
+      `DIRECT_PRICING` table (per-million, direct rates); OR price used as
+      `OpenRouterEstimate` fallback (tagged `(est)`, shown when local lacks a
+      price — user-confirmed desired behavior); native `/models` liveness prune
+      (DeepSeek/OpenAI, **time-boxed 5s**) prunes stale + surfaces new models.
+- [x] `/thinking` → `src/thinking.rs` mapping (anthropic `thinking` block /
+      openai `reasoning_effort` / openrouter `reasoning.effort`; other→`None`);
+      applied by **rebuilding the rig `Agent`** via `AgentBuilder::additional_params`
+      whenever the level (or model) changes. `AgentConfig::thinking_level` +
+      `CodeAgent` track it; the interactive loop is a free `run_interactive`
+      that owns `Box<dyn PicoAgent>` + `AgentConfig` and rebuilds on slash changes
+      (required: `CodeAgent<M>` is generic over the provider's model type).
+- [x] `/model` UI: `repl.select` list picker (raw TTY) or numbered list
+      (non-TTY); `format_option` shows `{provider}:{model}` + ctx + cost +
+      `(est)` tag + `[reasoning]`. Selection rebuilds the agent with the chosen
+      provider/model. (Per-model `supported_parameters` gating of thinking
+      injection: deferred — `/thinking` currently maps by provider.)
+- [x] `/help` command (lists commands + key bindings).
+- [x] 5-min cache (`OnceLock<Mutex<Cache>>` + `Instant` expiry), whole-catalog key.
+- [x] **Unit/integration tests** (`model_catalog.rs`): `parse_openrouter` fixture;
+      `extrapolate` (direct entries + availability gating + Direct/Estimate
+      pricing); `format_option` (est tag when local price missing); `provider_available`;
+      `thinking` mapping per provider. `#[ignore]` live `catalog()` test for manual runs.
+- [~] **Known follow-up (separate issue, not Stage 3):** the `/model` list rows
+      are not yet column-aligned or width-wrapped; long lines overflow. Fix with
+      a padded/aligned layout + `wrap()` (Stage 0) and redraw on resize (Stage 6).
 
 ### Stage 4 — Multi-line editing
 - [ ] Arrows, `Home`/`End`, `Backspace`/`Delete`, word-left/right (`Alt-B`/`Alt-F`).

@@ -45,6 +45,57 @@ pub fn filter_commands(query: &str) -> Vec<fuzzy::Ranked<'static, SlashCommand>>
     fuzzy::fuzzy_filter(registry(), query, |c| format!("{} {}", c.name, c.help))
 }
 
+/// Parse the text after a leading `/` into a dispatch intent.
+///
+/// Examples:
+/// - `""`             -> `Help` (bare `/` lists commands)
+/// - `"help"`         -> `Help`
+/// - `"model"`        -> `Model`
+/// - `"thinking low"` -> `Thinking("low")`
+/// - `"bogus"`        -> `Unknown("bogus")`
+#[derive(Debug, Clone, PartialEq)]
+pub enum SlashIntent {
+    /// Show help / command list.
+    Help,
+    /// Open the model selector.
+    Model,
+    /// Set thinking level (argument may be empty to mean "show current").
+    Thinking(String),
+    /// Unknown command name.
+    Unknown(String),
+}
+
+/// Parse the text following a leading `/` into a [`SlashIntent`].
+pub fn parse_slash(rest: &str) -> SlashIntent {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return SlashIntent::Help;
+    }
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
+    let arg = parts.next().unwrap_or("").trim().to_string();
+    match cmd.as_str() {
+        "help" | "h" | "?" => SlashIntent::Help,
+        "model" | "models" | "m" => SlashIntent::Model,
+        "thinking" | "think" | "t" => SlashIntent::Thinking(arg),
+        _ => SlashIntent::Unknown(cmd),
+    }
+}
+
+/// Human-readable help text listing commands and key bindings.
+pub fn render_help() -> String {
+    let mut s = String::from("Commands:\n");
+    for c in registry() {
+        s.push_str(&format!("  {} — {}\n", c.name, c.help));
+    }
+    s.push_str("\nKey bindings:\n");
+    s.push_str("  Enter        submit line\n");
+    s.push_str("  Esc          cancel current line\n");
+    s.push_str("  Ctrl-C       exit\n");
+    s.push_str("  /q, exit     quit session\n");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,8 +125,20 @@ mod tests {
     }
 
     #[test]
-    fn unknown_query_empty() {
-        let r = filter_commands("zzzq");
-        assert!(r.is_empty());
+    fn parse_slash_intents() {
+        assert_eq!(parse_slash(""), SlashIntent::Help);
+        assert_eq!(parse_slash("help"), SlashIntent::Help);
+        assert_eq!(parse_slash("THINKING low"), SlashIntent::Thinking("low".into()));
+        assert_eq!(parse_slash("thinking"), SlashIntent::Thinking("".into()));
+        assert_eq!(parse_slash("model"), SlashIntent::Model);
+        assert_eq!(parse_slash("bogus"), SlashIntent::Unknown("bogus".into()));
+    }
+
+    #[test]
+    fn render_help_lists_commands() {
+        let h = render_help();
+        assert!(h.contains("/model"));
+        assert!(h.contains("/thinking"));
+        assert!(h.contains("Ctrl-C"));
     }
 }

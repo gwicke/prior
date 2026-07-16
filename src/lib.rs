@@ -8,6 +8,8 @@ pub mod config;
 pub mod fuzzy;
 pub mod slash;
 pub mod repl;
+pub mod model_catalog;
+pub mod thinking;
 
 pub use config::{Config, Recipe, ToolSettings};
 
@@ -17,7 +19,7 @@ pub use rig::client::{CompletionClient, ProviderClient};
 pub use rig::completion::CompletionModel;
 pub use rig::providers;
 
-pub use agent::{create_agent, load_agents_md, AgentConfig, CodeAgent, PicoAgent};
+pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent, PicoAgent};
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
 
 #[derive(Error, Debug)]
