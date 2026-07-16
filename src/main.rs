@@ -123,7 +123,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .persona
         .or_else(|| recipe.as_ref().and_then(|r| r.persona.clone()));
 
-    let output: Arc<dyn picocode::Output> = if args.quiet || recipe.as_ref().map(|r| r.quiet).unwrap_or(false) {
+    let quiet = args.quiet || recipe.as_ref().map(|r| r.quiet).unwrap_or(false);
+    let output: Arc<dyn picocode::Output> = if quiet {
         Arc::new(picocode::QuietOutput::new())
     } else {
         Arc::new(ConsoleOutput::new())
@@ -139,6 +140,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         model,
         output,
         yolo,
+        quiet,
         tool_call_limit: args.tool_call_limit,
         system_message_extension,
         persona_prompt,

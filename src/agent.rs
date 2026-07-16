@@ -1,4 +1,5 @@
 use crate::output::Confirmation;
+use crate::repl::Repl;
 use crate::tools::{
     AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir, MoveFile,
     ReadFile, Remove, WriteFile,
@@ -15,6 +16,7 @@ use rig::providers::{
 };
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use async_trait::async_trait;
 
@@ -34,10 +36,23 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             self.tool_call_limit,
             self.persona_name.as_deref(),
         );
+        let prompt = "> ".to_string();
+        let use_repl = std::io::stdin().is_terminal() && !self.quiet;
+        let mut repl = if use_repl { Some(Repl::new()) } else { None };
+        if let Some(r) = repl.as_mut() {
+            let _ = r.start();
+        }
         let mut history = Vec::new();
         loop {
             self.output.display_separator();
-            let input = self.output.get_user_input();
+            let input = match repl.as_mut() {
+                Some(r) => r.read_input(&prompt),
+                None => Some(self.output.get_user_input()),
+            };
+            let input = match input {
+                Some(s) => s,
+                None => continue,
+            };
             if input.is_empty() {
                 continue;
             }
@@ -85,6 +100,7 @@ pub struct CodeAgent<M: CompletionModel> {
     model: String,
     yolo: bool,
     persona_name: Option<String>,
+    quiet: bool,
 }
 
 pub struct AgentConfig {
@@ -92,6 +108,7 @@ pub struct AgentConfig {
     pub model: String,
     pub output: Arc<dyn Output>,
     pub yolo: bool,
+    pub quiet: bool,
     pub tool_call_limit: usize,
     pub system_message_extension: Option<String>,
     pub persona_prompt: Option<String>,
@@ -124,6 +141,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.provider,
                 model,
                 config.yolo,
+                config.quiet,
                 config.persona_name,
             ))
         }};
@@ -415,6 +433,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         provider: String,
         model: String,
         yolo: bool,
+        quiet: bool,
         persona_name: Option<String>,
     ) -> Self {
         Self {
@@ -425,6 +444,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             model,
             yolo,
             persona_name,
+            quiet,
         }
     }
 

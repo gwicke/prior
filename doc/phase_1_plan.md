@@ -599,18 +599,35 @@ visible frame; **never** clear scrollback:
       command list; unknown command handling.
 
 ### Stage 2 — `Repl` skeleton + capability negotiation
-- [ ] `src/repl.rs`: `TermGuard` with `start()`/`stop()` implementing the §3.5.2
-      CSI ordering (snapshot `was_raw`/paste/kitty → `enable_raw_mode` (no smcup) →
-      `?2004h` → Kitty `?u` flags or `modifyOtherKeys` → `setup_stdin_reader`);
-      idempotent `stop()` (drain → pop kitty → `?2004l` → restore `was_raw`).
-- [ ] Implement `Drop` for `TermGuard`; reuse `main.rs:56` panic hook.
-- [ ] Gate `Repl` activation behind `std::io::IsTerminal(stdin)` **and** `! --quiet`.
-- [ ] Event loop with `crossterm::event::read`/`poll`; **single-line input only**
-      for this stage.
-- [ ] Wire `agent.rs::run_interactive` to use `Repl::read_input` (keep
-      `ConsoleOutput::get_user_input` for `confirm()`/non-TTY).
-- [ ] **Manual TTY test**: raw mode enters/exits cleanly; terminal restored after
-      `Ctrl-C` and after a forced panic.
+> **Stage 2 — ✅ DONE (2026-07-16).** `cargo build` green, **no warnings**;
+> 28 lib tests pass (incl. 3 new `repl::tests::render_line`). Pty smoke
+> test (Python `pty`, `deepseek` provider, key in env): child exits 0;
+> captured output shows `display_header` (cooked) → start CSI
+> `\x1b[?2004h\x1b[>1;1u\x1b[>4;1u` → prompt `> ` in raw mode;
+> cursor CSI `\x1b[1D`/`\x1b[0D` correct; empty `Enter` re-prompts;
+> non-empty enters the turn (separator printed); `/q` quits and `Drop`
+> restores cooked mode. `Ctrl-C`/`Esc`/panic restore paths are wired
+> (handler code present) but only the normal-exit Drop path is verified here.
+- [x] `src/repl.rs`: `TermGuard` with `start()`/`stop()` implementing the §3.5.2
+      CSI ordering (snapshot → `enable_raw_mode` (no `smcup`) → `?2004h` →
+      `modifyOtherKeys` `>1;1u`/`>4;1u`; idempotent `stop()`).
+      `pub mod repl;` added to `lib.rs`. (Kitty `PushKeyboardEnhancementFlags`
+      push deferred to Stage 4 — `modifyOtherKeys` is the sanctioned fallback
+      per §3.5.1/§3.5.2.)
+- [x] `Drop` for `TermGuard` (restores terminal); `main.rs:56` panic hook kept.
+- [x] `Repl` activation gated behind `std::io::IsTerminal(stdin)` **and**
+      `!quiet` (new `quiet: bool` field on `CodeAgent`/`AgentConfig`, threaded
+      from `main.rs`). Non-TTY / `--quiet` still use `get_user_input`.
+- [x] Event loop with `crossterm::event::read` (`read_input`); **single-line
+      input only** for this stage (insert/backspace/delete/left/right/home/end,
+      `Enter` submit, `Esc` cancels line, `Ctrl-C` → `guard.stop()` + `exit(1)`).
+- [x] `agent.rs::run_interactive` wired to `Repl::read_input` when active;
+      `ConsoleOutput::get_user_input` retained for `confirm()`/non-TTY.
+- [x] **Unit tests** (`repl.rs`): pure `render_line(prompt, buf, cursor)`
+      (cursor-at-end / mid-buffer / empty); 3 tests passing.
+- [~] **Manual TTY test** (Ctrl-C + forced panic restore): code paths wired
+      and normal-exit restore verified via pty; interactive Ctrl-C/panic check
+      still recommended for a final human sign-off.
 
 ### Stage 3 — Slash commands + `/model` (fetch, cache, extrapolation) + `/thinking`
 - [ ] `src/model_catalog.rs`: `fetch_openrouter()` via `reqwest` (unauthenticated
