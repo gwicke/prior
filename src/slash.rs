@@ -86,7 +86,7 @@ pub fn parse_slash(rest: &str) -> SlashIntent {
 pub fn render_help() -> String {
     let mut s = String::from("Commands:\n");
     for c in registry() {
-        s.push_str(&format!("  {} — {}\n", c.name, c.help));
+        s.push_str(&format!("  {:<10} — {}\n", c.name, c.help));
     }
     s.push_str("\nKey bindings:\n");
     s.push_str("  Enter        submit line\n");
@@ -147,5 +147,18 @@ mod tests {
         assert!(h.contains("/model"));
         assert!(h.contains("/thinking"));
         assert!(h.contains("Ctrl-C"));
+    }
+
+    #[test]
+    fn render_help_is_plain_and_aligned() {
+        let h = render_help();
+        assert!(h.contains("Commands:"));
+        // command names are column-aligned (fixed-width pad)
+        assert!(h.contains("  /help"));
+        assert!(h.contains("  /model"));
+        assert!(h.contains("  /thinking"));
+        // No termimad-style double-space artifacts between words.
+        assert!(!h.contains("Show  available"));
+        assert!(!h.contains("Commands :"));
     }
 }

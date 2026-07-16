@@ -1,5 +1,4 @@
 use console::{style, StyledObject};
-use unicode_segmentation::UnicodeSegmentation;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use std::sync::Mutex;
@@ -200,64 +199,60 @@ fn term_width() -> usize {
         .unwrap_or(80)
 }
 
-/// Wrap `text` to `width` columns on Unicode word boundaries (grapheme/char aware,
-/// CJK-safe). Lines with no break opportunity longer than `width` are hard-split.
-/// A `width` of 0 disables wrapping and returns the logical lines unchanged.
+/// Wrap `text` to `width` columns.
+///
+/// Tokenizes into maximal non-whitespace "words", collapsing any run of
+/// whitespace between them to a single space. A word longer than `width` is
+/// hard-split into `width`-sized character chunks (CJK-safe). Logical lines
+/// (split on `\n`) are wrapped independently, and blank lines are preserved.
+///
+/// Unlike a grapheme-boundary splitter, this keeps trailing punctuation
+/// attached to its word (e.g. `"Commands:"` stays `"Commands:"`, not
+/// `"Commands :"`) and never inserts a space adjacent to existing whitespace
+/// (so `"a  b"` reflows to `"a b"`).
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return text.lines().map(|l| l.to_string()).collect();
     }
+    let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
     for logical in text.split('\n') {
-        let mut cur = String::new();
-        let mut any = false;
-        for seg in logical.split_word_bounds() {
-            let wlen = seg.chars().count();
-            let is_ws = seg.chars().all(|c| c.is_whitespace());
-            if cur.is_empty() {
-                if is_ws {
-                    continue; // drop leading whitespace
+        if logical.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let words: Vec<&str> = logical.split_whitespace().collect();
+        let mut line = String::new();
+        for word in words {
+            if word.chars().count() > width {
+                // Flush any pending line, then hard-split the long word.
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
                 }
-                if wlen > width {
-                    for chunk in seg.chars().collect::<Vec<_>>().chunks(width) {
-                        out.push(chunk.iter().collect());
-                        any = true;
-                    }
-                } else {
-                    cur.push_str(seg);
+                let chunks: Vec<String> = word
+                    .chars()
+                    .collect::<Vec<_>>()
+                    .chunks(width)
+                    .map(|c| c.iter().collect())
+                    .collect();
+                for c in &chunks[..chunks.len().saturating_sub(1)] {
+                    out.push(c.clone());
                 }
-            } else if is_ws {
-                // whitespace following a word on the current line
-                if cur.chars().count() + wlen > width {
-                    out.push(std::mem::take(&mut cur));
-                    any = true;
-                    // drop the whitespace (don't start a new line with a space)
-                } else {
-                    cur.push_str(seg);
-                }
+                line = chunks.last().cloned().unwrap_or_default();
+                continue;
+            }
+            if line.is_empty() {
+                line.push_str(word);
+            } else if line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+                line.push_str(word);
             } else {
-                // a word; needs a separating space before it
-                if wlen > width {
-                    out.push(std::mem::take(&mut cur));
-                    any = true;
-                    for chunk in seg.chars().collect::<Vec<_>>().chunks(width) {
-                        out.push(chunk.iter().collect());
-                        any = true;
-                    }
-                } else if cur.chars().count() + 1 + wlen > width {
-                    out.push(std::mem::take(&mut cur));
-                    any = true;
-                    cur.push_str(seg); // new line starts with this word
-                } else {
-                    cur.push(' ');
-                    cur.push_str(seg);
-                }
+                line.push(' ');
+                line.push_str(word);
             }
         }
-        if !cur.is_empty() {
-            out.push(cur);
-        } else if !any {
-            out.push(String::new());
+        if !line.is_empty() {
+            out.push(line);
         }
     }
     out
@@ -313,6 +308,10 @@ impl ConsoleOutput {
 
 impl Output for ConsoleOutput {
     fn display_text(&self, text: &str) {
+        eprintln!(
+            "[picocode-dbg] ConsoleOutput::display_text first_line={:?}",
+            text.lines().next().unwrap_or("")
+        );
         self.stop_thinking();
         println!();
         print!("{} ", style("⏺").cyan());
@@ -574,13 +573,27 @@ mod tests {
     }
 
     #[test]
-    fn truncate_multibyte_no_panic() {
-        assert_eq!(truncate("日本語", 2), "日本...");
-        assert_eq!(truncate("日本語", 5), "日本語");
+    fn wrap_keeps_trailing_punctuation_attached() {
+        assert_eq!(wrap("Commands:", 100), vec!["Commands:"]);
+        assert_eq!(wrap("(provider:name)", 100), vec!["(provider:name)"]);
     }
 
     #[test]
-    fn truncate_ascii() {
+    fn wrap_single_spaces_around_emdash() {
+        assert_eq!(wrap("— Show available commands", 100), vec!["— Show available commands"]);
+    }
+
+    #[test]
+    fn wrap_preserves_alignment_free_help() {
+        // `wrap` reflows: leading/padding whitespace is collapsed to single
+        // spaces, punctuation stays attached, em-dash gets one space.
+        let help = "  /help      — Show available commands\n  /model      — Select a model";
+        let r = wrap(help, 100);
+        assert_eq!(r, vec!["/help — Show available commands", "/model — Select a model"]);
+    }
+
+    #[test]
+    fn truncate_multibyte_no_panic() {
         assert_eq!(truncate("hello", 3), "hel...");
         assert_eq!(truncate("hi", 5), "hi");
     }

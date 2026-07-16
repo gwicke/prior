@@ -746,6 +746,37 @@ visible frame; **never** clear scrollback:
   APIs expose no pricing). It is smaller/more stable than a full model catalog and
   only needed for configured providers. Follow-up: optionally generate it from each
   provider's published price page at build time (mirroring pi's generator).
+- **Raw-mode output needs `OPOST` re-enabled (root cause of `/help` stagger).**
+  `crossterm::enable_raw_mode` calls `cfmakeraw`, which clears `OPOST` (output
+  post-processing). With `OPOST` off the terminal does **not** translate `\n` →
+  `\r\n`, so every bare `\n` only moves down a row and leaves the cursor in the
+  same column — producing staggered "indentation" for any multi-line REPL output
+  (help, separators, **and termimad agent responses**). Fixed in `TermGuard::start()`
+  by re-enabling `OPOST | ONLCR` on `/dev/tty` (via `libc`) immediately after
+  `enable_raw_mode`; keeps raw *input* semantics. `disable_raw_mode` restores the
+  original cooked mode, so nothing leaks. (`print_block` and friends just emit `\n`
+  and rely on this translation.)
+- **`wrap_line` cursor placement (root cause of caret snapping to col 0).**
+  In `repl.rs`, `wrap_line` only set the cursor column when the caret sat at a
+  word *start* (`cursor == Some(i)`). When navigating left/backspace into the
+  *middle* of a word, `cursor_pos` stayed `None`, so `Layout.cursor_col` defaulted
+  to `0` and every redraw snapped the caret to column 0 (the "cursor jumps one
+  character indented" / "walking back lands on the second char" reports). Fixed by
+  computing the caret column for the actual position inside the word
+  (`col + (cu - i)`) in both word-fit branches, and dropping a leading-space row
+  start. Covered by `repl::tests::layout_cursor_tracks_mid_word`.
+- **Ctrl-U did not cross newlines.** `delete_line_start` stopped at a line boundary
+  (right after `\n`) and a second press did nothing, so the whole buffer could not
+  be cleared. Fixed: when the caret is already at a line start, it now deletes the
+  preceding `\n` *and* the whole previous line, so successive `Ctrl-U` presses
+  walk backward one logical line at a time. Covered by
+  `repl::tests::delete_line_start_walks_back_across_newlines` and
+  `delete_line_start_keeps_partial_line`.
+- **`wrap()` mangled punctuation/whitespace** (`Commands:` → `Commands :`, em-dash
+  double-spaces). Rewritten to tokenize by whitespace (keeps `Commands:`/
+  `(provider:name)` intact, single spaces between words, collapses alignment
+  padding). `print_block` prints `/help` **verbatim** (preserving `{:<10}` column
+  alignment) and only hard-wraps lines exceeding the terminal width.
 - **TODO (later investigation):** `Shift+Enter` newline currently depends on the
   terminal's Kitty keyboard protocol (wezterm `enable_kitty_keyboard`) or the
   `Ctrl-J` fallback. **pi handles `Shift+Enter` as newline with *no* Kitty

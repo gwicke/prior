@@ -152,10 +152,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         thinking_level: None,
     };
-    let agent = create_agent(agent_config.clone()).await?;
-
     match command {
         Commands::Recipe { name: _ } => {
+            let agent = create_agent(agent_config.clone()).await?;
             if let Some(r) = recipe {
                 let prompt = picocode::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
                     .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
@@ -174,6 +173,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Input { prompt } => {
+            let agent = create_agent(agent_config.clone()).await?;
             let response = agent.run_once(prompt).await?;
             if args.quiet {
                 println!("{}", response);
@@ -181,6 +181,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Chat => {
             if let Some(p) = prompt {
+                let agent = create_agent(agent_config.clone()).await?;
                 let response = agent.run_once(p).await?;
                 if args.quiet {
                     println!("{}", response);

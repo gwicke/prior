@@ -421,9 +421,14 @@ fn guard<T: Tool>(
 /// provider's completion-model type).
 pub async fn run_interactive(config: AgentConfig) -> Result<()> {
     let mut config = config;
-    let mut agent = create_agent(config.clone()).await?;
+    // Agent is created lazily on first use (or on /model, /thinking) so that
+    // commands like /help work without a network round-trip.
+    let mut agent: Option<Box<dyn PicoAgent>> = None;
 
-    let prompt_str = "> ".to_string();
+    // Empty prompt: the REPL input is left-aligned on every row (a `> ` prefix
+    // would only indent the first line and leave wrapped/continuation lines
+    // ragged). Mirrors pi's left-aligned input region.
+    let prompt_str = String::new();
     let use_repl = std::io::stdin().is_terminal() && !config.quiet;
     let mut repl = if use_repl { Some(Repl::new()) } else { None };
     if let Some(r) = repl.as_mut() {
@@ -454,7 +459,11 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
         if let Some(rest) = input.strip_prefix('/') {
             match slash::parse_slash(rest) {
                 slash::SlashIntent::Help => {
-                    config.output.display_text(&slash::render_help());
+                    let msg = slash::render_help();
+                    match repl.as_mut() {
+                        Some(r) => r.print_block(&msg),
+                        None => config.output.display_text(&msg),
+                    }
                 }
                 slash::SlashIntent::Model => {
                     if let Some((provider, model)) =
@@ -465,7 +474,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                         new_cfg.model = model;
                         match create_agent(new_cfg.clone()).await {
                             Ok(new_agent) => {
-                                agent = new_agent;
+                                agent = Some(new_agent);
                                 config = new_cfg;
                                 config.output.display_header(
                                     &config.provider,
@@ -484,9 +493,11 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                 slash::SlashIntent::Thinking(arg) => {
                     if arg.is_empty() {
                         let cur = config.thinking_level.as_deref().unwrap_or("off");
-                        config
-                            .output
-                            .display_text(&format!("thinking level: {}", cur));
+                        let msg = format!("thinking level: {}", cur);
+                        match repl.as_mut() {
+                            Some(r) => r.print_block(&msg),
+                            None => config.output.display_text(&msg),
+                        }
                     } else {
                         match arg.parse::<thinking::ThinkingLevel>() {
                             Ok(level) => {
@@ -494,34 +505,65 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                                 new_cfg.thinking_level = Some(level.as_str().to_string());
                                 match create_agent(new_cfg.clone()).await {
                                     Ok(new_agent) => {
-                                        agent = new_agent;
+                                        agent = Some(new_agent);
                                         config = new_cfg;
-                                        config.output.display_text(&format!(
+                                        let msg = format!(
                                             "thinking level -> {}",
                                             level.as_str()
-                                        ));
+                                        );
+                                        match repl.as_mut() {
+                                            Some(r) => r.print_block(&msg),
+                                            None => config.output.display_text(&msg),
+                                        }
                                     }
-                                    Err(e) => config
-                                        .output
-                                        .display_text(&format!("Cannot set thinking: {}", e)),
+                                    Err(e) => {
+                                        let msg = format!("Cannot set thinking: {}", e);
+                                        match repl.as_mut() {
+                                            Some(r) => r.print_block(&msg),
+                                            None => config.output.display_text(&msg),
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => config.output.display_text(&e),
+                            Err(e) => {
+                                let msg = e.to_string();
+                                match repl.as_mut() {
+                                    Some(r) => r.print_block(&msg),
+                                    None => config.output.display_text(&msg),
+                                }
+                            }
                         }
                     }
                 }
                 slash::SlashIntent::Unknown(cmd) => {
-                    config.output.display_text(&format!(
+                    let msg = format!(
                         "Unknown command: /{}. Type /help for a list.",
                         cmd
-                    ));
+                    );
+                    match repl.as_mut() {
+                        Some(r) => r.print_block(&msg),
+                        None => config.output.display_text(&msg),
+                    }
                 }
             }
             continue;
         }
 
-        // Normal prompt.
-        let response = agent.prompt(&input, Some(&mut history)).await?;
+        // Normal prompt — create the agent lazily on first use.
+        if agent.is_none() {
+            match create_agent(config.clone()).await {
+                Ok(a) => agent = Some(a),
+                Err(e) => {
+                    let msg = format!("Cannot start agent: {}", e);
+                    match repl.as_mut() {
+                        Some(r) => r.print_block(&msg),
+                        None => config.output.display_text(&msg),
+                    }
+                    continue;
+                }
+            }
+        }
+        let response = agent.as_ref().unwrap().prompt(&input, Some(&mut history)).await?;
         config.output.display_text(&response);
     }
     Ok(())

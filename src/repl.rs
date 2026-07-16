@@ -13,6 +13,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crate::output::wrap;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -40,6 +41,15 @@ impl TermGuard {
         }
         self.saved_paste = false;
         enable_raw_mode()?;
+        // crossterm's `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`.
+        // With `OPOST` off the terminal does NOT translate `\n` -> `\r\n`, so
+        // every bare `\n` (help text, separators, agent responses) only moves
+        // down a row and leaves the cursor at the same column — producing the
+        // staggered "indentation" seen on a full screen. Re-enable output
+        // post-processing (specifically `ONLCR`) so line breaks return to
+        // column 0, while keeping raw *input* semantics (no canonical line
+        // editing, no echo). `disable_raw_mode` restores the original mode.
+        enable_output_processing();
         Self::csi("?2004h")?; // bracketed paste on
         // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
         // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
@@ -80,6 +90,28 @@ impl TermGuard {
     }
 }
 
+/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`) on
+/// the controlling terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`,
+/// which disables `OPOST`; without it a bare `\n` does not return the cursor
+/// to column 0. Best-effort: errors are ignored (output simply stays raw).
+fn enable_output_processing() {
+    use std::os::unix::io::IntoRawFd;
+    let fd = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        Ok(f) => f.into_raw_fd(),
+        Err(_) => return,
+    };
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut termios) != 0 {
+            libc::close(fd);
+            return;
+        }
+        termios.c_oflag |= libc::OPOST | libc::ONLCR;
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        libc::close(fd);
+    }
+}
+
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = self.stop();
@@ -114,22 +146,45 @@ impl Repl {
         let mut editor = LineEditor::new();
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
-
-        // Save the input-top position so every redraw restores here (this also
-        // makes the picker in `select()` a clean "clear-from-cursor-down" that
-        // the next prompt fully reclaims).
-        let _ = io::stdout().write_all(b"\x1b[s");
-        let _ = io::stdout().flush();
-
-        let redraw = |editor: &LineEditor| {
+        // Screen rows occupied by the previously drawn input, so each redraw can
+        // Track the previously drawn region so each redraw can clear exactly
+        // those rows. We clear relative to the *current* cursor, which (by the
+        // editor's invariant) sits at `top + prev_cursor_row`, so moving up
+        // `prev_cursor_row` rows returns to the region's top. This avoids
+        // DECSC/DECRC save/restore, which some terminals honor inconsistently.
+        let mut prev_rows: usize = 0;
+        let mut prev_cursor_row: usize = 0;
+        let redraw = |editor: &LineEditor, prev_rows: &mut usize, prev_cursor_row: &mut usize| {
             let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
             let w = w as usize;
             let layout = editor.layout(w, prompt);
-            let s = render_input(&layout, prompt);
+            let rc = layout.row_count.max(1);
+            let cur = layout.cursor_row;
+            let mut s = String::new();
+            // Return to the top of the previously drawn region.
+            if *prev_cursor_row > 0 {
+                s.push_str(&format!("\x1b[{}A", *prev_cursor_row));
+            }
+            // Clear each previously drawn row (clear-to-EOL is universally
+            // supported; we avoid erase-down after a flaky save/restore).
+            s.push_str("\r\x1b[K");
+            for _ in 1..(*prev_rows).max(1) {
+                s.push('\n');
+                s.push_str("\x1b[K");
+            }
+            // Back to the top to write the new content.
+            if *prev_rows > 1 {
+                s.push_str(&format!("\x1b[{}A", *prev_rows - 1));
+            }
+            s.push('\r');
+            s.push_str(&render_content(&layout, prompt));
+            s.push_str(&cursor_positioning(&layout));
             let _ = io::stdout().write_all(s.as_bytes());
             let _ = io::stdout().flush();
+            *prev_rows = rc;
+            *prev_cursor_row = cur;
         };
-        redraw(&editor);
+        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
 
         loop {
             match event::read() {
@@ -137,7 +192,7 @@ impl Repl {
                     KeyCode::Enter => {
                         if key.modifiers.contains(KeyModifiers::SHIFT) {
                             editor.insert_newline();
-                            redraw(&editor);
+                            redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                         } else {
                             let _ = io::stdout().write_all(b"\n");
                             let _ = io::stdout().flush();
@@ -158,18 +213,18 @@ impl Repl {
                                 }
                                 'u' => {
                                     editor.delete_line_start();
-                                    redraw(&editor);
+                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                                 }
                                 'k' => {
                                     editor.delete_line_end();
-                                    redraw(&editor);
+                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                                 }
                                 'j' => {
                                     // Ctrl-J (LF) is a reliable, terminal-agnostic
                                     // newline even where Shift+Enter isn't
                                     // disambiguated (Kitty protocol off).
                                     editor.insert_newline();
-                                    redraw(&editor);
+                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                                 }
                                 _ => {}
                             }
@@ -177,42 +232,42 @@ impl Repl {
                             match c {
                                 'b' => {
                                     editor.word_left();
-                                    redraw(&editor);
+                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                                 }
                                 'f' => {
                                     editor.word_right();
-                                    redraw(&editor);
+                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                                 }
                                 _ => {}
                             }
                         } else {
                             editor.insert(c);
-                            redraw(&editor);
+                            redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                         }
                     }
                     KeyCode::Backspace => {
                         editor.backspace();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Delete => {
                         editor.delete();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Left => {
                         editor.left();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Right => {
                         editor.right();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Home => {
                         editor.home();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::End => {
                         editor.end();
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Up => {
                         if !editor.move_up_line() {
@@ -220,7 +275,7 @@ impl Repl {
                                 editor.set(&s);
                             }
                         }
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     KeyCode::Down => {
                         if !editor.move_down_line() {
@@ -228,13 +283,13 @@ impl Repl {
                                 editor.set(&s);
                             }
                         }
-                        redraw(&editor);
+                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                     }
                     _ => {}
                 },
                 Ok(Event::Paste(text)) => {
                     editor.insert_str(&text);
-                    redraw(&editor);
+                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                 }
                 Ok(_) => {} // resize/mouse: ignored (Stage 6 redraw)
                 Err(_) => return None,
@@ -245,50 +300,165 @@ impl Repl {
     /// Render a single-column selection list and let the user pick one entry.
     /// `options` are display strings. Returns `Some(index)` on Enter, `None` on
     /// Esc (cancel). Used by `/model` (and any future picker).
+    /// Pure renderer for the selection list (testable without a TTY). Produces the
+    /// visible text only — the caller prepends the clear-from-top escape sequence.
+    /// `title` appears exactly once; each option is wrapped to `width` with
+    /// continuation lines aligned under the option text; long lists scroll so the
+    /// selection stays in view. `sel` is the currently highlighted index.
+    pub fn render_select(
+        title: &str,
+        options: &[String],
+        sel: usize,
+        width: usize,
+        height: usize,
+    ) -> String {
+        let tw = width.max(1);
+        let th = height.max(1);
+        let prefix_w = 2usize; // "> " for the selection, "  " otherwise
+        let opt_w = tw.saturating_sub(prefix_w);
+        // Precompute wrapped display rows for each option. `first` marks the
+        // option's first (marker) row so continuation lines stay aligned.
+        let mut rows: Vec<(usize, String, bool)> = Vec::new();
+        for (i, o) in options.iter().enumerate() {
+            let wrapped = wrap(o, opt_w);
+            for (j, line) in wrapped.into_iter().enumerate() {
+                rows.push((i, line, j == 0));
+            }
+        }
+        let max_rows = th.saturating_sub(1).max(1); // title consumes one row
+        let sel_row = rows.iter().position(|(i, _, _)| *i == sel).unwrap_or(0);
+        let start = if rows.len() <= max_rows {
+            0
+        } else {
+            sel_row.saturating_sub(max_rows / 2).min(rows.len() - max_rows)
+        };
+        let mut s = String::new();
+        s.push_str(title);
+        s.push('\n');
+        for (i, line, first) in rows.iter().skip(start).take(max_rows) {
+            let marker = if *first && *i == sel { "> " } else { "  " };
+            s.push_str(marker);
+            s.push_str(line);
+            s.push('\n');
+        }
+        s
+    }
+
+    /// Clear `n` screen rows starting at the current row (moving up to the top
+    /// row, then clearing each with clear-to-EOL). Does not rely on DECSC/DECRC
+    /// save/restore, which some terminals honor inconsistently.
+    fn clear_n_rows(n: usize) {
+        let mut s = String::new();
+        if n > 1 {
+            s.push_str(&format!("\x1b[{}A", n - 1));
+        }
+        s.push_str("\r\x1b[K");
+        // Bare `\n`: `OPOST`/`ONLCR` (re-enabled in `TermGuard::start`) converts it to
+        // `\r\n`; writing `\r\n` here would yield `\r\r\n`.
+        for _ in 1..n.max(1) {
+            s.push('\n');
+            s.push_str("\x1b[K");
+        }
+        let _ = io::stdout().write_all(s.as_bytes());
+        let _ = io::stdout().flush();
+    }
+
+    /// Render a single-column selection list and let the user pick one entry.
+    /// `options` are display strings. Returns `Some(index)` on Enter, `None` on
+    /// Esc (cancel). Used by `/model` (and any future picker).
+    ///
+    /// Rendering model (mirrors pi's bounded, scrolling dropdown): on every
+    /// redraw, clear exactly the rows the previous render occupied (counted
+    /// clear-to-EOL per row) and reprint. This prevents the list from being
+    /// *appended* on each navigation (the old bug) without depending on
+    /// DECSC/DECRC save/restore + erase-down, which wezterm honors
+    /// inconsistently.
     pub fn select(&mut self, title: &str, options: &[String]) -> Option<usize> {
         if options.is_empty() {
             return None;
         }
+        let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+        let tw = tw as usize;
+        let th = th as usize;
+
         let mut sel: usize = 0;
-        let redraw = |sel: usize| -> std::io::Result<()> {
-            let mut s = String::from("\x1b[0J"); // clear from cursor down
-            s.push_str(title);
-            s.push('\n');
-            for (i, o) in options.iter().enumerate() {
-                if i == sel {
-                    s.push_str("> ");
-                } else {
-                    s.push_str("  ");
-                }
-                s.push_str(o);
-                s.push('\n');
+        let mut prev_rows: usize = 0;
+        let redraw = |sel: usize, prev_rows: &mut usize| -> std::io::Result<()> {
+            let rendered = Self::render_select(title, options, sel, tw, th);
+            let rc = rendered.matches('\n').count(); // ends with '\n' → row count
+            Self::clear_n_rows(*prev_rows);
+            // After clearing, cursor is on the bottom cleared row; return to top.
+            let mut s = String::new();
+            if *prev_rows > 1 {
+                s.push_str(&format!("\x1b[{}A", *prev_rows - 1));
             }
+            s.push('\r');
+            s.push_str(&rendered);
             io::stdout().write_all(s.as_bytes())?;
-            io::stdout().flush()
+            io::stdout().flush()?;
+            *prev_rows = rc;
+            Ok(())
         };
-        let _ = redraw(sel);
+        let _ = redraw(sel, &mut prev_rows);
         loop {
             match event::read() {
                 Ok(Event::Key(key)) => match key.code {
                     KeyCode::Down | KeyCode::Char('j') => {
                         if sel + 1 < options.len() {
                             sel += 1;
-                            let _ = redraw(sel);
+                            let _ = redraw(sel, &mut prev_rows);
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if sel > 0 {
                             sel -= 1;
-                            let _ = redraw(sel);
+                            let _ = redraw(sel, &mut prev_rows);
                         }
                     }
-                    KeyCode::Enter => return Some(sel),
-                    KeyCode::Esc => return None,
+                    KeyCode::Enter => {
+                        // Clear the menu region before returning.
+                        Self::clear_n_rows(prev_rows);
+                        return Some(sel);
+                    }
+                    KeyCode::Esc => {
+                        Self::clear_n_rows(prev_rows);
+                        return None;
+                    }
                     _ => {}
                 },
                 _ => {}
             }
         }
+    }
+
+    /// Print a block of REPL-originated text (help, status messages) below the
+    /// current input region, clearing that region first so output doesn't
+    /// overlap the prompt. Used in TTY mode; the next `read_input` re-saves a
+    /// fresh top. Falls back to the cooked `Output` when there is no REPL.
+    ///
+    /// Text is printed **verbatim** (its own newlines and column alignment are
+    /// preserved). Only lines longer than the terminal width are wrapped, so
+    /// pre-formatted output like `/help` keeps its alignment instead of being
+    /// reflowed into ragged columns.
+    pub fn print_block(&mut self, text: &str) {
+        let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+        let w = (w as usize).max(1);
+        let mut body = String::new();
+        for line in text.split('\n') {
+            if line.chars().count() <= w {
+                body.push_str(line);
+            } else {
+                for wl in crate::output::wrap(line, w) {
+                    body.push_str(&wl);
+                    body.push('\n');
+                }
+                continue;
+            }
+            body.push('\n');
+        }
+        let s = format!("\x1b[u\r\x1b[0J{}", body);
+        let _ = io::stdout().write_all(s.as_bytes());
+        let _ = io::stdout().flush();
     }
 }
 
@@ -403,18 +573,39 @@ impl LineEditor {
     }
 
     /// Delete from the cursor to the start of the logical line (`Ctrl-U`).
+    /// When the cursor is already at the start of a line (right after a `'\n'`),
+    /// this clears the preceding newline and the whole previous line, so
+    /// successive `Ctrl-U` presses walk backward one logical line at a time.
     pub fn delete_line_start(&mut self) {
-        let start = {
+        if self.cursor == 0 {
+            return;
+        }
+        // Start of the current logical line (after the preceding '\n', or buffer start).
+        let line_start = {
             let mut i = self.cursor;
             while i > 0 && self.buf[i - 1] != '\n' {
                 i -= 1;
             }
             i
         };
-        if start < self.cursor {
-            self.buf.drain(start..self.cursor);
-            self.cursor = start;
+        if line_start < self.cursor {
+            // There is content before the cursor on this line: delete it.
+            self.buf.drain(line_start..self.cursor);
+            self.cursor = line_start;
+            return;
         }
+        // Cursor is at the start of a line that follows a '\n': clear the
+        // preceding newline and the whole previous line so the next press can
+        // continue backward.
+        let prev_start = {
+            let mut i = self.cursor - 1; // step past the '\n'
+            while i > 0 && self.buf[i - 1] != '\n' {
+                i -= 1;
+            }
+            i
+        };
+        self.buf.drain(prev_start..self.cursor);
+        self.cursor = prev_start;
     }
 
     /// Delete from the cursor to the end of the logical line (`Ctrl-K`).
@@ -567,6 +758,10 @@ fn wrap_line(
                 continue;
             }
             if col + 1 > avail(row) {
+                // The trailing space is dropped and the next row starts here.
+                if cursor == Some(i) {
+                    cursor_pos = Some((row, col));
+                }
                 rows.push(std::mem::take(&mut cur));
                 row += 1;
                 col = 0;
@@ -586,8 +781,11 @@ fn wrap_line(
         let wlen = j - i;
         if col == 0 {
             if wlen <= avail(row) {
-                if cursor == Some(i) {
-                    cursor_pos = Some((row, col));
+                // Cursor may sit anywhere inside the word.
+                if let Some(cu) = cursor {
+                    if i <= cu && cu < j {
+                        cursor_pos = Some((row, col + (cu - i)));
+                    }
                 }
                 for k in i..j {
                     cur.push(line[k]);
@@ -612,8 +810,11 @@ fn wrap_line(
                 i = j;
             }
         } else if col + wlen <= avail(row) {
-            if cursor == Some(i) {
-                cursor_pos = Some((row, col));
+            // Cursor may sit anywhere inside the word.
+            if let Some(cu) = cursor {
+                if i <= cu && cu < j {
+                    cursor_pos = Some((row, col + (cu - i)));
+                }
             }
             for k in i..j {
                 cur.push(line[k]);
@@ -636,11 +837,16 @@ fn wrap_line(
 
 /// Build the escape sequence that restores the saved input-top, clears down,
 /// redraws `prompt` + rows, and positions the cursor. Pure string builder.
-fn render_input(layout: &Layout, prompt: &str) -> String {
-    let mut s = String::from("\x1b[u\r\x1b[0J");
+/// Content of the input region (prompt + visual rows), CRLF-separated, with
+/// no cursor positioning or other terminal escapes. Composed by the editor
+/// redraw and by [`render_input`].
+fn render_content(layout: &Layout, prompt: &str) -> String {
+    let mut s = String::new();
     let rc = layout.row_count.max(1);
     for r in 0..rc {
         if r > 0 {
+            // Bare `\n`: `OPOST`/`ONLCR` (re-enabled in `TermGuard::start`) turns it
+            // into `\r\n`, so writing `\r\n` here would become `\r\r\n`.
             s.push('\n');
         }
         if r == 0 {
@@ -650,11 +856,23 @@ fn render_input(layout: &Layout, prompt: &str) -> String {
             s.push_str(&layout.rows[r]);
         }
     }
+    s
+}
+
+/// Cursor-positioning suffix that places the caret at `layout.cursor_row` /
+/// `layout.cursor_col` after [`render_content`] has been written.
+fn cursor_positioning(layout: &Layout) -> String {
+    let rc = layout.row_count.max(1);
     let last_row_len = if rc == 1 {
-        prompt.chars().count() + layout.rows.first().map(|x| x.chars().count()).unwrap_or(0)
+        layout
+            .rows
+            .first()
+            .map(|x| x.chars().count())
+            .unwrap_or(0)
     } else {
         layout.rows.last().map(|x| x.chars().count()).unwrap_or(0)
     };
+    let mut s = String::new();
     let move_up = (rc - 1).saturating_sub(layout.cursor_row);
     if move_up > 0 {
         s.push_str(&format!("\x1b[{}A", move_up));
@@ -666,6 +884,16 @@ fn render_input(layout: &Layout, prompt: &str) -> String {
             s.push_str(&format!("\x1b[{}D", d));
         }
     }
+    s
+}
+
+/// `render_input` is only used by the unit tests below; gate it so the
+/// non-test build doesn't warn about an unused function.
+#[cfg(test)]
+fn render_input(layout: &Layout, prompt: &str) -> String {
+    let mut s = String::from("\x1b[u\r\x1b[0J");
+    s.push_str(&render_content(layout, prompt));
+    s.push_str(&cursor_positioning(layout));
     s
 }
 
@@ -852,11 +1080,51 @@ mod tests {
     }
 
     #[test]
+    fn delete_line_start_walks_back_across_newlines() {
+        // "line1\nline2" with the cursor at the end of line 2.
+        let mut e = LineEditor::new();
+        e.insert_str("line1\nline2"); // cursor 11
+        e.delete_line_start(); // clears line2 -> "line1\n", cursor 6
+        assert_eq!(e.text(), "line1\n");
+        assert_eq!(e.cursor, 6);
+        e.delete_line_start(); // at boundary: clears preceding '\n' + line1 -> "", cursor 0
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
+    fn delete_line_start_keeps_partial_line() {
+        // "a\nbc|d" -> first Ctrl-U clears "bc", second clears "a\n".
+        let mut e = LineEditor::new();
+        e.insert_str("a\nbcd"); // 0-4, cursor 5
+        e.left(); // cursor 4 (a\nbc|d)
+        e.delete_line_start(); // "a\nd"
+        assert_eq!(e.text(), "a\nd");
+        assert_eq!(e.cursor, 2);
+        e.delete_line_start(); // at boundary -> clears "a\n" -> "d"
+        assert_eq!(e.text(), "d");
+        assert_eq!(e.cursor, 0);
+    }
+
+    #[test]
     fn paste_insertion_preserves_newlines() {
         let mut e = LineEditor::new();
         e.insert_str("foo\nbar");
         assert_eq!(e.cursor, 7);
         assert_eq!(e.text(), "foo\nbar");
+    }
+
+    #[test]
+    fn layout_cursor_tracks_mid_word() {
+        let mut e = LineEditor::new();
+        e.insert_str("abcdef");
+        e.left();
+        e.left();
+        e.left(); // cursor at position 3 ('d')
+        let layout = e.layout(100, "");
+        assert_eq!(layout.rows, vec!["abcdef"]);
+        // Cursor must follow the actual position, not snap to column 0.
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 3));
     }
 
     #[test]
@@ -937,6 +1205,50 @@ mod tests {
         assert_eq!(h.next(&mut nav, &mut draft), Some("second".to_string()));
         assert_eq!(h.next(&mut nav, &mut draft), Some("draft".to_string()));
         assert!(nav.is_none());
+    }
+
+    #[test]
+    fn render_select_title_appears_once() {
+        let opts = vec![
+            "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
+            "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
+        ];
+        let out = Repl::render_select("Select a model:", &opts, 0, 80, 24);
+        assert_eq!(out.matches("Select a model:").count(), 1);
+        assert!(out.contains("> a: alpha"));
+        assert!(out.contains("  b: beta"));
+    }
+
+    #[test]
+    fn render_select_wraps_long_option_with_aligned_continuation() {
+        let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
+        let opts = vec![long.to_string()];
+        let out = Repl::render_select("Select a model:", &opts, 0, 40, 24);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[1].starts_with("> "), "first row is the marker row");
+        let cont: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("> "))
+            .collect();
+        assert!(
+            !cont.is_empty(),
+            "expected a wrapped continuation line indented under the option text"
+        );
+    }
+
+    #[test]
+    fn render_select_scrolls_selection_into_view() {
+        let opts: Vec<String> = (0..50).map(|i| format!("model-{} ctx 1000 $1/1 per M", i)).collect();
+        let out = Repl::render_select("Select:", &opts, 49, 80, 10);
+        assert!(
+            out.contains("model-49"),
+            "last option must be visible when selected"
+        );
+        assert!(
+            !out.contains("model-0"),
+            "early options should be scrolled out of the window"
+        );
+        assert_eq!(out.matches("Select:").count(), 1);
     }
 
     impl LineEditor {
