@@ -1,4 +1,5 @@
-use console::{style, StyledObject, Term};
+use console::{style, StyledObject};
+use unicode_segmentation::UnicodeSegmentation;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use std::sync::Mutex;
@@ -185,11 +186,81 @@ pub struct ConsoleOutput {
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+    if s.chars().count() > max_len {
+        format!("{}...", s.chars().take(max_len).collect::<String>())
     } else {
         s.to_string()
     }
+}
+
+/// Terminal width in columns, or 80 if it cannot be determined.
+fn term_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+}
+
+/// Wrap `text` to `width` columns on Unicode word boundaries (grapheme/char aware,
+/// CJK-safe). Lines with no break opportunity longer than `width` are hard-split.
+/// A `width` of 0 disables wrapping and returns the logical lines unchanged.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.lines().map(|l| l.to_string()).collect();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for logical in text.split('\n') {
+        let mut cur = String::new();
+        let mut any = false;
+        for seg in logical.split_word_bounds() {
+            let wlen = seg.chars().count();
+            let is_ws = seg.chars().all(|c| c.is_whitespace());
+            if cur.is_empty() {
+                if is_ws {
+                    continue; // drop leading whitespace
+                }
+                if wlen > width {
+                    for chunk in seg.chars().collect::<Vec<_>>().chunks(width) {
+                        out.push(chunk.iter().collect());
+                        any = true;
+                    }
+                } else {
+                    cur.push_str(seg);
+                }
+            } else if is_ws {
+                // whitespace following a word on the current line
+                if cur.chars().count() + wlen > width {
+                    out.push(std::mem::take(&mut cur));
+                    any = true;
+                    // drop the whitespace (don't start a new line with a space)
+                } else {
+                    cur.push_str(seg);
+                }
+            } else {
+                // a word; needs a separating space before it
+                if wlen > width {
+                    out.push(std::mem::take(&mut cur));
+                    any = true;
+                    for chunk in seg.chars().collect::<Vec<_>>().chunks(width) {
+                        out.push(chunk.iter().collect());
+                        any = true;
+                    }
+                } else if cur.chars().count() + 1 + wlen > width {
+                    out.push(std::mem::take(&mut cur));
+                    any = true;
+                    cur.push_str(seg); // new line starts with this word
+                } else {
+                    cur.push(' ');
+                    cur.push_str(seg);
+                }
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        } else if !any {
+            out.push(String::new());
+        }
+    }
+    out
 }
 
 fn get_preview(args: &Value) -> String {
@@ -223,7 +294,7 @@ impl Default for ConsoleOutput {
 
 impl ConsoleOutput {
     fn separator() {
-        let width = Term::stdout().size().1 as usize;
+        let width = term_width();
         println!("{}", style("─".repeat(width)).dim());
     }
 
@@ -301,18 +372,31 @@ impl Output for ConsoleOutput {
         }
 
         let show_max = if is_error { usize::MAX } else { 4 };
-        for (i, line) in lines.iter().take(show_max).enumerate() {
+        let wrap_width = term_width().saturating_sub(4); // account for "  │  " prefix
+        let mut printed = 0;
+        for (i, line) in lines.iter().enumerate() {
+            if printed >= show_max {
+                break;
+            }
             let symbol = if i == lines.len() - 1 && lines.len() <= show_max {
                 "└"
             } else {
                 "│"
             };
-            let styled = if is_error {
-                style(line.to_string()).red()
+            if is_error {
+                println!("  {}  {}", style(symbol).dim(), style(line.to_string()).red());
             } else {
-                style(truncate(line, 100)).dim()
-            };
-            println!("  {}  {}", style(symbol).dim(), styled);
+                let wrapped = if wrap_width == 0 {
+                    vec![line.to_string()]
+                } else {
+                    wrap(line, wrap_width)
+                };
+                for (j, wline) in wrapped.into_iter().enumerate() {
+                    let sym = if j == 0 { symbol } else { " " };
+                    println!("  {}  {}", style(sym).dim(), style(wline).dim());
+                }
+            }
+            printed += 1;
         }
 
         if lines.len() > show_max {
@@ -387,7 +471,7 @@ impl Output for ConsoleOutput {
         limit: usize,
         persona: Option<&str>,
     ) {
-        let width = Term::stdout().size().1 as usize;
+        let width = term_width();
         let avatar = [
             "    ▄     ▄    ",
             "   ███   ███   ",
@@ -435,5 +519,69 @@ impl Output for ConsoleOutput {
             style(format!("limit:{}", limit)).yellow(),
             style(cwd).dim()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_word_boundary() {
+        assert_eq!(wrap("hello world", 5), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn wrap_long_no_space() {
+        assert_eq!(
+            wrap("abcdefghij", 3),
+            vec!["abc", "def", "ghi", "j"]
+        );
+    }
+
+    #[test]
+    fn wrap_cjk_respects_width_and_preserves_content() {
+        let s = "汉字测试文本";
+        let r = wrap(s, 2);
+        assert!(
+            r.iter().all(|l| l.chars().count() <= 2),
+            "a line exceeded the wrap width: {:?}",
+            r
+        );
+        // No spaces are inserted between CJK segments, so concatenation is lossless.
+        assert_eq!(r.concat(), s);
+    }
+
+    #[test]
+    fn wrap_empty_width_returns_lines() {
+        assert_eq!(wrap("a\nb", 0), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn wrap_empty_input() {
+        assert_eq!(wrap("", 10), vec![""]);
+        assert_eq!(wrap("   ", 10), vec![""]);
+    }
+
+    #[test]
+    fn wrap_preserves_blank_line() {
+        assert_eq!(wrap("a\n\nb", 10), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_multiple_spaces_collapsed() {
+        assert_eq!(wrap("hello   world", 5), vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn truncate_multibyte_no_panic() {
+        assert_eq!(truncate("日本語", 2), "日本...");
+        assert_eq!(truncate("日本語", 5), "日本語");
+    }
+
+    #[test]
+    fn truncate_ascii() {
+        assert_eq!(truncate("hello", 3), "hel...");
+        assert_eq!(truncate("hi", 5), "hi");
     }
 }

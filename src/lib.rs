@@ -5,6 +5,8 @@ pub mod output;
 pub mod tools;
 pub mod persona;
 pub mod config;
+pub mod fuzzy;
+pub mod slash;
 
 pub use config::{Config, Recipe, ToolSettings};
 

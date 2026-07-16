@@ -33,6 +33,10 @@ duct = "1.1.1"
 duct_sh = "1.0.0"
 async-trait = "0.1"
 openssl = { version = "0.10", features = ["vendored"] }
+crossterm = "0.29"
+fuzzy-matcher = "0.3"
+unicode-segmentation = "1.12"
+reqwest = { version = "0.12", features = ["json"] }
 
 [lib]
 name = "picocode"
