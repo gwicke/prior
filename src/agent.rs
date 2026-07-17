@@ -64,7 +64,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         );
         self.output.display_separator();
         let response = self.prompt(&input, None).await?;
-        self.output.display_text(&response);
+        self.output.display_markdown(&response);
         Ok(response)
     }
 }
@@ -633,7 +633,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                 };
                 match response {
                     Ok(r) => {
-                        config.output.display_text(&r);
+                        config.output.display_markdown(&r);
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Error: {}", e));

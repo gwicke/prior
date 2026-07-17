@@ -281,6 +281,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-markdown-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fedfd95e3176f60e03c841c0b78ac924e6cc26b9e02272314d30b7e2dc337d7f"
+
+[[package]]
+name = "codewandler-markdown-terminal"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a637ca654633a100f6e56fd9e41cc63b723cf149bc7c6b756bbca4befbf6d94"
+dependencies = [
+ "codewandler-markdown-stream",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1530,6 +1546,8 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "clap",
+ "codewandler-markdown-stream",
+ "codewandler-markdown-terminal",
  "console",
  "crossterm",
  "duct",

@@ -3,11 +3,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::io::IsTerminal;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use termimad;
+use markdown_terminal::Theme;
 use libc;
 
 #[derive(Debug, PartialEq)]
@@ -19,6 +21,14 @@ pub enum Confirmation {
 
 pub trait Output: Send + Sync {
     fn display_text(&self, text: &str);
+    /// Render a model *response* as markdown. Defaults to `display_text` so
+    /// non-console impls (quiet/log/no-op) need no change; `ConsoleOutput`
+    /// overrides it with full block-markdown rendering (code blocks, tables,
+    /// headings, lists) via `codewandler-markdown-terminal`. Error/status text
+    /// should still go through `display_text` (inline/plain), not this.
+    fn display_markdown(&self, text: &str) {
+        self.display_text(text);
+    }
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
     fn get_user_input(&self) -> String;
@@ -215,6 +225,16 @@ pub fn term_width() -> usize {
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80)
+}
+
+/// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
+///
+/// Uses GFM (`parse_gfm`) so tables / task-lists / strikethrough render as users
+/// expect. `color` selects the default ANSI theme (TTY) vs `no_color` (pipes,
+/// logs, CI) so non-terminal output stays clean.
+pub(crate) fn render_markdown(src: &str, width: usize, color: bool) -> String {
+    let theme = if color { Theme::default() } else { Theme::no_color() };
+    markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
 
 /// Wrap `text` to `width` columns.
@@ -468,6 +488,18 @@ impl Output for ConsoleOutput {
             wrap(&strip_ansi(text), w).len().max(1)
         };
         println!("{}", text);
+        self.note_lines(n);
+    }
+
+    fn display_markdown(&self, text: &str) {
+        self.stop_thinking();
+        let color = std::io::stdout().is_terminal();
+        let rendered = render_markdown(text, term_width(), color);
+        println!();
+        print!("{}", rendered);
+        println!();
+        // +2 for the leading/trailing blank lines; the DSR query corrects drift.
+        let n = rendered.lines().count().max(1) + 2;
         self.note_lines(n);
     }
 
@@ -853,5 +885,77 @@ mod tests {
     fn truncate_multibyte_no_panic() {
         assert_eq!(truncate("hello", 3), "hel...");
         assert_eq!(truncate("hi", 5), "hi");
+    }
+
+    #[test]
+    fn render_markdown_gfm_table_is_ansi_free_and_boxed() {
+        let out = render_markdown("| a | b |\n|---|---|\n| 1 | 2 |\n", 80, false);
+        assert!(!out.contains('\x1b'), "no_color output must be ANSI-free");
+        assert!(out.contains('│'), "table needs column separators");
+        assert!(out.contains('├'), "table needs a header rule");
+        assert!(out.contains('┤'));
+        assert!(out.contains('1') && out.contains('2'));
+    }
+
+    /// Strip ANSI SGR sequences so we can assert the *highlighted* output still
+    /// contains the original source text (highlighting must not drop content).
+    fn strip_ansi(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            let ch_len = utf8_len(bytes[i]);
+            if i + ch_len <= bytes.len() {
+                out.push_str(std::str::from_utf8(&bytes[i..i + ch_len]).unwrap_or("\u{fffd}"));
+            }
+            i += ch_len.max(1);
+        }
+        out
+    }
+
+    #[test]
+    fn render_markdown_code_is_syntax_highlighted_when_colored() {
+        let src = "```rust\nfn main() {}\n```\n";
+        let colored = render_markdown(src, 80, true);
+        // Highlighting enabled on the terminal path: SGR codes wrap the tokens.
+        assert!(
+            colored.contains('\x1b'),
+            "color path must enable syntax highlighting (ANSI present)"
+        );
+        // Stripping ANSI must recover the source text (no content lost).
+        assert!(
+            strip_ansi(&colored).contains("fn main()"),
+            "highlighting must preserve the source code"
+        );
+    }
+
+    #[test]
+    fn render_markdown_code_has_no_ansi_when_plain() {
+        let src = "```rust\nfn main() {}\n```\n";
+        let plain = render_markdown(src, 80, false);
+        assert!(!plain.contains('\x1b'), "non-terminal path must stay ANSI-free");
+        assert!(plain.contains("fn main()"));
+    }
+
+    #[test]
+    fn render_markdown_heading_and_blockquote_keep_text() {
+        let out = render_markdown("# Title\n> quoted", 80, false);
+        assert!(!out.contains('\x1b'));
+        assert!(out.contains("Title"));
+        assert!(out.contains('│') && out.contains("quoted"));
     }
 }
