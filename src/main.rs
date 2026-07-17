@@ -151,6 +151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.agent_prompt_file.clone(),
         )?,
         thinking_level: None,
+        user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     match command {
         Commands::Recipe { name: _ } => {

@@ -33,11 +33,15 @@ pub trait PicoAgent: Send + Sync {
 impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
     async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String> {
         self.output.display_thinking("Thinking...");
+        // Fresh request: clear any stale cancel flag from a previous abort so a
+        // prior `Esc` doesn't silently cancel this one.
+        self.user_cancel.store(false, Ordering::SeqCst);
         let mut builder = self
             .agent
             .prompt(input)
             .with_hook(LoggingHook {
                 output: self.output.clone(),
+                user_cancel: self.user_cancel.clone(),
             })
             .multi_turn(self.tool_call_limit);
         if let Some(h) = history {
@@ -83,6 +87,7 @@ pub struct CodeAgent<M: CompletionModel> {
     model: String,
     yolo: bool,
     persona_name: Option<String>,
+    user_cancel: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -99,6 +104,10 @@ pub struct AgentConfig {
     pub persona_name: Option<String>,
     pub bash_auto_allow: Option<Vec<String>>,
     pub agent_prompt: Option<String>,
+    /// Shared cancel flag. The REPL's in-flight reader thread sets this when
+    /// the user presses `Esc` during an LLM request; the `LoggingHook` bridge
+    /// below turns it into a rig `CancelSignal` so the in-flight request stops.
+    pub user_cancel: Arc<AtomicBool>,
 }
 
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
@@ -128,6 +137,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 model,
                 config.yolo,
                 config.persona_name,
+                config.user_cancel.clone(),
             ))
         }};
     }
@@ -241,16 +251,42 @@ pub fn load_agents_md() -> Option<String> {
 #[derive(Clone)]
 struct LoggingHook {
     output: Arc<dyn Output>,
+    user_cancel: Arc<AtomicBool>,
 }
 
 impl<M: CompletionModel> PromptHook<M> for LoggingHook {
+    async fn on_completion_call(
+        &self,
+        _prompt: &Message,
+        _history: &[Message],
+        cancel_sig: CancelSignal,
+    ) {
+        if self.user_cancel.load(Ordering::SeqCst) {
+            cancel_sig.cancel();
+        }
+    }
+
+    async fn on_completion_response(
+        &self,
+        _prompt: &Message,
+        _response: &rig::completion::CompletionResponse<M::Response>,
+        cancel_sig: CancelSignal,
+    ) {
+        if self.user_cancel.load(Ordering::SeqCst) {
+            cancel_sig.cancel();
+        }
+    }
+
     async fn on_tool_call(
         &self,
         tool_name: &str,
         _tool_call_id: Option<String>,
         args: &str,
-        _cancel_sig: CancelSignal,
+        cancel_sig: CancelSignal,
     ) {
+        if self.user_cancel.load(Ordering::SeqCst) {
+            cancel_sig.cancel();
+        }
         let args_json =
             serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
         self.output.display_tool_call(tool_name, &args_json);
@@ -262,8 +298,11 @@ impl<M: CompletionModel> PromptHook<M> for LoggingHook {
         _tool_call_id: Option<String>,
         _args: &str,
         result: &str,
-        _cancel_sig: CancelSignal,
+        cancel_sig: CancelSignal,
     ) {
+        if self.user_cancel.load(Ordering::SeqCst) {
+            cancel_sig.cancel();
+        }
         self.output.display_tool_result(result);
     }
 }
@@ -449,6 +488,17 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
     let mut history = Vec::new();
     let mut line_history = crate::repl::History::load();
     let mut recent_models: Vec<String> = Vec::new();
+    // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
+    // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
+    // current request.
+    let cancel = Arc::new(AtomicBool::new(false));
+    // So `/model` etc. embed the same flag into the rebuilt agent.
+    config.user_cancel = cancel.clone();
+    // Guard handle for the reader thread (suspend/resume / hard-exit).
+    let guard = repl.as_ref().map(|r| r.guard());
+    if guard.is_some() {
+        crate::repl::register_sigcont();
+    }
     // Warm the model catalog cache in the background so the `/model`
     // overlay is populated within a few seconds *without* blocking the
     // first prompt. The overlay falls back to the cached/static list
@@ -547,11 +597,34 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                         }
                     }
                 }
-                let response = agent
-                    .as_ref()
-                    .unwrap()
-                    .prompt(&input, Some(&mut history))
-                    .await;
+                let response = {
+                    if let Some(g) = &guard {
+                        // While the main task is blocked awaiting the LLM, spawn a
+                        // background reader so `Esc`/`Ctrl-C`/`Ctrl-Z` are still
+                        // handled. Signal the thread to stop, then join, once the
+                        // request returns.
+                        let done = Arc::new(AtomicBool::new(false));
+                        let handle = crate::repl::spawn_in_flight_reader(
+                            g.clone(),
+                            cancel.clone(),
+                            done.clone(),
+                        );
+                        let resp = agent
+                            .as_ref()
+                            .unwrap()
+                            .prompt(&input, Some(&mut history))
+                            .await;
+                        done.store(true, Ordering::SeqCst);
+                        let _ = handle.join();
+                        resp
+                    } else {
+                        agent
+                            .as_ref()
+                            .unwrap()
+                            .prompt(&input, Some(&mut history))
+                            .await
+                    }
+                };
                 match response {
                     Ok(r) => {
                         config.output.display_text(&r);
@@ -575,6 +648,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         model: String,
         yolo: bool,
         persona_name: Option<String>,
+        user_cancel: Arc<AtomicBool>,
     ) -> Self {
         Self {
             agent,
@@ -584,6 +658,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             model,
             yolo,
             persona_name,
+            user_cancel,
         }
     }
 }

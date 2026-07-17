@@ -20,29 +20,111 @@ use crate::thinking;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+/// Set by the `SIGCONT` handler on resume from `Ctrl-Z`. Read by the
+/// in-flight reader thread, which re-enters raw mode once it sees the
+/// flag cleared.
+pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
+
+/// `SIGCONT` handler: we just record that the process resumed.
+/// It must stay async-signal-safe (no I/O, no allocation), so the
+/// actual terminal re-entry is performed by the reader thread (a normal
+/// thread context) or by `read_input`'s loop, which poll this flag.
+extern "C" fn on_sigcont(_sig: i32) {
+    RESUMED.store(true, Ordering::SeqCst);
+}
+
+/// Register the `SIGCONT` handler exactly once. Safe to call multiple
+/// times; `libc::signal` just replaces the handler. Required so that
+/// `Ctrl-Z` suspend/resume restores raw mode.
+pub(crate) fn register_sigcont() {
+    unsafe {
+        libc::signal(libc::SIGCONT, on_sigcont as *const () as usize);
+    }
+}
+
+/// Spawn a background stdin reader that lives *only* while an LLM request
+/// is in flight (`prompt().await` blocks the main task). In raw mode
+/// `event::read` is blocking and the main task cannot read keys during
+/// the await, so this thread catches `Esc`/`Ctrl-C`/`Ctrl-Z` that
+/// arrive mid-request. Normal editing keys are read by `read_input`
+/// (main task) and are simply dropped here.
+///
+/// - `Esc`        → `cancel.store(true)` (the rig `PromptHook` bridge
+///                  aborts the in-flight request).
+/// - `Ctrl-C`     → restore terminal, hard exit (process-wide).
+/// - `Ctrl-Z`     → restore terminal, `killpg(getpgrp(), SIGTSTP)`
+///                  (suspend the whole process group to the shell).
+/// - other keys  → ignored (cannot be typed into the prompt mid-request).
+///
+/// `done` is set by the caller once the await returns, so the loop can
+/// exit and be joined. `guard` and `cancel` are `Arc` and `stop()`/
+/// `store()` are process-wide, so calling them from this thread is safe.
+pub(crate) fn spawn_in_flight_reader(
+    guard: Arc<TermGuard>,
+    cancel: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        if done.load(Ordering::SeqCst) {
+            break;
+        }
+        if RESUMED.swap(false, Ordering::SeqCst) {
+            let _ = guard.start();
+        }
+        match event::poll(Duration::from_millis(50)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
+                    if let KeyCode::Char('c') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = guard.stop();
+                            process::exit(1);
+                        }
+                    } else if let KeyCode::Char('z') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = guard.stop();
+                            unsafe {
+                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
+                            }
+                        }
+                    } else if let KeyCode::Esc = key.code {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    })
+}
 
 /// Owns terminal mode transitions. [`TermGuard::start`] enters raw mode and
 /// negotiates capabilities; [`TermGuard::stop`] (idempotent) restores cooked
 /// mode. Safe to call from `Drop`, a panic hook, or a signal handler.
 pub struct TermGuard {
-    active: bool,
-    saved_paste: bool,
+    active: AtomicBool,
+    saved_paste: AtomicBool,
 }
 
 impl TermGuard {
     pub fn new() -> Self {
         Self {
-            active: false,
-            saved_paste: false,
+            active: AtomicBool::new(false),
+            saved_paste: AtomicBool::new(false),
         }
     }
 
     /// Enter raw mode and negotiate capabilities. Idempotent.
-    pub fn start(&mut self) -> io::Result<()> {
-        if self.active {
+    pub fn start(&self) -> io::Result<()> {
+        if self.active.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.saved_paste = false;
+        self.saved_paste.store(false, Ordering::SeqCst);
         enable_raw_mode()?;
         // crossterm's `enable_raw_mode` calls `cfmakeraw`, which clears `OPOST`.
         // With `OPOST` off the terminal does NOT translate `\n` -> `\r\n`, so
@@ -64,24 +146,24 @@ impl TermGuard {
                     | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
             )
         )?;
-        self.active = true;
+        self.active.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// Restore cooked mode. Idempotent; safe to call multiple times / from `Drop`.
-    pub fn stop(&mut self) -> io::Result<()> {
-        if !self.active {
+    pub fn stop(&self) -> io::Result<()> {
+        if !self.active.load(Ordering::SeqCst) {
             return Ok(());
         }
         // Pop one level of Kitty keyboard enhancement (matches the single push).
         let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        if self.saved_paste {
+        if self.saved_paste.load(Ordering::SeqCst) {
             Self::csi("?2004h")?;
         } else {
             Self::csi("?2004l")?;
         }
         disable_raw_mode()?;
-        self.active = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -119,7 +201,7 @@ impl Drop for TermGuard {
 
 /// The interactive REPL driver.
 pub struct Repl {
-    guard: TermGuard,
+    guard: Arc<TermGuard>,
 }
 
 /// Result of one `read_input` interaction.
@@ -146,13 +228,20 @@ pub struct ReplCtx {
 impl Repl {
     pub fn new() -> Self {
         Self {
-            guard: TermGuard::new(),
+            guard: Arc::new(TermGuard::new()),
         }
     }
 
     /// Enter raw mode (idempotent). Best-effort; `Drop` still restores.
-    pub fn start(&mut self) -> io::Result<()> {
+    pub fn start(&self) -> io::Result<()> {
         self.guard.start()
+    }
+
+    /// Shared handle to the terminal-mode guard. Used by `run_interactive` to
+    /// drive suspend/resume (Ctrl-Z) and in-flight cancel from a background
+    /// reader thread while an LLM request is in flight.
+    pub(crate) fn guard(&self) -> Arc<TermGuard> {
+        self.guard.clone()
     }
 
     /// Read a multi-line input in raw mode, with inline slash-command overlays.
@@ -280,6 +369,12 @@ impl Repl {
             *current_row = Self::next_input_row(row, term_h, er, n);
         };
         loop {
+            // On resume from Ctrl-Z (editing phase; the in-flight reader thread
+            // is not running then), re-enter raw mode so the next keystroke is
+            // read correctly. Idempotent; a no-op on every normal iteration.
+            if RESUMED.swap(false, Ordering::SeqCst) {
+                let _ = self.guard.start();
+            }
             // --- Compute the overlay from the current buffer. ---
             let buffer = editor.text();
             let mut kind: u8 = 0;
@@ -369,6 +464,23 @@ impl Repl {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             let _ = self.guard.stop();
                             std::process::exit(1);
+                        }
+                    }
+                    // Ctrl-Z: suspend the process group to the shell (SIGTSTP).
+                    // On resume (fg), the `RESUMED` check at the top of the loop
+                    // re-enters raw mode. Raw mode clears `ISIG`, so this must be
+                    // handled as a key event rather than relying on the kernel.
+                    if let KeyCode::Char('z') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            let _ = self.guard.stop();
+                            unsafe {
+                                libc::killpg(libc::getpgrp(), libc::SIGTSTP);
+                            }
+                            // `killpg(SIGTSTP)` stops the process group; execution
+                            // resumes here (in the main thread, a safe context)
+                            // once the shell sends `SIGCONT`. Re-enter raw mode so
+                            // the next keystroke is read correctly.
+                            let _ = self.guard.start();
                         }
                     }
                     if kind == 4 {
@@ -490,7 +602,7 @@ impl Repl {
                             },
                             _ => {
                                 if let Some(a) =
-                                    Self::edit_key(key, &mut editor, history, &mut nav, &mut draft)
+                                    Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                                 {
                                     if let InputAction::Submit(_) = &a {
                                         redraw(&LineEditor::new(), &[], sel, &mut input_row);
@@ -503,7 +615,7 @@ impl Repl {
                     }
                     // No overlay: normal editing.
                     if let Some(a) =
-                        Self::edit_key(key, &mut editor, history, &mut nav, &mut draft)
+                        Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                     {
                         if let InputAction::Submit(_) = &a {
                             redraw(&LineEditor::new(), &[], sel, &mut input_row);
@@ -707,6 +819,7 @@ impl Repl {
         history: &mut History,
         nav: &mut Option<usize>,
         draft: &mut String,
+        prompt: &str,
     ) -> Option<InputAction> {
         match key.code {
             KeyCode::Enter => {
@@ -766,7 +879,8 @@ impl Repl {
                 None
             }
             KeyCode::Up => {
-                if !editor.move_up_line() {
+                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                if !editor.visual_up(w as usize, prompt) {
                     if let Some(s) = history.prev(&editor.text(), nav, draft) {
                         editor.set(&s);
                     }
@@ -774,7 +888,8 @@ impl Repl {
                 None
             }
             KeyCode::Down => {
-                if !editor.move_down_line() {
+                let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                if !editor.visual_down(w as usize, prompt) {
                     if let Some(s) = history.next(nav, draft) {
                         editor.set(&s);
                     }
@@ -986,6 +1101,92 @@ impl LineEditor {
         true
     }
 
+    /// Move up one *visual* row (wrapped line), keeping the column when
+    /// possible. Returns `false` when already on the first row (caller may
+    /// navigate history). Unlike [`move_up_line`], this moves by soft-wrapped
+    /// row, so the cursor lands on the character directly above.
+    pub fn visual_up(&mut self, width: usize, prompt: &str) -> bool {
+        let (ranges, crow, ccol) = self.visual_rows(width, prompt);
+        if ranges.is_empty() || crow == 0 {
+            return false;
+        }
+        let (s, e) = ranges[crow - 1];
+        let len = e.saturating_sub(s);
+        let new = s + ccol.min(len);
+        if new == self.cursor {
+            return false;
+        }
+        self.cursor = new;
+        true
+    }
+
+    /// Move down one *visual* row (wrapped line), keeping the column when
+    /// possible. Returns `false` when already on the last row (caller may
+    /// navigate history).
+    pub fn visual_down(&mut self, width: usize, prompt: &str) -> bool {
+        let (ranges, crow, ccol) = self.visual_rows(width, prompt);
+        if ranges.is_empty() || crow + 1 >= ranges.len() {
+            return false;
+        }
+        let (s, e) = ranges[crow + 1];
+        let len = e.saturating_sub(s);
+        let new = s + ccol.min(len);
+        if new == self.cursor {
+            return false;
+        }
+        self.cursor = new;
+        true
+    }
+
+    /// Buffer index ranges `(start, end_exclusive)` for each visual row across
+    /// the whole buffer (logical lines concatenated), plus the cursor's
+    /// `(row, col_within_row)` position. Pure.
+    fn visual_rows(&self, width: usize, prompt: &str) -> (Vec<(usize, usize)>, usize, usize) {
+        let width = width.max(1);
+        let pcols = prompt.chars().count();
+        let n = self.buf.len();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut cursor_row = 0usize;
+        let mut cursor_col = 0usize; // col within the row's content
+        let mut cursor_set = false;
+        let mut line_start = 0usize;
+        let mut i = 0usize;
+        let mut row_offset = 0usize;
+        while i <= n {
+            if i == n || self.buf[i] == '\n' {
+                let line: Vec<char> = self.buf[line_start..i].to_vec();
+                let first_avail = if line_start == 0 {
+                    width.saturating_sub(pcols)
+                } else {
+                    width
+                };
+                let coff = if !cursor_set && self.cursor >= line_start && self.cursor <= i {
+                    Some(self.cursor - line_start)
+                } else {
+                    None
+                };
+                let (ranges_partial, cpos) = wrap_line(&line, first_avail, width, coff);
+                for r in &ranges_partial {
+                    ranges.push((line_start + r.0, line_start + r.1));
+                }
+                if let Some((cr, cc)) = cpos {
+                    cursor_row = row_offset + cr;
+                    cursor_col = cc;
+                    cursor_set = true;
+                }
+                row_offset += ranges_partial.len();
+                if i == n {
+                    break;
+                }
+                i += 1; // consume '\n'
+                line_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        (ranges, cursor_row, cursor_col)
+    }
+
     /// Compute the visual layout of the buffer at `width` columns, with `prompt`
     /// occupying the first visual row's prefix. Pure + unit-tested.
     pub fn layout(&self, width: usize, prompt: &str) -> Layout {
@@ -1013,8 +1214,8 @@ impl LineEditor {
                     None
                 };
                 let (lrows, cpos) = wrap_line(&line, first_avail, width, coff);
-                for (ri, lr) in lrows.iter().enumerate() {
-                    rows.push(lr.clone());
+                for (ri, range) in lrows.iter().enumerate() {
+                    rows.push(line[range.0..range.1].iter().collect());
                     if let Some((cr, cc)) = cpos {
                         if cr == ri {
                             cursor_row = row_offset + cr;
@@ -1055,8 +1256,10 @@ pub struct Layout {
     pub row_count: usize,
 }
 
-/// Word-boundary wrap of one logical line (no `'\n'`). Returns the visual rows
-/// and, if `cursor` is `Some`, the (row, col) where that char index lands.
+/// Word-boundary wrap of one logical line (no `'\n'`). Returns, for each
+/// visual row, the `(start, end_exclusive)` char range **within `line`**, and if
+/// `cursor` is `Some`, the `(row, col)` where that char lands (`col` is the
+/// column within the row's *content*, not counting any prompt prefix).
 /// Long words and CJK (no spaces) are char-wrapped; spaces are break
 /// opportunities and dropped at row starts.
 fn wrap_line(
@@ -1064,9 +1267,9 @@ fn wrap_line(
     first_width: usize,
     width: usize,
     cursor: Option<usize>,
-) -> (Vec<String>, Option<(usize, usize)>) {
-    let mut rows: Vec<String> = Vec::new();
-    let mut cur = String::new();
+) -> (Vec<(usize, usize)>, Option<(usize, usize)>) {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cur_start = 0usize; // start char index (within `line`) of current visual row
     let mut col = 0usize;
     let mut row = 0usize;
     let mut cursor_pos: Option<(usize, usize)> = None;
@@ -1085,16 +1288,13 @@ fn wrap_line(
             }
             if col + 1 > avail(row) {
                 // The trailing space is dropped and the next row starts here.
-                if cursor == Some(i) {
-                    cursor_pos = Some((row, col));
-                }
-                rows.push(std::mem::take(&mut cur));
+                ranges.push((cur_start, i));
                 row += 1;
                 col = 0;
+                cur_start = i + 1;
                 i += 1;
                 continue;
             }
-            cur.push(' ');
             col += 1;
             i += 1;
             continue;
@@ -1107,14 +1307,10 @@ fn wrap_line(
         let wlen = j - i;
         if col == 0 {
             if wlen <= avail(row) {
-                // Cursor may sit anywhere inside the word.
                 if let Some(cu) = cursor {
                     if i <= cu && cu < j {
                         cursor_pos = Some((row, col + (cu - i)));
                     }
-                }
-                for k in i..j {
-                    cur.push(line[k]);
                 }
                 col += wlen;
                 i = j;
@@ -1122,43 +1318,40 @@ fn wrap_line(
                 let mut k = i;
                 while k < j {
                     if col >= avail(row) {
-                        rows.push(std::mem::take(&mut cur));
+                        ranges.push((cur_start, k));
                         row += 1;
                         col = 0;
+                        cur_start = k;
                     }
                     if cursor == Some(k) {
                         cursor_pos = Some((row, col));
                     }
-                    cur.push(line[k]);
                     col += 1;
                     k += 1;
                 }
                 i = j;
             }
         } else if col + wlen <= avail(row) {
-            // Cursor may sit anywhere inside the word.
             if let Some(cu) = cursor {
                 if i <= cu && cu < j {
                     cursor_pos = Some((row, col + (cu - i)));
                 }
             }
-            for k in i..j {
-                cur.push(line[k]);
-            }
             col += wlen;
             i = j;
         } else {
-            rows.push(std::mem::take(&mut cur));
+            ranges.push((cur_start, i));
             row += 1;
             col = 0;
+            cur_start = i;
             continue; // re-process the word at the start of the new row
         }
     }
     if cursor == Some(n) {
         cursor_pos = Some((row, col));
     }
-    rows.push(cur);
-    (rows, cursor_pos)
+    ranges.push((cur_start, n));
+    (ranges, cursor_pos)
 }
 
 /// Build the escape sequence that restores the saved input-top, clears down,
@@ -1362,6 +1555,48 @@ mod tests {
         e.backspace(); // deletes 'b', the char before the cursor
         assert_eq!(e.text(), "ac");
         assert_eq!(e.cursor, 1);
+    }
+
+    #[test]
+    fn visual_up_down_moves_by_wrapped_row() {
+        // A long line that wraps at width 7: "aaa bbb ccc" -> rows
+        // ["aaa bbb", "ccc"]. Cursor at end (col 3 of row 1, past "ccc").
+        // Up -> character directly above at col 3 on row 0 = the space (index 3).
+        let mut e = LineEditor::new();
+        e.insert_str("aaa bbb ccc");
+        assert_eq!(e.cursor, 11);
+        assert!(e.visual_up(7, ""));
+        assert_eq!(e.cursor, 3);
+        // Down -> back to end of buffer.
+        assert!(e.visual_down(7, ""));
+        assert_eq!(e.cursor, 11);
+        // stays on last row -> false
+        assert!(!e.visual_down(7, ""));
+    }
+
+    #[test]
+    fn visual_up_down_clamps_column_on_shorter_row() {
+        // "aaaaaaa bbb" at width 7 wraps to ["aaaaaaa", " bbb"] (row 0 is
+        // 7 chars, cols 0-6). Cursor at end (row1 col3). Up -> col 3 on row 0
+        // (still within its content) = index 3 (the 4th 'a').
+        let mut e = LineEditor::new();
+        e.insert_str("aaaaaaa bbb");
+        assert_eq!(e.cursor, 11);
+        assert!(e.visual_up(7, ""));
+        assert_eq!(e.cursor, 3);
+    }
+
+    #[test]
+    fn visual_up_down_crosses_hard_newlines() {
+        // Two short lines, no wrap: "ab\ncd". cursor at end of line 2 (index 5).
+        // Up -> line 1 end (index 2).
+        let mut e = LineEditor::new();
+        e.insert_str("ab\ncd");
+        assert_eq!(e.cursor, 5);
+        assert!(e.visual_up(80, ""));
+        assert_eq!(e.cursor, 2);
+        assert!(e.visual_down(80, ""));
+        assert_eq!(e.cursor, 5);
     }
 
     #[test]

@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persona_name: None,
         bash_auto_allow: None,
         agent_prompt: None,
+        user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }).await?;
 
     println!("--- Picocode Library Example ---");
