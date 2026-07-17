@@ -14,6 +14,32 @@ tool_config:
       - "^git status"
       - "^cargo test"
       - "^npm test"
+    # Sandbox for the `bash` (and `agent-browser`) tools. Requires `bwrap`
+    # (bubblewrap) on PATH; if `enabled` is left unset it auto-enables only
+    # when bwrap is available, otherwise the command runs unsandboxed.
+    sandbox:
+      enabled: true
+      # Wall-clock timeout for the whole command (seconds). 0 = no timeout.
+      timeout_secs: 120
+      # Give the sandbox network access (default false => network unshared).
+      network: false
+      # Virtual-memory cap in MB (default none).
+      # memory_mb: 1024
+      # PID isolation, capability drop, scratch /tmp size (all default true/enabled).
+      # pid_isolation: true
+      # drop_caps: true
+      # tmp_size_mb: 256
+      # Filesystem bindings. Each entry is either `{ ro: PATH }` / `{ rw: PATH }`
+      # (identical host/in-sandbox path) or a remap
+      # `{ mode: ro|rw, from: HOST, to: SANDBOX }`. When `paths` is empty the
+      # current directory is mounted read-only with a writable /tmp scratch
+      # area. When `paths` is set, ONLY the listed paths are visible (deny by
+      # default) and the non-shell file tools enforce the same policy, so a
+      # remap like /tmp below is seen identically by the shell and by read/write.
+      paths:
+        - rw: "."
+        - rw: { from: "./cache", to: "/var/cache/app" }
+        # - ro: { from: "~/.cargo", to: "/opt/cargo" }
 
 # Named recipes for non-interactive execution (CI/CD, automation)
 recipes:

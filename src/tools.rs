@@ -3,7 +3,10 @@ use rig_derive::rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tokio::fs;
+
+use crate::config::{resolve_path_policy, resolve_paths, SandboxConfig};
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 pub enum ToolError {
@@ -25,10 +28,26 @@ impl From<tokio::task::JoinError> for ToolError {
 }
 
 fn get_path(path: &str) -> Result<PathBuf, ToolError> {
-    validate_path(
-        &std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?,
-        path,
-    )
+    get_path_with(path, false)
+}
+
+/// Resolve `path` for a filesystem tool, enforcing the sandbox path policy when
+/// active. `is_write` marks mutating operations (write/edit/make_dir/remove/
+/// move-dest/copy-dest), which require an `rw` binding under the policy.
+fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
+    let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
+
+    // When a path policy is active (sandbox enabled with explicit bindings),
+    // rewrite via the remap table, then enforce coverage + mode.
+    if let Some(policy) = current_path_policy() {
+        let host = policy.resolve(path);
+        return policy
+            .check(&host, is_write)
+            .map(|_| host)
+            .map_err(ToolError::Generic);
+    }
+
+    validate_path(&base, path)
 }
 
 fn validate_path(base: &std::path::Path, path: &str) -> Result<PathBuf, ToolError> {
@@ -90,7 +109,7 @@ pub async fn read_file(path: String, offset: u64, limit: u64) -> Result<String, 
 
 #[rig_tool(description = "Write content to file", required(path, content))]
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
-    fs::write(get_path(&path)?, content).await?;
+    fs::write(get_path_with(&path, true)?, content).await?;
     Ok("ok".into())
 }
 
@@ -104,7 +123,7 @@ pub async fn edit_file(
     new: String,
     all: bool,
 ) -> Result<String, ToolError> {
-    let p = get_path(&path)?;
+    let p = get_path_with(&path, true)?;
     let text = fs::read_to_string(&p).await?;
     if !text.contains(&old) {
         return Ok("error: old_string not found".into());
@@ -190,7 +209,14 @@ pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BashArgs {
+    /// The shell command to execute.
     pub cmd: String,
+    /// Optional timeout in seconds for this command. Overrides the configured
+    /// default (`tool_config.bash.sandbox.timeout_secs`). Must be a positive
+    /// finite number; values above the maximum are rejected. Leave unset to use
+    /// the configured default.
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 pub struct Bash;
@@ -211,22 +237,336 @@ impl rig_core::tool::Tool for Bash {
     }
 
     async fn call(&self, args: Self::Args) -> std::result::Result<Self::Output, Self::Error> {
-        let output = tokio::task::spawn_blocking(move || {
-            sh_dangerous(&args.cmd)
-                .stderr_to_stdout()
-                .unchecked()
-                .read()
-                .map_err(|e| ToolError::Io(e.to_string()))
-        })
-        .await??;
-
-        let res = output.trim().to_string();
-        Ok(if res.is_empty() {
-            "(empty)".into()
-        } else {
-            res
-        })
+        run_sandboxed(&args.cmd, args.timeout).await
     }
+}
+
+/// Process-wide resolved sandbox config. picocode runs a single agent per
+/// process and publishes it once at agent creation via [`set_sandbox`]; a
+/// `Mutex` (rather than `OnceLock`) keeps the helper test-friendly while still
+/// being written exactly once in normal operation.
+static SANDBOX: std::sync::LazyLock<std::sync::Mutex<Arc<Option<SandboxConfig>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Arc::new(None)));
+
+/// Cache for bwrap availability, resolved once on first use.
+static BWRAP_PRESENT: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn set_sandbox(cfg: Option<SandboxConfig>) {
+    *SANDBOX.lock().expect("sandbox lock poisoned") = Arc::new(cfg);
+}
+
+fn sandbox_config() -> Arc<Option<SandboxConfig>> {
+    SANDBOX.lock().expect("sandbox lock poisoned").clone()
+}
+
+/// Resolve the active path policy for the non-shell file tools. Returns `None`
+/// when the sandbox is disabled, bwrap is absent, or no explicit bindings are
+/// configured (permissive default). Mirrors the shell-sandboxing activation
+/// condition so the two worlds stay consistent.
+fn current_path_policy() -> Option<crate::config::PathPolicy> {
+    let cfg = sandbox_config();
+    let c = cfg.as_ref().as_ref()?;
+    if !c.enabled.unwrap_or(false) || !bwrap_available() {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_path_policy(c, &cwd, home.as_deref())
+}
+
+/// True if `bwrap` is available on PATH (cached).
+fn bwrap_available() -> bool {
+    *BWRAP_PRESENT.get_or_init(|| {
+        std::process::Command::new("which")
+            .arg("bwrap")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Maximum per-command timeout (seconds) an LLM may request via the bash
+/// tool's `timeout` argument. Mirrors pi's ceiling of `2_147_483_647` ms
+/// (i32::MAX), expressed in whole seconds.
+const MAX_TIMEOUT_SECS: u64 = 2_147_483;
+
+/// Resolve the effective wall-clock timeout for a command.
+///
+/// `override_timeout` is the LLM-supplied per-call value (seconds); when set it
+/// overrides the `configured` default. The returned value is `None` when there
+/// is no timeout (neither override nor default, or an explicitly-zero default).
+/// Invalid overrides (non-positive, or above [`MAX_TIMEOUT_SECS`]) are rejected
+/// with an error rather than silently clamped.
+fn resolve_timeout(
+    override_timeout: Option<u64>,
+    configured: Option<u64>,
+) -> Result<Option<u64>, ToolError> {
+    let requested = match override_timeout {
+        Some(t) => {
+            if t == 0 {
+                return Err(ToolError::Generic(
+                    "invalid timeout: must be a positive number of seconds".into(),
+                ));
+            }
+            if t > MAX_TIMEOUT_SECS {
+                return Err(ToolError::Generic(format!(
+                    "invalid timeout: maximum is {MAX_TIMEOUT_SECS} seconds"
+                )));
+            }
+            Some(t)
+        }
+        None => configured,
+    };
+    Ok(requested.filter(|s| *s > 0))
+}
+
+/// Run a shell command through the sandbox helper. Applies a wall-clock
+/// timeout (so a hung command reaps and releases the blocking thread) and,
+/// when enabled + bwrap is present, wraps the command in a Bubblewrap
+/// namespace. Degrades to plain `sh_dangerous` when bwrap is absent.
+///
+/// `override_timeout` is the LLM-supplied per-call timeout (seconds) from the
+/// bash tool's `timeout` argument; when `None`, the configured sandbox default
+/// (`tool_config.bash.sandbox.timeout_secs`) applies. A `None`/0 result means
+/// no timeout is enforced.
+pub(crate) async fn run_sandboxed(
+    cmd: &str,
+    override_timeout: Option<u64>,
+) -> Result<String, ToolError> {
+    let cfg = sandbox_config();
+
+    // The LLM may override the configured default timeout per command. The
+    // timeout is independent of whether sandboxing is active, so a disabled
+    // (or bwrap-absent) config still enforces it.
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs);
+    let timeout = resolve_timeout(override_timeout, configured)?;
+
+    // Move owned copies into the blocking task (`cmd` cloned to a String, the
+    // `Arc` config cheaply cloned) so the closure is `'static`. Everything runs
+    // in one task so the non-`Clone` `Handle` stays owned where it can be killed.
+    let cmd = cmd.to_string();
+    let cfg = cfg.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        // Decide sandboxing here: enabled AND bwrap present.
+        let effective = match cfg.as_ref().as_ref() {
+            Some(c) if c.enabled.unwrap_or(false) => {
+                if !bwrap_available() {
+                    eprintln!(
+                        "warning: sandbox enabled but 'bwrap' not found; running unsandboxed"
+                    );
+                    None
+                } else {
+                    Some(c)
+                }
+            }
+            _ => None,
+        };
+        match effective {
+            Some(c) => {
+                // Sandboxed: redirect output to a host temp file bound into the
+                // namespace (bwrap bypasses duct's stdout pipe).
+                let out_path = make_out_path()?;
+                let expr = build_bwrap_expr(&cmd, c, &out_path)?;
+                let handle = expr.unchecked().start()?;
+                let result = match timeout {
+                    None => handle
+                        .wait()
+                        .map(|_| ())
+                        .map_err(|e| ToolError::Io(e.to_string())),
+                    Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
+                        Ok(Some(_)) => Ok(()),
+                        Ok(None) => {
+                            let _ = handle.kill();
+                            Err(ToolError::Generic(format!(
+                                "command timed out after {secs}s"
+                            )))
+                        }
+                        Err(e) => Err(ToolError::Io(e.to_string())),
+                    },
+                };
+                // Read whatever the command wrote, regardless of exit/timeout,
+                // then clean up the temp file.
+                let captured = std::fs::read(&out_path).unwrap_or_default();
+                let _ = std::fs::remove_file(&out_path);
+                result.map(|_| captured)
+            }
+            None => {
+                // Unsandboxed: duct captures stdout directly.
+                let expr = sh_dangerous(&cmd).stderr_to_stdout();
+                let handle = expr.unchecked().start()?;
+                match timeout {
+                    None => handle
+                        .wait()
+                        .map(|o| o.stdout.clone())
+                        .map_err(|e| ToolError::Io(e.to_string())),
+                    Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
+                        Ok(Some(o)) => Ok(o.stdout.clone()),
+                        Ok(None) => {
+                            let _ = handle.kill();
+                            Err(ToolError::Generic(format!(
+                                "command timed out after {secs}s"
+                            )))
+                        }
+                        Err(e) => Err(ToolError::Io(e.to_string())),
+                    },
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| ToolError::Generic(e.to_string()))??;
+
+    Ok(trim_output(output))
+}
+
+/// Create a unique host temp file for capturing sandboxed command output.
+fn make_out_path() -> Result<std::path::PathBuf, ToolError> {
+    let name = format!(
+        "picocode-out-{}-{}.txt",
+        std::process::id(),
+        // Nanosecond-ish uniqueness without extra deps.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let path = std::env::temp_dir().join(name);
+    // Ensure the file exists so bwrap can bind it.
+    std::fs::write(&path, b"").map_err(|e| ToolError::Io(e.to_string()))?;
+    Ok(path)
+}
+
+/// Trim combined output and normalize empty results.
+fn trim_output(out: Vec<u8>) -> String {
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() {
+        "(empty)".into()
+    } else {
+        s
+    }
+}
+
+/// Read-only system directories bound into every sandbox so the shell and
+/// common tools can execute. They are read-only, so the host OS stays hidden
+/// from writes; only explicitly declared bindings add writable/project paths.
+const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
+
+/// Build a `duct` expression that runs `cmd` inside a bwrap namespace.
+///
+/// `out_path` is a host temp file that the sandboxed command's combined output
+/// is redirected into (see note below). It is bound read-write into the
+/// namespace at `/tmp/.picocode-out`.
+///
+/// NOTE: bwrap connects the inner command's stdio to its own inherited fds,
+/// which bypasses duct's capture pipe (duct reads an empty stdout). To get
+/// reliable output we redirect the command to a host temp file bound into the
+/// namespace and read that file after the process exits.
+fn build_bwrap_expr(
+    cmd: &str,
+    cfg: &SandboxConfig,
+    out_path: &std::path::Path,
+) -> Result<duct::Expression, ToolError> {
+    let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
+    let home = dirs_home();
+
+    // Resolve the configured bindings (empty list => CWD-visible default).
+    let binds = resolve_paths(&cwd, home.as_deref(), &cfg.paths)
+        .map_err(|e| ToolError::Generic(format!("sandbox config error: {e}")))?;
+
+    let mut args: Vec<String> = Vec::new();
+
+    // Essential read-only system directories so the shell and common tools
+    // (sh, ls, compilers, ...) can execute. These are read-only, so the host
+    // OS is hidden from writes and from anything not explicitly bound.
+    for dir in ESSENTIAL_RO_DIRS {
+        if std::path::Path::new(dir).is_dir() {
+            args.push("--ro-bind".into());
+            args.push(dir.to_string());
+            args.push(dir.to_string());
+        }
+    }
+
+    if binds.is_empty() {
+        // Default: read-only CWD + a writable tmpfs scratch area.
+        args.push("--ro-bind".into());
+        args.push(cwd.to_string_lossy().to_string());
+        args.push(cwd.to_string_lossy().to_string());
+    } else {
+        // Deny-by-default: only declared bindings are visible (on top of the
+        // essential read-only system dirs above). User bindings come BEFORE the
+        // scratch tmpfs so a user binding at /tmp wins over the tmpfs.
+        for b in &binds {
+            args.push(
+                if b.mode.is_writable() {
+                    "--bind"
+                } else {
+                    "--ro-bind"
+                }
+                .into(),
+            );
+            args.push(b.from.to_string_lossy().to_string());
+            args.push(b.to.to_string_lossy().to_string());
+        }
+    }
+
+    // Scratch tmpfs at /tmp, but only when no user binding already provides
+    // /tmp (a later tmpfs would otherwise shadow a user's /tmp bind).
+    let tmp_covered = binds.iter().any(|b| {
+        let t = b.to.as_os_str();
+        t == "/tmp" || t.to_string_lossy().starts_with("/tmp/")
+    });
+    if !tmp_covered {
+        let tmp_size = cfg.tmp_size_mb.unwrap_or(256);
+        let tmp_bytes = tmp_size as u64 * 1024 * 1024;
+        args.push("--size".into());
+        args.push(tmp_bytes.to_string());
+        args.push("--tmpfs".into());
+        args.push("/tmp".into());
+    }
+
+    // Bind the host temp output file into the namespace (read-write) AFTER user
+    // binds, so it is never shadowed by a user /tmp bind. The command redirects
+    // its output here and the parent reads it back after the process exits.
+    args.push("--bind".into());
+    args.push(out_path.to_string_lossy().to_string());
+    args.push("/tmp/.picocode-out".into());
+
+    if !cfg.network.unwrap_or(false) {
+        args.push("--unshare-net".into());
+    }
+    if cfg.pid_isolation.unwrap_or(true) {
+        args.push("--unshare-pid".into());
+    }
+    if cfg.drop_caps.unwrap_or(true) {
+        args.push("--cap-drop".into());
+        args.push("ALL".into());
+    }
+    args.push("--die-with-parent".into());
+
+    // Build the in-namespace payload. Memory limit via RLIMIT_AS (ulimit -v),
+    // scoped to the command's process tree by the PID namespace. The command's
+    // combined output is redirected to the bound host temp file (see note on
+    // bwrap stdio above).
+    let inner = if let Some(mb) = cfg.memory_mb {
+        let kb = mb * 1024;
+        format!("ulimit -v {kb}; exec sh -c {cmd:?}")
+    } else {
+        format!("exec sh -c {cmd:?}")
+    };
+    let payload = format!("{inner} > /tmp/.picocode-out 2>&1");
+    args.push("--".into());
+    args.push("sh".into());
+    args.push("-c".into());
+    args.push(payload);
+
+    Ok(duct::cmd("bwrap", &args))
+}
+
+/// Best-effort home directory lookup for `~` expansion in bindings.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[rig_tool(description = "List files and directories in a path", required(path))]
@@ -264,13 +604,13 @@ pub async fn list_dir(path: String) -> Result<String, ToolError> {
     required(path)
 )]
 pub async fn make_dir(path: String) -> Result<String, ToolError> {
-    fs::create_dir_all(get_path(&path)?).await?;
+    fs::create_dir_all(get_path_with(&path, true)?).await?;
     Ok("ok".into())
 }
 
 #[rig_tool(description = "Remove a file or directory", required(path, recursive))]
 pub async fn remove(path: String, recursive: bool) -> Result<String, ToolError> {
-    let p = get_path(&path)?;
+    let p = get_path_with(&path, true)?;
     if p.is_dir() {
         if recursive {
             fs::remove_dir_all(p).await?;
@@ -285,7 +625,7 @@ pub async fn remove(path: String, recursive: bool) -> Result<String, ToolError> 
 
 #[rig_tool(description = "Move or rename a file or directory", required(src, dst))]
 pub async fn move_file(src: String, dst: String) -> Result<String, ToolError> {
-    fs::rename(get_path(&src)?, get_path(&dst)?).await?;
+    fs::rename(get_path_with(&src, true)?, get_path_with(&dst, true)?).await?;
     Ok("ok".into())
 }
 
@@ -294,7 +634,7 @@ pub async fn move_file(src: String, dst: String) -> Result<String, ToolError> {
     required(src, dst)
 )]
 pub async fn copy_file(src: String, dst: String) -> Result<String, ToolError> {
-    fs::copy(get_path(&src)?, get_path(&dst)?).await?;
+    fs::copy(get_path_with(&src, true)?, get_path_with(&dst, true)?).await?;
     Ok("ok".into())
 }
 
@@ -318,22 +658,7 @@ Commands:
     required(args)
 )]
 pub async fn agent_browser(args: String) -> Result<String, ToolError> {
-    let cmd = format!("agent-browser {}", args);
-    let output = tokio::task::spawn_blocking(move || {
-        sh_dangerous(&cmd)
-            .stderr_to_stdout()
-            .unchecked()
-            .read()
-            .map_err(|e| ToolError::Io(e.to_string()))
-    })
-    .await??;
-
-    let res = output.trim().to_string();
-    Ok(if res.is_empty() {
-        "(empty)".into()
-    } else {
-        res
-    })
+    run_sandboxed(&format!("agent-browser {}", args), None).await
 }
 
 #[cfg(test)]
@@ -423,5 +748,233 @@ mod tests {
 
         // Root path
         assert!(validate_path(base, "/").is_err());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use crate::config::{BindMode, BindSpec, SandboxConfig};
+    use serial_test::serial;
+
+    fn bwrap_on_path() -> bool {
+        std::process::Command::new("which")
+            .arg("bwrap")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn sandbox_with(paths: Vec<BindSpec>, timeout_secs: Option<u64>) -> SandboxConfig {
+        SandboxConfig {
+            enabled: Some(true),
+            timeout_secs,
+            network: Some(false),
+            memory_mb: None,
+            pid_isolation: Some(true),
+            drop_caps: Some(true),
+            tmp_size_mb: Some(16),
+            paths,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_echo_works() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Default (empty paths): read-only CWD + writable tmpfs.
+        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        let out = run_sandboxed("echo hello-world", None).await.unwrap();
+        assert_eq!(out, "hello-world");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_tmpfs_is_writable() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        let out = run_sandboxed("echo x > /tmp/probe && cat /tmp/probe", None).await.unwrap();
+        assert_eq!(out, "x");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_timeout_kills_hung_command() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], Some(1))));
+        let res = run_sandboxed("sleep 30", None).await;
+        assert!(res.is_err(), "expected timeout error, got {:?}", res);
+        assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_rw_bind_sees_host_file() {
+        if !bwrap_on_path() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // Bind the temp dir read-write at /work inside the namespace.
+        let spec = BindSpec {
+            mode: BindMode::Rw,
+            from: dir.path().to_string_lossy().to_string(),
+            to: "/work".to_string(),
+        };
+        set_sandbox(Some(sandbox_with(vec![spec], Some(30))));
+        let out = run_sandboxed("echo inside > /work/probe.txt && cat /work/probe.txt", None)
+            .await
+            .unwrap();
+        assert_eq!(out, "inside");
+        // The write landed on the host temp dir.
+        assert!(dir.path().join("probe.txt").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unsandboxed_timeout_still_enforced() {
+        // No bwrap needed: disabled sandbox still applies the timeout.
+        set_sandbox(Some(SandboxConfig {
+            enabled: Some(false),
+            timeout_secs: Some(1),
+            network: None,
+            memory_mb: None,
+            pid_isolation: None,
+            drop_caps: None,
+            tmp_size_mb: None,
+            paths: vec![],
+        }));
+        let res = run_sandboxed("sleep 30", None).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    // ---- Phase 1b: LLM-configurable per-call timeout override ----
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_timeout_override_short_kills_hung_command() {
+        // A short per-call override short-circuits the long configured default
+        // and kills a hung command.
+        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        let res = run_sandboxed("sleep 30", Some(1)).await;
+        assert!(res.is_err(), "expected timeout error, got {:?}", res);
+        assert!(res.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_timeout_override_positive_works() {
+        // A generous override lets a quick command succeed even when the
+        // configured default is too short.
+        set_sandbox(Some(sandbox_with(vec![], Some(1))));
+        let out = run_sandboxed("echo ok", Some(30)).await.unwrap();
+        assert_eq!(out, "ok");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_timeout_override_zero_rejected() {
+        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        let res = run_sandboxed("echo hi", Some(0)).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("invalid timeout"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_timeout_override_above_max_rejected() {
+        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        let res = run_sandboxed("echo hi", Some(super::MAX_TIMEOUT_SECS + 1)).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("invalid timeout"));
+    }
+
+    // ---- Phase 3: non-shell path policy ----
+
+    /// Set a sandbox with explicit bindings so the non-shell path policy is
+    /// active (requires bwrap, like the shell sandbox).
+    fn sandbox_with_paths(paths: Vec<BindSpec>) {
+        set_sandbox(Some(sandbox_with(paths, Some(30))));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_ro_write_rejected() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // CWD bound read-only.
+        let cwd = std::env::current_dir().unwrap();
+        sandbox_with_paths(vec![BindSpec {
+            mode: BindMode::Ro,
+            from: cwd.to_string_lossy().to_string(),
+            to: cwd.to_string_lossy().to_string(),
+        }]);
+        let res = super::write_file("should_fail.txt".to_string(), "x".to_string()).await;
+        assert!(res.is_err(), "write under ro binding should be denied");
+        assert!(res.unwrap_err().to_string().contains("read-only"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_unbound_path_rejected() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Only a subdir is bound; writing elsewhere (still under CWD) is denied.
+        let dir = tempfile::tempdir().unwrap();
+        sandbox_with_paths(vec![BindSpec {
+            mode: BindMode::Rw,
+            from: dir.path().to_string_lossy().to_string(),
+            to: dir.path().to_string_lossy().to_string(),
+        }]);
+        // The crate root is not bound, so this is rejected.
+        let res = super::write_file("outside.txt".to_string(), "x".to_string()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("not within a permitted binding"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn nonshell_remap_consistency() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Bind a temp dir at the in-sandbox path /tmp (rw). Both the shell and
+        // the non-shell tools must address the same host file.
+        let dir = tempfile::tempdir().unwrap();
+        sandbox_with_paths(vec![BindSpec {
+            mode: BindMode::Rw,
+            from: dir.path().to_string_lossy().to_string(),
+            to: "/tmp".to_string(),
+        }]);
+
+        // Non-shell write to /tmp/x.
+        super::write_file("/tmp/x.txt".to_string(), "from-tool".to_string())
+            .await
+            .unwrap();
+        // Shell write to /tmp/x2.
+        run_sandboxed("echo from-shell > /tmp/x2.txt", None).await.unwrap();
+
+        // Both landed on the host temp dir.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x.txt")).unwrap().trim(),
+            "from-tool"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("x2.txt")).unwrap().trim(),
+            "from-shell"
+        );
+        // And the non-shell tool can read what the shell wrote.
+        let read = super::read_file("/tmp/x2.txt".to_string(), 0, 0).await.unwrap();
+        assert!(read.contains("from-shell"));
     }
 }

@@ -66,10 +66,14 @@ pub(crate) fn register_sigcont() {
 /// `done` is set by the caller once the await returns, so the loop can
 /// exit and be joined. `guard` and `cancel` are `Arc` and `stop()`/
 /// `store()` are process-wide, so calling them from this thread is safe.
+/// `paused` is set by a confirmation dialog on the main task while it owns
+/// stdin; while it is `true` this reader must not read, or it would swallow
+/// the dialog's keystrokes.
 pub(crate) fn spawn_in_flight_reader(
     guard: Arc<TermGuard>,
     cancel: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || loop {
         if done.load(Ordering::SeqCst) {
@@ -77,6 +81,12 @@ pub(crate) fn spawn_in_flight_reader(
         }
         if RESUMED.swap(false, Ordering::SeqCst) {
             let _ = guard.start();
+        }
+        // A confirmation dialog on the main task owns stdin right now; back
+        // off so we don't consume the keystrokes it is waiting for.
+        if paused.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(10));
+            continue;
         }
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {

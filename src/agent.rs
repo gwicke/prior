@@ -1,8 +1,8 @@
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx};
 use crate::tools::{
-    AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir, MoveFile,
-    ReadFile, Remove, WriteFile,
+    set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
+    MoveFile, ReadFile, Remove, WriteFile,
 };
 use crate::Output;
 use crate::Result;
@@ -108,6 +108,9 @@ pub struct AgentConfig {
     /// the user presses `Esc` during an LLM request; the `LoggingHook` bridge
     /// below turns it into a rig `CancelSignal` so the in-flight request stops.
     pub user_cancel: Arc<AtomicBool>,
+    /// Resolved sandbox configuration for shell tool execution. `None` means
+    /// sandboxing is disabled (plain `sh_dangerous`, timeout still enforced).
+    pub sandbox: Option<crate::config::SandboxConfig>,
 }
 
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
@@ -127,6 +130,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.bash_auto_allow.unwrap_or_default(),
                 config.agent_prompt,
                 think_json,
+                config.sandbox.clone(),
             );
 
             Box::new(CodeAgent::new(
@@ -343,6 +347,7 @@ fn build_rig_agent<M: CompletionModel>(
     bash_auto_allow: Vec<String>,
     agent_prompt: Option<String>,
     additional_params: Option<serde_json::Value>,
+    sandbox: Option<crate::config::SandboxConfig>,
 ) -> Agent<M> {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -378,6 +383,10 @@ fn build_rig_agent<M: CompletionModel>(
         .tool(guard(CopyFile, yolo, output.clone(), None));
 
     let auto_allow = bash_auto_allow.clone();
+    // Publish the resolved sandbox config for the shell tools. picocode runs a
+    // single agent per process, so a process-wide slot is sufficient and keeps
+    // the macro-generated tool structs untouched.
+    set_sandbox(sandbox.clone());
     builder = builder.tool(guard(
         Bash,
         yolo,
@@ -610,10 +619,17 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                         // handled. Signal the thread to stop, then join, once the
                         // request returns.
                         let done = Arc::new(AtomicBool::new(false));
+                        // Gate the reader backs off during a tool confirmation
+                        // dialog (which reads stdin on the main task).
+                        let confirm_gate = config
+                            .output
+                            .confirm_gate()
+                            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                         let handle = crate::repl::spawn_in_flight_reader(
                             g.clone(),
                             cancel.clone(),
                             done.clone(),
+                            confirm_gate,
                         );
                         let resp = agent
                             .as_ref()

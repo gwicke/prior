@@ -5,12 +5,15 @@ use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::io::IsTerminal;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use termimad;
 use markdown_terminal::Theme;
 use libc;
+use crossterm::event::{self, Event, KeyCode};
+use crate::repl::Repl;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -57,6 +60,14 @@ pub trait Output: Send + Sync {
     /// don't run the raw-mode REPL).
     fn cursor_row(&self) -> usize {
         crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
+    }
+
+    /// Gate the background in-flight reader should honor. While it is `true`,
+    /// the reader must not read stdin, because a confirmation dialog on the
+    /// main task owns stdin. Returns `None` for outputs that don't run the
+    /// raw-mode REPL (so there is no background reader to coordinate with).
+    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
+        None
     }
 }
 
@@ -210,6 +221,9 @@ impl Output for LogOutput {
 pub struct ConsoleOutput {
     spinner: Mutex<Option<ProgressBar>>,
     row: Mutex<usize>,
+    /// Set `true` while `confirm` is reading a keystroke, so the background
+    /// in-flight reader thread backs off and doesn't swallow the input.
+    reader_paused: Arc<AtomicBool>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -316,6 +330,7 @@ impl ConsoleOutput {
         Self {
             spinner: Mutex::new(None),
             row: Mutex::new(1),
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -618,6 +633,10 @@ impl Output for ConsoleOutput {
         input.trim().to_string()
     }
 
+    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.reader_paused.clone())
+    }
+
     fn display_error(&self, error: &str) {
         self.stop_thinking();
         println!("{} Error: {}", style("⏺").red(), error);
@@ -632,18 +651,98 @@ impl Output for ConsoleOutput {
 
     fn confirm(&self, message: &str) -> Confirmation {
         self.stop_thinking();
-        println!("\n{} {} [y/n/s]", style("⚠").yellow(), message);
-        println!(
-            "  {}es / {}o / {}ession",
-            style("y").bold(),
-            style("n").bold(),
-            style("s").bold()
-        );
-        self.note_lines(2);
-        let input = self.get_user_input().to_lowercase();
-        match input.as_str() {
-            "y" | "yes" => Confirmation::Yes,
-            "s" | "session" => Confirmation::Always,
+        // The REPL runs in raw mode while a request is in flight and a
+        // background reader thread polls stdin (Esc/Ctrl-C/Ctrl-Z). Two things
+        // go wrong if we read with `std::io::read_line` here:
+        //   1. `cfmakeraw` disables ICRNL, so the Enter key delivers `\r`
+        //      (0x0D) and never a `\n` (0x0A); `read_line` waits forever for a
+        //      newline that never arrives -> the client hangs with no echoed
+        //      input (verified: after `enable_raw_mode`, ICRNL==false).
+        //   2. The background reader also reads stdin and would consume the
+        //      keystrokes meant for this dialog.
+        // So (1) ask the reader to stand down, and (2) render the choice as an
+        // overlay (consistent with the `/` dialogs) and read a single
+        // navigation/selection key via crossterm's raw-mode event reader.
+        self.reader_paused.store(true, Ordering::SeqCst);
+
+        let (_w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let h = h.max(1) as usize;
+        // Anchor just below the current cursor. Clamp so this small overlay
+        // never scrolls the screen (which would make it impossible to clear
+        // precisely afterwards).
+        let start_row = self.cursor_row().min(h);
+        let n = 4usize; // title + 3 options
+        let top = start_row.min(h.saturating_sub(n));
+
+        // Options in display order. Default selection = No (safe: Enter -> No,
+        // matching the previous `read_line("")` default).
+        let options = vec![
+            "Yes".to_string(),
+            "No".to_string(),
+            "Always (session)".to_string(),
+        ];
+        let mut sel: usize = 1;
+
+        let draw = |sel: usize| {
+            let panel = Repl::overlay_lines(message, &options, sel, None);
+            let mut s = String::new();
+            s.push_str(&format!("\x1b[{};1H", top));
+            s.push_str("\x1b[0J");
+            for line in panel.lines() {
+                s.push_str(line);
+                s.push('\n');
+            }
+            let _ = io::stdout().write_all(s.as_bytes());
+            let _ = io::stdout().flush();
+        };
+        draw(sel);
+
+        // Navigate with up/down, confirm with Enter, or use quick keys.
+        let choice = loop {
+            match event::read() {
+                Ok(Event::Key(key)) => match key.code {
+                    KeyCode::Up => {
+                        if sel > 0 {
+                            sel -= 1;
+                            draw(sel);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if sel + 1 < options.len() {
+                            sel += 1;
+                            draw(sel);
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        break match c.to_ascii_lowercase() {
+                            'y' => 0,
+                            's' => 2,
+                            _ => 1, // n / anything else -> No
+                        };
+                    }
+                    KeyCode::Enter => break sel,
+                    KeyCode::Esc => break 1, // No
+                    _ => {}
+                },
+                _ => {}
+            }
+        };
+
+        // Clear the overlay region.
+        let mut s = String::new();
+        s.push_str(&format!("\x1b[{};1H", top));
+        s.push_str("\x1b[0J");
+        let _ = io::stdout().write_all(s.as_bytes());
+        let _ = io::stdout().flush();
+        self.reader_paused.store(false, Ordering::SeqCst);
+
+        // Echo the resolved choice (raw mode has no terminal echo).
+        println!("  {}", options[choice]);
+        self.note_lines(1);
+
+        match choice {
+            0 => Confirmation::Yes,
+            2 => Confirmation::Always,
             _ => Confirmation::No,
         }
     }
@@ -786,6 +885,9 @@ impl Output for ScrollbackOutput {
     }
     fn confirm(&self, message: &str) -> Confirmation {
         self.inner.confirm(message)
+    }
+    fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
+        self.inner.confirm_gate()
     }
     fn display_separator(&self) {
         let line = "─".repeat(term_width());

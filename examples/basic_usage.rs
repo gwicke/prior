@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persona_prompt: None,
         persona_name: None,
         bash_auto_allow: None,
+        sandbox: None,
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }).await?;

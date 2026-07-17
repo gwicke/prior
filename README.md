@@ -117,6 +117,31 @@ Picocode gives the AI a comprehensive set of tools to interact with your environ
 - **System**: `bash` (run any shell command).
 - **Web**: `agent_browser` (full browser automation via [agent-browser](https://github.com/jondot/agent-browser) if installed).
 
+## 🔒 Sandboxing (`bash` & file tools)
+
+Shell commands run inside a [Bubblewrap](https://github.com/containers/bwrap) (bwrap) namespace when `bwrap` is installed: the process gets its own mount, PID, and network namespaces, all capabilities dropped, and an optional virtual-memory cap. Commands are also killed if they exceed `timeout_secs`.
+
+Configure it under `tool_config.bash.sandbox` in `picocode.yaml` (see `picocode.yaml.example`):
+
+```yaml
+tool_config:
+  bash:
+    sandbox:
+      enabled: true          # auto-enabled only if bwrap is on PATH
+      timeout_secs: 120
+      network: false         # unshare network by default
+      memory_mb: 1024        # optional RLIMIT_AS cap
+      paths:
+        - rw: "."            # project dir mounted read-write
+        - rw: { from: "./cache", to: "/var/cache/app" }  # remap
+```
+
+- **Deny-by-default filesystem**: when `paths` is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.
+- When `bwrap` is absent, commands run unsandboxed (with the timeout still enforced) and a warning is printed.
+- This is defense-in-depth for an LLM-driven shell, not a jail against root — run picocode as an unprivileged user.
+
+See `doc/sandbox.md` for the full design.
+
 ## 🛠 Hacking on picocode
 
 Picocode is built with Rust and the [Rig](https://github.com/0xPlayground/rig) library. It's designed to be extremely easy to extend.

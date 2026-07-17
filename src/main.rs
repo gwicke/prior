@@ -135,6 +135,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|p| picocode::persona::get_persona(p));
 
+    // Resolve the sandbox config: merge user settings with built-in defaults,
+    // with `enabled` auto-enabled only when `bwrap` is present.
+    let bwrap_present = std::process::Command::new("which")
+        .arg("bwrap")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let sandbox = config
+        .bash_sandbox_raw()
+        .map(|raw| raw.with_defaults(bwrap_present));
+
     let agent_config = AgentConfig {
         provider: provider.clone(),
         model,
@@ -152,6 +165,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         thinking_level: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sandbox,
     };
     match command {
         Commands::Recipe { name: _ } => {
