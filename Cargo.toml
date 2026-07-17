@@ -13,8 +13,8 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["picocode.gif", ".github/"]
 
 [dependencies]
-rig-core = { version = "0.28.0", features = ["derive"] }
-rig-derive = "=0.1.10"
+rig-core = { version = "0.38", features = ["derive"] }
+rig-derive = "0.38"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -32,11 +32,10 @@ termimad = "0.34.1"
 duct = "1.1.1"
 duct_sh = "1.0.0"
 async-trait = "0.1"
-openssl = { version = "0.10", features = ["vendored"] }
 crossterm = "0.29"
 fuzzy-matcher = "0.3"
 unicode-segmentation = "1.12"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 libc = "0.2"
 
 [lib]

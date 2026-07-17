@@ -195,15 +195,15 @@ pub struct BashArgs {
 
 pub struct Bash;
 
-impl rig::tool::Tool for Bash {
+impl rig_core::tool::Tool for Bash {
     type Args = BashArgs;
     type Output = String;
     type Error = ToolError;
 
     const NAME: &'static str = "bash";
 
-    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
+    async fn definition(&self, _prompt: String) -> rig_core::completion::ToolDefinition {
+        rig_core::completion::ToolDefinition {
             name: Self::NAME.into(),
             description: "Run shell command".into(),
             parameters: serde_json::to_value(schemars::schema_for!(BashArgs)).unwrap(),

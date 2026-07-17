@@ -9,11 +9,11 @@ use crate::Result;
 use crate::model_catalog;
 use crate::thinking;
 use console::style;
-use rig::agent::{Agent, AgentBuilder, CancelSignal, PromptHook};
-use rig::client::{CompletionClient, ProviderClient};
-use rig::completion::{CompletionModel, Prompt, ToolDefinition};
-use rig::message::Message;
-use rig::providers::{
+use rig_core::agent::{Agent, AgentBuilder, HookAction, PromptHook, ToolCallHookAction};
+use rig_core::client::{CompletionClient, ProviderClient};
+use rig_core::completion::{CompletionModel, Prompt, ToolDefinition};
+use rig_core::message::Message;
+use rig_core::providers::{
     anthropic, azure, cohere, deepseek, galadriel, gemini, groq, huggingface, hyperbolic, mira,
     mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai,
 };
@@ -43,15 +43,15 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
             })
-            .multi_turn(self.tool_call_limit);
+            .max_turns(self.tool_call_limit);
         if let Some(h) = history {
-            builder = builder.with_history(h);
+            builder = builder.with_history(&*h);
         }
         let response = builder
             .await
             .map_err(|e| crate::PicocodeError::Other(e.to_string()))?;
         self.output.stop_thinking();
-        Ok(response.to_string())
+        Ok(response)
     }
 
     async fn run_once(&self, input: String) -> Result<String> {
@@ -156,78 +156,78 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let agent: Box<dyn PicoAgent> = match provider.as_str() {
         "anthropic" => {
             check_env!("ANTHROPIC_API_KEY");
-            build!(anthropic::Client::from_env())
+            build!(anthropic::Client::from_env()?)
         }
         "openai" => {
             check_env!("OPENAI_API_KEY");
-            build!(openai::Client::from_env())
+            build!(openai::Client::from_env()?)
         }
         "azure" => {
             check_env!("AZURE_OPENAI_API_KEY");
             check_env!("AZURE_OPENAI_ENDPOINT");
-            build!(azure::Client::from_env())
+            build!(azure::Client::from_env()?)
         }
         "cohere" => {
             check_env!("COHERE_API_KEY");
-            build!(cohere::Client::from_env())
+            build!(cohere::Client::from_env()?)
         }
         "deepseek" => {
             check_env!("DEEPSEEK_API_KEY");
-            build!(deepseek::Client::from_env())
+            build!(deepseek::Client::from_env()?)
         }
         "galadriel" => {
             check_env!("GALADRIEL_API_KEY");
-            build!(galadriel::Client::from_env())
+            build!(galadriel::Client::from_env()?)
         }
         "gemini" | "google" => {
             check_env!("GOOGLE_API_KEY");
-            build!(gemini::Client::from_env())
+            build!(gemini::Client::from_env()?)
         }
         "groq" => {
             check_env!("GROQ_API_KEY");
-            build!(groq::Client::from_env())
+            build!(groq::Client::from_env()?)
         }
         "huggingface" => {
             check_env!("HF_TOKEN");
-            build!(huggingface::Client::from_env())
+            build!(huggingface::Client::from_env()?)
         }
         "hyperbolic" => {
             check_env!("HYPERBOLIC_API_KEY");
-            build!(hyperbolic::Client::from_env())
+            build!(hyperbolic::Client::from_env()?)
         }
         "mira" => {
             check_env!("MIRA_API_KEY");
-            build!(mira::Client::from_env())
+            build!(mira::Client::from_env()?)
         }
         "mistral" => {
             check_env!("MISTRAL_API_KEY");
-            build!(mistral::Client::from_env())
+            build!(mistral::Client::from_env()?)
         }
         "moonshot" => {
             check_env!("MOONSHOT_API_KEY");
-            build!(moonshot::Client::from_env())
+            build!(moonshot::Client::from_env()?)
         }
         "ollama" => {
             if std::env::var("OLLAMA_API_BASE_URL").is_err() {
                 std::env::set_var("OLLAMA_API_BASE_URL", "http://localhost:11434");
             }
-            build!(ollama::Client::from_env())
+            build!(ollama::Client::from_env()?)
         }
         "openrouter" => {
             check_env!("OPENROUTER_API_KEY");
-            build!(openrouter::Client::from_env())
+            build!(openrouter::Client::from_env()?)
         }
         "perplexity" => {
             check_env!("PERPLEXITY_API_KEY");
-            build!(perplexity::Client::from_env())
+            build!(perplexity::Client::from_env()?)
         }
         "together" => {
             check_env!("TOGETHER_API_KEY");
-            build!(together::Client::from_env())
+            build!(together::Client::from_env()?)
         }
         "xai" => {
             check_env!("XAI_API_KEY");
-            build!(xai::Client::from_env())
+            build!(xai::Client::from_env()?)
         }
         _ => {
             return Err(crate::PicocodeError::Other(format!(
@@ -259,21 +259,25 @@ impl<M: CompletionModel> PromptHook<M> for LoggingHook {
         &self,
         _prompt: &Message,
         _history: &[Message],
-        cancel_sig: CancelSignal,
-    ) {
+    ) -> HookAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            cancel_sig.cancel();
+            // Esc was pressed: stop the agentic loop at the next checkpoint.
+            // rig 0.38 no longer exposes a mid-request CancelSignal.
+            HookAction::terminate("cancelled by user")
+        } else {
+            HookAction::cont()
         }
     }
 
     async fn on_completion_response(
         &self,
         _prompt: &Message,
-        _response: &rig::completion::CompletionResponse<M::Response>,
-        cancel_sig: CancelSignal,
-    ) {
+        _response: &rig_core::completion::CompletionResponse<M::Response>,
+    ) -> HookAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            cancel_sig.cancel();
+            HookAction::terminate("cancelled by user")
+        } else {
+            HookAction::cont()
         }
     }
 
@@ -281,29 +285,31 @@ impl<M: CompletionModel> PromptHook<M> for LoggingHook {
         &self,
         tool_name: &str,
         _tool_call_id: Option<String>,
+        _internal_call_id: &str,
         args: &str,
-        cancel_sig: CancelSignal,
-    ) {
+    ) -> ToolCallHookAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            cancel_sig.cancel();
+            return ToolCallHookAction::terminate("cancelled by user");
         }
         let args_json =
             serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
         self.output.display_tool_call(tool_name, &args_json);
+        ToolCallHookAction::cont()
     }
 
     async fn on_tool_result(
         &self,
         _tool_name: &str,
         _tool_call_id: Option<String>,
+        _internal_call_id: &str,
         _args: &str,
         result: &str,
-        cancel_sig: CancelSignal,
-    ) {
+    ) -> HookAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            cancel_sig.cancel();
+            return HookAction::terminate("cancelled by user");
         }
         self.output.display_tool_result(result);
+        HookAction::cont()
     }
 }
 
@@ -391,7 +397,7 @@ fn build_rig_agent<M: CompletionModel>(
     builder.build()
 }
 
-use rig::tool::Tool;
+use rig_core::tool::Tool;
 
 struct Guard<T: Tool> {
     tool: T,

@@ -14,10 +14,10 @@ pub mod thinking;
 pub use config::{Config, Recipe, ToolSettings};
 
 // Re-export core rig types for library users
-pub use rig::agent::AgentBuilder;
-pub use rig::client::{CompletionClient, ProviderClient};
-pub use rig::completion::CompletionModel;
-pub use rig::providers;
+pub use rig_core::agent::AgentBuilder;
+pub use rig_core::client::{CompletionClient, ProviderClient};
+pub use rig_core::completion::CompletionModel;
+pub use rig_core::providers;
 
 pub use agent::{create_agent, load_agents_md, run_interactive, AgentConfig, CodeAgent, PicoAgent};
 pub use output::{Confirmation, ConsoleOutput, LogOutput, NoOutput, Output, QuietOutput};
@@ -41,6 +41,9 @@ pub enum PicocodeError {
 
     #[error("Missing API key for provider {0}. Please set the {1} environment variable.")]
     MissingApiKey(String, String),
+
+    #[error("Provider client error: {0}")]
+    ProviderClient(#[from] rig_core::client::ProviderClientError),
 
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
