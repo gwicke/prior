@@ -826,9 +826,27 @@ impl Repl {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     editor.insert_newline();
                     None
+                } else if editor.char_before_cursor() == Some('\\') {
+                    // Kitty-independent multi-line entry (mirrors pi): a '\\'
+                    // before Enter inserts a newline instead of submitting,
+                    // so users on terminals that don't disambiguate Shift+Enter
+                    // still get a newline without changing terminal settings.
+                    editor.backspace();
+                    editor.insert_newline();
+                    None
                 } else {
                     Some(InputAction::Submit(editor.text()))
                 }
+            }
+            KeyCode::F(3) => {
+                // wezterm (and xterm-style terminals) send Shift+Enter as the
+                // legacy CSI sequence `\x1b[13;2~` even when the Kitty keyboard
+                // protocol is *disabled*. crossterm 0.29 parses that as
+                // `KeyCode::F(3)` (+SHIFT), not Enter — so it never reaches the
+                // Enter handler above. Mirror pi: treat it as a newline.
+                // (picocode has no F-key bindings, so this is safe.)
+                editor.insert_newline();
+                None
             }
             KeyCode::Esc => Some(InputAction::Submit(String::new())),
             KeyCode::Char(c) => {
@@ -937,6 +955,14 @@ impl LineEditor {
             self.buf.insert(self.cursor, c);
             self.cursor += 1;
         }
+    }
+
+    /// Character immediately before the cursor (`None` at buffer start).
+    pub fn char_before_cursor(&self) -> Option<char> {
+        if self.cursor == 0 {
+            return None;
+        }
+        self.buf.get(self.cursor - 1).copied()
     }
 
     pub fn backspace(&mut self) {
@@ -1545,6 +1571,29 @@ mod tests {
         e.delete(); // at end -> no change
         assert_eq!(e.text(), "a");
         assert_eq!(e.cursor, 1);
+    }
+
+    #[test]
+    fn char_before_cursor_returns_preceding_char() {
+        let mut e = LineEditor::new();
+        assert_eq!(e.char_before_cursor(), None);
+        e.insert_str("ab");
+        assert_eq!(e.char_before_cursor(), Some('b'));
+        e.left();
+        assert_eq!(e.char_before_cursor(), Some('a'));
+    }
+
+    #[test]
+    fn backslash_then_enter_inserts_newline() {
+        // Mirrors pi: a '\\' immediately before Enter inserts a newline
+        // (Kitty-independent multi-line entry) instead of submitting.
+        let mut e = LineEditor::new();
+        e.insert_str("line one\\");
+        assert_eq!(e.char_before_cursor(), Some('\\'));
+        e.backspace(); // drop the backslash
+        e.insert_newline();
+        assert_eq!(e.text(), "line one\n");
+        assert_eq!(e.cursor, 9);
     }
 
     #[test]

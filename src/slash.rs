@@ -96,9 +96,12 @@ pub fn render_help() -> String {
     }
     s.push_str("\nKey bindings:\n");
     s.push_str("  Enter        submit line\n");
-    s.push_str("  Shift-Enter  newline (multi-line); needs the terminal's Kitty\n");
-    s.push_str("                keyboard protocol ON (wezterm: enable_kitty_keyboard=true;\n");
-    s.push_str("                alacritty/kitty enable it by default)\n");
+    s.push_str("  Shift-Enter  newline (multi-line). Works on wezterm/kitty even\n");
+    s.push_str("                WITHOUT enabling the Kitty keyboard protocol (sent as\n");
+    s.push_str("                the legacy `ESC[13;2~` sequence), and on alacritty/kitty\n");
+    s.push_str("                when the Kitty protocol is ON (enable_kitty_keyboard=true)\n");
+    s.push_str("  \\\\+Enter     newline (multi-line) — works on ANY terminal, no Kitty\n");
+    s.push_str("                protocol needed (type \\\\ before Enter)\n");
     s.push_str("  Ctrl-J       newline (reliable on every terminal)\n");
     s.push_str("  Esc          cancel current line\n");
     s.push_str("  Up/Down      history (or move across lines)\n");

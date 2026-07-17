@@ -943,13 +943,23 @@ prompt itself owns, so the scrollback above is structurally untouchable.
   `(provider:name)` intact, single spaces between words, collapses alignment
   padding). `print_block` prints `/help` **verbatim** (preserving `{:<10}` column
   alignment) and only hard-wraps lines exceeding the terminal width.
-- **TODO (later investigation):** `Shift+Enter` newline currently depends on the
-  terminal's Kitty keyboard protocol (wezterm `enable_kitty_keyboard`) or the
-  `Ctrl-J` fallback. **pi handles `Shift+Enter` as newline with *no* Kitty
-  dependency** — investigate how (likely raw-byte reading / a different
-  enhancement handshake / bracketed-paste or modifier inference) and adopt it so
-  `Shift+Enter` works out-of-the-box on terminals that don't enable Kitty. See
-  `pi/packages/coding-agent/src/...` interactive input handling.
+- **`Shift+Enter` without Kitty dependency (2026-07-16, RESOLVED):** investigated
+  pi's editor (`pi/packages/tui/src/components/editor.ts`). Its newline detection
+  accepts several sequences — `tui.input.newLine`, `\x1b[13;2~` (the legacy
+  `CSI ~` form, not the Kitty `u` form), `\x1b\r`, any multi-char escape containing
+  both `ESC` and `CR`, and a bare `\n`. **But crossterm 0.29 parses `\x1b[13;2~` as
+  `KeyCode::F(13)` (not Enter+SHIFT)**, so that form isn't usable in picocode
+  without custom parsing — and pi's real Kitty-independent trick is the **`\` +
+  Enter → newline** workaround** (`editor.ts:791-799` + `shouldSubmitOnBackslashEnter`):
+  when Enter is pressed and the char before the cursor is `\`, it deletes the
+  backslash and inserts a newline instead of submitting. picocode now does the
+  same (in `edit_key`'s `Enter` handler, via
+  `LineEditor::char_before_cursor()` + `backspace()` + `insert_newline()`), joined
+  by the existing `Ctrl-J` (LF) fallback. Net effect: multi-line entry works on
+  **any** terminal with zero protocol support — the Kitty dependency is gone for
+  the newline feature (Kitty is still used to *also* deliver a true Shift+Enter
+  when the terminal enables it). Documented in `/help`. Unit-tested in
+  `repl::tests::backslash_then_enter_inserts_newline`.
 
 ## 7. Decisions & corrections log
 
