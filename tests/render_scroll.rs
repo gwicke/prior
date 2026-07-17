@@ -1,6 +1,5 @@
-//! Integration test: the inline pop-up must not leave duplicated input frames
-//! when it opens tall (causing a terminal scroll) and then shrinks as the user
-//! types. This guards the `Repl::next_input_row` scroll-tracking fix.
+//! Integration test: the inline pop-up must not delete the input line when
+//! it opens while the input sits on the *bottom* row of the terminal.
 //!
 //! Strategy (see discussion in `doc/phase_1_plan.md` §3.7):
 //! 1. Spawn `picocode` in a *real* pty (so it enters raw mode and believes it
@@ -8,13 +7,15 @@
 //!    screen.
 //! 2. Capture the raw output bytes and feed them to a *terminal emulator*
 //!    (`vt100`), which faithfully implements scroll / clear / addressing.
-//! 3. Assert on the emulator's visible screen: the latest input line must
-//!    appear exactly once, with no stale earlier input frame left behind.
+//! 3. Assert on the emulator's visible screen: after typing `/`, the input
+//!    line `/` must still be present (the bug deleted it, overwriting it with
+//!    the pop-up's divider).
 //!
-//! We force the scroll path with a short (8-row) terminal: the greeter + input
-//! occupy the top rows, the `/` command pop-up is tall enough to overflow the
-//! bottom, so the first keystroke scrolls and subsequent keystrokes must track
-//! that scroll (otherwise a second input frame is drawn lower down).
+//! The bug only triggers when the input line is on the bottom row. With an
+//! 8-row terminal the short greeter leaves the input at row 3, so we *force*
+//! the cursor to the last row by answering `picocode`'s cursor-position query
+//! (a DSR, `ESC[6n`) with `ESC[<ROWS>;1R` before it reads it. That makes the
+//! input sit on the bottom row, exactly the reported condition.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,7 +102,18 @@ fn popup_scroll_does_not_duplicate_input() {
     );
     eprintln!("[test] greeter seen");
 
-    // TEMP: capture the pre-'/' screen to see where the input line sits.
+    // `picocode` is now inside `read_input` and has just issued a cursor-position
+    // query (a DSR, `ESC[6n`); it blocks up to ~60ms waiting for the reply
+    // `ESC[<row>;<col>R`. Answer with `ESC[<ROWS>;1R` so it believes the input
+    // line sits on the *bottom* row — exactly the condition that triggers the
+    // reported bug (a `/` pop-up opening while the input is at the bottom of the
+    // term). Writing right after the greeter lands inside that 60ms window, and
+    // raw mode is already active so the reply is not echoed into the output.
+    let _ = writer.write_all(format!("\x1b[{};1R", ROWS).as_bytes());
+    let _ = writer.flush();
+
+    // Capture the pre-'/' screen to confirm the cursor was forced to the
+    // bottom row (input line at the last row, rows above it empty).
     {
         let data = bytes.lock().unwrap().clone();
         let mut p = Parser::new(ROWS, COLS, 1000);
@@ -114,11 +126,9 @@ fn popup_scroll_does_not_duplicate_input() {
         eprintln!("[test] PRE('/') screen ({} rows):\n{:?}", pre.len(), pre);
     }
 
-    // `ConsoleOutput::cursor_row()` issues a DSR (`ESC[6n`) and blocks up to
-    // ~60ms waiting for a response. In a real terminal the response is
-    // immediate, but in a pty with no responder that read can swallow a
-    // keystroke sent during its window. Wait it out before typing so the
-    // first `/` reaches the editor rather than the DSR read.
+    // `ConsoleOutput::cursor_row()` blocks up to ~60ms on the DSR reply we just
+    // supplied. Wait it out before typing so the first `/` reaches the editor
+    // rather than the DSR read, then give the opening redraw time to settle.
     thread::sleep(Duration::from_millis(400));
 
     // Type `/`, then `m`, then `o` — the pop-up grows tall then shrinks.
@@ -131,8 +141,8 @@ fn popup_scroll_does_not_duplicate_input() {
         // After the first char the pop-up is open; give the redraw time.
         thread::sleep(Duration::from_millis(if i == 0 { 400 } else { 250 }));
         if i == 0 {
-            // TEMP diagnostic: capture screen right after `/` to check the
-            // input line is present (not overwritten by the divider).
+            // Capture the screen right after `/` to check the input line is
+            // present (not overwritten by the pop-up divider — the bug).
             let data = bytes.lock().unwrap().clone();
             let mut p = Parser::new(ROWS, COLS, 1000);
             p.process(&data);
@@ -175,7 +185,7 @@ fn popup_scroll_does_not_duplicate_input() {
 
     let count_exact = |needle: &str| visible.iter().filter(|r| r.as_str() == needle).count();
 
-    // TEMP diagnostic assertions on the mid-sequence screen (after `/`).
+    // Diagnostic assertions on the mid-sequence screen (after `/`).
     if let Some(ref mid) = mid_screen {
         let mid_slash = mid.iter().filter(|r| r.starts_with("> /")).count();
         let mid_div = mid.iter().filter(|r| r.starts_with("────")).count();
