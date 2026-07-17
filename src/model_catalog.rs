@@ -157,6 +157,39 @@ pub fn parse_openrouter(value: &Value) -> Vec<ModelEntry> {
     out
 }
 
+/// Cell text for the `Ctx` column of an aligned model table: the context
+/// length, or `—` when unknown.
+pub fn ctx_cell(e: &ModelEntry) -> String {
+    match e.context_length {
+        Some(c) => c.to_string(),
+        None => "—".to_string(),
+    }
+}
+
+/// Cell text for the `Cost` column of an aligned model table: `$prompt/$completion`
+/// per million tokens. When the price is an OpenRouter estimate it is prefixed
+/// with `~` (the number is approximate). Returns `—` when cost is unknown.
+/// Reasoning is reported by [`reason_cell`].
+pub fn cost_cell(e: &ModelEntry) -> String {
+    match (e.prompt_cost, e.completion_cost) {
+        (Some(p), Some(c)) => {
+            let inner = format!("${:.2}/${:.2}", p, c);
+            if e.cost_source == CostSource::OpenRouterEstimate {
+                format!("~{}", inner)
+            } else {
+                inner
+            }
+        }
+        _ => "—".to_string(),
+    }
+}
+
+/// Cell text for the `Reason` column of an aligned model table: `✓` when the
+/// model exposes reasoning/thinking, `✗` otherwise.
+pub fn reason_cell(e: &ModelEntry) -> String {
+    if e.reasoning { "✓".to_string() } else { "✗".to_string() }
+}
+
 /// Human-readable one-line description for the `/model` picker.
 /// When the local `DIRECT_PRICING` table has no explicit cost, the OpenRouter
 /// (per-token) price is shown instead, tagged `(est)` — it's in the ballpark.
@@ -568,6 +601,54 @@ mod tests {
         let s = format_option(&missing);
         assert!(!s.contains("per M"), "{}", s);
         assert!(!s.contains("(est)"), "{}", s);
+    }
+
+    #[test]
+    fn ctx_cell_and_cost_cell_feed_the_table_columns() {
+        // Direct price -> plain `$p/$c`, no `est`/reasoning tags.
+        let direct = ModelEntry {
+            provider: "deepseek".into(),
+            id: "deepseek/deepseek-chat".into(),
+            display: "deepseek:deepseek-chat".into(),
+            context_length: Some(128_000),
+            prompt_cost: Some(0.0),
+            completion_cost: Some(0.0),
+            reasoning: false,
+            cost_source: CostSource::Direct,
+        };
+        assert_eq!(ctx_cell(&direct), "128000");
+        assert_eq!(cost_cell(&direct), "$0.00/$0.00");
+        assert_eq!(reason_cell(&direct), "✗");
+        // OpenRouter estimate + reasoning -> `~` prefix on cost, `✓` on reason.
+        let est = ModelEntry {
+            provider: "deepseek".into(),
+            id: "deepseek/deepseek-v4-flash".into(),
+            display: "deepseek:deepseek-v4-flash".into(),
+            context_length: Some(1048576),
+            prompt_cost: Some(0.435),
+            completion_cost: Some(0.87),
+            reasoning: true,
+            cost_source: CostSource::OpenRouterEstimate,
+        };
+        assert_eq!(ctx_cell(&est), "1048576");
+        let c = cost_cell(&est);
+        assert!(c.contains("$0.43/$0.87"), "{}", c);
+        assert!(c.starts_with('~'), "estimate marked with ~ inline: {}", c);
+        assert!(!c.contains("est"), "no separate est tag: {}", c);
+        assert_eq!(reason_cell(&est), "✓");
+        // Missing fields -> em dash placeholders.
+        let missing = ModelEntry {
+            provider: "deepseek".into(),
+            id: "deepseek/unknown".into(),
+            display: "deepseek:unknown".into(),
+            context_length: None,
+            prompt_cost: None,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: CostSource::Direct,
+        };
+        assert_eq!(ctx_cell(&missing), "—");
+        assert_eq!(cost_cell(&missing), "—");
     }
     #[tokio::test]
     #[ignore]

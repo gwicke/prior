@@ -17,6 +17,7 @@ use crate::output::{term_width, wrap};
 use crate::model_catalog;
 use crate::slash;
 use crate::thinking;
+use crate::table::{Align, Table};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -396,20 +397,35 @@ impl Repl {
                             cur_filter = rest.trim().to_string();
                             let (entries, act) = Self::model_overlay_entries(ctx, &cur_filter);
                             active = act;
-                            // Dim models whose provider has no API key configured.
-                            opts = entries
-                                .iter()
-                                .map(|e| {
-                                    let s = model_catalog::format_option(e);
-                                    if model_catalog::provider_available(&e.provider) {
-                                        s
-                                    } else {
-                                        format!("\x1b[2m{}\x1b[0m", s)
-                                    }
-                                })
-                                .collect();
-                            if opts.is_empty() {
+                            if entries.is_empty() {
                                 opts.push("(loading models... or no matches)".into());
+                            } else {
+                                // Aligned table: Model | Ctx | Cost | Reason. `avail` mirrors
+                                // `overlay_lines`' `opt_w` (terminal − marker width) so each
+                                // row fits on one line and the selection marker still fits.
+                                let avail = term_width().saturating_sub(2);
+                                let mut table = Table::new(&["Model", "Ctx", "Cost", "?"])
+                                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Left])
+                                    .with_min_widths(&[12, 5, 14, 3])
+                                    .with_priorities(&[3, 1, 2, 1])
+                                    .set_gap(2);
+                                for e in &entries {
+                                    table.add_row(&[
+                                        e.display.clone(),
+                                        model_catalog::ctx_cell(e),
+                                        model_catalog::cost_cell(e),
+                                        model_catalog::reason_cell(e),
+                                    ]);
+                                }
+                                let rows = table.render(avail);
+                                // Dim models whose provider has no API key configured.
+                                for (i, row) in rows.into_iter().enumerate() {
+                                    if model_catalog::provider_available(&entries[i].provider) {
+                                        opts.push(row);
+                                    } else {
+                                        opts.push(format!("\x1b[2m{}\x1b[0m", row));
+                                    }
+                                }
                             }
                         }
                         "thinking" | "think" | "t" => {

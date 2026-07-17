@@ -10,6 +10,7 @@ pub mod slash;
 pub mod repl;
 pub mod model_catalog;
 pub mod thinking;
+pub mod table;
 
 pub use config::{Config, Recipe, ToolSettings};
 
