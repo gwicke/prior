@@ -361,9 +361,55 @@ trait Output: Send + Sync {
 `tracing::info!` the deltas; `QuietOutput` stays silent (no-op) so quiet mode
 remains minimal.
 
-### Phase 4 — `ConsoleOutput` live rendering
-Reuses the `markdown-terminal` + `Theme` + GFM conventions established in Phase 1;
-only the *live* `LiveRenderer` path is new:
+### Phase 4 — `ConsoleOutput` live rendering (incremental)
+**Status: re-implemented** (2025-07-17). The first cut (whole-document
+in-place redraw, mirroring `markdown_terminal::LiveRenderer`) produced blank
+lines between wrapped rows and broke up / mis-rendered code blocks, because
+re-rendering the *entire* accumulated Markdown on every token fights the
+terminal's soft-wrap and re-parses incomplete structures (an open code fence
+renders inconsistently). Root cause confirmed by reading the crate: `LiveRenderer`
+itself re-renders the whole doc each push — the limitation is inherent to that
+approach.
+
+The crate's intended live path is its **incremental** `Renderer` + `StreamParser`:
+feed streamed deltas as events and let it emit *completed* blocks once. That is
+exactly the "coarser-grained streaming parsing" that fixes both classes of bug,
+so Phase 4 now uses it.
+
+Implementation (`src/output.rs`): `ConsoleOutput` holds a persistent
+`markdown_stream::StreamParser` and `markdown_terminal::Renderer` for the
+response (TTY only). `begin_response` (TTY) resets both and prints a leading
+blank. Code lines stream line-by-line; an open paragraph is held until it closes
+(coarse) and flushed at `end_response` via `parser.flush()`. The non-TTY path is
+unchanged (buffer + `display_markdown` once). Tests:
+`incremental_renderer_streams_code_lines_and_coarsens_paragraphs` asserts code
+lines render before the fence closes while an open paragraph is held back until
+`flush`; `incremental_renderer_gfm_table_renders` asserts GFM tables render.
+Known characteristic: a single paragraph with no intervening block renders only
+when it closes, so long prose appears at `end_response` rather than token-by-token
+(usually unnoticeable for block-structured coding responses).
+
+Behavior:
+- `begin_response` snapshots `is_terminal()` into `live`; on a TTY it prints a
+  leading blank to separate from the user prompt. On a non-TTY it buffers into
+  `text_buffer` (rendered once at `end_response` via `display_markdown`, matching
+  Phase 1/6 clean-output behavior).
+- `stream_text(delta)` (TTY) feeds `parser.write(delta)` → `renderer.feed(events,
+  stdout)`. Completed blocks print once: **code lines stream line-by-line**; an
+  **open paragraph is held until it closes** (coarse) and flushed at
+  `end_response` via `parser.flush()`. No in-place redraw → no wrap-count math,
+  and **scrollback stays clean** by construction. The per-screen C cap is
+  unnecessary and was dropped.
+- `stream_thinking(delta)` buffers; surfaced at `end_response` via
+  `display_text` (Phase 5 relocates into a thinking panel).
+- `end_response_segment()` (TTY) feeds `"\n\n"` to close any open paragraph so the
+  upcoming tool call/result prints below it (no stray blank if nothing follows).
+  `end_response()` (TTY) calls `parser.flush()` to finalize and emit the trailing
+  block. The non-TTY path is unchanged (buffer + `display_markdown` once).
+- `QuietOutput` / `NoOutput` / `LogOutput` / `ScrollbackOutput` unchanged
+  (streaming methods default to no-ops). Full suite green, no warnings.
+
+Original plan notes (kept for reference):
 - Hold a `markdown_terminal::LiveRenderer` (and a second one for the thinking
   panel) in `ConsoleOutput`, created in `begin_response` with
   `term_width()` and `std::io::stdout().is_terminal()` for `live`.
@@ -376,6 +422,48 @@ only the *live* `LiveRenderer` path is new:
   layout conflict between in-place redraw and interleaved tool output.
 - `end_response()` → final `live.finish` and update cursor-row tracking
   (see §5).
+
+### OSC 8 clickable links (forked `codewandler-markdown-terminal`)
+
+**Status: implemented (2025-07-17), vendored as a fork.**
+
+`codewandler-markdown-terminal` 0.2.1 renders inline links as colored/underlined
+text only and **discards the URL** — so links are never clickable. There is no
+built-in option for OSC 8 hyperlinks. Fix: a small, backward-compatible patch to
+the crate adds a `Theme::clickable_links: bool` field; when set, `Renderer::styled`
+wraps non-image links in OSC 8 sequences
+(`\x1b]8;;<href>\x1b\\ … \x1b]8;;\x1b\\`) so they are clickable in terminals
+that support it (iTerm2, GNOME Terminal, VS Code, Alacritty, WezTerm, Kitty).
+Off by default, so logs/pipes stay escape-free; picocode opts in **only on a real
+TTY**.
+
+Upstreamability / clean history:
+- The change lives in a fork of the upstream `codewandler-markdown` workspace
+  (repo `https://github.com/gwicke/codewandler-markdown`), as a **single feature
+  commit on top of upstream `acbe68d` (Release 0.2.1)**: commit `c28fdd3`
+  "Add OSC 8 clickable inline links, gated by Theme.clickable_links". This is a
+  ready-to-open PR diff (one commit; `Theme` default behavior unchanged).
+- Patch touches only `crates/markdown-terminal/src/{theme,lib}.rs` — adds the
+  field, the OSC 8 wrap in `styled`, and three unit tests (enabled / default-off
+  / image-exclusion).
+
+Wiring in picocode (`src/output.rs`):
+- `render_markdown(src, width, color)` sets `theme.clickable_links = color`, and
+  `ConsoleOutput::begin_response` (TTY) builds the `Renderer` with
+  `theme.clickable_links = true`. `color`/`live` are `is_terminal()`, so OSC 8 is
+  gated to a TTY and absent for pipes/CI.
+- Tests: `output::tests::render_markdown_emits_osc8_links_only_when_colored`
+  asserts OSC 8 appears for `color = true` and is absent for `false`.
+
+Build setup (`Cargo.toml`): `[patch.crates-io]` points both
+`codewandler-markdown-terminal` and `codewandler-markdown-stream` at the fork
+(`git = "https://github.com/gwicke/codewandler-markdown", rev = "c28fdd3"`).
+Both are pinned to the same fork commit so `markdown_stream::Event` resolves to a
+single type across picocode and the patched renderer (otherwise the patched
+crate's workspace `markdown-stream` and picocode's registry `markdown-stream`
+would be two sources and `feed(&[Event])` would fail to type-check). The local
+bind-mount path override used for testing was removed; the final setup references
+only the remote fork.
 
 ### Phase 5 — Thinking panel UX
 - A collapsible, dim "thinking" region above the final answer. Toggle visibility
