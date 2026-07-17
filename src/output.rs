@@ -1,9 +1,14 @@
 use console::{style, StyledObject};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 use termimad;
+use libc;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -31,6 +36,18 @@ pub trait Output: Send + Sync {
         limit: usize,
         persona: Option<&str>,
     );
+    /// Print plain text with no decorative prefix (used for the startup
+    /// hint/status line and REPL-originated confirmations). Advances the
+    /// tracked cursor by the wrapped line count.
+    fn display_plain(&self, _text: &str) {}
+    /// Current cursor row (1-based). The REPL uses it to position the input
+    /// line at the natural cursor rather than forcing it to the screen
+    /// bottom (which would leave a gap in the scrollback). The default
+    /// returns the terminal height (correct for non-console outputs, which
+    /// don't run the raw-mode REPL).
+    fn cursor_row(&self) -> usize {
+        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
+    }
 }
 
 pub struct QuietOutput {
@@ -182,6 +199,7 @@ impl Output for LogOutput {
 
 pub struct ConsoleOutput {
     spinner: Mutex<Option<ProgressBar>>,
+    row: Mutex<usize>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -193,7 +211,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Terminal width in columns, or 80 if it cannot be determined.
-fn term_width() -> usize {
+pub fn term_width() -> usize {
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80)
@@ -277,6 +295,7 @@ impl ConsoleOutput {
     pub fn new() -> Self {
         Self {
             spinner: Mutex::new(None),
+            row: Mutex::new(1),
         }
     }
 }
@@ -287,7 +306,123 @@ impl Default for ConsoleOutput {
     }
 }
 
+/// Remove ANSI/CSI escape sequences (e.g. `\x1b[1;36m`) so that
+/// downstream width/wrap math only counts *visible* characters.
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            // ESC [ ... <final>  (CSI)  or  ESC ] ... BEL/ST  (OSC): skip to terminator.
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() { i += 1; } // consume final byte
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
+                    i += 1;
+                }
+                if i < bytes.len() { i += 1; } // consume BEL or ST
+                continue;
+            }
+        }
+        // bytes[i] is either ASCII or a UTF-8 lead byte; copy the
+        // whole char to preserve multi-byte content.
+        let ch_len = utf8_len(bytes[i]);
+        if i + ch_len <= bytes.len() {
+            out.push_str(std::str::from_utf8(&bytes[i..i + ch_len]).unwrap_or("\u{fffd}"));
+        }
+        i += ch_len.max(1);
+    }
+    out
+}
+
+/// UTF-8 lead byte -> byte length (1..=4).
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 { 1 } else if b >> 5 == 0b110 { 2 } else if b >> 4 == 0b1110 { 3 } else if b >> 3 == 0b11110 { 4 } else { 1 }
+}
+
+/// Non-blocking Device Status Report: ask the terminal for the real
+/// cursor row, timing out fast so we never hang on a terminal that
+/// does not answer (e.g. a headless test pty). Returns a 1-indexed
+/// row. Reads the reply raw (bypassing crossterm's event parser).
+fn query_real_cursor_row() -> Option<usize> {
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    // Make stdin non-blocking so a missing DSR reply cannot hang us.
+    let old = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if old < 0 {
+        return None;
+    }
+    unsafe { libc::fcntl(fd, libc::F_SETFL, old | libc::O_NONBLOCK) };
+    let restore = |f: i32, o: i32| unsafe { libc::fcntl(f, libc::F_SETFL, o); };
+
+    let mut out = io::stdout();
+    if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
+        restore(fd, old);
+        return None;
+    }
+
+    let mut guard = stdin.lock();
+    let start = Instant::now();
+    let mut buf = Vec::new();
+    let mut got = false;
+    while start.elapsed() < Duration::from_millis(60) {
+        let mut b = [0u8; 1];
+        match guard.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(b[0]);
+                if b[0] == b'R' {
+                    got = true;
+                    break;
+                }
+            }
+            Err(_) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    restore(fd, old);
+    if got {
+        parse_dsr(&buf)
+    } else {
+        None
+    }
+}
+
+/// Parse a Device Status Report reply `ESC[<row>;<col>R` into the 1-indexed row.
+fn parse_dsr(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 4
+        || buf[0] != 0x1b
+        || buf[1] != b'['
+        || *buf.last()? != b'R'
+    {
+        return None;
+    }
+    let inner = &buf[2..buf.len() - 1];
+    let mut it = inner.splitn(2, |&c| c == b';');
+    let row = it.next()?;
+    let row_s = std::str::from_utf8(row).ok()?;
+    row_s.parse::<usize>().ok()
+}
+
 impl ConsoleOutput {
+    /// Advance the tracked cursor by `n` physical lines. The real terminal
+    /// scrolls and keeps the cursor on the bottom row when content overflows,
+    /// so we *clamp* to the height rather than wrapping (a modulo wrap would
+    /// teleport the tracked row to the top of the screen after a long session).
+    fn note_lines(&self, n: usize) {
+        let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let h = h.max(1) as usize;
+        let mut r = self.row.lock().unwrap();
+        *r = (*r + n - 1).min(h - 1) + 1;
+    }
+
     fn separator() {
         let width = term_width();
         println!("{}", style("─".repeat(width)).dim());
@@ -307,16 +442,43 @@ impl ConsoleOutput {
 }
 
 impl Output for ConsoleOutput {
+    fn cursor_row(&self) -> usize {
+        // Prefer the real terminal cursor position (robust to wrapping,
+        // ANSI escapes, and termimad-rendered responses). Fall back
+        // to the tracked/ANSI-stripped prediction if the terminal
+        // does not answer the Device Status Report (e.g. a headless pty).
+        match query_real_cursor_row() {
+            Some(r) => {
+                *self.row.lock().unwrap() = r;
+                r
+            }
+            None => *self.row.lock().unwrap(),
+        }
+    }
+
+    fn display_plain(&self, text: &str) {
+        self.stop_thinking();
+        // Count *visible* lines only; `text` may carry ANSI color escapes
+        // that must not be treated as visible width (or the cursor-row
+        // tracker over-advances and wraps to the top of the screen).
+        let w = term_width();
+        let n = if text.is_empty() {
+            1
+        } else {
+            wrap(&strip_ansi(text), w).len().max(1)
+        };
+        println!("{}", text);
+        self.note_lines(n);
+    }
+
     fn display_text(&self, text: &str) {
-        eprintln!(
-            "[picocode-dbg] ConsoleOutput::display_text first_line={:?}",
-            text.lines().next().unwrap_or("")
-        );
         self.stop_thinking();
         println!();
         print!("{} ", style("⏺").cyan());
         termimad::print_inline(text);
         println!();
+        let n = wrap(text, term_width()).len() + 1;
+        self.note_lines(n);
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
@@ -333,6 +495,7 @@ impl Output for ConsoleOutput {
             style(capitalized_name).bold(),
             style(preview).dim()
         );
+        self.note_lines(2);
     }
 
     fn display_tool_result(&self, result: &str) {
@@ -367,12 +530,14 @@ impl Output for ConsoleOutput {
 
         if lines.is_empty() {
             println!("  {}  {}", style("└").dim(), style("(empty)").dim());
+            self.note_lines(1);
             return;
         }
 
         let show_max = if is_error { usize::MAX } else { 4 };
         let wrap_width = term_width().saturating_sub(4); // account for "  │  " prefix
         let mut printed = 0;
+        let mut printed_count = 0;
         for (i, line) in lines.iter().enumerate() {
             if printed >= show_max {
                 break;
@@ -384,6 +549,7 @@ impl Output for ConsoleOutput {
             };
             if is_error {
                 println!("  {}  {}", style(symbol).dim(), style(line.to_string()).red());
+                printed_count += 1;
             } else {
                 let wrapped = if wrap_width == 0 {
                     vec![line.to_string()]
@@ -393,6 +559,7 @@ impl Output for ConsoleOutput {
                 for (j, wline) in wrapped.into_iter().enumerate() {
                     let sym = if j == 0 { symbol } else { " " };
                     println!("  {}  {}", style(sym).dim(), style(wline).dim());
+                    printed_count += 1;
                 }
             }
             printed += 1;
@@ -404,7 +571,9 @@ impl Output for ConsoleOutput {
                 style("└").dim(),
                 style(format!("... +{} lines", lines.len() - show_max)).dim()
             );
+            printed_count += 1;
         }
+        self.note_lines(printed_count.max(1));
     }
 
     fn get_user_input(&self) -> String {
@@ -420,11 +589,13 @@ impl Output for ConsoleOutput {
     fn display_error(&self, error: &str) {
         self.stop_thinking();
         println!("{} Error: {}", style("⏺").red(), error);
+        self.note_lines(1);
     }
 
     fn display_system(&self, text: &str) {
         self.stop_thinking();
         println!("{}", style(text).bold().dim());
+        self.note_lines(1);
     }
 
     fn confirm(&self, message: &str) -> Confirmation {
@@ -436,6 +607,7 @@ impl Output for ConsoleOutput {
             style("n").bold(),
             style("s").bold()
         );
+        self.note_lines(2);
         let input = self.get_user_input().to_lowercase();
         match input.as_str() {
             "y" | "yes" => Confirmation::Yes,
@@ -447,6 +619,7 @@ impl Output for ConsoleOutput {
     fn display_separator(&self) {
         self.stop_thinking();
         Self::separator();
+        self.note_lines(1);
     }
 
     fn display_thinking(&self, message: &str) {
@@ -518,6 +691,90 @@ impl Output for ConsoleOutput {
             style(format!("limit:{}", limit)).yellow(),
             style(cwd).dim()
         );
+        self.note_lines(9);
+    }
+}
+
+/// An `Output` wrapper no longer used: the REPL relies on the terminal's
+/// native scrollback (the session scrolls there naturally during the session),
+/// so a separate ring buffer is unnecessary.
+#[allow(dead_code)]
+pub struct ScrollbackOutput {
+    inner: Arc<dyn Output>,
+    sb: Arc<Mutex<VecDeque<String>>>,
+}
+
+#[allow(dead_code)]
+impl ScrollbackOutput {
+    pub fn new(inner: Arc<dyn Output>, sb: Arc<Mutex<VecDeque<String>>>) -> Self {
+        Self { inner, sb }
+    }
+
+    fn append(&self, text: &str) {
+        let mut sb = self.sb.lock().unwrap();
+        for line in text.split('\n') {
+            sb.push_back(line.to_string());
+        }
+        const CAP: usize = 1000;
+        while sb.len() > CAP {
+            sb.pop_front();
+        }
+    }
+}
+
+impl Output for ScrollbackOutput {
+    fn cursor_row(&self) -> usize {
+        self.inner.cursor_row()
+    }
+    fn display_plain(&self, text: &str) {
+        self.append(text);
+        self.inner.display_plain(text);
+    }
+    fn display_text(&self, text: &str) {
+        self.append(text);
+        self.inner.display_text(text);
+    }
+    fn display_tool_call(&self, name: &str, args: &Value) {
+        self.inner.display_tool_call(name, args);
+    }
+    fn display_tool_result(&self, result: &str) {
+        self.append(result);
+        self.inner.display_tool_result(result);
+    }
+    fn get_user_input(&self) -> String {
+        self.inner.get_user_input()
+    }
+    fn display_error(&self, error: &str) {
+        self.append(error);
+        self.inner.display_error(error);
+    }
+    fn display_system(&self, text: &str) {
+        self.append(text);
+        self.inner.display_system(text);
+    }
+    fn confirm(&self, message: &str) -> Confirmation {
+        self.inner.confirm(message)
+    }
+    fn display_separator(&self) {
+        let line = "─".repeat(term_width());
+        self.append(&line);
+        self.inner.display_separator();
+    }
+    fn display_thinking(&self, message: &str) {
+        self.inner.display_thinking(message);
+    }
+    fn stop_thinking(&self) {
+        self.inner.stop_thinking();
+    }
+    fn display_header(
+        &self,
+        provider: &str,
+        model: &str,
+        yolo: bool,
+        limit: usize,
+        persona: Option<&str>,
+    ) {
+        self.inner.display_header(provider, model, yolo, limit, persona);
     }
 }
 

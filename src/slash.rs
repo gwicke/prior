@@ -8,6 +8,7 @@ pub enum SlashKind {
     Help,
     Thinking,
     Model,
+    Quit,
 }
 
 /// A registered slash command.
@@ -35,6 +36,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/model",
             help: "Select a model (provider:name) with limits and cost",
             kind: SlashKind::Model,
+        },
+        SlashCommand {
+            name: "/quit",
+            help: "Quit the session",
+            kind: SlashKind::Quit,
         },
     ];
     COMMANDS
@@ -109,7 +115,7 @@ mod tests {
 
     #[test]
     fn registry_has_three_commands() {
-        assert_eq!(registry().len(), 3);
+        assert_eq!(registry().len(), 4);
     }
 
     #[test]
@@ -128,7 +134,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 3);
+        assert_eq!(r.len(), 4);
     }
 
     #[test]

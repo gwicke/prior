@@ -1,5 +1,5 @@
 use crate::output::Confirmation;
-use crate::repl::Repl;
+use crate::repl::{InputAction, Repl, ReplCtx};
 use crate::tools::{
     AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir, MoveFile,
     ReadFile, Remove, WriteFile,
@@ -7,8 +7,8 @@ use crate::tools::{
 use crate::Output;
 use crate::Result;
 use crate::model_catalog;
-use crate::slash;
 use crate::thinking;
+use console::style;
 use rig::agent::{Agent, AgentBuilder, CancelSignal, PromptHook};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{CompletionModel, Prompt, ToolDefinition};
@@ -433,186 +433,137 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
     let mut repl = if use_repl { Some(Repl::new()) } else { None };
     if let Some(r) = repl.as_mut() {
         let _ = r.start();
+        // First screen: a one-line hint + the current status line, both
+        // emitted via the `Output` impl so cursor tracking stays correct.
+        let status = format!(
+            "{} | {} ({}) | {}",
+            style("picocode").bold(),
+            style(&config.provider).cyan(),
+            style(&config.model).blue(),
+            style(format!("limit:{} yolo={}", config.tool_call_limit, config.yolo)).yellow(),
+        );
+        config.output.display_plain("picocode - /menu for details.  (or type /help)");
+        config.output.display_plain(&status);
     }
 
     let mut history = Vec::new();
     let mut line_history = crate::repl::History::load();
+    let mut recent_models: Vec<String> = Vec::new();
+    // Warm the model catalog cache in the background so the `/model`
+    // overlay is populated within a few seconds *without* blocking the
+    // first prompt. The overlay falls back to the cached/static list
+    // until the fetch completes.
+    let _ = tokio::task::spawn(async {
+        let _ = model_catalog::catalog().await;
+    });
     loop {
-        config.output.display_separator();
-        let input = match repl.as_mut() {
-            Some(r) => r.read_input(&prompt_str, &mut line_history),
-            None => Some(config.output.get_user_input()),
+        let action = match repl.as_mut() {
+            Some(r) => {
+                config.output.display_separator();
+                let ctx = ReplCtx {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    recent: recent_models.clone(),
+                };
+                r.read_input(&prompt_str, &mut line_history, &ctx, config.output.cursor_row())
+            }
+            None => Some(InputAction::Submit(config.output.get_user_input())),
         };
-        let input = match input {
-            Some(s) => s,
+        let action = match action {
+            Some(a) => a,
             None => continue,
         };
-        if input.is_empty() {
-            continue;
-        }
-        line_history.add(&input);
-        if input == "/q" || input == "exit" {
-            break;
-        }
-
-        // Slash dispatch (input already known to start with '/').
-        if let Some(rest) = input.strip_prefix('/') {
-            match slash::parse_slash(rest) {
-                slash::SlashIntent::Help => {
-                    let msg = slash::render_help();
-                    match repl.as_mut() {
-                        Some(r) => r.print_block(&msg),
-                        None => config.output.display_text(&msg),
+        match action {
+            InputAction::Quit => break,
+            InputAction::SetModel(provider, model) => {
+                let mut new_cfg = config.clone();
+                new_cfg.provider = provider;
+                new_cfg.model = model;
+                match create_agent(new_cfg.clone()).await {
+                    Ok(new_agent) => {
+                        agent = Some(new_agent);
+                        config = new_cfg;
+                        recent_models.push(format!("{}/{}", config.provider, config.model));
+                        config.output.display_plain(&format!(
+                            "model -> {}/{}",
+                            config.provider, config.model
+                        ));
                     }
+                    Err(e) => config
+                        .output
+                        .display_text(&format!("Cannot switch model: {}", e)),
                 }
-                slash::SlashIntent::Model => {
-                    if let Some((provider, model)) =
-                        select_model(&config, repl.as_mut()).await
-                    {
+            }
+            InputAction::SetThinking(level) => {
+                match level.parse::<thinking::ThinkingLevel>() {
+                    Ok(level) => {
                         let mut new_cfg = config.clone();
-                        new_cfg.provider = provider;
-                        new_cfg.model = model;
+                        new_cfg.thinking_level = Some(level.as_str().to_string());
                         match create_agent(new_cfg.clone()).await {
                             Ok(new_agent) => {
                                 agent = Some(new_agent);
                                 config = new_cfg;
-                                config.output.display_header(
-                                    &config.provider,
-                                    &config.model,
-                                    config.yolo,
-                                    config.tool_call_limit,
-                                    config.persona_name.as_deref(),
-                                );
-                            }
-                            Err(e) => config
-                                .output
-                                .display_text(&format!("Cannot switch model: {}", e)),
-                        }
-                    }
-                }
-                slash::SlashIntent::Thinking(arg) => {
-                    if arg.is_empty() {
-                        let cur = config.thinking_level.as_deref().unwrap_or("off");
-                        let msg = format!("thinking level: {}", cur);
-                        match repl.as_mut() {
-                            Some(r) => r.print_block(&msg),
-                            None => config.output.display_text(&msg),
-                        }
-                    } else {
-                        match arg.parse::<thinking::ThinkingLevel>() {
-                            Ok(level) => {
-                                let mut new_cfg = config.clone();
-                                new_cfg.thinking_level = Some(level.as_str().to_string());
-                                match create_agent(new_cfg.clone()).await {
-                                    Ok(new_agent) => {
-                                        agent = Some(new_agent);
-                                        config = new_cfg;
-                                        let msg = format!(
-                                            "thinking level -> {}",
-                                            level.as_str()
-                                        );
-                                        match repl.as_mut() {
-                                            Some(r) => r.print_block(&msg),
-                                            None => config.output.display_text(&msg),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let msg = format!("Cannot set thinking: {}", e);
-                                        match repl.as_mut() {
-                                            Some(r) => r.print_block(&msg),
-                                            None => config.output.display_text(&msg),
-                                        }
-                                    }
+                                let msg = format!("thinking level -> {}", level.as_str());
+                                match repl.as_mut() {
+                                    Some(_) => config.output.display_plain(&msg),
+                                    None => config.output.display_plain(&msg),
                                 }
                             }
                             Err(e) => {
-                                let msg = e.to_string();
-                                match repl.as_mut() {
-                                    Some(r) => r.print_block(&msg),
-                                    None => config.output.display_text(&msg),
-                                }
+                                let msg = format!("Cannot set thinking: {}", e);
+                                config.output.display_plain(&msg);
                             }
                         }
                     }
-                }
-                slash::SlashIntent::Unknown(cmd) => {
-                    let msg = format!(
-                        "Unknown command: /{}. Type /help for a list.",
-                        cmd
-                    );
-                    match repl.as_mut() {
-                        Some(r) => r.print_block(&msg),
-                        None => config.output.display_text(&msg),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        config.output.display_plain(&msg);
                     }
                 }
             }
-            continue;
-        }
-
-        // Normal prompt — create the agent lazily on first use.
-        if agent.is_none() {
-            match create_agent(config.clone()).await {
-                Ok(a) => agent = Some(a),
-                Err(e) => {
-                    let msg = format!("Cannot start agent: {}", e);
-                    match repl.as_mut() {
-                        Some(r) => r.print_block(&msg),
-                        None => config.output.display_text(&msg),
-                    }
+            InputAction::Submit(input) => {
+                if input.is_empty() {
                     continue;
                 }
+                line_history.add(&input);
+                if input == "/q" || input == "exit" {
+                    break;
+                }
+                // Reprint the submitted prompt via the `Output` impl so the
+                // session (and cursor tracking) stays correct; `read_input`
+                // cleared the input line on submit.
+                config.output.display_plain(&input);
+                // Separator between the user's prompt and the agent response.
+                config.output.display_separator();
+                // Normal prompt — create the agent lazily on first use.
+                if agent.is_none() {
+                    match create_agent(config.clone()).await {
+                        Ok(a) => agent = Some(a),
+                        Err(e) => {
+                            config
+                                .output
+                                .display_text(&format!("Cannot start agent: {}", e));
+                            continue;
+                        }
+                    }
+                }
+                let response = agent
+                    .as_ref()
+                    .unwrap()
+                    .prompt(&input, Some(&mut history))
+                    .await;
+                match response {
+                    Ok(r) => {
+                        config.output.display_text(&r);
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Error: {}", e));
+                    }
+                }
             }
         }
-        let response = agent.as_ref().unwrap().prompt(&input, Some(&mut history)).await?;
-        config.output.display_text(&response);
     }
     Ok(())
-}
-
-/// Render the `/model` selector and return the chosen `(provider, model)`.
-/// Uses the REPL list picker when a TTY is active, otherwise a numbered list.
-async fn select_model(config: &AgentConfig, repl: Option<&mut Repl>) -> Option<(String, String)> {
-    let entries = model_catalog::catalog().await;
-    if entries.is_empty() {
-        config
-            .output
-            .display_text("No models available (no provider API keys found).");
-        return None;
-    }
-    let options: Vec<String> = entries
-        .iter()
-        .map(model_catalog::format_option)
-        .collect();
-
-
-    let idx = match repl {
-        Some(r) => r.select("Select a model (up/down, Enter, Esc to cancel):", &options),
-        None => {
-            let mut s = String::from("Models:\n");
-            for (i, o) in options.iter().enumerate() {
-                s.push_str(&format!("  {}: {}\n", i + 1, o));
-            }
-            config.output.display_text(&s);
-            let choice = config.output.get_user_input();
-            choice
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .and_then(|n| {
-                    if n >= 1 && n <= entries.len() {
-                        Some(n - 1)
-                    } else {
-                        None
-                    }
-                })
-        }
-    };
-
-    idx.map(|i| {
-        let e = &entries[i];
-        let model = e.id.splitn(2, '/').nth(1).unwrap_or(&e.id).to_string();
-        (e.provider.clone(), model)
-    })
 }
 
 impl<M: CompletionModel + 'static> CodeAgent<M> {

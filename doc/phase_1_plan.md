@@ -535,6 +535,83 @@ visible frame; **never** clear scrollback:
   (the OQ5 user preference — avoids double-wrapping) while preserving the
   no-scrollback-wipe property (Appendix A invariant).
 
+### 3.7 Layout & rendering strategy (final, 2026-07-16)
+
+This is the canonical rendering model for the REPL. It supersedes the earlier
+"overlay above input" / scrollback-restore / SU-SD experiments (Stage 3 notes
+pt-2…pt-5), which proved fragile because clearing above the input clobbered
+session content and forced fragile redraws.
+
+**Core invariant: every `\x1b[K` / clear we emit is at the input row or
+*below* it.** Nothing above the input line (greeter, status, divider, session
+output) is ever cleared or redrawn. This is what keeps session content intact
+and removes the need for any scrollback re-emit, `SU`/`SD`, or status block.
+
+**Vertical layout (top → bottom), single primary scrollback:**
+```
+┌─ session output (native stdout, already in scrollback) ─────────────┐
+│ picocode - /menu for details. (or type /help)   ← startup hint    │
+│ picocode | openrouter (model) | limit:50 yolo=false  ← status    │
+│ ───────────────────────────────────────────────  ← startup divider│
+│ > _                                            ← input line      │
+│ ───────────────────────────────────────────────  ← under-prompt  │
+│ [pop-up area: /model list, /help, /thinking, /menu]  ← BELOW input │
+└───────────────────────────────────────────────────────────────────┘
+```
+- The **greeter** (hint + status + divider) is printed **once** at REPL entry as
+  ordinary stdout, so it simply becomes the top of the scrollback. The input
+  line then begins at the natural cursor row after it.
+- `read_input` receives `initial_row = Output::cursor_row()` (the row the cursor
+  is actually on after the greeter) and **never forces it to the screen
+  bottom** — the input stays exactly where the greeter left it.
+- The **under-prompt divider** is printed on submit (before the agent response)
+  as an ordinary separator in the scrollback. Because the pop-up lives *below*
+  the input, opening a pop-up never touches it.
+
+**Pop-up (overlay) geometry:**
+- The pop-up is emitted **below the input line** (rows `input_row+1 …`).
+- It uses **at most 2/3 of the terminal height** (minus divider lines), and
+  **at least 1 line** is always shown. Minimal 5-line terminal, top-down:
+  `1 line session content · 1 line divider · input line · divider · pop-up`.
+  On taller terminals both more session content (above) and more pop-up lines
+  (below) are shown. The pop-up is clamped so it never overwrites the input or
+  grows above row `input_row+1`.
+- The pop-up is rendered **linearly** (dim divider + title + option rows, top to
+  bottom) and **updated by overwrite**: each keystroke first positions the
+  cursor at the input row and clears to the end of the screen
+  (`\x1b[{input_row};1H\x1b[0J`), rewrites the input block, then emits the
+  divider + pop-up rows **directly below** the input (the terminal advances
+  the cursor downward via `\n` as each row is written). Content *above* the
+  input is never touched, so nothing in the scrollback needs re-emitting or
+  restoring. When the pop-up is taller than the space left, the terminal
+  naturally scrolls the overflow into its native scrollback (session
+  preserved above); the input **stays shifted up** (the scroll is never undone
+  automatically). The redraw tracks the input's *current* visible row across
+  keystrokes — it starts at `Output::cursor_row()` and is decreased by the
+  scroll delta (`max(0, end_row − term_h)`) whenever a write overflows the
+  bottom, and is never increased. This is what prevents duplication: a redraw
+  always clears and rewrites at the input's actual (possibly scrolled-up)
+  row, never at the fixed original row. (`Repl::next_input_row` is the pure
+  helper; unit-tested.) No `SU`/`SD`, no alt buffer, no per-row `\x1b[K` erase,
+  no scrollback manipulation — which is what makes the model robust and
+  side-effect-free. The **last pop-up line has no trailing newline**, so the
+  cursor rests at the end of the final row (no empty line below the pop-up).
+- Live filtering (fuzzy) re-sorts/reslices the option list every keystroke;
+  the selection cursor is kept within the visible window (see `overlay_window`).
+
+**Why below-input and not above:** an above-input pop-up forces clearing the
+rows *above* the input, which overlaps the divider/session content and
+necessitates restoring it on close (the fragile path we retired). Keeping all
+managed clearing at-or-below the input localizes every redraw to rows the
+prompt itself owns, so the scrollback above is structurally untouchable.
+
+**Start-up greeter content (current):**
+- Hint: `picocode - /menu for details. (or type /help)`
+- Status: `picocode | {provider} ({model}) | limit:{N} yolo={bool}`
+- *Follow-up:* the hint references `/menu`, but the slash registry defines
+  `/help` (and `/model`, `/thinking`, `/quit`). Either point the hint at `/help`
+  or add a `/menu` alias. (Tracked, not yet fixed.)
+
 ---
 
 # Part B — Implementation Plan
@@ -656,20 +733,60 @@ visible frame; **never** clear scrollback:
       `CodeAgent` track it; the interactive loop is a free `run_interactive`
       that owns `Box<dyn PicoAgent>` + `AgentConfig` and rebuilds on slash changes
       (required: `CodeAgent<M>` is generic over the provider's model type).
-- [x] `/model` UI: `repl.select` list picker (raw TTY) or numbered list
-      (non-TTY); `format_option` shows `{provider}:{model}` + ctx + cost +
-      `(est)` tag + `[reasoning]`. Selection rebuilds the agent with the chosen
-      provider/model. (Per-model `supported_parameters` gating of thinking
-      injection: deferred — `/thinking` currently maps by provider.)
-- [x] `/help` command (lists commands + key bindings).
-- [x] 5-min cache (`OnceLock<Mutex<Cache>>` + `Instant` expiry), whole-catalog key.
+- [x] `/model` UI — **inline overlay (redesigned 2026-07-16):** the old
+      alt-buffer `repl.select` list picker was removed. `read_input` now opens a
+      **slash-aware inline overlay** on the primary screen as the user types:
+        - typing `/model ` (space) opens the model selector; `/` alone shows the
+          command list; `/thinking ` opens the level list; `/help` opens help;
+          `/quit` quits. The overlay live-filters on every keystroke (fuzzy).
+        - `ReplCtx { provider, model, recent }` is rebuilt each loop iteration
+          from `AgentConfig`; `model_overlay_entries` sorts **active model first**,
+          then `recent_models`, then the rest, and marks the active row with `*`
+          (green) while the cursor row is highlighted (bold cyan) on a colored
+          background panel (`render_select` now pads every row to width and
+          wraps option text at `width-2`).
+        - **Availability:** models whose provider has no API key are dimmed
+          (`\x1b[2m`); recent models are pushed to the top via `recent_models`.
+        - `catalog_cached()` (synchronous, returns last cache or static
+          fallback) makes the overlay instant; the network-backed `catalog()`
+          refreshes the cache in the background (no fetch-then-render delay).
+        - Accept with `Enter`/`Tab` (Tab expands a partial command like `/mod`→
+          `/model `); `Esc` returns to the editor; for `/help` **any key** both
+          dismisses the overlay *and* is passed through to the input (so typing
+          resumes normally). Selection returns `InputAction::SetModel`/
+          `SetThinking`/`Quit` (new `InputAction` enum) — no more string-echo
+          round-trip through `select_model`.
+      `format_option` shows `{provider}:{model}` + ctx + cost + `(est)` tag +
+      `[reasoning]`. Selection rebuilds the agent with the chosen
+      provider/model.
+  - **Overlay rendering (final, 2026-07-16):** the inline overlay (pop-up) is
+    drawn **below the input line** (rows `input_row+1 …`), per §3.7. The managed
+    clearing region is the input row and everything below it, so the
+    greeter/status/divider/session above the input is never touched — this is
+    what preserves session content and removes the need for scrollback
+    re-emit, `SU`/`SD`, or a status block. The pop-up uses ≤ 2/3 of the terminal
+    height (≥ 1 line), is re-emitted linearly on every keystroke, and is cleared
+    by per-row erase (`\x1b[K`) on update and on dismiss (leaving the input line
+    contiguous). The active model is resolved against the catalog id with
+    OpenRouter namespace handling (`tencent/hy3:free` ← `--model hy3:free
+    --provider openrouter`), so it sorts first and is marked `*`. The catalog is
+    **deduped by `id`** (`model_catalog::dedupe`) so OpenRouter's routed +
+    direct entries for the same model collapse to one row (the `Direct`-priced
+    copy wins).
+- [x] 5-min cache (`OnceLock<Mutex<Cache>>` + `Instant` expiry), whole-catalog key;
+      plus synchronous `catalog_cached()` for instant overlay rendering.
 - [x] **Unit/integration tests** (`model_catalog.rs`): `parse_openrouter` fixture;
       `extrapolate` (direct entries + availability gating + Direct/Estimate
       pricing); `format_option` (est tag when local price missing); `provider_available`;
       `thinking` mapping per provider. `#[ignore]` live `catalog()` test for manual runs.
-- [~] **Known follow-up (separate issue, not Stage 3):** the `/model` list rows
-      are not yet column-aligned or width-wrapped; long lines overflow. Fix with
-      a padded/aligned layout + `wrap()` (Stage 0) and redraw on resize (Stage 6).
+- [x] `/help` command — rendered as the inline help overlay (any key closes,
+      key passed through); lists commands + key bindings via `slash::render_help`.
+- [x] **Unit tests** updated: `render_select` tests pass `active: Option<usize>`;
+      added `model_rank` sort-order test; `slash` registry now has 4 commands
+      (`/quit` added) — `/help`, `/thinking`, `/model`, `/quit`.
+- [x] **Known follow-up RESOLVED:** `/model` rows are now column-aligned,
+      width-wrapped, and rendered on a colored background panel; long lines no
+      longer overflow the terminal (handled by `wrap()` + `render_select`).
 
 ### Stage 4 — Multi-line editing — ✅ DONE
 > Implemented 2026-07-16. Build green, **no warnings**; 54 lib tests pass

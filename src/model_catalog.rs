@@ -354,6 +354,7 @@ pub async fn catalog() -> Vec<ModelEntry> {
         Err(_) => static_fallback(),
     };
     let entries = liveness_prune(entries).await;
+    let entries = dedupe(entries);
     if let Some(mut m) = CACHE.get_or_init(|| Mutex::new(None)).lock().ok() {
         *m = Some(CacheEntry {
             at: Instant::now(),
@@ -361,6 +362,50 @@ pub async fn catalog() -> Vec<ModelEntry> {
         });
     }
     entries
+}
+
+/// Synchronous, non-blocking catalog: returns the last cached entries if any
+/// (even if stale), otherwise the curated static fallback. Used by the live
+/// `/model` overlay so it can render instantly without a network round-trip;
+/// the network-backed [`catalog`] refreshes the cache in the background.
+pub fn catalog_cached() -> Vec<ModelEntry> {
+    if let Some(c) = CACHE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|g| g.as_ref().cloned())
+    {
+        return c.entries;
+    }
+    static_fallback()
+}
+
+/// Remove entries that share the same `id`. `extrapolate` keeps the
+/// OpenRouter-routed entry and adds a "direct" entry for every available
+/// provider namespace, so OpenRouter-native models (namespace `openrouter`)
+/// get a true duplicate and passthrough models (`anthropic/...`) appear twice
+/// (once routed via OpenRouter, once direct). Collapsing by `id` keeps one row
+/// per model and prefers the `Direct`-priced copy when both exist.
+fn dedupe(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    use std::collections::HashMap;
+    let mut keep: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<ModelEntry> = Vec::with_capacity(entries.len());
+    for e in entries {
+        match keep.get(&e.id) {
+            None => {
+                let idx = out.len();
+                keep.insert(e.id.clone(), idx);
+                out.push(e);
+            }
+            Some(&idx) => {
+                if e.cost_source == CostSource::Direct
+                    && out[idx].cost_source != CostSource::Direct
+                {
+                    out[idx] = e;
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

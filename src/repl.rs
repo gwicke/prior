@@ -13,7 +13,10 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crate::output::wrap;
+use crate::output::{term_width, wrap};
+use crate::model_catalog;
+use crate::slash;
+use crate::thinking;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -90,25 +93,21 @@ impl TermGuard {
     }
 }
 
-/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`) on
-/// the controlling terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`,
-/// which disables `OPOST`; without it a bare `\n` does not return the cursor
-/// to column 0. Best-effort: errors are ignored (output simply stays raw).
+/// Re-enable terminal output post-processing (specifically `OPOST`/`ONLCR`)
+/// on the stdout terminal. `crossterm::enable_raw_mode` runs `cfmakeraw`, which
+/// disables `OPOST`; without it a bare `\n` does not return the cursor to
+/// column 0, so agent responses and separators stagger. We operate on fd 1
+/// (stdout), which is the pty slave when interactive and a pipe otherwise
+/// (tcsetattr on a pipe harmlessly fails). Best-effort: errors are ignored.
 fn enable_output_processing() {
-    use std::os::unix::io::IntoRawFd;
-    let fd = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-        Ok(f) => f.into_raw_fd(),
-        Err(_) => return,
-    };
+    let fd = libc::STDOUT_FILENO;
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(fd, &mut termios) != 0 {
-            libc::close(fd);
             return;
         }
         termios.c_oflag |= libc::OPOST | libc::ONLCR;
         let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
-        libc::close(fd);
     }
 }
 
@@ -123,6 +122,27 @@ pub struct Repl {
     guard: TermGuard,
 }
 
+/// Result of one `read_input` interaction.
+pub enum InputAction {
+    /// Submit a normal prompt (text may be empty when the line was cancelled).
+    Submit(String),
+    /// Switch model: (provider, model).
+    SetModel(String, String),
+    /// Set thinking level (string form: off | low | med | high).
+    SetThinking(String),
+    /// Quit the session.
+    Quit,
+}
+
+/// Context the REPL needs to render slash overlays and to re-emit recent
+/// session output after an inline overlay is dismissed. Rebuilt each loop
+/// iteration from the live `AgentConfig`.
+pub struct ReplCtx {
+    pub provider: String,
+    pub model: String,
+    pub recent: Vec<String>,
+}
+
 impl Repl {
     pub fn new() -> Self {
         Self {
@@ -135,161 +155,351 @@ impl Repl {
         self.guard.start()
     }
 
-    /// Read a multi-line input in raw mode.
+    /// Read a multi-line input in raw mode, with inline slash-command overlays.
     ///
-    /// Returns `Some(text)` with the submitted text (newlines preserved), or
-    /// `Some("")` on `Esc` (cancel the current line), or `None` only on a read
-    /// error. `Ctrl-C` restores the terminal and exits the process (plan §3.4.1).
+    /// Returns `Some(InputAction::Submit(text))` with the submitted prompt,
+    /// `Some(InputAction::SetModel(p, m))` / `SetThinking(level)` / `Quit` when
+    /// the user accepts an overlay selection, or `None` only on a read error.
+    /// `Ctrl-C` restores the terminal and exits the process.
     ///
     /// `history` backs `Up`/`Down` navigation and is persisted to disk.
-    pub fn read_input(&mut self, prompt: &str, history: &mut History) -> Option<String> {
+    /// `Ctrl-C` restores the terminal and exits the process.
+    ///
+    /// As the user types a command (`/model`, `/thinking`, `/help`, `/quit`),
+    /// an inline overlay opens in the input region and live-filters as they
+    /// type. The prompt stays in the same position; overlays are dismissed with
+    /// Esc (or any key for `/help`).
+    /// The multi-line input loop. Slash commands (`/model`, `/thinking`,
+    /// `/help`, `/quit`) open an **inline overlay** directly *above* the
+    /// input line. The prompt stays in the same position; overlays are
+    /// dismissed with `Esc` (or any key for `/help`). Any key typed into
+    /// `/help` is passed through to the editor.
+    ///
+    /// The input line sits at `initial_row` — the natural cursor row tracked
+    /// by the console `Output` — and is *not* forced to the screen
+    /// bottom, so closing an overlay never leaves a gap in the scrollback.
+    /// Overlays are drawn by **overwriting the rows just below the input line**
+    /// (each cleared with `CSI K`); they never scroll, so once a dialog is
+    /// dismissed there are no picker traces in the scrollback. All clearing is
+    /// confined to the input row and below, so the greeter / status / divider /
+    /// session content above the input is never touched (plan §3.7). The pop-up
+    /// uses at most 2/3 of the terminal height (≥ 1 line).
+    pub fn read_input(
+        &mut self,
+        prompt: &str,
+        history: &mut History,
+        ctx: &ReplCtx,
+        initial_row: usize,
+    ) -> Option<InputAction> {
         let mut editor = LineEditor::new();
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
-        // Screen rows occupied by the previously drawn input, so each redraw can
-        // Track the previously drawn region so each redraw can clear exactly
-        // those rows. We clear relative to the *current* cursor, which (by the
-        // editor's invariant) sits at `top + prev_cursor_row`, so moving up
-        // `prev_cursor_row` rows returns to the region's top. This avoids
-        // DECSC/DECRC save/restore, which some terminals honor inconsistently.
-        let mut prev_rows: usize = 0;
-        let mut prev_cursor_row: usize = 0;
-        let redraw = |editor: &LineEditor, prev_rows: &mut usize, prev_cursor_row: &mut usize| {
-            let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+        let mut sel: usize = 0; // selection within the active overlay
+        let mut last_kind: u8 = 0; // 0=None,1=Cmd,2=Model,3=Thinking,4=Help
+        let mut help_view = false;
+        // Command word / filter text captured when building the overlay, so the
+        // Enter handler can re-resolve the highlighted item without re-parsing.
+        let mut cur_word = String::new();
+        let mut cur_filter = String::new();
+        // The input line starts at `initial_row` — the natural cursor row tracked
+        // by the console `Output` — and is *not* forced to the bottom of the
+        // screen, so it never leaves a gap in the session scrollback. `input_row`
+        // is the *current* visible row of the input and is updated every redraw to
+        // follow the terminal's native scroll: when a tall pop-up pushes the input
+        // up, `input_row` decreases and stays there as the pop-up later shrinks
+        // (the terminal never scrolls back down on its own).
+        let mut input_row = initial_row.max(1);
+
+        // Render the input line at `input_row` and the live overlay directly
+        // *below* it. We clear from `input_row` to the end of the screen
+        // (`\x1b[0J`) and rewrite input + overlay; content *above* the input
+        // (greeter / status / divider / session) is untouched. When the overlay
+        // is taller than the space left, the terminal scrolls the overflow into
+        // its native scrollback (session preserved); `input_row` is adjusted by
+        // the scroll delta so the next redraw clears/writes at the right place
+        // (no duplication). See plan §3.7.
+        let redraw = |editor: &LineEditor, overlay: &[&str], sel: usize,
+                      current_row: &mut usize| {
+            let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
             let w = w as usize;
+            let term_h = h.max(1) as usize;
+            let row = (*current_row).max(1).min(term_h);
             let layout = editor.layout(w, prompt);
-            let rc = layout.row_count.max(1);
-            let cur = layout.cursor_row;
+            let er = layout.row_count.max(1);
+            // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
+            // the terminal height (≥ 1 line); the terminal scrolls on overflow.
+            let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+            let n = overlay.len().min(max_pop);
+            // Window the (possibly long) overlay around the selection.
+            let win = Self::overlay_window(overlay.len(), n, sel);
             let mut s = String::new();
-            // Return to the top of the previously drawn region.
-            if *prev_cursor_row > 0 {
-                s.push_str(&format!("\x1b[{}A", *prev_cursor_row));
-            }
-            // Clear each previously drawn row (clear-to-EOL is universally
-            // supported; we avoid erase-down after a flaky save/restore).
-            s.push_str("\r\x1b[K");
-            for _ in 1..(*prev_rows).max(1) {
-                s.push('\n');
-                s.push_str("\x1b[K");
-            }
-            // Back to the top to write the new content.
-            if *prev_rows > 1 {
-                s.push_str(&format!("\x1b[{}A", *prev_rows - 1));
-            }
-            s.push('\r');
+            // Position at the input block's top row and clear to end of screen.
+            s.push_str(&format!("\x1b[{};1H", row));
+            s.push_str("\x1b[0J");
             s.push_str(&render_content(&layout, prompt));
             s.push_str(&cursor_positioning(&layout));
+            if n > 0 {
+                // Move *below* the input block using a relative down-move. An absolute
+                // address would be out of range when the input sits on the bottom
+                // row (and get silently ignored, overwriting the input); a relative
+                // move scrolls the screen instead, which is the desired behavior.
+                // `below` is the number of rows from the (caret) cursor row to just
+                // past the last input row.
+                let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
+                let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(w));
+                s.push_str(&format!("\x1b[{}B", below));
+                s.push('\r');
+                s.push_str(&divider);
+                s.push('\n');
+                for i in 0..n {
+                    s.push_str(overlay[win + i]);
+                    if i + 1 < n {
+                        s.push('\n');
+                    }
+                }
+            }
             let _ = io::stdout().write_all(s.as_bytes());
             let _ = io::stdout().flush();
-            *prev_rows = rc;
-            *prev_cursor_row = cur;
+            // Follow the terminal's native scroll: if this write pushed the input
+            // up, remember the new visible row so the next redraw clears/writes
+            // at the correct place (prevents the duplication seen when a tall
+            // pop-up shrinks but the screen has not scrolled back down).
+            *current_row = Self::next_input_row(row, term_h, er, n);
         };
-        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-
         loop {
+            // --- Compute the overlay from the current buffer. ---
+            let buffer = editor.text();
+            let mut kind: u8 = 0;
+            let mut opts: Vec<String> = Vec::new();
+            let mut active: Option<usize> = None;
+            let mut title = String::new();
+            cur_word.clear();
+            cur_filter.clear();
+            if help_view {
+                kind = 4;
+            } else if buffer.starts_with('/') {
+                let after = &buffer[1..];
+                if let Some((word, rest)) = after.split_once(' ') {
+                    match word {
+                        "model" | "models" | "m" => {
+                            kind = 2;
+                            title = "Models  (up/down or PgUp/PgDn, Enter select, Esc back)".into();
+                            cur_word = "model".into();
+                            cur_filter = rest.trim().to_string();
+                            let (entries, act) = Self::model_overlay_entries(ctx, &cur_filter);
+                            active = act;
+                            // Dim models whose provider has no API key configured.
+                            opts = entries
+                                .iter()
+                                .map(|e| {
+                                    let s = model_catalog::format_option(e);
+                                    if model_catalog::provider_available(&e.provider) {
+                                        s
+                                    } else {
+                                        format!("\x1b[2m{}\x1b[0m", s)
+                                    }
+                                })
+                                .collect();
+                            if opts.is_empty() {
+                                opts.push("(loading models... or no matches)".into());
+                            }
+                        }
+                        "thinking" | "think" | "t" => {
+                            kind = 3;
+                            title = "Thinking levels  (up/down, Enter select, Esc back)".into();
+                            cur_word = "thinking".into();
+                            cur_filter = rest.trim().to_string();
+                            let levels = Self::thinking_overlay_entries(&cur_filter);
+                            opts = levels.iter().map(|l| l.as_str().to_string()).collect();
+                            if opts.is_empty() {
+                                opts.push("(no matches)".into());
+                            }
+                        }
+                        _ => {
+                            kind = 0;
+                        }
+                    }
+                } else {
+                    kind = 1;
+                    title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
+                    cur_word = after.to_string();
+                    let ranked = slash::filter_commands(after);
+                    for r in &ranked {
+                        opts.push(format!("{:<10} {}", r.item.name, r.item.help));
+                    }
+                    if opts.is_empty() {
+                        opts.push("(no matching command)".into());
+                    }
+                }
+            }
+            if kind != last_kind {
+                sel = 0;
+                last_kind = kind;
+            }
+            let max_sel = opts.len().saturating_sub(1);
+            if sel > max_sel {
+                sel = max_sel;
+            }
+            let overlay_text = match kind {
+                0 => String::new(),
+                4 => Self::render_help_overlay(),
+                _ => Self::overlay_lines(&title, &opts, sel, active),
+            };
+            let overlay_vec: Vec<&str> = overlay_text.lines().collect();
+            redraw(&editor, &overlay_vec, sel, &mut input_row);
+
+            // --- Read and dispatch one key. ---
             match event::read() {
-                Ok(Event::Key(key)) => match key.code {
-                    KeyCode::Enter => {
-                        if key.modifiers.contains(KeyModifiers::SHIFT) {
-                            editor.insert_newline();
-                            redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                        } else {
-                            let _ = io::stdout().write_all(b"\n");
-                            let _ = io::stdout().flush();
-                            return Some(editor.text());
-                        }
-                    }
-                    KeyCode::Esc => {
-                        let _ = io::stdout().write_all(b"\n");
-                        let _ = io::stdout().flush();
-                        return Some(String::new());
-                    }
-                    KeyCode::Char(c) => {
+                Ok(Event::Key(key)) => {
+                    // Ctrl-C: restore terminal, hard exit.
+                    if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match c {
-                                'c' => {
-                                    let _ = self.guard.stop();
-                                    std::process::exit(1);
+                            let _ = self.guard.stop();
+                            std::process::exit(1);
+                        }
+                    }
+                    if kind == 4 {
+                        // Any key dismisses /help and is passed through.
+                        if let KeyCode::Char(c) = key.code {
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                editor.insert(c);
+                            }
+                        }
+                        help_view = false;
+                        continue;
+                    }
+                    if kind != 0 {
+                        match key.code {
+                            KeyCode::Down => {
+                                if sel + 1 < opts.len() {
+                                    sel += 1;
                                 }
-                                'u' => {
-                                    editor.delete_line_start();
-                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                            }
+                            KeyCode::Up => {
+                                if sel > 0 {
+                                    sel -= 1;
                                 }
-                                'k' => {
-                                    editor.delete_line_end();
-                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                            }
+                            KeyCode::PageDown => {
+                                let page = {
+                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    (h as usize).saturating_sub(2).max(1)
+                                };
+                                sel = (sel + page).min(opts.len().saturating_sub(1));
+                            }
+                            KeyCode::PageUp => {
+                                let page = {
+                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    (h as usize).saturating_sub(2).max(1)
+                                };
+                                sel = sel.saturating_sub(page);
+                            }
+                            KeyCode::Tab => {
+                                if kind == 1 {
+                                    let ranked = slash::filter_commands(&cur_word);
+                                    if let Some(cmd) = ranked.get(sel) {
+                                        editor.set(match cmd.item.kind {
+                                            slash::SlashKind::Model => "/model ",
+                                            slash::SlashKind::Thinking => "/thinking ",
+                                            slash::SlashKind::Help => "/help",
+                                            slash::SlashKind::Quit => "/quit",
+                                        });
+                                    }
                                 }
-                                'j' => {
-                                    // Ctrl-J (LF) is a reliable, terminal-agnostic
-                                    // newline even where Shift+Enter isn't
-                                    // disambiguated (Kitty protocol off).
-                                    editor.insert_newline();
-                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                            }
+                            KeyCode::Enter => {
+                                if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    match kind {
+                                        1 => {
+                                            let ranked = slash::filter_commands(&cur_word);
+                                            if let Some(cmd) = ranked.get(sel) {
+                                                match cmd.item.kind {
+                                                    slash::SlashKind::Help => {
+                                                        help_view = true;
+                                                        editor.set("");
+                                                    }
+                                                    slash::SlashKind::Quit => {
+                                                        redraw(&editor, &[], sel, &mut input_row);
+                                                        return Some(InputAction::Quit);
+                                                    }
+                                                    slash::SlashKind::Model => {
+                                                        editor.set("/model ");
+                                                    }
+                                                    slash::SlashKind::Thinking => {
+                                                        editor.set("/thinking ");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        2 => {
+                                            let (entries, _) =
+                                                Self::model_overlay_entries(ctx, &cur_filter);
+                                            if let Some(e) = entries.get(sel) {
+                                                let model = e
+                                                    .id
+                                                    .splitn(2, '/')
+                                                    .nth(1)
+                                                    .unwrap_or(&e.id)
+                                                    .to_string();
+                                                redraw(&editor, &[], sel, &mut input_row);
+                                                return Some(InputAction::SetModel(
+                                                    e.provider.clone(),
+                                                    model,
+                                                ));
+                                            }
+                                        }
+                                        3 => {
+                                            let levels = Self::thinking_overlay_entries(&cur_filter);
+                                            if let Some(l) = levels.get(sel) {
+                                                redraw(&editor, &[], sel, &mut input_row);
+                                                return Some(InputAction::SetThinking(
+                                                    l.as_str().to_string(),
+                                                ));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => match kind {
+                                1 => {
+                                    editor.set("");
+                                }
+                                2 => {
+                                    editor.set("/model");
+                                }
+                                3 => {
+                                    editor.set("/thinking");
                                 }
                                 _ => {}
-                            }
-                        } else if key.modifiers.contains(KeyModifiers::ALT) {
-                            match c {
-                                'b' => {
-                                    editor.word_left();
-                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                            },
+                            _ => {
+                                if let Some(a) =
+                                    Self::edit_key(key, &mut editor, history, &mut nav, &mut draft)
+                                {
+                                    if let InputAction::Submit(_) = &a {
+                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                    }
+                                    return Some(a);
                                 }
-                                'f' => {
-                                    editor.word_right();
-                                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            editor.insert(c);
-                            redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        editor.backspace();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::Delete => {
-                        editor.delete();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::Left => {
-                        editor.left();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::Right => {
-                        editor.right();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::Home => {
-                        editor.home();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::End => {
-                        editor.end();
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
-                    }
-                    KeyCode::Up => {
-                        if !editor.move_up_line() {
-                            if let Some(s) = history.prev(&editor.text(), &mut nav, &mut draft) {
-                                editor.set(&s);
                             }
                         }
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                        continue;
                     }
-                    KeyCode::Down => {
-                        if !editor.move_down_line() {
-                            if let Some(s) = history.next(&mut nav, &mut draft) {
-                                editor.set(&s);
-                            }
+                    // No overlay: normal editing.
+                    if let Some(a) =
+                        Self::edit_key(key, &mut editor, history, &mut nav, &mut draft)
+                    {
+                        if let InputAction::Submit(_) = &a {
+                            redraw(&LineEditor::new(), &[], sel, &mut input_row);
                         }
-                        redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
+                        return Some(a);
                     }
-                    _ => {}
-                },
+                }
                 Ok(Event::Paste(text)) => {
                     editor.insert_str(&text);
-                    redraw(&editor, &mut prev_rows, &mut prev_cursor_row);
                 }
                 Ok(_) => {} // resize/mouse: ignored (Stage 6 redraw)
                 Err(_) => return None,
@@ -297,27 +507,50 @@ impl Repl {
         }
     }
 
-    /// Render a single-column selection list and let the user pick one entry.
-    /// `options` are display strings. Returns `Some(index)` on Enter, `None` on
-    /// Esc (cancel). Used by `/model` (and any future picker).
-    /// Pure renderer for the selection list (testable without a TTY). Produces the
-    /// visible text only — the caller prepends the clear-from-top escape sequence.
-    /// `title` appears exactly once; each option is wrapped to `width` with
-    /// continuation lines aligned under the option text; long lists scroll so the
-    /// selection stays in view. `sel` is the currently highlighted index.
-    pub fn render_select(
+    /// Render the `/model` / `/thinking` overlay: a panel title line plus
+    /// Compute the input row for the *next* redraw after emitting `er` input rows
+    /// plus an `n`-line pop-up, given the current input row and terminal height.
+    /// When the pop-up overflows the bottom, the terminal scrolls up by the
+    /// overflow (`delta`), shifting the input up; it never scrolls back down on
+    /// its own, so a shrinking pop-up leaves the input where the tallest pop-up
+    /// put it. Pure + unit-tested (see `tests`).
+    fn next_input_row(start: usize, term_h: usize, er: usize, n: usize) -> usize {
+        let end_row = if n > 0 { start + er + n } else { start + er - 1 };
+        let delta = end_row.saturating_sub(term_h);
+        if delta > 0 {
+            start.saturating_sub(delta).max(1)
+        } else {
+            start
+        }
+    }
+    /// `avail` rows (≤ `overlay_len`), centered on `sel`. Returns the
+    /// start index into the full overlay. Extracted so it can be unit-tested
+    /// without a TTY.
+    pub fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
+        if overlay_len <= avail || avail == 0 {
+            0
+        } else {
+            sel.saturating_sub(avail / 2).min(overlay_len - avail)
+        }
+    }
+
+    /// Render the `/model` / `/thinking` overlay: a panel title line plus
+    /// wrapped, colored option rows with a `> ` selection marker and
+    /// (for `/model`) a green `*` on the currently-active model. Returns
+    /// plain text; the caller emits it directly above the input line.
+    pub fn overlay_lines(
         title: &str,
         options: &[String],
         sel: usize,
-        width: usize,
-        height: usize,
+        active: Option<usize>,
     ) -> String {
-        let tw = width.max(1);
-        let th = height.max(1);
-        let prefix_w = 2usize; // "> " for the selection, "  " otherwise
-        let opt_w = tw.saturating_sub(prefix_w);
-        // Precompute wrapped display rows for each option. `first` marks the
-        // option's first (marker) row so continuation lines stay aligned.
+        const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
+        const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
+        const C_SEL: &str = "\x1b[1;36m"; // bold cyan: cursor selection
+        const C_ACT: &str = "\x1b[32m"; // green: currently-active model
+        const C_RESET: &str = "\x1b[0m";
+        let tw = term_width().max(1);
+        let opt_w = tw.saturating_sub(2); // "> " / "* " / "  " marker
         let mut rows: Vec<(usize, String, bool)> = Vec::new();
         for (i, o) in options.iter().enumerate() {
             let wrapped = wrap(o, opt_w);
@@ -325,141 +558,221 @@ impl Repl {
                 rows.push((i, line, j == 0));
             }
         }
-        let max_rows = th.saturating_sub(1).max(1); // title consumes one row
-        let sel_row = rows.iter().position(|(i, _, _)| *i == sel).unwrap_or(0);
-        let start = if rows.len() <= max_rows {
-            0
-        } else {
-            sel_row.saturating_sub(max_rows / 2).min(rows.len() - max_rows)
+        let bg_line = |s: &str, bg: &str| -> String {
+            format!("{}{:<width$}{}", bg, s, C_RESET, width = tw)
         };
-        let mut s = String::new();
-        s.push_str(title);
-        s.push('\n');
-        for (i, line, first) in rows.iter().skip(start).take(max_rows) {
-            let marker = if *first && *i == sel { "> " } else { "  " };
-            s.push_str(marker);
-            s.push_str(line);
-            s.push('\n');
-        }
-        s
-    }
-
-    /// Clear `n` screen rows starting at the current row (moving up to the top
-    /// row, then clearing each with clear-to-EOL). Does not rely on DECSC/DECRC
-    /// save/restore, which some terminals honor inconsistently.
-    fn clear_n_rows(n: usize) {
-        let mut s = String::new();
-        if n > 1 {
-            s.push_str(&format!("\x1b[{}A", n - 1));
-        }
-        s.push_str("\r\x1b[K");
-        // Bare `\n`: `OPOST`/`ONLCR` (re-enabled in `TermGuard::start`) converts it to
-        // `\r\n`; writing `\r\n` here would yield `\r\r\n`.
-        for _ in 1..n.max(1) {
-            s.push('\n');
-            s.push_str("\x1b[K");
-        }
-        let _ = io::stdout().write_all(s.as_bytes());
-        let _ = io::stdout().flush();
-    }
-
-    /// Render a single-column selection list and let the user pick one entry.
-    /// `options` are display strings. Returns `Some(index)` on Enter, `None` on
-    /// Esc (cancel). Used by `/model` (and any future picker).
-    ///
-    /// Rendering model (mirrors pi's bounded, scrolling dropdown): on every
-    /// redraw, clear exactly the rows the previous render occupied (counted
-    /// clear-to-EOL per row) and reprint. This prevents the list from being
-    /// *appended* on each navigation (the old bug) without depending on
-    /// DECSC/DECRC save/restore + erase-down, which wezterm honors
-    /// inconsistently.
-    pub fn select(&mut self, title: &str, options: &[String]) -> Option<usize> {
-        if options.is_empty() {
-            return None;
-        }
-        let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
-        let tw = tw as usize;
-        let th = th as usize;
-
-        let mut sel: usize = 0;
-        let mut prev_rows: usize = 0;
-        let redraw = |sel: usize, prev_rows: &mut usize| -> std::io::Result<()> {
-            let rendered = Self::render_select(title, options, sel, tw, th);
-            let rc = rendered.matches('\n').count(); // ends with '\n' → row count
-            Self::clear_n_rows(*prev_rows);
-            // After clearing, cursor is on the bottom cleared row; return to top.
-            let mut s = String::new();
-            if *prev_rows > 1 {
-                s.push_str(&format!("\x1b[{}A", *prev_rows - 1));
-            }
-            s.push('\r');
-            s.push_str(&rendered);
-            io::stdout().write_all(s.as_bytes())?;
-            io::stdout().flush()?;
-            *prev_rows = rc;
-            Ok(())
-        };
-        let _ = redraw(sel, &mut prev_rows);
-        loop {
-            match event::read() {
-                Ok(Event::Key(key)) => match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if sel + 1 < options.len() {
-                            sel += 1;
-                            let _ = redraw(sel, &mut prev_rows);
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if sel > 0 {
-                            sel -= 1;
-                            let _ = redraw(sel, &mut prev_rows);
-                        }
-                    }
-                    KeyCode::Enter => {
-                        // Clear the menu region before returning.
-                        Self::clear_n_rows(prev_rows);
-                        return Some(sel);
-                    }
-                    KeyCode::Esc => {
-                        Self::clear_n_rows(prev_rows);
-                        return None;
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-    }
-
-    /// Print a block of REPL-originated text (help, status messages) below the
-    /// current input region, clearing that region first so output doesn't
-    /// overlap the prompt. Used in TTY mode; the next `read_input` re-saves a
-    /// fresh top. Falls back to the cooked `Output` when there is no REPL.
-    ///
-    /// Text is printed **verbatim** (its own newlines and column alignment are
-    /// preserved). Only lines longer than the terminal width are wrapped, so
-    /// pre-formatted output like `/help` keeps its alignment instead of being
-    /// reflowed into ragged columns.
-    pub fn print_block(&mut self, text: &str) {
-        let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
-        let w = (w as usize).max(1);
-        let mut body = String::new();
-        for line in text.split('\n') {
-            if line.chars().count() <= w {
-                body.push_str(line);
+        let mut out = String::new();
+        out.push_str(&bg_line(title, BG));
+        for (i, line, first) in &rows {
+            let marker = if *first && *i == sel {
+                "> "
+            } else if *first && active == Some(*i) {
+                "* "
             } else {
-                for wl in crate::output::wrap(line, w) {
-                    body.push_str(&wl);
-                    body.push('\n');
-                }
-                continue;
-            }
-            body.push('\n');
+                "  "
+            };
+            let body = if *first {
+                format!("{}{}", marker, line)
+            } else {
+                line.clone()
+            };
+            let (bg, fg) = if *i == sel {
+                (BG_SEL, C_SEL)
+            } else if active == Some(*i) {
+                (BG, C_ACT)
+            } else {
+                (BG, "")
+            };
+            let content = if fg.is_empty() {
+                body
+            } else {
+                format!("{}{}", fg, body)
+            };
+            out.push('\n');
+            out.push_str(&bg_line(&content, bg));
         }
-        let s = format!("\x1b[u\r\x1b[0J{}", body);
-        let _ = io::stdout().write_all(s.as_bytes());
-        let _ = io::stdout().flush();
+        out
     }
+
+    /// Render the `/help` overlay (panel background, no selection). Any key
+    /// dismisses it (see `read_input`).
+    fn render_help_overlay() -> String {
+        let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
+        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None)
+    }
+
+    /// Resolve the catalog id of the currently-active model. OpenRouter routes
+    /// models under their *original* provider namespace (`tencent/hy3:free`),
+    /// while `ctx.model` is usually the short name (`hy3:free`) and `ctx.provider`
+    /// is `openrouter` — so a naïve `"{provider}/{model}"` id never matches.
+    fn active_entry_id(entries: &[model_catalog::ModelEntry], provider: &str, model: &str) -> String {
+        let p = provider.to_lowercase();
+        let m = model.to_lowercase();
+        for e in entries {
+            let id = e.id.to_lowercase();
+            if id == format!("{}/{}", p, m) {
+                return e.id.clone();
+            }
+            if id == m {
+                return e.id.clone();
+            }
+            // OpenRouter passthrough (`tencent/hy3:free`) and native
+            // (`openrouter/hy3:free`) both end in the short model name.
+            if p == "openrouter" && id.ends_with(&format!("/{}", m)) {
+                return e.id.clone();
+            }
+        }
+        format!("{}/{}", p, m)
+    }
+
+
+    /// Rank a model id for `/model` sorting: active first (0), then recently
+    /// used (1, 2, ...), then everything else (u32::MAX).
+    fn model_rank(id: &str, active_id: &str, recent: &[String]) -> u32 {
+        if id == active_id {
+            0
+        } else if let Some(p) = recent.iter().position(|r| r == id) {
+            1 + p as u32
+        } else {
+            u32::MAX
+        }
+    }
+
+    /// Build the `/model` overlay rows for `filter`, sorted active-first then
+    /// recently-used, fuzzy-filtered by `filter`. Returns the (sorted+filtered)
+    /// entries and the position of the active model within them.
+    fn model_overlay_entries(
+        ctx: &ReplCtx,
+        filter: &str,
+    ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
+        let mut entries = model_catalog::catalog_cached();
+        let active_id = Self::active_entry_id(&entries, &ctx.provider, &ctx.model);
+        entries.sort_by(|a, b| {
+            Self::model_rank(&a.id, &active_id, &ctx.recent)
+                .cmp(&Self::model_rank(&b.id, &active_id, &ctx.recent))
+                .then_with(|| a.display.cmp(&b.display))
+        });
+        let filtered: Vec<model_catalog::ModelEntry> = if filter.trim().is_empty() {
+            entries
+        } else {
+            crate::fuzzy::fuzzy_filter(&entries, filter, |e| format!("{} {}", e.display, e.id))
+                .into_iter()
+                .map(|r| r.item.clone())
+                .collect()
+        };
+        let active = filtered.iter().position(|e| e.id == active_id);
+        (filtered, active)
+    }
+
+    /// Build the `/thinking` overlay rows for `filter`.
+    fn thinking_overlay_entries(filter: &str) -> Vec<thinking::ThinkingLevel> {
+        let all = [
+            thinking::ThinkingLevel::Off,
+            thinking::ThinkingLevel::Low,
+            thinking::ThinkingLevel::Med,
+            thinking::ThinkingLevel::High,
+        ];
+        if filter.trim().is_empty() {
+            all.to_vec()
+        } else {
+            crate::fuzzy::fuzzy_filter(&all, filter, |l| l.as_str().to_string())
+                .into_iter()
+                .map(|r| *r.item)
+                .collect()
+        }
+    }
+
+
+    /// Apply a normal editing key to the line editor. Returns `Some(action)`
+    /// only for terminal actions (Enter submits, Esc cancels the line,
+    /// Ctrl-C exits). All other keys mutate `editor` and return `None`. History
+    /// navigation is handled here too. `Ctrl-C` is *not* handled here (the
+    /// caller checks it before delegating, so it can stop the terminal).
+    fn edit_key(
+        key: event::KeyEvent,
+        editor: &mut LineEditor,
+        history: &mut History,
+        nav: &mut Option<usize>,
+        draft: &mut String,
+    ) -> Option<InputAction> {
+        match key.code {
+            KeyCode::Enter => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    editor.insert_newline();
+                    None
+                } else {
+                    Some(InputAction::Submit(editor.text()))
+                }
+            }
+            KeyCode::Esc => Some(InputAction::Submit(String::new())),
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match c {
+                        'u' => editor.delete_line_start(),
+                        'k' => editor.delete_line_end(),
+                        // Ctrl-J (LF) inserts a newline reliably even where
+                        // Shift+Enter isn't disambiguated (Kitty off).
+                        'j' => editor.insert_newline(),
+                        _ => {}
+                    }
+                    None
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    match c {
+                        'b' => editor.word_left(),
+                        'f' => editor.word_right(),
+                        _ => {}
+                    }
+                    None
+                } else {
+                    editor.insert(c);
+                    None
+                }
+            }
+            KeyCode::Backspace => {
+                editor.backspace();
+                None
+            }
+            KeyCode::Delete => {
+                editor.delete();
+                None
+            }
+            KeyCode::Left => {
+                editor.left();
+                None
+            }
+            KeyCode::Right => {
+                editor.right();
+                None
+            }
+            KeyCode::Home => {
+                editor.home();
+                None
+            }
+            KeyCode::End => {
+                editor.end();
+                None
+            }
+            KeyCode::Up => {
+                if !editor.move_up_line() {
+                    if let Some(s) = history.prev(&editor.text(), nav, draft) {
+                        editor.set(&s);
+                    }
+                }
+                None
+            }
+            KeyCode::Down => {
+                if !editor.move_down_line() {
+                    if let Some(s) = history.next(nav, draft) {
+                        editor.set(&s);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+
 }
 
 /// A flat character buffer + cursor for multi-line editing. All methods are pure
@@ -1213,7 +1526,7 @@ mod tests {
             "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
             "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
         ];
-        let out = Repl::render_select("Select a model:", &opts, 0, 80, 24);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
         assert_eq!(out.matches("Select a model:").count(), 1);
         assert!(out.contains("> a: alpha"));
         assert!(out.contains("  b: beta"));
@@ -1223,12 +1536,12 @@ mod tests {
     fn render_select_wraps_long_option_with_aligned_continuation() {
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let opts = vec![long.to_string()];
-        let out = Repl::render_select("Select a model:", &opts, 0, 40, 24);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].starts_with("> "), "first row is the marker row");
+        assert!(lines[1].contains("> "), "first row is the marker row");
         let cont: Vec<&&str> = lines
             .iter()
-            .filter(|l| l.starts_with("  ") && !l.starts_with("> "))
+            .filter(|l| l.contains("  ") && !l.contains("> "))
             .collect();
         assert!(
             !cont.is_empty(),
@@ -1237,18 +1550,66 @@ mod tests {
     }
 
     #[test]
-    fn render_select_scrolls_selection_into_view() {
-        let opts: Vec<String> = (0..50).map(|i| format!("model-{} ctx 1000 $1/1 per M", i)).collect();
-        let out = Repl::render_select("Select:", &opts, 49, 80, 10);
-        assert!(
-            out.contains("model-49"),
-            "last option must be visible when selected"
+    fn overlay_window_centers_on_selection_and_clamps() {
+        // 50 options in a 10-row window, selection at the very end.
+        assert_eq!(Repl::overlay_window(50, 10, 49), 40);
+        assert_eq!(Repl::overlay_window(50, 10, 0), 0);
+        assert_eq!(Repl::overlay_window(50, 10, 5), 0);
+        // avail >= len: show everything from the top.
+        assert_eq!(Repl::overlay_window(5, 10, 4), 0);
+        // avail == 0: degenerate, clamp to 0.
+        assert_eq!(Repl::overlay_window(50, 0, 49), 0);
+    }
+
+    #[test]
+    fn next_input_row_tracks_scroll_on_open_and_stays_on_shrink() {
+        // Input at the bottom row (40). A tall pop-up (n=4) overflows by 5, so
+        // the input scrolls up to row 35.
+        assert_eq!(Repl::next_input_row(40, 40, 1, 4), 35);
+        // The pop-up now shrinks (n=1) but the screen does NOT scroll back down,
+        // so the input stays at row 35 (no duplication on the next redraw).
+        assert_eq!(Repl::next_input_row(35, 40, 1, 1), 35);
+        // No overflow: input row is unchanged.
+        assert_eq!(Repl::next_input_row(5, 40, 1, 4), 5);
+        // Overflow never pushes the input off the top (clamped to 1).
+        assert_eq!(Repl::next_input_row(2, 40, 1, 40), 1);
+        // No pop-up: only the input block is rewritten in place.
+        assert_eq!(Repl::next_input_row(35, 40, 1, 0), 35);
+    }
+
+    #[test]
+    fn model_rank_sorts_active_then_recent_then_rest() {
+        let active = "openai/gpt-4";
+        let recent = vec!["anthropic/claude".to_string(), "gemini/gem".to_string()];
+        // active first
+        assert_eq!(Repl::model_rank("openai/gpt-4", active, &recent), 0);
+        // recent second (1-based)
+        assert_eq!(Repl::model_rank("anthropic/claude", active, &recent), 1);
+        assert_eq!(Repl::model_rank("gemini/gem", active, &recent), 2);
+        // everything else last
+        assert_eq!(
+            Repl::model_rank("deepseek/flash", active, &recent),
+            u32::MAX
         );
-        assert!(
-            !out.contains("model-0"),
-            "early options should be scrolled out of the window"
+        // ordering: active < recent1 < recent2 < other
+        let mut ids = vec![
+            "deepseek/flash".to_string(),
+            "gemini/gem".to_string(),
+            "anthropic/claude".to_string(),
+            "openai/gpt-4".to_string(),
+        ];
+        ids.sort_by(|a, b| {
+            Repl::model_rank(a, active, &recent).cmp(&Repl::model_rank(b, active, &recent))
+        });
+        assert_eq!(
+            ids,
+            vec![
+                "openai/gpt-4".to_string(),
+                "anthropic/claude".to_string(),
+                "gemini/gem".to_string(),
+                "deepseek/flash".to_string(),
+            ]
         );
-        assert_eq!(out.matches("Select:").count(), 1);
     }
 
     impl LineEditor {
