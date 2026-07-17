@@ -177,16 +177,15 @@ fn popup_scroll_does_not_duplicate_input() {
 
     // TEMP diagnostic assertions on the mid-sequence screen (after `/`).
     if let Some(ref mid) = mid_screen {
-        let mid_slash = mid.iter().filter(|r| r.as_str() == "/").count();
+        let mid_slash = mid.iter().filter(|r| r.starts_with("> /")).count();
         let mid_div = mid.iter().filter(|r| r.starts_with("────")).count();
         eprintln!(
-            "[test] MID(after '/') slash_lines={} divider_lines={}\n{:?}",
+            "[test] MID(after '/') input_lines={} divider_lines={}\n{:?}",
             mid_slash, mid_div, mid
         );
-        // The input `/` must be visible exactly once, with a single divider
-        // above it (the pre-input separator). Two stacked dividers and no '/'
-        // is the reported bug.
-        assert_eq!(mid_slash, 1, "MID: expected one '/' input line; screen={:?}", mid);
+        // The input `/` line (prompt-prefixed as `> /`) must be visible exactly
+        // once, with a single divider above it (the pre-input separator).
+        assert_eq!(mid_slash, 1, "MID: expected one '> /' input line; screen={:?}", mid);
     }
 
     // The final input buffer is "/mo" => exactly one such line.

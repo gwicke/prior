@@ -803,8 +803,17 @@ prompt itself owns, so the scrollback above is structurally untouchable.
 > navigation with draft restore). Pty smoke (deepseek): basic editing + `Esc`
 > cancel + `/q` exits 0; `<Shift-Enter>` (`\x1b[13;2u`) inserts a newline
 > (stays in editor, no LLM submit) — confirmed via Kitty `>1u`/`>4u` flags.
-- [x] Arrows, `Home`/`End`, `Backspace`/`Delete`, word-left/right (`Alt-B`/`Alt-F`):
-      pure `LineEditor` (flat `Vec<char>` + char-index cursor) in `src/repl.rs`.
+- [x] Arrows move by **visual (wrapped) row**, not logical line end
+      (follow-up 2026-07-16): `LineEditor::visual_up`/`visual_down` use a new
+      private `visual_rows` helper (buffer index ranges per wrapped row across
+      the whole buffer) to move the cursor to the character directly above/below,
+      keeping the column (clamped to the target row's length). `Up`/`Down` in
+      `edit_key` now call these instead of `move_up_line`/`move_down_line` (which
+      jump to logical-line ends). `move_up_line`/`move_down_line` remain as
+      available methods and are still unit-tested. History nav is unchanged: it
+      only triggers when `visual_up`/`visual_down` can't move further (first/
+      last row). Unit-tested in `repl.rs::tests`.
+- [x] `<Shift-Enter>` inserts newline via Kitty layer (`TermGuard` now emits the
 - [x] `<Shift-Enter>` inserts newline via Kitty layer (`TermGuard` now emits the
       **correct** via crossterm `PushKeyboardEnhancementFlags(
       DISAMBIGUATE_ESCAPE_CODES | REPORT_ALL_KEYS_AS_ESCAPE_CODES)` (emits `[>9u`) — this is
