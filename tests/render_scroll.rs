@@ -25,20 +25,24 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use vt100::Parser;
 
-const ROWS: u16 = 8;
+const ROWS: u16 = 3;
 const COLS: u16 = 80;
 
 /// Read everything the child emits (best-effort) on a background thread until
 /// the child is killed (which closes the pty and ends the read).
-fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>, thread::JoinHandle<()>) {
+fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let bytes_c = bytes.clone();
     let stop_c = stop.clone();
-    let handle = thread::spawn(move || {
+    // Hard deadline so a read() blocked after teardown can never hang us: we
+    // never join this thread, it exits on its own once the pty closes (or the
+    // deadline passes) and is reaped when the test process exits.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
-            if stop_c.load(Ordering::SeqCst) {
+            if stop_c.load(Ordering::SeqCst) || Instant::now() > deadline {
                 break;
             }
             match reader.read(&mut buf) {
@@ -48,7 +52,7 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, Arc<A
             }
         }
     });
-    (bytes, stop, handle)
+    (bytes, stop)
 }
 
 fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> bool {
@@ -87,7 +91,7 @@ fn popup_scroll_does_not_duplicate_input() {
         .master
         .try_clone_reader()
         .expect("clone reader");
-    let (bytes, stop, reader_handle) = spawn_reader(reader);
+    let (bytes, stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
 
     // Wait for the REPL to print its first screen (greeter + status).
@@ -95,25 +99,70 @@ fn popup_scroll_does_not_duplicate_input() {
         wait_for(&bytes, "picocode -", Duration::from_secs(5)),
         "picocode did not start the REPL (no greeter); raw-mode/pty setup failed"
     );
+    eprintln!("[test] greeter seen");
+
+    // TEMP: capture the pre-'/' screen to see where the input line sits.
+    {
+        let data = bytes.lock().unwrap().clone();
+        let mut p = Parser::new(ROWS, COLS, 1000);
+        p.process(&data);
+        let pre: Vec<String> = p
+            .screen()
+            .rows(0, COLS)
+            .map(|s| s.trim_end().to_string())
+            .collect();
+        eprintln!("[test] PRE('/') screen ({} rows):\n{:?}", pre.len(), pre);
+    }
+
+    // `ConsoleOutput::cursor_row()` issues a DSR (`ESC[6n`) and blocks up to
+    // ~60ms waiting for a response. In a real terminal the response is
+    // immediate, but in a pty with no responder that read can swallow a
+    // keystroke sent during its window. Wait it out before typing so the
+    // first `/` reaches the editor rather than the DSR read.
+    thread::sleep(Duration::from_millis(400));
 
     // Type `/`, then `m`, then `o` — the pop-up grows tall then shrinks.
     // Small delays let each keystroke be processed before the next.
+    let mut mid_screen: Option<Vec<String>> = None;
     for (i, ch) in "/mo".chars().enumerate() {
         let _ = writer.write_all(&[ch as u8]);
         let _ = writer.flush();
+        eprintln!("[test] typed '{}'", ch);
         // After the first char the pop-up is open; give the redraw time.
         thread::sleep(Duration::from_millis(if i == 0 { 400 } else { 250 }));
+        if i == 0 {
+            // TEMP diagnostic: capture screen right after `/` to check the
+            // input line is present (not overwritten by the divider).
+            let data = bytes.lock().unwrap().clone();
+            let mut p = Parser::new(ROWS, COLS, 1000);
+            p.process(&data);
+            mid_screen = Some(
+                p.screen()
+                    .rows(0, COLS)
+                    .map(|s| s.trim_end().to_string())
+                    .collect(),
+            );
+        }
     }
     // Let the final redraw settle.
     thread::sleep(Duration::from_millis(400));
+    eprintln!("[test] typing done, tearing down");
 
-    // Tear down: kill the child (closes the pty), stop the reader.
+    // Tear down: kill the child (closes the pty); the reader thread self-exits.
+    // We deliberately do NOT join it: `kill` closing the slave does not always
+    // unblock the cloned master read(), and joining would hang. The thread
+    // exits on its own deadline and is reaped when the test process exits.
+    drop(writer);
     let _ = child.kill();
-    let _ = child.wait();
     stop.store(true, Ordering::SeqCst);
-    let _ = reader_handle.join();
 
     let data = bytes.lock().unwrap().clone();
+    std::fs::write("/tmp/picocode_raw.txt", &data).unwrap();
+    let tail = &data[data.len().saturating_sub(400)..];
+    eprintln!(
+        "[test] raw tail: {}",
+        String::from_utf8_lossy(tail).replace('\x1b', "ESC")
+    );
 
     // Feed the whole byte stream to a faithful terminal emulator.
     let mut parser = Parser::new(ROWS, COLS, 1000);
@@ -125,6 +174,20 @@ fn popup_scroll_does_not_duplicate_input() {
         .collect();
 
     let count_exact = |needle: &str| visible.iter().filter(|r| r.as_str() == needle).count();
+
+    // TEMP diagnostic assertions on the mid-sequence screen (after `/`).
+    if let Some(ref mid) = mid_screen {
+        let mid_slash = mid.iter().filter(|r| r.as_str() == "/").count();
+        let mid_div = mid.iter().filter(|r| r.starts_with("────")).count();
+        eprintln!(
+            "[test] MID(after '/') slash_lines={} divider_lines={}\n{:?}",
+            mid_slash, mid_div, mid
+        );
+        // The input `/` must be visible exactly once, with a single divider
+        // above it (the pre-input separator). Two stacked dividers and no '/'
+        // is the reported bug.
+        assert_eq!(mid_slash, 1, "MID: expected one '/' input line; screen={:?}", mid);
+    }
 
     // The final input buffer is "/mo" => exactly one such line.
     assert_eq!(
