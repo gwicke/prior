@@ -220,3 +220,84 @@ fn popup_scroll_does_not_duplicate_input() {
         visible
     );
 }
+
+/// wezterm (and xterm-style terminals) send Shift+Enter as the legacy CSI
+/// sequence `\x1b[13;2~` even when the Kitty keyboard protocol is *disabled*.
+/// crossterm 0.29 parses that as `KeyCode::F(3)` (+SHIFT), which does NOT
+/// reach the Enter handler. picocode maps `F(3)` -> insert newline, mirroring
+/// pi. This test drives the real key bytes through a pty + vt100 emulator and
+/// asserts a newline was inserted (the input becomes two rows).
+#[test]
+fn shift_enter_inserts_newline_without_kitty() {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let (bytes, stop) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    assert!(
+        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        "picocode did not start the REPL (no greeter)"
+    );
+    // Don't force the input to the bottom row; keep it mid-screen so the
+    // multi-line input has room to grow. Answer the cursor-position DSR with
+    // a sane row so the startup read doesn't eat our first keystroke.
+    let _ = writer.write_all(b"\x1b[3;1R");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+
+    // Type "abc", send the legacy Shift+Enter sequence, then "d".
+    for ch in "abc".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(120));
+    }
+    let _ = writer.write_all(b"\x1b[13;2~");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(300));
+    let _ = writer.write_all(b"d");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(300));
+
+    drop(writer);
+    let _ = child.kill();
+    stop.store(true, Ordering::SeqCst);
+
+    let data = bytes.lock().unwrap().clone();
+    std::fs::write("/tmp/picocode_shiftenter.txt", &data).unwrap();
+    let mut parser = Parser::new(ROWS, COLS, 1000);
+    parser.process(&data);
+    let visible: Vec<String> = parser
+        .screen()
+        .rows(0, COLS)
+        .map(|s| s.trim_end().to_string())
+        .collect();
+    eprintln!("[test] visible (shift+enter w/o kitty):\n{:?}", visible);
+
+    let has_abc = visible.iter().any(|r| r.trim() == "abc");
+    let has_d = visible.iter().any(|r| r.trim() == "d");
+    assert!(
+        has_abc,
+        "expected an input row with 'abc'; visible={:?}",
+        visible
+    );
+    // If `\x1b[13;2~` were ignored (F-key no-op) the buffer would be 'abcd' on
+    // one line (no standalone 'd' row). If it submitted, 'abc' would be gone.
+    assert!(
+        has_d,
+        "expected a separate input row with 'd' (Shift+Enter inserted a newline); visible={:?}",
+        visible
+    );
+}

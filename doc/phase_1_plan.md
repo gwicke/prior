@@ -944,22 +944,31 @@ prompt itself owns, so the scrollback above is structurally untouchable.
   padding). `print_block` prints `/help` **verbatim** (preserving `{:<10}` column
   alignment) and only hard-wraps lines exceeding the terminal width.
 - **`Shift+Enter` without Kitty dependency (2026-07-16, RESOLVED):** investigated
-  pi's editor (`pi/packages/tui/src/components/editor.ts`). Its newline detection
-  accepts several sequences — `tui.input.newLine`, `\x1b[13;2~` (the legacy
-  `CSI ~` form, not the Kitty `u` form), `\x1b\r`, any multi-char escape containing
-  both `ESC` and `CR`, and a bare `\n`. **But crossterm 0.29 parses `\x1b[13;2~` as
-  `KeyCode::F(13)` (not Enter+SHIFT)**, so that form isn't usable in picocode
-  without custom parsing — and pi's real Kitty-independent trick is the **`\` +
-  Enter → newline** workaround** (`editor.ts:791-799` + `shouldSubmitOnBackslashEnter`):
-  when Enter is pressed and the char before the cursor is `\`, it deletes the
-  backslash and inserts a newline instead of submitting. picocode now does the
-  same (in `edit_key`'s `Enter` handler, via
-  `LineEditor::char_before_cursor()` + `backspace()` + `insert_newline()`), joined
-  by the existing `Ctrl-J` (LF) fallback. Net effect: multi-line entry works on
-  **any** terminal with zero protocol support — the Kitty dependency is gone for
-  the newline feature (Kitty is still used to *also* deliver a true Shift+Enter
-  when the terminal enables it). Documented in `/help`. Unit-tested in
-  `repl::tests::backslash_then_enter_inserts_newline`.
+  pi's editor (`pi/packages/tui/src/components/editor.ts`), which accepts several
+  newline sequences — `tui.input.newLine`, `\x1b[13;2~` (the legacy `CSI ~`
+  form), `\x1b\r`, any multi-char escape containing both `ESC` and `CR`, and a
+  bare `\n`. The important one is **`\x1b[13;2~`** — the *xterm-standard*
+  modified-key encoding for Shift+Enter (modifier `2` = shift on keycode `13` =
+  Enter), which terminals emit **without** the Kitty keyboard protocol. crossterm
+  0.29 parses `\x1b[13;2~` as **`KeyCode::F(3)` (+SHIFT)** (verified empirically
+  by the `shift_enter_inserts_newline_without_kitty` integration test: feeding
+  those bytes yields a two-row input `abc`/`d`), so it never reaches the `Enter`
+  handler. picocode therefore maps `KeyCode::F(3)` → `insert_newline()` in
+  `edit_key` (`src/repl.rs`). Because `\x1b[13;2~` is the standard xterm
+  modified-key form, this is **not wezterm-specific** — it also covers konsole,
+  gnome-terminal, alacritty (legacy mode), and any other xterm-compatible
+  terminal that sends the `~` form for Shift+Enter when Kitty is off. Together
+  with the two universal fallbacks it means literal Shift+Enter works broadly:
+  - `F(3)` handler (this item) — standard xterm `~` form, no Kitty needed.
+  - `Enter`+SHIFT handler — true Shift+Enter when the terminal *does* enable
+    Kitty (`\x1b[13;2u`).
+  - `\` + Enter → newline (pi's trick, `editor.ts:791-799`): when Enter is
+    pressed and the char before the cursor is `\`, delete it and insert a
+    newline instead of submitting. Works on **any** terminal, zero protocol.
+  - `Ctrl-J` (LF) → newline: reliable on every terminal.
+  Documented in `/help`; covered by unit test
+  `repl::tests::backslash_then_enter_inserts_newline` and the integration test
+  `tests/render_scroll.rs::shift_enter_inserts_newline_without_kitty`.
 
 ## 7. Decisions & corrections log
 
