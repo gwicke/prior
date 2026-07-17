@@ -11,8 +11,12 @@ use crate::thinking;
 use console::style;
 use rig_core::agent::{Agent, AgentBuilder, HookAction, PromptHook, ToolCallHookAction};
 use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::{CompletionModel, Prompt, ToolDefinition};
+use rig_core::completion::{CompletionModel, ToolDefinition};
 use rig_core::message::Message;
+use rig_core::agent::MultiTurnStreamItem;
+use rig_core::message::ReasoningContent;
+use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
+use futures::StreamExt;
 use rig_core::providers::{
     anthropic, azure, cohere, deepseek, galadriel, gemini, groq, huggingface, hyperbolic, mira,
     mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai,
@@ -31,27 +35,79 @@ pub trait PicoAgent: Send + Sync {
 
 #[async_trait]
 impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
-    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String> {
+    async fn prompt(
+        &self,
+        input: &str,
+        history: Option<&mut Vec<Message>>,
+    ) -> Result<String> {
         self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
         // prior `Esc` doesn't silently cancel this one.
         self.user_cancel.store(false, Ordering::SeqCst);
-        let mut builder = self
+
+        // Clone the prior history (owned) so we can still write the updated
+        // history back through the `&mut` borrow afterwards.
+        let prior: Vec<Message> = history.as_ref().map(|h| (*h).clone()).unwrap_or_default();
+
+        // `stream_prompt(...).await` yields the item stream (rig 0.38's
+        // `IntoFuture` returns the stream itself, not a collected response).
+        let mut stream = self
             .agent
-            .prompt(input)
+            .stream_prompt(input)
             .with_hook(LoggingHook {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
             })
-            .max_turns(self.tool_call_limit);
-        if let Some(h) = history {
-            builder = builder.with_history(&*h);
+            .multi_turn(self.tool_call_limit)
+            .with_history(prior)
+            .await;
+
+        let mut output = String::new();
+        let mut final_history: Option<Vec<Message>> = None;
+        self.output.begin_response();
+        while let Some(item) = stream.next().await {
+            match item.map_err(|e| crate::PicocodeError::Other(e.to_string()))? {
+                MultiTurnStreamItem::StreamAssistantItem(content) => match content {
+                    StreamedAssistantContent::Text(text) => {
+                        let delta = text.text();
+                        output.push_str(delta);
+                        self.output.stream_text(delta);
+                    }
+                    StreamedAssistantContent::Reasoning(reasoning) => {
+                        let t = reasoning_text(&reasoning);
+                        if !t.is_empty() {
+                            self.output.stream_thinking(&t);
+                        }
+                    }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        if !reasoning.is_empty() {
+                            self.output.stream_thinking(&reasoning);
+                        }
+                    }
+                    _ => {}
+                },
+                MultiTurnStreamItem::StreamUserItem(_) => {}
+                MultiTurnStreamItem::CompletionCall(_) => {
+                    // Commit the text so far before the tool call / result line.
+                    self.output.end_response_segment();
+                }
+                MultiTurnStreamItem::FinalResponse(resp) => {
+                    final_history = resp.history().map(|h| h.to_vec());
+                }
+                _ => {}
+            }
         }
-        let response = builder
-            .await
-            .map_err(|e| crate::PicocodeError::Other(e.to_string()))?;
-        self.output.stop_thinking();
-        Ok(response)
+        self.output.end_response();
+
+        // Persist history across turns (§2.4 fix): `with_history` clones into
+        // the request, so we must write the updated history back here.
+        if let Some(h) = history {
+            if let Some(fh) = final_history {
+                *h = fh;
+            }
+        }
+
+        Ok(output)
     }
 
     async fn run_once(&self, input: String) -> Result<String> {
@@ -63,10 +119,27 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             self.persona_name.as_deref(),
         );
         self.output.display_separator();
+        // `prompt` now renders the response itself via the streaming Output
+        // methods, so there is no separate `display_markdown` here.
         let response = self.prompt(&input, None).await?;
-        self.output.display_markdown(&response);
         Ok(response)
     }
+}
+
+/// Flatten a rig `Reasoning` payload into plain text. Provider-specific
+/// encrypted/redacted blocks are kept verbatim; other shapes are ignored.
+fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
+    r.content
+        .iter()
+        .map(|c| match c {
+            ReasoningContent::Text { text, .. } => text.clone(),
+            ReasoningContent::Summary(s) => s.clone(),
+            ReasoningContent::Encrypted(s) => s.clone(),
+            ReasoningContent::Redacted { data } => data.clone(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_tool_available(tool: &str) -> bool {
@@ -632,9 +705,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                     }
                 };
                 match response {
-                    Ok(r) => {
-                        config.output.display_markdown(&r);
-                    }
+                    Ok(_) => {}
                     Err(e) => {
                         config.output.display_text(&format!("Error: {}", e));
                     }
@@ -666,5 +737,24 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             persona_name,
             user_cancel,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rig_core::message::Reasoning;
+
+    use super::reasoning_text;
+
+    #[test]
+    fn reasoning_text_extracts_text_block() {
+        let r = Reasoning::new("think step by step");
+        assert_eq!(reasoning_text(&r), "think step by step");
+    }
+
+    #[test]
+    fn reasoning_text_extracts_text_with_signature() {
+        let r = Reasoning::new_with_signature("with sig", Some("sig".to_string()));
+        assert_eq!(reasoning_text(&r), "with sig");
     }
 }

@@ -1552,6 +1552,7 @@ dependencies = [
  "crossterm",
  "duct",
  "duct_sh",
+ "futures",
  "fuzzy-matcher",
  "globset",
  "ignore",

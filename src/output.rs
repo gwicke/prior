@@ -29,6 +29,21 @@ pub trait Output: Send + Sync {
     fn display_markdown(&self, text: &str) {
         self.display_text(text);
     }
+    // ---- Streaming (Phase 2+) ----
+    // Default no-ops so existing impls keep compiling without change.
+    // `ConsoleOutput` overrides these to render incrementally (Phase 4 adds
+    // live in-place redraw; Phase 2 uses a render-once-per-segment buffer).
+    /// Called once when an agent response begins streaming.
+    fn begin_response(&self) {}
+    /// A delta of assistant text.
+    fn stream_text(&self, _delta: &str) {}
+    /// A delta of model reasoning/thinking (already gated by level upstream).
+    fn stream_thinking(&self, _delta: &str) {}
+    /// Commit the current text/thinking segment before a static line (tool
+    /// call, tool result, completion call) is printed.
+    fn end_response_segment(&self) {}
+    /// Called when the whole response finishes; commit the final live block.
+    fn end_response(&self) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
     fn get_user_input(&self) -> String;
@@ -210,6 +225,13 @@ impl Output for LogOutput {
 pub struct ConsoleOutput {
     spinner: Mutex<Option<ProgressBar>>,
     row: Mutex<usize>,
+    /// Buffered assistant text while a response streams (Phase 2: flushed
+    /// via `display_markdown` at segment/response boundaries; Phase 4 switches
+    /// to a live in-place renderer).
+    text_buffer: Mutex<String>,
+    /// Buffered reasoning/thinking while a response streams (surfaced at
+    /// `end_response`; relocated into a dedicated panel in Phase 5).
+    thinking_buffer: Mutex<String>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -316,6 +338,17 @@ impl ConsoleOutput {
         Self {
             spinner: Mutex::new(None),
             row: Mutex::new(1),
+            text_buffer: Mutex::new(String::new()),
+            thinking_buffer: Mutex::new(String::new()),
+        }
+    }
+
+    /// Render and clear the buffered assistant text (Phase 2: render-once per
+    /// segment). Phase 4 will replace this with a live in-place redraw.
+    fn flush_text(&self) {
+        let text = std::mem::take(&mut *self.text_buffer.lock().unwrap());
+        if !text.is_empty() {
+            self.display_markdown(&text);
         }
     }
 }
@@ -511,6 +544,37 @@ impl Output for ConsoleOutput {
         println!();
         let n = wrap(text, term_width()).len() + 1;
         self.note_lines(n);
+    }
+
+    fn begin_response(&self) {
+        *self.text_buffer.lock().unwrap() = String::new();
+        *self.thinking_buffer.lock().unwrap() = String::new();
+        self.stop_thinking();
+    }
+
+    fn stream_text(&self, delta: &str) {
+        self.text_buffer.lock().unwrap().push_str(delta);
+    }
+
+    fn stream_thinking(&self, delta: &str) {
+        self.thinking_buffer.lock().unwrap().push_str(delta);
+    }
+
+    fn end_response_segment(&self) {
+        self.stop_thinking();
+        self.flush_text();
+    }
+
+    fn end_response(&self) {
+        self.stop_thinking();
+        self.flush_text();
+        let thinking = std::mem::take(&mut *self.thinking_buffer.lock().unwrap());
+        if !thinking.is_empty() {
+            // Interim surfacing (Phase 5 relocates this into a collapsible
+            // panel above the answer). `display_text` keeps it plain so it is
+            // not re-interpreted as markdown.
+            self.display_text(&format!("Reasoning:\n{}", thinking));
+        }
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
@@ -957,5 +1021,30 @@ mod tests {
         assert!(!out.contains('\x1b'));
         assert!(out.contains("Title"));
         assert!(out.contains('│') && out.contains("quoted"));
+    }
+
+    #[test]
+    fn console_output_streaming_buffers_and_flushes() {
+        let out = ConsoleOutput::new();
+        out.begin_response();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
+
+        out.stream_text("hello ");
+        out.stream_text("world");
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "hello world");
+
+        // A tool-call boundary commits (flushes + clears) the text buffer so
+        // the next static line prints below the committed text.
+        out.end_response_segment();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+
+        out.stream_thinking("let me think");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "let me think");
+
+        // End of response flushes remaining buffers.
+        out.end_response();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
     }
 }

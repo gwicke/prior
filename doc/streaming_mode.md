@@ -305,6 +305,19 @@ machinery exists — exactly the early formatting-issue detection requested (§3
 - `QuietOutput`/`NoOutput`/`LogOutput`/`ScrollbackOutput` unchanged (defaults).
 
 ### Phase 2 — Streaming plumbing (`src/agent.rs`)
+**Status: implemented** (2025-07-17). `PicoAgent::prompt` now drives
+`agent.stream_prompt(input).with_hook(LoggingHook{..}).multi_turn(limit).with_history(prior).await`
+(rig 0.38's `IntoFuture` for `StreamingPromptRequest` returns the *item stream*
+itself, not a collected response — there is no `multi_turn_with` / `stream()`
+method; `send()` is private). It loops over `MultiTurnStreamItem`, calling the
+new `Output` streaming methods (`begin_response` / `stream_text` /
+`stream_thinking` / `end_response_segment` / `end_response`) and accumulates the
+final text. The REPL `Submit` handler and `run_once` no longer call
+`display_markdown(&response)` — `prompt` renders itself. History is now
+**persisted**: `FinalResponse::history()` is written back through the
+`&mut Vec<Message>` (the §2.4 `with_history`-clones bug is fixed). Unit tests
+cover the `ConsoleOutput` buffer flush contract and `reasoning_text`. Full suite
+green, no warnings.
 - Change `prompt` to use `stream_prompt` + the loop in §3.1.
 - Drive the stream and call the new `Output` streaming methods (below) instead of
   `display_text(&response)`; keep `prompt` returning `Result<String>` (final text)
@@ -317,6 +330,14 @@ machinery exists — exactly the early formatting-issue detection requested (§3
 - Persist history from `FinalResponse::history()` (§2.4 fix).
 
 ### Phase 3 — Extend the `Output` trait (`src/output.rs`)
+**Status: implemented** (done as part of Phase 2 — Phase 2's `prompt` calls
+these, so the trait methods had to exist first). The five methods
+(`begin_response`, `stream_text`, `stream_thinking`, `end_response_segment`,
+`end_response`) are added to `Output` with default no-op bodies; `ConsoleOutput`
+overrides them with a **render-once-per-segment buffer** (Phase 4 will upgrade to
+live in-place redraw). `QuietOutput` / `NoOutput` / `LogOutput` / `ScrollbackOutput`
+compile unchanged (defaults). No `LogOutput` override for `stream_text` yet
+(optional future nicety).
 Add streaming methods **with default no-op bodies** so existing impls keep
 compiling without change:
 ```rust
