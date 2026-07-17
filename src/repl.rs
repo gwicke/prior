@@ -247,7 +247,20 @@ impl Repl {
                 // past the last input row.
                 let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
                 let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(w));
-                s.push_str(&format!("\x1b[{}B", below));
+                // Step below the input block with line feeds rather than a
+                // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
+                // the cursor to the bottom margin and never scrolls, so when the
+                // input sits on the bottom row the divider was emitted on the
+                // input's own row, overwriting it (see bug report: two stacked
+                // dividers, no input line). A bare `\n` is translated to `\r\n`
+                // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
+                // returns to column 0 and *scrolls* when the cursor is on the
+                // bottom row — exactly the move we need. Emitting `below` of
+                // them lands just past the last input row and makes the real
+                // scroll count match `next_input_row`'s `er + n` assumption.
+                for _ in 0..below {
+                    s.push('\n');
+                }
                 s.push('\r');
                 s.push_str(&divider);
                 s.push('\n');
