@@ -1,4 +1,4 @@
-# picocode.toml example
+# settings.toml example
 
 # --- Managed settings ---
 # All optional; sensible built-in defaults are used when omitted. These are

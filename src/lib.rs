@@ -2,6 +2,7 @@ use thiserror::Error;
 
 pub mod agent;
 pub mod output;
+pub mod platform;
 pub mod tools;
 pub mod persona;
 pub mod config;

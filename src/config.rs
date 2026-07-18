@@ -543,21 +543,18 @@ impl Recipe {
 }
 
 impl Config {
-    /// Load config from the given path, or from `picocode.toml` in the current
-    /// directory if `path` is `None`.
+    /// Load config from the given `--config` path, or from the platform config
+    /// file (`~/.config/picocode/settings.toml` on Linux,
+    /// `%APPDATA%/picocode/settings.toml` on Windows) when `path` is `None`.
+    ///
+    /// If no config location is available (no `--config` and no home /
+    /// application-data directory) or the resolved file does not exist, the
+    /// built-in defaults are used (so a fresh install runs without a config
+    /// file present).
     pub fn load(path: Option<&str>) -> crate::Result<Self> {
-        if let Some(path) = path {
-            let p = Path::new(path);
-            let content = std::fs::read_to_string(p).map_err(crate::PicocodeError::Io)?;
-            let config = toml_edit::de::from_str::<Config>(&content)
-                .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
-            return Ok(config);
-        }
-        let paths = ["picocode.toml"];
-        for path in paths {
-            let p = Path::new(path);
-            if p.exists() {
-                let content = std::fs::read_to_string(p).map_err(crate::PicocodeError::Io)?;
+        if let Some(path) = crate::platform::resolve_config_path(path) {
+            if path.exists() {
+                let content = std::fs::read_to_string(&path).map_err(crate::PicocodeError::Io)?;
                 let config = toml_edit::de::from_str::<Config>(&content)
                     .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
                 return Ok(config);
@@ -855,10 +852,10 @@ model = "claude-3-5-sonnet-20241022"
 
     #[test]
     fn example_toml_file_parses() {
-        // Regression check: the shipped `picocode.toml.example` (ported from the
+        // Regression check: the shipped `settings.toml.example` (ported from the
         // old YAML example) must parse under the TOML config loader.
         let content =
-            std::fs::read_to_string("picocode.toml.example").expect("example file present");
+            std::fs::read_to_string("settings.toml.example").expect("example file present");
         let cfg: Config =
             toml_edit::de::from_str(&content).expect("example TOML should parse");
         let bash = cfg.tool_config.get("bash").expect("bash tool config present");
