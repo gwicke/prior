@@ -24,8 +24,8 @@ use rig_core::message::ReasoningContent;
 use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
 use futures::StreamExt;
 use rig_core::providers::{
-    anthropic, azure, cohere, deepseek, gemini, groq, huggingface, hyperbolic, mira,
-    mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai,
+    anthropic, azure, cohere, doubleword, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mira,
+    minimax, mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai, xiaomimimo, zai,
 };
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -283,6 +283,10 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             check_env!("DEEPSEEK_API_KEY");
             build!(deepseek::Client::from_env()?)
         }
+        "doubleword" => {
+            check_env!("DOUBLEWORD_API_KEY");
+            build!(doubleword::Client::from_env()?)
+        }
         "gemini" | "google" => {
             check_env!("GOOGLE_API_KEY");
             build!(gemini::Client::from_env()?)
@@ -299,9 +303,17 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             check_env!("HYPERBOLIC_API_KEY");
             build!(hyperbolic::Client::from_env()?)
         }
+        "llamafile" => {
+            check_env!("LLAMAFILE_API_BASE_URL");
+            build!(llamafile::Client::from_env()?)
+        }
         "mira" => {
             check_env!("MIRA_API_KEY");
             build!(mira::Client::from_env()?)
+        }
+        "minimax" => {
+            check_env!("MINIMAX_API_KEY");
+            build!(minimax::Client::from_env()?)
         }
         "mistral" => {
             check_env!("MISTRAL_API_KEY");
@@ -332,6 +344,14 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         "xai" => {
             check_env!("XAI_API_KEY");
             build!(xai::Client::from_env()?)
+        }
+        "xiaomimimo" => {
+            check_env!("XIAOMI_MIMO_API_KEY");
+            build!(xiaomimimo::Client::from_env()?)
+        }
+        "zai" => {
+            check_env!("ZAI_API_KEY");
+            build!(zai::Client::from_env()?)
         }
         _ => {
             return Err(crate::PicocodeError::Other(format!(

@@ -101,6 +101,11 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("hyperbolic", "meta-llama/Llama-3-70b-instruct", 8_192, 0.0, 0.0, false),
     ("huggingface", "meta-llama/Llama-3-70b-chat-hf", 8_192, 0.0, 0.0, false),
     ("mira", "mira-v1", 8_192, 0.0, 0.0, false),
+    ("doubleword", "Qwen/Qwen3.5-4B", 128_000, 0.0, 0.0, false),
+    ("llamafile", "LLaMA_CPP", 128_000, 0.0, 0.0, false),
+    ("minimax", "MiniMax-M2.7", 200_000, 0.0, 0.0, false),
+    ("xiaomimimo", "mimo-v2.5-pro", 200_000, 0.0, 0.0, false),
+    ("zai", "glm-4.6", 128_000, 0.0, 0.0, false),
 ];
 
 fn required_env_vars(provider: &str) -> &'static [&'static str] {
@@ -110,11 +115,14 @@ fn required_env_vars(provider: &str) -> &'static [&'static str] {
         "azure" => &["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
         "cohere" => &["COHERE_API_KEY"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
+        "doubleword" => &["DOUBLEWORD_API_KEY"],
         "gemini" | "google" => &["GOOGLE_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "huggingface" => &["HF_TOKEN"],
         "hyperbolic" => &["HYPERBOLIC_API_KEY"],
+        "llamafile" => &["LLAMAFILE_API_BASE_URL"],
         "mira" => &["MIRA_API_KEY"],
+        "minimax" => &["MINIMAX_API_KEY"],
         "mistral" => &["MISTRAL_API_KEY"],
         "moonshot" => &["MOONSHOT_API_KEY"],
         "ollama" => &[],
@@ -122,6 +130,8 @@ fn required_env_vars(provider: &str) -> &'static [&'static str] {
         "perplexity" => &["PERPLEXITY_API_KEY"],
         "together" => &["TOGETHER_API_KEY"],
         "xai" => &["XAI_API_KEY"],
+        "xiaomimimo" => &["XIAOMI_MIMO_API_KEY"],
+        "zai" => &["ZAI_API_KEY"],
         _ => &[],
     }
 }
@@ -710,6 +720,30 @@ mod tests {
         };
         assert_eq!(ctx_cell(&missing), "—");
         assert_eq!(cost_cell(&missing), "—");
+    }
+    // Non-OAuth providers added from rig 0.40 (chat-capable). Verifies the
+    // env-var + curated catalog wiring so they are selectable and listed.
+    #[test]
+    fn new_providers_wired_with_env_vars_and_catalog_entries() {
+        assert_eq!(required_env_vars("doubleword"), &["DOUBLEWORD_API_KEY"]);
+        assert_eq!(required_env_vars("llamafile"), &["LLAMAFILE_API_BASE_URL"]);
+        assert_eq!(required_env_vars("minimax"), &["MINIMAX_API_KEY"]);
+        assert_eq!(required_env_vars("xiaomimimo"), &["XIAOMI_MIMO_API_KEY"]);
+        assert_eq!(required_env_vars("zai"), &["ZAI_API_KEY"]);
+        for (p, m) in [
+            ("doubleword", "Qwen/Qwen3.5-4B"),
+            ("llamafile", "LLaMA_CPP"),
+            ("minimax", "MiniMax-M2.7"),
+            ("xiaomimimo", "mimo-v2.5-pro"),
+            ("zai", "glm-4.6"),
+        ] {
+            assert!(
+                DIRECT_PRICING
+                    .iter()
+                    .any(|(pp, mm, _, _, _, _)| *pp == p && *mm == m),
+                "missing catalog entry for {}/{}", p, m
+            );
+        }
     }
     #[tokio::test]
     #[ignore]

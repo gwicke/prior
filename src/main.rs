@@ -13,7 +13,7 @@ struct Args {
     #[arg(index = 1)]
     prompt: Option<String>,
 
-    /// LLM provider (anthropic, openai, azure, cohere, deepseek, gemini, groq, huggingface, hyperbolic, mira, mistral, moonshot, ollama, openrouter, perplexity, together, xai)
+    /// LLM provider (anthropic, openai, azure, cohere, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, mira, minimax, mistral, moonshot, ollama, openrouter, perplexity, together, xai, xiaomimimo, zai)
     #[arg(short, long, global = true)]
     provider: Option<String>,
 
@@ -271,10 +271,13 @@ fn default_model(provider: &str) -> String {
         "azure" => "gpt-4o".to_string(),
         "cohere" => "command-r-plus".to_string(),
         "deepseek" => "deepseek-chat".to_string(),
+        "doubleword" => "Qwen/Qwen3.5-4B".to_string(),
         "groq" => "llama3-70b-8192".to_string(),
         "huggingface" => "meta-llama/Llama-3-70b-chat-hf".to_string(),
         "hyperbolic" => "meta-llama/Llama-3-70b-instruct".to_string(),
+        "llamafile" => "LLaMA_CPP".to_string(),
         "mira" => "mira-v1".to_string(),
+        "minimax" => "MiniMax-M2.7".to_string(),
         "mistral" => "mistral-large-latest".to_string(),
         "moonshot" => "moonshot-v1-8k".to_string(),
         "ollama" => "llama3".to_string(),
@@ -282,6 +285,8 @@ fn default_model(provider: &str) -> String {
         "perplexity" => "llama-3-sonar-large-32k-online".to_string(),
         "together" => "meta-llama/Llama-3-70b-chat-hf".to_string(),
         "xai" => "grok-1".to_string(),
+        "xiaomimimo" => "mimo-v2.5-pro".to_string(),
+        "zai" => "glm-4.6".to_string(),
         "gemini" | "google" => "gemini-1.5-pro".to_string(),
         _ => "unknown".to_string(),
     }
