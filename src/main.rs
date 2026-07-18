@@ -13,7 +13,7 @@ struct Args {
     #[arg(index = 1)]
     prompt: Option<String>,
 
-    /// LLM provider (anthropic, openai, azure, cohere, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, mira, minimax, mistral, moonshot, ollama, openrouter, perplexity, together, xai, xiaomimimo, zai)
+    /// LLM provider (anthropic, openai, azure, cohere, chatgpt, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, mira, minimax, mistral, moonshot, ollama, openrouter, perplexity, together, xai, xiaomimimo, zai)
     #[arg(short, long, global = true)]
     provider: Option<String>,
 
@@ -229,6 +229,8 @@ fn default_model(provider: &str) -> String {
         "openai" => "gpt-4o-mini".to_string(),
         "azure" => "gpt-4o".to_string(),
         "cohere" => "command-r-plus".to_string(),
+        "chatgpt" => "gpt-5".to_string(),
+        "copilot" => "gpt-5-codex".to_string(),
         "deepseek" => "deepseek-chat".to_string(),
         "doubleword" => "Qwen/Qwen3.5-4B".to_string(),
         "groq" => "llama3-70b-8192".to_string(),

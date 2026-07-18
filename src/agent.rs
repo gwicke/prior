@@ -24,7 +24,7 @@ use rig_core::message::ReasoningContent;
 use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
 use futures::StreamExt;
 use rig_core::providers::{
-    anthropic, azure, cohere, doubleword, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mira,
+    anthropic, azure, chatgpt, cohere, copilot, doubleword, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mira,
     minimax, mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai, xiaomimimo, zai,
 };
 use serde_json;
@@ -259,6 +259,14 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 ));
             }
         };
+        ($($var:expr),+ $(,)?) => {
+            if !( $( std::env::var($var).is_ok() )||+ ) {
+                return Err(crate::PicocodeError::MissingApiKey(
+                    provider.to_string(),
+                    vec![$($var.to_string()),+].join(" or "),
+                ));
+            }
+        };
     }
 
     let agent: Box<dyn PicoAgent> = match provider.as_str() {
@@ -278,6 +286,14 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         "cohere" => {
             check_env!("COHERE_API_KEY");
             build!(cohere::Client::from_env()?)
+        }
+        "chatgpt" => {
+            check_env!("CHATGPT_ACCESS_TOKEN");
+            build!(chatgpt::Client::from_env()?)
+        }
+        "copilot" => {
+            check_env!("GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN");
+            build!(copilot::Client::from_env()?)
         }
         "deepseek" => {
             check_env!("DEEPSEEK_API_KEY");

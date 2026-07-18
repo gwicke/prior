@@ -95,6 +95,8 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("openrouter", "meta-llama/llama-3-70b-instruct", 8_192, 0.0, 0.0, false),
     ("xai", "grok-1", 8_192, 5.0, 15.0, false),
     ("cohere", "command-r-plus", 128_000, 2.5, 10.0, false),
+    ("chatgpt", "gpt-5", 128_000, 0.0, 0.0, false),
+    ("copilot", "gpt-5-codex", 128_000, 0.0, 0.0, false),
     ("moonshot", "moonshot-v1-8k", 8_192, 0.0, 0.0, false),
     ("together", "meta-llama/Llama-3-70b-chat-hf", 8_192, 0.0, 0.0, false),
     ("perplexity", "llama-3-sonar-large-32k-online", 32_000, 1.0, 1.0, false),
@@ -114,6 +116,8 @@ fn required_env_vars(provider: &str) -> &'static [&'static str] {
         "openai" => &["OPENAI_API_KEY"],
         "azure" => &["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
         "cohere" => &["COHERE_API_KEY"],
+        "chatgpt" => &["CHATGPT_ACCESS_TOKEN"],
+        "copilot" => &["GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
         "doubleword" => &["DOUBLEWORD_API_KEY"],
         "gemini" | "google" => &["GOOGLE_API_KEY"],
@@ -730,12 +734,19 @@ mod tests {
         assert_eq!(required_env_vars("minimax"), &["MINIMAX_API_KEY"]);
         assert_eq!(required_env_vars("xiaomimimo"), &["XIAOMI_MIMO_API_KEY"]);
         assert_eq!(required_env_vars("zai"), &["ZAI_API_KEY"]);
+        assert_eq!(required_env_vars("chatgpt"), &["CHATGPT_ACCESS_TOKEN"]);
+        assert_eq!(
+            required_env_vars("copilot"),
+            &["GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN"]
+        );
         for (p, m) in [
             ("doubleword", "Qwen/Qwen3.5-4B"),
             ("llamafile", "LLaMA_CPP"),
             ("minimax", "MiniMax-M2.7"),
             ("xiaomimimo", "mimo-v2.5-pro"),
             ("zai", "glm-4.6"),
+            ("chatgpt", "gpt-5"),
+            ("copilot", "gpt-5-codex"),
         ] {
             assert!(
                 DIRECT_PRICING
