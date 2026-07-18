@@ -189,10 +189,33 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let think_json = thinking::mapping_opt(&provider, config.thinking_level.as_deref());
 
     macro_rules! build {
+        // Anthropic: enable automatic prompt caching so the static prefix
+        // (system prompt + tool definitions + growing conversation history) is
+        // cached server-side and billed as cache reads instead of full input
+        // tokens on every turn. Requires no beta header; the API advances the
+        // cache breakpoint automatically as the history grows.
+        (anthropic $client:expr) => {{
+            let cached_model = $client
+                .completion_model(&model)
+                .with_automatic_caching();
+            build!(@builder AgentBuilder::new(cached_model))
+        }};
+        // OpenRouter: enable prompt caching so the system-prompt prefix is
+        // marked with `cache_control: {"type": "ephemeral"}` and billed at the
+        // cache-hit rate on subsequent turns. Only effective when the routed
+        // upstream model supports explicit cache breakpoints (e.g. `anthropic/...`).
+        (openrouter $client:expr) => {{
+            let cached_model = $client
+                .completion_model(&model)
+                .with_prompt_caching();
+            build!(@builder AgentBuilder::new(cached_model))
+        }};
         ($client:expr) => {{
-            let builder = $client.agent(&model);
+            build!(@builder $client.agent(&model))
+        }};
+        (@builder $builder:expr) => {{
             let rig_agent = build_rig_agent(
-                builder,
+                $builder,
                 config.yolo,
                 config.output.clone(),
                 config.system_message_extension,
@@ -229,7 +252,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let agent: Box<dyn PicoAgent> = match provider.as_str() {
         "anthropic" => {
             check_env!("ANTHROPIC_API_KEY");
-            build!(anthropic::Client::from_env()?)
+            build!(anthropic anthropic::Client::from_env()?)
         }
         "openai" => {
             check_env!("OPENAI_API_KEY");
@@ -288,7 +311,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         }
         "openrouter" => {
             check_env!("OPENROUTER_API_KEY");
-            build!(openrouter::Client::from_env()?)
+            build!(openrouter openrouter::Client::from_env()?)
         }
         "perplexity" => {
             check_env!("PERPLEXITY_API_KEY");
