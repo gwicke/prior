@@ -386,8 +386,8 @@ pub(crate) async fn run_sandboxed(
                 result.map(|_| captured)
             }
             None => {
-                // Unsandboxed: duct captures stdout directly.
-                let expr = sh_dangerous(&cmd).stderr_to_stdout();
+                // Unsandboxed: capture combined output directly via duct.
+                let expr = sh_dangerous(&cmd).stderr_to_stdout().stdout_capture();
                 let handle = expr.unchecked().start()?;
                 match timeout {
                     None => handle
@@ -500,6 +500,28 @@ fn cap_lines(s: &str, n: usize) -> String {
 /// common tools can execute. They are read-only, so the host OS stays hidden
 /// from writes; only explicitly declared bindings add writable/project paths.
 const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
+
+/// Single-quote a string for safe embedding as a single argument inside a
+/// `sh -c` payload. The only shell metacharacter not inert inside single
+/// quotes is the single quote itself; we escape it as `''\''` (close, escaped
+/// quote, reopen). This lets the outer `sh -c` pass the user command through
+/// verbatim instead of expanding `$VAR` / `$(...)` before the inner shell runs
+/// it.
+fn sh_single_quote(s: &str) -> String {
+    let mut out = String::from('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push('\'');
+            out.push('\\');
+            out.push('\'');
+            out.push('\'');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
 
 /// Build the common bwrap argument vector shared by both execution paths:
 /// the read-only system dirs, the CWD/bindings, the scratch tmpfs, network/PID/
@@ -633,11 +655,12 @@ fn build_bwrap_expr(
     // Build the in-namespace payload. Memory limit via RLIMIT_AS (ulimit -v),
     // scoped to the command's process tree by the PID namespace. Combined
     // output is redirected to the bound host temp file.
+    let cmd_quoted = sh_single_quote(&cmd);
     let inner = if let Some(mb) = cfg.memory_mb {
         let kb = mb * 1024;
-        format!("ulimit -v {kb}; exec sh -c {cmd:?}")
+        format!("ulimit -v {kb}; exec sh -c {cmd_quoted}")
     } else {
-        format!("exec sh -c {cmd:?}")
+        format!("exec sh -c {cmd_quoted}")
     };
     let payload = format!("{inner} > /tmp/.picocode-out 2>&1");
     args.push("--".into());
@@ -1246,6 +1269,41 @@ mod sandbox_tests {
         );
         assert!(out.contains("HOME=[]"), "host HOME not wiped: {out}");
         std::env::remove_var("PICOCODE_WIPE_TEST");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unsandboxed_captures_stdout() {
+        // When the sandbox is disabled, output must still be captured (not
+        // leaked to the parent's stdout / returned empty).
+        set_sandbox(None);
+        let out = run_sandboxed("echo hi-there", None).await.unwrap();
+        assert_eq!(out.trim(), "hi-there");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_captures_whole_command_and_expands_vars() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        // A multi-statement command: the trailing `> /tmp/.picocode-out`
+        // redirect must scope the *whole* command, not just the last segment.
+        let multi = run_sandboxed("echo a; echo b; echo c", None).await.unwrap();
+        assert!(
+            multi.contains("a") && multi.contains("b") && multi.contains("c"),
+            "got: {multi}"
+        );
+        // Shell-local variables must expand during execution (single shell
+        // layer), not be pre-expanded by the outer `sh -c` against the clean env.
+        let looped = run_sandboxed("for i in 1 2 3; do echo num-$i; done", None)
+            .await
+            .unwrap();
+        assert!(
+            looped.contains("num-1") && looped.contains("num-2") && looped.contains("num-3"),
+            "variable expansion broken, got: {looped}"
+        );
     }
 
     #[tokio::test]
