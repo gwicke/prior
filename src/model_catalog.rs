@@ -100,7 +100,6 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("perplexity", "llama-3-sonar-large-32k-online", 32_000, 1.0, 1.0, false),
     ("hyperbolic", "meta-llama/Llama-3-70b-instruct", 8_192, 0.0, 0.0, false),
     ("huggingface", "meta-llama/Llama-3-70b-chat-hf", 8_192, 0.0, 0.0, false),
-    ("galadriel", "llama3-70b", 8_192, 0.0, 0.0, false),
     ("mira", "mira-v1", 8_192, 0.0, 0.0, false),
 ];
 
@@ -111,7 +110,6 @@ fn required_env_vars(provider: &str) -> &'static [&'static str] {
         "azure" => &["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
         "cohere" => &["COHERE_API_KEY"],
         "deepseek" => &["DEEPSEEK_API_KEY"],
-        "galadriel" => &["GALADRIEL_API_KEY"],
         "gemini" | "google" => &["GOOGLE_API_KEY"],
         "groq" => &["GROQ_API_KEY"],
         "huggingface" => &["HF_TOKEN"],
