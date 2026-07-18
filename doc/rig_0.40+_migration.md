@@ -396,12 +396,29 @@ pass, 1 ignored**.
   **no manual change** — `rig-derive` (bumped to HEAD) generates the matching
   `call(context, args)` impl.
 
-### 7.4 Removed `galadriel` provider
-- rig 0.40 dropped the `galadriel` provider entirely (commit `695490d9`
+### 7.4 Provider list changes (vs rig HEAD)
+
+- **Removed `galadriel`** — rig 0.40 dropped it entirely (commit `695490d9`
   `refactor(providers)!: remove galadriel provider (#2041)`, not a rename). Removed
   its `providers` import, the `"galadriel"` arm in `agent.rs`'s client builder,
   its `model_catalog.rs` entry + env-var arm, and the `main.rs` default-model arm
   + doc comment.
+- **Added (non-OAuth, chat-capable) — rig 0.40 providers picocode now wires:**
+  `doubleword`, `llamafile`, `minimax`, `xiaomimimo`, `zai`. Each got a client-
+  builder arm (`check_env!` + `build!(provider::Client::from_env()?)`), a
+  `model_catalog.rs` `required_env_vars` arm + `DIRECT_PRICING` entry (context
+  windows are best-effort estimates; prices left at `0.0` as placeholders —
+  fill in real numbers later), a `main.rs` `default_model` arm, and the doc
+  comment. Env vars: `DOUBLEWORD_API_KEY`, `LLAMAFILE_API_BASE_URL`,
+  `MINIMAX_API_KEY`, `XIAOMI_MIMO_API_KEY`, `ZAI_API_KEY`. Default models:
+  `Qwen/Qwen3.5-4B`, `LLaMA_CPP`, `MiniMax-M2.7`, `mimo-v2.5-pro`, `glm-4.6`.
+- **Excluded `voyageai`** — embeddings-only provider (no `completion_model`/
+  `AgentClient` chat path), so it cannot go through the `build!` chat builder.
+  Out of scope until picocode has an embeddings feature.
+- **Deferred (OAuth): `chatgpt`, `copilot`** — see §7.6. They implement
+  `from_env()` + `AgentClient`, so the token-env-var path is as easy as the
+  others above; the interactive device-code OAuth is moderate (rig does the
+  protocol). Not done in this migration.
 
 ### 7.5 Pre-existing test fix (not caused by this migration)
 - `settings.rs::apply_to_config_maps_the_five_settings` built `AgentConfig`
@@ -409,7 +426,34 @@ pass, 1 ignored**.
   field predates this migration; the test simply wasn't updated when the field
   was added.)
 
-### 7.6 Open follow-ups (not required for the upgrade)
+### 7.6 Adding the OAuth providers (`chatgpt`, `copilot`)
+
+Both already implement `from_env()` + `ProviderClient` (so `AgentClient`/`.agent()`
+works — they wire in like the non-OAuth providers). Two tiers:
+
+- **Tier 1 — token env var (trivial, ~15 LoC/provider, same as §7.4):**
+  `chatgpt` reads `CHATGPT_ACCESS_TOKEN` (+ optional `CHATGPT_ACCOUNT_ID`);
+  `copilot` reads `COPILOT_GITHUB_ACCESS_TOKEN`/`GITHUB_TOKEN` (or an API key
+  `GITHUB_COPILOT_API_KEY`/`COPILOT_API_KEY`). Add the client-builder arm +
+  catalog/default-model entries; the user supplies a browser-obtained token.
+- **Tier 2 — in-app interactive device-code OAuth (moderate, ~50–150 LoC):**
+  rig's `from_env()` with no token falls back to `ChatGPTAuth::OAuth` /
+  `CopilotAuth::OAuth`, which runs a **device-authorization flow** with
+  `on_device_code(handler)` (surfaces URL + user code) and `token_dir`/
+  `auth_file` (caches + auto-refreshes the token). picocode would: (a) register a
+  device-code handler that prints the verification URL + code (optionally opens
+  a browser); (b) wire `on_device_code(handler).token_dir(<picocode config dir>)`
+  into a **provider-specific `build!` arm** (like the anthropic/openrouter
+  caching arms, since the generic arm can't pass those); (c) optionally add a
+  `picocode login <provider>` subcommand. picocode does **not** implement the
+  OAuth protocol — rig's `auth` module handles token exchange, polling, and
+  refresh. Set `allow_device_flow(false)` for non-interactive/CI use so it errors
+  instead of hanging on a device code.
+
+**Recommendation:** do Tier 1 now (consistent with the other providers, low
+risk); defer Tier 2 unless passwordless `picocode login` is wanted.
+
+### 7.7 Open follow-ups (not required for the upgrade)
 - "Strip reasoning from persisted history" toggle (esp. for Anthropic, which
   keeps `thinking` blocks) — §5 risk.
 - Option (B): render reasoning-only turns as the visible answer for the residual
