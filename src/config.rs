@@ -52,6 +52,10 @@ pub struct SandboxConfig {
     /// Filesystem bindings. See [`BindSpec`].
     #[serde(default)]
     pub paths: Vec<BindSpec>,
+    /// Environment-filter policy. See [`EnvPolicy`]. When unset, a built-in
+    /// deny-secrets default (see [`DEFAULT_ENV_DISALLOW`]) is applied.
+    #[serde(default)]
+    pub env: Option<EnvPolicy>,
 }
 
 impl SandboxConfig {
@@ -69,7 +73,120 @@ impl SandboxConfig {
             drop_caps: self.drop_caps.or(Some(true)),
             tmp_size_mb: self.tmp_size_mb.or(Some(256)),
             paths: self.paths.clone(),
+            env: self.env.clone(),
         }
+    }
+}
+
+/// Environment-filter policy for the sandbox.
+///
+/// Controls which of the parent process's environment variables are visible
+/// to the sandboxed `bash`/`agent_browser` command. Modeled as a single
+/// mutually-exclusive mode: you cannot combine a blacklist and a whitelist in
+/// one policy.
+///
+/// - `disallow`: start from the full inherited environment and drop names
+///   matching any pattern (this is also the built-in default when `env` is
+///   unset — see [`DEFAULT_ENV_DISALLOW`]).
+/// - `only_allow`: keep only names matching a pattern; everything else is
+///   dropped (deny-by-default).
+///
+/// Patterns are matched against variable *names* (not values) and support a
+/// minimal glob: `*` matches any run of characters, `?` matches a single
+/// character, and anything else is a literal. Matching is case-sensitive and
+/// anchored to the whole name.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct EnvPolicy {
+    /// Which filtering mode to apply.
+    #[serde(rename = "mode")]
+    pub mode: EnvMode,
+    /// Name patterns to match, interpreted per `mode`. Empty means "drop
+    /// nothing" for `disallow` and "keep nothing" for `only_allow`.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+}
+
+/// The two environment-filtering modes.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvMode {
+    /// Drop matching names; keep the rest.
+    Disallow,
+    /// Keep only matching names; drop the rest.
+    OnlyAllow,
+}
+
+/// Built-in default `env` policy, applied when the user configures no `env`
+/// block. Drops common secret shapes (`*_KEY`, `*_SECRET`, `*_TOKEN`, `AWS_*`,
+/// `SSH_AUTH_SOCK`) while leaving the rest of the environment intact, so
+/// ordinary commands (which rely on `PATH`, `HOME`, `TERM`, ...) still work.
+pub const DEFAULT_ENV_DISALLOW: &[&str] = &[
+    "*_KEY",
+    "*_SECRET",
+    "*_TOKEN",
+    "AWS_*",
+    "SSH_AUTH_SOCK",
+];
+
+impl SandboxConfig {
+    /// Effective environment policy.
+    ///
+    /// Returns the user's `env` policy if configured, otherwise the built-in
+    /// deny-secrets default ([`DEFAULT_ENV_DISALLOW`]). The default does not
+    /// depend on `bwrap` presence; it applies whenever the sandbox runs.
+    pub fn env_policy(&self) -> EnvPolicy {
+        match &self.env {
+            Some(p) => p.clone(),
+            None => EnvPolicy {
+                mode: EnvMode::Disallow,
+                patterns: DEFAULT_ENV_DISALLOW.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+}
+
+/// Compute the `(name, value)` pairs from the parent environment that should be
+/// visible inside the sandbox under `policy`.
+///
+/// `env` is the parent's full environment (e.g. `std::env::vars().collect()`).
+/// The result is what `build_bwrap_expr` passes via `--clearenv` + `--setenv`.
+pub fn env_vars_to_keep(
+    policy: &EnvPolicy,
+    env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let keep = |name: &str| patterns_match_any(&policy.patterns, name);
+    match policy.mode {
+        EnvMode::Disallow => env
+            .iter()
+            .filter(|(n, _)| !keep(n))
+            .cloned()
+            .collect(),
+        EnvMode::OnlyAllow => env.iter().filter(|(n, _)| keep(n)).cloned().collect(),
+    }
+}
+
+/// True if `name` matches any of `patterns` (literal or minimal glob).
+fn patterns_match_any(patterns: &[String], name: &str) -> bool {
+    patterns.iter().any(|p| glob_match(p, name))
+}
+
+/// Minimal glob match: `*` = any run of chars, `?` = single char, else literal.
+/// Case-sensitive, anchored to the whole `name`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    glob_match_impl(pattern.as_bytes(), name.as_bytes())
+}
+
+fn glob_match_impl(pat: &[u8], s: &[u8]) -> bool {
+    match (pat.first(), s.first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some(b'*'), _) => {
+            // `*` matches zero or more chars: try consuming 0..=len of `s`.
+            (0..=s.len()).any(|i| glob_match_impl(&pat[1..], &s[i..]))
+        }
+        (Some(b'?'), Some(_)) => glob_match_impl(&pat[1..], &s[1..]),
+        (Some(a), Some(b)) if a == b => glob_match_impl(&pat[1..], &s[1..]),
+        _ => false,
     }
 }
 
@@ -509,6 +626,7 @@ mod tests {
             drop_caps: None,
             tmp_size_mb: None,
             paths: vec![],
+            env: None,
         };
         let d = raw.with_defaults(true);
         assert_eq!(d.enabled, Some(true));
@@ -559,4 +677,122 @@ mod tests {
         // Non-remapped path is unchanged.
         assert_eq!(table.rewrite(Path::new("/work/y")), Path::new("/work/y"));
     }
+
+    // ---- Environment policy ----
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn disallow_drops_matching_keeps_rest() {
+        let policy = EnvPolicy {
+            mode: EnvMode::Disallow,
+            patterns: vec!["*_KEY".into()],
+        };
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b"), ("HOME", "/h")]),
+        );
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(names.contains(&"PATH"));
+        assert!(names.contains(&"HOME"));
+    }
+
+    #[test]
+    fn disallow_empty_keeps_all() {
+        let policy = EnvPolicy {
+            mode: EnvMode::Disallow,
+            patterns: vec![],
+        };
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]),
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn only_allow_keeps_matching_only() {
+        let policy = EnvPolicy {
+            mode: EnvMode::OnlyAllow,
+            patterns: vec!["PATH".into()],
+        };
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b"), ("HOME", "/h")]),
+        );
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["PATH"]);
+    }
+
+    #[test]
+    fn only_allow_empty_keeps_nothing() {
+        let policy = EnvPolicy {
+            mode: EnvMode::OnlyAllow,
+            patterns: vec![],
+        };
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]),
+        );
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn default_policy_drops_secrets_but_keeps_path() {
+        // No `env` configured => built-in deny-secrets default applies.
+        let cfg = SandboxConfig::default();
+        let policy = cfg.env_policy();
+        assert_eq!(policy.mode, EnvMode::Disallow);
+        assert_eq!(policy.patterns, DEFAULT_ENV_DISALLOW.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let kept = env_vars_to_keep(
+            &policy,
+            &env(&[
+                ("ANTHROPIC_API_KEY", "x"),
+                ("HF_TOKEN", "y"),
+                ("AWS_SECRET_ACCESS_KEY", "z"),
+                ("SSH_AUTH_SOCK", "/tmp/a"),
+                ("MY_SECRET", "w"),
+                ("PATH", "/b"),
+                ("HOME", "/h"),
+            ]),
+        );
+        let names: Vec<&str> = kept.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!names.contains(&"HF_TOKEN"));
+        assert!(!names.contains(&"AWS_SECRET_ACCESS_KEY"));
+        assert!(!names.contains(&"SSH_AUTH_SOCK"));
+        // `*_SECRET` glob catches MY_SECRET too.
+        assert!(!names.contains(&"MY_SECRET"));
+        // Non-secret vars survive.
+        assert!(names.contains(&"PATH"));
+        assert!(names.contains(&"HOME"));
+    }
+
+    #[test]
+    fn env_policy_deserializes() {
+        let cfg: SandboxConfig = serde_yaml::from_str(
+            "enabled: true\nenv:\n  mode: disallow\n  patterns:\n    - '*_KEY'\n    - 'AWS_*'\n",
+        )
+        .expect("env policy should parse");
+        let p = cfg.env.expect("env present");
+        assert_eq!(p.mode, EnvMode::Disallow);
+        assert_eq!(p.patterns, vec!["*_KEY".to_string(), "AWS_*".to_string()]);
+
+        let cfg: SandboxConfig = serde_yaml::from_str(
+            "env:\n  mode: only_allow\n  patterns:\n    - PATH\n",
+        )
+        .expect("only_allow should parse");
+        let p = cfg.env.expect("env present");
+        assert_eq!(p.mode, EnvMode::OnlyAllow);
+        assert_eq!(p.patterns, vec!["PATH".to_string()]);
+    }
 }
+
+

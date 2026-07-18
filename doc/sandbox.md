@@ -158,10 +158,16 @@ Each entry declares one filesystem binding. Semantics mirror `bwrap`:
    (`bwrap --ro-bind / /` is *not* used). Only declared `paths` are visible.
    This is what makes the sandbox meaningful: the host FS is invisible unless
    explicitly bound.
-5. **Ordering / precedence.** Bindings are applied in config order. Later
-   bindings win on overlap (bwrap semantics: the last mount on a path shadows
-   earlier ones). A `rw` entry for a subtree of an earlier `ro` entry therefore
-   upgrades just that subtree to writable — the usual pattern.
+5. **Ordering / precedence.** On overlap, the **most-specific (deepest
+   in-sandbox `to`) binding wins**, regardless of the order you list bindings
+   in. `build_bwrap_expr` sorts bindings by `to` depth so the deepest is
+   mounted last (bwrap's "last mount wins"), and `PathPolicy::check` resolves
+   overlaps by `to` specificity via the remap table — so the shell sandbox and
+   the non-shell file tools always agree. A `rw` entry for a subtree of a
+   `ro` entry therefore upgrades just that subtree to writable; a `ro` entry
+   for a subtree of a `rw` entry restricts just that subtree. Do **not** rely
+   on config order to get the right result — the deepest binding is
+   authoritative either way.
 
 ### Remap semantics (the interesting case)
 
@@ -247,6 +253,58 @@ bwrap
   command's stdout/stderr is returned and the agent sees the real exit
   behavior through output. (Optionally surface a non-zero exit as a
   `ToolError::Generic` with the captured output — TBD per UX review.)
+
+### Environment isolation
+
+bwrap **inherits the parent environment verbatim** by default — it applies no
+env filtering of its own. picocode runs with provider API keys in its process
+environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `HF_TOKEN`, `AWS_*`, ...),
+plus any host secrets the operator's shell holds (`SSH_AUTH_SOCK`,
+`GITHUB_TOKEN`, ...). Without explicit sanitization, a sandboxed LLM command
+could read those secrets. The sandbox therefore applies an **environment
+policy** on top of bwrap's filesystem/network/PID/cap isolation.
+
+The policy is configured under `sandbox.env` as a single mutually-exclusive
+mode (you cannot combine a blacklist and a whitelist in one block):
+
+```yaml
+tool_config:
+  bash:
+    sandbox:
+      # Blacklist (default when `env` is unset): start from the full env,
+      # drop names matching any pattern. Glob `*`,`?` plus literal.
+      env:
+        mode: disallow
+        patterns: ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+      # -- or -- Whitelist: keep ONLY matching names; everything else dropped.
+      env:
+        mode: only_allow
+        patterns: ["PATH", "HOME", "TERM", "LANG"]
+```
+
+- `disallow` keeps the whole environment minus the matches. An **empty**
+  `patterns` list keeps everything (a debug / allow-all escape hatch).
+- `only_allow` keeps only the matches. An **empty** `patterns` list wipes the
+  environment (only `PWD` survives bwrap's `--clearenv`); commands that need
+  `PATH` will fail, so whitelists must include it.
+
+**Default.** When `sandbox.env` is omitted entirely, picocode applies the
+built-in `disallow` policy `["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*",
+"SSH_AUTH_SOCK"]`. This drops common secret shapes while leaving `PATH`,
+`HOME`, `TERM`, `LANG`, ... intact, so ordinary commands keep working. It is a
+defense-in-depth measure: the sandbox already blocks network egress by
+default, so a leaked key cannot be exfiltrated unless `network: true`.
+
+**Mechanism.** `build_bwrap_expr` always emits `--clearenv` (which retains
+only `PWD`) followed by `--setenv NAME VALUE` for each variable the policy
+permits. This makes the policy explicit and verifiable (inspect the `--setenv`
+args) rather than relying on bwrap's inheritance behavior.
+
+> **Caveat:** env isolation depends on bwrap's `--clearenv`/`--setenv`. When
+> `bwrap` is absent the sandbox degrades to unsandboxed execution (timeout
+> still enforced) and the environment is **not** sanitized — the same as
+> running the command directly. Keep `bwrap` present in any environment that
+> handles real secrets.
 
 ### Path-binding special case
 

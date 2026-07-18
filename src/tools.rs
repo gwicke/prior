@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::fs;
 
-use crate::config::{resolve_path_policy, resolve_paths, SandboxConfig};
+use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig};
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 pub enum ToolError {
@@ -472,8 +472,17 @@ fn build_bwrap_expr(
     let home = dirs_home();
 
     // Resolve the configured bindings (empty list => CWD-visible default).
-    let binds = resolve_paths(&cwd, home.as_deref(), &cfg.paths)
+    let mut binds = resolve_paths(&cwd, home.as_deref(), &cfg.paths)
         .map_err(|e| ToolError::Generic(format!("sandbox config error: {e}")))?;
+    // Emit bindings most-specific-first: sort by the in-sandbox `to` path depth
+    // so the deepest (most specific) binding is mounted LAST. bwrap resolves
+    // overlapping mounts by "last mount wins", so this makes the deeper
+    // binding authoritative on overlap. This matches the non-shell
+    // `PathPolicy::check` (which resolves overlaps by `to` specificity via the
+    // remap table), keeping the two worlds order-independent: a nested `ro`
+    // child is read-only, and a nested `rw` child upgrades its subtree, no
+    // matter what order the operator lists the bindings in.
+    binds.sort_by_key(|b| b.to.components().count());
 
     let mut args: Vec<String> = Vec::new();
 
@@ -544,6 +553,23 @@ fn build_bwrap_expr(
         args.push("ALL".into());
     }
     args.push("--die-with-parent".into());
+
+    // Environment isolation (see doc/sandbox.md, "Environment isolation").
+    // bwrap inherits the parent environment verbatim, which would otherwise
+    // leak host secrets (API keys, tokens, SSH agent socket, ...) into the
+    // LLM-driven command. We start from a clean env (`--clearenv` retains
+    // only PWD) and explicitly re-expose exactly the variables the policy
+    // permits. The policy is deny-by-default (secrets) unless the user set an
+    // explicit `env` block. Always emit `--clearenv` (even when nothing is
+    // kept) so the policy is enforced regardless of how many vars survive.
+    let policy = cfg.env_policy();
+    let keep = env_vars_to_keep(&policy, &std::env::vars().collect::<Vec<_>>());
+    args.push("--clearenv".into());
+    for (name, value) in &keep {
+        args.push("--setenv".into());
+        args.push(name.clone());
+        args.push(value.clone());
+    }
 
     // Build the in-namespace payload. Memory limit via RLIMIT_AS (ulimit -v),
     // scoped to the command's process tree by the PID namespace. The command's
@@ -754,7 +780,7 @@ mod tests {
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
-    use crate::config::{BindMode, BindSpec, SandboxConfig};
+    use crate::config::{BindMode, BindSpec, EnvMode, EnvPolicy, SandboxConfig};
     use serial_test::serial;
 
     fn bwrap_on_path() -> bool {
@@ -777,6 +803,7 @@ mod sandbox_tests {
             drop_caps: Some(true),
             tmp_size_mb: Some(16),
             paths,
+            env: None,
         }
     }
 
@@ -850,6 +877,7 @@ mod sandbox_tests {
             drop_caps: None,
             tmp_size_mb: None,
             paths: vec![],
+            env: None,
         }));
         let res = run_sandboxed("sleep 30", None).await;
         assert!(res.is_err());
@@ -944,6 +972,41 @@ mod sandbox_tests {
 
     #[tokio::test]
     #[serial]
+    async fn nonshell_nested_ro_child_write_rejected() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // rw parent with a nested ro child. A write under the ro child must be
+        // denied even though the parent is writable (most-specific binding
+        // wins), while a write under the rw parent must succeed. This is the
+        // built-in `write` tool path (host-direct, via PathPolicy::check).
+        let dir = tempfile::tempdir().unwrap();
+        let ro_sub = dir.path().join("ro");
+        std::fs::create_dir_all(&ro_sub).unwrap();
+        sandbox_with_paths(vec![
+            BindSpec {
+                mode: BindMode::Rw,
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/proj".to_string(),
+            },
+            BindSpec {
+                mode: BindMode::Ro,
+                from: ro_sub.to_string_lossy().to_string(),
+                to: "/proj/ro".to_string(),
+            },
+        ]);
+        // Write under the rw parent succeeds.
+        super::write_file("/proj/writable.txt".to_string(), "x".to_string())
+            .await
+            .unwrap();
+        // Write under the nested ro child is denied.
+        let res = super::write_file("/proj/ro/x.txt".to_string(), "x".to_string()).await;
+        assert!(res.is_err(), "write under nested ro child should be denied");
+        assert!(res.unwrap_err().to_string().contains("read-only"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn nonshell_remap_consistency() {
         if !bwrap_on_path() {
             return;
@@ -977,4 +1040,136 @@ mod sandbox_tests {
         let read = super::read_file("/tmp/x2.txt".to_string(), 0, 0).await.unwrap();
         assert!(read.contains("from-shell"));
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_nested_ro_child_denies_write_reversed_order() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // The ro child is listed BEFORE the rw parent in config. Before the
+        // depth-sort fix, bwrap's "last mount wins" made the child writable
+        // (a shell-side hole). After the fix, most-specific wins regardless of
+        // order, so the nested ro child must deny writes while the rw parent
+        // stays writable.
+        let dir = tempfile::tempdir().unwrap();
+        let ro_sub = dir.path().join("ro");
+        std::fs::create_dir_all(&ro_sub).unwrap();
+        let specs = vec![
+            BindSpec {
+                mode: BindMode::Ro,
+                from: ro_sub.to_string_lossy().to_string(),
+                to: "/proj/ro".to_string(),
+            },
+            BindSpec {
+                mode: BindMode::Rw,
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/proj".to_string(),
+            },
+        ];
+        set_sandbox(Some(sandbox_with(specs, Some(30))));
+        let out = run_sandboxed(
+            "touch /proj/ro/x; if [ -e /proj/ro/x ]; then echo WRITE_OK; else echo WRITE_DENIED; fi; \
+             touch /proj/parent_file.txt; if [ -e /proj/parent_file.txt ]; then echo PARENT_OK; else echo PARENT_DENIED; fi",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("WRITE_DENIED"), "nested ro child should deny write: {out}");
+        assert!(out.contains("PARENT_OK"), "rw parent should allow write: {out}");
+    }
+
+    // ---- Environment isolation ----
+
+    /// Set a sandbox with an explicit `env` policy.
+    fn sandbox_with_env(env: EnvPolicy) -> SandboxConfig {
+        SandboxConfig {
+            enabled: Some(true),
+            timeout_secs: Some(30),
+            network: Some(false),
+            memory_mb: None,
+            pid_isolation: Some(true),
+            drop_caps: Some(true),
+            tmp_size_mb: Some(16),
+            paths: vec![],
+            env: Some(env),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_env_drops_secret_but_keeps_path() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // No `env` configured => built-in deny-secrets default (drops *_KEY etc).
+        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        std::env::set_var("PICOCODE_TEST_KEY", "supersecret");
+        // PATH must still be present for `cat` (external) to work, proving the
+        // default is a blacklist, not a blanket wipe.
+        let out = run_sandboxed(
+            "echo \"K=[$PICOCODE_TEST_KEY] PATH_OK=$PATH\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("supersecret"),
+            "secret leaked into sandbox: {out}"
+        );
+        assert!(out.contains("PATH_OK="), "PATH missing: {out}");
+        std::env::remove_var("PICOCODE_TEST_KEY");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_allow_policy_keeps_path_drops_secret() {
+        if !bwrap_on_path() {
+            return;
+        }
+        std::env::set_var("PICOCODE_TEST_KEY2", "topsecret");
+        set_sandbox(Some(sandbox_with_env(EnvPolicy {
+            mode: EnvMode::OnlyAllow,
+            patterns: vec!["PATH".into()],
+        })));
+        let out = run_sandboxed(
+            "echo \"K=[$PICOCODE_TEST_KEY2] PATH_OK=$PATH\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("topsecret"),
+            "secret leaked under only_allow: {out}"
+        );
+        assert!(out.contains("PATH_OK="), "PATH missing: {out}");
+        std::env::remove_var("PICOCODE_TEST_KEY2");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn only_allow_empty_wipes_env() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // An empty only_allow list denies everything (besides PWD, and bwrap's
+        // own default PATH which it always injects so commands can run).
+        // Verify a host secret we set is NOT visible, and that host HOME (which
+        // bwrap does not default) is wiped.
+        set_sandbox(Some(sandbox_with_env(EnvPolicy {
+            mode: EnvMode::OnlyAllow,
+            patterns: vec![],
+        })));
+        std::env::set_var("PICOCODE_WIPE_TEST", "wipedme");
+        let out = run_sandboxed("echo \"K=[$PICOCODE_WIPE_TEST] HOME=[$HOME]\"", None)
+            .await
+            .unwrap();
+        assert!(
+            !out.contains("wipedme"),
+            "host secret leaked under empty only_allow: {out}"
+        );
+        assert!(out.contains("HOME=[]"), "host HOME not wiped: {out}");
+        std::env::remove_var("PICOCODE_WIPE_TEST");
+    }
 }
+

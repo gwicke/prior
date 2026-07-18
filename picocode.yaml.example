@@ -40,6 +40,22 @@ tool_config:
         - rw: "."
         - rw: { from: "./cache", to: "/var/cache/app" }
         # - ro: { from: "~/.cargo", to: "/opt/cargo" }
+      # Environment policy for the sandboxed command. bwrap inherits the parent
+      # env verbatim, so without this the LLM command could read host secrets
+      # (API keys, tokens, SSH agent socket). Two mutually-exclusive modes:
+      #   disallow  : keep the full env MINUS names matching `patterns`
+      #   only_allow: keep ONLY names matching `patterns` (everything else dropped)
+      # Patterns are glob (`*`/`?`) or literal, matched against var *names*.
+      # When `env` is omitted entirely, the built-in default applies:
+      #   disallow: ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+      # Uncomment and adjust as needed:
+      # env:
+      #   mode: disallow
+      #   patterns: ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+      # Or a strict whitelist (must include PATH or commands break):
+      # env:
+      #   mode: only_allow
+      #   patterns: ["PATH", "HOME", "TERM", "LANG"]
 
 # Named recipes for non-interactive execution (CI/CD, automation)
 recipes:
