@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use termimad;
-use markdown_terminal::Theme;
+use markdown_stream::{Parser, StreamParser};
+use markdown_terminal::{Renderer, Theme};
 use libc;
 use crossterm::event::{self, Event, KeyCode};
 use crate::repl::Repl;
@@ -32,6 +33,21 @@ pub trait Output: Send + Sync {
     fn display_markdown(&self, text: &str) {
         self.display_text(text);
     }
+    // ---- Streaming (Phase 2+) ----
+    // Default no-ops so existing impls keep compiling without change.
+    // `ConsoleOutput` overrides these to render incrementally (Phase 4 adds
+    // live in-place redraw; Phase 2 uses a render-once-per-segment buffer).
+    /// Called once when an agent response begins streaming.
+    fn begin_response(&self) {}
+    /// A delta of assistant text.
+    fn stream_text(&self, _delta: &str) {}
+    /// A delta of model reasoning/thinking (already gated by level upstream).
+    fn stream_thinking(&self, _delta: &str) {}
+    /// Commit the current text/thinking segment before a static line (tool
+    /// call, tool result, completion call) is printed.
+    fn end_response_segment(&self) {}
+    /// Called when the whole response finishes; commit the final live block.
+    fn end_response(&self) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
     fn get_user_input(&self) -> String;
@@ -224,6 +240,24 @@ pub struct ConsoleOutput {
     /// Set `true` while `confirm` is reading a keystroke, so the background
     /// in-flight reader thread backs off and doesn't swallow the input.
     reader_paused: Arc<AtomicBool>,
+    /// Buffered assistant text while a response streams (non-TTY / pipe path;
+    /// rendered once at `end_response` via `display_markdown`). The TTY live
+    /// path uses the incremental `parser`/`renderer` instead.
+    text_buffer: Mutex<String>,
+    /// Buffered reasoning/thinking while a response streams (surfaced at
+    /// `end_response`; relocated into a dedicated panel in Phase 5).
+    thinking_buffer: Mutex<String>,
+    /// Whether the current response is being rendered live (TTY) or buffered
+    /// (non-TTY). Decided once per response in `begin_response`.
+    live: Mutex<bool>,
+    /// Incremental GFM markdown parser for the current response (TTY only).
+    /// Fed the streamed deltas; emits events for *completed* blocks so the
+    /// renderer can print them once, avoiding whole-document re-renders.
+    parser: Mutex<StreamParser>,
+    /// Incremental terminal renderer (TTY only): prints each completed block
+    /// once as it closes, so code blocks stream line-by-line and paragraphs
+    /// appear on close — coarse-grained, with clean scrollback.
+    renderer: Mutex<Renderer>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -247,7 +281,10 @@ pub fn term_width() -> usize {
 /// expect. `color` selects the default ANSI theme (TTY) vs `no_color` (pipes,
 /// logs, CI) so non-terminal output stays clean.
 pub(crate) fn render_markdown(src: &str, width: usize, color: bool) -> String {
-    let theme = if color { Theme::default() } else { Theme::no_color() };
+    // In callers, `color` is `is_terminal()`, so enabling OSC 8 clickable
+    // links here gates them to a real TTY (pipes/CI stay escape-free).
+    let mut theme = if color { Theme::default() } else { Theme::no_color() };
+    theme.clickable_links = color;
     markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
 
@@ -331,6 +368,21 @@ impl ConsoleOutput {
             spinner: Mutex::new(None),
             row: Mutex::new(1),
             reader_paused: Arc::new(AtomicBool::new(false)),
+            text_buffer: Mutex::new(String::new()),
+            thinking_buffer: Mutex::new(String::new()),
+            live: Mutex::new(false),
+            parser: Mutex::new(StreamParser::new_gfm()),
+            renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
+        }
+    }
+
+    /// Render and clear the buffered assistant text (non-TTY / pipe path:
+    /// `live` is false so the TTY live renderer isn't used; this renders once
+    /// via `display_markdown`, matching the Phase 1/6 clean-output behavior).
+    fn flush_text(&self) {
+        let text = std::mem::take(&mut *self.text_buffer.lock().unwrap());
+        if !text.is_empty() {
+            self.display_markdown(&text);
         }
     }
 }
@@ -526,6 +578,91 @@ impl Output for ConsoleOutput {
         println!();
         let n = wrap(text, term_width()).len() + 1;
         self.note_lines(n);
+    }
+
+    fn begin_response(&self) {
+        let live = std::io::stdout().is_terminal();
+        *self.live.lock().unwrap() = live;
+        *self.thinking_buffer.lock().unwrap() = String::new();
+        if live {
+            // Reset the incremental parser/renderer for a fresh response and
+            // print a leading blank to separate from the user prompt.
+            let mut parser = self.parser.lock().unwrap();
+            *parser = StreamParser::new_gfm();
+            let mut theme = Theme::default();
+            theme.clickable_links = true; // real TTY path
+            let mut renderer = self.renderer.lock().unwrap();
+            *renderer = Renderer::new(theme, term_width());
+            println!();
+            self.note_lines(1);
+        } else {
+            *self.text_buffer.lock().unwrap() = String::new();
+        }
+    }
+
+    fn stream_text(&self, delta: &str) {
+        let live = *self.live.lock().unwrap();
+        if !live {
+            self.text_buffer.lock().unwrap().push_str(delta);
+            return;
+        }
+        // Coarse-grained live rendering: feed the delta to the incremental
+        // parser and emit only the *completed* blocks. Each block prints once
+        // (code lines line-by-line, paragraphs on close), so there is no whole
+        // document re-render, no in-place cursor gymnastics, and scrollback
+        // stays clean.
+        let mut parser = self.parser.lock().unwrap();
+        let events = parser.write(delta.as_bytes());
+        let mut renderer = self.renderer.lock().unwrap();
+        let mut out = std::io::stdout();
+        let _ = renderer.feed(&events, &mut out);
+    }
+
+    fn stream_thinking(&self, delta: &str) {
+        self.thinking_buffer.lock().unwrap().push_str(delta);
+    }
+
+    fn end_response_segment(&self) {
+        self.stop_thinking();
+        let live = *self.live.lock().unwrap();
+        if live {
+            // Close any open paragraph so the upcoming tool call / result prints
+            // below it (and not mid-sentence). The blank line is a block
+            // separator; the renderer emits no stray blank if nothing follows.
+            let mut parser = self.parser.lock().unwrap();
+            let events = parser.write(b"\n\n");
+            let mut renderer = self.renderer.lock().unwrap();
+            let mut out = std::io::stdout();
+            let _ = renderer.feed(&events, &mut out);
+            println!();
+            self.note_lines(1);
+        } else {
+            self.flush_text();
+        }
+    }
+
+    fn end_response(&self) {
+        self.stop_thinking();
+        let live = *self.live.lock().unwrap();
+        if live {
+            // Finalize: close the document and flush any trailing block.
+            let mut parser = self.parser.lock().unwrap();
+            let events = parser.flush();
+            let mut renderer = self.renderer.lock().unwrap();
+            let mut out = std::io::stdout();
+            let _ = renderer.feed(&events, &mut out);
+            println!();
+            self.note_lines(1);
+        } else {
+            self.flush_text();
+        }
+        // Surface buffered thinking (Phase 5 relocates this into a collapsible
+        // panel above the answer). `display_text` keeps it plain so it is not
+        // re-interpreted as markdown.
+        let thinking = std::mem::take(&mut *self.thinking_buffer.lock().unwrap());
+        if !thinking.is_empty() {
+            self.display_text(&format!("Reasoning:\n{}", thinking));
+        }
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
@@ -1059,5 +1196,94 @@ mod tests {
         assert!(!out.contains('\x1b'));
         assert!(out.contains("Title"));
         assert!(out.contains('│') && out.contains("quoted"));
+    }
+
+    #[test]
+    fn console_output_streaming_buffers_and_flushes() {
+        let out = ConsoleOutput::new();
+        out.begin_response();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
+
+        out.stream_text("hello ");
+        out.stream_text("world");
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "hello world");
+
+        // A tool-call boundary commits (flushes + clears) the text buffer so
+        // the next static line prints below the committed text.
+        out.end_response_segment();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+
+        out.stream_thinking("let me think");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "let me think");
+
+        // End of response flushes remaining buffers.
+        out.end_response();
+        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
+        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
+    }
+
+    /// The TTY live path relies on the crate's *incremental* `Renderer` + `StreamParser`:
+    /// completed blocks are emitted once (so scrollback stays clean) and code
+    /// lines stream as they arrive, while an open paragraph is held back until
+    /// it closes (coarse-grained). These tests pin that contract.
+    #[test]
+    fn incremental_renderer_streams_code_lines_and_coarsens_paragraphs() {
+        let mut parser = StreamParser::new_gfm();
+        let mut renderer = Renderer::new(Theme::no_color(), 80);
+        let mut buf: Vec<u8> = Vec::new();
+
+        // Code block streams line-by-line *before* the fence closes.
+        let _ = renderer.feed(&parser.write("```python\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("def f():\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("    return 1\n".as_bytes()), &mut buf);
+        let mid = String::from_utf8(buf.clone()).unwrap();
+        assert!(
+            mid.contains("def f():"),
+            "code line should render before the fence closes"
+        );
+        let _ = renderer.feed(&parser.write("```\n".as_bytes()), &mut buf);
+
+        // An open paragraph is NOT emitted until it closes (coarse-grained).
+        let before = buf.len();
+        let _ = renderer.feed(
+            &parser.write("Intro sentence without a trailing blank line".as_bytes()),
+            &mut buf,
+        );
+        assert_eq!(buf.len(), before, "open paragraph must not be emitted yet");
+
+        // Finalizing the document flushes the trailing paragraph.
+        let _ = renderer.feed(&parser.flush(), &mut buf);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("Intro sentence without a trailing blank line"),
+            "flush must emit the trailing paragraph"
+        );
+    }
+
+    #[test]
+    fn incremental_renderer_gfm_table_renders() {
+        let mut parser = StreamParser::new_gfm();
+        let mut renderer = Renderer::new(Theme::no_color(), 80);
+        let mut buf: Vec<u8> = Vec::new();
+        let evs = parser.write("| a | b |\n|---|---|\n| 1 | 2 |\n\n".as_bytes());
+        let _ = renderer.feed(&evs, &mut buf);
+        let _ = renderer.feed(&parser.flush(), &mut buf);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains('│'), "GFM table must render with box chars");
+    }
+
+    #[test]
+    fn render_markdown_emits_osc8_links_only_when_colored() {
+        // `color` is `is_terminal()` in callers, so OSC 8 clickable links must
+        // appear on a TTY (color = true) and stay absent for pipes/CI.
+        let tty = render_markdown("[text](https://example.com/a)", 80, true);
+        assert!(tty.contains("\x1b]8;;https://example.com/a\x1b\\"), "TTY render must wrap link in OSC 8");
+        assert!(tty.contains("text"));
+        let piped = render_markdown("[text](https://example.com/a)", 80, false);
+        assert!(
+            !piped.contains("\x1b]8;;"),
+            "non-TTY render must not emit OSC 8 hyperlink sequences"
+        );
     }
 }

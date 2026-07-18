@@ -40,6 +40,7 @@ unicode-segmentation = "1.12"
 unicode-width = "0.1"
 reqwest = { version = "0.13", features = ["json"] }
 libc = "0.2"
+futures = "0.3"
 
 [lib]
 name = "picocode"
@@ -54,3 +55,12 @@ tempfile = "3.24.0"
 portable-pty = "0.8"
 vt100 = "0.16"
 serial_test = "3.1"
+
+# Fork of codewandler-markdown-terminal adding OSC 8 clickable inline links
+# (gated by Theme.clickable_links). Both crates are pinned to the same fork
+# commit so `markdown_stream::Event` resolves to one type across picocode and
+# the patched renderer. Once the fork is pushed, `cargo build` updates
+# Cargo.lock to the git source. See doc/streaming_mode.md (§OSC 8 links).
+[patch.crates-io]
+codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "c28fdd3" }
+codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "c28fdd3" }
