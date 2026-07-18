@@ -439,13 +439,15 @@ TTY**.
 
 Upstreamability / clean history:
 - The change lives in a fork of the upstream `codewandler-markdown` workspace
-  (repo `https://github.com/gwicke/codewandler-markdown`), as a **single feature
-  commit on top of upstream `acbe68d` (Release 0.2.1)**: commit `c28fdd3`
-  "Add OSC 8 clickable inline links, gated by Theme.clickable_links". This is a
-  ready-to-open PR diff (one commit; `Theme` default behavior unchanged).
+  (repo `https://github.com/gwicke/codewandler-markdown`), as **two small,
+  backward-compatible feature commits on top of upstream `acbe68d` (Release
+  0.2.1)**: commit `c28fdd3` "Add OSC 8 clickable inline links, gated by
+  Theme.clickable_links" and commit `41d0922` "Add Theme::dimmed() for faded
+  secondary content". Each is a ready-to-open PR diff; `Theme` default behavior
+  is unchanged. picocode pins both crates to `rev = 41d0922` (see wiring below).
 - Patch touches only `crates/markdown-terminal/src/{theme,lib}.rs` — adds the
-  field, the OSC 8 wrap in `styled`, and three unit tests (enabled / default-off
-  / image-exclusion).
+  `clickable_links` field + OSC 8 wrap in `styled` (+ 3 unit tests), and adds the
+  `dimmed()` theme whose `reset` re-applies the faint attribute (+ 1 unit test).
 
 Wiring in picocode (`src/output.rs`):
 - `render_markdown(src, width, color)` sets `theme.clickable_links = color`, and
@@ -465,10 +467,69 @@ would be two sources and `feed(&[Event])` would fail to type-check). The local
 bind-mount path override used for testing was removed; the final setup references
 only the remote fork.
 
-### Phase 5 — Thinking panel UX
-- A collapsible, dim "thinking" region above the final answer. Toggle visibility
-  with the existing `/thinking` level (and/or a `/showthinking` flag).
-- For non-thinking levels, `stream_thinking` is a no-op (no panel).
+### Phase 5 — Thinking: always dim inline
+**Status: implemented** (2025-07-17).
+
+Decision (per discussion): start with **always-dim inline** thinking rather than
+a separate panel — it fits the linear/incremental streaming model and matches the
+familiar faded-inline UX. A `/settings` toggle for "show thinking" can layer on
+later once the settings UI lands; in the streaming model only *future* content
+emission changes (no re-rendering of earlier content).
+
+Implementation (`src/output.rs`):
+- `ConsoleOutput` holds a separate `thinking_parser`/`thinking_renderer`
+  (incremental) so thinking and answer blocks keep independent state, plus
+  `dim_on`/`thinking_run` flags.
+- TTY `stream_thinking` turns a faint SGR (`\x1b[2m`) on **once per run** and
+  feeds the delta to the thinking renderer, which uses a dedicated
+  **`Theme::dimmed()`** whose `reset` re-applies the faint attribute
+  (`\x1b[0m\x1b[2m`). This is the key fix: the renderer resets via `theme.reset`
+  after *every* inline style, so without the re-dim, bold/code spans would wipe
+  the fading (the original bug — inline formatting reset the global dim). With
+  `Theme::dimmed()`, the whole thinking stays faded through any inline
+  formatting, and `stream_text` turns the faint **off** before emitting answer
+  blocks. No `⏺ ` marker — once the fade is reliable, it alone distinguishes
+  thinking from the answer. (`Theme::dimmed()` is a second fork commit,
+  `41d0922`, on top of `c28fdd3`; see §OSC 8 links for the fork setup.)
+- `end_response_segment` closes any open thinking paragraph (via `\n\n`, not
+  `flush`, so post-tool-call thinking can continue) and leaves dim off;
+  `end_response` `flush()`es the thinking document and resets dim.
+- The thinking→answer boundary is normalized to **one paragraph gap**: at the
+  transition, any still-open thinking paragraph is committed (while dim is still
+  on) and a single blank line is emitted, so the answer always starts on a fresh
+  paragraph. This fixes the earlier inconsistency where a direct thinking→answer
+  transition (no intervening tool call) produced only a single newline, while the
+  tool-call path produced a blank line. The two renderers are independent, so
+  without this nudge the answer renderer (fresh `pending_gap`) would start
+  immediately after the thinking output.
+- **Multi-turn double-gap fix:** in a multi-turn turn (thinking → answer → tool
+  → thinking → answer), the answer `Renderer` persists across the whole response,
+  so its `pending_gap` (set when the answer paragraph is committed at the tool
+  boundary) would otherwise fire at the *next* answer segment's first block — on
+  top of the blank line the thinking→answer transition emits — producing **two**
+  blank lines before the second answer. `end_response_segment` therefore
+  **resets the answer `Renderer` to a fresh instance** after committing the
+  paragraph (the thinking `Renderer` is intentionally *not* reset, so post-tool
+  thinking reads as one continuous faded stream). This drops the pending gap so
+  exactly one blank precedes each answer. Regression-guarded by
+  `output::tests::multi_turn_answer_boundary_single_blank`.
+- Non-TTY streams thinking to **stderr** (not buffered) as it arrives, so
+  consumers can drop it (`2>/dev/null`) or merge it (`2>&1`) while stdout stays
+  the clean answer + tool calls. (Tool calls/results already print to stdout.)
+- When the thinking level is off, no `Reasoning` items are produced, so
+  `stream_thinking` is never called and nothing is dimmed.
+
+Tests: `output::tests::thinking_streams_inline_and_dimmed` guards the re-dim
+mechanism (`Theme::dimmed()` keeps `\x1b[2m` alive through inline bold/code);
+`output::tests::multi_turn_answer_boundary_single_blank` guards exactly one blank
+before each answer (incl. multi-turn); the fork adds
+`tests::dimmed_theme_reapplies_faint_after_inline_style`. Full suite green, no
+warnings.
+
+Note: the fade uses the standard faint attribute (`\x1b[2m`). To dim *more*
+aggressively (e.g. gray the plain text), set the initial/faint SGR and
+`Theme::dimmed().reset` to `\x1b[2;90m` (faint + bright-black) — a one-line
+change in `src/output.rs` (`ensure_dim`) and the fork theme.
 
 ### Phase 6 — Quiet / non-interactive (`run_once`, pipes)
 - `run_once` and piped stdin use `ConsoleOutput` with `live = false`, so the

@@ -244,9 +244,6 @@ pub struct ConsoleOutput {
     /// rendered once at `end_response` via `display_markdown`). The TTY live
     /// path uses the incremental `parser`/`renderer` instead.
     text_buffer: Mutex<String>,
-    /// Buffered reasoning/thinking while a response streams (surfaced at
-    /// `end_response`; relocated into a dedicated panel in Phase 5).
-    thinking_buffer: Mutex<String>,
     /// Whether the current response is being rendered live (TTY) or buffered
     /// (non-TTY). Decided once per response in `begin_response`.
     live: Mutex<bool>,
@@ -258,6 +255,16 @@ pub struct ConsoleOutput {
     /// once as it closes, so code blocks stream line-by-line and paragraphs
     /// appear on close — coarse-grained, with clean scrollback.
     renderer: Mutex<Renderer>,
+    /// Incremental parser/renderer for *thinking* content (TTY only). Kept
+    /// separate from the answer parser/renderer so thinking and answer blocks
+    /// have independent state; thinking is rendered inline and dimmed as it
+    /// streams (Phase 5).
+    thinking_parser: Mutex<StreamParser>,
+    thinking_renderer: Mutex<Renderer>,
+    /// Whether a dim SGR is currently active on stdout. Toggled at thinking /
+    /// answer boundaries so streamed thinking reads faded *without* re-rendering
+    /// any already-emitted content.
+    dim_on: Mutex<bool>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -369,10 +376,27 @@ impl ConsoleOutput {
             row: Mutex::new(1),
             reader_paused: Arc::new(AtomicBool::new(false)),
             text_buffer: Mutex::new(String::new()),
-            thinking_buffer: Mutex::new(String::new()),
             live: Mutex::new(false),
             parser: Mutex::new(StreamParser::new_gfm()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
+            thinking_parser: Mutex::new(StreamParser::new_gfm()),
+            thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
+            dim_on: Mutex::new(false),
+        }
+    }
+
+    /// Toggle the global dim SGR on stdout to match `on`, emitting the escape
+    /// only when the state actually changes. Used so streamed thinking reads
+    /// faded without re-rendering any already-emitted content.
+    fn ensure_dim(&self, on: bool, out: &mut io::Stdout) {
+        let mut dim = self.dim_on.lock().unwrap();
+        if *dim != on {
+            let _ = if on {
+                out.write_all(b"\x1b[2m")
+            } else {
+                out.write_all(b"\x1b[0m")
+            };
+            *dim = on;
         }
     }
 
@@ -583,7 +607,6 @@ impl Output for ConsoleOutput {
     fn begin_response(&self) {
         let live = std::io::stdout().is_terminal();
         *self.live.lock().unwrap() = live;
-        *self.thinking_buffer.lock().unwrap() = String::new();
         if live {
             // Reset the incremental parser/renderer for a fresh response and
             // print a leading blank to separate from the user prompt.
@@ -593,6 +616,12 @@ impl Output for ConsoleOutput {
             theme.clickable_links = true; // real TTY path
             let mut renderer = self.renderer.lock().unwrap();
             *renderer = Renderer::new(theme, term_width());
+            // Reset the thinking parser/renderer and dim state for this response.
+            let mut tparser = self.thinking_parser.lock().unwrap();
+            *tparser = StreamParser::new_gfm();
+            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            *trenderer = Renderer::new(Theme::dimmed(), term_width());
+            *self.dim_on.lock().unwrap() = false;
             println!();
             self.note_lines(1);
         } else {
@@ -611,29 +640,82 @@ impl Output for ConsoleOutput {
         // (code lines line-by-line, paragraphs on close), so there is no whole
         // document re-render, no in-place cursor gymnastics, and scrollback
         // stays clean.
+        let mut out = std::io::stdout();
+        let was_thinking = *self.dim_on.lock().unwrap();
+        if was_thinking {
+            // Thinking just ended: normalize the thinking→answer boundary to a
+            // single paragraph gap. Commit any still-open thinking paragraph
+            // (while dim is still on) and emit one blank line, so the answer
+            // starts on a fresh paragraph regardless of whether a tool call
+            // intervened in between (the tool path already prints its own gap).
+            {
+                let mut tparser = self.thinking_parser.lock().unwrap();
+                let events = tparser.write(b"\n\n");
+                let mut trenderer = self.thinking_renderer.lock().unwrap();
+                let _ = trenderer.feed(&events, &mut out);
+            }
+            self.ensure_dim(false, &mut out);
+            println!();
+            self.note_lines(1);
+        } else {
+            self.ensure_dim(false, &mut out);
+        }
         let mut parser = self.parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
         let mut renderer = self.renderer.lock().unwrap();
-        let mut out = std::io::stdout();
         let _ = renderer.feed(&events, &mut out);
     }
 
     fn stream_thinking(&self, delta: &str) {
-        self.thinking_buffer.lock().unwrap().push_str(delta);
+        let live = *self.live.lock().unwrap();
+        if !live {
+            // Non-TTY: stream thinking to stderr so consumers can drop it
+            // (`2>/dev/null`) or merge it (`2>&1`) without touching stdout.
+            let mut err = std::io::stderr();
+            let _ = err.write_all(delta.as_bytes());
+            return;
+        }
+        // Always-dim inline: render thinking through its own incremental
+        // renderer using a faded theme whose `reset` re-applies the dim SGR,
+        // so inline formatting (bold/code) does not clear the fading. The
+        // initial dim is turned on once per run via `ensure_dim`.
+        let mut out = std::io::stdout();
+        self.ensure_dim(true, &mut out);
+        let mut parser = self.thinking_parser.lock().unwrap();
+        let events = parser.write(delta.as_bytes());
+        let mut renderer = self.thinking_renderer.lock().unwrap();
+        let _ = renderer.feed(&events, &mut out);
     }
 
     fn end_response_segment(&self) {
         self.stop_thinking();
         let live = *self.live.lock().unwrap();
         if live {
-            // Close any open paragraph so the upcoming tool call / result prints
-            // below it (and not mid-sentence). The blank line is a block
-            // separator; the renderer emits no stray blank if nothing follows.
-            let mut parser = self.parser.lock().unwrap();
-            let events = parser.write(b"\n\n");
-            let mut renderer = self.renderer.lock().unwrap();
             let mut out = std::io::stdout();
-            let _ = renderer.feed(&events, &mut out);
+            // Commit any open answer paragraph so the tool call/result prints
+            // below, then start a *fresh* answer renderer for the next segment.
+            // This drops the renderer's `pending_gap`, which otherwise fires at
+            // the next answer segment's first block and would double the blank
+            // line at the thinking→answer boundary in multi-turn turns (the
+            // transition already emits one blank).
+            {
+                let mut parser = self.parser.lock().unwrap();
+                let events = parser.write(b"\n\n");
+                let mut renderer = self.renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+                let mut theme = Theme::default();
+                theme.clickable_links = true; // real TTY path
+                *renderer = Renderer::new(theme, term_width());
+            }
+            // Commit thinking (don't reset: post-tool thinking continues in the
+            // same thinking renderer so it reads as one continuous faded stream).
+            {
+                let mut parser = self.thinking_parser.lock().unwrap();
+                let events = parser.write(b"\n\n");
+                let mut renderer = self.thinking_renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+            }
+            self.ensure_dim(false, &mut out);
             println!();
             self.note_lines(1);
         } else {
@@ -645,23 +727,27 @@ impl Output for ConsoleOutput {
         self.stop_thinking();
         let live = *self.live.lock().unwrap();
         if live {
-            // Finalize: close the document and flush any trailing block.
-            let mut parser = self.parser.lock().unwrap();
-            let events = parser.flush();
-            let mut renderer = self.renderer.lock().unwrap();
             let mut out = std::io::stdout();
-            let _ = renderer.feed(&events, &mut out);
+            // Finalize the answer document.
+            {
+                let mut parser = self.parser.lock().unwrap();
+                let events = parser.flush();
+                let mut renderer = self.renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+            }
+            // Finalize thinking (it was rendered inline + dimmed as it streamed).
+            {
+                let mut parser = self.thinking_parser.lock().unwrap();
+                let events = parser.flush();
+                let mut renderer = self.thinking_renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+            }
+            self.ensure_dim(false, &mut out);
             println!();
             self.note_lines(1);
         } else {
             self.flush_text();
-        }
-        // Surface buffered thinking (Phase 5 relocates this into a collapsible
-        // panel above the answer). `display_text` keeps it plain so it is not
-        // re-interpreted as markdown.
-        let thinking = std::mem::take(&mut *self.thinking_buffer.lock().unwrap());
-        if !thinking.is_empty() {
-            self.display_text(&format!("Reasoning:\n{}", thinking));
+            // Non-TTY thinking already streamed to stderr; stdout stays clean.
         }
     }
 
@@ -1203,7 +1289,6 @@ mod tests {
         let out = ConsoleOutput::new();
         out.begin_response();
         assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
-        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
 
         out.stream_text("hello ");
         out.stream_text("world");
@@ -1215,12 +1300,13 @@ mod tests {
         assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
 
         out.stream_thinking("let me think");
-        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "let me think");
+        // Non-TTY thinking is streamed to stderr, never buffered into the
+        // stdout answer path (so stdout stays clean for piping).
+        assert!(!out.text_buffer.lock().unwrap().contains("let me think"));
 
         // End of response flushes remaining buffers.
         out.end_response();
         assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
-        assert_eq!(out.thinking_buffer.lock().unwrap().clone(), "");
     }
 
     /// The TTY live path relies on the crate's *incremental* `Renderer` + `StreamParser`:
@@ -1284,6 +1370,89 @@ mod tests {
         assert!(
             !piped.contains("\x1b]8;;"),
             "non-TTY render must not emit OSC 8 hyperlink sequences"
+        );
+    }
+
+    #[test]
+    fn thinking_streams_inline_and_dimmed() {
+        // Mirrors Phase 5's TTY thinking path: a faint SGR + a faded theme whose
+        // `reset` re-applies the dim keep thinking faded even through inline
+        // formatting (bold/code), without re-rendering past content.
+        let mut parser = StreamParser::new_gfm();
+        let mut renderer = Renderer::new(Theme::dimmed(), 80);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = write!(buf, "\x1b[2m"); // initial dim (mirrors `ensure_dim(true)`)
+        let _ = renderer.feed(&parser.write("let me **think** step by step\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.flush(), &mut buf);
+        let _ = write!(buf, "\x1b[0m"); // reset (mirrors `ensure_dim(false)`)
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("\x1b[2m"), "thinking must be dimmed");
+        assert!(
+            out.contains("\x1b[0m\x1b[2m"),
+            "inline formatting must re-apply dim (reset re-dim), not clear it"
+        );
+    }
+
+    #[test]
+    fn multi_turn_answer_boundary_single_blank() {
+        // Reproduces the TTY orchestration with *persistent* renderers across a
+        // multi-turn turn (thinking1 -> answer1 -> tool -> thinking2 -> answer2),
+        // exactly as the `ConsoleOutput` fields behave. Before the fix, the
+        // answer renderer's `pending_gap` (set when the answer paragraph was
+        // committed at the tool boundary) fired at answer2's first block, on
+        // top of the one blank the thinking→answer transition emits — TWO
+        // blank lines. Resetting the answer renderer at the tool boundary
+        // (as `end_response_segment` now does) drops that pending gap.
+        let mut tparser = StreamParser::new_gfm();
+        let mut trenderer = Renderer::new(Theme::dimmed(), 80);
+        let mut aparser = StreamParser::new_gfm();
+        let mut arenderer = Renderer::new(Theme::default(), 80);
+        let mut out: Vec<u8> = Vec::new();
+        let w = |out: &mut Vec<u8>, s: &[u8]| out.extend_from_slice(s);
+
+        // thinking1 -> answer1
+        let _ = trenderer.feed(&tparser.write(b"think one\n"), &mut out);
+        let _ = trenderer.feed(&tparser.write(b"\n\n"), &mut out); // transition
+        w(&mut out, b"\n"); // separator
+        let _ = arenderer.feed(&aparser.write(b"\n\nanswer one\n"), &mut out);
+        w(&mut out, b"\n");
+
+        // tool call boundary: commit the answer paragraph, then RESET the
+        // answer renderer (mirrors the fix) so no pending gap survives into
+        // answer2. The model's leading blank lines stay in answer2 below.
+        let _ = arenderer.feed(&aparser.write(b"\n\n"), &mut out);
+        arenderer = Renderer::new(Theme::default(), 80);
+        w(&mut out, b"\n");
+
+        // thinking2 -> answer2 (model sends leading blank lines)
+        let _ = trenderer.feed(&tparser.write(b"think two\n"), &mut out);
+        let _ = trenderer.feed(&tparser.write(b"\n\n"), &mut out); // transition
+        w(&mut out, b"\n"); // separator
+        let _ = arenderer.feed(&aparser.write(b"\n\nanswer two\n"), &mut out);
+
+        // end_response: flush both documents once.
+        let _ = arenderer.feed(&aparser.flush(), &mut out);
+        let _ = trenderer.feed(&tparser.flush(), &mut out);
+        w(&mut out, b"\n");
+
+        let s = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = s.split('\n').collect();
+        let idx = match lines.iter().position(|l| l.contains("answer two")) {
+            Some(i) => i,
+            None => {
+                for (i, l) in lines.iter().enumerate() {
+                    eprintln!("[{i}] {:?}", l);
+                }
+                panic!("answer two not found");
+            }
+        };
+        assert!(
+            lines[idx - 1].trim().is_empty(),
+            "line immediately before answer two must be blank"
+        );
+        assert!(
+            !lines[idx - 2].trim().is_empty(),
+            "exactly ONE blank line before answer two (no double gap)"
         );
     }
 }
