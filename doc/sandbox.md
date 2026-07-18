@@ -512,7 +512,7 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       path translation shared by the shell wrapper and `validate_path`.
 - [ ] Add `Config::bash_sandbox() -> SandboxConfig` accessor (merges defaults).
 - [ ] Unit tests: parse all four `BindSpec` forms; resolve relative/`~`/absolute.
-- [ ] Update `picocode.toml.example` with the full `sandbox:` block (commented).
+- [ ] Update `settings.toml.example` with the full `sandbox:` block (commented).
 
 ### Phase 1 — Timeout + `run_sandboxed` refactor (shell tools)
 
@@ -570,7 +570,7 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 
 - [ ] Document `sandbox:` in README (security properties + caveats).
 - [ ] Add a `doc/sandbox.md` link / summary to README.
-- [ ] Final integration pass: run the example `picocode.toml` recipes under
+- [ ] Final integration pass: run the example `settings.toml` recipes under
       sandbox on/off.
 - [ ] CHANGELOG entry; confirm `cargo test` + `cargo build` green on a host
       with and without bwrap.

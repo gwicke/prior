@@ -58,7 +58,7 @@ This plan mirrors the existing `/model` + `/thinking` inline-overlay design in
   (2026-07-17):** switch the whole config format from YAML to TOML (hard break,
   no YAML fallback — this is an experimental personal fork). The five settings
   become `#[serde(default)]` fields on `Config`, persisted to the **same**
-  `picocode.toml` that holds `recipes` (split later if desired). Writes go
+  `settings.toml` that holds `recipes` (split later if desired). Writes go
   through `toml_edit` so user comments + recipes survive. See §A.5.
 - **Live application today** is the `SetModel`/`SetThinking` path in
   `agent.rs::run_interactive`: it clones `config`, calls `create_agent`, and
@@ -218,12 +218,12 @@ durable even if the session later crashes.
 **Decision (2026-07-17):** switch the entire config format to **TOML** (hard
 break, no YAML fallback — experimental personal fork). The five settings are
 added as `#[serde(default)]` fields on `Config`, so they live in the **same**
-`picocode.toml` as `recipes`/`agent_prompt`/`tool_config` (can be split into a
+`settings.toml` as `recipes`/`agent_prompt`/`tool_config` (can be split into a
 separate file later). This is the cleanest resolution of the earlier Q1: TOML +
 `toml_edit` preserves user comments + recipes on every `/set` write, which
 YAML (no round-trip comment-preserving library in Rust) cannot do.
 
-**Reading.** `Config::load` reads `picocode.toml` (single default name; the
+**Reading.** `Config::load` reads `settings.toml` (single default name; the
 `--config <path>` override still works). Deserialize via `toml_edit::de::from_str`
 (or `toml::from_str`) into the `Config` struct — the existing serde derives work
 unchanged. The five new fields are `#[serde(default)]` so an old/minimal file
@@ -232,7 +232,7 @@ still parses.
 **Writing (comment-preserving).** `SettingsStore::save()` does **not**
 round-trip the whole file through serde (that would drop comments + recipes
 structure). Instead it:
-1. Parses the existing `picocode.toml` with `toml_edit::DocumentMut::from_str`
+1. Parses the existing `settings.toml` with `toml_edit::DocumentMut::from_str`
    (if the file is absent, starts from an empty `DocumentMut` + a header comment
    block).
 2. Sets only the five managed keys (`default_model`, `security_mode`,
@@ -341,13 +341,13 @@ Refinements from the recent work:
 |---|---|
 | `src/set.rs` | **New.** `SettingKey`, `ValueKind`, `SettingMeta`, `SETTINGS` registry, `SettingsStore` (`load`/`save`/`value`/`set_value`/`overlay_rows`), parse + validate per key. Re-export from `lib.rs`. |
 | `Cargo.toml` | Drop `serde_yaml`; add `toml_edit = { version = "0.25", features = ["serde"] }`. |
-| `src/config.rs` | **YAML→TOML hard switch.** `Config::load` reads `picocode.toml` (single default; `--config` override unchanged). Add `#[serde(default)]` fields `default_model`, `security_mode`, `tool_call_limit`, `default_persona`, `default_thinking_level`. No `Config::save` (settings writes go through `SettingsStore`/`toml_edit`). |
+| `src/config.rs` | **YAML→TOML hard switch.** `Config::load` reads `settings.toml` (single default; `--config` override unchanged). Add `#[serde(default)]` fields `default_model`, `security_mode`, `tool_call_limit`, `default_persona`, `default_thinking_level`. No `Config::save` (settings writes go through `SettingsStore`/`toml_edit`). |
 | `src/slash.rs` | Add `SlashKind::Settings`; registry entry `/set`; `filter_commands`/completion already picks it up; update `parse_slash` not required (handled inline in `repl.rs`). Bump registry count test (currently `4`). |
 | `src/repl.rs` | `read_input` already takes `&mut SettingsStore` (Phase 1). For Phase 2 live-apply, add `dirty: &mut bool` and set it on a successful `/set` `set_value`. Add `kind = 5` branch, `edit_setting`/`edit_prev_input` locals, the edit-mode key guard, and `settings_overlay_entries` pure helper. Update `render_help`/hint references. |
 | `src/agent.rs` | `run_interactive`: build `SettingsStore` from `Config`; pass `&mut` into `read_input`; add `dirty` flag; on `Submit`, rebuild agent if dirty (Phase 2). |
-| `src/main.rs` | Switch config load to `picocode.toml`; resolve setting precedence (CLI > file > built-in) for the 5 settings; update help strings ("picocode.yaml" → "picocode.toml"); pass `Config` into `run_interactive`. |
+| `src/main.rs` | Switch config load to `settings.toml`; resolve setting precedence (CLI > file > built-in) for the 5 settings; update help strings ("picocode.yaml" → "settings.toml"); pass `Config` into `run_interactive`. |
 | `src/lib.rs` | `pub mod settings;`, re-export `SettingsStore`, `SettingKey`. Replace `PicocodeError::Yaml` with `Toml(String)` (mapped from `toml_edit`/`toml` parse errors). |
-| `picocode.toml.example` | New (rename `picocode.yaml.example`): TOML syntax for `agent_prompt`, `tool_config`, `recipes`, and the 5 settings keys (see §B.3). |
+| `settings.toml.example` | New (rename `picocode.yaml.example`): TOML syntax for `agent_prompt`, `tool_config`, `recipes`, and the 5 settings keys (see §B.3). |
 
 ## B.2 Staged checklist
 
@@ -366,10 +366,10 @@ Refinements from the recent work:
       `overlay_rows` empty-query returns all 5 in order; subsequence filter;
       `load`/`save` round-trip preserves values; `save` via `toml_edit` preserves
       the *other* keys (e.g. a `[recipes.*]` block) and their comments in the
-      same `picocode.toml`.
+      same `settings.toml`.
 
 ### Stage 2 — `config.rs` YAML→TOML switch
-- [ ] `Config::load` reads `picocode.toml` (drop `.yaml`/`.yml`); deserialize via
+- [ ] `Config::load` reads `settings.toml` (drop `.yaml`/`.yml`); deserialize via
       `toml_edit::de::from_str`. Keep `load(None)` cwd search.
 - [ ] Add 5 `#[serde(default)]` fields to `Config`; `#[derive]` unchanged.
 - [ ] `PicocodeError`: replace `Yaml` variant with `Toml(String)`; `From`
@@ -430,7 +430,7 @@ Refinements from the recent work:
   new value immediately (it reads the in-memory `SettingsStore`).
 - `/model` (session switch) intentionally does **not** persist to
   `default_model` — they are separate on purpose. `/set default_model`
-  is the only path that writes the session default to `picocode.toml`.
+  is the only path that writes the session default to `settings.toml`.
 
 ### Stage 6 — Integration (pty) test
 - [x] `tests/render_scroll.rs`: `settings_string_hierarchy_saves_and_errors`
@@ -440,7 +440,7 @@ Refinements from the recent work:
 ## B.3 `SettingsStore` ↔ `Config` mapping (concrete)
 
 ```toml
-# picocode.toml (additions; all optional, defaulted)
+# settings.toml (additions; all optional, defaulted)
 # Managed by the /set menu — safe to edit by hand.
 default_model = "anthropic:claude-3-5-sonnet-20241022"
 security_mode = "confirm"          # yolo | confirm
@@ -452,13 +452,13 @@ default_thinking_level = "off"     # off | low | med | high
 `SettingsStore` reads these into its typed fields (via `Config`/`toml_edit::de`);
 `set_value` writes them back through `toml_edit::DocumentMut`, preserving the
 rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
-`agent_prompt`, `tool_config`, and `[recipes.*]` (see `picocode.toml.example`).
+`agent_prompt`, `tool_config`, and `[recipes.*]` (see `settings.toml.example`).
 
 ## B.4 Risks & open questions
 
 - **Q1 — Config format / file location.** **RESOLVED (2026-07-17):** hard
   switch the whole config to **TOML** (no YAML fallback); settings + `recipes`
-  live in the same `picocode.toml`; writes via `toml_edit` preserve comments +
+  live in the same `settings.toml`; writes via `toml_edit` preserve comments +
   recipes. Supersedes both the "extend YAML" and "dedicated YAML file" options.
   (Splitting settings into a separate file later remains possible.)
 - **Q2 — "Stay in overlay" vs live-apply rebuild.** Resolved in §A.7: save +
@@ -469,7 +469,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   CLI > file > built-in (§A.5). **RESOLVED (2026-07-17):** `/model` (session
   switch) intentionally does **not** persist to `default_model` — they are
   separate on purpose (frequent session switch vs. durable default). Only
-  `/set default_model` writes the session default to `picocode.toml`.
+  `/set default_model` writes the session default to `settings.toml`.
   Live-apply of `/set default_model` still updates the running session
   (Stage 5).
 - **Q4 — Security-mode vocabulary.** Using `yolo`/`confirm` (with `ask`/`safe`
@@ -487,7 +487,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   invariant — only rows at/below input are touched).
 - **Q8 — Test for the save path in CI.** The pty test (Stage 6) writes a real
   file; run it as an integration test, not a unit test, to avoid touching the
-  user's `picocode.toml`.
+  user's `settings.toml`.
 
 ## B.5 Decisions / corrections log
 
@@ -499,7 +499,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   overlay design per request.
 - **2026-07-17** — Config format decision: **hard switch YAML→TOML** (no YAML
   fallback; experimental personal fork). Settings + `recipes` live in the same
-  `picocode.toml`; writes via `toml_edit` preserve comments + recipes. Dropped
+  `settings.toml`; writes via `toml_edit` preserve comments + recipes. Dropped
   `serde_yaml`; added `toml_edit` (serde feature). `PicocodeError::Yaml` →
   `Toml(String)`. Q1 resolved. Updated §A.5, §B.1, §B.2 (Stage 2), §B.3, §B.4.
 - **2026-07-17** — *Phase 1 implemented.* New `src/set.rs` (`SettingKey`,
@@ -508,7 +508,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   `SlashKind::Settings`; `repl.rs::read_input` gains a `kind = 5` list branch +
   a `list ⇄ edit` two-state overlay (`edit_setting`/`edit_prev_input`/
   `edit_error`); `agent.rs::run_interactive` + `main.rs` wire a `&mut
-  SettingsStore` through. `picocode.yaml.example` → `picocode.toml.example`.
+  SettingsStore` through. `picocode.yaml.example` → `settings.toml.example`.
   92 lib tests + 2 pty tests green; `cargo build` warning-free. Phase 2
   (live-apply) and Stage 4 (value autocomplete) remain.
 

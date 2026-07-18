@@ -1,6 +1,6 @@
 //! Settings registry + persistence for the `/settings` menu.
 //!
-//! Settings are persisted into the same `picocode.toml` that holds `recipes`
+//! Settings are persisted into the same `settings.toml` that holds `recipes`
 //! (see `doc/settings_menu.md`). Reads go through serde (`toml_edit::de`);
 //! writes go through `toml_edit::DocumentMut` so that user comments and the
 //! `[recipes.*]` blocks are preserved on every save (YAML cannot do this).
@@ -80,7 +80,8 @@ pub static SETTINGS: &[SettingMeta] = &[
     },
 ];
 
-/// In-memory mirror of the five managed settings, plus the file to persist to.
+/// In-memory mirror of the five managed settings, plus the optional file to
+/// persist to (`None` when no platform location exists, e.g. no `$HOME`).
 #[derive(Debug, Clone)]
 pub struct SettingsStore {
     pub default_model: String,
@@ -88,14 +89,14 @@ pub struct SettingsStore {
     pub tool_call_limit: usize,
     pub default_persona: Option<String>,
     pub default_thinking_level: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
 }
 
 impl SettingsStore {
     /// Build the store from the *resolved* effective session config, so the
     /// menu shows the actual current values (CLI > file > built-in precedence
     /// is already applied by the caller in `main.rs`).
-    pub fn from_agent_config(cfg: &crate::AgentConfig, path: &Path) -> Self {
+    pub fn from_agent_config(cfg: &crate::AgentConfig, path: Option<&Path>) -> Self {
         SettingsStore {
             default_model: format!("{}:{}", cfg.provider, cfg.model),
             security_mode: if cfg.yolo {
@@ -109,13 +110,13 @@ impl SettingsStore {
                 .thinking_level
                 .clone()
                 .unwrap_or_else(|| "off".to_string()),
-            path: path.to_path_buf(),
+            path: path.map(|p| p.to_path_buf()),
         }
     }
 
     /// Build the store from a parsed `Config` (file fields, with built-in
     /// fallbacks for anything the file omits).
-    pub fn from_config(cfg: &crate::Config, path: &Path) -> Self {
+    pub fn from_config(cfg: &crate::Config, path: Option<&Path>) -> Self {
         SettingsStore {
             default_model: cfg.default_model.clone().unwrap_or_default(),
             security_mode: cfg
@@ -128,7 +129,7 @@ impl SettingsStore {
                 .default_thinking_level
                 .clone()
                 .unwrap_or_else(|| "off".to_string()),
-            path: path.to_path_buf(),
+            path: path.map(|p| p.to_path_buf()),
         }
     }
 
@@ -160,12 +161,12 @@ impl SettingsStore {
     /// absent (the file is only written once a setting is first saved).
     pub fn load(path: &Path) -> crate::Result<Self> {
         if !path.exists() {
-            return Ok(Self::from_config(&crate::Config::default(), path));
+            return Ok(Self::from_config(&crate::Config::default(), Some(path)));
         }
         let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
         let cfg: crate::Config = toml_edit::de::from_str(&content)
             .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
-        Ok(Self::from_config(&cfg, path))
+        Ok(Self::from_config(&cfg, Some(path)))
     }
 
     /// Current display/edit value for a setting.
@@ -254,18 +255,25 @@ impl SettingsStore {
             .collect()
     }
 
-    /// Persist the five managed keys into `self.path` via `toml_edit`, leaving
-    /// everything else (comments, `[recipes.*]`, `tool_config`, …) intact.
+    /// Persist the five managed keys into the configured file via `toml_edit`,
+    /// leaving everything else (comments, `[recipes.*]`, `tool_config`, …)
+    /// intact. When no persistent location is configured (`self.path` is
+    /// `None` — e.g. no `$HOME`/`$XDG_CONFIG_HOME`/`%APPDATA%`), this is a
+    /// no-op: in-session edits still apply but are not written to disk.
     pub fn save(&self) -> crate::Result<()> {
-        let mut doc = if self.path.exists() {
-            let content = std::fs::read_to_string(&self.path).map_err(crate::PicocodeError::Io)?;
+        let path = match &self.path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let mut doc = if path.exists() {
+            let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
             content
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?
         } else {
             let mut d = toml_edit::DocumentMut::new();
             d.decor_mut().set_prefix(
-                "# picocode.toml -- managed by the /settings menu; safe to edit by hand.\n\n",
+                "# settings.toml -- managed by the /settings menu; safe to edit by hand.\n\n",
             );
             d
         };
@@ -288,7 +296,12 @@ impl SettingsStore {
             "default_thinking_level",
             toml_edit::value(self.default_thinking_level.clone()),
         );
-        std::fs::write(&self.path, doc.to_string()).map_err(crate::PicocodeError::Io)?;
+        // Ensure the parent directory (e.g. ~/.config/picocode) exists before
+        // writing, mirroring how the history file is created.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(crate::PicocodeError::Io)?;
+        }
+        std::fs::write(path, doc.to_string()).map_err(crate::PicocodeError::Io)?;
         Ok(())
     }
 
@@ -339,7 +352,7 @@ mod tests {
             tool_call_limit: 50,
             default_persona: Some("architect".into()),
             default_thinking_level: "off".into(),
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
         }
     }
 

@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand};
 use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput, SettingsStore};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -37,7 +36,7 @@ struct Args {
     #[arg(long, help = format!("Choose a persona for the agent. Available built-in personas:\n{}", picocode::persona::list_personas()), global = true)]
     persona: Option<String>,
 
-    /// Path to config file (default: picocode.toml in current directory)
+    /// Path to config file (default: ~/.config/picocode/settings.toml; --config overrides)
     #[arg(short, long, global = true)]
     config: Option<String>,
 }
@@ -48,7 +47,7 @@ enum Commands {
     Chat,
     /// Run a single prompt
     Input { prompt: String },
-    /// Run a pre-defined recipe from picocode.toml
+    /// Run a pre-defined recipe from the config file
     Recipe { name: String },
 }
 
@@ -172,10 +171,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(config.tool_call_limit)
         .unwrap_or(50);
     let thinking_level = config.default_thinking_level.clone();
-    let settings_path = args
-        .config
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("picocode.toml"));
+    let settings_path = picocode::platform::resolve_config_path(args.config.as_deref());
 
     let persona_name = args
         .persona
@@ -220,7 +216,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sandbox,
     };
-    let mut settings = SettingsStore::from_agent_config(&agent_config, &settings_path);
+    let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;

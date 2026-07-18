@@ -1937,18 +1937,7 @@ impl History {
 }
 
 fn history_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        return Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("picocode")
-                .join("history"),
-        );
-    }
-    if let Some(app) = std::env::var_os("APPDATA") {
-        return Some(PathBuf::from(app).join("picocode").join("history"));
-    }
-    None
+    crate::platform::history_path()
 }
 
 #[cfg(test)]
