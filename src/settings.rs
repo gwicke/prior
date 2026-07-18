@@ -132,6 +132,30 @@ impl SettingsStore {
         }
     }
 
+    /// Apply the five managed settings onto an `AgentConfig`, overwriting only
+    /// the fields `/settings` controls. Used by `run_interactive` to live-apply
+    /// pending `/settings` changes; the non-settings fields (output, agent/
+    /// system prompt, bash auto-allow, cancel flag, …) are preserved. This is
+    /// the inverse of [`SettingsStore::from_agent_config`].
+    pub fn apply_to_config(&self, cfg: &mut crate::AgentConfig) {
+        if let Some((p, m)) = self.default_model.split_once(':') {
+            cfg.provider = p.to_string();
+            cfg.model = m.to_string();
+        }
+        cfg.yolo = self.security_mode.eq_ignore_ascii_case("yolo");
+        cfg.tool_call_limit = self.tool_call_limit;
+        cfg.persona_name = self.default_persona.clone();
+        cfg.persona_prompt = self
+            .default_persona
+            .as_ref()
+            .and_then(|p| crate::persona::get_persona(p));
+        cfg.thinking_level = if self.default_thinking_level.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(self.default_thinking_level.clone())
+        };
+    }
+
     /// Load from `path`, falling back to built-in defaults when the file is
     /// absent (the file is only written once a setting is first saved).
     pub fn load(path: &Path) -> crate::Result<Self> {
@@ -354,6 +378,52 @@ mod tests {
         assert!(SettingsStore::validate(SettingKey::DefaultThinking, "off").is_ok());
         assert!(SettingsStore::validate(SettingKey::DefaultThinking, "high").is_ok());
         assert!(SettingsStore::validate(SettingKey::DefaultThinking, "bogus").is_err());
+    }
+
+    #[test]
+    fn apply_to_config_maps_the_five_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = store(tmp.path().join("picocode.toml").as_path());
+        // Baseline `AgentConfig` built the way `main.rs` does.
+        let mut cfg = crate::AgentConfig {
+            provider: "anthropic".into(),
+            model: "claude-3-5-sonnet-20241022".into(),
+            output: std::sync::Arc::new(crate::QuietOutput::new()),
+            yolo: false,
+            quiet: true,
+            thinking_level: None,
+            tool_call_limit: 50,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // Mutate every setting, then apply.
+        s.set_value(SettingKey::DefaultModel, "openrouter:tencent/hy3:free")
+            .unwrap();
+        s.set_value(SettingKey::SecurityMode, "yolo").unwrap();
+        s.set_value(SettingKey::ToolCallLimit, "12").unwrap();
+        s.set_value(SettingKey::DefaultPersona, "architect").unwrap();
+        s.set_value(SettingKey::DefaultThinking, "high").unwrap();
+        s.apply_to_config(&mut cfg);
+        assert_eq!(cfg.provider, "openrouter");
+        assert_eq!(cfg.model, "tencent/hy3:free");
+        assert!(cfg.yolo);
+        assert_eq!(cfg.tool_call_limit, 12);
+        assert_eq!(cfg.persona_name.as_deref(), Some("architect"));
+        assert!(cfg.persona_prompt.is_some(), "persona prompt should resolve");
+        assert_eq!(cfg.thinking_level.as_deref(), Some("high"));
+
+        // "off" thinking level maps back to `None`.
+        s.set_value(SettingKey::DefaultThinking, "off").unwrap();
+        s.apply_to_config(&mut cfg);
+        assert_eq!(cfg.thinking_level, None);
+
+        // Non-settings fields are preserved.
+        assert!(cfg.quiet);
+        assert!(cfg.agent_prompt.is_none());
     }
 
     #[test]

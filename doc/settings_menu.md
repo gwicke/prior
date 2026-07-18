@@ -263,33 +263,60 @@ replaces the edit-box text. This is a nice-to-have; Phase 1 may ship free-text
 edit only and add candidate pop-ups in Phase 2. The `ValueKind` enum (§A.2) is
 the hook point so this is a localized addition later.
 
-## A.7 Live application (Phase 2)
+## A.7 Live application (Phase 2) — re-evaluated 2026-07-17
 
-Phase 1 persists to the file only. Phase 2 makes sense to also affect the
-**running session**. The clean path reuses `run_interactive`'s existing agent
-rebuild:
+Phase 1 persists to the file only. Phase 2 makes a change also affect the
+**running session**. The recent `/settings` commit flow (string-hierarchy,
+`emit_commit` stays in the `read_input` loop instead of returning an
+`InputAction`) *confirms* the original design choice: save happens in
+`read_input`, and the agent rebuild is deferred to `run_interactive` via a
+`dirty` flag — there is no other clean path, because `read_input` is **sync**
+and cannot call the async `create_agent`.
 
-- Change `read_input` to also take `&mut AgentConfig` (or a small
-  `&mut LiveState { config: &mut AgentConfig, dirty: &mut bool }`) alongside
-  `&mut SettingsStore`.
-- On a successful `set_value`, in addition to persisting, update the matching
-  `AgentConfig` field(s):
-  - `DefaultModel` → `config.provider`/`config.model` (split `provider:model`).
-  - `SecurityMode` → `config.yolo = (mode == "yolo")`.
-  - `ToolCallLimit` → `config.tool_call_limit`.
-  - `DefaultPersona` → `config.persona_name` + reload `persona_prompt` via
-    `persona::get_persona`.
-  - `DefaultThinking` → `config.thinking_level`.
-  - Set `dirty = true` for any field the running agent reads at build time.
-- Because `read_input` stays in the overlay on save (does **not** return), the
-  rebuild is deferred: `run_interactive`, **just before each `Submit` prompt**,
-  checks `dirty` and, if set, calls `create_agent(config.clone())` (mirroring the
-  `SetModel`/`SetThinking` branches) and clears `dirty`. This avoids pushing the
-  generic agent-rebuild into `repl.rs` and keeps the "stay in overlay"
-  requirement intact. The "applies on next prompt" latency is acceptable for
-  *default* settings.
-- `ReplCtx { provider, model, recent }` is rebuilt each loop from `config`, so
-  the `/model` overlay and status line reflect the new model automatically.
+Refinements from the recent work:
+
+- **`read_input` must NOT mutate `AgentConfig`.** It only needs `&mut bool`
+  (`dirty`). On a successful `set_value` it sets `*dirty = true`; it does
+  **not** touch `config`. `run_interactive` already owns `settings: &mut
+  SettingsStore` (which `set_value` already updated in memory), so at the next
+  `Submit` it derives the new `AgentConfig` *from the `SettingsStore`* and
+  rebuilds. This keeps `read_input` sync-only and avoids a config/agent
+  divergence bug: if the rebuild fails (valid-format but non-existent model,
+  missing API key), `config` and the agent stay in sync (both old) instead of
+  `config` having been mutated while the agent did not.
+- **Derive, don't duplicate.** Add `apply_settings_to_config(cfg: &mut
+  AgentConfig, s: &SettingsStore)` — the inverse of the existing
+  `SettingsStore::from_agent_config` — mapping the five settings onto
+  `AgentConfig` (`default_model` → provider/model split, `security_mode` →
+  `yolo`, `tool_call_limit`, `default_persona` → `persona_name` +
+  `persona::get_persona`, `default_thinking_level` → `thinking_level`).
+- **Rebuild site + timing.** In `run_interactive`'s `Submit` arm, *before*
+  generating the response (where `create_agent` is already lazily called), if
+  `dirty`: `let mut new_cfg = config.clone();
+  apply_settings_to_config(&mut new_cfg, settings); match
+  create_agent(new_cfg.clone()).await { Ok(a) => { agent = Some(a); config =
+  new_cfg; dirty = false; }, Err(e) => { output.display_text(&format!("Cannot
+  apply settings: {}", e)); /* keep `dirty` so the next Submit retries */ }
+  }`. This mirrors the existing `SetModel`/`SetThinking` handlers exactly.
+- **Immediate feedback without a rebuild.** The `/settings` *list* re-renders
+  with the new value the instant `set_value` succeeds (it updates the
+  `SettingsStore` in memory). The `/model` overlay's active marker and the
+  status line pick up the new model only after the deferred rebuild (next
+  `Submit`) — acceptable latency, same as the original plan's note. *Verify
+  whether the status line is reprinted per-loop; if printed once at startup it
+  is stale until the rebuild (cosmetic only).*
+- **Precedence.** Live changes write the `SettingsStore` (and the file) and,
+  via the rebuild, override the initial CLI/file `AgentConfig` for the rest of
+  the session. Startup precedence (CLI > file > built-in) is unaffected.
+- **Optional consistency.** `/model`/`/thinking` already live-apply (they
+  return `SetModel`/`SetThinking`) but do **not** persist. Consider also
+  writing `default_model` when the user picks a model, so the session default
+  survives restart (out of scope unless wanted).
+- **`LiveState` is just `&mut dirty`.** Because `run_interactive` already
+  holds `settings: &mut SettingsStore` (the source of truth for the rebuild),
+  `read_input` only needs `dirty: &mut bool` added to its signature — not a
+  `&mut AgentConfig`. (A `LiveState { dirty }` struct can be introduced later
+  if more live state is needed.)
 
 ## A.8 `slash.rs` + help wiring
 
@@ -316,7 +343,7 @@ rebuild:
 | `Cargo.toml` | Drop `serde_yaml`; add `toml_edit = { version = "0.25", features = ["serde"] }`. |
 | `src/config.rs` | **YAML→TOML hard switch.** `Config::load` reads `picocode.toml` (single default; `--config` override unchanged). Add `#[serde(default)]` fields `default_model`, `security_mode`, `tool_call_limit`, `default_persona`, `default_thinking_level`. No `Config::save` (settings writes go through `SettingsStore`/`toml_edit`). |
 | `src/slash.rs` | Add `SlashKind::Settings`; registry entry `/settings`; `filter_commands`/completion already picks it up; update `parse_slash` not required (handled inline in `repl.rs`). Bump registry count test (currently `4`). |
-| `src/repl.rs` | `read_input` gains `&mut SettingsStore` (+ `&mut LiveState` for Phase 2). Add `kind = 5` branch, `edit_setting`/`edit_prev_input` locals, the edit-mode key guard, and `settings_overlay_entries` pure helper. Update `render_help`/hint references. |
+| `src/repl.rs` | `read_input` already takes `&mut SettingsStore` (Phase 1). For Phase 2 live-apply, add `dirty: &mut bool` and set it on a successful `/settings` `set_value`. Add `kind = 5` branch, `edit_setting`/`edit_prev_input` locals, the edit-mode key guard, and `settings_overlay_entries` pure helper. Update `render_help`/hint references. |
 | `src/agent.rs` | `run_interactive`: build `SettingsStore` from `Config`; pass `&mut` into `read_input`; add `dirty` flag; on `Submit`, rebuild agent if dirty (Phase 2). |
 | `src/main.rs` | Switch config load to `picocode.toml`; resolve setting precedence (CLI > file > built-in) for the 5 settings; update help strings ("picocode.yaml" → "picocode.toml"); pass `Config` into `run_interactive`. |
 | `src/lib.rs` | `pub mod settings;`, re-export `SettingsStore`, `SettingKey`. Replace `PicocodeError::Yaml` with `Toml(String)` (mapped from `toml_edit`/`toml` parse errors). |
@@ -378,21 +405,37 @@ rebuild:
       pop-up (catalog / `/thinking` levels / `persona::PERSONAS`); selection
       replaces the edit-box text. Localized to `ValueKind` dispatch.
 
-### Stage 5 — Phase 2 live-apply
-- [ ] `read_input` takes `&mut LiveState { config, dirty }`.
-- [ ] On successful `set_value`, update `AgentConfig` fields + `dirty = true`.
-- [ ] `run_interactive`: before each `Submit` prompt, if `dirty` rebuild agent
-      via `create_agent(config.clone())` (mirror `SetModel`/`SetThinking`) and
-      clear `dirty`.
-- [ ] **Manual/integration test**: change `default_model` via `/settings`, send
-      a prompt, assert the new provider/model is used (status line / response
-      origin).
+### Stage 5 — Phase 2 live-apply (refined 2026-07-17) — DONE
+- [x] `run_interactive`: add `let mut dirty = false;`; pass `&mut dirty` into
+      `read_input` (alongside the existing `&mut SettingsStore`).
+- [x] `read_input` signature: add `dirty: &mut bool`. In the `/settings` value
+      commit `Ok` branch, after `settings.set_value(...)` succeeds, set
+      `*dirty = true`. No `AgentConfig` mutation here.
+- [x] Add `apply_settings_to_config(cfg, settings)` (inverse of
+      `from_agent_config`); unit-test the five mappings
+      (`settings::tests::apply_to_config_maps_the_five_settings`).
+- [x] `run_interactive` `Submit` arm: if `dirty`, derive `new_cfg` from
+      `config` + `settings`, `create_agent(new_cfg)`, mirror `SetModel`
+      failure handling (display error, keep `dirty` to retry), on `Ok` update
+      `agent` + `config` and clear `dirty`.
+- [x] **Test:** `settings_change_triggers_deferred_rebuild` (pty) drives a
+      `/settings` change, asserts the committed line + the deferred rebuild
+      attempt at the next `Submit` (`Unsupported provider` error) + file
+      persistence. Unit test covers the five mappings.
+
+**Confirmed decisions (2026-07-17):**
+- The startup status line is *not* refreshed after live-apply; it stays as
+  printed once at startup (screen-space efficiency; expose settings via a
+  future slash command instead). The `/settings` *list* re-renders with the
+  new value immediately (it reads the in-memory `SettingsStore`).
+- `/model` (session switch) intentionally does **not** persist to
+  `default_model` — they are separate on purpose. `/settings default_model`
+  is the only path that writes the session default to `picocode.toml`.
 
 ### Stage 6 — Integration (pty) test
-- [ ] Extend `tests/render_scroll.rs` pattern (portable-pty + vt100): open
-      `/settings`, type `mod` to filter, select `default_model`, edit value,
-      `Enter`; assert (a) the list re-renders with the new value, (b) the
-      settings file on disk contains it.
+- [x] `tests/render_scroll.rs`: `settings_string_hierarchy_saves_and_errors`
+      (save + red-error + clear-on-Esc) and `settings_change_triggers_deferred_rebuild`
+      (deferred rebuild wiring) cover this. See Stage 5.
 
 ## B.3 `SettingsStore` ↔ `Config` mapping (concrete)
 
@@ -423,9 +466,12 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   the next `Submit` via a `dirty` flag (no new `InputAction`, no generic rebuild
   inside `repl.rs`).
 - **Q3 — `default_model` vs CLI / `default_model(provider)`.** Precedence is
-  CLI > file > built-in (§A.5). `/model` (session switch) currently does **not**
-  persist; optionally Phase 2 could also write `default_model` — out of scope
-  unless desired.
+  CLI > file > built-in (§A.5). **RESOLVED (2026-07-17):** `/model` (session
+  switch) intentionally does **not** persist to `default_model` — they are
+  separate on purpose (frequent session switch vs. durable default). Only
+  `/settings default_model` writes the session default to `picocode.toml`.
+  Live-apply of `/settings default_model` still updates the running session
+  (Stage 5).
 - **Q4 — Security-mode vocabulary.** Using `yolo`/`confirm` (with `ask`/`safe`
   aliases normalized to `confirm`). Confirm canonical strings with user; they map
   directly to `AgentConfig::yolo`.

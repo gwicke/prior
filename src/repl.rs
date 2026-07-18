@@ -299,6 +299,7 @@ impl Repl {
         history: &mut History,
         ctx: &ReplCtx,
         settings: &mut SettingsStore,
+        dirty: &mut bool,
         initial_row: usize,
         output: &dyn Output,
     ) -> Option<InputAction> {
@@ -783,6 +784,10 @@ impl Repl {
                                                     match settings.set_value(k, &vq_eff) {
                                                         Ok(()) => {
                                                             value_error = None;
+                                                            // A successful save means the running session should
+                                                            // pick up the change; `run_interactive` performs the
+                                                            // (async) agent rebuild before the next prompt.
+                                                            *dirty = true;
                                                             // When Enter was pressed on an empty value (the
                                                             // highlighted candidate), reflect the saved value in
                                                             // the emitted line so the record is accurate.
