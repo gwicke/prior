@@ -151,14 +151,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|name| config.recipes.get(name).cloned());
 
+    // Provider/model precedence (CLI > recipe > file `default_model` > built-in):
+    // `settings.toml`'s `default_model = "provider:model"` is the file-level
+    // fallback that the `/set default_model` menu writes. `default_model` is a
+    // single combined string, so when only one of provider/model is overridden
+    // (via CLI/recipe) the other falls back to the built-in default model for
+    // the resolved provider.
+    let file_default = config
+        .default_model
+        .as_deref()
+        .and_then(|s| s.split_once(':'))
+        .filter(|(p, m)| !p.trim().is_empty() && !m.trim().is_empty())
+        .map(|(p, m)| (p.trim().to_string(), m.trim().to_string()));
+
     let provider = args
         .provider
         .or_else(|| recipe.as_ref().and_then(|r| r.provider.clone()))
+        .or_else(|| file_default.as_ref().map(|(p, _)| p.clone()))
         .unwrap_or_else(|| "anthropic".to_string());
 
     let model = args
         .model
         .or_else(|| recipe.as_ref().and_then(|r| r.model.clone()))
+        .or_else(|| file_default.as_ref().map(|(_, m)| m.clone()))
         .unwrap_or_else(|| default_model(&provider));
 
     let yolo = if let Some(y) = args.yolo {
