@@ -52,6 +52,44 @@ enum Commands {
     Recipe { name: String },
 }
 
+/// External binaries picocode depends on at runtime. We fail closed at
+/// startup (rather than degrading) because both are integral to the sandboxed
+/// tool-execution model: `bwrap` provides the command namespace, `rg` backs
+/// the grep tool.
+const REQUIRED_BINARIES: &[(&str, &str)] = &[
+    ("bwrap", "bubblewrap (bwrap)"),
+    ("rg", "ripgrep (rg)"),
+];
+
+/// Returns `Ok(())` if every required binary is present and runnable on PATH,
+/// otherwise an error describing the missing ones with install hints.
+fn check_runtime_deps() -> Result<(), String> {
+    let missing: Vec<&str> = REQUIRED_BINARIES
+        .iter()
+        .filter(|(bin, _)| !is_executable(bin))
+        .map(|(_, label)| *label)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Missing required dependencies: {}.\n\nInstall them and retry:\n  - bubblewrap (bwrap): https://github.com/containers/bwrap#installation\n  - ripgrep (rg):        https://github.com/BurntSushi/ripgrep#installation",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// True if `name` resolves to an executable on PATH, probed via `--version`.
+fn is_executable(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() {
     std::panic::set_hook(Box::new(|info| {
@@ -83,6 +121,15 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Fail closed: required external tools must be present before we do any
+    // work. Degrading (e.g. running unsandboxed) is not safe once `rg` and
+    // `bwrap` are assumed by the tool layer.
+    if let Err(msg) = check_runtime_deps() {
+        eprintln!("{}", msg);
+        std::process::exit(1);
+    }
+
     let config = Config::load(args.config.as_deref())?;
 
     let (command, prompt, recipe_name) = match (&args.command, &args.prompt) {
@@ -147,18 +194,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(|p| picocode::persona::get_persona(p));
 
-    // Resolve the sandbox config: merge user settings with built-in defaults,
-    // with `enabled` auto-enabled only when `bwrap` is present.
-    let bwrap_present = std::process::Command::new("which")
-        .arg("bwrap")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Resolve the sandbox config: merge user settings with built-in defaults.
+    // `bwrap` is required at startup (see `check_runtime_deps`), so it is
+    // always present here.
     let sandbox = config
         .bash_sandbox_raw()
-        .map(|raw| raw.with_defaults(bwrap_present));
+        .map(|raw| raw.with_defaults(true));
 
     let agent_config = AgentConfig {
         provider: provider.clone(),
@@ -243,5 +284,22 @@ fn default_model(provider: &str) -> String {
         "xai" => "grok-1".to_string(),
         "gemini" | "google" => "gemini-1.5-pro".to_string(),
         _ => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_executable_false_for_missing_binary() {
+        assert!(!is_executable("definitely-not-a-real-binary-xyz"));
+    }
+
+    #[test]
+    fn check_runtime_deps_ok_when_both_present() {
+        // Both binaries are now hard requirements, so this holds in any
+        // environment where picocode is expected to run.
+        assert!(check_runtime_deps().is_ok());
     }
 }

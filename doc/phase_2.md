@@ -2,6 +2,19 @@
 
 ## session output
 - thinking_audit.md - surface thinking content
+- better tool formatting:
+  - show full bash command, shorten preamble to just $
+
+## Sandboxing / commands
+- Require sandbox
+- Run `grep` in sandbox
+- Add `!` and `!!` commands, run in sandbox
+
+## Agent changes
+- Enable caching
+- Track token usage / cache hit rate - new /usage command
+- Compaction similar to ultracompact
+  - drop reasoning content
 
 ## / menu
 New entries

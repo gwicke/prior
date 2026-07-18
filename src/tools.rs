@@ -3,7 +3,7 @@ use rig_derive::rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::fs;
 use rig_core::tool::ToolContext;
 
@@ -178,34 +178,31 @@ pub async fn glob_files(pat: String, path: String) -> Result<String, ToolError> 
     Ok(if res.is_empty() { "none".into() } else { res })
 }
 
-#[rig_tool(description = "Search files for regex pattern", required(pat, path))]
+#[rig_tool(description = "Search files for a regex pattern (ripgrep)", required(pat, path))]
 pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
-    let base = get_path(&path)?;
-    let re = regex::Regex::new(&pat).map_err(|e| ToolError::Generic(e.to_string()))?;
-    let hits = tokio::task::spawn_blocking(move || {
-        walk_files(&base)
-            .flat_map(|e| {
-                let p = e.path().to_owned();
-                std::fs::read_to_string(&p).ok().map(|c| (p, c))
-            })
-            .flat_map(|(p, c)| {
-                let re = re.clone();
-                let p_str = p.display().to_string();
-                c.lines()
-                    .enumerate()
-                    .filter(move |(_, l)| re.is_match(l))
-                    .map(move |(i, l)| format!("{}:{}:{}", p_str, i + 1, l))
-                    .collect::<Vec<_>>()
-            })
-            .take(50)
-            .collect::<Vec<_>>()
-    })
-    .await?;
-    Ok(if hits.is_empty() {
-        "none".into()
+    // Validate the search root against the active path policy (or cwd bounds);
+    // ripgrep itself runs confined inside a read-only sandbox.
+    let _ = get_path(&path)?;
+
+    let cfg = sandbox_config();
+    let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
+    let timeout = cfg.timeout_secs.or(Some(60));
+
+    // Constrained ripgrep: pattern as a discrete argv element via `-e`, hidden
+    // files included, with hard resource caps. `shell_quote` keeps regex
+    // metacharacters and quotes from being interpreted by the inner shell.
+    let cmd = format!(
+        "rg --line-number --no-heading --no-column --color never --hidden --max-depth 25 --max-filesize 5M --max-count 500 -e {} {}",
+        shell_quote(&pat),
+        shell_quote(&path)
+    );
+    let raw = run_sandboxed_ro(&cmd, &cfg, timeout).await?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok("none".into())
     } else {
-        hits.join("\n")
-    })
+        Ok(cap_lines(trimmed, 50))
+    }
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -253,9 +250,6 @@ impl rig_core::tool::Tool for Bash {
 static SANDBOX: std::sync::LazyLock<std::sync::Mutex<Arc<Option<SandboxConfig>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Arc::new(None)));
 
-/// Cache for bwrap availability, resolved once on first use.
-static BWRAP_PRESENT: OnceLock<bool> = OnceLock::new();
-
 pub(crate) fn set_sandbox(cfg: Option<SandboxConfig>) {
     *SANDBOX.lock().expect("sandbox lock poisoned") = Arc::new(cfg);
 }
@@ -271,25 +265,12 @@ fn sandbox_config() -> Arc<Option<SandboxConfig>> {
 fn current_path_policy() -> Option<crate::config::PathPolicy> {
     let cfg = sandbox_config();
     let c = cfg.as_ref().as_ref()?;
-    if !c.enabled.unwrap_or(false) || !bwrap_available() {
+    if !c.enabled.unwrap_or(false) {
         return None;
     }
     let cwd = std::env::current_dir().ok()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     resolve_path_policy(c, &cwd, home.as_deref())
-}
-
-/// True if `bwrap` is available on PATH (cached).
-fn bwrap_available() -> bool {
-    *BWRAP_PRESENT.get_or_init(|| {
-        std::process::Command::new("which")
-            .arg("bwrap")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
 }
 
 /// Maximum per-command timeout (seconds) an LLM may request via the bash
@@ -329,8 +310,9 @@ fn resolve_timeout(
 
 /// Run a shell command through the sandbox helper. Applies a wall-clock
 /// timeout (so a hung command reaps and releases the blocking thread) and,
-/// when enabled + bwrap is present, wraps the command in a Bubblewrap
-/// namespace. Degrades to plain `sh_dangerous` when bwrap is absent.
+/// when enabled, wraps the command in a Bubblewrap namespace. `bwrap` is
+/// required at startup (see `check_runtime_deps`), so its absence is handled
+/// before any command runs; when disabled, the command runs unsandboxed.
 ///
 /// `override_timeout` is the LLM-supplied per-call timeout (seconds) from the
 /// bash tool's `timeout` argument; when `None`, the configured sandbox default
@@ -354,18 +336,11 @@ pub(crate) async fn run_sandboxed(
     let cmd = cmd.to_string();
     let cfg = cfg.clone();
     let output = tokio::task::spawn_blocking(move || {
-        // Decide sandboxing here: enabled AND bwrap present.
+        // Decide sandboxing here: `bwrap` is required at startup, so its
+        // absence is handled before any command runs; we only gate on the
+        // configured `enabled` flag.
         let effective = match cfg.as_ref().as_ref() {
-            Some(c) if c.enabled.unwrap_or(false) => {
-                if !bwrap_available() {
-                    eprintln!(
-                        "warning: sandbox enabled but 'bwrap' not found; running unsandboxed"
-                    );
-                    None
-                } else {
-                    Some(c)
-                }
-            }
+            Some(c) if c.enabled.unwrap_or(false) => Some(c),
             _ => None,
         };
         match effective {
@@ -373,7 +348,7 @@ pub(crate) async fn run_sandboxed(
                 // Sandboxed: redirect output to a host temp file bound into the
                 // namespace (bwrap bypasses duct's stdout pipe).
                 let out_path = make_out_path()?;
-                let expr = build_bwrap_expr(&cmd, c, &out_path)?;
+                let expr = build_bwrap_expr(&cmd, c, &out_path, false)?;
                 let handle = expr.unchecked().start()?;
                 let result = match timeout {
                     None => handle
@@ -426,6 +401,48 @@ pub(crate) async fn run_sandboxed(
     Ok(trim_output(output))
 }
 
+/// Run a command inside a **read-only** Bubblewrap namespace. Used by
+/// read-only tools such as grep: unlike [`run_sandboxed`] it never degrades to
+/// unsandboxed (ripgrep is always confined — `bwrap` is required at startup),
+/// and every user binding is mounted read-only regardless of its configured
+/// mode. Output is captured the same way (redirected to a host temp file bound
+/// into the namespace, since bwrap bypasses duct's stdout pipe).
+pub(crate) async fn run_sandboxed_ro(
+    cmd: &str,
+    cfg: &SandboxConfig,
+    timeout: Option<u64>,
+) -> Result<String, ToolError> {
+    let cmd = cmd.to_string();
+    let cfg = cfg.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let out_path = make_out_path()?;
+        let expr = build_bwrap_expr(&cmd, &cfg, &out_path, true)?;
+        let handle = expr.unchecked().start()?;
+        let result = match timeout {
+            None => handle
+                .wait()
+                .map(|_| ())
+                .map_err(|e| ToolError::Io(e.to_string())),
+            Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => {
+                    let _ = handle.kill();
+                    Err(ToolError::Generic(format!(
+                        "command timed out after {secs}s"
+                    )))
+                }
+                Err(e) => Err(ToolError::Io(e.to_string())),
+            },
+        };
+        let captured = std::fs::read(&out_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+        result.map(|_| captured)
+    })
+    .await
+    .map_err(|e| ToolError::Generic(e.to_string()))??;
+    Ok(String::from_utf8_lossy(&output).to_string())
+}
+
 /// Create a unique host temp file for capturing sandboxed command output.
 fn make_out_path() -> Result<std::path::PathBuf, ToolError> {
     let name = format!(
@@ -453,6 +470,32 @@ fn trim_output(out: Vec<u8>) -> String {
     }
 }
 
+/// Single-quote a string for safe inclusion in a shell command. The only
+/// shell metacharacter not already inert inside single quotes is the single
+/// quote itself; we escape it as `'''` (close, escaped quote, reopen). Combined
+/// with the Debug-quoting `build_bwrap_expr` applies to the whole payload, this
+/// makes injected patterns/paths inert.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::from('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push('\'');
+            out.push('\\');
+            out.push('\'');
+            out.push('\'');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Cap output to the first `n` lines (token economy for large greps).
+fn cap_lines(s: &str, n: usize) -> String {
+    s.lines().take(n).collect::<Vec<_>>().join("\n")
+}
+
 /// Read-only system directories bound into every sandbox so the shell and
 /// common tools can execute. They are read-only, so the host OS stays hidden
 /// from writes; only explicitly declared bindings add writable/project paths.
@@ -472,6 +515,7 @@ fn build_bwrap_expr(
     cmd: &str,
     cfg: &SandboxConfig,
     out_path: &std::path::Path,
+    read_only: bool,
 ) -> Result<duct::Expression, ToolError> {
     let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
     let home = dirs_home();
@@ -513,7 +557,7 @@ fn build_bwrap_expr(
         // scratch tmpfs so a user binding at /tmp wins over the tmpfs.
         for b in &binds {
             args.push(
-                if b.mode.is_writable() {
+                if !read_only && b.mode.is_writable() {
                     "--bind"
                 } else {
                     "--ro-bind"
