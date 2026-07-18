@@ -13,10 +13,11 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crate::output::{term_width, wrap};
+use crate::output::{term_width, wrap, Output};
 use crate::model_catalog;
 use crate::slash;
 use crate::thinking;
+use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
@@ -236,6 +237,14 @@ pub struct ReplCtx {
     pub recent: Vec<String>,
 }
 
+/// A candidate value shown in a setting's value-pick overlay.
+#[derive(Clone)]
+struct ValueCandidate {
+    display: String,
+    value: String,
+    desc: String,
+}
+
 impl Repl {
     pub fn new() -> Self {
         Self {
@@ -289,7 +298,9 @@ impl Repl {
         prompt: &str,
         history: &mut History,
         ctx: &ReplCtx,
+        settings: &mut SettingsStore,
         initial_row: usize,
+        output: &dyn Output,
     ) -> Option<InputAction> {
         let mut editor = LineEditor::new();
         let mut nav: Option<usize> = None;
@@ -301,6 +312,7 @@ impl Repl {
         // Enter handler can re-resolve the highlighted item without re-parsing.
         let mut cur_word = String::new();
         let mut cur_filter = String::new();
+        let mut value_error: Option<String> = None;
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -398,8 +410,21 @@ impl Repl {
                 kind = 4;
             } else if buffer.starts_with('/') {
                 let after = &buffer[1..];
-                if let Some((word, rest)) = after.split_once(' ') {
-                    match word {
+                // A bare token that is exactly a known command word opens that
+                // menu (no trailing space required); a non-command bare token
+                // (e.g. `/hel`) falls through to the command list.
+                let (word, rest) = if let Some((w, r)) = after.split_once(' ') {
+                    (w, r)
+                } else if matches!(
+                    after,
+                    "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "settings"
+                        | "setting" | "s"
+                ) {
+                    (after, "")
+                } else {
+                    ("", after)
+                };
+                match word {
                         "model" | "models" | "m" => {
                             kind = 2;
                             title = "Models  (up/down or PgUp/PgDn, Enter select, Esc back)".into();
@@ -421,20 +446,25 @@ impl Repl {
                                     .set_gap(2);
                                 for e in &entries {
                                     table.add_row(&[
-                                        e.display.clone(),
+                                        e.qualified(),
                                         model_catalog::ctx_cell(e),
                                         model_catalog::cost_cell(e),
                                         model_catalog::reason_cell(e),
                                     ]);
                                 }
-                                let rows = table.render(avail);
+                                let rows = table.render_multiline(avail);
                                 // Dim models whose provider has no API key configured.
+                                // Dim each visual line (a wrapped row carries `\n`).
                                 for (i, row) in rows.into_iter().enumerate() {
-                                    if model_catalog::provider_available(&entries[i].provider) {
-                                        opts.push(row);
+                                    let styled = if model_catalog::provider_available(&entries[i].provider) {
+                                        row
                                     } else {
-                                        opts.push(format!("\x1b[2m{}\x1b[0m", row));
-                                    }
+                                        row.lines()
+                                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    };
+                                    opts.push(styled);
                                 }
                             }
                         }
@@ -449,22 +479,88 @@ impl Repl {
                                 opts.push("(no matches)".into());
                             }
                         }
+                        "settings" | "setting" | "s" => {
+                            kind = 5;
+                            cur_word = "settings".into();
+                            cur_filter = rest.trim().to_string();
+                            let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
+                            if is_value {
+                                if let Some(k) = skey {
+                                    let meta = SETTINGS.iter().find(|m| m.key == k).unwrap();
+                                    title = format!(
+                                        "Setting {}  —  pick a value (Tab completes, Enter saves, Esc backs up)",
+                                        meta.name
+                                    );
+                                    let cands = Self::setting_value_candidates(k, ctx);
+                                    let filtered: Vec<ValueCandidate> = if vq.trim().is_empty() {
+                                        cands
+                                    } else {
+                                        crate::fuzzy::fuzzy_filter(&cands, &vq, |c| c.display.clone())
+                                            .into_iter()
+                                            .map(|r| r.item.clone())
+                                            .collect()
+                                    };
+                                    if filtered.is_empty() {
+                                        opts.push("(type a value, then Enter to save)".into());
+                                    } else {
+                                        let avail = term_width().saturating_sub(2);
+                                        let mut table = Table::new(&["Value", "Description"])
+                                            .with_aligns(&[Align::Left, Align::Left])
+                                            .with_min_widths(&[20, 30])
+                                            .with_priorities(&[2, 1])
+                                            .set_gap(2);
+                                        for c in &filtered {
+                                            table.add_row(&[c.display.clone(), c.desc.clone()]);
+                                        }
+                                        for row in table.render_multiline(avail) {
+                                            opts.push(row);
+                                        }
+                                    }
+                                    active = None;
+                                } else {
+                                    opts.push("(no matching setting)".into());
+                                }
+                            } else {
+                                // Not in value mode this iteration: any prior
+                                // validation error no longer applies (e.g. the
+                                // user Escaped a failed value entry back to the
+                                // list), so drop the red header.
+                                value_error = None;
+                                title =
+                                    "Settings  (type to filter, Tab completes, Enter edits, Esc backs up)"
+                                        .into();
+                                let entries = settings.overlay_rows(&cur_filter);
+                                if entries.is_empty() {
+                                    opts.push("(no matching setting)".into());
+                                } else {
+                                    let avail = term_width().saturating_sub(2);
+                                    let mut table = Table::new(&["Setting", "Value", "Description"])
+                                        .with_aligns(&[Align::Left, Align::Left, Align::Left])
+                                        .with_min_widths(&[16, 18, 24])
+                                        .with_priorities(&[2, 2, 1])
+                                        .set_gap(2);
+                                    for (meta, value) in &entries {
+                                        table.add_row(&[meta.name, value.as_str(), meta.description]);
+                                    }
+                                    for row in table.render_multiline(avail) {
+                                        opts.push(row);
+                                    }
+                                }
+                            }
+                        }
                         _ => {
-                            kind = 0;
+                            kind = 1;
+                            title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
+                            cur_word = rest.to_string();
+                            let ranked = slash::filter_commands(rest);
+                            for r in &ranked {
+                                opts.push(format!("{:<10} {}", r.item.name, r.item.help));
+                            }
+                            if opts.is_empty() {
+                                opts.push("(no matching command)".into());
+                            }
                         }
                     }
-                } else {
-                    kind = 1;
-                    title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
-                    cur_word = after.to_string();
-                    let ranked = slash::filter_commands(after);
-                    for r in &ranked {
-                        opts.push(format!("{:<10} {}", r.item.name, r.item.help));
-                    }
-                    if opts.is_empty() {
-                        opts.push("(no matching command)".into());
-                    }
-                }
             }
             if kind != last_kind {
                 sel = 0;
@@ -474,17 +570,42 @@ impl Repl {
             if sel > max_sel {
                 sel = max_sel;
             }
-            let overlay_text = match kind {
+            let mut overlay_text = match kind {
                 0 => String::new(),
                 4 => Self::render_help_overlay(),
-                _ => Self::overlay_lines(&title, &opts, sel, active),
+                _ => Self::overlay_lines(&title, &opts, sel, active, kind == 1),
             };
+            // Value-mode settings error: red header line above the regular overlay.
+            if kind == 5 && value_error.is_some() {
+                let err = format!(
+                    "\x1b[48;5;235m\x1b[31merror: {}\x1b[0m",
+                    value_error.as_ref().unwrap()
+                );
+                overlay_text = format!("{}\n{}", err, overlay_text);
+            }
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
-            redraw(&editor, &overlay_vec, sel, &mut input_row);
+            // `sel` indexes logical options; a wrapped option spans several
+            // visual lines, so center the window on the selected option's
+            // first visual line (the title accounts for the +1 offset).
+            let focus = {
+                let sc = sel.min(opts.len());
+                let base = if kind == 5 && value_error.is_some() {
+                    2 // red header line + title
+                } else {
+                    1 // title
+                };
+                base + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
+            };
+            redraw(&editor, &overlay_vec, focus, &mut input_row);
 
             // --- Read and dispatch one key. ---
             match event::read() {
                 Ok(Event::Key(key)) => {
+                    // Any key event starts a fresh interaction: drop a stale
+                    // value-mode validation error. The Enter handler re-sets it
+                    // if the new value is still invalid, so the red header only
+                    // persists while the user is re-submitting the same bad input.
+                    value_error = None;
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -548,16 +669,44 @@ impl Repl {
                                 sel = sel.saturating_sub(page);
                             }
                             KeyCode::Tab => {
-                                if kind == 1 {
-                                    let ranked = slash::filter_commands(&cur_word);
-                                    if let Some(cmd) = ranked.get(sel) {
-                                        editor.set(match cmd.item.kind {
-                                            slash::SlashKind::Model => "/model ",
-                                            slash::SlashKind::Thinking => "/thinking ",
-                                            slash::SlashKind::Help => "/help",
-                                            slash::SlashKind::Quit => "/quit",
-                                        });
+                                let buf = editor.text();
+                                match kind {
+                                    1 => {
+                                        let ranked = slash::filter_commands(&cur_word);
+                                        if let Some(c) = ranked.get(sel) {
+                                            editor.set(&Self::complete_command(&c.item));
+                                        }
                                     }
+                                    2 => {
+                                        let (entries, _) = Self::model_overlay_entries(ctx, &cur_filter);
+                                        if let Some(e) = entries.get(sel) {
+                                            editor.set(&Self::replace_last_token(&buf, &e.display));
+                                        }
+                                    }
+                                    3 => {
+                                        let levels = Self::thinking_overlay_entries(&cur_filter);
+                                        if let Some(l) = levels.get(sel) {
+                                            editor.set(&Self::replace_last_token(&buf, l.as_str()));
+                                        }
+                                    }
+                                    5 => {
+                                        let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
+                                        if is_value {
+                                            if let Some(k) = skey {
+                                                let filtered =
+                                                    Self::filtered_value_candidates(k, ctx, &vq);
+                                                if let Some(c) = filtered.get(sel) {
+                                                    editor.set(&Self::replace_last_token(&buf, &c.value));
+                                                }
+                                            }
+                                        } else {
+                                            let entries = settings.overlay_rows(&cur_filter);
+                                            if let Some((meta, _)) = entries.get(sel) {
+                                                editor.set(&format!("/settings {} ", meta.name));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             KeyCode::Enter => {
@@ -572,7 +721,11 @@ impl Repl {
                                                         editor.set("");
                                                     }
                                                     slash::SlashKind::Quit => {
+                                                        // Clear the input line and emit a trailing newline so
+                                                        // the shell prompt after quit begins on a fresh line
+                                                        // (otherwise it is left indented under the input).
                                                         redraw(&editor, &[], sel, &mut input_row);
+                                                        output.display_plain("");
                                                         return Some(InputAction::Quit);
                                                     }
                                                     slash::SlashKind::Model => {
@@ -581,6 +734,9 @@ impl Repl {
                                                     slash::SlashKind::Thinking => {
                                                         editor.set("/thinking ");
                                                     }
+                                                    slash::SlashKind::Settings => {
+                                                        editor.set("/settings ");
+                                                    }
                                                 }
                                             }
                                         }
@@ -588,26 +744,76 @@ impl Repl {
                                             let (entries, _) =
                                                 Self::model_overlay_entries(ctx, &cur_filter);
                                             if let Some(e) = entries.get(sel) {
-                                                let model = e
-                                                    .id
-                                                    .splitn(2, '/')
-                                                    .nth(1)
-                                                    .unwrap_or(&e.id)
-                                                    .to_string();
-                                                redraw(&editor, &[], sel, &mut input_row);
-                                                return Some(InputAction::SetModel(
-                                                    e.provider.clone(),
-                                                    model,
-                                                ));
+                                                let (provider, model) = e.qualified_parts();
+                                                // Echo the *selected* model as a committed-invocation
+                                                // record (not the raw editor text), so a bare `/model`
+                                                // + Enter still records the choice. Next prompt is an
+                                                // empty (leaf) command.
+                                                let line = format!("/model {}", e.qualified());
+                                                Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
+                                                return Some(InputAction::SetModel(provider, model));
                                             }
                                         }
                                         3 => {
                                             let levels = Self::thinking_overlay_entries(&cur_filter);
                                             if let Some(l) = levels.get(sel) {
-                                                redraw(&editor, &[], sel, &mut input_row);
+                                                // Echo the *selected* level as a committed-invocation
+                                                // record; next prompt is an empty (leaf) command.
+                                                let line = format!("/thinking {}", l.as_str());
+                                                Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
                                                 return Some(InputAction::SetThinking(
                                                     l.as_str().to_string(),
                                                 ));
+                                            }
+                                        }
+                                        5 => {
+                                            let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
+                                            if is_value {
+                                                if let Some(k) = skey {
+                                                    // Enter with an empty value saves the highlighted
+                                                    // candidate (mirrors Tab); a typed value is saved as-is.
+                                                    let vq_eff = if vq.trim().is_empty() {
+                                                        Self::filtered_value_candidates(k, ctx, &vq)
+                                                            .get(sel)
+                                                            .map(|c| c.value.clone())
+                                                            .unwrap_or_default()
+                                                    } else {
+                                                        vq.clone()
+                                                    };
+                                                    match settings.set_value(k, &vq_eff) {
+                                                        Ok(()) => {
+                                                            value_error = None;
+                                                            // When Enter was pressed on an empty value (the
+                                                            // highlighted candidate), reflect the saved value in
+                                                            // the emitted line so the record is accurate.
+                                                            if vq.trim().is_empty() {
+                                                                if let Some(name) =
+                                                                    SETTINGS.iter().find(|m| m.key == k).map(|m| m.name)
+                                                                {
+                                                                    editor.set(&format!(
+                                                                        "/settings {} {}",
+                                                                        name, vq_eff
+                                                                    ));
+                                                                }
+                                                            }
+                                                            // Echo the committed `/settings <key> <value>` line,
+                                                            // then revert one level up to the `/settings` list
+                                                            // (handled by `editor.set` below). `emit_commit` draws
+                                                            // the separator, so the emitted line is framed even
+                                                            // though the list's own divider sits below its input.
+                                                            let line = editor.text();
+                                                            Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "/settings", true);
+                                                        }
+                                                        Err(msg) => {
+                                                            value_error = Some(msg);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                let entries = settings.overlay_rows(&cur_filter);
+                                                if let Some((meta, _)) = entries.get(sel) {
+                                                    editor.set(&format!("/settings {} ", meta.name));
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -623,6 +829,14 @@ impl Repl {
                                 }
                                 3 => {
                                     editor.set("/thinking");
+                                }
+                                5 => {
+                                    let buf = editor.text();
+                                    if let Some(idx) = buf.rfind(' ') {
+                                        editor.set(&buf[..idx]);
+                                    } else {
+                                        editor.set("");
+                                    }
                                 }
                                 _ => {}
                             },
@@ -658,7 +872,7 @@ impl Repl {
         }
     }
 
-    /// Render the `/model` / `/thinking` overlay: a panel title line plus
+
     /// Compute the input row for the *next* redraw after emitting `er` input rows
     /// plus an `n`-line pop-up, given the current input row and terminal height.
     /// When the pop-up overflows the bottom, the terminal scrolls up by the
@@ -685,15 +899,59 @@ impl Repl {
         }
     }
 
-    /// Render the `/model` / `/thinking` overlay: a panel title line plus
-    /// wrapped, colored option rows with a `> ` selection marker and
-    /// (for `/model`) a green `*` on the currently-active model. Returns
-    /// plain text; the caller emits it directly above the input line.
+    /// Echo a committed-invocation `line` to the transcript (a record of the
+    /// change), draw a separator, then begin the next input prompt pre-filled
+    /// with `next_input` (empty string for a leaf command). This unifies the
+    /// `/model`, `/thinking`, and `/settings <key> <value>` commits so each
+    /// leaves exactly one separator directly below the emitted line — the next
+    /// prompt's own divider (drawn below its input) no longer has to do that
+    /// job, which previously left `/settings` value commits looking
+    /// separator-less because their next prompt (`/settings` list) is visibly
+    /// different from the emitted line. `redraw` is the live overlay closure
+    /// from `read_input`; `input_row` is kept in sync so the next loop
+    /// iteration redraws at the correct row.
+    ///
+    /// `sep` controls whether this helper draws the separator itself:
+    /// `/settings` value commits *stay in the `read_input` loop* (they revert
+    /// to the list rather than returning an action), so no other separator
+    /// will follow the emitted line — pass `true`. `/model` and `/thinking`
+    /// *return* an `InputAction`, so `agent.rs` draws a separator before the
+    /// next `read_input` (its per-prompt framing); passing `false` here avoids
+    /// a doubled separator.
+    fn emit_commit<F: Fn(&LineEditor, &[&str], usize, &mut usize)>(
+        output: &dyn Output,
+        editor: &mut LineEditor,
+        redraw: &F,
+        sel: usize,
+        input_row: &mut usize,
+        line: &str,
+        next_input: &str,
+        sep: bool,
+    ) {
+        redraw(&LineEditor::new(), &[], sel, input_row);
+        output.display_plain(line);
+        if sep {
+            output.display_separator();
+        }
+        *input_row = output.cursor_row();
+        editor.set(next_input);
+    }
+
+    /// Render the `/model` / `/thinking` / `/settings` overlay: a panel title
+    /// line plus option rows with a `> ` selection marker and (for `/model`)
+    /// a green `*` on the currently-active model. Returns plain text; the
+    /// caller emits it directly above the input line.
+    ///
+    /// `wrap_opts` controls layout of the option rows: pre-formatted rows
+    /// (model/settings/thinking tables) must pass `false` so the inter-column
+    /// padding spaces are preserved (word-wrapping would collapse them and
+    /// destroy column alignment); prose rows (help) pass `true`.
     pub fn overlay_lines(
         title: &str,
         options: &[String],
         sel: usize,
         active: Option<usize>,
+        wrap_opts: bool,
     ) -> String {
         const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
         const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
@@ -704,7 +962,17 @@ impl Repl {
         let opt_w = tw.saturating_sub(2); // "> " / "* " / "  " marker
         let mut rows: Vec<(usize, String, bool)> = Vec::new();
         for (i, o) in options.iter().enumerate() {
-            let wrapped = wrap(o, opt_w);
+            // Prose overlays (help, command list) word-wrap each option.
+            // Pre-formatted overlays (model/settings/thinking tables) are already
+            // width-bounded and may carry their own `\n` (multi-line rows from
+            // `Table::render_multiline`); preserve newlines instead of
+            // re-wrapping, so column alignment survives across the wrapped
+            // lines of one logical option.
+            let wrapped: Vec<String> = if wrap_opts {
+                wrap(o, opt_w)
+            } else {
+                o.split('\n').map(String::from).collect()
+            };
             for (j, line) in wrapped.into_iter().enumerate() {
                 rows.push((i, line, j == 0));
             }
@@ -715,6 +983,10 @@ impl Repl {
         let mut out = String::new();
         out.push_str(&bg_line(title, BG));
         for (i, line, first) in &rows {
+            // The 2-char marker area prefixes every line (including wrapped
+            // continuation lines) so all visual lines of one option stay
+            // column-aligned; only the first line of the selected/active
+            // option shows `> `/`* `.
             let marker = if *first && *i == sel {
                 "> "
             } else if *first && active == Some(*i) {
@@ -722,11 +994,7 @@ impl Repl {
             } else {
                 "  "
             };
-            let body = if *first {
-                format!("{}{}", marker, line)
-            } else {
-                line.clone()
-            };
+            let body = format!("{}{}", marker, line);
             let (bg, fg) = if *i == sel {
                 (BG_SEL, C_SEL)
             } else if active == Some(*i) {
@@ -749,7 +1017,7 @@ impl Repl {
     /// dismisses it (see `read_input`).
     fn render_help_overlay() -> String {
         let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
-        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None)
+        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None, true)
     }
 
     /// Resolve the catalog id of the currently-active model. OpenRouter routes
@@ -792,6 +1060,110 @@ impl Repl {
     /// Build the `/model` overlay rows for `filter`, sorted active-first then
     /// recently-used, fuzzy-filtered by `filter`. Returns the (sorted+filtered)
     /// entries and the position of the active model within them.
+
+    /// Parse the `/settings` argument string into (setting, value query, is_value_mode).
+    ///
+    /// Value mode opens only when the first token EXACTLY matches a setting
+    /// name (case-insensitive). A partial prefix (e.g. `d`, `def`, `sec`) stays
+    /// in list mode — the user types more or Tab-completes to the full name,
+    /// which is what actually opens the sub-menu.
+    fn parse_settings(rest: &str) -> (Option<SettingKey>, String, bool) {
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.is_empty() {
+            return (None, String::new(), false);
+        }
+        let exact = SETTINGS.iter().find(|m| m.name.eq_ignore_ascii_case(parts[0]));
+        if let Some(m) = exact {
+            let vq = if parts.len() >= 2 {
+                parts[1..].join(" ")
+            } else {
+                String::new()
+            };
+            (Some(m.key), vq, true)
+        } else {
+            (None, rest.trim().to_string(), false)
+        }
+    }
+
+    /// Candidate values for a setting's value-pick overlay.
+    fn setting_value_candidates(key: SettingKey, ctx: &ReplCtx) -> Vec<ValueCandidate> {
+        match key {
+            SettingKey::SecurityMode => vec![
+                ValueCandidate { display: "confirm".into(), value: "confirm".into(), desc: "ask before each tool call".into() },
+                ValueCandidate { display: "yolo".into(), value: "yolo".into(), desc: "run tools without prompts".into() },
+            ],
+            SettingKey::DefaultThinking => vec![
+                ValueCandidate { display: "off".into(), value: "off".into(), desc: "no extra reasoning".into() },
+                ValueCandidate { display: "low".into(), value: "low".into(), desc: "minimal reasoning".into() },
+                ValueCandidate { display: "med".into(), value: "med".into(), desc: "balanced reasoning".into() },
+                ValueCandidate { display: "high".into(), value: "high".into(), desc: "maximum reasoning".into() },
+            ],
+            SettingKey::DefaultPersona => {
+                let mut v: Vec<ValueCandidate> = crate::persona::PERSONAS
+                    .iter()
+                    .map(|p| ValueCandidate {
+                        display: p.name.into(),
+                        value: p.name.into(),
+                        desc: p.description.into(),
+                    })
+                    .collect();
+                v.push(ValueCandidate { display: "none".into(), value: String::new(), desc: "no persona".into() });
+                v
+            }
+            SettingKey::DefaultModel => {
+                let (entries, _) = Self::model_overlay_entries(ctx, "");
+                entries.iter().map(Self::model_candidate).collect()
+            }
+            SettingKey::ToolCallLimit => Vec::new(),
+        }
+    }
+
+    /// Candidate values for `key`, fuzzy-filtered by `vq` (empty `vq` => all).
+    fn filtered_value_candidates(
+        key: SettingKey,
+        ctx: &ReplCtx,
+        vq: &str,
+    ) -> Vec<ValueCandidate> {
+        let cands = Self::setting_value_candidates(key, ctx);
+        if vq.trim().is_empty() {
+            cands
+        } else {
+            crate::fuzzy::fuzzy_filter(&cands, vq, |c| c.display.clone())
+                .into_iter()
+                .map(|r| r.item.clone())
+                .collect()
+        }
+    }
+    /// Map a catalog `ModelEntry` to a `default_model` value candidate.
+    /// Both `value` and `display` carry the `provider:model` form so the panel
+    /// always shows — and stores — a fully-qualified model id.
+    fn model_candidate(e: &model_catalog::ModelEntry) -> ValueCandidate {
+        let q = e.qualified();
+        ValueCandidate {
+            display: q.clone(),
+            value: q,
+            desc: format!("ctx {} | {}", model_catalog::ctx_cell(e), model_catalog::cost_cell(e)),
+        }
+    }
+
+    /// Replace the last whitespace-delimited token of `s` with `repl`.
+    fn replace_last_token(s: &str, repl: &str) -> String {
+        if let Some(idx) = s.rfind(' ') {
+            format!("{} {}", &s[..idx], repl)
+        } else {
+            repl.to_string()
+        }
+    }
+
+    /// Build the line that replaces the current input when Tab-completing a
+    /// slash command. Command `name`s already include the leading `/`
+    /// (e.g. `"/help"`), so we must NOT prepend another — that would yield
+    /// `//help`. A trailing space opens the argument slot (matching the
+    /// Enter handler's `editor.set("/model ")`, etc.).
+    fn complete_command(c: &slash::SlashCommand) -> String {
+        format!("{} ", c.name)
+    }
+
     fn model_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
@@ -806,10 +1178,17 @@ impl Repl {
         let filtered: Vec<model_catalog::ModelEntry> = if filter.trim().is_empty() {
             entries
         } else {
-            crate::fuzzy::fuzzy_filter(&entries, filter, |e| format!("{} {}", e.display, e.id))
-                .into_iter()
-                .map(|r| r.item.clone())
-                .collect()
+            crate::fuzzy::fuzzy_filter(
+                &entries,
+                filter,
+                // Searchable text leads with the `provider:model` display (so a
+                // `provider:model` query matches directly) and also includes the
+                // bare provider, the slash-id form, and the qualified form.
+                |e| format!("{} {} {} {}", e.provider, e.display, e.id, e.qualified()),
+            )
+            .into_iter()
+            .map(|r| r.item.clone())
+            .collect()
         };
         let active = filtered.iter().position(|e| e.id == active_id);
         (filtered, active)
@@ -992,9 +1371,12 @@ impl LineEditor {
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            self.buf.remove(self.cursor);
+        // Always delete from the end of the line (append-only input model): the
+        // cursor is treated as living at the end, so backspace never reaches
+        // into the middle of the buffer.
+        if !self.buf.is_empty() {
+            self.buf.pop();
+            self.cursor = self.buf.len();
         }
     }
 
@@ -1568,6 +1950,104 @@ fn history_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    // --- Phase 2: string-hierarchy parsing (pure) ---
+    #[test]
+    fn parse_settings_modes() {
+        // empty -> list, no filter
+        assert_eq!(Repl::parse_settings(""), (None, String::new(), false));
+        // Partial prefixes do NOT open the sub-menu: they stay in list mode
+        // (the user must type the full name or Tab-complete it).
+        assert_eq!(Repl::parse_settings("d"), (None, "d".to_string(), false));
+        assert_eq!(Repl::parse_settings("def"), (None, "def".to_string(), false));
+        assert_eq!(Repl::parse_settings("sec"), (None, "sec".to_string(), false));
+        assert_eq!(Repl::parse_settings("default"), (None, "default".to_string(), false));
+        assert_eq!(Repl::parse_settings("default_"), (None, "default_".to_string(), false));
+        // single token that resolves -> value mode, empty value
+        assert_eq!(
+            Repl::parse_settings("default_model"),
+            (Some(crate::settings::SettingKey::DefaultModel), String::new(), true)
+        );
+        // two tokens -> value mode with value query
+        assert_eq!(
+            Repl::parse_settings("default_model openrouter:foo"),
+            (
+                Some(crate::settings::SettingKey::DefaultModel),
+                "openrouter:foo".to_string(),
+                true
+            )
+        );
+        // unresolved single token -> list mode (filtered)
+        assert_eq!(
+            Repl::parse_settings("bogus"),
+            (None, "bogus".to_string(), false)
+        );
+        // multi-word value query preserved with spaces
+        assert_eq!(
+            Repl::parse_settings("default_persona my models/x y"),
+            (
+                Some(crate::settings::SettingKey::DefaultPersona),
+                "my models/x y".to_string(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn model_candidate_has_provider_prefix() {
+        // Flat id (no nested path): provider:model, value == display.
+        let e = model_catalog::ModelEntry {
+            provider: "anthropic".into(),
+            id: "anthropic/claude-3-5-sonnet".into(),
+            display: "anthropic:claude-3-5-sonnet".into(),
+            context_length: None,
+            prompt_cost: None,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: model_catalog::CostSource::OpenRouterEstimate,
+        };
+        let c = Repl::model_candidate(&e);
+        assert_eq!(c.value, "anthropic:claude-3-5-sonnet");
+        assert_eq!(c.display, c.value);
+        // Nested OpenRouter id keeps the full model path after the colon.
+        // `parse_openrouter` stores the raw id *without* the `openrouter/`
+        // prefix (the provider is carried separately), so the qualified form
+        // is `openrouter:deepseek/deepseek-v4-flash`.
+        let e2 = model_catalog::ModelEntry {
+            provider: "openrouter".into(),
+            id: "deepseek/deepseek-v4-flash".into(),
+            display: "deepseek:deepseek-v4-flash".into(),
+            context_length: None,
+            prompt_cost: None,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: model_catalog::CostSource::OpenRouterEstimate,
+        };
+        let c2 = Repl::model_candidate(&e2);
+        assert_eq!(c2.value, "openrouter:deepseek/deepseek-v4-flash");
+        assert!(c2.value.starts_with("openrouter:"), "value must carry the provider: prefix");
+    }
+
+    #[test]
+    fn replace_last_token_replaces_tail() {
+        assert_eq!(Repl::replace_last_token("/settings default_model x:y", "ABC"), "/settings default_model ABC");
+        assert_eq!(Repl::replace_last_token("/model gpt", "gpt-4"), "/model gpt-4");
+        // no space -> whole string replaced
+        assert_eq!(Repl::replace_last_token("/settings", "X"), "X");
+    }
+
+    #[test]
+    fn complete_command_single_slash() {
+        for c in slash::registry() {
+            let s = Repl::complete_command(c);
+            assert!(s.starts_with('/'), "command completion must keep its leading slash: {:?}", s);
+            assert!(!s.starts_with("//"), "command completion must not double the slash: {:?}", s);
+            assert!(s.ends_with(' '), "command completion should open the arg slot: {:?}", s);
+        }
+        // the reported bug case: `/` + Tab must yield `/help`, not `//help`.
+        let help = slash::registry().iter().find(|c| c.name == "/help").unwrap();
+        assert_eq!(Repl::complete_command(help), "/help ");
+    }
+
     #[test]
     fn insert_and_text() {
         let mut e = LineEditor::new();
@@ -1579,15 +2059,19 @@ mod tests {
     }
 
     #[test]
-    fn backspace_at_boundary_noop() {
+    fn backspace_always_deletes_last_char() {
         let mut e = LineEditor::new();
         e.insert('a');
         e.insert('b');
-        e.home();
+        e.home(); // cursor at start; backspace still deletes from the end
         assert_eq!(e.cursor, 0);
-        e.backspace(); // at start -> no change
-        assert_eq!(e.cursor, 0);
-        assert_eq!(e.text(), "ab");
+        e.backspace();
+        assert_eq!(e.cursor, 1);
+        assert_eq!(e.text(), "a");
+        // empty buffer -> no-op
+        let mut e2 = LineEditor::new();
+        e2.backspace();
+        assert_eq!(e2.text(), "");
     }
 
     #[test]
@@ -1623,13 +2107,13 @@ mod tests {
     }
 
     #[test]
-    fn backspace_middle() {
+    fn backspace_deletes_from_end_regardless_of_cursor() {
         let mut e = LineEditor::new();
         e.insert_str("abc");
-        e.left();
-        e.backspace(); // deletes 'b', the char before the cursor
-        assert_eq!(e.text(), "ac");
-        assert_eq!(e.cursor, 1);
+        e.left(); // cursor in the middle
+        e.backspace(); // still deletes the last char
+        assert_eq!(e.text(), "ab");
+        assert_eq!(e.cursor, 2);
     }
 
     #[test]
@@ -1849,7 +2333,7 @@ mod tests {
             "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
             "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
         ];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
         assert_eq!(out.matches("Select a model:").count(), 1);
         assert!(out.contains("> a: alpha"));
         assert!(out.contains("  b: beta"));
@@ -1859,7 +2343,7 @@ mod tests {
     fn render_select_wraps_long_option_with_aligned_continuation() {
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let opts = vec![long.to_string()];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[1].contains("> "), "first row is the marker row");
         let cont: Vec<&&str> = lines

@@ -684,7 +684,7 @@ impl Output for ConsoleOutput {
         let mut sel: usize = 1;
 
         let draw = |sel: usize| {
-            let panel = Repl::overlay_lines(message, &options, sel, None);
+            let panel = Repl::overlay_lines(message, &options, sel, None, true);
             let mut s = String::new();
             s.push_str(&format!("\x1b[{};1H", top));
             s.push_str("\x1b[0J");

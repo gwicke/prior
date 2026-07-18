@@ -34,27 +34,33 @@ wraps the command in a Bubblewrap (`bwrap`) namespace.
 Extend `Config` so that sandbox settings live under the existing
 `tool_config.<tool>` map (the same place as `auto_allow`):
 
-```yaml
-tool_config:
-  bash:
-    auto_allow:
-      - "^cargo test"
-    sandbox:
-      enabled: true            # default: true if bwrap present, else false
-      timeout_secs: 120        # default: 120
-      network: false           # default: false (unshare network)
-      memory_mb: 1024          # default: none (unlimited)
-      pid_isolation: true      # default: true (--unshare-pid --pid)
-      drop_caps: true          # default: true (--cap-drop ALL)
-      tmp_size_mb: 256         # default: 256 (size of sandbox tmpfs at /tmp)
-      paths:
-        - ro:  "."             # read-only, identical from/to (common case)
-        - rw:  "."             # read-write, identical from/to
-        - ro:  "/usr"
-        - rw:  "./target"      # built artifacts can be written
-        # Remap: host path -> different in-sandbox path
-        - ro:  { from: "~/.cargo", to: "/opt/cargo" }
-        - rw:  { from: "./cache", to: "/var/cache/app" }
+```toml
+[tool_config.bash]
+auto_allow = ["^cargo test"]
+
+[tool_config.bash.sandbox]
+enabled = true            # default: true if bwrap present, else false
+timeout_secs = 120        # default: 120
+network = false           # default: false (unshare network)
+memory_mb = 1024          # default: none (unlimited)
+pid_isolation = true      # default: true (--unshare-pid --pid)
+drop_caps = true           # default: true (--cap-drop ALL)
+tmp_size_mb = 256         # default: 256 (size of sandbox tmpfs at /tmp)
+# `paths` is an array of tables; each entry is `{ ro = "PATH" }` /
+# `{ rw = "PATH" }` (identical host/in-sandbox path) or a remap
+# `{ rw = { from = "HOST", to = "SANDBOX" } }`.
+[[tool_config.bash.sandbox.paths]]
+ro = "."
+[[tool_config.bash.sandbox.paths]]
+rw = "."
+[[tool_config.bash.sandbox.paths]]
+ro = "/usr"
+[[tool_config.bash.sandbox.paths]]
+rw = "./target"
+[[tool_config.bash.sandbox.paths]]
+ro = { from = "~/.cargo", to = "/opt/cargo" }
+[[tool_config.bash.sandbox.paths]]
+rw = { from = "./cache", to = "/var/cache/app" }
 ```
 
 ### Schema (Rust)
@@ -175,9 +181,9 @@ Remapping lets the agent see a host directory at a **different** location than
 on the host. Example: the host cache lives at `/home/user/.cache/foo` but the
 tool inside the sandbox expects `/var/cache/foo`:
 
-```yaml
-paths:
-  - rw: { from: "~/.cache/foo", to: "/var/cache/foo" }
+```toml
+[[tool_config.bash.sandbox.paths]]
+rw = { from = "~/.cache/foo", to = "/var/cache/foo" }
 ```
 
 At runtime this becomes `--bind <expanded ~/.cache/foo> /var/cache/foo`. The
@@ -267,19 +273,16 @@ policy** on top of bwrap's filesystem/network/PID/cap isolation.
 The policy is configured under `sandbox.env` as a single mutually-exclusive
 mode (you cannot combine a blacklist and a whitelist in one block):
 
-```yaml
-tool_config:
-  bash:
-    sandbox:
-      # Blacklist (default when `env` is unset): start from the full env,
-      # drop names matching any pattern. Glob `*`,`?` plus literal.
-      env:
-        mode: disallow
-        patterns: ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
-      # -- or -- Whitelist: keep ONLY matching names; everything else dropped.
-      env:
-        mode: only_allow
-        patterns: ["PATH", "HOME", "TERM", "LANG"]
+```toml
+# Blacklist (default when `env` is unset): start from the full env,
+# drop names matching any pattern. Glob `*`,`?` plus literal.
+[tool_config.bash.sandbox.env]
+mode = "disallow"
+patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+# -- or -- Whitelist: keep ONLY matching names; everything else dropped.
+# [tool_config.bash.sandbox.env]
+# mode = "only_allow"
+# patterns = ["PATH", "HOME", "TERM", "LANG"]
 ```
 
 - `disallow` keeps the whole environment minus the matches. An **empty**
@@ -509,7 +512,7 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       path translation shared by the shell wrapper and `validate_path`.
 - [ ] Add `Config::bash_sandbox() -> SandboxConfig` accessor (merges defaults).
 - [ ] Unit tests: parse all four `BindSpec` forms; resolve relative/`~`/absolute.
-- [ ] Update `picocode.yaml.example` with the full `sandbox:` block (commented).
+- [ ] Update `picocode.toml.example` with the full `sandbox:` block (commented).
 
 ### Phase 1 — Timeout + `run_sandboxed` refactor (shell tools)
 
@@ -567,7 +570,7 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 
 - [ ] Document `sandbox:` in README (security properties + caveats).
 - [ ] Add a `doc/sandbox.md` link / summary to README.
-- [ ] Final integration pass: run the example `picocode.yaml` recipes under
+- [ ] Final integration pass: run the example `picocode.toml` recipes under
       sandbox on/off.
 - [ ] CHANGELOG entry; confirm `cargo test` + `cargo build` green on a host
       with and without bwrap.

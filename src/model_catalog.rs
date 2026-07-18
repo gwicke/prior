@@ -49,6 +49,36 @@ pub struct ModelEntry {
     pub cost_source: CostSource,
 }
 
+impl ModelEntry {
+    /// The (`provider`, `model`) pair for the `provider:model` convention.
+    ///
+    /// OpenRouter-routed entries carry `provider == "openrouter"` and an `id`
+    /// that is the full (possibly namespaced) model path, e.g.
+    /// `tencent/hy3:free`; the qualified form is `openrouter:tencent/hy3:free`.
+    /// Direct entries carry the provider both in `provider` and as the `id`
+    /// prefix, e.g. `tencent/hy3:free` → `tencent:hy3:free` (the namespace is
+    /// stripped).
+    pub fn qualified_parts(&self) -> (String, String) {
+        if self.provider == "openrouter" {
+            ("openrouter".to_string(), self.id.clone())
+        } else {
+            let model = self
+                .id
+                .split_once('/')
+                .map(|(_, m)| m)
+                .unwrap_or(&self.id)
+                .to_string();
+            (self.provider.clone(), model)
+        }
+    }
+
+    /// The `provider:model` string (see [`ModelEntry::qualified_parts`]).
+    pub fn qualified(&self) -> String {
+        let (p, m) = self.qualified_parts();
+        format!("{}:{}", p, m)
+    }
+}
+
 /// Curated fallback: **direct-access** pricing per million tokens.
 /// Used when offline or for providers OpenRouter doesn't surface.
 const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
@@ -504,6 +534,39 @@ mod tests {
     fn parse_openrouter_handles_missing_data() {
         assert!(parse_openrouter(&json!({"data": []})).is_empty());
         assert!(parse_openrouter(&json!({"nope": 1})).is_empty());
+    }
+
+    // OpenRouter entries carry `provider == "openrouter"` and an `id` that is
+    // the full (namespaced) model path; the qualified `provider:model` form
+    // must keep the namespace (e.g. `openrouter:tencent/hy3:free`), not drop
+    // it. Direct entries keep `provider:model` with the namespace stripped.
+    #[test]
+    fn qualified_parts_keeps_namespace_for_openrouter() {
+        let or = ModelEntry {
+            provider: "openrouter".into(),
+            id: "tencent/hy3:free".into(),
+            display: "tencent/hy3:free".into(),
+            context_length: None,
+            prompt_cost: None,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: CostSource::OpenRouterEstimate,
+        };
+        assert_eq!(or.qualified_parts(), ("openrouter".to_string(), "tencent/hy3:free".to_string()));
+        assert_eq!(or.qualified(), "openrouter:tencent/hy3:free");
+
+        let direct = ModelEntry {
+            provider: "tencent".into(),
+            id: "tencent/hy3:free".into(),
+            display: "tencent:hy3:free".into(),
+            context_length: None,
+            prompt_cost: None,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: CostSource::Direct,
+        };
+        assert_eq!(direct.qualified_parts(), ("tencent".to_string(), "hy3:free".to_string()));
+        assert_eq!(direct.qualified(), "tencent:hy3:free");
     }
 
     // `extrapolate` keeps the OpenRouter entry and adds a direct one (when the

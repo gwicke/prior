@@ -1,0 +1,94 @@
+# picocode.toml example
+
+# --- Managed settings ---
+# All optional; sensible built-in defaults are used when omitted. These are
+# root-level keys, so they must appear before any `[table]` header below.
+default_model = "anthropic:claude-3-5-sonnet-20241022"  # provider:model
+security_mode = "confirm"          # yolo | confirm
+tool_call_limit = 50
+default_persona = "architect"      # built-in name or file path; omit for none
+default_thinking_level = "off"     # off | low | med | high
+
+# Custom agent prompt (replaces the default "Concise coding assistant" prompt)
+# agent_prompt = "You are a senior software engineer specialized in Rust and systems programming."
+# Or load from a file:
+# agent_prompt_file = "prompts/custom_agent.txt"
+
+# Tool-specific configurations
+[tool_config.bash]
+# Commands that will be automatically allowed without prompting (when yolo is false)
+auto_allow = [
+  "^ls -la",
+  "^git status",
+  "^cargo test",
+  "^npm test",
+]
+# Sandbox for the `bash` (and `agent-browser`) tools. Requires `bwrap`
+# (bubblewrap) on PATH; if `enabled` is left unset it auto-enables only
+# when bwrap is available, otherwise the command runs unsandboxed.
+[tool_config.bash.sandbox]
+enabled = true
+# Wall-clock timeout for the whole command (seconds). 0 = no timeout.
+timeout_secs = 120
+# Give the sandbox network access (default false => network unshared).
+network = false
+# Virtual-memory cap in MB (default none).
+# memory_mb = 1024
+# PID isolation, capability drop, scratch /tmp size (all default true/enabled).
+# pid_isolation = true
+# drop_caps = true
+# tmp_size_mb = 256
+# Filesystem bindings. Each entry is either `{ ro = "PATH" }` / `{ rw = "PATH" }`
+# (identical host/in-sandbox path) or a remap
+# `{ rw = { from = "HOST", to = "SANDBOX" } }`. When `paths` is empty the
+# current directory is mounted read-only with a writable /tmp scratch area.
+# When `paths` is set, ONLY the listed paths are visible (deny by default) and
+# the non-shell file tools enforce the same policy, so a remap like /tmp below
+# is seen identically by the shell and by read/write.
+[[tool_config.bash.sandbox.paths]]
+rw = "."
+
+[[tool_config.bash.sandbox.paths]]
+rw = { from = "./cache", to = "/var/cache/app" }
+
+# [[tool_config.bash.sandbox.paths]]
+# ro = { from = "~/.cargo", to = "/opt/cargo" }
+
+# Environment policy for the sandboxed command. bwrap inherits the parent env
+# verbatim, so without this the LLM command could read host secrets (API keys,
+# tokens, SSH agent socket). Two mutually-exclusive modes:
+#   disallow  : keep the full env MINUS names matching `patterns`
+#   only_allow: keep ONLY names matching `patterns` (everything else dropped)
+# Patterns are glob (`*`/`?`) or literal, matched against var *names*.
+# When `env` is omitted entirely, the built-in default applies:
+#   disallow = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+# Uncomment and adjust as needed:
+# [tool_config.bash.sandbox.env]
+# mode = "disallow"
+# patterns = ["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"]
+# Or a strict whitelist (must include PATH or commands break):
+# [tool_config.bash.sandbox.env]
+# mode = "only_allow"
+# patterns = ["PATH", "HOME", "TERM", "LANG"]
+
+# Named recipes for non-interactive execution (CI/CD, automation)
+[recipes.review-security]
+prompt = "Review the codebase for security issues and vulnerabilities. Exit with a clear summary and indicate if the build should break."
+provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+persona = "security"
+yolo = false
+# If the response matches this regex, exit with error (e.g. for CI/CD)
+# error_if = "CRITICAL|FAIL|vulnerability found"
+
+[recipes.simplify]
+prompt = "Refactor the most complex functions in the current directory to be simpler and more readable. Maintain the same behavior."
+yolo = true
+
+[recipes.fix-lints]
+prompt = "Run the project's linter and fix all reported issues."
+yolo = true
+
+[recipes.custom-review]
+prompt_file = "prompts/review.txt"
+model = "gpt-4o"

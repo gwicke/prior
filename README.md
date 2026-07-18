@@ -68,19 +68,18 @@ Picocode isn't just a tool; it has character. Use `--persona` to change the agen
 
 ## ⚙️ Recipes & Automation
 
-Picocode supports named **Recipes** in a `picocode.yaml` file for non-interactive execution (CI/CD, automation).
+Picocode supports named **Recipes** in a `picocode.toml` file for non-interactive execution (CI/CD, automation).
 
-```yaml
-# picocode.yaml
-recipes:
-  review-security:
-    prompt: "Review the codebase for security issues."
-    persona: "security"
-    model: "claude-3-5-sonnet-latest"
+```toml
+# picocode.toml
+[recipes.review-security]
+prompt = "Review the codebase for security issues."
+persona = "security"
+model = "claude-3-5-sonnet-latest"
 
-  review-from-file:
-    prompt_file: "prompts/security_review.txt"
-    persona: "security"
+[recipes.review-from-file]
+prompt_file = "prompts/security_review.txt"
+persona = "security"
 ```
 
 Run it with:
@@ -97,7 +96,7 @@ Picocode is designed to be flexible, whether you're using it for a quick questio
 
 - **Interactive Chat**: `picocode` or `picocode chat` (Default)
 - **Single Prompt**: `picocode "your prompt"` or `picocode input "your prompt"`
-- **Recipes**: `picocode recipe <name>` (Runs a pre-defined task from `picocode.yaml`)
+- **Recipes**: `picocode recipe <name>` (Runs a pre-defined task from `picocode.toml`)
 
 ### Common Flags
 
@@ -121,19 +120,19 @@ Picocode gives the AI a comprehensive set of tools to interact with your environ
 
 Shell commands run inside a [Bubblewrap](https://github.com/containers/bwrap) (bwrap) namespace when `bwrap` is installed: the process gets its own mount, PID, and network namespaces, all capabilities dropped, and an optional virtual-memory cap. Commands are also killed if they exceed `timeout_secs`.
 
-Configure it under `tool_config.bash.sandbox` in `picocode.yaml` (see `picocode.yaml.example`):
+Configure it under `tool_config.bash.sandbox` in `picocode.toml` (see `picocode.toml.example`):
 
-```yaml
-tool_config:
-  bash:
-    sandbox:
-      enabled: true          # auto-enabled only if bwrap is on PATH
-      timeout_secs: 120
-      network: false         # unshare network by default
-      memory_mb: 1024        # optional RLIMIT_AS cap
-      paths:
-        - rw: "."            # project dir mounted read-write
-        - rw: { from: "./cache", to: "/var/cache/app" }  # remap
+```toml
+[tool_config.bash.sandbox]
+enabled = true          # auto-enabled only if bwrap is on PATH
+timeout_secs = 120
+network = false         # unshare network by default
+memory_mb = 1024        # optional RLIMIT_AS cap
+# Deny-by-default: only the listed paths are visible.
+[[tool_config.bash.sandbox.paths]]
+rw = "."
+[[tool_config.bash.sandbox.paths]]
+rw = { from = "./cache", to = "/var/cache/app" }  # remap
 ```
 
 - **Deny-by-default filesystem**: when `paths` is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.

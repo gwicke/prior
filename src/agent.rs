@@ -1,5 +1,6 @@
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx};
+use crate::settings::SettingsStore;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
     MoveFile, ReadFile, Remove, WriteFile,
@@ -473,7 +474,7 @@ fn guard<T: Tool>(
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
-pub async fn run_interactive(config: AgentConfig) -> Result<()> {
+pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
     let mut config = config;
     // Agent is created lazily on first use (or on /model, /thinking) so that
     // commands like /help work without a network round-trip.
@@ -530,7 +531,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                     model: config.model.clone(),
                     recent: recent_models.clone(),
                 };
-                r.read_input(&prompt_str, &mut line_history, &ctx, config.output.cursor_row())
+                r.read_input(&prompt_str, &mut line_history, &ctx, settings, config.output.cursor_row(), config.output.as_ref())
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };
@@ -549,10 +550,8 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                         agent = Some(new_agent);
                         config = new_cfg;
                         recent_models.push(format!("{}/{}", config.provider, config.model));
-                        config.output.display_plain(&format!(
-                            "model -> {}/{}",
-                            config.provider, config.model
-                        ));
+                        // No confirmation line: the `/model <provider:model>` input
+                        // line (emitted by `read_input`) is the record of the change.
                     }
                     Err(e) => config
                         .output
@@ -568,11 +567,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                             Ok(new_agent) => {
                                 agent = Some(new_agent);
                                 config = new_cfg;
-                                let msg = format!("thinking level -> {}", level.as_str());
-                                match repl.as_mut() {
-                                    Some(_) => config.output.display_plain(&msg),
-                                    None => config.output.display_plain(&msg),
-                                }
+                                // No confirmation line: the `/thinking <level>` input is self-documenting.
                             }
                             Err(e) => {
                                 let msg = format!("Cannot set thinking: {}", e);

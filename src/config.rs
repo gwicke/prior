@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,22 @@ pub struct Config {
     pub tool_config: HashMap<String, ToolSettings>,
     #[serde(default)]
     pub recipes: HashMap<String, Recipe>,
+    // --- Managed settings (persisted by the /settings menu; see doc/settings_menu.md) ---
+    /// Default model as `provider:model` (used for new sessions).
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Tool execution policy: `yolo` (no prompts) or `confirm` (ask).
+    #[serde(default)]
+    pub security_mode: Option<String>,
+    /// Max tool calls per prompt/turn.
+    #[serde(default)]
+    pub tool_call_limit: Option<usize>,
+    /// Persona for new sessions (built-in name or file path); `None` = no persona.
+    #[serde(default)]
+    pub default_persona: Option<String>,
+    /// Default thinking level: `off` | `low` | `med` | `high`.
+    #[serde(default)]
+    pub default_thinking_level: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -526,22 +543,23 @@ impl Recipe {
 }
 
 impl Config {
-    /// Load config from the given path, or from picocode.yaml/picocode.yml in the current directory if path is None.
+    /// Load config from the given path, or from `picocode.toml` in the current
+    /// directory if `path` is `None`.
     pub fn load(path: Option<&str>) -> crate::Result<Self> {
         if let Some(path) = path {
             let p = Path::new(path);
             let content = std::fs::read_to_string(p).map_err(crate::PicocodeError::Io)?;
-            let config = serde_yaml::from_str::<Config>(&content)
-                .map_err(crate::PicocodeError::Yaml)?;
+            let config = toml_edit::de::from_str::<Config>(&content)
+                .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
             return Ok(config);
         }
-        let paths = ["picocode.yaml", "picocode.yml"];
+        let paths = ["picocode.toml"];
         for path in paths {
             let p = Path::new(path);
             if p.exists() {
                 let content = std::fs::read_to_string(p).map_err(crate::PicocodeError::Io)?;
-                let config = serde_yaml::from_str::<Config>(&content)
-                    .map_err(crate::PicocodeError::Yaml)?;
+                let config = toml_edit::de::from_str::<Config>(&content)
+                    .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
                 return Ok(config);
             }
         }
@@ -571,21 +589,17 @@ pub fn read_prompt(prompt: Option<String>, prompt_file: Option<String>) -> crate
     }
 }
 
-// Re-use the crate's Regex type so `Recipe::is_error` matches the rest of the
-// crate's error handling.
-use regex::Regex;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse_bind(yaml: &str) -> BindSpec {
-        serde_yaml::from_str(yaml).expect("bind spec should parse")
+    fn parse_bind(toml: &str) -> BindSpec {
+        toml_edit::de::from_str(toml).expect("bind spec should parse")
     }
 
     #[test]
     fn bind_simple_ro() {
-        let b = parse_bind("ro: \"./src\"");
+        let b = parse_bind("ro = \"./src\"");
         assert_eq!(b.mode, BindMode::Ro);
         assert_eq!(b.from, "./src");
         assert_eq!(b.to, "./src");
@@ -593,7 +607,7 @@ mod tests {
 
     #[test]
     fn bind_simple_rw() {
-        let b = parse_bind("rw: \"./target\"");
+        let b = parse_bind("rw = \"./target\"");
         assert_eq!(b.mode, BindMode::Rw);
         assert_eq!(b.from, "./target");
         assert_eq!(b.to, "./target");
@@ -601,7 +615,7 @@ mod tests {
 
     #[test]
     fn bind_remap_nested_rw() {
-        let b = parse_bind("rw:\n  from: ./cache\n  to: /var/cache/app");
+        let b = parse_bind("rw = { from = \"./cache\", to = \"/var/cache/app\" }");
         assert_eq!(b.mode, BindMode::Rw);
         assert_eq!(b.from, "./cache");
         assert_eq!(b.to, "/var/cache/app");
@@ -609,7 +623,7 @@ mod tests {
 
     #[test]
     fn bind_remap_explicit_mode() {
-        let b = parse_bind("mode: ro\nfrom: ~/.cargo\nto: /opt/cargo");
+        let b = parse_bind("mode = \"ro\"\nfrom = \"~/.cargo\"\nto = \"/opt/cargo\"");
         assert_eq!(b.mode, BindMode::Ro);
         assert_eq!(b.from, "~/.cargo");
         assert_eq!(b.to, "/opt/cargo");
@@ -650,9 +664,9 @@ mod tests {
             Path::new("/work"),
             Some(Path::new("/home/u")),
             &[
-                parse_bind("rw: \".\""),
-                parse_bind("rw:\n  from: ./cache\n  to: /var/cache/app"),
-                parse_bind("ro:\n  from: ~/.cargo\n  to: /opt/cargo"),
+                parse_bind("rw = \".\""),
+                parse_bind("rw = { from = \"./cache\", to = \"/var/cache/app\" }"),
+                parse_bind("ro = { from = \"~/.cargo\", to = \"/opt/cargo\" }"),
             ],
         )
         .unwrap();
@@ -669,7 +683,7 @@ mod tests {
         let binds = resolve_paths(
             Path::new("/work"),
             None,
-            &[parse_bind("rw:\n  from: ./scratch\n  to: /tmp")],
+            &[parse_bind("rw = { from = \"./scratch\", to = \"/tmp\" }")],
         )
         .unwrap();
         let table = RemapTable::build(&binds);
@@ -777,22 +791,79 @@ mod tests {
 
     #[test]
     fn env_policy_deserializes() {
-        let cfg: SandboxConfig = serde_yaml::from_str(
-            "enabled: true\nenv:\n  mode: disallow\n  patterns:\n    - '*_KEY'\n    - 'AWS_*'\n",
+        let cfg: SandboxConfig = toml_edit::de::from_str(
+            "enabled = true\n\n[env]\nmode = \"disallow\"\npatterns = [\"*_KEY\", \"AWS_*\"]\n",
         )
         .expect("env policy should parse");
         let p = cfg.env.expect("env present");
         assert_eq!(p.mode, EnvMode::Disallow);
         assert_eq!(p.patterns, vec!["*_KEY".to_string(), "AWS_*".to_string()]);
 
-        let cfg: SandboxConfig = serde_yaml::from_str(
-            "env:\n  mode: only_allow\n  patterns:\n    - PATH\n",
+        let cfg: SandboxConfig = toml_edit::de::from_str(
+            "[env]\nmode = \"only_allow\"\npatterns = [\"PATH\"]\n",
         )
         .expect("only_allow should parse");
         let p = cfg.env.expect("env present");
         assert_eq!(p.mode, EnvMode::OnlyAllow);
         assert_eq!(p.patterns, vec!["PATH".to_string()]);
     }
+
+    // ---- p2: TOML settings load ----
+
+    #[test]
+    fn load_parses_toml_with_settings_and_recipes() {
+        let toml = r#"
+# comment preserved on write elsewhere
+default_model = "anthropic:claude-3-5-sonnet-20241022"
+security_mode = "confirm"
+tool_call_limit = 50
+default_persona = "architect"
+default_thinking_level = "off"
+
+[tool_config.bash]
+auto_allow = ["^ls -la"]
+
+[recipes.review-security]
+prompt = "Review the codebase."
+provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+"#;
+        let cfg: Config =
+            toml_edit::de::from_str(toml).expect("TOML config with settings should parse");
+        assert_eq!(
+            cfg.default_model.as_deref(),
+            Some("anthropic:claude-3-5-sonnet-20241022")
+        );
+        assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
+        assert_eq!(cfg.tool_call_limit, Some(50));
+        assert_eq!(cfg.default_persona.as_deref(), Some("architect"));
+        assert_eq!(cfg.default_thinking_level.as_deref(), Some("off"));
+        assert_eq!(cfg.recipes.len(), 1);
+        assert!(cfg.tool_config.contains_key("bash"));
+    }
+
+    #[test]
+    fn load_defaults_when_keys_absent() {
+        let cfg: Config =
+            toml_edit::de::from_str("recipes = {}").expect("minimal TOML should parse");
+        assert!(cfg.default_model.is_none());
+        assert!(cfg.security_mode.is_none());
+        assert!(cfg.tool_call_limit.is_none());
+        assert!(cfg.default_persona.is_none());
+        assert!(cfg.default_thinking_level.is_none());
+    }
+
+    #[test]
+    fn example_toml_file_parses() {
+        // Regression check: the shipped `picocode.toml.example` (ported from the
+        // old YAML example) must parse under the TOML config loader.
+        let content =
+            std::fs::read_to_string("picocode.toml.example").expect("example file present");
+        let cfg: Config =
+            toml_edit::de::from_str(&content).expect("example TOML should parse");
+        let bash = cfg.tool_config.get("bash").expect("bash tool config present");
+        assert!(bash.sandbox.is_some(), "example should include a sandbox block");
+        assert_eq!(cfg.tool_call_limit, Some(50));
+        assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
+    }
 }
-
-
