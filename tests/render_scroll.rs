@@ -302,9 +302,9 @@ fn shift_enter_inserts_newline_without_kitty() {
     );
 }
 
-/// Phase 2 integration: the `/settings` string hierarchy — the list
+/// Phase 2 integration: the `/set` string hierarchy — the list
 /// appears, a valid value is saved (and the overlay reverts to top
-/// `/settings`), and an invalid value shows the red error header
+/// `/set`), and an invalid value shows the red error header
 /// (and is NOT saved). Uses a temp config so the save side-effect
 /// never touches the repo.
 #[test]
@@ -342,7 +342,7 @@ fn settings_string_hierarchy_saves_and_errors() {
     thread::sleep(Duration::from_millis(400));
 
     // Open the settings list.
-    for ch in "/settings ".chars() {
+    for ch in "/set ".chars() {
         let _ = writer.write_all(&[ch as u8]);
         let _ = writer.flush();
         thread::sleep(Duration::from_millis(100));
@@ -426,7 +426,7 @@ fn settings_string_hierarchy_saves_and_errors() {
     stop.store(true, Ordering::SeqCst);
 }
 
-/// Live-apply wiring: a `/settings` change flips `dirty`; the agent rebuild
+/// Live-apply wiring: a `/set` change flips `dirty`; the agent rebuild
 /// is attempted at the next `Submit` (without hanging the REPL). Offline the
 /// rebuild fails on a missing API key, but the `Submit` arm must still return
 /// to a responsive prompt — proving the deferred rebuild ran and the loop
@@ -465,7 +465,7 @@ fn settings_change_triggers_deferred_rebuild() {
     // Change default_model (exact name -> value mode), then Enter. Use an
     // unsupported provider so the deferred rebuild *always* fails (env-independent),
     // giving a deterministic proof that the rebuild was attempted at the next Submit.
-    for ch in "/settings default_model ".chars() {
+    for ch in "/set default_model ".chars() {
         let _ = writer.write_all(&[ch as u8]);
         let _ = writer.flush();
         thread::sleep(Duration::from_millis(60));
@@ -479,18 +479,18 @@ fn settings_change_triggers_deferred_rebuild() {
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(500));
 
-    // The commit reverts the editor to `/settings`; clear it (Esc on a
+    // The commit reverts the editor to `/set`; clear it (Esc on a
     // space-less buffer empties the input) so the next text is a real prompt.
     let _ = writer.write_all(b"\x1b");
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(300));
 
-    // The committed `/settings <key> <value>` line must have been emitted.
+    // The committed `/set <key> <value>` line must have been emitted.
     {
         let data = bytes.lock().unwrap().clone();
         let s = String::from_utf8_lossy(&data);
         assert!(
-            s.contains("/settings default_model definitelynotarealprovider:model"),
+            s.contains("/set default_model definitelynotarealprovider:model"),
             "committed /settings line not emitted; tail={}",
             s.replace('\x1b', "ESC").chars().rev().take(300).collect::<String>()
         );

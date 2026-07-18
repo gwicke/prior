@@ -399,6 +399,7 @@ mod tests {
             bash_auto_allow: None,
             agent_prompt: None,
             user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sandbox: None,
         };
         // Mutate every setting, then apply.
         s.set_value(SettingKey::DefaultModel, "openrouter:tencent/hy3:free")

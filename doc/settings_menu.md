@@ -1,6 +1,6 @@
-# `/settings` sub-menu — Implementation Plan
+# `/set` sub-menu — Implementation Plan
 
-Extend the `/` menu with a `/settings` sub-menu that lists settings as a
+Extend the `/` menu with a `/set` sub-menu that lists settings as a
 `Setting | Value | Description` table, lets the user fuzzy-filter on the
 setting key, and select / tab-complete a setting (same model as `/model`).
 Selecting a setting drops its **current value** into the input box for free
@@ -21,7 +21,7 @@ This plan mirrors the existing `/model` + `/thinking` inline-overlay design in
 > (model/persona/thinking/limits/security) to the current session.
 
 > **Status (2026-07-17):** *Phase 1 implemented and merged-build green.
-> The config format was hard-switched YAML→TOML (no YAML fallback). `/settings`
+> The config format was hard-switched YAML→TOML (no YAML fallback). `/set`
 > opens a `Setting | Value | Description` table, fuzzy-filters on key +
 > description, and selecting a row drops that setting's current value into the
 > input box for free editing. `Enter` validates + persists via `toml_edit`
@@ -48,7 +48,7 @@ This plan mirrors the existing `/model` + `/thinking` inline-overlay design in
   key-dispatch wiring in `read_input` is thin and calls these.
 - **`slash.rs` registry**: `SlashCommand { name, help, kind }` (`SlashKind ∈
   {Help, Thinking, Model, Quit}`). `filter_commands` drives the bare `/` list
-  and `Tab` completion (`/mod` → `/model `). `/settings` must be added here so
+  and `Tab` completion (`/mod` → `/model `). `/set` must be added here so
   it appears in the `/` list and completes.
 - **Settings today are NOT persisted.** `Config` (`src/config.rs`) currently
   loads `picocode.yaml`/`picocode.yml` (YAML) and holds only `agent_prompt`,
@@ -70,7 +70,7 @@ A single, centralized, **extendable** registry so the table, filtering,
 validation, and value-autocomplete all share one source of truth.
 
 ```rust
-// src/settings.rs (new)
+// src/set.rs (new)
 pub enum SettingKey {
     DefaultModel,        // provider:model
     SecurityMode,        // yolo | confirm
@@ -143,9 +143,9 @@ let mut edit_prev_input: String = String::new(); // exact buffer (incl. filter) 
 let mut last_kind: u8 = 0; // 0=None,1=Cmd,2=Model,3=Thinking,4=Help,5=Settings
 ```
 
-### List mode (`/settings <filter>`, `edit_setting == None`)
+### List mode (`/set <filter>`, `edit_setting == None`)
 
-- Buffer starts with `/settings ` (or `/setting `, `/s `). `kind = 5`.
+- Buffer starts with `/set ` (or `/setting `, `/s `). `kind = 5`.
 - `cur_word = "settings"`, `cur_filter = <text after the command word>`.
 - Build rows via `SettingsStore::overlay_rows(cur_filter)` → a `Table` with
   headers `["Setting", "Value", "Description"]` (reuse `table.rs`; give
@@ -154,12 +154,12 @@ let mut last_kind: u8 = 0; // 0=None,1=Cmd,2=Model,3=Thinking,4=Help,5=Settings
   stay readable). Each row shows `name | current_value | description`.
 - Navigation identical to `/model`: `Up`/`Down`/`PgUp`/`PgDn` move `sel`;
   `Tab`/`Enter` **select** the highlighted setting (do **not** bubble up).
-- `Esc` returns the buffer to `/settings` (mirrors `/model` Esc → `/model`).
+- `Esc` returns the buffer to `/set` (mirrors `/model` Esc → `/model`).
 
 ### Edit mode (after selecting a setting, `edit_setting == Some(key)`)
 
 - On selection: capture `edit_prev_input = editor.text()` (**exact**, e.g.
-  `/settings app`), then `editor.set(store.value(key))` so the input box holds
+  `/set app`), then `editor.set(store.value(key))` so the input box holds
   the current value (`anthropic:claude-3-5-sonnet-20241022`, `yolo`, `50`,
   `architect`, `off`), and set `edit_setting = Some(key)`. `kind` becomes `0`
   (no overlay) naturally because the buffer no longer starts with `/`, so the
@@ -169,7 +169,7 @@ let mut last_kind: u8 = 0; // 0=None,1=Cmd,2=Model,3=Thinking,4=Help,5=Settings
   §A.6) can surface candidates to pick from — Phase 1 may ship free-edit only.
 - `Enter` (no Shift): call `store.set_value(key, editor.text())`:
   - **Ok** → value persisted to file; restore `editor.set(&edit_prev_input)`,
-    `edit_setting = None`; the loop re-renders the **list** from `/settings app`
+    `edit_setting = None`; the loop re-renders the **list** from `/set app`
     with the **updated value** shown. (Stays in `read_input` — no `InputAction`
     returned.)
   - **Err(msg)** → do **not** save, do **not** restore; show `msg` as a one-line
@@ -220,7 +220,7 @@ break, no YAML fallback — experimental personal fork). The five settings are
 added as `#[serde(default)]` fields on `Config`, so they live in the **same**
 `picocode.toml` as `recipes`/`agent_prompt`/`tool_config` (can be split into a
 separate file later). This is the cleanest resolution of the earlier Q1: TOML +
-`toml_edit` preserves user comments + recipes on every `/settings` write, which
+`toml_edit` preserves user comments + recipes on every `/set` write, which
 YAML (no round-trip comment-preserving library in Rust) cannot do.
 
 **Reading.** `Config::load` reads `picocode.toml` (single default name; the
@@ -241,7 +241,7 @@ structure). Instead it:
 3. Re-emits with `doc.to_string()` — every other key (incl. `[recipes.*]` and
    their comments) is preserved byte-for-byte.
 
-This keeps recipe editing and `/settings` writes in one file with zero comment
+This keeps recipe editing and `/set` writes in one file with zero comment
 loss.
 
 **Precedence (effective value resolved in `main.rs`):**
@@ -266,7 +266,7 @@ the hook point so this is a localized addition later.
 ## A.7 Live application (Phase 2) — re-evaluated 2026-07-17
 
 Phase 1 persists to the file only. Phase 2 makes a change also affect the
-**running session**. The recent `/settings` commit flow (string-hierarchy,
+**running session**. The recent `/set` commit flow (string-hierarchy,
 `emit_commit` stays in the `read_input` loop instead of returning an
 `InputAction`) *confirms* the original design choice: save happens in
 `read_input`, and the agent rebuild is deferred to `run_interactive` via a
@@ -298,7 +298,7 @@ Refinements from the recent work:
   new_cfg; dirty = false; }, Err(e) => { output.display_text(&format!("Cannot
   apply settings: {}", e)); /* keep `dirty` so the next Submit retries */ }
   }`. This mirrors the existing `SetModel`/`SetThinking` handlers exactly.
-- **Immediate feedback without a rebuild.** The `/settings` *list* re-renders
+- **Immediate feedback without a rebuild.** The `/set` *list* re-renders
   with the new value the instant `set_value` succeeds (it updates the
   `SettingsStore` in memory). The `/model` overlay's active marker and the
   status line pick up the new model only after the deferred rebuild (next
@@ -321,15 +321,15 @@ Refinements from the recent work:
 ## A.8 `slash.rs` + help wiring
 
 - Add `SlashKind::Settings` and a registry entry
-  `SlashCommand { name: "/settings", help: "View and edit settings (model, security, limits, persona, thinking)", kind: Settings }`.
+  `SlashCommand { name: "/set", help: "View and edit settings (model, security, limits, persona, thinking)", kind: Settings }`.
 - In `read_input`'s command dispatch, add a branch for
   `"settings" | "setting" | "s"` (parallel to `"model" | "models" | "m"`),
   setting `kind = 5`.
 - `Tab` completion from the `/` list: when the highlighted command is
-  `Settings`, `editor.set("/settings ")`.
+  `Settings`, `editor.set("/set ")`.
 - `render_help` and the startup hint currently reference `/menu` (a known TODO,
-  see `phase_1_plan.md` §3.7). Update them to mention `/settings` (or alias
-  `/menu` → `/settings`).
+  see `phase_1_plan.md` §3.7). Update them to mention `/set` (or alias
+  `/menu` → `/set`).
 
 ---
 
@@ -339,11 +339,11 @@ Refinements from the recent work:
 
 | File | Change |
 |---|---|
-| `src/settings.rs` | **New.** `SettingKey`, `ValueKind`, `SettingMeta`, `SETTINGS` registry, `SettingsStore` (`load`/`save`/`value`/`set_value`/`overlay_rows`), parse + validate per key. Re-export from `lib.rs`. |
+| `src/set.rs` | **New.** `SettingKey`, `ValueKind`, `SettingMeta`, `SETTINGS` registry, `SettingsStore` (`load`/`save`/`value`/`set_value`/`overlay_rows`), parse + validate per key. Re-export from `lib.rs`. |
 | `Cargo.toml` | Drop `serde_yaml`; add `toml_edit = { version = "0.25", features = ["serde"] }`. |
 | `src/config.rs` | **YAML→TOML hard switch.** `Config::load` reads `picocode.toml` (single default; `--config` override unchanged). Add `#[serde(default)]` fields `default_model`, `security_mode`, `tool_call_limit`, `default_persona`, `default_thinking_level`. No `Config::save` (settings writes go through `SettingsStore`/`toml_edit`). |
-| `src/slash.rs` | Add `SlashKind::Settings`; registry entry `/settings`; `filter_commands`/completion already picks it up; update `parse_slash` not required (handled inline in `repl.rs`). Bump registry count test (currently `4`). |
-| `src/repl.rs` | `read_input` already takes `&mut SettingsStore` (Phase 1). For Phase 2 live-apply, add `dirty: &mut bool` and set it on a successful `/settings` `set_value`. Add `kind = 5` branch, `edit_setting`/`edit_prev_input` locals, the edit-mode key guard, and `settings_overlay_entries` pure helper. Update `render_help`/hint references. |
+| `src/slash.rs` | Add `SlashKind::Settings`; registry entry `/set`; `filter_commands`/completion already picks it up; update `parse_slash` not required (handled inline in `repl.rs`). Bump registry count test (currently `4`). |
+| `src/repl.rs` | `read_input` already takes `&mut SettingsStore` (Phase 1). For Phase 2 live-apply, add `dirty: &mut bool` and set it on a successful `/set` `set_value`. Add `kind = 5` branch, `edit_setting`/`edit_prev_input` locals, the edit-mode key guard, and `settings_overlay_entries` pure helper. Update `render_help`/hint references. |
 | `src/agent.rs` | `run_interactive`: build `SettingsStore` from `Config`; pass `&mut` into `read_input`; add `dirty` flag; on `Submit`, rebuild agent if dirty (Phase 2). |
 | `src/main.rs` | Switch config load to `picocode.toml`; resolve setting precedence (CLI > file > built-in) for the 5 settings; update help strings ("picocode.yaml" → "picocode.toml"); pass `Config` into `run_interactive`. |
 | `src/lib.rs` | `pub mod settings;`, re-export `SettingsStore`, `SettingKey`. Replace `PicocodeError::Yaml` with `Toml(String)` (mapped from `toml_edit`/`toml` parse errors). |
@@ -379,12 +379,12 @@ Refinements from the recent work:
       via `Default`. (No `Config::save` — writes flow through `SettingsStore`.)
 
 ### Stage 3 — `slash.rs` + `repl.rs` overlay (Phase 1: persist only)
-- [ ] `slash.rs`: `SlashKind::Settings` + `/settings` registry entry; update
+- [ ] `slash.rs`: `SlashKind::Settings` + `/set` registry entry; update
       count assertions (`registry().len() == 5`, `empty_query_returns_all == 5`).
 - [ ] `repl.rs::read_input`: add `&mut SettingsStore` param; `kind = 5` branch
       building the `Setting|Value|Description` `Table` from
       `settings_overlay_entries`; `Up/Down/PgUp/PgDn`/`Tab`/`Enter` select;
-      `Esc` → `/settings`.
+      `Esc` → `/set`.
 - [ ] New locals `edit_setting`/`edit_prev_input`; edit-mode key guard
       (commit `set_value`; on Ok restore `edit_prev_input` + re-render list; on
       Err show inline error; `Esc` cancels). Pure helper
@@ -392,7 +392,7 @@ Refinements from the recent work:
       `model_overlay_entries`) for unit testing.
 - [ ] `run_interactive`: construct `SettingsStore`, pass `&mut`; save happens
       inside `read_input` (no `InputAction` needed for Phase 1).
-- [ ] Update `render_help` + startup hint to mention `/settings`.
+- [ ] Update `render_help` + startup hint to mention `/set`.
 - [ ] **Unit tests** (`repl.rs`): `settings_overlay_entries` returns 5 rows,
       filters by key, includes current values; the select→edit→commit→restore
       transition can be exercised via a small pure `SettingsOverlayState` helper
@@ -408,7 +408,7 @@ Refinements from the recent work:
 ### Stage 5 — Phase 2 live-apply (refined 2026-07-17) — DONE
 - [x] `run_interactive`: add `let mut dirty = false;`; pass `&mut dirty` into
       `read_input` (alongside the existing `&mut SettingsStore`).
-- [x] `read_input` signature: add `dirty: &mut bool`. In the `/settings` value
+- [x] `read_input` signature: add `dirty: &mut bool`. In the `/set` value
       commit `Ok` branch, after `settings.set_value(...)` succeeds, set
       `*dirty = true`. No `AgentConfig` mutation here.
 - [x] Add `apply_settings_to_config(cfg, settings)` (inverse of
@@ -419,17 +419,17 @@ Refinements from the recent work:
       failure handling (display error, keep `dirty` to retry), on `Ok` update
       `agent` + `config` and clear `dirty`.
 - [x] **Test:** `settings_change_triggers_deferred_rebuild` (pty) drives a
-      `/settings` change, asserts the committed line + the deferred rebuild
+      `/set` change, asserts the committed line + the deferred rebuild
       attempt at the next `Submit` (`Unsupported provider` error) + file
       persistence. Unit test covers the five mappings.
 
 **Confirmed decisions (2026-07-17):**
 - The startup status line is *not* refreshed after live-apply; it stays as
   printed once at startup (screen-space efficiency; expose settings via a
-  future slash command instead). The `/settings` *list* re-renders with the
+  future slash command instead). The `/set` *list* re-renders with the
   new value immediately (it reads the in-memory `SettingsStore`).
 - `/model` (session switch) intentionally does **not** persist to
-  `default_model` — they are separate on purpose. `/settings default_model`
+  `default_model` — they are separate on purpose. `/set default_model`
   is the only path that writes the session default to `picocode.toml`.
 
 ### Stage 6 — Integration (pty) test
@@ -441,7 +441,7 @@ Refinements from the recent work:
 
 ```toml
 # picocode.toml (additions; all optional, defaulted)
-# Managed by the /settings menu — safe to edit by hand.
+# Managed by the /set menu — safe to edit by hand.
 default_model = "anthropic:claude-3-5-sonnet-20241022"
 security_mode = "confirm"          # yolo | confirm
 tool_call_limit = 50
@@ -469,8 +469,8 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   CLI > file > built-in (§A.5). **RESOLVED (2026-07-17):** `/model` (session
   switch) intentionally does **not** persist to `default_model` — they are
   separate on purpose (frequent session switch vs. durable default). Only
-  `/settings default_model` writes the session default to `picocode.toml`.
-  Live-apply of `/settings default_model` still updates the running session
+  `/set default_model` writes the session default to `picocode.toml`.
+  Live-apply of `/set default_model` still updates the running session
   (Stage 5).
 - **Q4 — Security-mode vocabulary.** Using `yolo`/`confirm` (with `ask`/`safe`
   aliases normalized to `confirm`). Confirm canonical strings with user; they map
@@ -502,7 +502,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   `picocode.toml`; writes via `toml_edit` preserve comments + recipes. Dropped
   `serde_yaml`; added `toml_edit` (serde feature). `PicocodeError::Yaml` →
   `Toml(String)`. Q1 resolved. Updated §A.5, §B.1, §B.2 (Stage 2), §B.3, §B.4.
-- **2026-07-17** — *Phase 1 implemented.* New `src/settings.rs` (`SettingKey`,
+- **2026-07-17** — *Phase 1 implemented.* New `src/set.rs` (`SettingKey`,
   `ValueKind`, `SettingMeta`, `SETTINGS`, `SettingsStore` with `load`/`save`/
   `value`/`validate`/`set_value`/`overlay_rows`); `slash.rs` gains
   `SlashKind::Settings`; `repl.rs::read_input` gains a `kind = 5` list branch +
@@ -518,7 +518,7 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
 
 ## P2.1 Goal
 
-Replace the `/settings` *two-state* overlay (`list` ⇄ free-text `edit`,
+Replace the `/set` *two-state* overlay (`list` ⇄ free-text `edit`,
 threaded via `edit_setting`/`edit_prev_input`/`edit_error`) with a
 **single, string-driven hierarchy** that mirrors how `/model`, `/thinking`
 and the command palette already work: the input line *is* the navigation
@@ -528,10 +528,10 @@ set a hard rule for Tab vs Enter.
 ## P2.2 Input-string hierarchy
 
 ```
-/settings                     -> list mode  (all settings)
-/settings def                -> list mode  (fuzzy-filtered by token)
-/settings default_model       -> list mode  (row selected; Enter drills in)
-/settings default_model x:y   -> value mode for `default_model`, query "x:y"
+/set                     -> list mode  (all settings)
+/set def                -> list mode  (fuzzy-filtered by token)
+/set default_model       -> list mode  (row selected; Enter drills in)
+/set default_model x:y   -> value mode for `default_model`, query "x:y"
 ```
 
 Parsed from `editor.text()` every iteration (no extra state):
@@ -547,10 +547,10 @@ Parsed from `editor.text()` every iteration (no extra state):
   **Never commits a lasting change** (no save / no quit / no drill-in).
   No-op when the candidate list is empty (safe).
 - **Enter = activate.** Do the primary action on the highlighted item:
-  - list mode → drill in: `editor.set("/settings {exact_name} ")`
+  - list mode → drill in: `editor.set("/set {exact_name} ")`
     (namespace completion appends a space; leaf values do **not**).
   - value mode → `set_value(key, candidates[sel].value | value_query)`
-    then **revert to top `/settings`** on success.
+    then **revert to top `/set`** on success.
   - `/model` → `InputAction::SetModel`; `/thinking` → `SetThinking`;
     `/quit` → `Quit`. All lasting changes go through Enter only.
 
@@ -560,8 +560,8 @@ of one generic `complete_token` that each mode feeds its candidate *names*.
 
 ## P2.4 Esc = pop one level
 
-`Esc` removes the last token (walks up the tree): `/settings default_model x:y`
-⇒ `/settings default_model` (list) ⇒ `/settings` (top list) ⇒ closes the
+`Esc` removes the last token (walks up the tree): `/set default_model x:y`
+⇒ `/set default_model` (list) ⇒ `/set` (top list) ⇒ closes the
 overlay. This replaces the old `edit_setting` Esc = full-cancel, and is
 consistent with the string hierarchy (backspace walks up too).
 
@@ -587,7 +587,7 @@ keystroke that edits the value token. List mode shows no error.
 ## P2.7 Scope
 
 **Uniform now (scope A).** Build the generic `complete_token` and wire it
-for `/settings` *and* `/model` / `/thinking` / commands in the same pass;
+for `/set` *and* `/model` / `/thinking` / commands in the same pass;
 this deletes the ad-hoc Tab code and prevents further inconsistent menus.
 
 ## P2.8 Net code change vs Phase 1
@@ -602,29 +602,29 @@ this deletes the ad-hoc Tab code and prevents further inconsistent menus.
   `model_overlay_entries` wholesale. Low risk; fewer lines than Phase 1's
   edit plumbing.
 
-- **2026-07-17** — *Phase 2 design locked.* Replaces the `/settings`
+- **2026-07-17** — *Phase 2 design locked.* Replaces the `/set`
   `list ⇄ edit` two-state overlay with a **string hierarchy**
-  (`/settings [key] [value]`); state lives in the input line, so
+  (`/set [key] [value]`); state lives in the input line, so
   `edit_setting`/`edit_prev_input` are removed. **Uniform rule:** Tab =
   expand current token to the highlighted full match (never commits); Enter
   = activate/commit (lasting changes — save, quit — only via Enter).
-  **Value mode opens only when the first `/settings` token *exactly* matches a
+  **Value mode opens only when the first `/set` token *exactly* matches a
   setting name** (case-insensitive); partial prefixes (e.g. `d`, `def`, `sec`)
   stay in the list until typed out or Tab-completed to the full name. This
-  avoids `/settings d` jumping straight into `default_model` while other
+  avoids `/set d` jumping straight into `default_model` while other
   `d`-prefixed settings exist.
-  `complete_token` is generic across `/settings`, `/model`, `/thinking`,
+  `complete_token` is generic across `/set`, `/model`, `/thinking`,
   commands; retires the ad-hoc Tab handlers. `Esc` = pop one token.
-  Successful set reverts to top `/settings`. Value errors render as a red
+  Successful set reverts to top `/set`. Value errors render as a red
   header line above the regular value overlay. Candidate source
   `setting_value_candidates(key, ctx)` reuses `model_overlay_entries` for
   `Model`. **Implemented & green:** pure fns `parse_settings` /
   `resolve_setting_key` / `replace_last_token` + assoc
   `setting_value_candidates(key, ctx)`; the `kind == 5` build block
   branches list vs value mode; uniform `Tab` handler (generic
-  `complete_token` behaviour wired for `/settings`, `/model`,
+  `complete_token` behaviour wired for `/set`, `/model`,
   `/thinking`, commands) replaces the ad-hoc handlers; `Enter` commits
-  (value mode → `set_value` then revert to top `/settings`); `Esc` pops
+  (value mode → `set_value` then revert to top `/set`); `Esc` pops
   one token; value errors render as a red header line above the
   regular value overlay. Unit tests for the parsers + a pty
   integration test (`settings_string_hierarchy_saves_and_errors`)
@@ -633,7 +633,7 @@ this deletes the ad-hoc Tab code and prevents further inconsistent menus.
   live-apply to the running session remains — see Phase 1 note.)
 
   **UI refinements (post-implementation nits, all green):**
-  - A bare `/settings` (or `/model`, `/thinking`) with *no* trailing space
+  - A bare `/set` (or `/model`, `/thinking`) with *no* trailing space
     now opens its menu — the command dispatch opens a menu when the bare
     token exactly matches a command word (`matches!` on `after`).
   - The `default_model` value candidates (`model_candidate` pure helper)
@@ -650,12 +650,12 @@ this deletes the ad-hoc Tab code and prevents further inconsistent menus.
     confirmation line (the `/thinking <level>` input is self-documenting);
     the live-apply still happens in `agent.rs::run_interactive`.
   - **Generic `emit_commit` helper (unified commit):** all three commits
-    (`/model`, `/thinking`, `/settings <key> <value>`) now go through
+    (`/model`, `/thinking`, `/set <key> <value>`) now go through
     `Repl::emit_commit`, which clears the input, `display_plain`s the
     committed-invocation line, syncs `input_row`, and pre-fills the next
-    input (`""` for leaf commands; `"/settings"` for the `/settings` value
+    input (`""` for leaf commands; `"/set"` for the `/set` value
     commit that reverts to the list). The separator below the emitted line is
-    drawn *conditionally* via a `sep` flag: `/settings` value commits stay in
+    drawn *conditionally* via a `sep` flag: `/set` value commits stay in
     the `read_input` loop (revert to the list, never return to `agent.rs`), so
     `emit_commit` draws the separator itself (`sep = true`); `/model` and
     `/thinking` *return* an `InputAction`, so `agent.rs` already draws a
@@ -675,7 +675,7 @@ this deletes the ad-hoc Tab code and prevents further inconsistent menus.
     so the qualified form is `openrouter:tencent/hy3:free` — **not**
     `openrouter:hy3:free`. Added `ModelEntry::qualified_parts()`/
     `qualified()` (model_catalog.rs) and routed both `model_candidate` (the
-    `/settings default_model` picker) and the `/model` Enter handler through
+    `/set default_model` picker) and the `/model` Enter handler through
     it, plus the `/model` list's Model column and its fuzzy filter text. A
     regression test locks the nested form. Previously the id was split on the
     first `/` and the namespace was dropped.
@@ -688,7 +688,7 @@ this deletes the ad-hoc Tab code and prevents further inconsistent menus.
     `agent.rs::SetModel` success confirmation line is removed (mirroring the
     already-clean `SetThinking` path). The emitted input line is the sole
     record of the change.
-  - **Enter on a highlighted `/settings` value candidate no longer errors:**
+  - **Enter on a highlighted `/set` value candidate no longer errors:**
     pressing Enter with an empty value editor saved the empty string →
     `expected provider:model` validation error. Enter now saves the
     highlighted candidate's value when the editor is empty (mirrors Tab); a

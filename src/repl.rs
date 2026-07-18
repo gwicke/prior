@@ -418,8 +418,8 @@ impl Repl {
                     (w, r)
                 } else if matches!(
                     after,
-                    "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "settings"
-                        | "setting" | "s"
+                    "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
+                        | "s"
                 ) {
                     (after, "")
                 } else {
@@ -480,9 +480,9 @@ impl Repl {
                                 opts.push("(no matches)".into());
                             }
                         }
-                        "settings" | "setting" | "s" => {
+                        "set" | "s" => {
                             kind = 5;
-                            cur_word = "settings".into();
+                            cur_word = "set".into();
                             cur_filter = rest.trim().to_string();
                             let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
                             if is_value {
@@ -703,7 +703,7 @@ impl Repl {
                                         } else {
                                             let entries = settings.overlay_rows(&cur_filter);
                                             if let Some((meta, _)) = entries.get(sel) {
-                                                editor.set(&format!("/settings {} ", meta.name));
+                                                editor.set(&format!("/set {} ", meta.name));
                                             }
                                         }
                                     }
@@ -736,7 +736,7 @@ impl Repl {
                                                         editor.set("/thinking ");
                                                     }
                                                     slash::SlashKind::Settings => {
-                                                        editor.set("/settings ");
+                                                        editor.set("/set ");
                                                     }
                                                 }
                                             }
@@ -796,18 +796,18 @@ impl Repl {
                                                                     SETTINGS.iter().find(|m| m.key == k).map(|m| m.name)
                                                                 {
                                                                     editor.set(&format!(
-                                                                        "/settings {} {}",
+                                                                        "/set {} {}",
                                                                         name, vq_eff
                                                                     ));
                                                                 }
                                                             }
-                                                            // Echo the committed `/settings <key> <value>` line,
-                                                            // then revert one level up to the `/settings` list
+                                                            // Echo the committed `/set <key> <value>` line,
+                                                            // then revert one level up to the `/set` list
                                                             // (handled by `editor.set` below). `emit_commit` draws
                                                             // the separator, so the emitted line is framed even
                                                             // though the list's own divider sits below its input.
                                                             let line = editor.text();
-                                                            Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "/settings", true);
+                                                            Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "/set", true);
                                                         }
                                                         Err(msg) => {
                                                             value_error = Some(msg);
@@ -817,7 +817,7 @@ impl Repl {
                                             } else {
                                                 let entries = settings.overlay_rows(&cur_filter);
                                                 if let Some((meta, _)) = entries.get(sel) {
-                                                    editor.set(&format!("/settings {} ", meta.name));
+                                                    editor.set(&format!("/set {} ", meta.name));
                                                 }
                                             }
                                         }
@@ -907,17 +907,17 @@ impl Repl {
     /// Echo a committed-invocation `line` to the transcript (a record of the
     /// change), draw a separator, then begin the next input prompt pre-filled
     /// with `next_input` (empty string for a leaf command). This unifies the
-    /// `/model`, `/thinking`, and `/settings <key> <value>` commits so each
+    /// `/model`, `/thinking`, and `/set <key> <value>` commits so each
     /// leaves exactly one separator directly below the emitted line — the next
     /// prompt's own divider (drawn below its input) no longer has to do that
-    /// job, which previously left `/settings` value commits looking
-    /// separator-less because their next prompt (`/settings` list) is visibly
+    /// job, which previously left `/set` value commits looking
+    /// separator-less because their next prompt (`/set` list) is visibly
     /// different from the emitted line. `redraw` is the live overlay closure
     /// from `read_input`; `input_row` is kept in sync so the next loop
     /// iteration redraws at the correct row.
     ///
     /// `sep` controls whether this helper draws the separator itself:
-    /// `/settings` value commits *stay in the `read_input` loop* (they revert
+    /// `/set` value commits *stay in the `read_input` loop* (they revert
     /// to the list rather than returning an action), so no other separator
     /// will follow the emitted line — pass `true`. `/model` and `/thinking`
     /// *return* an `InputAction`, so `agent.rs` draws a separator before the
@@ -942,7 +942,7 @@ impl Repl {
         editor.set(next_input);
     }
 
-    /// Render the `/model` / `/thinking` / `/settings` overlay: a panel title
+    /// Render the `/model` / `/thinking` / `/set` overlay: a panel title
     /// line plus option rows with a `> ` selection marker and (for `/model`)
     /// a green `*` on the currently-active model. Returns plain text; the
     /// caller emits it directly above the input line.
@@ -2034,10 +2034,10 @@ mod tests {
 
     #[test]
     fn replace_last_token_replaces_tail() {
-        assert_eq!(Repl::replace_last_token("/settings default_model x:y", "ABC"), "/settings default_model ABC");
+        assert_eq!(Repl::replace_last_token("/set default_model x:y", "ABC"), "/set default_model ABC");
         assert_eq!(Repl::replace_last_token("/model gpt", "gpt-4"), "/model gpt-4");
         // no space -> whole string replaced
-        assert_eq!(Repl::replace_last_token("/settings", "X"), "X");
+        assert_eq!(Repl::replace_last_token("/set", "X"), "X");
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub fn registry() -> &'static [SlashCommand] {
             kind: SlashKind::Model,
         },
         SlashCommand {
-            name: "/settings",
+            name: "/set",
             help: "View and edit settings (model, security, limits, persona, thinking)",
             kind: SlashKind::Settings,
         },
@@ -133,7 +133,7 @@ mod tests {
     fn lookup_by_name() {
         let m = registry().iter().find(|c| c.name == "/model").unwrap();
         assert_eq!(m.kind, SlashKind::Model);
-        let s = registry().iter().find(|c| c.name == "/settings").unwrap();
+        let s = registry().iter().find(|c| c.name == "/set").unwrap();
         assert_eq!(s.kind, SlashKind::Settings);
     }
 
