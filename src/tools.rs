@@ -188,15 +188,28 @@ pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
     let timeout = cfg.timeout_secs.or(Some(60));
 
-    // Constrained ripgrep: pattern as a discrete argv element via `-e`, hidden
-    // files included, with hard resource caps. `shell_quote` keeps regex
-    // metacharacters and quotes from being interpreted by the inner shell.
-    let cmd = format!(
-        "rg --line-number --no-heading --no-column --color never --hidden --max-depth 25 --max-filesize 5M --max-count 500 -e {} {}",
-        shell_quote(&pat),
-        shell_quote(&path)
-    );
-    let raw = run_sandboxed_ro(&cmd, &cfg, timeout).await?;
+    // Constrained ripgrep, passed as a discrete argv list (no shell, no string
+    // construction). The pattern and path are argv elements, so regex
+    // metacharacters and shell metacharacters are never interpreted by a shell.
+    let argv: Vec<String> = vec![
+        "rg".into(),
+        "--line-number".into(),
+        "--with-filename".into(),
+        "--no-column".into(),
+        "--color".into(),
+        "never".into(),
+        "--hidden".into(),
+        "--max-depth".into(),
+        "25".into(),
+        "--max-filesize".into(),
+        "5M".into(),
+        "--max-count".into(),
+        "500".into(),
+        "-e".into(),
+        pat,
+        path,
+    ];
+    let raw = run_sandboxed_ro(&argv, &cfg, timeout).await?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         Ok("none".into())
@@ -401,30 +414,35 @@ pub(crate) async fn run_sandboxed(
     Ok(trim_output(output))
 }
 
-/// Run a command inside a **read-only** Bubblewrap namespace. Used by
-/// read-only tools such as grep: unlike [`run_sandboxed`] it never degrades to
-/// unsandboxed (ripgrep is always confined — `bwrap` is required at startup),
-/// and every user binding is mounted read-only regardless of its configured
-/// mode. Output is captured the same way (redirected to a host temp file bound
-/// into the namespace, since bwrap bypasses duct's stdout pipe).
+/// Run a program (given as an argv list) inside a **read-only** Bubblewrap
+/// namespace. Unlike [`run_sandboxed`] it never goes through a shell, so each
+/// argument is passed verbatim — no quoting or escaping, and no shell
+/// metacharacters are ever interpreted. Used by read-only tools such as grep.
+/// Every user binding is mounted read-only regardless of its configured mode,
+/// and `bwrap` is required at startup (see `check_runtime_deps`).
 pub(crate) async fn run_sandboxed_ro(
-    cmd: &str,
+    argv: &[String],
     cfg: &SandboxConfig,
     timeout: Option<u64>,
 ) -> Result<String, ToolError> {
-    let cmd = cmd.to_string();
+    let argv = argv.to_vec();
     let cfg = cfg.clone();
-    let output = tokio::task::spawn_blocking(move || {
-        let out_path = make_out_path()?;
-        let expr = build_bwrap_expr(&cmd, &cfg, &out_path, true)?;
-        let handle = expr.unchecked().start()?;
-        let result = match timeout {
+    let output = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ToolError> {
+        let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
+        let handle = expr
+            .stdout_capture()
+            .stderr_capture()
+            .unchecked()
+            .start()
+            .map_err(|e| ToolError::Io(e.to_string()))?;
+        // Capture stdout + stderr directly (bwrap forwards the child's stdio to
+        // the inherited fds). Combine them the way the shell path's `2>&1` does.
+        let captured = match timeout {
             None => handle
                 .wait()
-                .map(|_| ())
                 .map_err(|e| ToolError::Io(e.to_string())),
             Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
-                Ok(Some(_)) => Ok(()),
+                Ok(Some(o)) => Ok(o),
                 Ok(None) => {
                     let _ = handle.kill();
                     Err(ToolError::Generic(format!(
@@ -433,10 +451,13 @@ pub(crate) async fn run_sandboxed_ro(
                 }
                 Err(e) => Err(ToolError::Io(e.to_string())),
             },
-        };
-        let captured = std::fs::read(&out_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&out_path);
-        result.map(|_| captured)
+        }?;
+        let mut v = captured.stdout.clone();
+        if !captured.stderr.is_empty() {
+            v.push(b'\n');
+            v.extend_from_slice(&captured.stderr);
+        }
+        Ok(v)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -470,27 +491,6 @@ fn trim_output(out: Vec<u8>) -> String {
     }
 }
 
-/// Single-quote a string for safe inclusion in a shell command. The only
-/// shell metacharacter not already inert inside single quotes is the single
-/// quote itself; we escape it as `'''` (close, escaped quote, reopen). Combined
-/// with the Debug-quoting `build_bwrap_expr` applies to the whole payload, this
-/// makes injected patterns/paths inert.
-fn shell_quote(s: &str) -> String {
-    let mut out = String::from('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push('\'');
-            out.push('\\');
-            out.push('\'');
-            out.push('\'');
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Cap output to the first `n` lines (token economy for large greps).
 fn cap_lines(s: &str, n: usize) -> String {
     s.lines().take(n).collect::<Vec<_>>().join("\n")
@@ -501,22 +501,15 @@ fn cap_lines(s: &str, n: usize) -> String {
 /// from writes; only explicitly declared bindings add writable/project paths.
 const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
 
-/// Build a `duct` expression that runs `cmd` inside a bwrap namespace.
-///
-/// `out_path` is a host temp file that the sandboxed command's combined output
-/// is redirected into (see note below). It is bound read-write into the
-/// namespace at `/tmp/.picocode-out`.
-///
-/// NOTE: bwrap connects the inner command's stdio to its own inherited fds,
-/// which bypasses duct's capture pipe (duct reads an empty stdout). To get
-/// reliable output we redirect the command to a host temp file bound into the
-/// namespace and read that file after the process exits.
-fn build_bwrap_expr(
-    cmd: &str,
+/// Build the common bwrap argument vector shared by both execution paths:
+/// the read-only system dirs, the CWD/bindings, the scratch tmpfs, network/PID/
+/// capability isolation, and the sanitized environment. Callers append either
+/// the `sh -c` payload (shell path) or the program argv (direct path) after
+/// `--`.
+fn build_bwrap_args(
     cfg: &SandboxConfig,
-    out_path: &std::path::Path,
     read_only: bool,
-) -> Result<duct::Expression, ToolError> {
+) -> Result<Vec<String>, ToolError> {
     let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
     let home = dirs_home();
 
@@ -584,13 +577,6 @@ fn build_bwrap_expr(
         args.push("/tmp".into());
     }
 
-    // Bind the host temp output file into the namespace (read-write) AFTER user
-    // binds, so it is never shadowed by a user /tmp bind. The command redirects
-    // its output here and the parent reads it back after the process exits.
-    args.push("--bind".into());
-    args.push(out_path.to_string_lossy().to_string());
-    args.push("/tmp/.picocode-out".into());
-
     if !cfg.network.unwrap_or(false) {
         args.push("--unshare-net".into());
     }
@@ -620,10 +606,33 @@ fn build_bwrap_expr(
         args.push(value.clone());
     }
 
+    Ok(args)
+}
+
+/// Build a `duct` expression that runs `cmd` inside a bwrap namespace, with its
+/// combined output redirected into the bound host temp file `out_path` (the
+/// shell path). Used by the bash tool.
+///
+/// NOTE: the shell payload explicitly redirects its output to `/tmp/.picocode-out`
+/// (which is bound from `out_path`) rather than relying on the inherited fd, so
+/// the parent reads it back from `out_path` after the process exits.
+fn build_bwrap_expr(
+    cmd: &str,
+    cfg: &SandboxConfig,
+    out_path: &std::path::Path,
+    read_only: bool,
+) -> Result<duct::Expression, ToolError> {
+    let mut args = build_bwrap_args(cfg, read_only)?;
+
+    // Bind the host temp output file into the namespace (read-write) AFTER user
+    // binds, so it is never shadowed by a user /tmp bind.
+    args.push("--bind".into());
+    args.push(out_path.to_string_lossy().to_string());
+    args.push("/tmp/.picocode-out".into());
+
     // Build the in-namespace payload. Memory limit via RLIMIT_AS (ulimit -v),
-    // scoped to the command's process tree by the PID namespace. The command's
-    // combined output is redirected to the bound host temp file (see note on
-    // bwrap stdio above).
+    // scoped to the command's process tree by the PID namespace. Combined
+    // output is redirected to the bound host temp file.
     let inner = if let Some(mb) = cfg.memory_mb {
         let kb = mb * 1024;
         format!("ulimit -v {kb}; exec sh -c {cmd:?}")
@@ -636,6 +645,24 @@ fn build_bwrap_expr(
     args.push("-c".into());
     args.push(payload);
 
+    Ok(duct::cmd("bwrap", &args))
+}
+
+/// Build a `duct` expression that runs a program with an explicit argv list
+/// inside a bwrap namespace, with NO shell in between. Each argument is passed
+/// verbatim to the program, so regex patterns and paths need no quoting or
+/// escaping and shell metacharacters are never interpreted. Output is captured
+/// directly by duct (bwrap forwards the child's stdio to its inherited fds).
+fn build_bwrap_expr_argv(
+    argv: &[String],
+    cfg: &SandboxConfig,
+    read_only: bool,
+) -> Result<duct::Expression, ToolError> {
+    let mut args = build_bwrap_args(cfg, read_only)?;
+    args.push("--".into());
+    for a in argv {
+        args.push(a.clone());
+    }
     Ok(duct::cmd("bwrap", &args))
 }
 
@@ -1220,5 +1247,28 @@ mod sandbox_tests {
         assert!(out.contains("HOME=[]"), "host HOME not wiped: {out}");
         std::env::remove_var("PICOCODE_WIPE_TEST");
     }
-}
 
+    #[tokio::test]
+    #[serial]
+    async fn grep_text_uses_ripgrep_and_sandboxes() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Reset sandbox state so grep uses the default (CWD-visible, read-only)
+        // namespace and the search root resolves against cwd bounds.
+        set_sandbox(None);
+        // No sandbox bindings: ripgrep runs confined over the current working
+        // dir (ro-mounted by bwrap). Search a real source file for a known token.
+        let out = grep_text("fn main".to_string(), "src/main.rs".to_string())
+            .await
+            .unwrap();
+        assert!(
+            out.contains("src/main.rs"),
+            "expected path in output, got: {out}"
+        );
+        assert!(
+            out.contains("fn main"),
+            "expected match in output, got: {out}"
+        );
+    }
+}
