@@ -453,6 +453,41 @@ works — they wire in like the non-OAuth providers). Two tiers:
   refresh. Set `allow_device_flow(false)` for non-interactive/CI use so it errors
   instead of hanging on a device code.
 
+  #### Token storage (`token_dir`)
+  - rig persists credentials in its **own file**, not picocode's settings:
+    chatgpt → `<config_dir>/chatgpt/auth.json`
+    (`chatgpt/mod.rs:607`); copilot → `<config_dir>/github_copilot/`
+    (`access-token` + `api-key.json`, `copilot/mod.rs:1643`). `config_dir` =
+    `$XDG_CONFIG_HOME` / `$HOME/.config` (or `%APPDATA%`). Overridable via
+    `token_dir(dir)` / `auth_file(path)`.
+  - The record is a full OAuth cache (`access_token`, `refresh_token`,
+    `id_token`, `expires_at`, `account_id`, pretty JSON). The **refresh token
+    persists and auto-renews** — `auth_context_oauth` (`auth/native.rs`) reads
+    the cache, uses a valid access token, else refreshes it (rewriting the
+    cache), else (no cache / refresh failed) runs the device flow and writes the
+    new record. The browser step happens **once**; later runs just refresh.
+  - **Don't merge into the settings file.** Settings are non-secret config
+    (provider/model/persona); the refresh token is a secret. Point `token_dir`
+    at a picocode-owned credentials dir (e.g. `~/.config/picocode/credentials/
+    <provider>`) so tokens co-locate and the dir can be private + gitignored.
+  - **Permission caveat:** rig writes the file with default perms
+    (`ensure_parent_dir` only `create_dir_all`; no `0o600` chmod in
+    `auth/native.rs`), so the token file is typically world/group-readable.
+    Mitigate by creating the parent `token_dir` with `0o700`. Upstream fix: set
+    `0o600` on write.
+
+  #### "Login on startup" = the `from_env()` fallback (no extra logic)
+  - Simplest correct design: **drop the hard `check_env!`** for chatgpt/copilot
+    and let `from_env()` decide — token env var present → used directly (Tier 1,
+    no file, no browser); absent → device OAuth (Tier 2). The flow is **lazy**
+    (first `create_agent`/request), so there is no separate login step. Tier 1
+    token presence *avoids* OAuth; its absence makes OAuth run automatically on
+    first use and cache the token. Sufficient on its own.
+  - **Interactivity gating:** the device flow needs a TTY/user. In
+    non-interactive/CI (`--quiet`, piped stdin) set `allow_device_flow(false)`
+    so it errors cleanly ("sign-in required") instead of hanging. picocode
+    already tracks interactive vs `--quiet`.
+
 **Status:** Tier 1 implemented. Tier 2 (interactive device-code OAuth) is
   deferred unless passwordless `picocode login` is wanted.
 
