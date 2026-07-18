@@ -522,7 +522,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     model: config.model.clone(),
                     recent: recent_models.clone(),
                 };
-                r.read_input(&prompt_str, &mut line_history, &ctx, settings, config.output.cursor_row())
+                r.read_input(&prompt_str, &mut line_history, &ctx, settings, config.output.cursor_row(), config.output.as_ref())
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };
@@ -541,10 +541,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         agent = Some(new_agent);
                         config = new_cfg;
                         recent_models.push(format!("{}/{}", config.provider, config.model));
-                        config.output.display_plain(&format!(
-                            "model -> {}/{}",
-                            config.provider, config.model
-                        ));
+                        // No confirmation line: the `/model <provider:model>` input
+                        // line (emitted by `read_input`) is the record of the change.
                     }
                     Err(e) => config
                         .output
@@ -560,11 +558,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             Ok(new_agent) => {
                                 agent = Some(new_agent);
                                 config = new_cfg;
-                                let msg = format!("thinking level -> {}", level.as_str());
-                                match repl.as_mut() {
-                                    Some(_) => config.output.display_plain(&msg),
-                                    None => config.output.display_plain(&msg),
-                                }
+                                // No confirmation line: the `/thinking <level>` input is self-documenting.
                             }
                             Err(e) => {
                                 let msg = format!("Cannot set thinking: {}", e);

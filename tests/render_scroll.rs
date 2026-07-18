@@ -301,3 +301,127 @@ fn shift_enter_inserts_newline_without_kitty() {
         visible
     );
 }
+
+/// Phase 2 integration: the `/settings` string hierarchy — the list
+/// appears, a valid value is saved (and the overlay reverts to top
+/// `/settings`), and an invalid value shows the red error header
+/// (and is NOT saved). Uses a temp config so the save side-effect
+/// never touches the repo.
+#[test]
+fn settings_string_hierarchy_saves_and_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("picocode.toml");
+    // Pre-create so `-c` resolves to an existing (empty) file; the
+    // save side-effect then lands here instead of the repo CWD.
+    std::fs::write(&cfg, "\n").expect("write temp config");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 20,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c", cfg.to_str().unwrap()]);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let (bytes, stop) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    assert!(
+        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        "REPL did not start"
+    );
+    // Answer the cursor-position DSR with a sane mid-screen row.
+    let _ = writer.write_all(b"\x1b[3;1R");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+
+    // Open the settings list.
+    for ch in "/settings ".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        wait_for(&bytes, "default_model", Duration::from_secs(3)),
+        "settings list not shown"
+    );
+    {
+        let data = bytes.lock().unwrap().clone();
+        let mut p = Parser::new(20, 100, 1000);
+        p.process(&data);
+        let vis: Vec<String> = p.screen().rows(0, 100).map(|s| s.trim().to_string()).collect();
+        assert!(vis.iter().any(|r| r.contains("security_mode")), "security_mode row missing: {:?}", vis);
+    }
+
+    // Type a valid value and press Enter -> saves + reverts to top.
+    for ch in "security_mode yolo".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(80));
+    }
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+    // Re-open the list; security_mode should now show `yolo`.
+    for ch in " ".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(150));
+    }
+    thread::sleep(Duration::from_millis(300));
+    {
+        let data = bytes.lock().unwrap().clone();
+        let mut p = Parser::new(20, 100, 1000);
+        p.process(&data);
+        let vis: Vec<String> = p.screen().rows(0, 100).map(|s| s.trim().to_string()).collect();
+        let sec = vis.iter().find(|r| r.contains("security_mode"));
+        assert!(
+            sec.map(|r| r.contains("yolo")).unwrap_or(false),
+            "security_mode value not saved as yolo: {:?}", vis
+        );
+    }
+
+    // Invalid value -> red error header, NOT saved.
+    for ch in "tool_call_limit 0".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(70));
+    }
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+    {
+        let data = bytes.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&data);
+        assert!(
+            s.contains("error: tool_call_limit must be greater than 0"),
+            "invalid value did not show red error; tail={}",
+            s.replace('\x1b', "ESC").chars().rev().take(300).collect::<String>()
+        );
+    }
+    // Nit 3: the red error is tied to value mode — Escaping back to the list
+    // must clear it (no stale error line in the current screen).
+    let _ = writer.write_all(b"\x1b");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+    {
+        let data = bytes.lock().unwrap().clone();
+        let mut p = Parser::new(20, 100, 1000);
+        p.process(&data);
+        let visible: Vec<String> = p.screen().rows(0, 100).map(|r| r.trim().to_string()).collect();
+        assert!(
+            !visible.iter().any(|r| r.contains("error:")),
+            "red error must clear when leaving value mode: {:?}", visible
+        );
+    }
+
+    drop(writer);
+    let _ = child.kill();
+    stop.store(true, Ordering::SeqCst);
+}

@@ -465,3 +465,187 @@ rest of the file. `default_persona` omitted ⇄ `None`. Full file also holds
   SettingsStore` through. `picocode.yaml.example` → `picocode.toml.example`.
   92 lib tests + 2 pty tests green; `cargo build` warning-free. Phase 2
   (live-apply) and Stage 4 (value autocomplete) remain.
+
+---
+
+# Phase 2 — string-hierarchy + uniform tab-complete (DESIGN LOCKED)
+
+## P2.1 Goal
+
+Replace the `/settings` *two-state* overlay (`list` ⇄ free-text `edit`,
+threaded via `edit_setting`/`edit_prev_input`/`edit_error`) with a
+**single, string-driven hierarchy** that mirrors how `/model`, `/thinking`
+and the command palette already work: the input line *is* the navigation
+state. Also generalize **Tab** to a uniform, all-dialogs completion and
+set a hard rule for Tab vs Enter.
+
+## P2.2 Input-string hierarchy
+
+```
+/settings                     -> list mode  (all settings)
+/settings def                -> list mode  (fuzzy-filtered by token)
+/settings default_model       -> list mode  (row selected; Enter drills in)
+/settings default_model x:y   -> value mode for `default_model`, query "x:y"
+```
+
+Parsed from `editor.text()` every iteration (no extra state):
+`parse_settings(rest) -> { setting: Option<SettingKey>, value_query: String, mode: List|Value }`.
+`parts = rest.split_whitespace()`; `len >= 2` ⇒ value mode (resolve
+`parts[0]` to a `SettingKey` via exact then fuzzy best match); else list mode.
+
+## P2.3 Tab vs Enter — the uniform rule
+
+- **Tab = expand only.** Fill the *current (last) token* with the
+  highlighted candidate (`candidates[sel]` — the best fuzzy match for what
+  is typed). Updates the input string ⇒ recomputes the overlay next render.
+  **Never commits a lasting change** (no save / no quit / no drill-in).
+  No-op when the candidate list is empty (safe).
+- **Enter = activate.** Do the primary action on the highlighted item:
+  - list mode → drill in: `editor.set("/settings {exact_name} ")`
+    (namespace completion appends a space; leaf values do **not**).
+  - value mode → `set_value(key, candidates[sel].value | value_query)`
+    then **revert to top `/settings`** on success.
+  - `/model` → `InputAction::SetModel`; `/thinking` → `SetThinking`;
+    `/quit` → `Quit`. All lasting changes go through Enter only.
+
+This retires the two ad-hoc Tab behaviors at `repl.rs` (kind==1 ⇒
+command-word replace; kind==5 ⇒ `enter_setting_edit`/drill-in) in favour
+of one generic `complete_token` that each mode feeds its candidate *names*.
+
+## P2.4 Esc = pop one level
+
+`Esc` removes the last token (walks up the tree): `/settings default_model x:y`
+⇒ `/settings default_model` (list) ⇒ `/settings` (top list) ⇒ closes the
+overlay. This replaces the old `edit_setting` Esc = full-cancel, and is
+consistent with the string hierarchy (backspace walks up too).
+
+## P2.5 Value errors → red header overlay
+
+Validation failure (`set_value` `Err`) sets a display-only `value_error:
+Option<String>`. In **value mode** the overlay prepends a **red header
+line** (same below-position, BG + red) *above* the regular candidate
+list, e.g. `error: tool_call_limit must be greater than 0`. The `focus`
+visual-line index is bumped by the header line count. Cleared on any
+keystroke that edits the value token. List mode shows no error.
+
+## P2.6 Candidate source
+
+`setting_value_candidates(key, ctx) -> Vec<Candidate { display, value }>`:
+- `Enum(values)` ⇒ the `&[..]` slice (e.g. `yolo`/`confirm`, `off`/`low`/`med`/`high`).
+- `Persona` ⇒ `persona::PERSONAS` names + a `"none"` entry (value `""`).
+- `Model` ⇒ reuse `model_overlay_entries(ctx, query)`; `value =
+  "provider:model"` derived from the `ModelEntry` (id `openrouter/tencent/hy3:free`
+  ⇒ `openrouter:tencent/hy3:free`).
+- `Int` / `FreeText` ⇒ empty (free-text box; `value_query` from the input line).
+
+## P2.7 Scope
+
+**Uniform now (scope A).** Build the generic `complete_token` and wire it
+for `/settings` *and* `/model` / `/thinking` / commands in the same pass;
+this deletes the ad-hoc Tab code and prevents further inconsistent menus.
+
+## P2.8 Net code change vs Phase 1
+
+- **Remove** `edit_setting: Option<SettingKey>`, `edit_prev_input: String`
+  (state now encoded in the input string). Keep `value_error` (display-only).
+- **Add** `parse_settings`, `setting_value_candidates`, generic
+  `complete_token`.
+- **Rework** the `kind == 5` overlay (list vs value) + Enter/Tab/Esc
+  dispatch; retire `enter_setting_edit`.
+- Reuses `fuzzy_filter`, `overlay_lines`, `Table::render_multiline`, and
+  `model_overlay_entries` wholesale. Low risk; fewer lines than Phase 1's
+  edit plumbing.
+
+- **2026-07-17** — *Phase 2 design locked.* Replaces the `/settings`
+  `list ⇄ edit` two-state overlay with a **string hierarchy**
+  (`/settings [key] [value]`); state lives in the input line, so
+  `edit_setting`/`edit_prev_input` are removed. **Uniform rule:** Tab =
+  expand current token to the highlighted full match (never commits); Enter
+  = activate/commit (lasting changes — save, quit — only via Enter).
+  **Value mode opens only when the first `/settings` token *exactly* matches a
+  setting name** (case-insensitive); partial prefixes (e.g. `d`, `def`, `sec`)
+  stay in the list until typed out or Tab-completed to the full name. This
+  avoids `/settings d` jumping straight into `default_model` while other
+  `d`-prefixed settings exist.
+  `complete_token` is generic across `/settings`, `/model`, `/thinking`,
+  commands; retires the ad-hoc Tab handlers. `Esc` = pop one token.
+  Successful set reverts to top `/settings`. Value errors render as a red
+  header line above the regular value overlay. Candidate source
+  `setting_value_candidates(key, ctx)` reuses `model_overlay_entries` for
+  `Model`. **Implemented & green:** pure fns `parse_settings` /
+  `resolve_setting_key` / `replace_last_token` + assoc
+  `setting_value_candidates(key, ctx)`; the `kind == 5` build block
+  branches list vs value mode; uniform `Tab` handler (generic
+  `complete_token` behaviour wired for `/settings`, `/model`,
+  `/thinking`, commands) replaces the ad-hoc handlers; `Enter` commits
+  (value mode → `set_value` then revert to top `/settings`); `Esc` pops
+  one token; value errors render as a red header line above the
+  regular value overlay. Unit tests for the parsers + a pty
+  integration test (`settings_string_hierarchy_saves_and_errors`)
+  cover list→save→persist and invalid→red-error (no clobber).
+  98 lib + 3 pty tests pass; build warning-free. (Phase 2 done;
+  live-apply to the running session remains — see Phase 1 note.)
+
+  **UI refinements (post-implementation nits, all green):**
+  - A bare `/settings` (or `/model`, `/thinking`) with *no* trailing space
+    now opens its menu — the command dispatch opens a menu when the bare
+    token exactly matches a command word (`matches!` on `after`).
+  - The `default_model` value candidates (`model_candidate` pure helper)
+    carry the `provider:model` form in both `value` and `display`; a
+    regression test locks this.
+  - The red validation-error header is tied to value mode: cleared at the
+    start of every key event (the Enter handler re-sets it on a fresh
+    invalid submit), so it disappears the moment the user navigates away
+    (e.g. Esc) instead of lingering in the settings list. Pty test asserts
+    the error line is gone from the live screen after Esc.
+  - `LineEditor::backspace` now always deletes from the end of the line
+    (append-only input); cursor position is ignored. Updated unit tests.
+  - `/thinking <level>` no longer prints a `thinking level -> …`
+    confirmation line (the `/thinking <level>` input is self-documenting);
+    the live-apply still happens in `agent.rs::run_interactive`.
+  - **Generic `emit_commit` helper (unified commit):** all three commits
+    (`/model`, `/thinking`, `/settings <key> <value>`) now go through
+    `Repl::emit_commit`, which clears the input, `display_plain`s the
+    committed-invocation line, syncs `input_row`, and pre-fills the next
+    input (`""` for leaf commands; `"/settings"` for the `/settings` value
+    commit that reverts to the list). The separator below the emitted line is
+    drawn *conditionally* via a `sep` flag: `/settings` value commits stay in
+    the `read_input` loop (revert to the list, never return to `agent.rs`), so
+    `emit_commit` draws the separator itself (`sep = true`); `/model` and
+    `/thinking` *return* an `InputAction`, so `agent.rs` already draws a
+    separator before the next `read_input` (its per-prompt framing at
+    `agent.rs:519`) — passing `sep = false` there avoids a doubled separator.
+    This guarantees exactly one separator *directly* below the emitted line for
+    every commit. Verified by pty: a single divider sits immediately below the
+    emitted line for all three. `/quit` also emits a trailing newline
+    (`display_plain("")`) so the shell prompt after exit starts on a fresh
+    line instead of indented under the input.
+  - `/model` list shows the `provider:model` form (verified by dump) and the
+    filter text now leads with `provider:model` (plus bare provider + slash
+    id), so typing `openrouter:deepseek` filters to that model.
+  - **Model names are fully-qualified `provider:model` (nested namespace
+    preserved):** OpenRouter entries carry `provider == "openrouter"` with an
+    `id` that is the *full* (namespaced) model path (e.g. `tencent/hy3:free`),
+    so the qualified form is `openrouter:tencent/hy3:free` — **not**
+    `openrouter:hy3:free`. Added `ModelEntry::qualified_parts()`/
+    `qualified()` (model_catalog.rs) and routed both `model_candidate` (the
+    `/settings default_model` picker) and the `/model` Enter handler through
+    it, plus the `/model` list's Model column and its fuzzy filter text. A
+    regression test locks the nested form. Previously the id was split on the
+    first `/` and the namespace was dropped.
+  - **`/model` / `/thinking` commits now emit the *selected* line (not the raw
+    editor):** previously a bare `/model` + Enter emitted the literal `/model`
+    (no model) because `editor.text()` was empty, and `agent.rs` additionally
+    printed a redundant `model -> provider/model` confirmation. Now the Enter
+    handler emits `/model <provider:model>` / `/thinking <level>` built from
+    the highlighted selection (`ModelEntry::qualified()`), and the
+    `agent.rs::SetModel` success confirmation line is removed (mirroring the
+    already-clean `SetThinking` path). The emitted input line is the sole
+    record of the change.
+  - **Enter on a highlighted `/settings` value candidate no longer errors:**
+    pressing Enter with an empty value editor saved the empty string →
+    `expected provider:model` validation error. Enter now saves the
+    highlighted candidate's value when the editor is empty (mirrors Tab); a
+    typed value is still saved as-is. The emitted line is rewritten to the
+    saved value so the record is accurate. `filtered_value_candidates` helper
+    shared by Tab + Enter.
