@@ -1,0 +1,46 @@
+# picocode.toml example
+
+# Custom agent prompt (replaces the default "Concise coding assistant" prompt)
+# agent_prompt = "You are a senior software engineer specialized in Rust and systems programming."
+# Or load from a file:
+# agent_prompt_file = "prompts/custom_agent.txt"
+
+# Tool-specific configurations
+[tool_config.bash]
+# Commands that will be automatically allowed without prompting (when yolo is false)
+auto_allow = [
+  "^ls -la",
+  "^git status",
+  "^cargo test",
+  "^npm test",
+]
+
+# Named recipes for non-interactive execution (CI/CD, automation)
+[recipes.review-security]
+prompt = "Review the codebase for security issues and vulnerabilities. Exit with a clear summary and indicate if the build should break."
+provider = "anthropic"
+model = "claude-3-5-sonnet-20241022"
+persona = "security"
+yolo = false
+# If the response matches this regex, exit with error (e.g. for CI/CD)
+# error_if = "CRITICAL|FAIL|vulnerability found"
+
+[recipes.simplify]
+prompt = "Refactor the most complex functions in the current directory to be simpler and more readable. Maintain the same behavior."
+yolo = true
+
+[recipes.fix-lints]
+prompt = "Run the project's linter and fix all reported issues."
+yolo = true
+
+[recipes.custom-review]
+prompt_file = "prompts/review.txt"
+model = "gpt-4o"
+
+# --- Managed settings (written by the /settings menu) ---
+# All optional; sensible built-in defaults are used when omitted.
+default_model = "anthropic:claude-3-5-sonnet-20241022"  # provider:model
+security_mode = "confirm"          # yolo | confirm
+tool_call_limit = 50
+default_persona = "architect"      # built-in name or file path; omit for none
+default_thinking_level = "off"     # off | low | med | high

@@ -8,6 +8,7 @@ pub enum SlashKind {
     Help,
     Thinking,
     Model,
+    Settings,
     Quit,
 }
 
@@ -36,6 +37,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/model",
             help: "Select a model (provider:name) with limits and cost",
             kind: SlashKind::Model,
+        },
+        SlashCommand {
+            name: "/settings",
+            help: "View and edit settings (model, security, limits, persona, thinking)",
+            kind: SlashKind::Settings,
         },
         SlashCommand {
             name: "/quit",
@@ -119,14 +125,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_three_commands() {
-        assert_eq!(registry().len(), 4);
+    fn registry_has_five_commands() {
+        assert_eq!(registry().len(), 5);
     }
 
     #[test]
     fn lookup_by_name() {
         let m = registry().iter().find(|c| c.name == "/model").unwrap();
         assert_eq!(m.kind, SlashKind::Model);
+        let s = registry().iter().find(|c| c.name == "/settings").unwrap();
+        assert_eq!(s.kind, SlashKind::Settings);
     }
 
     #[test]
@@ -139,7 +147,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 5);
     }
 
     #[test]

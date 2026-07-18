@@ -17,6 +17,7 @@ use crate::output::{term_width, wrap};
 use crate::model_catalog;
 use crate::slash;
 use crate::thinking;
+use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
@@ -279,6 +280,7 @@ impl Repl {
         prompt: &str,
         history: &mut History,
         ctx: &ReplCtx,
+        settings: &mut SettingsStore,
         initial_row: usize,
     ) -> Option<InputAction> {
         let mut editor = LineEditor::new();
@@ -291,6 +293,12 @@ impl Repl {
         // Enter handler can re-resolve the highlighted item without re-parsing.
         let mut cur_word = String::new();
         let mut cur_filter = String::new();
+        // /settings overlay sub-state: when `Some(key)`, the input box holds
+        // that setting's *value* for free editing; `edit_prev_input` is the
+        // exact buffer (incl. filter) to restore on commit/cancel.
+        let mut edit_setting: Option<SettingKey> = None;
+        let mut edit_prev_input = String::new();
+        let mut edit_error: Option<String> = None;
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -417,14 +425,19 @@ impl Repl {
                                         model_catalog::reason_cell(e),
                                     ]);
                                 }
-                                let rows = table.render(avail);
+                                let rows = table.render_multiline(avail);
                                 // Dim models whose provider has no API key configured.
+                                // Dim each visual line (a wrapped row carries `\n`).
                                 for (i, row) in rows.into_iter().enumerate() {
-                                    if model_catalog::provider_available(&entries[i].provider) {
-                                        opts.push(row);
+                                    let styled = if model_catalog::provider_available(&entries[i].provider) {
+                                        row
                                     } else {
-                                        opts.push(format!("\x1b[2m{}\x1b[0m", row));
-                                    }
+                                        row.lines()
+                                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    };
+                                    opts.push(styled);
                                 }
                             }
                         }
@@ -437,6 +450,29 @@ impl Repl {
                             opts = levels.iter().map(|l| l.as_str().to_string()).collect();
                             if opts.is_empty() {
                                 opts.push("(no matches)".into());
+                            }
+                        }
+                        "settings" | "setting" | "s" => {
+                            kind = 5;
+                            title = "Settings  (type to filter, up/down, Enter/Tab edit, Esc back)".into();
+                            cur_word = "settings".into();
+                            cur_filter = rest.trim().to_string();
+                            let entries = settings.overlay_rows(&cur_filter);
+                            if entries.is_empty() {
+                                opts.push("(no matching setting)".into());
+                            } else {
+                                let avail = term_width().saturating_sub(2);
+                                let mut table = Table::new(&["Setting", "Value", "Description"])
+                                    .with_aligns(&[Align::Left, Align::Left, Align::Left])
+                                    .with_min_widths(&[16, 18, 24])
+                                    .with_priorities(&[2, 2, 1])
+                                    .set_gap(2);
+                                for (meta, value) in &entries {
+                                    table.add_row(&[meta.name, value.as_str(), meta.description]);
+                                }
+                                for row in table.render_multiline(avail) {
+                                    opts.push(row);
+                                }
                             }
                         }
                         _ => {
@@ -464,13 +500,32 @@ impl Repl {
             if sel > max_sel {
                 sel = max_sel;
             }
-            let overlay_text = match kind {
-                0 => String::new(),
-                4 => Self::render_help_overlay(),
-                _ => Self::overlay_lines(&title, &opts, sel, active),
+            let overlay_text = if let Some(key) = edit_setting {
+                let meta = SETTINGS.iter().find(|m| m.key == key).unwrap();
+                let mut lines: Vec<String> =
+                    vec![format!("Editing {}  (Enter saves, Esc cancels)", meta.name)];
+                if let Some(err) = &edit_error {
+                    lines.push(format!("\x1b[31merror: {}\x1b[0m", err));
+                }
+                Self::overlay_lines(&lines[0], &lines[1..], 0, None, false)
+            } else {
+                match kind {
+                    0 => String::new(),
+                    4 => Self::render_help_overlay(),
+                    _ => Self::overlay_lines(&title, &opts, sel, active, kind == 1),
+                }
             };
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
-            redraw(&editor, &overlay_vec, sel, &mut input_row);
+            // `sel` indexes logical options; a wrapped option spans several
+            // visual lines, so center the window on the selected option's
+            // first visual line (the title accounts for the +1 offset).
+            let focus = if edit_setting.is_some() {
+                0
+            } else {
+                let sc = sel.min(opts.len());
+                1 + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
+            };
+            redraw(&editor, &overlay_vec, focus, &mut input_row);
 
             // --- Read and dispatch one key. ---
             match event::read() {
@@ -498,6 +553,46 @@ impl Repl {
                             // the next keystroke is read correctly.
                             let _ = self.guard.start();
                         }
+                    }
+                    // /settings edit mode: the input box holds a setting's value.
+                    if let Some(skey) = edit_setting {
+                        match key.code {
+                            KeyCode::Enter
+                                if !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                            {
+                                match settings.set_value(skey, &editor.text()) {
+                                    Ok(()) => {
+                                        edit_error = None;
+                                        editor.set(&edit_prev_input);
+                                        edit_setting = None;
+                                    }
+                                    Err(msg) => {
+                                        edit_error = Some(msg);
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                edit_error = None;
+                                editor.set(&edit_prev_input);
+                                edit_setting = None;
+                            }
+                            _ => {
+                                if let Some(a) = Self::edit_key(
+                                    key,
+                                    &mut editor,
+                                    history,
+                                    &mut nav,
+                                    &mut draft,
+                                    prompt,
+                                ) {
+                                    if let InputAction::Submit(_) = &a {
+                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                    }
+                                    return Some(a);
+                                }
+                            }
+                        }
+                        continue;
                     }
                     if kind == 4 {
                         // Any key dismisses /help and is passed through.
@@ -546,8 +641,19 @@ impl Repl {
                                             slash::SlashKind::Thinking => "/thinking ",
                                             slash::SlashKind::Help => "/help",
                                             slash::SlashKind::Quit => "/quit",
+                                            slash::SlashKind::Settings => "/settings ",
                                         });
                                     }
+                                } else if kind == 5 {
+                                    Self::enter_setting_edit(
+                                        &mut editor,
+                                        settings,
+                                        sel,
+                                        &cur_filter,
+                                        &mut edit_setting,
+                                        &mut edit_prev_input,
+                                        &mut edit_error,
+                                    );
                                 }
                             }
                             KeyCode::Enter => {
@@ -570,6 +676,9 @@ impl Repl {
                                                     }
                                                     slash::SlashKind::Thinking => {
                                                         editor.set("/thinking ");
+                                                    }
+                                                    slash::SlashKind::Settings => {
+                                                        editor.set("/settings ");
                                                     }
                                                 }
                                             }
@@ -600,6 +709,17 @@ impl Repl {
                                                 ));
                                             }
                                         }
+                                        5 => {
+                                            Self::enter_setting_edit(
+                                                &mut editor,
+                                                settings,
+                                                sel,
+                                                &cur_filter,
+                                                &mut edit_setting,
+                                                &mut edit_prev_input,
+                                                &mut edit_error,
+                                            );
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -613,6 +733,9 @@ impl Repl {
                                 }
                                 3 => {
                                     editor.set("/thinking");
+                                }
+                                5 => {
+                                    editor.set("/settings");
                                 }
                                 _ => {}
                             },
@@ -649,6 +772,27 @@ impl Repl {
     }
 
     /// Render the `/model` / `/thinking` overlay: a panel title line plus
+    /// Enter the /settings *edit* sub-state for the highlighted setting: stash
+    /// the current buffer (incl. filter) and drop the setting's value into the
+    /// input box for free editing.
+    fn enter_setting_edit(
+        editor: &mut LineEditor,
+        settings: &SettingsStore,
+        sel: usize,
+        filter: &str,
+        edit_setting: &mut Option<SettingKey>,
+        edit_prev_input: &mut String,
+        edit_error: &mut Option<String>,
+    ) {
+        let entries = settings.overlay_rows(filter);
+        if let Some((meta, _)) = entries.get(sel) {
+            *edit_setting = Some(meta.key);
+            *edit_prev_input = editor.text().to_string();
+            editor.set(&settings.value(meta.key));
+            *edit_error = None;
+        }
+    }
+
     /// Compute the input row for the *next* redraw after emitting `er` input rows
     /// plus an `n`-line pop-up, given the current input row and terminal height.
     /// When the pop-up overflows the bottom, the terminal scrolls up by the
@@ -675,15 +819,21 @@ impl Repl {
         }
     }
 
-    /// Render the `/model` / `/thinking` overlay: a panel title line plus
-    /// wrapped, colored option rows with a `> ` selection marker and
-    /// (for `/model`) a green `*` on the currently-active model. Returns
-    /// plain text; the caller emits it directly above the input line.
+    /// Render the `/model` / `/thinking` / `/settings` overlay: a panel title
+    /// line plus option rows with a `> ` selection marker and (for `/model`)
+    /// a green `*` on the currently-active model. Returns plain text; the
+    /// caller emits it directly above the input line.
+    ///
+    /// `wrap_opts` controls layout of the option rows: pre-formatted rows
+    /// (model/settings/thinking tables) must pass `false` so the inter-column
+    /// padding spaces are preserved (word-wrapping would collapse them and
+    /// destroy column alignment); prose rows (help) pass `true`.
     pub fn overlay_lines(
         title: &str,
         options: &[String],
         sel: usize,
         active: Option<usize>,
+        wrap_opts: bool,
     ) -> String {
         const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
         const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
@@ -694,7 +844,17 @@ impl Repl {
         let opt_w = tw.saturating_sub(2); // "> " / "* " / "  " marker
         let mut rows: Vec<(usize, String, bool)> = Vec::new();
         for (i, o) in options.iter().enumerate() {
-            let wrapped = wrap(o, opt_w);
+            // Prose overlays (help, command list) word-wrap each option.
+            // Pre-formatted overlays (model/settings/thinking tables) are already
+            // width-bounded and may carry their own `\n` (multi-line rows from
+            // `Table::render_multiline`); preserve newlines instead of
+            // re-wrapping, so column alignment survives across the wrapped
+            // lines of one logical option.
+            let wrapped: Vec<String> = if wrap_opts {
+                wrap(o, opt_w)
+            } else {
+                o.split('\n').map(String::from).collect()
+            };
             for (j, line) in wrapped.into_iter().enumerate() {
                 rows.push((i, line, j == 0));
             }
@@ -705,6 +865,10 @@ impl Repl {
         let mut out = String::new();
         out.push_str(&bg_line(title, BG));
         for (i, line, first) in &rows {
+            // The 2-char marker area prefixes every line (including wrapped
+            // continuation lines) so all visual lines of one option stay
+            // column-aligned; only the first line of the selected/active
+            // option shows `> `/`* `.
             let marker = if *first && *i == sel {
                 "> "
             } else if *first && active == Some(*i) {
@@ -712,11 +876,7 @@ impl Repl {
             } else {
                 "  "
             };
-            let body = if *first {
-                format!("{}{}", marker, line)
-            } else {
-                line.clone()
-            };
+            let body = format!("{}{}", marker, line);
             let (bg, fg) = if *i == sel {
                 (BG_SEL, C_SEL)
             } else if active == Some(*i) {
@@ -739,7 +899,7 @@ impl Repl {
     /// dismisses it (see `read_input`).
     fn render_help_overlay() -> String {
         let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
-        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None)
+        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None, true)
     }
 
     /// Resolve the catalog id of the currently-active model. OpenRouter routes
@@ -1839,7 +1999,7 @@ mod tests {
             "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
             "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
         ];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
         assert_eq!(out.matches("Select a model:").count(), 1);
         assert!(out.contains("> a: alpha"));
         assert!(out.contains("  b: beta"));
@@ -1849,7 +2009,7 @@ mod tests {
     fn render_select_wraps_long_option_with_aligned_continuation() {
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let opts = vec![long.to_string()];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None);
+        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[1].contains("> "), "first row is the marker row");
         let cont: Vec<&&str> = lines

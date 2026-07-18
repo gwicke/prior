@@ -15,6 +15,8 @@
 
 use unicode_width::UnicodeWidthChar;
 
+use crate::output::wrap;
+
 /// Horizontal alignment of a column's cells (and its header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -102,6 +104,61 @@ impl Table {
         self.rows.len()
     }
 
+    /// Column widths that [`Table::render`] / [`Table::render_multiline`] will
+    /// use for `max_width`. Exposed so callers can compute where a column
+    /// starts (e.g. to wrap a description and keep continuations aligned).
+    pub fn column_widths(&self, max_width: usize) -> Vec<usize> {
+        self.layout(max_width)
+    }
+
+    /// Render data rows to `max_width` total columns, **wrapping** long cells
+    /// (e.g. a description) across multiple visual lines instead of
+    /// truncating them. Each returned `String` is one *logical* row and may
+    /// itself contain `\n` (one visual line per wrapped cell line). All visual
+    /// lines stay column-aligned: continuation lines leave the other columns
+    /// blank. Pair this with an overlay renderer that splits on `\n` so a
+    /// wrapped logical row is treated as one selectable item (arrow keys move
+    /// by logical row, not by visual line).
+    ///
+    /// ```
+    /// # use picocode::table::{Align, Table};
+    /// let mut t = Table::new(&["Setting", "Description"])
+    ///     .with_aligns(&[Align::Left, Align::Left]);
+    /// t.add_row(&["default_model", "a fairly long description that must wrap"]);
+    /// let rows = t.render_multiline(40);
+    /// assert!(rows[0].contains('\n'), "long cell wraps to multiple visual lines");
+    /// # assert_eq!(rows[0].split('\n').count(), 2);
+    /// ```
+    pub fn render_multiline(&self, max_width: usize) -> Vec<String> {
+        let widths = self.layout(max_width);
+        let mut out = Vec::new();
+        for row in &self.rows {
+            // Wrap each cell independently to its column width.
+            let wrapped: Vec<Vec<String>> = (0..widths.len())
+                .map(|col| match row.get(col).map(String::as_str) {
+                    Some("") | None => vec![String::new()],
+                    Some(cell) => wrap(cell, widths[col]),
+                })
+                .collect();
+            let max_lines = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            let mut lines: Vec<String> = Vec::with_capacity(max_lines);
+            for k in 0..max_lines {
+                let mut s = String::new();
+                for (col, cell_lines) in wrapped.iter().enumerate() {
+                    if col > 0 {
+                        s.push_str(&" ".repeat(self.gap));
+                    }
+                    let chunk = cell_lines.get(k).map(String::as_str).unwrap_or("");
+                    let align = self.aligns.get(col).copied().unwrap_or(Align::Left);
+                    s.push_str(&fit(chunk, widths[col], align, self.ellipsis));
+                }
+                lines.push(s);
+            }
+            out.push(lines.join("\n"));
+        }
+        out
+    }
+
     /// Render data rows to `max_width` total columns. Each returned string is
     /// exactly one visual line, column-aligned and width-fitted.
     pub fn render(&self, max_width: usize) -> Vec<String> {
@@ -164,7 +221,17 @@ impl Table {
         }
         let total_nat: usize = nat.iter().sum::<usize>() + gaps;
         if total_nat <= max_width {
-            return nat; // everything fits naturally, no truncation needed
+            // Everything fits naturally. Grow the last (typically descriptive)
+            // column to absorb the slack so the row fills `max_width` and stays
+            // column-aligned — no empty gutter on the right of wide terminals,
+            // and the explanation column gets the extra room instead of being
+            // ellipsized early.
+            let mut cur = nat;
+            let slack = max_width - total_nat;
+            if let Some(last) = cur.last_mut() {
+                *last += slack;
+            }
+            return cur;
         }
 
         // Shrink from natural down toward min until it fits. Greedily reduce
@@ -323,19 +390,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn natural_width_fits_without_ellipsis() {
+    fn natural_width_fills_slack_into_last_column() {
         let mut t = Table::new(&["A", "B"]);
         t.add_row(&["x", "y"]);
         t.add_row(&["longer", "zz"]);
         let rows = t.render(80);
         assert_eq!(rows.len(), 2);
-        // Natural widths: A=6 ("longer"), B=2 ("zz"), gap=2 => total 10. Both
-        // rows share that width and the 2nd column starts at the same offset.
-        assert_eq!(display_width(&rows[0]), 10);
-        assert_eq!(display_width(&rows[1]), 10);
+        // Natural widths: A=6 ("longer"), B=2 ("zz"), gap=2 => total 10, which
+        // fits in 80. The 70 cols of slack are absorbed by the last column, so
+        // every row spans the full width and columns stay aligned.
+        assert_eq!(display_width(&rows[0]), 80);
+        assert_eq!(display_width(&rows[1]), 80);
         let col1 = 6 + 2;
         assert!(rows[0][col1..].starts_with('y'));
         assert!(rows[1][col1..].starts_with("zz"));
+        // B is left-aligned within its grown column, so trailing padding only.
+        // (Col A is padded to its natural width 6, then a 2-space gap, then B.)
+        assert_eq!(rows[0].trim_end(), "x       y");
+        assert_eq!(rows[1].trim_end(), "longer  zz");
     }
 
     #[test]
@@ -394,10 +466,12 @@ mod tests {
         let mut t = Table::new(&["H"]);
         t.add_row(&[styled]);
         let rows = t.render(80);
-        // "dim" is 3 visible; padded to the natural header width 1 -> "dim".
-        assert_eq!(display_width(&rows[0]), 3);
+        // "dim" is 3 visible; the single column grows to fill the width, so
+        // the row is 80 wide but the visible content is just "dim".
+        assert_eq!(display_width(&rows[0]), 80);
         assert!(rows[0].contains("dim"));
-        assert!(!rows[0].contains("  "));
+        // The styled content is preserved exactly, then padded to the right.
+        assert_eq!(rows[0].trim_end(), "\x1b[2mdim\x1b[0m");
     }
 
     #[test]
@@ -407,9 +481,10 @@ mod tests {
         t.add_row(&["beta", "22"]);
         let out = t.render_with_header(80);
         assert_eq!(out.len(), 4); // header + sep + 2 rows
-        // Column widths: Name=5, N=2, gap=2 => every line is width 9.
+        // Column widths: Name=5, N grows to fill the slack => every line is
+        // width 80 (Name=5, gap=2, N=73).
         for line in &out {
-            assert_eq!(display_width(line), 9);
+            assert_eq!(display_width(line), 80);
         }
         // Columns align: col1 ("N"/"1"/"22") starts at offset 5+2=7 (right-
         // aligned, so check the trimmed cell content).
@@ -419,5 +494,34 @@ mod tests {
         assert_eq!(out[3][c1..].trim(), "22");
         // Separator is dashes + the inter-column gap.
         assert!(out[1].chars().all(|ch| ch == '-' || ch == ' '));
+    }
+
+    #[test]
+    fn render_multiline_wraps_long_cell_and_aligns_continuations() {
+        let mut t = Table::new(&["A", "B"])
+            .with_aligns(&[Align::Left, Align::Left])
+            .with_min_widths(&[4, 20]);
+        t.add_row(&[
+            "x",
+            "a fairly long description that must wrap across multiple visual lines",
+        ]);
+        let rows = t.render_multiline(30);
+        assert_eq!(rows.len(), 1, "one logical row");
+        let lines: Vec<&str> = rows[0].split('\n').collect();
+        assert!(lines.len() >= 2, "long cell should wrap");
+        // All visual lines share one total width (columns stay aligned).
+        let w = lines[0].len();
+        assert!(
+            lines.iter().all(|l| l.len() == w),
+            "visual lines must be equal width"
+        );
+        // Continuation lines leave column A blank (aligned under the first).
+        let a_w = t.column_widths(30)[0];
+        for line in &lines[1..] {
+            assert!(
+                line[..a_w].chars().all(|c| c == ' '),
+                "column A must be blank on continuation lines"
+            );
+        }
     }
 }

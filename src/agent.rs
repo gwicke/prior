@@ -1,5 +1,6 @@
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx};
+use crate::settings::SettingsStore;
 use crate::tools::{
     AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir, MoveFile,
     ReadFile, Remove, WriteFile,
@@ -464,7 +465,7 @@ fn guard<T: Tool>(
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
-pub async fn run_interactive(config: AgentConfig) -> Result<()> {
+pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
     let mut config = config;
     // Agent is created lazily on first use (or on /model, /thinking) so that
     // commands like /help work without a network round-trip.
@@ -521,7 +522,7 @@ pub async fn run_interactive(config: AgentConfig) -> Result<()> {
                     model: config.model.clone(),
                     recent: recent_models.clone(),
                 };
-                r.read_input(&prompt_str, &mut line_history, &ctx, config.output.cursor_row())
+                r.read_input(&prompt_str, &mut line_history, &ctx, settings, config.output.cursor_row())
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };

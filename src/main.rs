@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
-use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput};
+use picocode::{config::Config, create_agent, AgentConfig, ConsoleOutput, SettingsStore};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -29,14 +30,14 @@ struct Args {
     quiet: bool,
 
     /// Maximum number of tool calls per prompt
-    #[arg(long, default_value = "50", global = true)]
-    tool_call_limit: usize,
+    #[arg(long, global = true)]
+    tool_call_limit: Option<usize>,
 
     /// Choose a persona for the agent
     #[arg(long, help = format!("Choose a persona for the agent. Available built-in personas:\n{}", picocode::persona::list_personas()), global = true)]
     persona: Option<String>,
 
-    /// Path to config file (default: picocode.yaml or picocode.yml in current directory)
+    /// Path to config file (default: picocode.toml in current directory)
     #[arg(short, long, global = true)]
     config: Option<String>,
 }
@@ -47,7 +48,7 @@ enum Commands {
     Chat,
     /// Run a single prompt
     Input { prompt: String },
-    /// Run a pre-defined recipe from picocode.yaml
+    /// Run a pre-defined recipe from picocode.toml
     Recipe { name: String },
 }
 
@@ -114,14 +115,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| recipe.as_ref().and_then(|r| r.model.clone()))
         .unwrap_or_else(|| default_model(&provider));
 
-    let yolo = args
-        .yolo
-        .or_else(|| recipe.as_ref().and_then(|r| r.yolo))
-        .unwrap_or(false);
+    let yolo = if let Some(y) = args.yolo {
+        y
+    } else {
+        config.security_mode.as_deref() == Some("yolo")
+    };
+    let tool_call_limit = args
+        .tool_call_limit
+        .or(config.tool_call_limit)
+        .unwrap_or(50);
+    let thinking_level = config.default_thinking_level.clone();
+    let settings_path = args
+        .config
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("picocode.toml"));
 
     let persona_name = args
         .persona
-        .or_else(|| recipe.as_ref().and_then(|r| r.persona.clone()));
+        .or_else(|| recipe.as_ref().and_then(|r| r.persona.clone()))
+        .or(config.default_persona.clone());
 
     let quiet = args.quiet || recipe.as_ref().map(|r| r.quiet).unwrap_or(false);
     let output: Arc<dyn picocode::Output> = if quiet {
@@ -141,7 +153,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         output,
         yolo,
         quiet,
-        tool_call_limit: args.tool_call_limit,
+        tool_call_limit,
         system_message_extension,
         persona_prompt,
         persona_name,
@@ -150,9 +162,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.agent_prompt.clone(),
             config.agent_prompt_file.clone(),
         )?,
-        thinking_level: None,
+        thinking_level,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    let mut settings = SettingsStore::from_agent_config(&agent_config, &settings_path);
     match command {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;
@@ -188,7 +201,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                picocode::agent::run_interactive(agent_config).await?;
+                picocode::agent::run_interactive(agent_config, &mut settings).await?;
             }
         }
     }

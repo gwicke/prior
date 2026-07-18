@@ -11,8 +11,10 @@ pub mod repl;
 pub mod model_catalog;
 pub mod thinking;
 pub mod table;
+pub mod settings;
 
 pub use config::{Config, Recipe, ToolSettings};
+pub use settings::{SettingKey, SettingsStore};
 
 // Re-export core rig types for library users
 pub use rig_core::agent::AgentBuilder;
@@ -31,8 +33,8 @@ pub enum PicocodeError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    #[error("TOML error: {0}")]
+    Toml(String),
 
     #[error("Tool error: {0}")]
     Tool(String),
