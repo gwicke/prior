@@ -425,3 +425,110 @@ fn settings_string_hierarchy_saves_and_errors() {
     let _ = child.kill();
     stop.store(true, Ordering::SeqCst);
 }
+
+/// Live-apply wiring: a `/settings` change flips `dirty`; the agent rebuild
+/// is attempted at the next `Submit` (without hanging the REPL). Offline the
+/// rebuild fails on a missing API key, but the `Submit` arm must still return
+/// to a responsive prompt — proving the deferred rebuild ran and the loop
+/// continued. The change is also persisted to the temp config file.
+#[test]
+fn settings_change_triggers_deferred_rebuild() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = tmp.path().join("picocode.toml");
+    std::fs::write(&cfg, "\n").expect("write temp config");
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 20,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
+    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c", cfg.to_str().unwrap()]);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
+
+    let reader = pair.master.try_clone_reader().expect("clone reader");
+    let (bytes, stop) = spawn_reader(reader);
+    let mut writer = pair.master.take_writer().expect("take writer");
+
+    assert!(
+        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
+        "REPL did not start"
+    );
+    let _ = writer.write_all(b"\x1b[3;1R");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(400));
+
+    // Change default_model (exact name -> value mode), then Enter. Use an
+    // unsupported provider so the deferred rebuild *always* fails (env-independent),
+    // giving a deterministic proof that the rebuild was attempted at the next Submit.
+    for ch in "/settings default_model ".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(60));
+    }
+    for ch in "definitelynotarealprovider:model".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(40));
+    }
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(500));
+
+    // The commit reverts the editor to `/settings`; clear it (Esc on a
+    // space-less buffer empties the input) so the next text is a real prompt.
+    let _ = writer.write_all(b"\x1b");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(300));
+
+    // The committed `/settings <key> <value>` line must have been emitted.
+    {
+        let data = bytes.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&data);
+        assert!(
+            s.contains("/settings default_model definitelynotarealprovider:model"),
+            "committed /settings line not emitted; tail={}",
+            s.replace('\x1b', "ESC").chars().rev().take(300).collect::<String>()
+        );
+    }
+
+    // Submit a chat prompt -> the dirty rebuild is attempted at this Submit.
+    for ch in "hello".chars() {
+        let _ = writer.write_all(&[ch as u8]);
+        let _ = writer.flush();
+        thread::sleep(Duration::from_millis(80));
+    }
+    let _ = writer.write_all(b"\r");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(1500));
+
+    // The deferred rebuild must have been attempted: an unsupported-provider
+    // error (wrapped as "Cannot apply settings: ...") proves `dirty` was set in
+    // `read_input` and the rebuild ran here in `run_interactive`. The `Submit`
+    // arm then continues (the loop returns to a responsive prompt).
+    {
+        let data = bytes.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&data);
+        assert!(
+            s.contains("Unsupported provider: definitelynotarealprovider"),
+            "deferred rebuild was not attempted at next Submit; tail={}",
+            s.replace('\x1b', "ESC").chars().rev().take(400).collect::<String>()
+        );
+    }
+
+    drop(writer);
+    let _ = child.kill();
+    stop.store(true, Ordering::SeqCst);
+
+    // The change was persisted to the temp config (set_value side-effect).
+    let saved = std::fs::read_to_string(&cfg).unwrap();
+    assert!(
+        saved.contains("default_model = \"definitelynotarealprovider:model\""),
+        "setting not persisted to temp config: {}",
+        saved
+    );
+}

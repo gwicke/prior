@@ -467,6 +467,10 @@ fn guard<T: Tool>(
 /// provider's completion-model type).
 pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
     let mut config = config;
+    // Pending `/settings` changes that need an agent rebuild before the next
+    // prompt. `read_input` only flips this flag; the rebuild stays here so it
+    // can call the async `create_agent`.
+    let mut dirty = false;
     // Agent is created lazily on first use (or on /model, /thinking) so that
     // commands like /help work without a network round-trip.
     let mut agent: Option<Box<dyn PicoAgent>> = None;
@@ -522,7 +526,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     model: config.model.clone(),
                     recent: recent_models.clone(),
                 };
-                r.read_input(&prompt_str, &mut line_history, &ctx, settings, config.output.cursor_row(), config.output.as_ref())
+                r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };
@@ -586,6 +590,28 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 config.output.display_plain(&input);
                 // Separator between the user's prompt and the agent response.
                 config.output.display_separator();
+                // Live-apply pending `/settings` changes (deferred agent
+                // rebuild). `read_input` only flips `dirty`; the rebuild stays
+                // here so it can call the async `create_agent` and mirror the
+                // `SetModel`/`SetThinking` error handling.
+                if dirty {
+                    let mut new_cfg = config.clone();
+                    settings.apply_to_config(&mut new_cfg);
+                    match create_agent(new_cfg.clone()).await {
+                        Ok(new_agent) => {
+                            agent = Some(new_agent);
+                            config = new_cfg;
+                            dirty = false;
+                        }
+                        Err(e) => {
+                            config
+                                .output
+                                .display_text(&format!("Cannot apply settings: {}", e));
+                            // Keep `dirty` set so the next Submit retries; `config`
+                            // and the agent stay in sync (both old).
+                        }
+                    }
+                }
                 // Normal prompt — create the agent lazily on first use.
                 if agent.is_none() {
                     match create_agent(config.clone()).await {
