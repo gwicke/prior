@@ -10,16 +10,21 @@ use crate::Result;
 use crate::model_catalog;
 use crate::thinking;
 use console::style;
-use rig_core::agent::{Agent, AgentBuilder, HookAction, PromptHook, ToolCallHookAction};
+use rig_core::agent::{
+    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
+    HookContext, ModelTurnAction, ModelTurnFinished, ObservationAction, ToolCall, ToolCallAction,
+    ToolResultAction, ToolResultEvent,
+};
+use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::{CompletionModel, ToolDefinition};
+use rig_core::completion::CompletionModel;
 use rig_core::message::Message;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
 use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
 use futures::StreamExt;
 use rig_core::providers::{
-    anthropic, azure, cohere, deepseek, galadriel, gemini, groq, huggingface, hyperbolic, mira,
+    anthropic, azure, cohere, deepseek, gemini, groq, huggingface, hyperbolic, mira,
     mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai,
 };
 use serde_json;
@@ -50,17 +55,17 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         // history back through the `&mut` borrow afterwards.
         let prior: Vec<Message> = history.as_ref().map(|h| (*h).clone()).unwrap_or_default();
 
-        // `stream_prompt(...).await` yields the item stream (rig 0.38's
+        // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
         let mut stream = self
             .agent
             .stream_prompt(input)
-            .with_hook(LoggingHook {
+            .add_hook(LoggingHook {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
             })
-            .multi_turn(self.tool_call_limit)
-            .with_history(prior)
+            .max_turns(self.tool_call_limit)
+            .history(prior)
             .await;
 
         let mut output = String::new();
@@ -93,14 +98,16 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                     self.output.end_response_segment();
                 }
                 MultiTurnStreamItem::FinalResponse(resp) => {
-                    final_history = resp.history().map(|h| h.to_vec());
+                    final_history = resp.messages().map(|h| h.to_vec());
                 }
+                MultiTurnStreamItem::ToolExecutionCommitted { .. } => {}
+                MultiTurnStreamItem::ModelTurnRetried { .. } => {}
                 _ => {}
             }
         }
         self.output.end_response();
 
-        // Persist history across turns (§2.4 fix): `with_history` clones into
+        // Persist history across turns (§2.4 fix): `history` is cloned into
         // the request, so we must write the updated history back here.
         if let Some(h) = history {
             if let Some(fh) = final_history {
@@ -276,10 +283,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             check_env!("DEEPSEEK_API_KEY");
             build!(deepseek::Client::from_env()?)
         }
-        "galadriel" => {
-            check_env!("GALADRIEL_API_KEY");
-            build!(galadriel::Client::from_env()?)
-        }
         "gemini" | "google" => {
             check_env!("GOOGLE_API_KEY");
             build!(gemini::Client::from_env()?)
@@ -355,62 +358,68 @@ struct LoggingHook {
     user_cancel: Arc<AtomicBool>,
 }
 
-impl<M: CompletionModel> PromptHook<M> for LoggingHook {
+impl AgentHook for LoggingHook {
     async fn on_completion_call(
         &self,
-        _prompt: &Message,
-        _history: &[Message],
-    ) -> HookAction {
+        _ctx: &HookContext,
+        _event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            // Esc was pressed: stop the agentic loop at the next checkpoint.
-            // rig 0.38 no longer exposes a mid-request CancelSignal.
-            HookAction::terminate("cancelled by user")
+            CompletionCallAction::Stop("cancelled by user".into())
         } else {
-            HookAction::cont()
+            CompletionCallAction::Continue
         }
     }
 
     async fn on_completion_response(
         &self,
-        _prompt: &Message,
-        _response: &rig_core::completion::CompletionResponse<M::Response>,
-    ) -> HookAction {
+        _ctx: &HookContext,
+        _event: CompletionResponseEvent<'_>,
+    ) -> ObservationAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            HookAction::terminate("cancelled by user")
+            ObservationAction::Stop("cancelled by user".into())
         } else {
-            HookAction::cont()
+            ObservationAction::Continue
+        }
+    }
+
+    async fn on_model_turn_finished(
+        &self,
+        _ctx: &HookContext,
+        _event: ModelTurnFinished<'_>,
+    ) -> ModelTurnAction {
+        if self.user_cancel.load(Ordering::SeqCst) {
+            ModelTurnAction::Stop("cancelled by user".into())
+        } else {
+            ModelTurnAction::Continue
         }
     }
 
     async fn on_tool_call(
         &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        args: &str,
-    ) -> ToolCallHookAction {
+        _ctx: &HookContext,
+        event: ToolCall<'_>,
+    ) -> ToolCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            return ToolCallHookAction::terminate("cancelled by user");
+            return ToolCallAction::Stop("cancelled by user".into());
         }
-        let args_json =
-            serde_json::from_str(args).unwrap_or(serde_json::Value::String(args.to_string()));
-        self.output.display_tool_call(tool_name, &args_json);
-        ToolCallHookAction::cont()
+        let args_json = serde_json::from_str(event.args)
+            .unwrap_or(serde_json::Value::String(event.args.to_string()));
+        self.output.display_tool_call(event.tool_name, &args_json);
+        ToolCallAction::Run
     }
 
     async fn on_tool_result(
         &self,
-        _tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        _args: &str,
-        result: &str,
-    ) -> HookAction {
+        _ctx: &HookContext,
+        event: ToolResultEvent<'_>,
+    ) -> ToolResultAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            return HookAction::terminate("cancelled by user");
+            return ToolResultAction::Stop("cancelled by user".into());
         }
-        self.output.display_tool_result(result);
-        HookAction::cont()
+        self.output
+            .display_tool_result(&event.raw_result.output().render());
+        ToolResultAction::Keep
     }
 }
 
@@ -520,11 +529,19 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
 
     const NAME: &'static str = T::NAME;
 
-    async fn definition(&self, prompt: String) -> ToolDefinition {
-        self.tool.definition(prompt).await
+    fn description(&self) -> String {
+        self.tool.description()
     }
 
-    async fn call(&self, args: Self::Args) -> std::result::Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        self.tool.parameters()
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        args: Self::Args,
+    ) -> std::result::Result<Self::Output, Self::Error> {
         let should_auto_approve = self
             .auto_approve
             .as_ref()
@@ -547,7 +564,7 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
                 }
             }
         }
-        self.tool.call(args).await
+        self.tool.call(context, args).await
     }
 }
 

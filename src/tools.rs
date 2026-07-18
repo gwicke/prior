@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tokio::fs;
+use rig_core::tool::ToolContext;
 
 use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig};
 
@@ -228,15 +229,19 @@ impl rig_core::tool::Tool for Bash {
 
     const NAME: &'static str = "bash";
 
-    async fn definition(&self, _prompt: String) -> rig_core::completion::ToolDefinition {
-        rig_core::completion::ToolDefinition {
-            name: Self::NAME.into(),
-            description: "Run shell command".into(),
-            parameters: serde_json::to_value(schemars::schema_for!(BashArgs)).unwrap(),
-        }
+    fn description(&self) -> String {
+        "Run shell command".into()
     }
 
-    async fn call(&self, args: Self::Args) -> std::result::Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(BashArgs)).unwrap()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> std::result::Result<Self::Output, Self::Error> {
         run_sandboxed(&args.cmd, args.timeout).await
     }
 }
