@@ -415,10 +415,12 @@ pass, 1 ignored**.
 - **Excluded `voyageai`** — embeddings-only provider (no `completion_model`/
   `AgentClient` chat path), so it cannot go through the `build!` chat builder.
   Out of scope until picocode has an embeddings feature.
-- **Deferred (OAuth): `chatgpt`, `copilot`** — see §7.6. They implement
-  `from_env()` + `AgentClient`, so the token-env-var path is as easy as the
-  others above; the interactive device-code OAuth is moderate (rig does the
-  protocol). Not done in this migration.
+- **Added (Tier 1, token env var): `chatgpt`, `copilot`** — see §7.6. Both
+  implement `from_env()` + `AgentClient`, so they wire in like the others.
+  `chatgpt` requires `CHATGPT_ACCESS_TOKEN`; `copilot` requires
+  `GITHUB_COPILOT_API_KEY` or `COPILOT_GITHUB_ACCESS_TOKEN` (the `check_env!`
+  macro was extended to OR multiple vars). The interactive device-code OAuth
+  (Tier 2) remains deferred.
 
 ### 7.5 Pre-existing test fix (not caused by this migration)
 - `settings.rs::apply_to_config_maps_the_five_settings` built `AgentConfig`
@@ -431,11 +433,12 @@ pass, 1 ignored**.
 Both already implement `from_env()` + `ProviderClient` (so `AgentClient`/`.agent()`
 works — they wire in like the non-OAuth providers). Two tiers:
 
-- **Tier 1 — token env var (trivial, ~15 LoC/provider, same as §7.4):**
-  `chatgpt` reads `CHATGPT_ACCESS_TOKEN` (+ optional `CHATGPT_ACCOUNT_ID`);
-  `copilot` reads `COPILOT_GITHUB_ACCESS_TOKEN`/`GITHUB_TOKEN` (or an API key
-  `GITHUB_COPILOT_API_KEY`/`COPILOT_API_KEY`). Add the client-builder arm +
-  catalog/default-model entries; the user supplies a browser-obtained token.
+- **Tier 1 — token env var (DONE in this migration):** `chatgpt` reads
+  `CHATGPT_ACCESS_TOKEN`; `copilot` reads `COPILOT_GITHUB_ACCESS_TOKEN`/
+  `GITHUB_TOKEN` (or an API key `GITHUB_COPILOT_API_KEY`/`COPILOT_API_KEY`). The
+  client-builder arm + catalog/default-model entries are added; the user
+  supplies a browser-obtained token. `check_env!` was extended to OR multiple
+  vars so copilot accepts either credential.
 - **Tier 2 — in-app interactive device-code OAuth (moderate, ~50–150 LoC):**
   rig's `from_env()` with no token falls back to `ChatGPTAuth::OAuth` /
   `CopilotAuth::OAuth`, which runs a **device-authorization flow** with
@@ -450,8 +453,43 @@ works — they wire in like the non-OAuth providers). Two tiers:
   refresh. Set `allow_device_flow(false)` for non-interactive/CI use so it errors
   instead of hanging on a device code.
 
-**Recommendation:** do Tier 1 now (consistent with the other providers, low
-risk); defer Tier 2 unless passwordless `picocode login` is wanted.
+  #### Token storage (`token_dir`)
+  - rig persists credentials in its **own file**, not picocode's settings:
+    chatgpt → `<config_dir>/chatgpt/auth.json`
+    (`chatgpt/mod.rs:607`); copilot → `<config_dir>/github_copilot/`
+    (`access-token` + `api-key.json`, `copilot/mod.rs:1643`). `config_dir` =
+    `$XDG_CONFIG_HOME` / `$HOME/.config` (or `%APPDATA%`). Overridable via
+    `token_dir(dir)` / `auth_file(path)`.
+  - The record is a full OAuth cache (`access_token`, `refresh_token`,
+    `id_token`, `expires_at`, `account_id`, pretty JSON). The **refresh token
+    persists and auto-renews** — `auth_context_oauth` (`auth/native.rs`) reads
+    the cache, uses a valid access token, else refreshes it (rewriting the
+    cache), else (no cache / refresh failed) runs the device flow and writes the
+    new record. The browser step happens **once**; later runs just refresh.
+  - **Don't merge into the settings file.** Settings are non-secret config
+    (provider/model/persona); the refresh token is a secret. Point `token_dir`
+    at a picocode-owned credentials dir (e.g. `~/.config/picocode/credentials/
+    <provider>`) so tokens co-locate and the dir can be private + gitignored.
+  - **Permission caveat:** rig writes the file with default perms
+    (`ensure_parent_dir` only `create_dir_all`; no `0o600` chmod in
+    `auth/native.rs`), so the token file is typically world/group-readable.
+    Mitigate by creating the parent `token_dir` with `0o700`. Upstream fix: set
+    `0o600` on write.
+
+  #### "Login on startup" = the `from_env()` fallback (no extra logic)
+  - Simplest correct design: **drop the hard `check_env!`** for chatgpt/copilot
+    and let `from_env()` decide — token env var present → used directly (Tier 1,
+    no file, no browser); absent → device OAuth (Tier 2). The flow is **lazy**
+    (first `create_agent`/request), so there is no separate login step. Tier 1
+    token presence *avoids* OAuth; its absence makes OAuth run automatically on
+    first use and cache the token. Sufficient on its own.
+  - **Interactivity gating:** the device flow needs a TTY/user. In
+    non-interactive/CI (`--quiet`, piped stdin) set `allow_device_flow(false)`
+    so it errors cleanly ("sign-in required") instead of hanging. picocode
+    already tracks interactive vs `--quiet`.
+
+**Status:** Tier 1 implemented. Tier 2 (interactive device-code OAuth) is
+  deferred unless passwordless `picocode login` is wanted.
 
 ### 7.7 Open follow-ups (not required for the upgrade)
 - "Strip reasoning from persisted history" toggle (esp. for Anthropic, which

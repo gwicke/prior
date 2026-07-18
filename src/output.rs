@@ -409,6 +409,33 @@ impl ConsoleOutput {
             self.display_markdown(&text);
         }
     }
+
+    /// Shared body of `begin_response`. Takes the live/TTY decision explicitly
+    /// so the non-TTY (buffered) path can be forced in tests without depending
+    /// on whether the test process's stdout is attached to a terminal.
+    fn begin_response_inner(&self, live: bool) {
+        *self.live.lock().unwrap() = live;
+        if live {
+            // Reset the incremental parser/renderer for a fresh response and
+            // print a leading blank to separate from the user prompt.
+            let mut parser = self.parser.lock().unwrap();
+            *parser = StreamParser::new_gfm();
+            let mut theme = Theme::default();
+            theme.clickable_links = true; // real TTY path
+            let mut renderer = self.renderer.lock().unwrap();
+            *renderer = Renderer::new(theme, term_width());
+            // Reset the thinking parser/renderer and dim state for this response.
+            let mut tparser = self.thinking_parser.lock().unwrap();
+            *tparser = StreamParser::new_gfm();
+            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            *trenderer = Renderer::new(Theme::dimmed(), term_width());
+            *self.dim_on.lock().unwrap() = false;
+            println!();
+            self.note_lines(1);
+        } else {
+            *self.text_buffer.lock().unwrap() = String::new();
+        }
+    }
 }
 
 impl Default for ConsoleOutput {
@@ -605,28 +632,7 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_response(&self) {
-        let live = std::io::stdout().is_terminal();
-        *self.live.lock().unwrap() = live;
-        if live {
-            // Reset the incremental parser/renderer for a fresh response and
-            // print a leading blank to separate from the user prompt.
-            let mut parser = self.parser.lock().unwrap();
-            *parser = StreamParser::new_gfm();
-            let mut theme = Theme::default();
-            theme.clickable_links = true; // real TTY path
-            let mut renderer = self.renderer.lock().unwrap();
-            *renderer = Renderer::new(theme, term_width());
-            // Reset the thinking parser/renderer and dim state for this response.
-            let mut tparser = self.thinking_parser.lock().unwrap();
-            *tparser = StreamParser::new_gfm();
-            let mut trenderer = self.thinking_renderer.lock().unwrap();
-            *trenderer = Renderer::new(Theme::dimmed(), term_width());
-            *self.dim_on.lock().unwrap() = false;
-            println!();
-            self.note_lines(1);
-        } else {
-            *self.text_buffer.lock().unwrap() = String::new();
-        }
+        self.begin_response_inner(std::io::stdout().is_terminal());
     }
 
     fn stream_text(&self, delta: &str) {
@@ -1287,7 +1293,9 @@ mod tests {
     #[test]
     fn console_output_streaming_buffers_and_flushes() {
         let out = ConsoleOutput::new();
-        out.begin_response();
+        // Force the buffered (non-TTY) path this test exercises, so it does not
+        // depend on whether the test process's stdout is attached to a terminal.
+        out.begin_response_inner(false);
         assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
 
         out.stream_text("hello ");
