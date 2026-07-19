@@ -1376,12 +1376,12 @@ impl LineEditor {
     }
 
     pub fn backspace(&mut self) {
-        // Always delete from the end of the line (append-only input model): the
-        // cursor is treated as living at the end, so backspace never reaches
-        // into the middle of the buffer.
-        if !self.buf.is_empty() {
-            self.buf.pop();
-            self.cursor = self.buf.len();
+        // Delete the character immediately before the cursor (standard editor
+        // behavior), so backspace works correctly when the cursor is in the
+        // middle of the line. No-op at the buffer start.
+        if self.cursor > 0 {
+            self.buf.remove(self.cursor - 1);
+            self.cursor -= 1;
         }
     }
 
@@ -2053,16 +2053,16 @@ mod tests {
     }
 
     #[test]
-    fn backspace_always_deletes_last_char() {
+    fn backspace_deletes_char_before_cursor() {
         let mut e = LineEditor::new();
         e.insert('a');
         e.insert('b');
-        e.home(); // cursor at start; backspace still deletes from the end
+        e.home(); // cursor at start; backspace is a no-op
         assert_eq!(e.cursor, 0);
         e.backspace();
-        assert_eq!(e.cursor, 1);
-        assert_eq!(e.text(), "a");
-        // empty buffer -> no-op
+        assert_eq!(e.text(), "ab");
+        assert_eq!(e.cursor, 0);
+        // non-empty buffer, cursor at start -> still no-op
         let mut e2 = LineEditor::new();
         e2.backspace();
         assert_eq!(e2.text(), "");
@@ -2101,13 +2101,13 @@ mod tests {
     }
 
     #[test]
-    fn backspace_deletes_from_end_regardless_of_cursor() {
+    fn backspace_deletes_char_before_cursor_in_middle() {
         let mut e = LineEditor::new();
         e.insert_str("abc");
-        e.left(); // cursor in the middle
-        e.backspace(); // still deletes the last char
-        assert_eq!(e.text(), "ab");
-        assert_eq!(e.cursor, 2);
+        e.left(); // cursor in the middle (after 'b')
+        e.backspace(); // deletes 'b', not the final 'c'
+        assert_eq!(e.text(), "ac");
+        assert_eq!(e.cursor, 1);
     }
 
     #[test]
