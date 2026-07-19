@@ -244,13 +244,22 @@ bwrap
   [--unshare-pid --pid]                 # if pid_isolation (default true)
   [--cap-drop ALL]                      # if drop_caps (default true)
   --die-with-parent
-  -- sh -c '<memory ulimit wrapper> exec <cmd>'
+  -- prlimit --as=<memory_mb*1024*1024> -- <cmd argv>   # memory cap via direct argv (see below)
 ```
 
-- **Memory limit.** bwrap has no direct RLIMIT flag, so the in-namespace payload
-  is wrapped: `sh -c 'ulimit -v <memory_mb*1024>; exec "$0" "$@"' sh -c <cmd>`.
-  (`ulimit -v` sets `RLIMIT_AS`; combined with `--unshare-pid` the limit is
-  scoped to the command's process tree.)
+- **Memory limit.** bwrap has no direct RLIMIT flag. We set `RLIMIT_AS` with
+  `prlimit` (util-linux), which execs the target via a **direct argv list** — no
+  shell, so the limit step is never interpreted by a shell. `prlimit --as`
+  takes bytes, so `memory_mb` is converted to `memory_mb * 1024 * 1024`. Both the
+  shell path (`sh -c <cmd>`) and the argv path (`<program> <argv…>`) are wrapped
+  the same way, so the cap is enforced on both. (`RLIMIT_AS` + `--unshare-pid`
+  scopes the limit to the command's process tree.)
+  - **Fallback.** If `prlimit` is absent on the host (it lives under `/usr/bin`,
+    bound read-only into the namespace), the shell path falls back to the shell
+    builtin `ulimit -v <memory_mb*1024>; exec sh -c <cmd>` (still a cap, but via
+    a shell). The argv path has no shell, so it simply runs uncapped when
+    `prlimit` is missing — matching the prior behavior where that path never
+    enforced a memory limit.
 - **Timeout vs memory.** If memory is exceeded the process is killed by the
   kernel (OOM within the limit), not by the timeout. The timeout covers hangs;
   the memory cap covers runaway allocation.
@@ -536,7 +545,7 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       `--unshare-net` (unless `network`); `--unshare-pid --pid`
       (if `pid_isolation`); `--cap-drop ALL` (if `drop_caps`);
       `--die-with-parent`.
-- [ ] Memory wrapper: `sh -c 'ulimit -v <MB>; exec …'` inside the namespace.
+- [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no shell); `ulimit -v` shell-builtin fallback when `prlimit` absent.
 - [ ] Default `enabled` to `true` only when bwrap detected; warn on
       enabled-but-absent.
 - [ ] Integration tests (tempfile): ro/rw remap round-trip; `network:false`

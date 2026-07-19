@@ -523,6 +523,65 @@ fn sh_single_quote(s: &str) -> String {
     out
 }
 
+/// Whether `prlimit` (util-linux) is available to set `RLIMIT_AS` via a direct
+/// argv exec. Cached after the first probe: `prlimit` lives under `/usr/bin`,
+/// which is bound read-only into every sandbox, so host availability implies
+/// in-namespace availability.
+fn prlimit_available() -> bool {
+    static AVAILABLE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::process::Command::new("prlimit")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    });
+    *AVAILABLE
+}
+
+/// Return the post-`--` argv that runs `target` under the configured memory cap
+/// (if any).
+///
+/// * With `prlimit` available: `prlimit --as=<bytes> -- <target…>` — a direct
+///   argv exec, so the limit step is never interpreted by a shell. Works for
+///   both the shell and argv execution paths.
+/// * Without `prlimit`: when `allow_shell_fallback` is set (the shell path,
+///   which already runs `sh -c`), prepend `ulimit -v <KB>; ` to the payload so
+///   the cap is still applied via the shell builtin. The argv path passes
+///   `false`, so it runs `target` uncapped (matching prior behavior, where the
+///   argv path never enforced a memory limit).
+fn memory_wrapped_target(
+    memory_mb: Option<u64>,
+    target: Vec<String>,
+    allow_shell_fallback: bool,
+) -> Vec<String> {
+    let Some(mb) = memory_mb else {
+        return target;
+    };
+    if prlimit_available() {
+        // `prlimit --as` takes bytes; the shell `ulimit -v` equivalent is KB.
+        let mut v = vec![
+            "prlimit".into(),
+            "--as".into(),
+            (mb * 1024 * 1024).to_string(),
+            "--".into(),
+        ];
+        v.extend(target);
+        return v;
+    }
+    if allow_shell_fallback {
+        // `target` is `sh -c <payload>`; prepend `ulimit -v` to the payload so
+        // the existing two-level shell still applies the cap. This reproduces
+        // the original `sh -c 'ulimit -v <KB>; exec sh -c <cmd>'` wrapper
+        // exactly (the limit is set before the inner shell is exec'd).
+        let payload = target.get(2).cloned().unwrap_or_default();
+        let kb = mb * 1024;
+        return vec!["sh".into(), "-c".into(), format!("ulimit -v {kb}; {payload}")];
+    }
+    target
+}
+
 /// Build the common bwrap argument vector shared by both execution paths:
 /// the read-only system dirs, the CWD/bindings, the scratch tmpfs, network/PID/
 /// capability isolation, and the sanitized environment. Callers append either
@@ -652,21 +711,23 @@ fn build_bwrap_expr(
     args.push(out_path.to_string_lossy().to_string());
     args.push("/tmp/.picocode-out".into());
 
-    // Build the in-namespace payload. Memory limit via RLIMIT_AS (ulimit -v),
-    // scoped to the command's process tree by the PID namespace. Combined
-    // output is redirected to the bound host temp file.
+    // The user command is a shell string, so it must run via `sh -c`. We use a
+    // two-level shell: the outer `sh -c` sets up the output redirection and
+    // `exec`s an inner `sh -c` that actually interprets the (single-quoted)
+    // user command, so pipes/redirections inside it work. `exec` replaces the
+    // outer shell so only one shell process runs the command.
     let cmd_quoted = sh_single_quote(&cmd);
-    let inner = if let Some(mb) = cfg.memory_mb {
-        let kb = mb * 1024;
-        format!("ulimit -v {kb}; exec sh -c {cmd_quoted}")
-    } else {
-        format!("exec sh -c {cmd_quoted}")
-    };
-    let payload = format!("{inner} > /tmp/.picocode-out 2>&1");
+    let payload = format!("exec sh -c {cmd_quoted} > /tmp/.picocode-out 2>&1");
+    let target: Vec<String> = vec!["sh".into(), "-c".into(), payload];
+
+    // Apply the memory cap as a `prlimit --as=…` wrapper when available (direct
+    // argv, no shell interpreting the limit). Fall back to the shell `ulimit`
+    // builtin, which reproduces the original `sh -c 'ulimit -v …; exec sh -c
+    // <cmd>'` wrapper exactly. See `memory_wrapped_target`.
+    let post = memory_wrapped_target(cfg.memory_mb, target, true);
+
     args.push("--".into());
-    args.push("sh".into());
-    args.push("-c".into());
-    args.push(payload);
+    args.extend(post);
 
     Ok(duct::cmd("bwrap", &args))
 }
@@ -676,16 +737,21 @@ fn build_bwrap_expr(
 /// verbatim to the program, so regex patterns and paths need no quoting or
 /// escaping and shell metacharacters are never interpreted. Output is captured
 /// directly by duct (bwrap forwards the child's stdio to its inherited fds).
+///
+/// The memory cap (if configured) is applied via `prlimit --as=…`, a direct
+/// argv exec — so this path now enforces `memory_mb`, which it previously did
+/// not.
 fn build_bwrap_expr_argv(
     argv: &[String],
     cfg: &SandboxConfig,
     read_only: bool,
 ) -> Result<duct::Expression, ToolError> {
     let mut args = build_bwrap_args(cfg, read_only)?;
+    // `false`: no shell is involved, so the `ulimit` fallback cannot apply;
+    // when `prlimit` is absent the cap is simply skipped (prior behavior).
+    let post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
     args.push("--".into());
-    for a in argv {
-        args.push(a.clone());
-    }
+    args.extend(post);
     Ok(duct::cmd("bwrap", &args))
 }
 
