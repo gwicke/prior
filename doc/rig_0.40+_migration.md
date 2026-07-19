@@ -439,57 +439,53 @@ works — they wire in like the non-OAuth providers). Two tiers:
   client-builder arm + catalog/default-model entries are added; the user
   supplies a browser-obtained token. `check_env!` was extended to OR multiple
   vars so copilot accepts either credential.
-- **Tier 2 — in-app interactive device-code OAuth (moderate, ~50–150 LoC):**
-  rig's `from_env()` with no token falls back to `ChatGPTAuth::OAuth` /
-  `CopilotAuth::OAuth`, which runs a **device-authorization flow** with
-  `on_device_code(handler)` (surfaces URL + user code) and `token_dir`/
-  `auth_file` (caches + auto-refreshes the token). picocode would: (a) register a
-  device-code handler that prints the verification URL + code (optionally opens
-  a browser); (b) wire `on_device_code(handler).token_dir(<picocode config dir>)`
-  into a **provider-specific `build!` arm** (like the anthropic/openrouter
-  caching arms, since the generic arm can't pass those); (c) optionally add a
-  `picocode login <provider>` subcommand. picocode does **not** implement the
-  OAuth protocol — rig's `auth` module handles token exchange, polling, and
-  refresh. Set `allow_device_flow(false)` for non-interactive/CI use so it errors
-  instead of hanging on a device code.
+- **Tier 2 — in-app interactive device-code OAuth (IMPLEMENTED):** the build
+  chain is `provider::Client::builder().oauth().token_dir(dir)
+  .allow_device_flow(true).build()` (note: rig only exposes the device-code
+  methods `oauth`/`token_dir`/`allow_device_flow`/`on_device_code` on the
+  **post-`oauth()`** builder type `ClientBuilder<ProviderBuilder, ProviderAuth,
+  H>`, so `.oauth()` must come first). `token_dir` is set to the settings `token/`
+  sub-directory (see below); `allow_device_flow(true)` is always on because the
+  flow only triggers on the explicit `oauth` sentinel (no silent fallback, so
+  CI-gating isn't needed). picocode does **not** implement the OAuth protocol —
+  rig's `auth` module handles token exchange, polling, refresh, and persistence.
+  - **Trigger (consistent with other providers):** keep `check_env!` requiring
+    the token env var (a provider is still "triggered by an env var"), and treat
+    the literal value `oauth` as the signal to run the device flow. So
+    `CHATGPT_ACCESS_TOKEN=oauth` (or `COPILOT_GITHUB_ACCESS_TOKEN=oauth`) →
+    interactive sign-in; any other value → direct token (Tier 1). This keeps
+    chatgpt/copilot consistent with every other provider (env-var triggered).
+  - **rig limitation — no custom device-code handler:** `on_device_code`'s
+    `DeviceCodePrompt` type is **private** in rig (`mod auth` is private in
+    `chatgpt/mod.rs` and `copilot/mod.rs`), so a custom handler (e.g. to print
+    the prompt to stderr instead of stdout) can't be passed without a small rig
+    change (make `DeviceCodePrompt` + `mod auth` `pub`). Rig's built-in default
+    handler prints the verification URL + code via `println!` (stdout). The token
+    caching still works; only the prompt destination is stdout. Upstream rig fix
+    would route it to stderr cleanly. A `picocode login <provider>` subcommand
+    remains a nice-to-have.
 
   #### Token storage (`token_dir`)
-  - rig persists credentials in its **own file**, not picocode's settings:
-    chatgpt → `<config_dir>/chatgpt/auth.json`
-    (`chatgpt/mod.rs:607`); copilot → `<config_dir>/github_copilot/`
-    (`access-token` + `api-key.json`, `copilot/mod.rs:1643`). `config_dir` =
-    `$XDG_CONFIG_HOME` / `$HOME/.config` (or `%APPDATA%`). Overridable via
-    `token_dir(dir)` / `auth_file(path)`.
-  - The record is a full OAuth cache (`access_token`, `refresh_token`,
-    `id_token`, `expires_at`, `account_id`, pretty JSON). The **refresh token
-    persists and auto-renews** — `auth_context_oauth` (`auth/native.rs`) reads
-    the cache, uses a valid access token, else refreshes it (rewriting the
-    cache), else (no cache / refresh failed) runs the device flow and writes the
-    new record. The browser step happens **once**; later runs just refresh.
-  - **Don't merge into the settings file.** Settings are non-secret config
-    (provider/model/persona); the refresh token is a secret. Point `token_dir`
-    at a picocode-owned credentials dir (e.g. `~/.config/picocode/credentials/
-    <provider>`) so tokens co-locate and the dir can be private + gitignored.
-  - **Permission caveat:** rig writes the file with default perms
-    (`ensure_parent_dir` only `create_dir_all`; no `0o600` chmod in
-    `auth/native.rs`), so the token file is typically world/group-readable.
-    Mitigate by creating the parent `token_dir` with `0o700`. Upstream fix: set
-    `0o600` on write.
+  - Token dir = `platform::app_config_dir().join("token").join(<provider>)`
+    (e.g. `~/.config/picocode/token/chatgpt/auth.json`), created with `0o700`
+    perms (see `create_private_dir` in `agent.rs`). This is separate from the
+    settings file, as recommended. rig persists the full OAuth cache
+    (`access_token`, `refresh_token`, `id_token`, `expires_at`, `account_id`)
+    and **auto-renews** the refresh token (`auth/native.rs`); the browser step
+    happens once.
+    (rig default without our `token_dir`: `<config_dir>/chatgpt/auth.json`
+    / `<config_dir>/github_copilot/`.)
+  - **Permission caveat:** rig writes the token file with default perms (no
+    `0o600` chmod in `auth/native.rs`); mitigated by making the `token/`
+    directory tree `0o700`.
 
-  #### "Login on startup" = the `from_env()` fallback (no extra logic)
-  - Simplest correct design: **drop the hard `check_env!`** for chatgpt/copilot
-    and let `from_env()` decide — token env var present → used directly (Tier 1,
-    no file, no browser); absent → device OAuth (Tier 2). The flow is **lazy**
-    (first `create_agent`/request), so there is no separate login step. Tier 1
-    token presence *avoids* OAuth; its absence makes OAuth run automatically on
-    first use and cache the token. Sufficient on its own.
-  - **Interactivity gating:** the device flow needs a TTY/user. In
-    non-interactive/CI (`--quiet`, piped stdin) set `allow_device_flow(false)`
-    so it errors cleanly ("sign-in required") instead of hanging. picocode
-    already tracks interactive vs `--quiet`.
+  #### "Login on startup" = explicit `oauth` sentinel (no extra logic)
+  - Because the `check_env!` requirement + `oauth` sentinel already make the
+    device flow explicit and lazy (first `create_agent`/request), there is no
+    separate login step or `from_env()` fallback needed. Setting the token env
+    var to `oauth` *triggers* the flow; any real token *avoids* it.
 
-**Status:** Tier 1 implemented. Tier 2 (interactive device-code OAuth) is
-  deferred unless passwordless `picocode login` is wanted.
+**Status:** Tier 1 and Tier 2 both implemented for `chatgpt`/`copilot`.
 
 ### 7.7 Open follow-ups (not required for the upgrade)
 - "Strip reasoning from persisted history" toggle (esp. for Anthropic, which

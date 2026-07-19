@@ -30,6 +30,7 @@ use rig_core::providers::{
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Arc;
 use async_trait::async_trait;
 
@@ -194,10 +195,33 @@ pub struct AgentConfig {
     pub sandbox: Option<crate::config::SandboxConfig>,
 }
 
+/// Sentinel env-var value that triggers the interactive device-code OAuth
+/// flow instead of using a literal token. Consistent with the other providers:
+/// the env var must be set; its value decides the auth method.
+const OAUTH_TOKEN: &str = "oauth";
+
+/// Create `dir` (and parents) with restrictive `0o700` permissions on Unix so a
+/// cached OAuth refresh token is not world/group readable. On other platforms we
+/// just create it.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    Ok(())
+}
+
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
     let think_json = thinking::mapping_opt(&provider, config.thinking_level.as_deref());
+
+    // OAuth credentials live in a `token` sub-directory of the settings dir
+    // (see `platform::app_config_dir`), kept private so refresh tokens aren't
+    // world-readable. Created up front so the per-provider subdirs inherit it.
+    let token_base = crate::platform::app_config_dir().map(|d| d.join("token"));
+    if let Some(base) = &token_base {
+        let _ = create_private_dir(base);
+    }
 
     macro_rules! build {
         // Anthropic: enable automatic prompt caching so the static prefix
@@ -289,11 +313,57 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         }
         "chatgpt" => {
             check_env!("CHATGPT_ACCESS_TOKEN");
-            build!(chatgpt::Client::from_env()?)
+            let token = std::env::var("CHATGPT_ACCESS_TOKEN").unwrap();
+            if token == OAUTH_TOKEN {
+                let dir = token_base.as_ref().map(|b| b.join("chatgpt"));
+                if let Some(d) = &dir {
+                    let _ = create_private_dir(d);
+                }
+                // Device-code prompt is surfaced by rig's default handler (the
+                // `DeviceCodePrompt` type is private, so a custom stderr handler
+                // can't be passed without a rig change). `token_dir` routes the
+                // cached refresh token into the settings `token` sub-directory.
+                let client = match dir {
+                    Some(d) => chatgpt::Client::builder()
+                        .oauth()
+                        .token_dir(d)
+                        .allow_device_flow(true)
+                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                    None => chatgpt::Client::builder()
+                        .oauth()
+                        .allow_device_flow(true)
+                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                };
+                build!(client)
+            } else {
+                build!(chatgpt::Client::from_env()?)
+            }
         }
         "copilot" => {
             check_env!("GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN");
-            build!(copilot::Client::from_env()?)
+            let oauth = ["GITHUB_COPILOT_API_KEY", "COPILOT_GITHUB_ACCESS_TOKEN"]
+                .iter()
+                .any(|v| std::env::var(v).as_deref() == Ok(OAUTH_TOKEN));
+            if oauth {
+                let dir = token_base.as_ref().map(|b| b.join("copilot"));
+                if let Some(d) = &dir {
+                    let _ = create_private_dir(d);
+                }
+                let client = match dir {
+                    Some(d) => copilot::Client::builder()
+                        .oauth()
+                        .token_dir(d)
+                        .allow_device_flow(true)
+                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                    None => copilot::Client::builder()
+                        .oauth()
+                        .allow_device_flow(true)
+                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                };
+                build!(client)
+            } else {
+                build!(copilot::Client::from_env()?)
+            }
         }
         "deepseek" => {
             check_env!("DEEPSEEK_API_KEY");
@@ -857,7 +927,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
 mod tests {
     use rig_core::message::Reasoning;
 
-    use super::reasoning_text;
+    use super::{create_private_dir, reasoning_text};
 
     #[test]
     fn reasoning_text_extracts_text_block() {
@@ -869,5 +939,18 @@ mod tests {
     fn reasoning_text_extracts_text_with_signature() {
         let r = Reasoning::new_with_signature("with sig", Some("sig".to_string()));
         assert_eq!(reasoning_text(&r), "with sig");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_sets_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("picocode_token_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

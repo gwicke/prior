@@ -12,7 +12,8 @@ struct Args {
     #[arg(index = 1)]
     prompt: Option<String>,
 
-    /// LLM provider (anthropic, openai, azure, cohere, chatgpt, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, mira, minimax, mistral, moonshot, ollama, openrouter, perplexity, together, xai, xiaomimimo, zai)
+    /// LLM provider (anthropic, openai, azure, cohere, chatgpt, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, mira, minimax, mistral, moonshot, ollama, openrouter, perplexity, together, xai, xiaomimimo, zai).
+    /// For chatgpt/copilot, set the token env var to `oauth` to sign in interactively (device-code flow); the cached refresh token is stored under the settings `token/` directory.
     #[arg(short, long, global = true)]
     provider: Option<String>,
 
