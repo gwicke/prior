@@ -1902,7 +1902,7 @@ dependencies = [
 [[package]]
 name = "rig-derive"
 version = "0.40.0"
-source = "git+https://github.com/gwicke/rig.git?rev=87f3f5b7#87f3f5b77a3caeffa10d60225c41e386753bf05e"
+source = "git+https://github.com/gwicke/rig.git?rev=87f3f5b7#f31c38c2160e0c07fcfb005a68574cd7311351e4"
 dependencies = [
  "convert_case 0.11.0",
  "indoc",
