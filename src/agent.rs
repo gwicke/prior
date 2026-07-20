@@ -1079,6 +1079,68 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 if input == "/q" || input == "exit" {
                     break;
                 }
+                // User-initiated shell command. `!cmd` runs `cmd` in the
+                // sandbox and captures its output into the session context (so
+                // the LLM sees it on the next turn); `!!cmd` runs and displays
+                // it but does NOT add it to context. Both reuse the same
+                // `run_sandboxed` helper (and therefore the same bwrap sandbox
+                // + timeout policy) as the LLM's `bash` tool, so user- and
+                // model-initiated shelling are identical. No confirmation is
+                // required: the user typed it explicitly, unlike the
+                // LLM-initiated tool call. This skips the LLM prompt entirely.
+                if input.starts_with("!!") || input.starts_with('!') {
+                    let (capture, cmd) = if input.starts_with("!!") {
+                        (false, &input[2..])
+                    } else {
+                        (true, &input[1..])
+                    };
+                    let cmd = cmd.trim();
+                    // Reprint the submitted command (cleared by `read_input`).
+                    config.output.display_plain(&input);
+                    config.output.display_separator();
+                    if cmd.is_empty() {
+                        config
+                            .output
+                            .display_plain("Usage: !<command> (capture output into context), or !!<command> (display only)");
+                    } else {
+                        match crate::tools::run_sandboxed(cmd, None).await {
+                            Ok(out) => {
+                                let out = out.trim();
+                                if out.is_empty() {
+                                    config.output.display_plain("(no output)");
+                                } else {
+                                    config.output.display_plain(out);
+                                }
+                                if capture {
+                                    // Mirror a normal turn so the model sees
+                                    // both the command and its result: a user
+                                    // message naming the command, plus an
+                                    // assistant message carrying the captured
+                                    // output.
+                                    history.push(Message::user(format!(
+                                        "Ran shell command: {cmd}"
+                                    )));
+                                    history.push(Message::Assistant {
+                                        id: None,
+                                        content: OneOrMany::one(AssistantContent::Text(
+                                            Text::new(out.to_string()),
+                                        )),
+                                    });
+                                } else {
+                                    config.output.display_plain(
+                                        "(output was displayed but not added to context)",
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                config
+                                    .output
+                                    .display_text(&format!("shell error: {}", e));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
                 // to do for that keyword.

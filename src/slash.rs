@@ -112,6 +112,9 @@ pub fn render_help() -> String {
     for c in registry() {
         s.push_str(&format!("  {:<10} — {}\n", c.name, c.help));
     }
+    s.push_str("\nShell:\n");
+    s.push_str("  !cmd        run `cmd` in the sandbox; output is shown AND added to context\n");
+    s.push_str("  !!cmd       run `cmd` in the sandbox; output is shown ONLY (not in context)\n");
     s.push_str("\nKey bindings:\n");
     s.push_str("  Enter        submit line\n");
     s.push_str("  Shift-Enter  newline (multi-line). On any xterm-compatible\n");
