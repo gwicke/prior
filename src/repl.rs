@@ -1194,6 +1194,10 @@ impl Repl {
                 ValueCandidate { display: "indicator".into(), value: "indicator".into(), desc: "show only a Thinking… spinner".into() },
                 ValueCandidate { display: "content".into(), value: "content".into(), desc: "show the reasoning text (default)".into() },
             ],
+            SettingKey::ReasoningInContext => vec![
+                ValueCandidate { display: "true".into(), value: "true".into(), desc: "keep reasoning blocks in the session context".into() },
+                ValueCandidate { display: "false".into(), value: "false".into(), desc: "drop reasoning from context to save tokens (default)".into() },
+            ],
         }
     }
 

@@ -202,6 +202,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
+    let reasoning_in_context = config.reasoning_in_context.unwrap_or(false);
     let output: Arc<dyn picocode::Output> = if quiet {
         Arc::new(picocode::QuietOutput::new(show_reasoning_handle.clone()))
     } else {
@@ -239,6 +240,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sandbox,
         show_reasoning_handle,
+        reasoning_in_context,
     };
     let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {

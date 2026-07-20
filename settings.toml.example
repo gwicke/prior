@@ -9,6 +9,7 @@ tool_call_limit = 50
 default_persona = "architect"      # built-in name or file path; omit for none
 default_thinking_level = "off"     # off | low | med | high
 show_reasoning = "content"         # disabled | indicator | content
+reasoning_in_context = false       # keep reasoning in session context (true | false)
 
 # Custom agent prompt (replaces the default "Concise coding assistant" prompt)
 # agent_prompt = "You are a senior software engineer specialized in Rust and systems programming."

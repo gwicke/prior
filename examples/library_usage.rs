@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         show_reasoning_handle: picocode::settings::default_show_reasoning_handle(),
+        reasoning_in_context: false,
     }).await?;
 
     println!("Running agent in silent mode...");

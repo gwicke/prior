@@ -19,6 +19,8 @@ use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
 use rig_core::completion::{CompletionModel, PromptError};
 use rig_core::message::Message;
+use rig_core::message::{AssistantContent, Text};
+use rig_core::OneOrMany;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
 use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
@@ -148,7 +150,14 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         // (fixing root cause #1, which previously *replaced* the whole history
         // and dropped every earlier exchange) and, on cancellation, replaces
         // with the in-flight full history (root cause #2).
-        persist_turn(&mut history, final_history, cancelled_history);
+        persist_turn(
+            &mut history,
+            final_history,
+            cancelled_history,
+            self.reasoning_in_context,
+            &self.provider,
+            &self.model,
+        );
 
         if aborted {
             return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
@@ -202,18 +211,73 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
     ///   partial assistant text). Replaces `history` rather than appending, since
     ///   it already contains the prior turns; appending would duplicate them. This
     ///   is the root-cause-#2 fix.
+    /// * `reasoning_in_context` — when `false`, `Reasoning` blocks are stripped
+    ///   from assistant messages before they enter the stored context (a cheap,
+    ///   deterministic "Level 0" compaction that saves tokens). Ignored for
+    ///   Anthropic-family providers (`provider`/`model` satisfy
+    ///   [`is_anthropic_family`]), which require reasoning to be replayed verbatim
+    ///   on the next turn (thinking+tool_use contract), so reasoning is always
+    ///   kept there.
     fn persist_turn(
         history: &mut Option<&mut Vec<Message>>,
         final_history: Option<Vec<Message>>,
         cancelled_history: Option<Vec<Message>>,
+        reasoning_in_context: bool,
+        provider: &str,
+        model: &str,
     ) {
         if let Some(h) = history {
             if let Some(fh) = final_history {
-                h.extend(fh);
+                let to_commit = maybe_strip_reasoning(fh, reasoning_in_context, provider, model);
+                h.extend(to_commit);
             } else if let Some(ch) = cancelled_history {
-                **h = ch;
+                let to_commit = maybe_strip_reasoning(ch, reasoning_in_context, provider, model);
+                **h = to_commit;
             }
         }
+    }
+
+    /// Strip `AssistantContent::Reasoning` blocks when reasoning should *not* be
+    /// kept in context. Returns the messages unchanged when `reasoning_in_context`
+    /// is `true` or the provider is Anthropic-family. Assistant messages left
+    /// empty by the filter get a placeholder `Text` so the message stays
+    /// well-formed and user/assistant alternation holds.
+    fn maybe_strip_reasoning(
+        messages: Vec<Message>,
+        reasoning_in_context: bool,
+        provider: &str,
+        model: &str,
+    ) -> Vec<Message> {
+        if reasoning_in_context || is_anthropic_family(provider, model) {
+            return messages;
+        }
+        messages
+            .into_iter()
+            .map(|m| match m {
+                Message::Assistant { id, content } => {
+                    let kept: Vec<AssistantContent> = content
+                        .into_iter()
+                        .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
+                        .collect();
+                    let content = if kept.is_empty() {
+                        OneOrMany::one(AssistantContent::Text(Text::new("[reasoning stripped]")))
+                    } else {
+                        OneOrMany::many(kept)
+                            .expect("assistant content non-empty after filtering reasoning")
+                    };
+                    Message::Assistant { id, content }
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    /// Whether `provider`/`model` refers to an Anthropic-family model, for which
+    /// reasoning must be kept in context (the thinking+tool_use replay contract).
+    /// Covers direct `anthropic` and OpenRouter routing to `anthropic/*` models.
+    fn is_anthropic_family(provider: &str, model: &str) -> bool {
+        provider.eq_ignore_ascii_case("anthropic")
+            || (provider.eq_ignore_ascii_case("openrouter") && model.starts_with("anthropic/"))
     }
 
     fn is_tool_available(tool: &str) -> bool {
@@ -236,6 +300,7 @@ pub struct CodeAgent<M: CompletionModel> {
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
     thinking_level: Option<String>,
+    reasoning_in_context: bool,
 }
 
 #[derive(Clone)]
@@ -263,6 +328,10 @@ pub struct AgentConfig {
     /// holds a clone and reads it on every thinking event, so `/set
     /// show_reasoning …` updates the rendering immediately (no agent rebuild).
     pub show_reasoning_handle: crate::settings::ShowReasoningHandle,
+    /// Whether reasoning blocks are kept in the stored session context. `false`
+    /// drops them at store time (cheap token savings); forced `true` for
+    /// Anthropic-family providers (thinking+tool_use replay contract).
+    pub reasoning_in_context: bool,
 }
 
 /// Sentinel env-var value that triggers the interactive device-code OAuth
@@ -341,6 +410,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.persona_name,
                 config.user_cancel.clone(),
                 config.thinking_level.clone(),
+                config.reasoning_in_context,
             ))
         }};
     }
@@ -1024,6 +1094,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
         thinking_level: Option<String>,
+        reasoning_in_context: bool,
     ) -> Self {
         Self {
             agent,
@@ -1035,6 +1106,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             persona_name,
             user_cancel,
             thinking_level,
+            reasoning_in_context,
         }
     }
 }
@@ -1043,8 +1115,10 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
 mod tests {
     use rig_core::message::Reasoning;
 
-    use super::{create_private_dir, persist_turn, reasoning_text};
+    use super::{create_private_dir, is_anthropic_family, maybe_strip_reasoning, persist_turn, reasoning_text};
     use rig_core::message::Message;
+use rig_core::message::{AssistantContent, Text};
+use rig_core::OneOrMany;
 
     #[test]
     fn reasoning_text_extracts_text_block() {
@@ -1085,6 +1159,9 @@ mod tests {
                 Message::assistant("turn-2-reply"),
             ]),
             None,
+            true,
+            "openai",
+            "",
         );
 
         // Prior turn preserved, new turn appended (not wiped/replaced).
@@ -1113,7 +1190,7 @@ mod tests {
             Message::user("aborted-prompt"),
             Message::assistant("aborted-partial"),
         ];
-        persist_turn(&mut Some(&mut hist), None, Some(cancelled));
+        persist_turn(&mut Some(&mut hist), None, Some(cancelled), true, "openai", "");
 
         // Replaced (not appended): exactly the in-flight full history, with no
         // duplicate of `prior-1`.
@@ -1124,5 +1201,54 @@ mod tests {
         );
         assert!(hist.contains(&Message::user("aborted-prompt")));
         assert!(hist.contains(&Message::assistant("aborted-partial")));
+    }
+
+    // `reasoning_in_context=false` must drop reasoning blocks from assistant
+    // messages for non-Anthropic providers, while keeping text (and keeping
+    // reasoning entirely for Anthropic-family or when the flag is true).
+    #[test]
+    fn strips_reasoning_for_non_anthropic_when_disabled() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(Reasoning::new("hidden thought")),
+                AssistantContent::Text(Text::new("answer")),
+            ])
+            .unwrap(),
+        };
+        let msgs = vec![Message::user("q"), assistant];
+
+        // Disabled + non-Anthropic: reasoning dropped, text preserved.
+        let out = maybe_strip_reasoning(msgs.clone(), false, "openai", "");
+        if let Message::Assistant { content, .. } = &out[1] {
+            assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
+        } else {
+            panic!("expected assistant message");
+        }
+
+        // Enabled: reasoning kept.
+        let kept = maybe_strip_reasoning(msgs.clone(), true, "openai", "");
+        if let Message::Assistant { content, .. } = &kept[1] {
+            assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        } else {
+            panic!("expected assistant message");
+        }
+
+        // Anthropic-family: reasoning forced to be kept despite disabled.
+        let forced = maybe_strip_reasoning(msgs, false, "anthropic", "claude-3-5-sonnet");
+        if let Message::Assistant { content, .. } = &forced[1] {
+            assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        } else {
+            panic!("expected assistant message");
+        }
+    }
+
+    #[test]
+    fn is_anthropic_family_classifies_providers() {
+        assert!(is_anthropic_family("anthropic", "claude-x"));
+        assert!(is_anthropic_family("openrouter", "anthropic/claude-3.5-sonnet"));
+        assert!(!is_anthropic_family("openrouter", "openai/gpt-4o"));
+        assert!(!is_anthropic_family("openai", "gpt-4o"));
     }
 }

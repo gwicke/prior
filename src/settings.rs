@@ -95,6 +95,8 @@ pub enum SettingKey {
     DefaultThinking,
     /// `disabled` | `indicator` | `content`.
     ShowReasoning,
+    /// `true` | `false` — keep reasoning blocks in the session context.
+    ReasoningInContext,
 }
 
 /// How a setting's *value* may be completed. Drive a value-autocomplete
@@ -155,6 +157,12 @@ pub static SETTINGS: &[SettingMeta] = &[
         description: "How reasoning is shown: disabled | indicator | content",
         kind: ValueKind::Enum(&["disabled", "indicator", "content"]),
     },
+    SettingMeta {
+        key: SettingKey::ReasoningInContext,
+        name: "reasoning_in_context",
+        description: "Keep reasoning in session context: true | false",
+        kind: ValueKind::Enum(&["true", "false"]),
+    },
 ];
 
 /// In-memory mirror of the five managed settings, plus the optional file to
@@ -168,6 +176,9 @@ pub struct SettingsStore {
     pub default_thinking_level: String,
     /// `disabled` | `indicator` | `content` (how reasoning is shown).
     pub show_reasoning: String,
+    /// `true` keeps reasoning blocks in the stored session context; `false`
+    /// (default) drops them to save tokens. Forced `true` for Anthropic models.
+    pub reasoning_in_context: bool,
     pub path: Option<PathBuf>,
 }
 
@@ -195,6 +206,7 @@ impl SettingsStore {
                 .unwrap()
                 .as_str()
                 .to_string(),
+            reasoning_in_context: cfg.reasoning_in_context,
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -220,6 +232,7 @@ impl SettingsStore {
                 .and_then(|s| ShowReasoning::parse_opt(&s))
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "content".to_string()),
+            reasoning_in_context: cfg.reasoning_in_context.unwrap_or(false),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -251,6 +264,7 @@ impl SettingsStore {
         if let Ok(mode) = self.show_reasoning.parse::<ShowReasoning>() {
             *cfg.show_reasoning_handle.lock().unwrap() = mode;
         }
+        cfg.reasoning_in_context = self.reasoning_in_context;
     }
 
     /// Load from `path`, falling back to built-in defaults when the file is
@@ -274,6 +288,7 @@ impl SettingsStore {
             SettingKey::DefaultPersona => self.default_persona.clone().unwrap_or_default(),
             SettingKey::DefaultThinking => self.default_thinking_level.clone(),
             SettingKey::ShowReasoning => self.show_reasoning.clone(),
+            SettingKey::ReasoningInContext => self.reasoning_in_context.to_string(),
         }
     }
 
@@ -330,6 +345,13 @@ impl SettingsStore {
                 .parse::<ShowReasoning>()
                 .map(|_| ())
                 .map_err(|e| e),
+            SettingKey::ReasoningInContext => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "false" => Ok(()),
+                other => Err(format!(
+                    "reasoning_in_context must be true or false (got '{}')",
+                    other
+                )),
+            },
         }
     }
 
@@ -402,6 +424,10 @@ impl SettingsStore {
             "show_reasoning",
             toml_edit::value(self.show_reasoning.clone()),
         );
+        table.insert(
+            "reasoning_in_context",
+            toml_edit::value(self.reasoning_in_context),
+        );
         // Ensure the parent directory (e.g. ~/.config/picocode) exists before
         // writing, mirroring how the history file is created.
         if let Some(parent) = path.parent() {
@@ -430,6 +456,10 @@ impl SettingsStore {
             }
             SettingKey::ShowReasoning => {
                 self.show_reasoning = normalize_show_reasoning(value).to_string()
+            }
+            SettingKey::ReasoningInContext => {
+                self.reasoning_in_context =
+                    matches!(value.trim().to_ascii_lowercase().as_str(), "true")
             }
         }
     }
@@ -469,6 +499,7 @@ mod tests {
             default_persona: Some("architect".into()),
             default_thinking_level: "off".into(),
             show_reasoning: "content".into(),
+            reasoning_in_context: false,
             path: Some(path.to_path_buf()),
         }
     }
@@ -519,6 +550,13 @@ mod tests {
     }
 
     #[test]
+    fn validate_reasoning_in_context() {
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "true").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "FALSE").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "bogus").is_err());
+    }
+
+    #[test]
     fn show_reasoning_parse_and_default() {
         assert_eq!(ShowReasoning::default(), ShowReasoning::Content);
         assert_eq!("disabled".parse::<ShowReasoning>().unwrap(), ShowReasoning::Disabled);
@@ -550,6 +588,7 @@ mod tests {
             user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: None,
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
+            reasoning_in_context: false,
         };
         // Mutate every setting, then apply.
         s.set_value(SettingKey::DefaultModel, "openrouter:tencent/hy3:free")
@@ -559,6 +598,7 @@ mod tests {
         s.set_value(SettingKey::DefaultPersona, "architect").unwrap();
         s.set_value(SettingKey::DefaultThinking, "high").unwrap();
         s.set_value(SettingKey::ShowReasoning, "indicator").unwrap();
+        s.set_value(SettingKey::ReasoningInContext, "true").unwrap();
         s.apply_to_config(&mut cfg);
         assert_eq!(cfg.provider, "openrouter");
         assert_eq!(cfg.model, "tencent/hy3:free");
@@ -572,6 +612,9 @@ mod tests {
             *cfg.show_reasoning_handle.lock().unwrap(),
             crate::settings::ShowReasoning::Indicator
         );
+
+        // reasoning_in_context is applied from the store value.
+        assert!(cfg.reasoning_in_context, "reasoning_in_context should be true after /set");
 
         // "off" thinking level maps back to `None`.
         s.set_value(SettingKey::DefaultThinking, "off").unwrap();
@@ -588,7 +631,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().join("picocode.toml").as_path());
         let all = s.overlay_rows("");
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         let filtered = s.overlay_rows("model");
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.key, SettingKey::DefaultModel);
@@ -667,8 +710,8 @@ mod tests {
         let opts: Vec<String> = table.render(200);
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
-        // title + 6 single-line options (pre-formatted rows are NOT wrapped).
-        assert_eq!(lines.len(), 7, "pre-formatted rows must not be word-wrapped");
+        // title + 7 single-line options (pre-formatted rows are NOT wrapped).
+        assert_eq!(lines.len(), 8, "pre-formatted rows must not be word-wrapped");
         // Strip ANSI so visible column positions compare cleanly (the selected
         // row carries an extra color escape that must not affect alignment).
         fn strip_ansi(s: &str) -> String {

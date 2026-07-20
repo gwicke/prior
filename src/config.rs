@@ -32,6 +32,14 @@ pub struct Config {
     /// How reasoning is shown: `disabled` | `indicator` | `content`.
     #[serde(default)]
     pub show_reasoning: Option<String>,
+    /// Whether reasoning content is included in the session context (the
+    /// conversation history sent to the model). `false` (default) drops
+    /// `AssistantContent::Reasoning` blocks from stored history to save tokens;
+    /// `true` keeps them. Ignored/forced `true` for Anthropic-family providers,
+    /// which require reasoning to be replayed verbatim (thinking+tool_use
+    /// contract). See `doc/compaction.md`.
+    #[serde(default)]
+    pub reasoning_in_context: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

@@ -448,6 +448,7 @@ tool_call_limit = 50
 default_persona = "architect"      # omit for no persona
 default_thinking_level = "off"     # off | low | med | high
 show_reasoning = "content"         # disabled | indicator | content
+reasoning_in_context = false       # keep reasoning in session context (true | false)
 ```
 
 `SettingsStore` reads these into its typed fields (via `Config`/`toml_edit::de`);
