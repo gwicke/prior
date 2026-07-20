@@ -12,6 +12,7 @@ pub mod repl;
 pub mod model_catalog;
 pub mod thinking;
 pub mod table;
+pub mod sandbox_bindings;
 pub mod settings;
 
 pub use config::{Config, Recipe, ToolSettings};

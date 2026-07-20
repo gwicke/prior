@@ -1084,6 +1084,28 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
             }
+            InputAction::Sandbox(sub, path) => {
+                let result = match sub.as_str() {
+                    "add_ro" => crate::sandbox_bindings::add_ro(&path),
+                    "add_rw" => crate::sandbox_bindings::add_rw(&path),
+                    "remove" => crate::sandbox_bindings::remove(&path),
+                    _ => Err(format!("unknown sandbox subcommand: {}", sub)),
+                };
+                match result {
+                    Ok(()) => {
+                        // Re-publish the sandbox config with session bindings merged.
+                        let mut merged = config.sandbox.clone().unwrap_or_default();
+                        crate::sandbox_bindings::merge_into(&mut merged);
+                        crate::tools::set_sandbox(Some(merged));
+                        let msg = format!("sandbox: {} {} (ok)", sub, path);
+                        config.output.display_plain(&msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("sandbox error: {}", e);
+                        config.output.display_plain(&msg);
+                    }
+                }
+            }
             InputAction::Submit(input) => {
                 if input.is_empty() {
                     continue;

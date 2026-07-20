@@ -230,6 +230,8 @@ pub enum InputAction {
     SetPersona(String),
     /// Quit the session.
     Quit,
+    /// Sandbox operation: (subcommand, path).
+    Sandbox(String, String),
 }
 
 /// Context the REPL needs to render slash overlays and to re-emit recent
@@ -472,6 +474,7 @@ impl Repl {
                     after,
                     "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
                         | "s" | "persona" | "personas" | "p" | "stat" | "stats"
+                        | "sandbox" | "sb"
                 ) {
                     (after, "")
                 } else {
@@ -618,6 +621,13 @@ impl Repl {
                                 ctx.session_usage,
                             );
                             active = None;
+                        }
+                        "sandbox" | "sb" => {
+                            kind = 8;
+                            title = "Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
+                            cur_word = "sandbox".into();
+                            cur_filter = rest.trim().to_string();
+                            Self::sandbox_overlay_entries(&cur_filter, &mut opts, &mut active);
                         }
                         _ => {
                             kind = 1;
@@ -808,6 +818,44 @@ impl Repl {
                                             editor.set(&Self::replace_last_token(&buf, &tok));
                                         }
                                     }
+                                    8 => {
+                                        let buf = editor.text();
+                                        // Determine if we're completing a subcommand or a path.
+                                        let after = &buf["/sandbox".len()..].trim();
+                                        if let Some((sub, rest)) = after.split_once(' ') {
+                                            let rest = rest.trim();
+                                            match sub {
+                                                "add_ro" | "add_rw" => {
+                                                    if !rest.is_empty() {
+                                                        let completions = Self::complete_path_prefix(rest);
+                                                        if let Some(c) = completions.get(sel) {
+                                                            editor.set(&Self::replace_last_token(&buf, c));
+                                                        }
+                                                    }
+                                                }
+                                                "remove" => {
+                                                    if !rest.is_empty() {
+                                                        let binds = crate::sandbox_bindings::list();
+                                                        let filtered: Vec<_> = crate::fuzzy::fuzzy_filter(
+                                                            &binds, rest,
+                                                            |b| b.host_path.to_string_lossy().to_string(),
+                                                        );
+                                                        if let Some(r) = filtered.get(sel) {
+                                                            let path = r.item.host_path.to_string_lossy().to_string();
+                                                            editor.set(&Self::replace_last_token(&buf, &path));
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        } else {
+                                            // Complete the subcommand.
+                                            let subcommands = ["add_ro", "add_rw", "remove"];
+                                            if let Some(c) = subcommands.get(sel) {
+                                                editor.set(&format!("/sandbox {} ", c));
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -848,6 +896,9 @@ impl Repl {
                                                         // commit/submission — Esc or clearing the
                                                         // input closes it.
                                                         editor.set("/stat ");
+                                                    }
+                                                    slash::SlashKind::Sandbox => {
+                                                        editor.set("/sandbox ");
                                                     }
                                                 }
                                             }
@@ -961,6 +1012,28 @@ impl Repl {
                                                 }
                                             }
                                         }
+                                        8 => {
+                                            let buf = editor.text();
+                                            let after = &buf["/sandbox".len()..].trim();
+                                            if let Some((sub, path)) = after.split_once(' ') {
+                                                let path = path.trim();
+                                                match sub {
+                                                    "add_ro" | "add_rw" | "remove" => {
+                                                        if !path.is_empty() {
+                                                            let line = format!("/sandbox {} {}", sub, path);
+                                                            Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
+                                                            return Some(InputAction::Sandbox(sub.to_string(), path.to_string()));
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            // No path yet: complete the subcommand with a trailing space.
+                                            let subcommands = ["add_ro", "add_rw", "remove"];
+                                            if let Some(c) = subcommands.get(sel) {
+                                                editor.set(&format!("/sandbox {} ", c));
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -987,6 +1060,9 @@ impl Repl {
                                     editor.set("");
                                 }
                                 7 => {
+                                    editor.set("");
+                                }
+                                8 => {
                                     editor.set("");
                                 }
                                 _ => {}
@@ -1407,6 +1483,111 @@ impl Repl {
         }
     }
 
+    /// Build the `/sandbox` overlay rows for `filter`.
+    ///
+    /// When `filter` is empty, shows the three sub-commands (add_ro, add_rw, remove).
+    /// When `filter` starts with a sub-command + space, shows file-path completions
+    /// (for add_ro/add_rw) or the current session bindings (for remove).
+    fn sandbox_overlay_entries(
+        filter: &str,
+        opts: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        let subcommands = [
+            ("add_ro", "Make path available read-only"),
+            ("add_rw", "Make path available read-write"),
+            ("remove", "Remove a path from the bindings"),
+        ];
+
+        if filter.trim().is_empty() {
+            // Show the three sub-commands.
+            for (name, help) in &subcommands {
+                opts.push(format!("{:<10} {}", name, help));
+            }
+            *active = None;
+            return;
+        }
+
+        let (sub, path) = if let Some((w, r)) = filter.split_once(' ') {
+            (w, r)
+        } else {
+            // Fuzzy-filter on sub-commands.
+            for (name, help) in &subcommands {
+                if name.starts_with(filter) || help.contains(filter) {
+                    opts.push(format!("{:<10} {}", name, help));
+                }
+            }
+            if opts.is_empty() {
+                opts.push("(no matching command)".into());
+            }
+            *active = None;
+            return;
+        };
+
+        match sub {
+            "add_ro" | "add_rw" => {
+                let path = path.trim();
+                if path.is_empty() {
+                    opts.push("(type a path and press Tab to complete)".into());
+                    *active = None;
+                    return;
+                }
+                // Show file path completions.
+                let completions = Self::complete_path_prefix(path);
+                if completions.is_empty() {
+                    opts.push("(no matching path)".into());
+                } else {
+                    for c in &completions {
+                        opts.push(c.clone());
+                    }
+                }
+                *active = None;
+            }
+            "remove" => {
+                let path = path.trim();
+                let binds = crate::sandbox_bindings::list();
+                if binds.is_empty() {
+                    opts.push("(no session bindings to remove)".into());
+                    *active = None;
+                    return;
+                }
+                let filtered: Vec<_> = if path.is_empty() {
+                    binds
+                } else {
+                    crate::fuzzy::fuzzy_filter(&binds, path, |b| {
+                        b.host_path.to_string_lossy().to_string()
+                    })
+                    .into_iter()
+                    .map(|r| r.item.clone())
+                    .collect()
+                };
+                if filtered.is_empty() {
+                    opts.push("(no matching bindings)".into());
+                } else {
+                    for b in &filtered {
+                        let mode = if b.mode == crate::config::BindMode::Ro {
+                            "ro"
+                        } else {
+                            "rw"
+                        };
+                        opts.push(format!("{}  ({})", b.host_path.display(), mode));
+                    }
+                }
+                *active = None;
+            }
+            _ => {
+                opts.push("(unknown subcommand: use add_ro, add_rw, or remove)".into());
+                *active = None;
+            }
+        }
+    }
+
+    /// Complete a file path prefix by listing the parent directory.
+    /// Returns matching paths (absolute) that start with `prefix`.
+    /// If `prefix` is empty, returns nothing (the user must type at least a `/`).
+    fn complete_path_prefix(prefix: &str) -> Vec<String> {
+        complete_path_prefix_impl(prefix)
+    }
 
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
     /// only for terminal actions (Enter submits, Esc cancels the line,
@@ -1519,6 +1700,67 @@ impl Repl {
     }
 
 
+}
+
+/// Generic file-path prefix completion. Lists the parent directory of `prefix`
+/// and returns entries whose file name starts with the stem of `prefix`.
+/// Directories get a trailing `/`.
+///
+/// When `prefix` is an existing directory (or ends with `/`), lists the full
+/// contents of that directory (no stem filtering).  This makes `/tmp<tab>`
+/// show everything under `/tmp`, not just entries starting with `"tmp"`.
+///
+/// This is a public free function so it can be used by the regular prompt input
+/// (e.g. when the user types `/tmp/foo<tab>` in the prompt text) as well as
+/// slash-command overlays.
+pub fn complete_path_prefix_impl(prefix: &str) -> Vec<String> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+
+    let path = std::path::Path::new(prefix);
+
+    // If the prefix is an existing directory (or ends with /), list its
+    // full contents rather than filtering by the directory name as a stem.
+    // This makes `/tmp<tab>` show everything under /tmp, not just entries
+    // starting with "tmp".
+    if prefix.ends_with('/') || path.is_dir() {
+        return list_dir_entries(path, "");
+    }
+
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // When the stem is empty (e.g. prefix is just "/"), list all.
+    if stem.is_empty() {
+        list_dir_entries(parent, "")
+    } else {
+        list_dir_entries(parent, &stem)
+    }
+}
+
+/// List entries in `dir`, filtering by `filter` (empty = all).
+/// Directories get a trailing `/`.
+fn list_dir_entries(dir: &std::path::Path, filter: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(filter) {
+                let full = dir.join(&name);
+                let display = full.to_string_lossy().to_string();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    results.push(format!("{}/", display));
+                } else {
+                    results.push(display);
+                }
+            }
+        }
+    }
+    results.sort();
+    results
 }
 
 /// A flat character buffer + cursor for multi-line editing. All methods are pure
