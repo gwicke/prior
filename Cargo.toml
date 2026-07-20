@@ -65,5 +65,5 @@ serial_test = "3.1"
 [patch.crates-io]
 codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
 codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
-rig-core = { git = "https://github.com/gwicke/rig.git", rev = "87f3f5b7" }
-rig-derive = { git = "https://github.com/gwicke/rig.git", rev = "87f3f5b7" }
+rig-core = { git = "https://github.com/gwicke/rig.git", rev = "f31c38c2160e0c07fcfb005a68574cd7311351e4" }
+rig-derive = { git = "https://github.com/gwicke/rig.git", rev = "f31c38c2160e0c07fcfb005a68574cd7311351e4" }
