@@ -443,6 +443,7 @@ fn capture_bounded(
 ) -> Result<Vec<u8>, ToolError> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -457,16 +458,29 @@ fn capture_bounded(
     // `read` below returns. Only direct children (bwrap) are killed; bwrap's
     // `--die-with-parent`/namespace reaping handles the sandbox internals, the
     // same limitation the previous `wait_timeout` + `kill` path already had.
+    //
+    // `cancel_tx` is the early-exit signal: dropping it closes the channel,
+    // which unblocks `recv_timeout` in the watchdog thread immediately so that
+    // `g.join()` returns promptly when the command finishes before the timeout.
+    // Without this, `g.join()` would stall for the full sleep duration on every
+    // successful (non-timed-out) command execution.
     let timed_out = Arc::new(AtomicBool::new(false));
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     let guard: Option<std::thread::JoinHandle<()>> = timeout.map(|secs| {
         let w = handle.clone();
         let flag = timed_out.clone();
         std::thread::Builder::new()
             .name("sandbox-timeout".to_string())
             .spawn(move || {
-                std::thread::sleep(Duration::from_secs(secs));
-                flag.store(true, Ordering::SeqCst);
-                let _ = w.kill();
+                // Block until the timeout elapses *or* the main thread signals
+                // completion by dropping `cancel_tx` (Disconnected) or sending
+                // on it.  Only the true-timeout branch kills the child.
+                if let Err(mpsc::RecvTimeoutError::Timeout) =
+                    cancel_rx.recv_timeout(Duration::from_secs(secs))
+                {
+                    flag.store(true, Ordering::SeqCst);
+                    let _ = w.kill();
+                }
             })
             .map_err(|e| ToolError::Io(e.to_string()))
             .expect("sandbox timeout thread")
@@ -478,10 +492,10 @@ fn capture_bounded(
     let mut exceeded = false;
     let mut reader: &duct::ReaderHandle = &handle;
 
-    loop {
+    let io_result = loop {
         match (&mut reader).read(&mut buf) {
-            // EOF: `read` already waited on the inner handle.
-            Ok(0) => break,
+            // EOF: duct's Read impl already called handle.wait() internally.
+            Ok(0) => break Ok(()),
             Ok(n) => {
                 total += n;
                 if !exceeded {
@@ -494,33 +508,30 @@ fn capture_bounded(
                     }
                 }
             }
-            Err(e) => {
-                // A read error after the watchdog fired means we killed the
-                // child; report a timeout rather than a spurious IO error.
-                if timed_out.load(Ordering::SeqCst) {
-                    return Err(ToolError::Generic(format!(
-                        "command timed out after {}s",
-                        timeout.unwrap_or(0)
-                    )));
-                }
-                return Err(ToolError::Io(e.to_string()));
-            }
+            // A read error after the watchdog fired means we killed the
+            // child; surface as a timeout rather than a spurious IO error.
+            Err(e) => break Err(e),
         }
+    };
+
+    // Signal the watchdog to exit immediately: closing cancel_tx makes
+    // recv_timeout return Disconnected, so the watchdog exits without killing
+    // anything.  If the watchdog already fired (Timeout branch), this is a
+    // no-op and join() returns as soon as the thread finishes its kill() call.
+    drop(cancel_tx);
+    if let Some(g) = guard {
+        let _ = g.join();
     }
 
-    // If the watchdog fired (and the command was killed), report a timeout
-    // instead of handing back a partial/empty result.
+    // Now that the watchdog has definitively finished, check its flag.
     if timed_out.load(Ordering::SeqCst) {
-        if let Some(g) = guard {
-            let _ = g.join();
-        }
         return Err(ToolError::Generic(format!(
             "command timed out after {}s",
             timeout.unwrap_or(0)
         )));
     }
-    if let Some(g) = guard {
-        let _ = g.join();
+    if let Err(e) = io_result {
+        return Err(ToolError::Io(e.to_string()));
     }
 
     if exceeded {
