@@ -436,6 +436,39 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Merge OpenRouter `ProviderPreferences` into the existing additional_params
+/// (typically thinking config). Pins requests to a preferred upstream provider
+/// so that server-side cache state accumulates across turns instead of being
+/// invalidated by load-balancing between multiple upstreams for the same model.
+fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    use rig_core::providers::openrouter::ProviderPreferences;
+    let prefs = ProviderPreferences::new()
+        .order(["anthropic"])
+        .allow_fallbacks(true);
+    let prefs_json = prefs.to_json();
+    match existing {
+        Some(mut base) => {
+            // Merge provider preferences into the existing params manually.
+            if let (Some(base_obj), Some(prefs_obj)) =
+                (base.as_object_mut(), prefs_json.as_object())
+            {
+                for (k, v) in prefs_obj {
+                    base_obj.insert(k.clone(), v.clone());
+                }
+            }
+            Some(base)
+        }
+        None => {
+            let obj = prefs_json.as_object()?;
+            if obj.is_empty() {
+                None
+            } else {
+                Some(prefs_json)
+            }
+        }
+    }
+}
+
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
@@ -450,31 +483,38 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     }
 
     macro_rules! build {
-        // Anthropic: enable automatic prompt caching so the static prefix
-        // (system prompt + tool definitions + growing conversation history) is
-        // cached server-side and billed as cache reads instead of full input
-        // tokens on every turn. Requires no beta header; the API advances the
-        // cache breakpoint automatically as the history grows.
+        // Anthropic: enable automatic prompt caching with 1-hour TTL so the
+        // static prefix (system prompt + tool definitions + growing conversation
+        // history) is cached server-side for the duration of an interactive
+        // session and billed as cache reads instead of full input tokens on
+        // every turn. The API advances the cache breakpoint automatically.
         (anthropic $client:expr) => {{
             let cached_model = $client
                 .completion_model(&model)
-                .with_automatic_caching();
+                .with_automatic_caching_1h();
             build!(@builder AgentBuilder::new(cached_model))
         }};
         // OpenRouter: enable prompt caching so the system-prompt prefix is
         // marked with `cache_control: {"type": "ephemeral"}` and billed at the
-        // cache-hit rate on subsequent turns. Only effective when the routed
-        // upstream model supports explicit cache breakpoints (e.g. `anthropic/...`).
+        // cache-hit rate on subsequent turns. Also pins to a preferred upstream
+        // provider so cache state accumulates across turns instead of being
+        // invalidated by load-balancing between multiple providers for the same
+        // model slug (e.g. `anthropic/claude-sonnet-4` routed to different
+        // upstreams on different turns).
         (openrouter $client:expr) => {{
             let cached_model = $client
                 .completion_model(&model)
                 .with_prompt_caching();
-            build!(@builder AgentBuilder::new(cached_model))
+            let merged = merge_openrouter_params(think_json.clone());
+            build!(@builder_with_params AgentBuilder::new(cached_model), merged)
         }};
         ($client:expr) => {{
             build!(@builder $client.agent(&model))
         }};
         (@builder $builder:expr) => {{
+            build!(@builder_with_params $builder, think_json.clone())
+        }};
+        (@builder_with_params $builder:expr, $params:expr) => {{
             let rig_agent = build_rig_agent(
                 $builder,
                 config.yolo,
@@ -483,7 +523,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.persona_prompt,
                 config.bash_auto_allow.unwrap_or_default(),
                 config.agent_prompt,
-                think_json,
+                $params,
                 config.sandbox.clone(),
             );
 
@@ -665,7 +705,26 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
         }
         "zai" => {
             check_env!("ZAI_API_KEY");
-            build!(zai::Client::from_env()?)
+            // OpenAI-compatible endpoint — enable prompt caching so the
+            // system prompt and last message are marked with cache_control.
+            // Effective when the upstream model/gateway supports it.
+            let cached_model = zai::Client::from_env()?
+                .completion_model(&model)
+                .with_prompt_caching();
+            build!(@builder AgentBuilder::new(cached_model))
+        }
+        // ZAI Anthropic-compatible endpoint (ANTHROPIC_API_BASE_URL). Uses
+        // the Anthropic provider with automatic prompt caching. Enable by
+        // setting `ZAI_API_BASE=https://api.z.ai/api/anthropic` in the env
+        // (or the config provider's `env` block) and using provider `zai`.
+        // The `zai-anthropic` alias uses the Anthropic-compatible client
+        // directly so automatic caching is available regardless of base URL.
+        "zai-anthropic" => {
+            check_env!("ZAI_API_KEY");
+            let cached_model = zai::AnthropicClient::from_env()?
+                .completion_model(&model)
+                .with_automatic_caching();
+            build!(@builder AgentBuilder::new(cached_model))
         }
         _ => {
             return Err(crate::PicocodeError::Other(format!(

@@ -1858,7 +1858,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.40.0"
-source = "git+https://github.com/gwicke/rig.git?rev=f31c38c2160e0c07fcfb005a68574cd7311351e4#f31c38c2160e0c07fcfb005a68574cd7311351e4"
+source = "git+file:///home/gabriel/src/rig?rev=39ff227587bda9fd37991518d6fb220a34173f8a#39ff227587bda9fd37991518d6fb220a34173f8a"
 dependencies = [
  "as-any",
  "async-stream",
@@ -1891,7 +1891,7 @@ dependencies = [
 [[package]]
 name = "rig-derive"
 version = "0.40.0"
-source = "git+https://github.com/gwicke/rig.git?rev=f31c38c2160e0c07fcfb005a68574cd7311351e4#f31c38c2160e0c07fcfb005a68574cd7311351e4"
+source = "git+file:///home/gabriel/src/rig?rev=39ff227587bda9fd37991518d6fb220a34173f8a#39ff227587bda9fd37991518d6fb220a34173f8a"
 dependencies = [
  "convert_case 0.11.0",
  "indoc",
