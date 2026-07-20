@@ -224,6 +224,8 @@ pub enum InputAction {
     SetModel(String, String),
     /// Set thinking level (string form: off | low | med | high).
     SetThinking(String),
+    /// Set runtime persona (empty string => none).
+    SetPersona(String),
     /// Quit the session.
     Quit,
 }
@@ -235,6 +237,9 @@ pub struct ReplCtx {
     pub provider: String,
     pub model: String,
     pub recent: Vec<String>,
+    /// Currently active runtime persona name (None => none), for marking the
+    /// active entry in the `/persona` overlay.
+    pub persona: Option<String>,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -419,7 +424,7 @@ impl Repl {
                 } else if matches!(
                     after,
                     "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
-                        | "s"
+                        | "s" | "persona" | "personas" | "p"
                 ) {
                     (after, "")
                 } else {
@@ -480,73 +485,51 @@ impl Repl {
                                 opts.push("(no matches)".into());
                             }
                         }
-                        "set" | "s" => {
-                            kind = 5;
-                            cur_word = "set".into();
+                        "persona" | "personas" | "p" => {
+                            kind = 6;
+                            title = "Personas  (up/down, Enter select, Esc back)".into();
+                            cur_word = "persona".into();
                             cur_filter = rest.trim().to_string();
-                            let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
-                            if is_value {
-                                if let Some(k) = skey {
-                                    let meta = SETTINGS.iter().find(|m| m.key == k).unwrap();
-                                    title = format!(
-                                        "Setting {}  —  pick a value (Tab completes, Enter saves, Esc backs up)",
-                                        meta.name
-                                    );
-                                    let cands = Self::setting_value_candidates(k, ctx);
-                                    let filtered: Vec<ValueCandidate> = if vq.trim().is_empty() {
-                                        cands
-                                    } else {
-                                        crate::fuzzy::fuzzy_filter(&cands, &vq, |c| c.display.clone())
-                                            .into_iter()
-                                            .map(|r| r.item.clone())
-                                            .collect()
-                                    };
-                                    if filtered.is_empty() {
-                                        opts.push("(type a value, then Enter to save)".into());
-                                    } else {
-                                        let avail = term_width().saturating_sub(2);
-                                        let mut table = Table::new(&["Value", "Description"])
-                                            .with_aligns(&[Align::Left, Align::Left])
-                                            .with_min_widths(&[20, 30])
-                                            .with_priorities(&[2, 1])
-                                            .set_gap(2);
-                                        for c in &filtered {
-                                            table.add_row(&[c.display.clone(), c.desc.clone()]);
-                                        }
-                                        for row in table.render_multiline(avail) {
-                                            opts.push(row);
-                                        }
-                                    }
-                                    active = None;
-                                } else {
-                                    opts.push("(no matching setting)".into());
-                                }
+                            // Reuse the value candidates already defined for the
+                            // `default_persona` setting (built-in names + "none").
+                            let cands = Self::setting_value_candidates(
+                                crate::settings::SettingKey::DefaultPersona,
+                                ctx,
+                            );
+                            let filtered: Vec<ValueCandidate> = if cur_filter.is_empty() {
+                                cands
                             } else {
-                                // Not in value mode this iteration: any prior
-                                // validation error no longer applies (e.g. the
-                                // user Escaped a failed value entry back to the
-                                // list), so drop the red header.
-                                value_error = None;
-                                title =
-                                    "Settings  (type to filter, Tab completes, Enter edits, Esc backs up)"
-                                        .into();
-                                let entries = settings.overlay_rows(&cur_filter);
-                                if entries.is_empty() {
-                                    opts.push("(no matching setting)".into());
-                                } else {
-                                    let avail = term_width().saturating_sub(2);
-                                    let mut table = Table::new(&["Setting", "Value", "Description"])
-                                        .with_aligns(&[Align::Left, Align::Left, Align::Left])
-                                        .with_min_widths(&[16, 18, 24])
-                                        .with_priorities(&[2, 2, 1])
-                                        .set_gap(2);
-                                    for (meta, value) in &entries {
-                                        table.add_row(&[meta.name, value.as_str(), meta.description]);
-                                    }
-                                    for row in table.render_multiline(avail) {
-                                        opts.push(row);
-                                    }
+                                crate::fuzzy::fuzzy_filter(&cands, &cur_filter, |c| {
+                                    c.display.clone()
+                                })
+                                .into_iter()
+                                .map(|r| r.item.clone())
+                                .collect()
+                            };
+                            if filtered.is_empty() {
+                                opts.push("(no matching persona)".into());
+                                active = None;
+                            } else {
+                                let avail = term_width().saturating_sub(2);
+                                let mut table = Table::new(&["Persona", "Description"])
+                                    .with_aligns(&[Align::Left, Align::Left])
+                                    .with_min_widths(&[20, 30])
+                                    .with_priorities(&[2, 1])
+                                    .set_gap(2);
+                                for c in &filtered {
+                                    table.add_row(&[c.display.clone(), c.desc.clone()]);
                                 }
+                                for row in table.render_multiline(avail) {
+                                    opts.push(row);
+                                }
+                                // Mark the currently active persona (skip the
+                                // "none" entry, whose value is empty).
+                                active = filtered
+                                    .iter()
+                                    .position(|c| {
+                                        !c.value.is_empty()
+                                            && ctx.persona.as_deref() == Some(c.value.as_str())
+                                    });
                             }
                         }
                         _ => {
@@ -707,6 +690,32 @@ impl Repl {
                                             }
                                         }
                                     }
+                                    6 => {
+                                        let cands = Self::setting_value_candidates(
+                                            crate::settings::SettingKey::DefaultPersona,
+                                            ctx,
+                                        );
+                                        let filtered = if cur_filter.is_empty() {
+                                            cands
+                                        } else {
+                                            crate::fuzzy::fuzzy_filter(&cands, &cur_filter, |c| {
+                                                c.display.clone()
+                                            })
+                                            .into_iter()
+                                            .map(|r| r.item.clone())
+                                            .collect()
+                                        };
+                                        // `value` is empty for the "none" entry; complete with the
+                                        // display name in that case so the buffer reads `/persona none`.
+                                        if let Some(c) = filtered.get(sel) {
+                                            let tok = if c.value.is_empty() {
+                                                c.display.clone()
+                                            } else {
+                                                c.value.clone()
+                                            };
+                                            editor.set(&Self::replace_last_token(&buf, &tok));
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -738,6 +747,9 @@ impl Repl {
                                                     slash::SlashKind::Settings => {
                                                         editor.set("/set ");
                                                     }
+                                                    slash::SlashKind::Persona => {
+                                                        editor.set("/persona ");
+                                                    }
                                                 }
                                             }
                                         }
@@ -765,6 +777,35 @@ impl Repl {
                                                 return Some(InputAction::SetThinking(
                                                     l.as_str().to_string(),
                                                 ));
+                                            }
+                                        }
+                                        6 => {
+                                            let cands = Self::setting_value_candidates(
+                                                crate::settings::SettingKey::DefaultPersona,
+                                                ctx,
+                                            );
+                                            let filtered = if cur_filter.is_empty() {
+                                                cands
+                                            } else {
+                                                crate::fuzzy::fuzzy_filter(&cands, &cur_filter, |c| {
+                                                    c.display.clone()
+                                                })
+                                                .into_iter()
+                                                .map(|r| r.item.clone())
+                                                .collect()
+                                            };
+                                            // `value` is empty for the "none" entry; emit the display
+                                            // name so the transcript reads `/persona none` (the agent
+                                            // treats empty as no persona).
+                                            if let Some(c) = filtered.get(sel) {
+                                                let name = if c.value.is_empty() {
+                                                    c.display.clone()
+                                                } else {
+                                                    c.value.clone()
+                                                };
+                                                let line = format!("/persona {}", name);
+                                                Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
+                                                return Some(InputAction::SetPersona(name));
                                             }
                                         }
                                         5 => {
@@ -830,10 +871,10 @@ impl Repl {
                                     editor.set("");
                                 }
                                 2 => {
-                                    editor.set("/model");
+                                    editor.set("");
                                 }
                                 3 => {
-                                    editor.set("/thinking");
+                                    editor.set("");
                                 }
                                 5 => {
                                     let buf = editor.text();
@@ -842,6 +883,9 @@ impl Repl {
                                     } else {
                                         editor.set("");
                                     }
+                                }
+                                6 => {
+                                    editor.set("");
                                 }
                                 _ => {}
                             },

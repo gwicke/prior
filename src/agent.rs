@@ -806,6 +806,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     provider: config.provider.clone(),
                     model: config.model.clone(),
                     recent: recent_models.clone(),
+                    persona: config.persona_name.clone(),
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
@@ -854,6 +855,42 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     Err(e) => {
                         let msg = e.to_string();
                         config.output.display_plain(&msg);
+                    }
+                }
+            }
+            InputAction::SetPersona(name) => {
+                let mut new_cfg = config.clone();
+                // Empty name (the "none" entry) clears the runtime persona.
+                new_cfg.persona_name = if name.trim().is_empty() {
+                    None
+                } else {
+                    // Resolve now so an unknown name is rejected before rebuild.
+                    match crate::persona::get_persona(&name) {
+                        Some(prompt) => {
+                            new_cfg.persona_prompt = Some(prompt);
+                            Some(name.clone())
+                        }
+                        None => {
+                            config.output.display_plain(&format!(
+                                "Unknown persona '{}' (see /persona for the list)",
+                                name
+                            ));
+                            // Skip the agent rebuild; keep the old persona.
+                            None
+                        }
+                    }
+                };
+                if new_cfg.persona_name.is_some() || name.trim().is_empty() {
+                    match create_agent(new_cfg.clone()).await {
+                        Ok(new_agent) => {
+                            agent = Some(new_agent);
+                            config = new_cfg;
+                            // No confirmation line: the `/persona <name>` input is self-documenting.
+                        }
+                        Err(e) => {
+                            let msg = format!("Cannot set persona: {}", e);
+                            config.output.display_plain(&msg);
+                        }
                     }
                 }
             }
