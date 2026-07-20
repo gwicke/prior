@@ -230,8 +230,8 @@ pub enum InputAction {
     SetPersona(String),
     /// Quit the session.
     Quit,
-    /// Sandbox operation: (subcommand, path).
-    Sandbox(String, String),
+    /// Sandbox operation: (subcommand, path, sandbox_path).
+    Sandbox(String, String, String),
 }
 
 /// Context the REPL needs to render slash overlays and to re-emit recent
@@ -827,7 +827,9 @@ impl Repl {
                                             match sub {
                                                 "add_ro" | "add_rw" => {
                                                     if !rest.is_empty() {
-                                                        let completions = Self::complete_path_prefix(rest);
+                                                        // Complete the last token (host or sandbox path).
+                                                        let last_token = rest.split_whitespace().last().unwrap_or("");
+                                                        let completions = Self::complete_path_prefix(last_token);
                                                         if let Some(c) = completions.get(sel) {
                                                             editor.set(&Self::replace_last_token(&buf, c));
                                                         }
@@ -836,12 +838,13 @@ impl Repl {
                                                 "remove" => {
                                                     if !rest.is_empty() {
                                                         let binds = crate::sandbox_bindings::list();
+                                                        let last_token = rest.split_whitespace().last().unwrap_or("");
                                                         let filtered: Vec<_> = crate::fuzzy::fuzzy_filter(
-                                                            &binds, rest,
-                                                            |b| b.host_path.to_string_lossy().to_string(),
+                                                            &binds, last_token,
+                                                            |b| b.sandbox_path.to_string_lossy().to_string(),
                                                         );
                                                         if let Some(r) = filtered.get(sel) {
-                                                            let path = r.item.host_path.to_string_lossy().to_string();
+                                                            let path = r.item.sandbox_path.to_string_lossy().to_string();
                                                             editor.set(&Self::replace_last_token(&buf, &path));
                                                         }
                                                     }
@@ -1018,11 +1021,27 @@ impl Repl {
                                             if let Some((sub, path)) = after.split_once(' ') {
                                                 let path = path.trim();
                                                 match sub {
-                                                    "add_ro" | "add_rw" | "remove" => {
+                                                    "add_ro" | "add_rw" => {
                                                         if !path.is_empty() {
-                                                            let line = format!("/sandbox {} {}", sub, path);
+                                                            // Split on whitespace: first token = host, second = optional sandbox.
+                                                            let parts: Vec<&str> = path.split_whitespace().collect();
+                                                            let host = parts[0];
+                                                            let sandbox = parts.get(1).unwrap_or(&"");
+                                                            let line = if sandbox.is_empty() {
+                                                                format!("/sandbox {} {}", sub, host)
+                                                            } else {
+                                                                format!("/sandbox {} {} {}", sub, host, sandbox)
+                                                            };
                                                             Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
-                                                            return Some(InputAction::Sandbox(sub.to_string(), path.to_string()));
+                                                            return Some(InputAction::Sandbox(sub.to_string(), host.to_string(), sandbox.to_string()));
+                                                        }
+                                                    }
+                                                    "remove" => {
+                                                        if !path.is_empty() {
+                                                            let sandbox = path.split_whitespace().next().unwrap_or("");
+                                                            let line = format!("/sandbox remove {}", sandbox);
+                                                            Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
+                                                            return Some(InputAction::Sandbox("remove".to_string(), sandbox.to_string(), String::new()));
                                                         }
                                                     }
                                                     _ => {}
@@ -1532,8 +1551,9 @@ impl Repl {
                     *active = None;
                     return;
                 }
-                // Show file path completions.
-                let completions = Self::complete_path_prefix(path);
+                // The last token is the one being typed; show file completions.
+                let last_token = path.split_whitespace().last().unwrap_or("");
+                let completions = Self::complete_path_prefix(last_token);
                 if completions.is_empty() {
                     opts.push("(no matching path)".into());
                 } else {
@@ -1555,7 +1575,7 @@ impl Repl {
                     binds
                 } else {
                     crate::fuzzy::fuzzy_filter(&binds, path, |b| {
-                        b.host_path.to_string_lossy().to_string()
+                        b.sandbox_path.to_string_lossy().to_string()
                     })
                     .into_iter()
                     .map(|r| r.item.clone())
@@ -1570,7 +1590,13 @@ impl Repl {
                         } else {
                             "rw"
                         };
-                        opts.push(format!("{}  ({})", b.host_path.display(), mode));
+                        let host = b.host_path.display();
+                        let sandbox = b.sandbox_path.display();
+                        if b.host_path == b.sandbox_path {
+                            opts.push(format!("{}  ({})", sandbox, mode));
+                        } else {
+                            opts.push(format!("{} → {}  ({})", host, sandbox, mode));
+                        }
                     }
                 }
                 *active = None;

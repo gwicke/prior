@@ -12,9 +12,13 @@ use std::sync::{LazyLock, Mutex};
 use crate::config::{BindMode, SandboxConfig};
 
 /// A single temporary binding added during the session.
+///
+/// A simple bind has `sandbox_path == host_path`; a remap has them different.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionBind {
     pub host_path: PathBuf,
+    /// In-sandbox destination path.  Equal to `host_path` for a simple bind.
+    pub sandbox_path: PathBuf,
     pub mode: BindMode,
 }
 
@@ -22,9 +26,8 @@ pub struct SessionBind {
 static SESSION_BINDS: LazyLock<Mutex<Vec<SessionBind>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Resolve `path` (relative to CWD or absolute, `~` expanded) to an absolute
-/// host path, then canonicalize if it exists. Returns the normalized path on
-/// success, or an error string if the path does not exist.
+/// Resolve a host path (relative to CWD or absolute, `~` expanded) to an
+/// absolute, canonical path.  Returns an error if the path does not exist.
 fn resolve_host_path(path: &str) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot get CWD: {}", e))?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -50,15 +53,29 @@ fn resolve_host_path(path: &str) -> Result<PathBuf, String> {
     // Normalize components (.., .)
     let normalized = normalize(&abs);
 
-    // The path must exist (or be a valid prefix of an existing path) so the
-    // binding is meaningful. We canonicalize for the existence check but
-    // store the normalized (non-canonical) form so the user sees their own
-    // path string in the list.
+    // The path must exist so the binding is meaningful.
     let canonical = std::fs::canonicalize(&normalized)
         .map_err(|e| format!("path does not exist: {} ({})", normalized.display(), e))?;
-    // If canonicalization resolved symlinks to a different path, use the
-    // canonical form so bwrap gets the real path.
     Ok(canonical)
+}
+
+/// Resolve a sandbox path (in-sandbox destination) — just normalizes, no
+/// existence check required since it is created inside the namespace.
+fn resolve_sandbox_path(path: &str) -> PathBuf {
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match &home {
+            Some(h) => h.join(rest),
+            None => PathBuf::from(path),
+        }
+    } else if path == "~" {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path))
+    } else {
+        PathBuf::from(path)
+    };
+    normalize(&expanded)
 }
 
 fn normalize(p: &PathBuf) -> PathBuf {
@@ -75,17 +92,25 @@ fn normalize(p: &PathBuf) -> PathBuf {
 
 /// Add a read-only path binding for the session.
 ///
-/// `path` is resolved against the CWD (`~` expanded). Returns an error if the
-/// path does not exist or cannot be resolved.
-pub fn add_ro(path: &str) -> Result<(), String> {
-    let host_path = resolve_host_path(path)?;
+/// `host_path` is resolved against the CWD (`~` expanded); it must exist.
+/// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
+/// empty).  Returns an error if the host path does not exist.
+pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
+    let host = resolve_host_path(host_path)?;
+    let sandbox = if sandbox_path.is_empty() {
+        host.clone()
+    } else {
+        resolve_sandbox_path(sandbox_path)
+    };
     let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
-    // Dedup: replace an existing binding for the same path (regardless of mode).
-    if let Some(pos) = binds.iter().position(|b| b.host_path == host_path) {
+    // Dedup by sandbox (in-sandbox) path.
+    if let Some(pos) = binds.iter().position(|b| b.sandbox_path == sandbox) {
         binds[pos].mode = BindMode::Ro;
+        binds[pos].host_path = host;
     } else {
         binds.push(SessionBind {
-            host_path,
+            host_path: host,
+            sandbox_path: sandbox,
             mode: BindMode::Ro,
         });
     }
@@ -94,17 +119,25 @@ pub fn add_ro(path: &str) -> Result<(), String> {
 
 /// Add a read-write path binding for the session.
 ///
-/// `path` is resolved against the CWD (`~` expanded). Returns an error if the
-/// path does not exist or cannot be resolved.
-pub fn add_rw(path: &str) -> Result<(), String> {
-    let host_path = resolve_host_path(path)?;
+/// `host_path` is resolved against the CWD (`~` expanded); it must exist.
+/// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
+/// empty).  Returns an error if the host path does not exist.
+pub fn add_rw(host_path: &str, sandbox_path: &str) -> Result<(), String> {
+    let host = resolve_host_path(host_path)?;
+    let sandbox = if sandbox_path.is_empty() {
+        host.clone()
+    } else {
+        resolve_sandbox_path(sandbox_path)
+    };
     let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
-    // Dedup: replace an existing binding for the same path (regardless of mode).
-    if let Some(pos) = binds.iter().position(|b| b.host_path == host_path) {
+    // Dedup by sandbox (in-sandbox) path.
+    if let Some(pos) = binds.iter().position(|b| b.sandbox_path == sandbox) {
         binds[pos].mode = BindMode::Rw;
+        binds[pos].host_path = host;
     } else {
         binds.push(SessionBind {
-            host_path,
+            host_path: host,
+            sandbox_path: sandbox,
             mode: BindMode::Rw,
         });
     }
@@ -113,15 +146,15 @@ pub fn add_rw(path: &str) -> Result<(), String> {
 
 /// Remove a path binding from the session.
 ///
-/// `path` is resolved the same way as `add_ro`/`add_rw`. Returns an error if
-/// the resolved path does not match any existing binding.
-pub fn remove(path: &str) -> Result<(), String> {
-    let host_path = resolve_host_path(path)?;
+/// `sandbox_path` is the in-sandbox path to remove (the "to" component).
+/// Returns an error if no matching binding is found.
+pub fn remove(sandbox_path: &str) -> Result<(), String> {
+    let target = resolve_sandbox_path(sandbox_path);
     let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
     let pos = binds
         .iter()
-        .position(|b| b.host_path == host_path)
-        .ok_or_else(|| format!("no session binding for path: {}", host_path.display()))?;
+        .position(|b| b.sandbox_path == target)
+        .ok_or_else(|| format!("no session binding for sandbox path: {}", target.display()))?;
     binds.remove(pos);
     Ok(())
 }
@@ -143,19 +176,25 @@ pub fn merge_into(cfg: &mut SandboxConfig) {
     let binds = list();
 
     for b in &binds {
-        // Convert to a BindPath::Simple using the host path. Since the path
-        // is already absolute and resolved, we use the string form.
         let from = b.host_path.to_string_lossy().to_string();
-        // Map to in-sandbox path: same as host (simple bind).
+        let to = b.sandbox_path.to_string_lossy().to_string();
+        let bind = if from == to {
+            crate::config::BindPath::Simple(from)
+        } else {
+            crate::config::BindPath::Remap {
+                from: from.clone(),
+                to: to.clone(),
+            }
+        };
         match b.mode {
-            BindMode::Ro => cfg.ro.push(crate::config::BindPath::Simple(from)),
-            BindMode::Rw => cfg.rw.push(crate::config::BindPath::Simple(from)),
+            BindMode::Ro => cfg.ro.push(bind),
+            BindMode::Rw => cfg.rw.push(bind),
         }
     }
 }
 
-/// Helper: resolve a path for display/removal, returning the normalized form
-/// (the same key used in the list). Returns `None` if the path does not exist.
+/// Helper: resolve a host path for display/validation.  Returns `None` if the
+/// path does not exist.
 pub fn resolve_for_display(path: &str) -> Option<PathBuf> {
     resolve_host_path(path).ok()
 }
@@ -171,6 +210,7 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
 
     fn setup() {
@@ -178,98 +218,146 @@ mod tests {
     }
 
     #[test]
-    fn test_add_ro_and_list() {
+    #[serial]
+    fn test_add_ro_simple() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_ro");
         fs::create_dir_all(&path).unwrap();
-
         let ps = path.to_string_lossy();
-        add_ro(&ps).unwrap();
+
+        add_ro(&ps, "").unwrap();
         let binds = list();
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0].mode, BindMode::Ro);
-        assert!(binds[0].host_path.exists());
+        assert_eq!(binds[0].host_path, binds[0].sandbox_path);
 
-        // Add same path again (dedup, still ro)
-        add_ro(&ps).unwrap();
+        // Dedup (same sandbox path)
+        add_ro(&ps, "").unwrap();
         assert_eq!(list().len(), 1);
     }
 
     #[test]
-    fn test_add_rw_and_list() {
+    #[serial]
+    fn test_add_ro_remap() {
+        setup();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host_ro");
+        fs::create_dir_all(&host).unwrap();
+        let sandbox = dir.path().join("sandbox_ro");
+
+        let hs = host.to_string_lossy();
+        let ss = sandbox.to_string_lossy();
+        add_ro(&hs, &ss).unwrap();
+        let binds = list();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].mode, BindMode::Ro);
+        assert_eq!(binds[0].host_path, host);
+        // sandbox_path is resolved to an absolute path
+        assert!(binds[0].sandbox_path.to_string_lossy().ends_with("sandbox_ro"));
+        assert_ne!(binds[0].host_path, binds[0].sandbox_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_rw_simple() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_rw");
         fs::create_dir_all(&path).unwrap();
-
         let ps = path.to_string_lossy();
-        add_rw(&ps).unwrap();
+
+        add_rw(&ps, "").unwrap();
         let binds = list();
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0].mode, BindMode::Rw);
     }
 
     #[test]
+    #[serial]
     fn test_dedup_upgrades_mode() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dedup");
         fs::create_dir_all(&path).unwrap();
-
         let ps = path.to_string_lossy();
-        add_ro(&ps).unwrap();
+
+        add_ro(&ps, "").unwrap();
         // Upgrade to rw
-        add_rw(&ps).unwrap();
+        add_rw(&ps, "").unwrap();
         let binds = list();
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0].mode, BindMode::Rw);
     }
 
     #[test]
-    fn test_remove() {
+    #[serial]
+    fn test_remove_by_sandbox_path() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("remove_me");
         fs::create_dir_all(&path).unwrap();
-
         let ps = path.to_string_lossy();
-        add_ro(&ps).unwrap();
+
+        add_ro(&ps, "").unwrap();
         assert_eq!(list().len(), 1);
+        // Remove by sandbox path (same as host path for simple bind).
         remove(&ps).unwrap();
         assert_eq!(list().len(), 0);
     }
 
     #[test]
+    #[serial]
+    fn test_remove_remap() {
+        setup();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host_path");
+        let sandbox = dir.path().join("sandbox_path");
+        fs::create_dir_all(&host).unwrap();
+
+        let hs = host.to_string_lossy();
+        let ss = sandbox.to_string_lossy();
+        add_ro(&hs, &ss).unwrap();
+        assert_eq!(list().len(), 1);
+        // Remove by sandbox path (the "to" component).
+        remove(&ss).unwrap();
+        assert_eq!(list().len(), 0);
+    }
+
+    #[test]
+    #[serial]
     fn test_remove_nonexistent_binding() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("never_added");
         fs::create_dir_all(&path).unwrap();
-
         let ps = path.to_string_lossy();
+
         let err = remove(&ps).unwrap_err();
         assert!(err.contains("no session binding"));
     }
 
     #[test]
+    #[serial]
     fn test_add_nonexistent_path() {
         setup();
-        let err = add_ro("/nonexistent_path_12345").unwrap_err();
+        let err = add_ro("/nonexistent_path_12345", "").unwrap_err();
         assert!(err.contains("does not exist"));
     }
 
     #[test]
-    fn test_merge_into() {
+    #[serial]
+    fn test_merge_into_simple_and_remap() {
         setup();
         let dir = tempfile::tempdir().unwrap();
         let p1 = dir.path().join("merge_ro");
-        let p2 = dir.path().join("merge_rw");
+        let p2 = dir.path().join("merge_rw_host");
+        let p2s = dir.path().join("merge_rw_sandbox");
         fs::create_dir_all(&p1).unwrap();
         fs::create_dir_all(&p2).unwrap();
 
-        add_ro(&p1.to_string_lossy()).unwrap();
-        add_rw(&p2.to_string_lossy()).unwrap();
+        add_ro(&p1.to_string_lossy(), "").unwrap();
+        add_rw(&p2.to_string_lossy(), &p2s.to_string_lossy()).unwrap();
 
         let mut cfg = SandboxConfig::default();
         assert!(cfg.ro.is_empty());
@@ -279,5 +367,19 @@ mod tests {
 
         assert_eq!(cfg.ro.len(), 1);
         assert_eq!(cfg.rw.len(), 1);
+
+        // The simple bind uses BindPath::Simple
+        match &cfg.ro[0] {
+            crate::config::BindPath::Simple(s) => assert!(s.contains("merge_ro")),
+            _ => panic!("expected Simple for ro bind"),
+        }
+        // The remap uses BindPath::Remap
+        match &cfg.rw[0] {
+            crate::config::BindPath::Remap { from, to } => {
+                assert!(from.contains("merge_rw_host"));
+                assert!(to.contains("merge_rw_sandbox"));
+            }
+            _ => panic!("expected Remap for rw bind"),
+        }
     }
 }

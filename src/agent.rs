@@ -1084,10 +1084,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
             }
-            InputAction::Sandbox(sub, path) => {
+            InputAction::Sandbox(sub, path, sandbox_path) => {
                 let result = match sub.as_str() {
-                    "add_ro" => crate::sandbox_bindings::add_ro(&path),
-                    "add_rw" => crate::sandbox_bindings::add_rw(&path),
+                    "add_ro" => crate::sandbox_bindings::add_ro(&path, &sandbox_path),
+                    "add_rw" => crate::sandbox_bindings::add_rw(&path, &sandbox_path),
                     "remove" => crate::sandbox_bindings::remove(&path),
                     _ => Err(format!("unknown sandbox subcommand: {}", sub)),
                 };
@@ -1097,7 +1097,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         let mut merged = config.sandbox.clone().unwrap_or_default();
                         crate::sandbox_bindings::merge_into(&mut merged);
                         crate::tools::set_sandbox(Some(merged));
-                        let msg = format!("sandbox: {} {} (ok)", sub, path);
+                        let msg = if sandbox_path.is_empty() {
+                            format!("sandbox: {} {} (ok)", sub, path)
+                        } else {
+                            format!("sandbox: {} {} → {} (ok)", sub, path, sandbox_path)
+                        };
                         config.output.display_plain(&msg);
                     }
                     Err(e) => {
