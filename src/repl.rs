@@ -3383,9 +3383,9 @@ mod tests {
         assert_eq!(&w, "wo", "cursor after 'wo' in 'world': got {:?}", &w);
         assert_eq!(s, 6);
         assert_eq!(e, 8);
-        // Cursor at position 11 (the space after "world") → word *before*: "world"
+        // Cursor at position 11 (the space after "world") → word *after*: "foo"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, 11);
-        assert_eq!(&w, "world", "cursor on space after world: {:?}", &w);
+        assert_eq!(&w, "foo", "cursor on space after world: {:?}", &w);
         // Cursor after last word (at end) → last word "foo"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
         assert_eq!(&w, "foo", "cursor at end: last word");
