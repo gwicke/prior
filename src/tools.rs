@@ -363,10 +363,13 @@ pub(crate) async fn run_sandboxed(
         };
         // Sandboxed: stream combined stdout+stderr with a bounded reader. bwrap
         // forwards the child's stdio to its inherited fds, so we read the pipe
-        // in fixed chunks and keep at most `MAX_TOOL_OUTPUT_BYTES` in memory —
-        // no temp file and no unbounded `read_to_end` (see `capture_bounded`).
+        // in fixed chunks and keep at most `max_output_bytes` (configurable:
+        // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB) in
+        // memory — no temp file and no unbounded `read_to_end` (see
+        // `capture_bounded`).
+        let cap = cfg.max_output_bytes();
         let expr = build_bwrap_expr(&cmd, cfg, false)?;
-        capture_bounded(expr, timeout, MAX_TOOL_OUTPUT_BYTES)
+        capture_bounded(expr, timeout, cap)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -387,23 +390,19 @@ pub(crate) async fn run_sandboxed_ro(
 ) -> Result<String, ToolError> {
     let argv = argv.to_vec();
     let cfg = cfg.clone();
+    let cap = cfg.max_output_bytes();
     let output = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ToolError> {
         let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
         // Stream merged stdout+stderr in bounded chunks (matches the shell
         // path: bwrap forwards stdio to inherited fds; stderr is merged in,
-        // as `2>&1` would do).
-        capture_bounded(expr, timeout, MAX_TOOL_OUTPUT_BYTES)
+        // as `2>&1` would do). Output is capped to `cap` (configurable:
+        // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB).
+        capture_bounded(expr, timeout, cap)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
     Ok(String::from_utf8_lossy(&output).to_string())
 }
-
-/// Maximum combined stdout+stderr retained from a single sandboxed command.
-/// Both the bash and grep/rg paths read through this cap, so the memory handed
-/// back to the model stays bounded and tool output stays small; anything beyond
-/// it is truncated with a notice (see [`capture_bounded`]).
-const MAX_TOOL_OUTPUT_BYTES: usize = 20 * 1024; // 20 KiB
 
 /// Trim combined output and normalize empty results.
 fn trim_output(out: Vec<u8>) -> String {
@@ -1024,6 +1023,7 @@ mod sandbox_tests {
             ro,
             rw,
             env: None,
+            max_output_bytes: None,
         }
     }
 
@@ -1332,6 +1332,7 @@ mod sandbox_tests {
             ro: vec![],
             rw: vec![],
             env: Some(env),
+            max_output_bytes: None,
         }
     }
 

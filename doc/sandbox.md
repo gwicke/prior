@@ -216,9 +216,13 @@ fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
         Some(s) => expr.timeout(std::time::Duration::from_secs(s)),
     };
 
-    // 3. Capture combined output.
+    // 3. Capture combined output. Output is streamed in bounded chunks and
+    //    capped to `cfg.max_output_bytes` (configurable via
+    //    `[tool_config.bash.sandbox].max_output_bytes`; default 20 KiB). Beyond
+    //    the cap the pipe is still drained but surplus bytes are discarded, so a
+    //    chatty command can never balloon memory.
     tokio::task::spawn_blocking(move || {
-        expr.stderr_to_stdout().unchecked().read()
+        expr.stderr_to_stdout().unchecked().reader().read_bounded(cfg.max_output_bytes())
             .map_err(|e| ToolError::Io(e.to_string()))
     }).await??
 }
