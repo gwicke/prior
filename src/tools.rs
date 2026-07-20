@@ -630,6 +630,28 @@ fn build_bwrap_args(
         // essential read-only system dirs above). User bindings come BEFORE the
         // scratch tmpfs so a user binding at /tmp wins over the tmpfs.
         for b in &binds {
+            // `/dev` and `/proc` can NOT be mounted with `--bind`/`--ro-bind`.
+            // Binding `/dev` that way produces a *non-functional* device tree
+            // (e.g. `/dev/null` becomes unopenable with EACCES), and `/proc`
+            // simply is not mountable as a regular bind at all. bwrap provides
+            // dedicated `--dev <mnt>` and `--proc <mnt>` flags that populate a
+            // fresh, working device tree / procfs at the given mountpoint. So a
+            // binding whose in-sandbox target is `/dev`/`/proc` is translated to
+            // the corresponding special flag. The host `from` path is ignored
+            // by `--dev`/`--proc` (they always build a fresh instance). A
+            // trailing slash is tolerated for `to` (e.g. "/dev/").
+            let to = b.to.to_string_lossy();
+            let to = to.trim_end_matches('/');
+            if to == "/dev" {
+                args.push("--dev".into());
+                args.push("/dev".into());
+                continue;
+            }
+            if to == "/proc" {
+                args.push("--proc".into());
+                args.push("/proc".into());
+                continue;
+            }
             args.push(
                 if !read_only && b.mode.is_writable() {
                     "--bind"
@@ -705,8 +727,14 @@ fn build_bwrap_expr(
 ) -> Result<duct::Expression, ToolError> {
     let mut args = build_bwrap_args(cfg, read_only)?;
 
-    // Bind the host temp output file into the namespace (read-write) AFTER user
-    // binds, so it is never shadowed by a user /tmp bind.
+    // Bind the host temp output file into the namespace (read-write) AFTER all
+    // user binds (this is appended in `build_bwrap_expr`, which runs after
+    // `build_bwrap_args` has emitted the user bindings). Because mounts apply
+    // in order, a file bind at `/tmp/.picocode-out` layers on top of whatever
+    // `/tmp` mount is already present — whether the scratch tmpfs added in
+    // `build_bwrap_args` (when the user configured no `/tmp` binding) or the
+    // user's own `/tmp` remap. Either way the file is reachable at
+    // `/tmp/.picocode-out` and is never shadowed by a later mount.
     args.push("--bind".into());
     args.push(out_path.to_string_lossy().to_string());
     args.push("/tmp/.picocode-out".into());
@@ -1034,6 +1062,43 @@ mod sandbox_tests {
         assert_eq!(out, "inside");
         // The write landed on the host temp dir.
         assert!(dir.path().join("probe.txt").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_dev_bind_is_functional() {
+        // A naive `--bind /dev /dev` yields a non-functional device tree
+        // (e.g. `/dev/null` becomes unopenable). `build_bwrap_args` must
+        // translate a `/dev` binding to bwrap's dedicated `--dev /dev` flag so
+        // the standard device nodes actually work inside the namespace.
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![BindPath::Simple("/dev".into())], Some(30))));
+        // Open /dev/null read-write; many tools (git, compilers, ...) require it.
+        let out = run_sandboxed(
+            "exec 3<>/dev/null && echo DEVNULL_RW_OK || echo DEVNULL_RW_FAIL",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "DEVNULL_RW_OK");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sandboxed_proc_bind_is_functional() {
+        // `/proc` must be translated to bwrap's `--proc /proc` flag; a plain
+        // bind would not mount a usable procfs. With PID isolation on, the
+        // namespace's own init should be visible under /proc.
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![BindPath::Simple("/proc".into())], Some(30))));
+        let out = run_sandboxed("test -d /proc && ls /proc/self/status >/dev/null && echo PROC_OK || echo PROC_FAIL", None)
+            .await
+            .unwrap();
+        assert_eq!(out, "PROC_OK");
     }
 
     #[tokio::test]
