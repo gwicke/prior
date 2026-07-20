@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sandbox: None,
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         show_reasoning_handle: picocode::settings::default_show_reasoning_handle(),
         reasoning_in_context: false,
     }).await?;
