@@ -293,7 +293,7 @@ pub(crate) fn sandbox_list_dir(dir: &str) -> Option<Vec<String>> {
     let output = std::process::Command::new("bwrap")
         .args(&args)
         .arg("--")
-        .args(["ls", "-1p", dir])
+        .args(["ls", "-1ap", dir])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()

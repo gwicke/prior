@@ -978,7 +978,7 @@ impl Repl {
                                         if let Some(c) = path_completions.get(sel) {
                                             let buf = editor.text();
                                             if let Some((start, end)) = completion_pos {
-                                                editor.set(&Self::replace_token_at(&buf, start, end, c));
+                                                editor.replace_range(start, end, c);
                                             } else {
                                                 editor.set(&Self::replace_last_token(&buf, c));
                                             }
@@ -1181,7 +1181,7 @@ impl Repl {
                                             if let Some(c) = path_completions.get(sel) {
                                                 let buf = editor.text();
                                                 if let Some((start, end)) = completion_pos {
-                                                    editor.set(&Self::replace_token_at(&buf, start, end, c));
+                                                    editor.replace_range(start, end, c);
                                                 } else {
                                                     editor.set(&Self::replace_last_token(&buf, c));
                                                 }
@@ -1262,12 +1262,7 @@ impl Repl {
                                 // host filesystem otherwise.
                                 let completions = Self::complete_path_prefix_sandbox(&token);
                                 if completions.len() == 1 {
-                                    editor.set(&Self::replace_token_at(
-                                        &buf,
-                                        tok_start,
-                                        tok_end,
-                                        &completions[0],
-                                    ));
+                                    editor.replace_range(tok_start, tok_end, &completions[0]);
                                 } else if !completions.is_empty() {
                                     path_completions = completions;
                                     completion_pos = Some((tok_start, tok_end));
@@ -1668,21 +1663,8 @@ impl Repl {
             return (0, 0, String::new());
         }
 
-        // 3. Cursor on whitespace → try the word *after* cursor first (the
-        //    word the user is typing).  Skip consecutive whitespace to handle
-        //    multiple spaces between words.  If nothing after, try *before*.
-        let mut after_start = pos + 1;
-        while after_start < len && buf[after_start].is_whitespace() {
-            after_start += 1;
-        }
-        if after_start < len {
-            let mut end_after = after_start + 1;
-            while end_after < len && !buf[end_after].is_whitespace() {
-                end_after += 1;
-            }
-            return (after_start, end_after, buf[after_start..end_after].iter().collect());
-        }
-        // Nothing after → word *before* cursor.
+        // 3. Cursor on whitespace → word *before* cursor (the token the user
+        //    just typed and wants to complete).
         let mut start_before = pos;
         while start_before > 0 && !buf[start_before - 1].is_whitespace() {
             start_before -= 1;
@@ -1690,17 +1672,8 @@ impl Repl {
         if start_before < pos {
             return (start_before, pos, buf[start_before..pos].iter().collect());
         }
-
+        // Nothing before cursor on this line → no completion.
         (0, 0, String::new())
-    }
-
-    /// Replace the token spanning byte range `[start, end)` in `s` with `repl`.
-    fn replace_token_at(s: &str, start: usize, end: usize, repl: &str) -> String {
-        if start >= end || start >= s.len() {
-            return repl.to_string();
-        }
-        let end = end.min(s.len());
-        format!("{}{}{}", &s[..start], repl, &s[end..])
     }
 
     /// Complete a file path prefix, preferring sandbox-aware listing when the
@@ -1716,11 +1689,18 @@ impl Repl {
             return Vec::new();
         }
 
-        // Determine the directory to list and the name filter.
-        let path = std::path::Path::new(prefix);
-        let (dir, filter) = if prefix.ends_with('/') || path.is_dir() {
-            // Strip trailing / so we don't double it when joining.
-            (prefix.trim_end_matches('/').to_string(), String::new())
+        // Detect `~` prefix so we can round-trip results back to `~`.
+        let uses_tilde = prefix.starts_with('~');
+        let expanded = expand_tilde(prefix);
+        let path = std::path::Path::new(&expanded);
+
+        let (dir, filter) = if expanded.ends_with('/') || path.is_dir() {
+            let d = expanded.trim_end_matches('/');
+            if d.is_empty() {
+                ("/".to_string(), String::new())
+            } else {
+                (d.to_string(), String::new())
+            }
         } else {
             let parent = path.parent().unwrap_or(std::path::Path::new("."));
             let stem = path
@@ -1730,28 +1710,40 @@ impl Repl {
             (parent.to_string_lossy().to_string(), stem)
         };
 
-        // Check whether a sandbox is active so we know if host fallback is
-        // safe.  The sandbox config is published once before the REPL starts
-        // (see agent.rs, `set_sandbox`).
-        let sandbox_active = crate::tools::sandbox_config().is_some();
+        let sandbox_active = crate::tools::sandbox_config()
+            .as_ref()
+            .as_ref()
+            .is_some();
 
-        // Sandbox listing.
-        if let Some(entries) = crate::tools::sandbox_list_dir(&dir) {
+        if let Some(mut entries) = crate::tools::sandbox_list_dir(&dir) {
+            entries.retain(|name| name != "./" && name != "../");
+            let home = if uses_tilde {
+                let h = std::env::var("HOME").unwrap_or_default();
+                if h.ends_with('/') { h } else { format!("{}/", h) }
+            } else {
+                String::new()
+            };
             let mut results: Vec<String> = entries
                 .into_iter()
                 .filter(|name| name.starts_with(&filter))
-                .map(|name| format!("{}/{}", dir, name))
+                .map(|name| {
+                    let full = format!("{}/{}", dir, name);
+                    if uses_tilde {
+                        if let Some(rest) = full.strip_prefix(&home) {
+                            return format!("~/{}", rest);
+                        }
+                    }
+                    full
+                })
                 .collect();
             results.sort();
             return results;
         }
 
-        // Sandbox is active but listing failed → no results (directory not
-        // reachable in sandbox).  Only fall back to host when no sandbox.
         if sandbox_active {
             return Vec::new();
         }
-        complete_path_prefix_impl(prefix)
+        complete_path_prefix_impl(&expanded)
     }
 
     /// Build the line that replaces the current input when Tab-completing a
@@ -2112,6 +2104,21 @@ fn edit_in_editor(current: &str) -> io::Result<String> {
     Ok(result)
 }
 
+/// Expand `~` and `~/` prefix to the home directory.  Leaves other paths
+/// unchanged.  Used by path completion to resolve `~` before calling `ls`
+/// inside the sandbox (which doesn't do shell expansion).
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home.trim_end_matches('/'), rest);
+        }
+    }
+    path.to_string()
+}
+
 /// Generic file-path prefix completion. Lists the parent directory of `prefix`
 /// and returns entries whose file name starts with the stem of `prefix`.
 /// Directories get a trailing `/`.
@@ -2190,6 +2197,21 @@ impl LineEditor {
     pub fn set(&mut self, s: &str) {
         self.buf = s.chars().collect();
         self.cursor = self.buf.len();
+    }
+
+    /// Replace the char range `[start, end)` with `repl` and position the
+    /// cursor right after the replacement text.
+    pub fn replace_range(&mut self, start: usize, end: usize, repl: &str) {
+        let start = start.min(self.buf.len());
+        let end = end.min(self.buf.len());
+        if start > end {
+            return;
+        }
+        let new_chars: Vec<char> = repl.chars().collect();
+        // Remove old range, insert new chars at `start`.
+        self.buf.splice(start..end, new_chars.iter().copied());
+        // Position cursor after the replacement.
+        self.cursor = start + new_chars.len();
     }
 
     /// Current buffer as a `String` (newlines preserved).
@@ -3375,9 +3397,9 @@ mod tests {
         assert_eq!(&w, "h", "cursor after 'h': got {:?}", &w);
         assert_eq!(s, 0);
         assert_eq!(e, 1);
-        // Cursor at position 5 (on the space after "hello") → word *after*: "world"
+        // Cursor at position 5 (on the space after "hello") → word *before*: "hello"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, 5);
-        assert_eq!(&w, "world", "cursor on space after hello: {:?}", &w);
+        assert_eq!(&w, "hello", "cursor on space after hello: {:?}", &w);
         // Cursor at position 8 (after "wo" in "world") → chars before: "wo"
         let (s, e, w) = Repl::token_at_cursor(&buf, 8);
         assert_eq!(&w, "wo", "cursor after 'wo' in 'world': got {:?}", &w);
@@ -3396,9 +3418,8 @@ mod tests {
         let buf: Vec<char> = "   abc".chars().collect();
         // Cursor at position 0 (start, before any word) → empty
         assert_eq!(Repl::token_at_cursor(&buf, 0), (0, 0, String::new()));
-        // Cursor at position 2 (on leading whitespace) → no word before, word after is "abc"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 2);
-        assert_eq!(&w, "abc");
+        // Cursor at position 2 (on leading whitespace) → no word before → empty
+        assert_eq!(Repl::token_at_cursor(&buf, 2), (0, 0, String::new()), "cursor on leading whitespace");
         // Cursor at position 4 (on 'b' in "abc") → chars before: "a"
         let (s, e, w) = Repl::token_at_cursor(&buf, 4);
         assert_eq!(&w, "a", "cursor on 'b' in 'abc': chars before is {:?}", &w);
@@ -3411,9 +3432,9 @@ mod tests {
         // Cursor in the middle of a sentence
         let buf: Vec<char> = "write_file src/foo.rs src/bar.rs".chars().collect();
         // Cursor at position 21 (the space between the two paths)
-        // → word AFTER cursor: "src/bar.rs" (the word being typed)
+        // → word BEFORE cursor: "src/foo.rs"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, 21);
-        assert_eq!(&w, "src/bar.rs", "cursor on space: word after: {:?}", &w);
+        assert_eq!(&w, "src/foo.rs", "cursor on space: word before: {:?}", &w);
         // Cursor at position 20 (on the 's' at end of "src/foo.rs")
         // → chars before cursor: "src/foo.r"
         let (s, e, w) = Repl::token_at_cursor(&buf, 20);
@@ -3445,28 +3466,22 @@ mod tests {
     }
 
     #[test]
-    fn replace_token_at_replaces_correct_range() {
-        let s = "hello world foo";
-        // Replace "world" with "there"
-        assert_eq!(
-            Repl::replace_token_at(s, 6, 11, "there"),
-            "hello there foo"
-        );
-        // Replace "hello" at start
-        assert_eq!(
-            Repl::replace_token_at(s, 0, 5, "hi"),
-            "hi world foo"
-        );
-        // Replace "foo" at end
-        assert_eq!(
-            Repl::replace_token_at(s, 12, 15, "bar"),
-            "hello world bar"
-        );
-        // Start >= end => full replacement
-        assert_eq!(
-            Repl::replace_token_at(s, 10, 5, "X"),
-            "X"
-        );
+    fn replace_range_tests() {
+        let mut e = LineEditor::from_text("hello world foo");
+        // Replace "world" with "there" in the middle
+        e.replace_range(6, 11, "there");
+        assert_eq!(e.text(), "hello there foo");
+        assert_eq!(e.cursor, 11);
+        // Replace at start
+        let mut e = LineEditor::from_text("hello world foo");
+        e.replace_range(0, 5, "hi");
+        assert_eq!(e.text(), "hi world foo");
+        assert_eq!(e.cursor, 2);
+        // Replace at end
+        let mut e = LineEditor::from_text("hello world foo");
+        e.replace_range(12, 15, "bar");
+        assert_eq!(e.text(), "hello world bar");
+        assert_eq!(e.cursor, 15);
     }
 
     impl LineEditor {
