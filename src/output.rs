@@ -48,6 +48,11 @@ pub trait Output: Send + Sync {
     fn end_response_segment(&self) {}
     /// Called when the whole response finishes; commit the final live block.
     fn end_response(&self) {}
+    /// Enable/disable *answer holding*: when enabled (a reasoning-capable
+    /// turn), the assistant answer text is buffered and only emitted once the
+    /// turn ends, so that reasoning arriving *after* the answer is still shown
+    /// above it. Default no-op for outputs that don't stream incrementally.
+    fn set_answer_hold(&self, _hold: bool) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
     fn get_user_input(&self) -> String;
@@ -265,6 +270,15 @@ pub struct ConsoleOutput {
     /// answer boundaries so streamed thinking reads faded *without* re-rendering
     /// any already-emitted content.
     dim_on: Mutex<bool>,
+    /// When true (a reasoning-capable turn), the assistant answer text is
+    /// buffered instead of rendered, and only flushed once the turn ends
+    /// (`end_response_segment` / `end_response`). This keeps reasoning that
+    /// arrives *after* the answer pinned *above* it rather than leaking below.
+    /// Set via `set_answer_hold` at the start of each response.
+    answer_held: Mutex<bool>,
+    /// Buffered assistant answer text while `answer_held` is true. Flushed at
+    /// the turn boundary.
+    answer_buffer: Mutex<String>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -382,6 +396,8 @@ impl ConsoleOutput {
             thinking_parser: Mutex::new(StreamParser::new_gfm()),
             thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             dim_on: Mutex::new(false),
+            answer_held: Mutex::new(false),
+            answer_buffer: Mutex::new(String::new()),
         }
     }
 
@@ -415,6 +431,10 @@ impl ConsoleOutput {
     /// on whether the test process's stdout is attached to a terminal.
     fn begin_response_inner(&self, live: bool) {
         *self.live.lock().unwrap() = live;
+        // Reset per-response answer-holding state. `set_answer_hold` is called
+        // afterwards (from the agent) to re-enable it for reasoning turns.
+        *self.answer_held.lock().unwrap() = false;
+        *self.answer_buffer.lock().unwrap() = String::new();
         if live {
             // Reset the incremental parser/renderer for a fresh response and
             // print a leading blank to separate from the user prompt.
@@ -561,6 +581,43 @@ impl ConsoleOutput {
         *r = (*r + n - 1).min(h - 1) + 1;
     }
 
+    /// Render any answer text held back while reasoning was streaming, after
+    /// committing the thinking paragraph so the layout reads `[thinking][answer]`.
+    /// Renders the answer through a *local* parser so `self.parser` stays empty
+    /// and the caller's own per-segment answer-commit (a no-op on an empty
+    /// parser) does not re-render it. Returns true when a held answer was
+    /// flushed on the live path.
+    fn flush_held_answer(&self) -> bool {
+        let live = *self.live.lock().unwrap();
+        if !live {
+            return false;
+        }
+        let buffer = std::mem::take(&mut *self.answer_buffer.lock().unwrap());
+        if buffer.is_empty() {
+            return false;
+        }
+        let mut out = std::io::stdout();
+        // Commit the (dimmed) thinking paragraph first, mirroring the
+        // thinking→answer boundary handling in `stream_text`.
+        let was_thinking = *self.dim_on.lock().unwrap();
+        if was_thinking {
+            let mut tparser = self.thinking_parser.lock().unwrap();
+            let events = tparser.write(b"\n\n");
+            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            let _ = trenderer.feed(&events, &mut out);
+        }
+        self.ensure_dim(false, &mut out);
+        // Render the answer with a local parser so `self.parser` is left empty
+        // for the caller's renderer reset.
+        let mut local_parser = StreamParser::new_gfm();
+        let events = local_parser.write(buffer.as_bytes());
+        let mut renderer = self.renderer.lock().unwrap();
+        let _ = renderer.feed(&events, &mut out);
+        println!();
+        self.note_lines(1);
+        true
+    }
+
     fn separator() {
         let width = term_width();
         println!("{}", style("─".repeat(width)).dim());
@@ -635,10 +692,21 @@ impl Output for ConsoleOutput {
         self.begin_response_inner(std::io::stdout().is_terminal());
     }
 
+    fn set_answer_hold(&self, hold: bool) {
+        *self.answer_held.lock().unwrap() = hold;
+    }
+
     fn stream_text(&self, delta: &str) {
         let live = *self.live.lock().unwrap();
         if !live {
             self.text_buffer.lock().unwrap().push_str(delta);
+            return;
+        }
+        // While a turn is answer-held (reasoning-capable), buffer the answer so
+        // it can be flushed *below* any reasoning that streams after it. The
+        // buffer is emitted at the turn boundary (see `flush_held_answer`).
+        if *self.answer_held.lock().unwrap() {
+            self.answer_buffer.lock().unwrap().push_str(delta);
             return;
         }
         // Coarse-grained live rendering: feed the delta to the incremental
@@ -698,6 +766,10 @@ impl Output for ConsoleOutput {
         let live = *self.live.lock().unwrap();
         if live {
             let mut out = std::io::stdout();
+            // Flush any answer held back while reasoning was streaming. When it
+            // flushes, it has already committed the thinking paragraph and
+            // printed the gap, so we skip that part below.
+            let flushed = self.flush_held_answer();
             // Commit any open answer paragraph so the tool call/result prints
             // below, then start a *fresh* answer renderer for the next segment.
             // This drops the renderer's `pending_gap`, which otherwise fires at
@@ -713,17 +785,20 @@ impl Output for ConsoleOutput {
                 theme.clickable_links = true; // real TTY path
                 *renderer = Renderer::new(theme, term_width());
             }
-            // Commit thinking (don't reset: post-tool thinking continues in the
-            // same thinking renderer so it reads as one continuous faded stream).
-            {
-                let mut parser = self.thinking_parser.lock().unwrap();
-                let events = parser.write(b"\n\n");
-                let mut renderer = self.thinking_renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
+            if !flushed {
+                // Commit thinking (don't reset: post-tool thinking continues in
+                // the same thinking renderer so it reads as one continuous
+                // faded stream).
+                {
+                    let mut parser = self.thinking_parser.lock().unwrap();
+                    let events = parser.write(b"\n\n");
+                    let mut renderer = self.thinking_renderer.lock().unwrap();
+                    let _ = renderer.feed(&events, &mut out);
+                }
+                self.ensure_dim(false, &mut out);
+                println!();
+                self.note_lines(1);
             }
-            self.ensure_dim(false, &mut out);
-            println!();
-            self.note_lines(1);
         } else {
             self.flush_text();
         }
@@ -734,23 +809,29 @@ impl Output for ConsoleOutput {
         let live = *self.live.lock().unwrap();
         if live {
             let mut out = std::io::stdout();
-            // Finalize the answer document.
-            {
-                let mut parser = self.parser.lock().unwrap();
-                let events = parser.flush();
-                let mut renderer = self.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
+            // Flush any answer held back while reasoning was streaming. When it
+            // flushes, the answer and thinking are already finalized below, so
+            // skip the redundant finalize.
+            let flushed = self.flush_held_answer();
+            if !flushed {
+                // Finalize the answer document.
+                {
+                    let mut parser = self.parser.lock().unwrap();
+                    let events = parser.flush();
+                    let mut renderer = self.renderer.lock().unwrap();
+                    let _ = renderer.feed(&events, &mut out);
+                }
+                // Finalize thinking (it was rendered inline + dimmed as it streamed).
+                {
+                    let mut parser = self.thinking_parser.lock().unwrap();
+                    let events = parser.flush();
+                    let mut renderer = self.thinking_renderer.lock().unwrap();
+                    let _ = renderer.feed(&events, &mut out);
+                }
+                self.ensure_dim(false, &mut out);
+                println!();
+                self.note_lines(1);
             }
-            // Finalize thinking (it was rendered inline + dimmed as it streamed).
-            {
-                let mut parser = self.thinking_parser.lock().unwrap();
-                let events = parser.flush();
-                let mut renderer = self.thinking_renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
-            }
-            self.ensure_dim(false, &mut out);
-            println!();
-            self.note_lines(1);
         } else {
             self.flush_text();
             // Non-TTY thinking already streamed to stderr; stdout stays clean.
@@ -1461,6 +1542,48 @@ mod tests {
         assert!(
             !lines[idx - 2].trim().is_empty(),
             "exactly ONE blank line before answer two (no double gap)"
+        );
+    }
+
+    #[test]
+    fn late_reasoning_answer_is_withheld_until_turn_end() {
+        // Regression test for the OpenRouter ordering quirk: when reasoning is
+        // enabled, answer text that arrives *before* a trailing reasoning delta
+        // must be *withheld* (buffered) until the turn ends, so it can be
+        // flushed *below* the reasoning rather than above it. Reasoning renders
+        // inline immediately (see `stream_thinking`), so withholding the answer
+        // is what guarantees the `[thinking][answer]` emission order.
+        let out = ConsoleOutput::new();
+        out.begin_response_inner(true); // force the live/TTY path
+        out.set_answer_hold(true); // reasoning enabled → hold the answer
+        // Answer arrives first, then a trailing reasoning delta.
+        out.stream_text("ZQANSWERZQ");
+        out.stream_thinking("ZQTHINKZQ");
+        // While held, the answer lives in the buffer, not yet emitted.
+        assert_eq!(
+            out.answer_buffer.lock().unwrap().as_str(),
+            "ZQANSWERZQ",
+            "answer must be buffered (withheld) while reasoning is still streaming"
+        );
+        out.end_response();
+        // At the turn boundary the answer is flushed and the buffer cleared.
+        assert!(
+            out.answer_buffer.lock().unwrap().is_empty(),
+            "held answer must be flushed at end_response"
+        );
+    }
+
+    #[test]
+    fn answer_not_withheld_when_reasoning_disabled() {
+        // Without answer-holding, the answer renders inline (not buffered), so
+        // this path is unaffected by the fix.
+        let out = ConsoleOutput::new();
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.stream_text("ZQANSWERZQ");
+        assert!(
+            out.answer_buffer.lock().unwrap().is_empty(),
+            "answer must render inline (not buffered) when holding is off"
         );
     }
 }
