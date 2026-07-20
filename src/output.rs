@@ -802,35 +802,58 @@ impl ConsoleOutput {
     }
 
     /// Render one full-width dark-grey panel row for `text` (plain, no ANSI).
-    /// `text` is wrapped to the terminal width and painted dim (or red for
-    /// errors). The grey background is applied to every piece — the text *and*
-    /// the trailing padding — so the panel stays solid across the whole row:
-    /// nesting one pre-styled string under a single background would let
-    /// `console`'s trailing `\x1b[0m` reset the background before the padding
-    /// spaces (those would then render on the default background). Padding uses
+    /// `text` is wrapped to one column shy of the terminal width and painted
+    /// dim (or red for errors), indented by a single column so the tool output
+    /// reads as a distinct block. The grey background is painted onto *every*
+    /// segment — the leading indent, each text piece, *and* the trailing
+    /// padding — so the panel stays solid across the whole row. That per-segment
+    /// painting matters because a coloured diff marker (`-`/`+`) carries its own
+    /// `\x1b[0m`; wrapping the whole line under one background would let that
+    /// reset drop the grey behind the remaining (dim) text. Padding uses
     /// display-column width so wide/CJK characters keep the panel edge aligned.
     fn tool_panel(&self, text: &str, is_error: bool) {
         let width = term_width();
+        // Leave one column for the indent; keep the background full-width.
+        let inner = width.saturating_sub(1).max(1);
         let lines = if text.is_empty() {
             vec![String::new()]
         } else {
-            wrap(text, width.max(1))
+            wrap(text, inner)
         };
         for line in lines {
             let vis = UnicodeWidthStr::width(line.as_str());
+            // +1 covers the leading indent so the row still fills `width`.
             let pad = if width == 0 {
                 0
             } else {
-                width.saturating_sub(vis)
+                width.saturating_sub(vis + 1)
             };
-            let fg = if is_error {
-                style(line.as_str()).red()
+            // Foreground content painted on the grey background. Only a leading
+            // diff indicator (`-`/`+`) is recoloured (red/green); the rest stays
+            // dim. The indicator and the remainder are kept as separate
+            // background-painted segments so the indicator's internal reset
+            // cannot drop the background behind the rest of the line.
+            let content = if is_error {
+                style(line.to_string()).red().on_true_color(22, 22, 26).to_string()
+            } else if let Some(rest) = line.strip_prefix("- ") {
+                format!(
+                    "{}{}",
+                    style("-").red().on_true_color(22, 22, 26),
+                    style(format!(" {rest}")).dim().on_true_color(22, 22, 26),
+                )
+            } else if let Some(rest) = line.strip_prefix("+ ") {
+                format!(
+                    "{}{}",
+                    style("+").green().on_true_color(22, 22, 26),
+                    style(format!(" {rest}")).dim().on_true_color(22, 22, 26),
+                )
             } else {
-                style(line.as_str()).dim()
+                style(line.to_string()).dim().on_true_color(22, 22, 26).to_string()
             };
             let row = format!(
-                "{}{}",
-                fg.on_true_color(22, 22, 26),
+                "{}{}{}",
+                style(" ").on_true_color(22, 22, 26),
+                content,
                 style(" ".repeat(pad)).on_true_color(22, 22, 26),
             );
             println!("{}", row);
@@ -1070,7 +1093,7 @@ impl Output for ConsoleOutput {
             println!();
             self.note_lines(1);
         }
-        // Dark-grey panel box (no `⏺`, no tree line-art, no indent).
+        // Dark-grey panel box (no `⏺`, no tree line-art; 1-char indent).
         self.tool_panel(&label, false);
         for line in &extra {
             self.tool_panel(line, false);
@@ -1113,7 +1136,7 @@ impl Output for ConsoleOutput {
         }
 
         // Render each output line as its own dark-grey panel row (no `│`/`└`
-        // tree art, no indent), matching the tool-call box. Errors are red.
+        // tree art; 1-char indent), matching the tool-call box. Errors are red.
         let show_max = if is_error { usize::MAX } else { 4 };
         for (printed, line) in lines.iter().enumerate() {
             if printed >= show_max {
