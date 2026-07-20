@@ -19,7 +19,7 @@ use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
 use rig_core::completion::{CompletionModel, PromptError};
 use rig_core::message::Message;
-use rig_core::message::{AssistantContent, Text};
+use rig_core::message::{AssistantContent, Text, ToolResult, UserContent};
 use rig_core::OneOrMany;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
@@ -195,6 +195,25 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                                     break;
                                 }
                             }
+                            // Phase 2a: preserve user prompt on non-cancellation
+                            // errors. Commit the partial turn so the next prompt or
+                            // steering message sees the user's input and any partial
+                            // assistant text, rather than having it silently dropped.
+                            // See doc/pi_steering_rig.md §6.5.3.
+                            if let Some(ref mut h) = history {
+                                let mut partial = vec![Message::user(input)];
+                                if !output.is_empty() {
+                                    partial.push(Message::assistant(&output));
+                                }
+                                let to_commit = maybe_strip_reasoning(
+                                    partial,
+                                    self.reasoning_in_context,
+                                    &self.provider,
+                                    &self.model,
+                                );
+                                let to_commit = normalize_call_ids(to_commit);
+                                h.extend(to_commit);
+                            }
                             self.output.end_response();
                             return Err(crate::PicocodeError::Other(e.to_string()));
                         }
@@ -286,6 +305,34 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         .join("\n")
 }
 
+    /// Ensure every `ToolResult` in the given messages has `call_id` set.
+    ///
+    /// If `call_id` is `None`, set it to the tool result's own `id`. This is
+    /// the Phase 2b fix for cross-provider safety: the OpenAI Responses API
+    /// requires `call_id` to be present on every tool result, and normalising
+    /// at persist time avoids the need for pi's `transformMessages` layer.
+    /// See doc/pi_steering_rig.md §6.5.4.
+    fn normalize_call_ids(messages: Vec<Message>) -> Vec<Message> {
+        messages.into_iter().map(|m| match m {
+            Message::User { content } => {
+                let items: Vec<UserContent> = content.into_iter().map(|c| match c {
+                    UserContent::ToolResult(tr) => {
+                        UserContent::ToolResult(ToolResult {
+                            call_id: tr.call_id.or_else(|| Some(tr.id.clone())),
+                            ..tr
+                        })
+                    }
+                    other => other,
+                }).collect();
+                Message::User {
+                    content: OneOrMany::many(items)
+                        .expect("OneOrMany never empty after iterating over non-empty content"),
+                }
+            }
+            other => other,
+        }).collect()
+    }
+
     /// Merge a finished (or aborted) turn into the session `history`.
     ///
     /// * `final_history` — messages for a *successfully completed* turn (`[user,
@@ -319,9 +366,11 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         if let Some(h) = history {
             if let Some(fh) = final_history {
                 let to_commit = maybe_strip_reasoning(fh, reasoning_in_context, provider, model);
+                let to_commit = normalize_call_ids(to_commit);
                 h.extend(to_commit);
             } else if let Some(ch) = cancelled_history {
                 let to_commit = maybe_strip_reasoning(ch, reasoning_in_context, provider, model);
+                let to_commit = normalize_call_ids(to_commit);
                 **h = to_commit;
             }
         }
