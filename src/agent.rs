@@ -81,6 +81,18 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         let mut cancelled_history: Option<Vec<Message>> = None;
         let mut aborted = false;
         self.output.begin_response();
+        // When reasoning/thinking is enabled, hold the assistant answer back and
+        // flush it only at the turn boundary. This guarantees that reasoning
+        // arriving *after* the answer (an occasional OpenRouter streaming order)
+        // is still shown above it instead of leaking below. See `output.rs`
+        // `answer_held` / `flush_held_answer`.
+        let reasoning_expected = self
+            .thinking_level
+            .as_deref()
+            .and_then(|s| s.parse::<thinking::ThinkingLevel>().ok())
+            .map(|l| l != thinking::ThinkingLevel::Off)
+            .unwrap_or(false);
+        self.output.set_answer_hold(reasoning_expected);
         while let Some(item) = stream.next().await {
             match item {
                 Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
@@ -223,6 +235,7 @@ pub struct CodeAgent<M: CompletionModel> {
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
+    thinking_level: Option<String>,
 }
 
 #[derive(Clone)]
@@ -323,6 +336,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
+                config.thinking_level.clone(),
             ))
         }};
     }
@@ -1005,6 +1019,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
+        thinking_level: Option<String>,
     ) -> Self {
         Self {
             agent,
@@ -1015,6 +1030,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             yolo,
             persona_name,
             user_cancel,
+            thinking_level,
         }
     }
 }
