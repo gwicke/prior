@@ -966,8 +966,9 @@ impl Repl {
         let mut help_view = false;
         // Command word / filter text captured when building the overlay, so the
         // Enter handler can re-resolve the highlighted item without re-parsing.
-        let mut cur_word = String::new();
-        let mut cur_filter = String::new();
+        // No initial value: assigned by compute_overlay at top of each iteration.
+        let mut cur_word;
+        let mut cur_filter;
         let mut value_error: Option<String> = None;
         // Cached value candidates for the /set overlay, reused by the Enter
         // handler so it indexes into the same list the user navigated.
