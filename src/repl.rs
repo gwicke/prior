@@ -1368,19 +1368,19 @@ impl Repl {
         let m = model.to_lowercase();
         for e in entries {
             let id = e.id.to_lowercase();
-            if id == format!("{}/{}", p, m) {
+            if id == format!("{}:{}", p, m) {
                 return e.id.clone();
             }
             if id == m {
                 return e.id.clone();
             }
             // OpenRouter passthrough (`tencent/hy3:free`) and native
-            // (`openrouter/hy3:free`) both end in the short model name.
+            // (`openrouter:tencent/hy3:free`) both end in the short model name.
             if p == "openrouter" && id.ends_with(&format!("/{}", m)) {
                 return e.id.clone();
             }
         }
-        format!("{}/{}", p, m)
+        format!("{}:{}", p, m)
     }
 
 
@@ -2523,7 +2523,7 @@ mod tests {
         // Flat id (no nested path): provider:model, value == display.
         let e = model_catalog::ModelEntry {
             provider: "anthropic".into(),
-            id: "anthropic/claude-3-5-sonnet".into(),
+            id: "anthropic:claude-3-5-sonnet".into(),
             display: "anthropic:claude-3-5-sonnet".into(),
             context_length: None,
             prompt_cost: None,
@@ -2540,8 +2540,8 @@ mod tests {
         // is `openrouter:deepseek/deepseek-v4-flash`.
         let e2 = model_catalog::ModelEntry {
             provider: "openrouter".into(),
-            id: "deepseek/deepseek-v4-flash".into(),
-            display: "deepseek:deepseek-v4-flash".into(),
+            id: "openrouter:deepseek/deepseek-v4-flash".into(),
+            display: "openrouter:deepseek/deepseek-v4-flash".into(),
             context_length: None,
             prompt_cost: None,
             completion_cost: None,
