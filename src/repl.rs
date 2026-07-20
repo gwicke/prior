@@ -341,6 +341,9 @@ impl Repl {
         let mut value_cands: Vec<ValueCandidate> = Vec::new();
         // Path completions for Tab in the regular prompt (kind 9 overlay).
         let mut path_completions: Vec<String> = Vec::new();
+        // Cursor position (char indices) of the token being completed so that
+        // selection handlers replace the right token (not always the last one).
+        let mut completion_pos: Option<(usize, usize)> = None;
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -974,8 +977,13 @@ impl Repl {
                                     9 => {
                                         if let Some(c) = path_completions.get(sel) {
                                             let buf = editor.text();
-                                            editor.set(&Self::replace_last_token(&buf, c));
+                                            if let Some((start, end)) = completion_pos {
+                                                editor.set(&Self::replace_token_at(&buf, start, end, c));
+                                            } else {
+                                                editor.set(&Self::replace_last_token(&buf, c));
+                                            }
                                             path_completions.clear();
+                                            completion_pos = None;
                                         }
                                     }
                                     _ => {}
@@ -1172,8 +1180,13 @@ impl Repl {
                                         9 => {
                                             if let Some(c) = path_completions.get(sel) {
                                                 let buf = editor.text();
-                                                editor.set(&Self::replace_last_token(&buf, c));
+                                                if let Some((start, end)) = completion_pos {
+                                                    editor.set(&Self::replace_token_at(&buf, start, end, c));
+                                                } else {
+                                                    editor.set(&Self::replace_last_token(&buf, c));
+                                                }
                                                 path_completions.clear();
+                                                completion_pos = None;
                                             }
                                         }
                                         _ => {}
@@ -1209,6 +1222,7 @@ impl Repl {
                                 }
                                 9 => {
                                     path_completions.clear();
+                                    completion_pos = None;
                                 }
                                 _ => {}
                             },
@@ -1217,6 +1231,7 @@ impl Repl {
                                 // active dismisses it (user is typing something else).
                                 if kind == 9 {
                                     path_completions.clear();
+                                    completion_pos = None;
                                 }
                                 if let Some(a) =
                                     Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
@@ -1231,23 +1246,31 @@ impl Repl {
                         continue;
                     }
                     // No overlay: normal editing.
-                    // Tab: file-path completion on the last whitespace-delimited token.
+                    // Tab: file-path completion on the token at the cursor.
                     if let KeyCode::Tab = key.code {
                         if !key.modifiers.contains(KeyModifiers::CONTROL)
                             && !key.modifiers.contains(KeyModifiers::ALT)
                         {
                             let buf = editor.text();
-                            let last_token = buf
-                                .split_whitespace()
-                                .last()
-                                .map(|s| s.to_string())
-                                .unwrap_or_default();
-                            if !last_token.is_empty() {
-                                let completions = complete_path_prefix_impl(&last_token);
+                            let cursor = editor.cursor;
+                            let buf_chars: Vec<char> = buf.chars().collect();
+                            let (tok_start, tok_end, token) =
+                                Self::token_at_cursor(&buf_chars, cursor);
+                            if !token.is_empty() {
+                                // Complete using sandbox-aware listing when
+                                // the sandbox is active; falls back to the
+                                // host filesystem otherwise.
+                                let completions = Self::complete_path_prefix_sandbox(&token);
                                 if completions.len() == 1 {
-                                    editor.set(&Self::replace_last_token(&buf, &completions[0]));
+                                    editor.set(&Self::replace_token_at(
+                                        &buf,
+                                        tok_start,
+                                        tok_end,
+                                        &completions[0],
+                                    ));
                                 } else if !completions.is_empty() {
                                     path_completions = completions;
+                                    completion_pos = Some((tok_start, tok_end));
                                     sel = 0;
                                 }
                             }
@@ -1597,6 +1620,138 @@ impl Repl {
         } else {
             repl.to_string()
         }
+    }
+
+    /// Find the whitespace-delimited token at or near `cursor` (char index
+    /// into `buf`). Returns `(start_byte, end_byte, token_text)`.
+    ///
+    /// Strategy, in priority order:
+    /// 1. Cursor at/beyond end-of-buffer → last whitespace-delimited token.
+    /// 2. Cursor *on* a non-WS character → the word containing that position.
+    /// 3. Cursor *on* whitespace → word *after* cursor (the word the user is
+    ///    currently typing).  If none (e.g. trailing whitespace), word *before*.
+    ///
+    /// Returns `(0, 0, "")` when there is no word.
+    fn token_at_cursor(buf: &[char], cursor: usize) -> (usize, usize, String) {
+        let len = buf.len();
+        if len == 0 || cursor == 0 {
+            return (0, 0, String::new());
+        }
+        let pos = cursor.min(len);
+
+        // 1. Past end or on trailing WS → last word.
+        if pos >= len || (pos == len - 1 && buf[pos].is_whitespace()) {
+            let mut end = len;
+            while end > 0 && buf[end - 1].is_whitespace() {
+                end -= 1;
+            }
+            if end == 0 {
+                return (0, 0, String::new());
+            }
+            let mut start = end;
+            while start > 0 && !buf[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            return (start, end, buf[start..end].iter().collect());
+        }
+
+        // 2. Cursor on a non-WS char → chars of that word *before* the cursor.
+        if !buf[pos].is_whitespace() {
+            let mut start = pos;
+            while start > 0 && !buf[start - 1].is_whitespace() {
+                start -= 1;
+            }
+            if start < cursor {
+                return (start, cursor, buf[start..cursor].iter().collect());
+            }
+            // Cursor at word start with nothing typed → no completion.
+            return (0, 0, String::new());
+        }
+
+        // 3. Cursor on whitespace → try the word *after* cursor first (the
+        //    word the user is typing).  Skip consecutive whitespace to handle
+        //    multiple spaces between words.  If nothing after, try *before*.
+        let mut after_start = pos + 1;
+        while after_start < len && buf[after_start].is_whitespace() {
+            after_start += 1;
+        }
+        if after_start < len {
+            let mut end_after = after_start + 1;
+            while end_after < len && !buf[end_after].is_whitespace() {
+                end_after += 1;
+            }
+            return (after_start, end_after, buf[after_start..end_after].iter().collect());
+        }
+        // Nothing after → word *before* cursor.
+        let mut start_before = pos;
+        while start_before > 0 && !buf[start_before - 1].is_whitespace() {
+            start_before -= 1;
+        }
+        if start_before < pos {
+            return (start_before, pos, buf[start_before..pos].iter().collect());
+        }
+
+        (0, 0, String::new())
+    }
+
+    /// Replace the token spanning byte range `[start, end)` in `s` with `repl`.
+    fn replace_token_at(s: &str, start: usize, end: usize, repl: &str) -> String {
+        if start >= end || start >= s.len() {
+            return repl.to_string();
+        }
+        let end = end.min(s.len());
+        format!("{}{}{}", &s[..start], repl, &s[end..])
+    }
+
+    /// Complete a file path prefix, preferring sandbox-aware listing when the
+    /// sandbox is active.
+    ///
+    /// When the sandbox has explicit bindings, runs `ls -1p` *inside* the
+    /// sandbox (via bwrap) so completions reflect exactly what the agent would
+    /// see.  Falls back to the host filesystem only when no sandbox is
+    /// configured at all; when the sandbox IS active but a directory doesn't
+    /// exist inside it, returns empty so non-sandbox paths are never suggested.
+    fn complete_path_prefix_sandbox(prefix: &str) -> Vec<String> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+
+        // Determine the directory to list and the name filter.
+        let path = std::path::Path::new(prefix);
+        let (dir, filter) = if prefix.ends_with('/') || path.is_dir() {
+            // Strip trailing / so we don't double it when joining.
+            (prefix.trim_end_matches('/').to_string(), String::new())
+        } else {
+            let parent = path.parent().unwrap_or(std::path::Path::new("."));
+            let stem = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (parent.to_string_lossy().to_string(), stem)
+        };
+
+        // Check whether a sandbox is active so we know if host fallback is
+        // safe.  The sandbox config is published once before the REPL starts
+        // (see agent.rs, `set_sandbox`).
+        let sandbox_active = crate::tools::sandbox_config().is_some();
+
+        // Sandbox listing.
+        if let Some(entries) = crate::tools::sandbox_list_dir(&dir) {
+            let mut results: Vec<String> = entries
+                .into_iter()
+                .filter(|name| name.starts_with(&filter))
+                .map(|name| format!("{}/{}", dir, name))
+                .collect();
+            results.sort();
+            return results;
+        }
+
+        // Sandbox is active but listing failed → no results (directory not
+        // reachable in sandbox).  Only fall back to host when no sandbox.
+        if sandbox_active {
+            return Vec::new();
+        }
+        complete_path_prefix_impl(prefix)
     }
 
     /// Build the line that replaces the current input when Tab-completing a
@@ -3202,6 +3357,115 @@ mod tests {
                 "gemini/gem".to_string(),
                 "deepseek/flash".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn token_at_cursor_handles_various_positions() {
+        // Empty buffer
+        assert_eq!(Repl::token_at_cursor(&[], 0), (0, 0, String::new()));
+
+        // "hello world foo"
+        //  h=0 e=1 l=2 l=3 o=4  =5 w=6 o=7 r=8 l=9 d=10  =11 f=12 o=13 o=14
+        let buf: Vec<char> = "hello world foo".chars().collect();
+        // Cursor at start (0) → empty
+        assert_eq!(Repl::token_at_cursor(&buf, 0), (0, 0, String::new()));
+        // Cursor at position 1 (after 'h') → chars before: "h"
+        let (s, e, w) = Repl::token_at_cursor(&buf, 1);
+        assert_eq!(&w, "h", "cursor after 'h': got {:?}", &w);
+        assert_eq!(s, 0);
+        assert_eq!(e, 1);
+        // Cursor at position 5 (on the space after "hello") → word *after*: "world"
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 5);
+        assert_eq!(&w, "world", "cursor on space after hello: {:?}", &w);
+        // Cursor at position 8 (after "wo" in "world") → chars before: "wo"
+        let (s, e, w) = Repl::token_at_cursor(&buf, 8);
+        assert_eq!(&w, "wo", "cursor after 'wo' in 'world': got {:?}", &w);
+        assert_eq!(s, 6);
+        assert_eq!(e, 8);
+        // Cursor at position 11 (the space after "world") → word *before*: "world"
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 11);
+        assert_eq!(&w, "world", "cursor on space after world: {:?}", &w);
+        // Cursor after last word (at end) → last word "foo"
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
+        assert_eq!(&w, "foo", "cursor at end: last word");
+    }
+
+    #[test]
+    fn token_at_cursor_empty_at_whitespace_start() {
+        let buf: Vec<char> = "   abc".chars().collect();
+        // Cursor at position 0 (start, before any word) → empty
+        assert_eq!(Repl::token_at_cursor(&buf, 0), (0, 0, String::new()));
+        // Cursor at position 2 (on leading whitespace) → no word before, word after is "abc"
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 2);
+        assert_eq!(&w, "abc");
+        // Cursor at position 4 (on 'b' in "abc") → chars before: "a"
+        let (s, e, w) = Repl::token_at_cursor(&buf, 4);
+        assert_eq!(&w, "a", "cursor on 'b' in 'abc': chars before is {:?}", &w);
+        assert_eq!(s, 3);
+        assert_eq!(e, 4);
+    }
+
+    #[test]
+    fn token_at_cursor_middle_of_sentence() {
+        // Cursor in the middle of a sentence
+        let buf: Vec<char> = "write_file src/foo.rs src/bar.rs".chars().collect();
+        // Cursor at position 21 (the space between the two paths)
+        // → word AFTER cursor: "src/bar.rs" (the word being typed)
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 21);
+        assert_eq!(&w, "src/bar.rs", "cursor on space: word after: {:?}", &w);
+        // Cursor at position 20 (on the 's' at end of "src/foo.rs")
+        // → chars before cursor: "src/foo.r"
+        let (s, e, w) = Repl::token_at_cursor(&buf, 20);
+        assert_eq!(&w, "src/foo.r", "cursor on 's' in src/foo.rs: chars before: {:?}", &w);
+        assert_eq!(s, 11);
+        assert_eq!(e, 20);
+        // Cursor at position 22 (on 's' at start of "src/bar.rs")
+        // → cursor at word start, no chars before → empty (no completion)
+        assert_eq!(Repl::token_at_cursor(&buf, 22), (0, 0, String::new()), "cursor at start of src/bar.rs");
+    }
+
+    #[test]
+    fn token_at_cursor_trailing_whitespace() {
+        // Cursor past trailing whitespace → last word
+        let buf: Vec<char> = "write_file src/ ".chars().collect();
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
+        assert_eq!(&w, "src/", "trailing ws: last word");
+    }
+
+    #[test]
+    fn token_at_cursor_single_word() {
+        let buf: Vec<char> = "hello".chars().collect();
+        // Cursor at end of buffer
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 5);
+        assert_eq!(&w, "hello");
+        // Cursor at 1 (after 'h') → chars before: "h"
+        let (_s, _e, w) = Repl::token_at_cursor(&buf, 1);
+        assert_eq!(&w, "h");
+    }
+
+    #[test]
+    fn replace_token_at_replaces_correct_range() {
+        let s = "hello world foo";
+        // Replace "world" with "there"
+        assert_eq!(
+            Repl::replace_token_at(s, 6, 11, "there"),
+            "hello there foo"
+        );
+        // Replace "hello" at start
+        assert_eq!(
+            Repl::replace_token_at(s, 0, 5, "hi"),
+            "hi world foo"
+        );
+        // Replace "foo" at end
+        assert_eq!(
+            Repl::replace_token_at(s, 12, 15, "bar"),
+            "hello world bar"
+        );
+        // Start >= end => full replacement
+        assert_eq!(
+            Repl::replace_token_at(s, 10, 5, "X"),
+            "X"
         );
     }
 
