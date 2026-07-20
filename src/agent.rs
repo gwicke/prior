@@ -12,12 +12,12 @@ use crate::thinking;
 use console::style;
 use rig_core::agent::{
     Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    HookContext, ModelTurnAction, ModelTurnFinished, ObservationAction, ToolCall, ToolCallAction,
-    ToolResultAction, ToolResultEvent,
+    HookContext, ModelTurnAction, ModelTurnFinished, ObservationAction, StreamingError, ToolCall,
+    ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::CompletionModel;
+use rig_core::completion::{CompletionModel, PromptError};
 use rig_core::message::Message;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
@@ -45,11 +45,15 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
     async fn prompt(
         &self,
         input: &str,
-        history: Option<&mut Vec<Message>>,
+        mut history: Option<&mut Vec<Message>>,
     ) -> Result<String> {
         self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
-        // prior `Esc` doesn't silently cancel this one.
+        // prior `Esc` doesn't silently cancel this prompt. The REPL's in-flight
+        // reader sets `cancel` on `<Esc>` and is always joined (after `done` is
+        // set) before the next `prompt()` begins, so a leftover `cancel` can
+        // only survive while the reader is still running — which it never is at
+        // this point. See doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
 
         // Clone the prior history (owned) so we can still write the updated
@@ -71,10 +75,15 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
 
         let mut output = String::new();
         let mut final_history: Option<Vec<Message>> = None;
+        // Captured when the run is cancelled via `<Esc>`; rig's error carries the
+        // in-flight *full* history (prior turns + this turn's user prompt + any
+        // partial assistant text). Persisting it is root cause #2's fix.
+        let mut cancelled_history: Option<Vec<Message>> = None;
+        let mut aborted = false;
         self.output.begin_response();
         while let Some(item) = stream.next().await {
-            match item.map_err(|e| crate::PicocodeError::Other(e.to_string()))? {
-                MultiTurnStreamItem::StreamAssistantItem(content) => match content {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
                     StreamedAssistantContent::Text(text) => {
                         let delta = text.text();
                         output.push_str(delta);
@@ -93,27 +102,44 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                     }
                     _ => {}
                 },
-                MultiTurnStreamItem::StreamUserItem(_) => {}
-                MultiTurnStreamItem::CompletionCall(_) => {
+                Ok(MultiTurnStreamItem::StreamUserItem(_)) => {}
+                Ok(MultiTurnStreamItem::CompletionCall(_)) => {
                     // Commit the text so far before the tool call / result line.
                     self.output.end_response_segment();
                 }
-                MultiTurnStreamItem::FinalResponse(resp) => {
+                Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
                     final_history = resp.messages().map(|h| h.to_vec());
                 }
-                MultiTurnStreamItem::ToolExecutionCommitted { .. } => {}
-                MultiTurnStreamItem::ModelTurnRetried { .. } => {}
-                _ => {}
+                Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. }) => {}
+                Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {}
+                Ok(_) => {}
+                Err(e) => {
+                    // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
+                    // as a terminal `PromptCancelled` error that carries the
+                    // in-flight full history. Capture it so an aborted turn is not
+                    // a total loss and cross-turn context survives (root cause #2).
+                    if let StreamingError::Prompt(prompt_err) = &e {
+                        if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
+                            cancelled_history = Some(chat_history.clone());
+                            aborted = true;
+                            break;
+                        }
+                    }
+                    self.output.end_response();
+                    return Err(crate::PicocodeError::Other(e.to_string()));
+                }
             }
         }
         self.output.end_response();
 
-        // Persist history across turns (§2.4 fix): `history` is cloned into
-        // the request, so we must write the updated history back here.
-        if let Some(h) = history {
-            if let Some(fh) = final_history {
-                *h = fh;
-            }
+        // Persist history across turns. `persist_turn` appends a completed turn
+        // (fixing root cause #1, which previously *replaced* the whole history
+        // and dropped every earlier exchange) and, on cancellation, replaces
+        // with the in-flight full history (root cause #2).
+        persist_turn(&mut history, final_history, cancelled_history);
+
+        if aborted {
+            return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
         }
 
         Ok(output)
@@ -151,7 +177,34 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         .join("\n")
 }
 
-fn is_tool_available(tool: &str) -> bool {
+    /// Merge a finished (or aborted) turn into the session `history`.
+    ///
+    /// * `final_history` — messages for a *successfully completed* turn (`[user,
+    ///   assistant]`). Appended, because `history` already holds the prior turns;
+    ///   this mirrors rig's blocking `chat()`, which does `chat_history.extend(
+    ///   messages)`. This is the root-cause-#1 fix: the previous code *replaced*
+    ///   the whole history with just this turn, so earlier context was lost every
+    ///   turn.
+    /// * `cancelled_history` — the in-flight *full* history rig attaches to a
+    ///   `PromptCancelled` error (prior turns + the aborted user prompt + any
+    ///   partial assistant text). Replaces `history` rather than appending, since
+    ///   it already contains the prior turns; appending would duplicate them. This
+    ///   is the root-cause-#2 fix.
+    fn persist_turn(
+        history: &mut Option<&mut Vec<Message>>,
+        final_history: Option<Vec<Message>>,
+        cancelled_history: Option<Vec<Message>>,
+    ) {
+        if let Some(h) = history {
+            if let Some(fh) = final_history {
+                h.extend(fh);
+            } else if let Some(ch) = cancelled_history {
+                **h = ch;
+            }
+        }
+    }
+
+    fn is_tool_available(tool: &str) -> bool {
     std::process::Command::new("which")
         .arg(tool)
         .stdout(std::process::Stdio::null())
@@ -889,6 +942,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 };
                 match response {
                     Ok(_) => {}
+                    Err(crate::PicocodeError::Cancelled(msg)) => {
+                        // Turn aborted via `<Esc>`; `prompt()` already persisted
+                        // the in-flight history, so show a clear notice instead
+                        // of a generic "Error:".
+                        config.output.display_text(&msg);
+                    }
                     Err(e) => {
                         config.output.display_text(&format!("Error: {}", e));
                     }
@@ -927,7 +986,8 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
 mod tests {
     use rig_core::message::Reasoning;
 
-    use super::{create_private_dir, reasoning_text};
+    use super::{create_private_dir, persist_turn, reasoning_text};
+    use rig_core::message::Message;
 
     #[test]
     fn reasoning_text_extracts_text_block() {
@@ -952,5 +1012,60 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Regression test for root cause #1: a successful turn must *append* to the
+    // existing history, preserving prior turns. The old code replaced the whole
+    // history with just the latest turn, so earlier exchanges were lost every
+    // turn.
+    #[test]
+    fn successful_turn_appends_to_history() {
+        let mut hist: Vec<Message> = vec![Message::user("prior-1")];
+        persist_turn(
+            &mut Some(&mut hist),
+            Some(vec![
+                Message::user("turn-2-prompt"),
+                Message::assistant("turn-2-reply"),
+            ]),
+            None,
+        );
+
+        // Prior turn preserved, new turn appended (not wiped/replaced).
+        assert_eq!(hist.len(), 3);
+        assert!(hist.contains(&Message::user("prior-1")));
+        assert!(hist.contains(&Message::user("turn-2-prompt")));
+        assert!(hist.contains(&Message::assistant("turn-2-reply")));
+        // Prior must come before the new turn.
+        let prior_idx = hist.iter().position(|m| *m == Message::user("prior-1")).unwrap();
+        let new_idx = hist
+            .iter()
+            .position(|m| *m == Message::user("turn-2-prompt"))
+            .unwrap();
+        assert!(prior_idx < new_idx);
+    }
+
+    // Regression test for root cause #2: an aborted turn must keep the prior
+    // turns and commit the in-flight full history *without* duplicating the
+    // priors (rig's cancellation error already includes them).
+    #[test]
+    fn aborted_turn_keeps_prior_and_no_duplication() {
+        let mut hist: Vec<Message> = vec![Message::user("prior-1")];
+        // rig's `PromptCancelled.chat_history` == full_history() == prior + this turn.
+        let cancelled = vec![
+            Message::user("prior-1"),
+            Message::user("aborted-prompt"),
+            Message::assistant("aborted-partial"),
+        ];
+        persist_turn(&mut Some(&mut hist), None, Some(cancelled));
+
+        // Replaced (not appended): exactly the in-flight full history, with no
+        // duplicate of `prior-1`.
+        assert_eq!(hist.len(), 3);
+        assert_eq!(
+            hist.iter().filter(|m| **m == Message::user("prior-1")).count(),
+            1
+        );
+        assert!(hist.contains(&Message::user("aborted-prompt")));
+        assert!(hist.contains(&Message::assistant("aborted-partial")));
     }
 }

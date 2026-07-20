@@ -3,8 +3,9 @@
 Investigation into: *"aborting via `<esc>` seems to completely wipe context, so
 subsequent submissions have no reference to the earlier conversation."*
 
-This document records the root-cause analysis only. No code was changed; fixes
-are **proposed** at the end.
+This document records the root-cause analysis. The fixes described in §4 have
+since been **implemented** in `src/agent.rs` (see `persist_turn` and the `<Esc>`
+cancellation handling in `prompt()`).
 
 All upstream references are to the patched rig fork pinned in `Cargo.toml`
 (`rig-core = { git = ".../rig.git", rev = "87f3f5b7" }`), located at
@@ -149,47 +150,42 @@ history it could have persisted.
 
 ---
 
-## 4. Proposed fixes (not implemented)
+## 4. Fixes (implemented)
 
-1. **Fix the persistence contract (root cause #1).** In `src/agent.rs:112-116`,
-   append the returned turn to the existing history instead of replacing it,
-   mirroring rig's blocking `chat()`:
-
-   ```rust
-   if let Some(h) = history {
-       if let Some(fh) = final_history {
-           h.extend(fh);   // prior + this turn, instead of *h = fh
-       }
-   }
-   ```
+1. **Fix the persistence contract (root cause #1).** **Implemented** in
+   `persist_turn`: the completed turn's `final_history` is appended to `history`
+   (`.extend(fh)`) instead of replacing it (`*h = fh`), mirroring rig's blocking
+   `chat()`.
 
    `fh` already includes the user message + assistant turns for this prompt, so
-   `extend` yields the correct full history. This alone fixes cross-turn context
-   loss and also means an abort (which skips the write-back) preserves everything
-   up to the last successful turn.
+   `extend` yields the correct full history. This fixes cross-turn context loss
+   and also means an abort (which skips the write-back) preserves everything up
+   to the last successful turn.
 
-2. **Make `<Esc>` preserve continuity (root cause #2).** Stop swallowing the
-   cancellation error. Catch the `PromptError::prompt_cancelled { history, .. }`
-   specifically, extract its `history` (the in-flight `full_history()`), and
-   persist it (e.g. via `extend`) so the user can refine the aborted turn. Decide
-   on the desired UX:
-   - commit the partial turn (user prompt + partial assistant text) so the
-     conversation continues seamlessly, **or**
-   - at minimum commit the user's prompt so a first-turn abort isn't a total
-     loss, and surface a clear "aborted" message instead of a generic `Error:`.
+2. **Make `<Esc>` preserve continuity (root cause #2).** **Implemented.**
+   `prompt()` no longer swallows the cancellation error: it matches
+   `StreamingError::Prompt(PromptError::PromptCancelled { chat_history, .. })`
+   and persists `chat_history` (the in-flight `full_history()`) via
+   `persist_turn`. Because `full_history()` already includes the prior turns,
+   `persist_turn` **replaces** `history` (rather than appending) to avoid
+   duplicating the priors — this is the one deviation from the original "extend"
+   suggestion, which would have double-counted the prior turns. The abort
+   therefore commits the partial turn (user prompt + partial assistant text) so
+   the conversation continues seamlessly, and a clear `Aborted.` notice is
+   surfaced in `run_interactive` (via a new `PicocodeError::Cancelled` variant)
+   instead of a generic `Error:`.
 
-3. **Hygiene.** `user_cancel` is reset at the start of each `prompt()`
-   (`src/agent.rs:52`), which already prevents a stale cancel from leaking into
-   the next turn. Add a comment / test documenting that the in-flight reader's
-   `done` flag and `cancel` are mutually consistent across abort → next prompt.
+3. **Hygiene.** **Implemented.** `user_cancel` is reset at the start of each
+   `prompt()` (with a comment documenting that the in-flight reader's `done` flag
+   and `cancel` are mutually consistent across abort → next prompt), so a stale
+   cancel cannot leak into the next turn.
 
-4. **Tests.** There are currently no tests asserting streaming-history
-   persistence (`tests/` has none referencing `history`/`messages`/`FinalResponse`
-   /abort). Add a regression test that:
-   - runs two successful turns and asserts `history` contains both turns (catches
-     root cause #1), and
-   - aborts a turn and asserts the prior turns remain and the new prompt is at
-     least retained (catches root cause #2).
+4. **Tests.** **Implemented.** `src/agent.rs` now has regression tests covering
+   the persistence contract:
+   - `successful_turn_appends_to_history` runs two turns and asserts `history`
+     contains both (catches root cause #1), and
+   - `aborted_turn_keeps_prior_and_no_duplication` aborts a turn and asserts the
+     prior turns remain with no duplication (catches root cause #2).
 
 ---
 

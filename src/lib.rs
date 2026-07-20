@@ -54,6 +54,9 @@ pub enum PicocodeError {
 
     #[error("Other error: {0}")]
     Other(String),
+
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
 }
 
 pub type Result<T> = std::result::Result<T, PicocodeError>;
