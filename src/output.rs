@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 use termimad;
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
@@ -289,6 +290,12 @@ pub struct ConsoleOutput {
     /// Live `show_reasoning` display mode. Read on every thinking event so a
     /// `/set show_reasoning …` change applies immediately (no agent rebuild).
     show_reasoning: ShowReasoningHandle,
+    /// Whether the most recently emitted block was a *tool* panel (call or
+    /// result) as opposed to ordinary text/answer. Lets `display_tool_call`
+    /// insert a single blank-line divider between consecutive tool calls
+    /// without doubling the divider that a preceding text segment already
+    /// printed.
+    last_was_tool: Mutex<bool>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -409,9 +416,10 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             (s, Vec::new())
         }
         "bash" => {
-            // Show the *entire* command line; never shorten it.
+            // Show the *entire* command line; never shorten it. Prefix with `$`
+            // so it reads like a shell prompt.
             let cmd = get_str("cmd").unwrap_or("").trim();
-            (cmd.to_string(), Vec::new())
+            (format!("$ {}", cmd), Vec::new())
         }
         s if s.starts_with("grep") => {
             // Grep_* family: label as `grep`, showing the full pattern and the
@@ -421,6 +429,11 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 .unwrap_or("");
             let path = get_str("path").unwrap_or("");
             (format!("grep {} {}", pat, path), Vec::new())
+        }
+        s if s.starts_with("list") => {
+            // `list_dir` (and any `List_*` variant): shorten to `ls`.
+            let path = get_str("path").unwrap_or("");
+            (format!("ls {}", path), Vec::new())
         }
         "edit_file" => {
             let path = get_str("path").unwrap_or("");
@@ -516,6 +529,7 @@ impl ConsoleOutput {
             answer_held: Mutex::new(false),
             answer_buffer: Mutex::new(String::new()),
             show_reasoning,
+            last_was_tool: Mutex::new(false),
         }
     }
 
@@ -570,6 +584,7 @@ impl ConsoleOutput {
             *self.dim_on.lock().unwrap() = false;
             println!();
             self.note_lines(1);
+            self.note_text();
         } else {
             *self.text_buffer.lock().unwrap() = String::new();
         }
@@ -755,12 +770,63 @@ impl ConsoleOutput {
         let _ = renderer.feed(&events, &mut out);
         println!();
         self.note_lines(1);
+        self.note_text();
         true
     }
 
     fn separator() {
         let width = term_width();
         println!("{}", style("─".repeat(width)).dim());
+    }
+
+    /// Record that the most recent output block was ordinary text/answer (not a
+    /// tool panel), so the next tool call will not insert a redundant blank-line
+    /// divider — a text segment already emits its own leading blank line.
+    fn note_text(&self) {
+        *self.last_was_tool.lock().unwrap() = false;
+    }
+
+    /// Record that the most recent output block was a tool panel.
+    fn note_tool(&self) {
+        *self.last_was_tool.lock().unwrap() = true;
+    }
+
+    /// Render one full-width dark-grey panel row for `text` (plain, no ANSI).
+    /// `text` is wrapped to the terminal width and painted dim (or red for
+    /// errors). The grey background is applied to every piece — the text *and*
+    /// the trailing padding — so the panel stays solid across the whole row:
+    /// nesting one pre-styled string under a single background would let
+    /// `console`'s trailing `\x1b[0m` reset the background before the padding
+    /// spaces (those would then render on the default background). Padding uses
+    /// display-column width so wide/CJK characters keep the panel edge aligned.
+    fn tool_panel(&self, text: &str, is_error: bool) {
+        let width = term_width();
+        let lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            wrap(text, width.max(1))
+        };
+        for line in lines {
+            let vis = UnicodeWidthStr::width(line.as_str());
+            let pad = if width == 0 {
+                0
+            } else {
+                width.saturating_sub(vis)
+            };
+            let fg = if is_error {
+                style(line.as_str()).red()
+            } else {
+                style(line.as_str()).dim()
+            };
+            let row = format!(
+                "{}{}",
+                fg.on_true_color(22, 22, 26),
+                style(" ".repeat(pad)).on_true_color(22, 22, 26),
+            );
+            println!("{}", row);
+            self.note_lines(1);
+        }
+        self.note_tool();
     }
 
     fn create_spinner(message: &str) -> ProgressBar {
@@ -866,6 +932,7 @@ impl Output for ConsoleOutput {
             self.ensure_dim(false, &mut out);
             println!();
             self.note_lines(1);
+            self.note_text();
         } else {
             self.ensure_dim(false, &mut out);
         }
@@ -936,6 +1003,7 @@ impl Output for ConsoleOutput {
                 self.ensure_dim(false, &mut out);
                 println!();
                 self.note_lines(1);
+                self.note_text();
             }
         } else {
             self.flush_text();
@@ -969,6 +1037,7 @@ impl Output for ConsoleOutput {
                 self.ensure_dim(false, &mut out);
                 println!();
                 self.note_lines(1);
+                self.note_text();
             }
         } else {
             self.flush_text();
@@ -978,18 +1047,21 @@ impl Output for ConsoleOutput {
 
     fn display_tool_call(&self, name: &str, args: &Value) {
         self.stop_thinking();
-        // One line separator, then a purpose-built label (+ optional trailing
-        // lines such as an edit diff). `get_preview` returns the label and any
-        // extra lines; we render the label on the ⏺ line and hang extras below.
+        // Purpose-built label (+ optional trailing lines such as an edit diff)
+        // from `get_preview`. A preceding *text* segment already printed its
+        // own leading blank line, so we only add a blank divider when the
+        // previous block was also a tool (call or result) — that separates
+        // consecutive tool calls without doubling the segment's divider.
         let (label, extra) = get_preview(name, args);
-        print!("\n{} {}", style("⏺").green(), style(label).dim());
-        println!();
-        let mut lines = 2usize; // separator + label line
-        for line in &extra {
-            println!("  {} {}", style("│").dim(), style(line).dim());
-            lines += 1;
+        if *self.last_was_tool.lock().unwrap() {
+            println!();
+            self.note_lines(1);
         }
-        self.note_lines(lines);
+        // Dark-grey panel box (no `⏺`, no tree line-art, no indent).
+        self.tool_panel(&label, false);
+        for line in &extra {
+            self.tool_panel(line, false);
+        }
     }
 
     fn display_tool_result(&self, result: &str) {
@@ -1023,51 +1095,28 @@ impl Output for ConsoleOutput {
         let lines: Vec<_> = cleaned.lines().collect();
 
         if lines.is_empty() {
-            println!("  {}  {}", style("└").dim(), style("(empty)").dim());
-            self.note_lines(1);
+            self.tool_panel("(empty)", false);
             return;
         }
 
+        // Render each output line as its own dark-grey panel row (no `│`/`└`
+        // tree art, no indent), matching the tool-call box. Errors are red.
         let show_max = if is_error { usize::MAX } else { 4 };
-        let wrap_width = term_width().saturating_sub(4); // account for "  │  " prefix
-        let mut printed = 0;
-        let mut printed_count = 0;
-        for (i, line) in lines.iter().enumerate() {
+        for (printed, line) in lines.iter().enumerate() {
             if printed >= show_max {
                 break;
             }
-            let symbol = if i == lines.len() - 1 && lines.len() <= show_max {
-                "└"
-            } else {
-                "│"
-            };
-            if is_error {
-                println!("  {}  {}", style(symbol).dim(), style(line.to_string()).red());
-                printed_count += 1;
-            } else {
-                let wrapped = if wrap_width == 0 {
-                    vec![line.to_string()]
-                } else {
-                    wrap(line, wrap_width)
-                };
-                for (j, wline) in wrapped.into_iter().enumerate() {
-                    let sym = if j == 0 { symbol } else { " " };
-                    println!("  {}  {}", style(sym).dim(), style(wline).dim());
-                    printed_count += 1;
-                }
+            for wline in wrap(line, term_width().max(1)) {
+                self.tool_panel(&wline, is_error);
             }
-            printed += 1;
         }
 
         if lines.len() > show_max {
-            println!(
-                "  {}  {}",
-                style("└").dim(),
-                style(format!("... +{} lines", lines.len() - show_max)).dim()
+            self.tool_panel(
+                &format!("... +{} lines", lines.len() - show_max),
+                false,
             );
-            printed_count += 1;
         }
-        self.note_lines(printed_count.max(1));
     }
 
     fn get_user_input(&self) -> String {
@@ -1456,11 +1505,22 @@ mod tests {
     #[test]
     fn get_preview_bash_full_cmdline() {
         let args = serde_json::json!({"cmd": "cargo build --release && echo done"});
-        // No truncation: the full command is preserved verbatim.
+        // No truncation: the full command is preserved verbatim, prefixed with
+        // `$` so it reads like a shell prompt.
         assert_eq!(
             get_preview("bash", &args).0,
-            "cargo build --release && echo done"
+            "$ cargo build --release && echo done"
         );
+    }
+
+    #[test]
+    fn get_preview_list_dir_shortened_to_ls() {
+        // `list_dir` (and any `List_*` variant) collapses to `ls <path>`.
+        for name in ["list_dir", "ListDir", "ListFiles"] {
+            let (label, diff) = get_preview(name, &serde_json::json!({"path": "src"}));
+            assert_eq!(label, "ls src");
+            assert!(diff.is_empty());
+        }
     }
 
     #[test]
