@@ -321,7 +321,7 @@ Refinements from the recent work:
 ## A.8 `slash.rs` + help wiring
 
 - Add `SlashKind::Settings` and a registry entry
-  `SlashCommand { name: "/set", help: "View and edit settings (model, security, limits, persona, thinking)", kind: Settings }`.
+  `SlashCommand { name: "/set", help: "View and edit settings", kind: Settings }`.
 - In `read_input`'s command dispatch, add a branch for
   `"settings" | "setting" | "s"` (parallel to `"model" | "models" | "m"`),
   setting `kind = 5`.

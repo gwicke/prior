@@ -871,10 +871,10 @@ impl Repl {
                                     editor.set("");
                                 }
                                 2 => {
-                                    editor.set("/model");
+                                    editor.set("");
                                 }
                                 3 => {
-                                    editor.set("/thinking");
+                                    editor.set("");
                                 }
                                 5 => {
                                     let buf = editor.text();
@@ -885,7 +885,7 @@ impl Repl {
                                     }
                                 }
                                 6 => {
-                                    editor.set("/persona");
+                                    editor.set("");
                                 }
                                 _ => {}
                             },

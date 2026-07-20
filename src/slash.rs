@@ -41,7 +41,7 @@ pub fn registry() -> &'static [SlashCommand] {
         },
         SlashCommand {
             name: "/set",
-            help: "View and edit settings (model, security, limits, persona, thinking)",
+            help: "View and edit settings",
             kind: SlashKind::Settings,
         },
         SlashCommand {
