@@ -129,72 +129,100 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             .map(|l| l != thinking::ThinkingLevel::Off)
             .unwrap_or(false);
         self.output.set_answer_hold(reasoning_expected);
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
-                    StreamedAssistantContent::Text(text) => {
-                        let delta = text.text();
-                        output.push_str(delta);
-                        self.output.stream_text(delta);
-                    }
-                    StreamedAssistantContent::Reasoning(reasoning) => {
-                        let t = reasoning_text(&reasoning);
-                        if !t.is_empty() {
-                            self.output.stream_thinking(&t);
+        use tokio::time::{sleep, Duration};
+        loop {
+            tokio::select! {
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(content))) => match content {
+                            StreamedAssistantContent::Text(text) => {
+                                let delta = text.text();
+                                output.push_str(delta);
+                                self.output.stream_text(delta);
+                            }
+                            StreamedAssistantContent::Reasoning(reasoning) => {
+                                let t = reasoning_text(&reasoning);
+                                if !t.is_empty() {
+                                    self.output.stream_thinking(&t);
+                                }
+                            }
+                            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                                if !reasoning.is_empty() {
+                                    self.output.stream_thinking(&reasoning);
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some(Ok(MultiTurnStreamItem::StreamUserItem(_))) => {}
+                        Some(Ok(MultiTurnStreamItem::CompletionCall(call))) => {
+                            // Plumb per-request usage out of the stream (compaction's
+                            // prerequisite — doc/compaction.md §2.7). The last call's
+                            // `input_tokens` is the current context size; the sum across
+                            // calls approximates session cost. Zero-valued usage is rig's
+                            // sentinel for "provider reported nothing" (e.g. ollama), so
+                            // skip it to keep the telemetry honest.
+                            let u = call.usage;
+                            if u.has_values() {
+                                if let Ok(mut g) = self.usage.lock() {
+                                    g.last_input_tokens = u.input_tokens;
+                                    g.last_output_tokens = u.output_tokens;
+                                    g.last_cached_input_tokens = u.cached_input_tokens;
+                                    g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                    g.session_input_tokens += u.input_tokens;
+                                    g.session_output_tokens += u.output_tokens;
+                                    g.session_cached_input_tokens += u.cached_input_tokens;
+                                    g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
+                                    g.session_reasoning_tokens += u.reasoning_tokens;
+                                }
+                            }
+                            // Commit the text so far before the tool call / result line.
+                            self.output.end_response_segment();
                         }
-                    }
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                        if !reasoning.is_empty() {
-                            self.output.stream_thinking(&reasoning);
+                        Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
+                            final_history = resp.messages().map(|h| h.to_vec());
                         }
-                    }
-                    _ => {}
-                },
-                Ok(MultiTurnStreamItem::StreamUserItem(_)) => {}
-                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                    // Plumb per-request usage out of the stream (compaction's
-                    // prerequisite — doc/compaction.md §2.7). The last call's
-                    // `input_tokens` is the current context size; the sum across
-                    // calls approximates session cost. Zero-valued usage is rig's
-                    // sentinel for "provider reported nothing" (e.g. ollama), so
-                    // skip it to keep the telemetry honest.
-                    let u = call.usage;
-                    if u.has_values() {
-                        if let Ok(mut g) = self.usage.lock() {
-                            g.last_input_tokens = u.input_tokens;
-                            g.last_output_tokens = u.output_tokens;
-                            g.last_cached_input_tokens = u.cached_input_tokens;
-                            g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
-                            g.session_input_tokens += u.input_tokens;
-                            g.session_output_tokens += u.output_tokens;
-                            g.session_cached_input_tokens += u.cached_input_tokens;
-                            g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
-                            g.session_reasoning_tokens += u.reasoning_tokens;
+                        Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
+                        Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
+                            // as a terminal `PromptCancelled` error that carries the
+                            // in-flight full history. Capture it so an aborted turn is not
+                            // a total loss and cross-turn context survives (root cause #2).
+                            if let StreamingError::Prompt(prompt_err) = &e {
+                                if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
+                                    cancelled_history = Some(chat_history.clone());
+                                    aborted = true;
+                                    break;
+                                }
+                            }
+                            self.output.end_response();
+                            return Err(crate::PicocodeError::Other(e.to_string()));
                         }
+                        None => break,
                     }
-                    // Commit the text so far before the tool call / result line.
-                    self.output.end_response_segment();
                 }
-                Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
-                    final_history = resp.messages().map(|h| h.to_vec());
-                }
-                Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. }) => {}
-                Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {}
-                Ok(_) => {}
-                Err(e) => {
-                    // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
-                    // as a terminal `PromptCancelled` error that carries the
-                    // in-flight full history. Capture it so an aborted turn is not
-                    // a total loss and cross-turn context survives (root cause #2).
-                    if let StreamingError::Prompt(prompt_err) = &e {
-                        if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
-                            cancelled_history = Some(chat_history.clone());
-                            aborted = true;
-                            break;
+                _ = sleep(Duration::from_millis(50)) => {
+                    if self.user_cancel.load(Ordering::SeqCst) {
+                        // User pressed `<Esc>` — stop rendering and return control
+                        // to the REPL immediately. The stream is dropped, which
+                        // closes the HTTP connection; any running tool was already
+                        // killed by the watchdog (Phase 1a-d tool-cancel channel).
+                        //
+                        // Persist the partial turn before breaking, since we
+                        // won't receive a PromptCancelled error with full_history
+                        // (we're breaking out before the hook has a chance to fire).
+                        if let Some(h) = history.as_ref() {
+                            let mut partial = Vec::clone(h);
+                            partial.push(Message::user(input));
+                            if !output.is_empty() {
+                                partial.push(Message::assistant(&output));
+                            }
+                            cancelled_history = Some(partial);
                         }
+                        aborted = true;
+                        break;
                     }
-                    self.output.end_response();
-                    return Err(crate::PicocodeError::Other(e.to_string()));
                 }
             }
         }
