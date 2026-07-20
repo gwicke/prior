@@ -7,6 +7,14 @@ to the unreleased HEAD to fix the "reasoning-only turns look like missing
 responses" issue more cleanly, and pick up the refined hooks/tools/caching API.
 Findings below are grounded in the actual `rig/` source.
 
+**Fork note (temporary):** We are currently tracking a vendored copy of `rig`
+via `[patch.crates-io]` in `Cargo.toml` (→ `https://github.com/gwicke/rig.git`)
+instead of the published `0.40` crates. This is a **short-term measure**: we
+submitted a bug fix upstream and are pinned to this fork until that fix lands in
+a released `rig` version. Once it does, revert the `[patch.crates-io]` entry
+(and the `rig-core` dependency) back to the plain published `0.40` crates — no
+code changes should be required beyond dropping the patch.
+
 **Two references were checked:** the released tag `v0.40.0`
 (`2f37dfcd`, released 2026-07-11) and the current `HEAD` (post-0.40, includes
 significant changes). The **benefits** (§1–§3) are all present in the *released*
