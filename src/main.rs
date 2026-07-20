@@ -40,6 +40,10 @@ struct Args {
     /// Path to config file (default: ~/.config/picocode/settings.toml; --config overrides)
     #[arg(short, long, global = true)]
     config: Option<String>,
+
+    /// Log available providers and debug model catalog extrapolation/filtering
+    #[arg(long, global = true)]
+    debug_providers: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -121,6 +125,30 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Enable debug-providers mode if requested.
+    if args.debug_providers {
+        picocode::model_catalog::set_debug_providers(true);
+    }
+
+    // Log available providers at startup (before any network calls).
+    {
+        let providers = picocode::model_catalog::list_available_providers();
+        let configured: Vec<_> = providers.iter().filter(|(_, avail, _)| *avail).collect();
+        let unconfigured: Vec<_> = providers.iter().filter(|(_, avail, _)| !*avail).collect();
+        eprintln!("── Providers ──────────────────────────────────");
+        eprintln!("  Configured ({}):", configured.len());
+        for (name, _, envs) in &configured {
+            eprintln!("    {}  ({})", name, envs.join(", "));
+        }
+        if args.debug_providers {
+            eprintln!("  Unconfigured ({}):", unconfigured.len());
+            for (name, _, envs) in &unconfigured {
+                eprintln!("    {}  (needs: {})", name, envs.join(", "));
+            }
+        }
+        eprintln!("── Providers ──────────────────────────────────");
+    }
 
     // Fail closed: required external tools must be present before we do any
     // work. Degrading (e.g. running unsandboxed) is not safe once `rg` and
