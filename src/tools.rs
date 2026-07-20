@@ -1,5 +1,5 @@
 use duct_sh::sh_dangerous;
-use rig_derive::rig_tool;
+use rig_core::tool_macro as rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

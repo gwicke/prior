@@ -14,7 +14,6 @@ exclude = ["picocode.gif", ".github/"]
 
 [dependencies]
 rig-core = { version = "0.40", features = ["derive"] }
-rig-derive = "0.40"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -66,4 +65,3 @@ serial_test = "3.1"
 codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
 codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
 rig-core = { git = "https://github.com/gwicke/rig.git", rev = "f31c38c2160e0c07fcfb005a68574cd7311351e4" }
-rig-derive = { git = "https://github.com/gwicke/rig.git", rev = "f31c38c2160e0c07fcfb005a68574cd7311351e4" }

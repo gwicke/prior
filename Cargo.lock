@@ -1514,7 +1514,6 @@ dependencies = [
  "regex",
  "reqwest",
  "rig-core",
- "rig-derive",
  "schemars",
  "serde",
  "serde_json",
