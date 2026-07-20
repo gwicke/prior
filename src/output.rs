@@ -636,7 +636,17 @@ impl ConsoleOutput {
         if was_thinking {
             self.commit_thinking(&mut out);
         }
+        // Turn off dimming and emit one blank line so the answer starts on a
+        // fresh paragraph. The blank line MUST come *after* `ensure_dim(false)`
+        // (the dim-reset SGR): a GFM list/table emits no trailing newline of its
+        // own, so a `\n` placed before the reset would be swallowed as the
+        // block's closing newline instead of a blank separator. Ordering this
+        // exactly like `stream_text`'s transition is what guarantees the gap.
         self.ensure_dim(false, &mut out);
+        // Blank line between reasoning and answer, written to `out` (the same
+        // handle the reasoning/answer use) so it lands in the right place.
+        let _ = out.write_all(b"\n");
+        self.note_lines(1);
         // Render the answer with a local parser so `self.parser` is left empty
         // for the caller's renderer reset. `flush()` (not just `write`) so the
         // answer's final, blank-line-unterminated paragraph is emitted rather
@@ -757,7 +767,10 @@ impl Output for ConsoleOutput {
             // between (the tool path already prints its own gap).
             self.commit_thinking(&mut out);
             self.ensure_dim(false, &mut out);
-            println!();
+            // Blank line between reasoning and answer, written to `out` so it
+            // lands in the right place (a `println!` here can land in a
+            // different write buffer and be lost).
+            let _ = out.write_all(b"\n");
             self.note_lines(1);
         } else {
             self.ensure_dim(false, &mut out);
@@ -827,7 +840,7 @@ impl Output for ConsoleOutput {
                 // parser is reset, inside `commit_thinking`).
                 self.commit_thinking(&mut out);
                 self.ensure_dim(false, &mut out);
-                println!();
+                let _ = out.write_all(b"\n");
                 self.note_lines(1);
             }
         } else {
@@ -1582,6 +1595,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn late_reasoning_answer_is_withheld_until_turn_end() {
         // Regression test for the OpenRouter ordering quirk: when reasoning is
         // enabled, answer text that arrives *before* a trailing reasoning delta
@@ -1610,6 +1624,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn answer_not_withheld_when_reasoning_disabled() {
         // Without answer-holding, the answer renders inline (not buffered), so
         // this path is unaffected by the fix.
@@ -1625,16 +1640,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn reasoning_with_trailing_list_renders_before_answer() {
-        // Regression for the reasoning-below-answer bug (see
-        // `doc/reasoning_order_opus.md` §4). A GFM list cannot be closed by a
-        // blank line — the streaming parser must see a non-list line or EOF —
-        // so committing the thinking parser with `write(b"\n\n")` stranded
-        // list-structured reasoning until `end_response`'s `flush()`, which runs
-        // *after* the answer parser, printing the reasoning below the answer.
-        // The fix commits thinking with `flush()` (`commit_thinking`). Here we
-        // capture stdout at the fd level and assert the reasoning list item is
-        // emitted BEFORE the answer text.
+    fn reasoning_before_answer_has_blank_line_separator() {
+        // Regression for two related bugs (see `doc/reasoning_order_opus.md`
+        // §4 and §10):
+        //  (a) reasoning whose last block is a GFM list was stranded below the
+        //      answer because the thinking parser was committed with
+        //      `write(b"\n\n")` (a blank line can't close a list) instead of
+        //      `flush()`;
+        //  (b) in the held-answer (reasoning-enabled) path the answer started
+        //      immediately after the reasoning with no separating blank line.
+        // Here we capture stdout at the fd level and assert that (1) a trailing-
+        // list reasoning block renders BEFORE the answer, and (2) exactly one
+        // blank line separates them.
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
 
@@ -1644,7 +1661,7 @@ mod tests {
 
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response_inner(true); // live/TTY path
-        out.set_answer_hold(false); // NOHOLD: reasoning renders inline
+        out.set_answer_hold(true); // reasoning enabled → hold the answer
         // Markers are unique to this test: the fd-level redirect is process-wide,
         // so parallel tests' stdout lands in the same capture file — a shared
         // marker (e.g. "ANSWER") could false-match another test's output.
@@ -1671,6 +1688,17 @@ mod tests {
         assert!(
             list_pos < ans_pos,
             "reasoning (trailing list) must render BEFORE the answer; got:\n{plain}"
+        );
+        // Blank-line separation: the line immediately preceding the answer must
+        // be empty (the answer marker is the first non-empty line of its block).
+        let lines: Vec<&str> = plain.split('\n').collect();
+        let ans_line = lines
+            .iter()
+            .position(|l| l.contains("PICOCODE_RTANSWER_MARK"))
+            .unwrap();
+        assert!(
+            ans_line > 0 && lines[ans_line - 1].trim().is_empty(),
+            "answer must be separated from reasoning by a blank line; got:\n{plain}"
         );
     }
 }
