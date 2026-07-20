@@ -276,6 +276,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         thinking_level,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         sandbox,
         show_reasoning_handle,
         reasoning_in_context,

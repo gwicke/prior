@@ -129,7 +129,6 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             .map(|l| l != thinking::ThinkingLevel::Off)
             .unwrap_or(false);
         self.output.set_answer_hold(reasoning_expected);
-        use tokio::time::{sleep, Duration};
         loop {
             tokio::select! {
                 item = stream.next() => {
@@ -202,7 +201,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                         None => break,
                     }
                 }
-                _ = sleep(Duration::from_millis(50)) => {
+                _ = self.cancel_notify.notified() => {
                     if self.user_cancel.load(Ordering::SeqCst) {
                         // User pressed `<Esc>` — stop rendering and return control
                         // to the REPL immediately. The stream is dropped, which
@@ -406,6 +405,10 @@ pub struct CodeAgent<M: CompletionModel> {
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
+    /// Event-based cancel signal. The in-flight reader calls `notify_one()`
+    /// when `<Esc>` is pressed; the streaming loop selects on `notified()`
+    /// instead of polling with a sleep.
+    cancel_notify: Arc<tokio::sync::Notify>,
     thinking_level: Option<String>,
     reasoning_in_context: bool,
     /// Accumulated token-usage telemetry captured from the streaming run
@@ -432,6 +435,10 @@ pub struct AgentConfig {
     /// the user presses `Esc` during an LLM request; the `LoggingHook` bridge
     /// below turns it into a rig `CancelSignal` so the in-flight request stops.
     pub user_cancel: Arc<AtomicBool>,
+    /// Event-based cancel signal paired with `user_cancel`. The in-flight
+    /// reader calls `notify_one()` when `<Esc>` is pressed; the streaming
+    /// loop selects on `notified()` instead of polling.
+    pub cancel_notify: Arc<tokio::sync::Notify>,
     /// Resolved sandbox configuration for shell tool execution. `None` means
     /// the sandbox was never configured, in which case shell commands are
     /// refused rather than run unsandboxed. In normal operation `main.rs`
@@ -524,6 +531,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
+                config.cancel_notify.clone(),
                 config.thinking_level.clone(),
                 config.reasoning_in_context,
             ))
@@ -998,6 +1006,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     let cancel = Arc::new(AtomicBool::new(false));
     // So `/model` etc. embed the same flag into the rebuilt agent.
     config.user_cancel = cancel.clone();
+    // Event-based cancel signal — the streaming loop selects on this instead
+    // of polling.  Paired with `user_cancel` above.
+    let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    config.cancel_notify = cancel_notify.clone();
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
     if guard.is_some() {
@@ -1267,6 +1279,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         let handle = crate::repl::spawn_in_flight_reader(
                             g.clone(),
                             cancel.clone(),
+                            config.cancel_notify.clone(),
                             done.clone(),
                             confirm_gate,
                         );
@@ -1388,6 +1401,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
+        cancel_notify: Arc<tokio::sync::Notify>,
         thinking_level: Option<String>,
         reasoning_in_context: bool,
     ) -> Self {
@@ -1400,6 +1414,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             yolo,
             persona_name,
             user_cancel,
+            cancel_notify,
             thinking_level,
             reasoning_in_context,
             usage: Mutex::new(SessionUsage::default()),
@@ -1714,6 +1729,7 @@ use rig_core::OneOrMany;
             bash_auto_allow: None,
             agent_prompt: None,
             user_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             sandbox: Some(sandbox),
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
