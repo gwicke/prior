@@ -378,19 +378,126 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn get_preview(args: &Value) -> String {
-    let s = if let Some(obj) = args.as_object() {
-        obj.values()
-            .next()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                _ => v.to_string(),
-            })
-            .unwrap_or_default()
-    } else {
-        args.to_string()
+/// Build a human-readable one-line *label* for a tool call plus any optional
+/// *trailing* lines (e.g. a diff preview for edits).
+///
+/// The label replaces the old generic first-argument dump with purpose-built
+/// summaries:
+///   - `read_file`  -> `read <path> [start..end]`   (line range optional)
+///   - `bash`       -> the full command line, untruncated
+///   - `edit_file`  -> `edit <path> [start..end]`   (+ a best-effort diff)
+///   - anything else falls back to `Name <first-arg>` (truncated to 50 cols).
+fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
+    let obj = args.as_object();
+    let get_str = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_str());
+    let get_u64 = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_u64());
+
+    match name.to_lowercase().as_str() {
+        "read_file" => {
+            let path = get_str("path").unwrap_or("");
+            let offset = get_u64("offset").unwrap_or(0);
+            let limit = get_u64("limit").unwrap_or(0);
+            let mut s = format!("read {}", path);
+            // `offset` is 0-based; `limit` is a count. Display is 1-based, so the
+            // affected window is [offset+1, offset+limit]. A zero `limit` means
+            // "to end of file" -> omit the (optional) range.
+            if limit > 0 {
+                s.push_str(&format!(" [{}..{}]", offset + 1, offset + limit));
+            } else if offset > 0 {
+                s.push_str(&format!(" [{}..]", offset + 1));
+            }
+            (s, Vec::new())
+        }
+        "bash" => {
+            // Show the *entire* command line; never shorten it.
+            let cmd = get_str("cmd").unwrap_or("").trim();
+            (cmd.to_string(), Vec::new())
+        }
+        s if s.starts_with("grep") => {
+            // Grep_* family: label as `grep`, showing the full pattern and the
+            // full search path (never truncated).
+            let pat = get_str("pat")
+                .or_else(|| get_str("pattern"))
+                .unwrap_or("");
+            let path = get_str("path").unwrap_or("");
+            (format!("grep {} {}", pat, path), Vec::new())
+        }
+        "edit_file" => {
+            let path = get_str("path").unwrap_or("");
+            let old = get_str("old").unwrap_or("");
+            let new = get_str("new").unwrap_or("");
+            let (range, diff) = edit_preview(path, old, new);
+            let mut s = format!("edit {}", path);
+            if let Some(r) = range {
+                s.push_str(&format!(" [{}]", r));
+            }
+            (s, diff)
+        }
+        _ => {
+            let first = obj
+                .and_then(|o| o.values().next())
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                })
+                .unwrap_or_else(|| args.to_string());
+            let cap = name
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + &name[1..])
+                .unwrap_or_else(|| name.to_string());
+            (format!("{} {}", cap, truncate(&first.replace('\n', " "), 50)), Vec::new())
+        }
+    }
+}
+
+/// Best-effort line range + diff preview for an `edit_file` call.
+///
+/// Locates `old` in the current file contents (the edit has not run yet, so the
+/// text still matches) to derive the 1-based `[start..end]` line window, and
+/// emits a compact `-`/`+` preview of the change. A failed read or a missing
+/// `old` both degrade gracefully to `(None, [])` so the caller just prints
+/// `edit <path>` with no range/diff.
+fn edit_preview(path: &str, old: &str, new: &str) -> (Option<String>, Vec<String>) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return (None, Vec::new());
     };
-    truncate(&s.replace('\n', " "), 50)
+    let Some(idx) = content.find(old) else {
+        return (None, Vec::new());
+    };
+    // 1-based line number of the first line of `old`.
+    let start = content[..idx].matches('\n').count() + 1;
+    let end = start + old.matches('\n').count();
+    let range = if start == end {
+        format!("{start}")
+    } else {
+        format!("{start}..{end}")
+    };
+
+    // Compact diff preview: removed lines, then added lines, capped so huge
+    // replacements don't flood the scrollback.
+    const MAX: usize = 8;
+    let old_lines: Vec<&str> = old.split('\n').collect();
+    let new_lines: Vec<&str> = new.split('\n').collect();
+    let clip = |lines: &[&str]| -> Vec<String> {
+        if lines.len() > MAX {
+            lines[..MAX - 1]
+                .iter()
+                .map(|l| l.to_string())
+                .chain(std::iter::once("…".to_string()))
+                .collect()
+        } else {
+            lines.iter().map(|l| l.to_string()).collect()
+        }
+    };
+    let mut diff = Vec::new();
+    for l in clip(&old_lines) {
+        diff.push(format!("- {l}"));
+    }
+    for l in clip(&new_lines) {
+        diff.push(format!("+ {l}"));
+    }
+    (Some(range), diff)
 }
 
 impl ConsoleOutput {
@@ -871,19 +978,18 @@ impl Output for ConsoleOutput {
 
     fn display_tool_call(&self, name: &str, args: &Value) {
         self.stop_thinking();
-        let preview = get_preview(args);
-        let capitalized_name = name
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().collect::<String>() + &name[1..])
-            .unwrap_or_else(|| name.to_string());
-        println!(
-            "\n{} {}({})",
-            style("⏺").green(),
-            style(capitalized_name).bold(),
-            style(preview).dim()
-        );
-        self.note_lines(2);
+        // One line separator, then a purpose-built label (+ optional trailing
+        // lines such as an edit diff). `get_preview` returns the label and any
+        // extra lines; we render the label on the ⏺ line and hang extras below.
+        let (label, extra) = get_preview(name, args);
+        print!("\n{} {}", style("⏺").green(), style(label).dim());
+        println!();
+        let mut lines = 2usize; // separator + label line
+        for line in &extra {
+            println!("  {} {}", style("│").dim(), style(line).dim());
+            lines += 1;
+        }
+        self.note_lines(lines);
     }
 
     fn display_tool_result(&self, result: &str) {
@@ -1333,6 +1439,66 @@ mod tests {
     fn truncate_multibyte_no_panic() {
         assert_eq!(truncate("hello", 3), "hel...");
         assert_eq!(truncate("hi", 5), "hi");
+    }
+
+    #[test]
+    fn get_preview_read_file_range() {
+        let args = serde_json::json!({"path": "src/output.rs", "offset": 100, "limit": 50});
+        assert_eq!(get_preview("read_file", &args).0, "read src/output.rs [101..150]");
+        // zero limit => whole file, no range
+        let args = serde_json::json!({"path": "src/output.rs", "offset": 0, "limit": 0});
+        assert_eq!(get_preview("read_file", &args).0, "read src/output.rs");
+        // offset-only (limit 0) => open-ended range
+        let args = serde_json::json!({"path": "src/output.rs", "offset": 19, "limit": 0});
+        assert_eq!(get_preview("read_file", &args).0, "read src/output.rs [20..]");
+    }
+
+    #[test]
+    fn get_preview_bash_full_cmdline() {
+        let args = serde_json::json!({"cmd": "cargo build --release && echo done"});
+        // No truncation: the full command is preserved verbatim.
+        assert_eq!(
+            get_preview("bash", &args).0,
+            "cargo build --release && echo done"
+        );
+    }
+
+    #[test]
+    fn get_preview_edit_file_falls_back_without_file() {
+        let args = serde_json::json!({
+            "path": "/no/such/file.rs",
+            "old": "a",
+            "new": "b",
+            "all": false
+        });
+        let (label, diff) = get_preview("edit_file", &args);
+        assert_eq!(label, "edit /no/such/file.rs");
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn get_preview_unknown_tool_truncates() {
+        let args = serde_json::json!({"query": "a very very very very very long value that exceeds fifty characters for sure"});
+        let (label, diff) = get_preview("Search", &args);
+        assert!(label.starts_with("Search "));
+        assert!(label.ends_with("..."));
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn get_preview_grep_full_pattern_and_path() {
+        // Matches the `grep_text` tool name (and any `Grep_*` family member).
+        let args = serde_json::json!({
+            "pat": "fn (main|run)\\(",
+            "path": "/home/gabriel/src/picocode2/src"
+        });
+        for name in ["grep_text", "GrepText", "GrepFiles"] {
+            let (label, diff) = get_preview(name, &args);
+            // Label is shortened to just `grep`, and both pattern and path are
+            // shown in full (no 50-col truncation).
+            assert_eq!(label, "grep fn (main|run)\\( /home/gabriel/src/picocode2/src");
+            assert!(diff.is_empty());
+        }
     }
 
     #[test]
