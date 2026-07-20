@@ -327,6 +327,9 @@ impl Repl {
         let mut cur_word = String::new();
         let mut cur_filter = String::new();
         let mut value_error: Option<String> = None;
+        // Cached value candidates for the /set overlay, reused by the Enter
+        // handler so it indexes into the same list the user navigated.
+        let mut value_cands: Vec<ValueCandidate> = Vec::new();
         // Path completions for Tab in the regular prompt (kind 9 overlay).
         let mut path_completions: Vec<String> = Vec::new();
         // The input line starts at `initial_row` — the natural cursor row tracked
@@ -586,27 +589,68 @@ impl Repl {
                         }
                         "set" | "s" => {
                             kind = 5;
-                            title = "Settings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
                             cur_word = "set".into();
                             cur_filter = rest.to_string();
-                            let entries = settings.overlay_rows(&cur_filter);
-                            if entries.is_empty() {
-                                opts.push("(no matching setting)".into());
-                                active = None;
+                            let (skey, vq, is_value) = Self::parse_settings(rest);
+                            if is_value {
+                                // Value-pick mode: show candidates for the setting.
+                                if let Some(k) = skey {
+                                    let cands = Self::filtered_value_candidates(k, ctx, &vq);
+                                    value_cands = cands.clone();
+                                    let setting_name = SETTINGS
+                                        .iter()
+                                        .find(|m| m.key == k)
+                                        .map(|m| m.name)
+                                        .unwrap_or("?");
+                                    title = format!(
+                                        "{}  (type to filter, up/down, Enter select, Esc back)",
+                                        setting_name,
+                                    );
+                                    if cands.is_empty() {
+                                        opts.push("(no candidates)".into());
+                                        active = None;
+                                    } else {
+                                        let avail = term_width().saturating_sub(2);
+                                        let mut table = Table::new(&["Value", "Description"])
+                                            .with_aligns(&[Align::Left, Align::Left])
+                                            .with_min_widths(&[28, 30])
+                                            .with_priorities(&[2, 1])
+                                            .set_gap(2);
+                                        for c in &cands {
+                                            table.add_row(&[c.display.clone(), c.desc.clone()]);
+                                        }
+                                        for row in table.render_multiline(avail) {
+                                            opts.push(row);
+                                        }
+                                        // Mark the current value as active.
+                                        let cur_val = settings.value(k);
+                                        active = cands.iter().position(|c| c.value == cur_val);
+                                    }
+                                } else {
+                                    opts.push("(no matching setting)".into());
+                                    active = None;
+                                }
                             } else {
-                                let avail = term_width().saturating_sub(2);
-                                let mut table = Table::new(&["Setting", "Value", "Description"])
-                                    .with_aligns(&[Align::Left, Align::Left, Align::Left])
-                                    .with_min_widths(&[22, 18, 26])
-                                    .with_priorities(&[2, 2, 1])
-                                    .set_gap(2);
-                                for (meta, value) in &entries {
-                                    table.add_row(&[meta.name, value.as_str(), meta.description]);
+                                title = "Settings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
+                                let entries = settings.overlay_rows(&cur_filter);
+                                if entries.is_empty() {
+                                    opts.push("(no matching setting)".into());
+                                    active = None;
+                                } else {
+                                    let avail = term_width().saturating_sub(2);
+                                    let mut table = Table::new(&["Setting", "Value", "Description"])
+                                        .with_aligns(&[Align::Left, Align::Left, Align::Left])
+                                        .with_min_widths(&[22, 18, 26])
+                                        .with_priorities(&[2, 2, 1])
+                                        .set_gap(2);
+                                    for (meta, value) in &entries {
+                                        table.add_row(&[meta.name, value.as_str(), meta.description]);
+                                    }
+                                    for row in table.render_multiline(avail) {
+                                        opts.push(row);
+                                    }
+                                    active = None;
                                 }
-                                for row in table.render_multiline(avail) {
-                                    opts.push(row);
-                                }
-                                active = None;
                             }
                         }
                         "stat" | "stats" => {
@@ -792,10 +836,23 @@ impl Repl {
                                         let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
                                         if is_value {
                                             if let Some(k) = skey {
-                                                let filtered =
-                                                    Self::filtered_value_candidates(k, ctx, &vq);
-                                                if let Some(c) = filtered.get(sel) {
-                                                    editor.set(&Self::replace_last_token(&buf, &c.value));
+                                                // Use the cached candidates so we index the same
+                                                // list the user navigated during overlay rendering.
+                                                if let Some(c) = value_cands.get(sel) {
+                                                    // If the buffer ends with the setting name
+                                                    // (no trailing space), append the value;
+                                                    // otherwise replace the last token.
+                                                    let setting_name = SETTINGS
+                                                        .iter()
+                                                        .find(|m| m.key == k)
+                                                        .map(|m| m.name)
+                                                        .unwrap_or("?");
+                                                    let trimmed = buf.trim_end();
+                                                    if trimmed.ends_with(setting_name) {
+                                                        editor.set(&format!("/set {} {}", setting_name, c.value));
+                                                    } else {
+                                                        editor.set(&Self::replace_last_token(&buf, &c.value));
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -988,10 +1045,7 @@ impl Repl {
                                                     // Enter with an empty value saves the highlighted
                                                     // candidate (mirrors Tab); a typed value is saved as-is.
                                                     let vq_eff = if vq.trim().is_empty() {
-                                                        Self::filtered_value_candidates(k, ctx, &vq)
-                                                            .get(sel)
-                                                            .map(|c| c.value.clone())
-                                                            .unwrap_or_default()
+                                                        value_cands.get(sel).map(|c| c.value.clone()).unwrap_or_default()
                                                     } else {
                                                         vq.clone()
                                                     };
