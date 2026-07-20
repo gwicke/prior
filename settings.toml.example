@@ -8,6 +8,7 @@ security_mode = "confirm"          # yolo | confirm
 tool_call_limit = 50
 default_persona = "architect"      # built-in name or file path; omit for none
 default_thinking_level = "off"     # off | low | med | high
+show_thinking = "content"         # disabled | indicator | content
 
 # Custom agent prompt (replaces the default "Concise coding assistant" prompt)
 # agent_prompt = "You are a senior software engineer specialized in Rust and systems programming."

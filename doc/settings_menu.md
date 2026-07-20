@@ -447,6 +447,7 @@ security_mode = "confirm"          # yolo | confirm
 tool_call_limit = 50
 default_persona = "architect"      # omit for no persona
 default_thinking_level = "off"     # off | low | med | high
+show_thinking = "content"         # disabled | indicator | content
 ```
 
 `SettingsStore` reads these into its typed fields (via `Config`/`toml_edit::de`);

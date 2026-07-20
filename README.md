@@ -186,7 +186,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let output = Arc::new(ConsoleOutput::new());
+    let output = Arc::new(ConsoleOutput::new(picocode::settings::default_show_thinking_handle()));
 
     let agent = create_agent(AgentConfig {
         provider: "anthropic".into(),
@@ -199,6 +199,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persona_name: None,
         bash_auto_allow: None,
         agent_prompt: None,
+        user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        sandbox: None,
+        show_thinking_handle: picocode::settings::default_show_thinking_handle(),
     }).await?;
 
     let response = agent.run_once("Analyze the current project".into()).await?;

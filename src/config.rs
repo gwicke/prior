@@ -29,6 +29,9 @@ pub struct Config {
     /// Default thinking level: `off` | `low` | `med` | `high`.
     #[serde(default)]
     pub default_thinking_level: Option<String>,
+    /// How reasoning is shown: `disabled` | `indicator` | `content`.
+    #[serde(default)]
+    pub show_thinking: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

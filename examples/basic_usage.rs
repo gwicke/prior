@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup the output handler (ConsoleOutput provides pretty terminal printing)
-    let output = Arc::new(ConsoleOutput::new());
+    let output = Arc::new(ConsoleOutput::new(picocode::settings::default_show_thinking_handle()));
 
     // 2. Create the agent with a simple config struct
     // You no longer need to manually initialize Rig clients or builders.
@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sandbox: None,
         agent_prompt: None,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        show_thinking_handle: picocode::settings::default_show_thinking_handle(),
     }).await?;
 
     println!("--- Picocode Library Example ---");

@@ -10,6 +10,75 @@
 //! [`SettingsStore::set_value`].
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+/// How model reasoning/thinking is surfaced to the user.
+///
+/// * `Content`   (default) — stream the thinking/reasoning text inline, dimmed.
+/// * `Indicator`          — show only a "Thinking…" spinner (no reasoning text).
+/// * `Disabled`           — show neither the indicator nor the reasoning text.
+///
+/// Driven by the `show_thinking` setting (editable via `/set`). The live value
+/// lives in a [`ShowThinkingHandle`] shared by the `Output` impl and the running
+/// `AgentConfig`, so a `/set show_thinking …` change applies to the very next
+/// response without rebuilding the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShowThinking {
+    /// Stream the thinking/reasoning text inline (dimmed).
+    #[default]
+    Content,
+    /// Show only a "Thinking…" spinner; suppress the reasoning text.
+    Indicator,
+    /// Show neither the indicator nor the reasoning text.
+    Disabled,
+}
+
+impl ShowThinking {
+    /// Canonical lowercase name used for persistence and the `/set` menu.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShowThinking::Content => "content",
+            ShowThinking::Indicator => "indicator",
+            ShowThinking::Disabled => "disabled",
+        }
+    }
+
+    /// Map a stored/parsed string to the mode. Tolerant of case and a few
+    /// common synonyms; returns `None` for anything unrecognized so callers
+    /// can fall back to the default and reject invalid `/set` input.
+    pub fn parse_opt(s: &str) -> Option<ShowThinking> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "content" | "on" | "true" | "reasoning" => Some(ShowThinking::Content),
+            "indicator" | "spinner" | "status" => Some(ShowThinking::Indicator),
+            "disabled" | "off" | "none" | "false" => Some(ShowThinking::Disabled),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for ShowThinking {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_opt(s).ok_or_else(|| {
+            format!(
+                "unknown show_thinking value: '{}' (use disabled | indicator | content)",
+                s.trim()
+            )
+        })
+    }
+}
+
+/// Shared, live-editable handle for the [`ShowThinking`] display mode. The
+/// `Output` impl holds a clone and reads it on every thinking event; the
+/// running `AgentConfig` also holds a clone so `/set` can update it and the
+/// change is effective immediately.
+pub type ShowThinkingHandle = Arc<Mutex<ShowThinking>>;
+
+/// Build an owned default handle (`Content`).
+pub fn default_show_thinking_handle() -> ShowThinkingHandle {
+    Arc::new(Mutex::new(ShowThinking::default()))
+}
 
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +93,8 @@ pub enum SettingKey {
     DefaultPersona,
     /// `off` | `low` | `med` | `high`.
     DefaultThinking,
+    /// `disabled` | `indicator` | `content`.
+    ShowThinking,
 }
 
 /// How a setting's *value* may be completed. Drive a value-autocomplete
@@ -78,6 +149,12 @@ pub static SETTINGS: &[SettingMeta] = &[
         description: "Default thinking level: off | low | med | high",
         kind: ValueKind::Enum(&["off", "low", "med", "high"]),
     },
+    SettingMeta {
+        key: SettingKey::ShowThinking,
+        name: "show_thinking",
+        description: "How reasoning is shown: disabled | indicator | content",
+        kind: ValueKind::Enum(&["disabled", "indicator", "content"]),
+    },
 ];
 
 /// In-memory mirror of the five managed settings, plus the optional file to
@@ -89,6 +166,8 @@ pub struct SettingsStore {
     pub tool_call_limit: usize,
     pub default_persona: Option<String>,
     pub default_thinking_level: String,
+    /// `disabled` | `indicator` | `content` (how reasoning is shown).
+    pub show_thinking: String,
     pub path: Option<PathBuf>,
 }
 
@@ -110,6 +189,12 @@ impl SettingsStore {
                 .thinking_level
                 .clone()
                 .unwrap_or_else(|| "off".to_string()),
+            show_thinking: cfg
+                .show_thinking_handle
+                .lock()
+                .unwrap()
+                .as_str()
+                .to_string(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -129,6 +214,12 @@ impl SettingsStore {
                 .default_thinking_level
                 .clone()
                 .unwrap_or_else(|| "off".to_string()),
+            show_thinking: cfg
+                .show_thinking
+                .clone()
+                .and_then(|s| ShowThinking::parse_opt(&s))
+                .map(|t| t.as_str().to_string())
+                .unwrap_or_else(|| "content".to_string()),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -155,6 +246,11 @@ impl SettingsStore {
         } else {
             Some(self.default_thinking_level.clone())
         };
+        // Live-update the shared `show_thinking` handle so the `Output` impl
+        // (which holds a clone) honors the new mode on the very next response.
+        if let Ok(mode) = self.show_thinking.parse::<ShowThinking>() {
+            *cfg.show_thinking_handle.lock().unwrap() = mode;
+        }
     }
 
     /// Load from `path`, falling back to built-in defaults when the file is
@@ -177,6 +273,7 @@ impl SettingsStore {
             SettingKey::ToolCallLimit => self.tool_call_limit.to_string(),
             SettingKey::DefaultPersona => self.default_persona.clone().unwrap_or_default(),
             SettingKey::DefaultThinking => self.default_thinking_level.clone(),
+            SettingKey::ShowThinking => self.show_thinking.clone(),
         }
     }
 
@@ -226,6 +323,11 @@ impl SettingsStore {
             SettingKey::DefaultThinking => value
                 .trim()
                 .parse::<crate::thinking::ThinkingLevel>()
+                .map(|_| ())
+                .map_err(|e| e),
+            SettingKey::ShowThinking => value
+                .trim()
+                .parse::<ShowThinking>()
                 .map(|_| ())
                 .map_err(|e| e),
         }
@@ -296,6 +398,10 @@ impl SettingsStore {
             "default_thinking_level",
             toml_edit::value(self.default_thinking_level.clone()),
         );
+        table.insert(
+            "show_thinking",
+            toml_edit::value(self.show_thinking.clone()),
+        );
         // Ensure the parent directory (e.g. ~/.config/picocode) exists before
         // writing, mirroring how the history file is created.
         if let Some(parent) = path.parent() {
@@ -322,6 +428,9 @@ impl SettingsStore {
             SettingKey::DefaultThinking => {
                 self.default_thinking_level = normalize_thinking(value).to_string()
             }
+            SettingKey::ShowThinking => {
+                self.show_thinking = normalize_show_thinking(value).to_string()
+            }
         }
     }
 }
@@ -340,6 +449,13 @@ fn normalize_thinking(v: &str) -> &'static str {
         .unwrap_or("off")
 }
 
+fn normalize_show_thinking(v: &str) -> &'static str {
+    v.trim()
+        .parse::<ShowThinking>()
+        .map(|l| l.as_str())
+        .unwrap_or("content")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +468,7 @@ mod tests {
             tool_call_limit: 50,
             default_persona: Some("architect".into()),
             default_thinking_level: "off".into(),
+            show_thinking: "content".into(),
             path: Some(path.to_path_buf()),
         }
     }
@@ -394,6 +511,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_show_thinking() {
+        assert!(SettingsStore::validate(SettingKey::ShowThinking, "disabled").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ShowThinking, "INDICATOR").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ShowThinking, "content").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ShowThinking, "bogus").is_err());
+    }
+
+    #[test]
+    fn show_thinking_parse_and_default() {
+        assert_eq!(ShowThinking::default(), ShowThinking::Content);
+        assert_eq!("disabled".parse::<ShowThinking>().unwrap(), ShowThinking::Disabled);
+        assert_eq!("INDICATOR".parse::<ShowThinking>().unwrap(), ShowThinking::Indicator);
+        assert_eq!("content".parse::<ShowThinking>().unwrap(), ShowThinking::Content);
+        assert!("bogus".parse::<ShowThinking>().is_err());
+        assert_eq!(ShowThinking::parse_opt("spinner"), Some(ShowThinking::Indicator));
+        assert_eq!(ShowThinking::as_str(ShowThinking::Disabled), "disabled");
+    }
+
+    #[test]
     fn apply_to_config_maps_the_five_settings() {
         let tmp = tempfile::tempdir().unwrap();
         let mut s = store(tmp.path().join("picocode.toml").as_path());
@@ -401,7 +537,7 @@ mod tests {
         let mut cfg = crate::AgentConfig {
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet-20241022".into(),
-            output: std::sync::Arc::new(crate::QuietOutput::new()),
+            output: std::sync::Arc::new(crate::QuietOutput::new(crate::settings::default_show_thinking_handle())),
             yolo: false,
             quiet: true,
             thinking_level: None,
@@ -413,6 +549,7 @@ mod tests {
             agent_prompt: None,
             user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sandbox: None,
+            show_thinking_handle: crate::settings::default_show_thinking_handle(),
         };
         // Mutate every setting, then apply.
         s.set_value(SettingKey::DefaultModel, "openrouter:tencent/hy3:free")
@@ -421,6 +558,7 @@ mod tests {
         s.set_value(SettingKey::ToolCallLimit, "12").unwrap();
         s.set_value(SettingKey::DefaultPersona, "architect").unwrap();
         s.set_value(SettingKey::DefaultThinking, "high").unwrap();
+        s.set_value(SettingKey::ShowThinking, "indicator").unwrap();
         s.apply_to_config(&mut cfg);
         assert_eq!(cfg.provider, "openrouter");
         assert_eq!(cfg.model, "tencent/hy3:free");
@@ -429,6 +567,11 @@ mod tests {
         assert_eq!(cfg.persona_name.as_deref(), Some("architect"));
         assert!(cfg.persona_prompt.is_some(), "persona prompt should resolve");
         assert_eq!(cfg.thinking_level.as_deref(), Some("high"));
+        // `show_thinking` is applied live via the shared handle.
+        assert_eq!(
+            *cfg.show_thinking_handle.lock().unwrap(),
+            crate::settings::ShowThinking::Indicator
+        );
 
         // "off" thinking level maps back to `None`.
         s.set_value(SettingKey::DefaultThinking, "off").unwrap();
@@ -445,7 +588,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().join("picocode.toml").as_path());
         let all = s.overlay_rows("");
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         let filtered = s.overlay_rows("model");
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.key, SettingKey::DefaultModel);
@@ -524,8 +667,8 @@ mod tests {
         let opts: Vec<String> = table.render(200);
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
-        // title + 5 single-line options (pre-formatted rows are NOT wrapped).
-        assert_eq!(lines.len(), 6, "pre-formatted rows must not be word-wrapped");
+        // title + 6 single-line options (pre-formatted rows are NOT wrapped).
+        assert_eq!(lines.len(), 7, "pre-formatted rows must not be word-wrapped");
         // Strip ANSI so visible column positions compare cleanly (the selected
         // row carries an extra color escape that must not affect alignment).
         fn strip_ansi(s: &str) -> String {

@@ -15,6 +15,7 @@ use markdown_terminal::{Renderer, Theme};
 use libc;
 use crossterm::event::{self, Event, KeyCode};
 use crate::repl::Repl;
+use crate::settings::{ShowThinking, ShowThinkingHandle};
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -89,12 +90,14 @@ pub trait Output: Send + Sync {
 
 pub struct QuietOutput {
     spinner: Mutex<Option<ProgressBar>>,
+    show_thinking: ShowThinkingHandle,
 }
 
 impl QuietOutput {
-    pub fn new() -> Self {
+    pub fn new(show_thinking: ShowThinkingHandle) -> Self {
         Self {
             spinner: Mutex::new(None),
+            show_thinking,
         }
     }
 
@@ -136,6 +139,10 @@ impl Output for QuietOutput {
     }
     fn display_separator(&self) {}
     fn display_thinking(&self, message: &str) {
+        // Indicator mode => show the spinner; otherwise suppress it.
+        if *self.show_thinking.lock().unwrap() != ShowThinking::Indicator {
+            return;
+        }
         let mut spinner_lock = self.spinner.lock().unwrap();
         if spinner_lock.is_none() {
             *spinner_lock = Some(Self::create_spinner(message));
@@ -265,6 +272,9 @@ pub struct ConsoleOutput {
     /// answer boundaries so streamed thinking reads faded *without* re-rendering
     /// any already-emitted content.
     dim_on: Mutex<bool>,
+    /// Live `show_thinking` display mode. Read on every thinking event so a
+    /// `/set show_thinking …` change applies immediately (no agent rebuild).
+    show_thinking: ShowThinkingHandle,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -370,7 +380,7 @@ fn get_preview(args: &Value) -> String {
 }
 
 impl ConsoleOutput {
-    pub fn new() -> Self {
+    pub fn new(show_thinking: ShowThinkingHandle) -> Self {
         Self {
             spinner: Mutex::new(None),
             row: Mutex::new(1),
@@ -382,6 +392,7 @@ impl ConsoleOutput {
             thinking_parser: Mutex::new(StreamParser::new_gfm()),
             thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             dim_on: Mutex::new(false),
+            show_thinking,
         }
     }
 
@@ -440,7 +451,7 @@ impl ConsoleOutput {
 
 impl Default for ConsoleOutput {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::settings::default_show_thinking_handle())
     }
 }
 
@@ -673,6 +684,10 @@ impl Output for ConsoleOutput {
     }
 
     fn stream_thinking(&self, delta: &str) {
+        // Content mode => stream the reasoning text; otherwise suppress it.
+        if *self.show_thinking.lock().unwrap() != ShowThinking::Content {
+            return;
+        }
         let live = *self.live.lock().unwrap();
         if !live {
             // Non-TTY: stream thinking to stderr so consumers can drop it
@@ -983,6 +998,11 @@ impl Output for ConsoleOutput {
     }
 
     fn display_thinking(&self, message: &str) {
+        // Indicator mode => show the spinner; otherwise suppress it (content
+        // mode shows the reasoning text, disabled shows nothing).
+        if *self.show_thinking.lock().unwrap() != ShowThinking::Indicator {
+            return;
+        }
         let mut spinner_lock = self.spinner.lock().unwrap();
         if spinner_lock.is_none() {
             *spinner_lock = Some(Self::create_spinner(message));
@@ -1292,7 +1312,7 @@ mod tests {
 
     #[test]
     fn console_output_streaming_buffers_and_flushes() {
-        let out = ConsoleOutput::new();
+        let out = ConsoleOutput::default();
         // Force the buffered (non-TTY) path this test exercises, so it does not
         // depend on whether the test process's stdout is attached to a terminal.
         out.begin_response_inner(false);

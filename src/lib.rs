@@ -15,7 +15,7 @@ pub mod table;
 pub mod settings;
 
 pub use config::{Config, Recipe, ToolSettings};
-pub use settings::{SettingKey, SettingsStore};
+pub use settings::{SettingKey, SettingsStore, ShowThinking, ShowThinkingHandle};
 
 // Re-export core rig types for library users
 pub use rig_core::agent::AgentBuilder;

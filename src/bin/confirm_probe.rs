@@ -17,7 +17,7 @@ fn main() {
 
     // Exercise the real raw-mode confirm path (mirrors the REPL's terminal).
     let _ = crossterm::terminal::enable_raw_mode();
-    let out = ConsoleOutput::new();
+    let out = ConsoleOutput::new(picocode::settings::default_show_thinking_handle());
     let c: Confirmation = out.confirm(&msg);
 
     // Print the resolved choice on its own line so the test can read it back.
