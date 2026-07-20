@@ -273,6 +273,7 @@ pub async fn fetch_openrouter() -> Result<Vec<ModelEntry>, String> {
 /// priced from `DIRECT_PRICING` (or OpenRouter's value, tagged as estimate).
 fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
     let mut out = Vec::new();
+    let mut debug_count = 0usize;
     for e in or_entries {
         out.push(e.clone());
         if let Some((ns, model)) = e.id.split_once('/') {
@@ -288,6 +289,15 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                     reasoning: e.reasoning,
                     cost_source: source,
                 });
+                debug_count += 1;
+            }
+        }
+    }
+    if DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[debug-providers] extrapolate: {} OpenRouter entries → {} direct entries added", out.len() - debug_count, debug_count);
+        for e in &out {
+            if e.provider != "openrouter" {
+                eprintln!("[debug-providers]   direct: {} (cost_source={:?})", e.display, e.cost_source);
             }
         }
     }
@@ -313,7 +323,7 @@ fn direct_price(
 
 /// Offline / fetch-failure fallback: curated table gated by availability.
 fn static_fallback() -> Vec<ModelEntry> {
-    DIRECT_PRICING
+    let entries: Vec<ModelEntry> = DIRECT_PRICING
         .iter()
         .filter(|(p, _, _, _, _, _)| provider_available(p))
         .map(|(p, m, ctx, pc, cc, r)| ModelEntry {
@@ -326,7 +336,14 @@ fn static_fallback() -> Vec<ModelEntry> {
             reasoning: *r,
             cost_source: CostSource::Direct,
         })
-        .collect()
+        .collect();
+    if DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[debug-providers] static_fallback: {} entries from DIRECT_PRICING", entries.len());
+        for e in &entries {
+            eprintln!("[debug-providers]   {}", e.display);
+        }
+    }
+    entries
 }
 
 /// Live ids from a provider's native `/models` endpoint (best-effort).
@@ -367,15 +384,30 @@ async fn native_models(provider: &str) -> Vec<String> {
 /// Prune/extend direct entries for providers exposing `/models`, using the
 /// live id set to drop stale models and surface new ones. Best-effort.
 async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
+    let debug = DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed);
     for provider in ["deepseek", "openai"] {
+        let before = entries.len();
         if !provider_available(provider) {
+            if debug {
+                eprintln!("[debug-providers] liveness_prune: {} not available (skipped)", provider);
+            }
             continue;
         }
         let live = native_models(provider).await;
         if live.is_empty() {
+            if debug {
+                eprintln!("[debug-providers] liveness_prune: {} native /models returned empty (skipped)", provider);
+            }
             continue;
         }
+        if debug {
+            eprintln!("[debug-providers] liveness_prune: {} returned {} live models", provider, live.len());
+            for m in &live {
+                eprintln!("[debug-providers]   live: {}", m);
+            }
+        }
         let live_set: HashSet<String> = live.iter().cloned().collect();
+        let retained = entries.len();
         entries.retain(|e| {
             if e.provider == provider {
                 let model = e.id.splitn(2, '/').nth(1).unwrap_or(&e.id);
@@ -384,6 +416,10 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                 true
             }
         });
+        let pruned = retained - entries.len();
+        if debug && pruned > 0 {
+            eprintln!("[debug-providers] liveness_prune: pruned {} stale entries for {}", pruned, provider);
+        }
         for m in live {
             let id = format!("{}/{}", provider, m);
             if !entries.iter().any(|e| e.id == id) {
@@ -397,7 +433,13 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                     reasoning: false,
                     cost_source: CostSource::Direct,
                 });
+                if debug {
+                    eprintln!("[debug-providers] liveness_prune: added new live model {}", id);
+                }
             }
+        }
+        if debug {
+            eprintln!("[debug-providers] liveness_prune: {} entries before, {} after", before, entries.len());
         }
     }
     entries
@@ -415,21 +457,41 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// Return the model catalog: live OpenRouter fetch → extrapolate → liveness
 /// prune, cached for 5 minutes. Falls back to the curated table on fetch error.
 pub async fn catalog() -> Vec<ModelEntry> {
+    let debug = DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(c) = CACHE
         .get()
         .and_then(|m| m.lock().ok())
         .and_then(|g| g.as_ref().cloned())
     {
         if c.at.elapsed() < CACHE_TTL {
+            if debug {
+                eprintln!("[debug-providers] catalog: returning {} cached entries (age={}s)", c.entries.len(), c.at.elapsed().as_secs());
+            }
             return c.entries;
+        }
+        if debug {
+            eprintln!("[debug-providers] catalog: cache stale (age={}s), re-fetching", c.at.elapsed().as_secs());
         }
     }
     let entries = match fetch_openrouter().await {
-        Ok(or) => extrapolate(or),
-        Err(_) => static_fallback(),
+        Ok(or) => {
+            if debug {
+                eprintln!("[debug-providers] catalog: OpenRouter returned {} models", or.len());
+            }
+            extrapolate(or)
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("[debug-providers] catalog: OpenRouter fetch failed: {}, using static fallback", e);
+            }
+            static_fallback()
+        }
     };
     let entries = liveness_prune(entries).await;
     let entries = dedupe(entries);
+    if debug {
+        eprintln!("[debug-providers] catalog: final count = {} entries", entries.len());
+    }
     if let Some(mut m) = CACHE.get_or_init(|| Mutex::new(None)).lock().ok() {
         *m = Some(CacheEntry {
             at: Instant::now(),
@@ -492,6 +554,45 @@ fn dedupe(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                 }
             }
         }
+    }
+    out
+}
+
+/// Global debug flag for model catalog operations. Set via
+/// [`set_debug_providers`] or the `--debug-providers` CLI flag.
+static DEBUG_PROVIDERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable or disable debug logging for provider discovery and catalog
+/// extrapolation/filtering.
+pub fn set_debug_providers(enabled: bool) {
+    DEBUG_PROVIDERS.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Return a human-readable list of all known providers and whether they are
+/// configured (API key env var present). Used by `--debug-providers` startup
+/// logging.
+pub fn list_available_providers() -> Vec<(String, bool, Vec<String>)> {
+    let mut out: Vec<(String, bool, Vec<String>)> = Vec::new();
+    // Collect unique provider names from `required_env_vars`'s match arms.
+    // We enumerate them explicitly to match the static registry.
+    let known = &[
+        "anthropic", "openai", "azure", "cohere", "chatgpt", "copilot",
+        "deepseek", "doubleword", "gemini", "google", "groq", "huggingface",
+        "hyperbolic", "llamafile", "mira", "minimax", "mistral", "moonshot",
+        "ollama", "openrouter", "perplexity", "together", "xai", "xiaomimimo", "zai",
+    ];
+    for p in known {
+        let vars = required_env_vars(p);
+        let available = provider_available(p);
+        let env_list: Vec<String> = vars.iter().map(|v| {
+            let val = std::env::var(v).ok().unwrap_or_default();
+            if val.is_empty() {
+                format!("{}=", v)
+            } else {
+                format!("{}={}{}", v, &val[..val.len().min(8)], if val.len() > 8 { "…" } else { "" })
+            }
+        }).collect();
+        out.push((p.to_string(), available, env_list));
     }
     out
 }
