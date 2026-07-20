@@ -1663,8 +1663,8 @@ impl Repl {
     /// Strategy, in priority order:
     /// 1. Cursor at/beyond end-of-buffer → last whitespace-delimited token.
     /// 2. Cursor *on* a non-WS character → the word containing that position.
-    /// 3. Cursor *on* whitespace → word *after* cursor (the word the user is
-    ///    currently typing).  If none (e.g. trailing whitespace), word *before*.
+    /// 3. Cursor *on* whitespace → word *before* cursor (the token the user
+    ///    just typed and wants to Tab-complete).  If none, empty.
     ///
     /// Returns `(0, 0, "")` when there is no word.
     fn token_at_cursor(buf: &[char], cursor: usize) -> (usize, usize, String) {
@@ -3445,9 +3445,9 @@ mod tests {
         assert_eq!(&w, "wo", "cursor after 'wo' in 'world': got {:?}", &w);
         assert_eq!(s, 6);
         assert_eq!(e, 8);
-        // Cursor at position 11 (the space after "world") → word *after*: "foo"
+        // Cursor at position 11 (the space after "world") → word *before*: "world"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, 11);
-        assert_eq!(&w, "foo", "cursor on space after world: {:?}", &w);
+        assert_eq!(&w, "world", "cursor on space after world: {:?}", &w);
         // Cursor after last word (at end) → last word "foo"
         let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
         assert_eq!(&w, "foo", "cursor at end: last word");
