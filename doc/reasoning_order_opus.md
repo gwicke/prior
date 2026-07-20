@@ -207,15 +207,29 @@ stdout/stderr redirected to separate files.
   `write`), so a held answer's final unterminated paragraph is emitted rather
   than dropped — the §5 fix.
 - **`end_response_segment`** answer commit now `flush()`es + resets the answer
-  parser too (was `write(b"\n\n")`), for the same robustness on a segment whose
-  answer text ends in a list/table.
+  parser too (was `write(b"\n\n")`), for the same robustness on a segment
+  whose answer text ends in a list/table.
+- **Blank-line separator between reasoning and answer.** At every
+  reasoning→answer boundary (`stream_text` transition, `end_response_segment`,
+  `flush_held_answer`) the one blank line is emitted by writing `\n` to the
+  *same* `out` handle the reasoning/answer use — placed **after**
+  `ensure_dim(false)` (the dim-reset SGR). Ordering matters: a GFM list/table
+  emits no trailing newline of its own, so a `\n` placed before the reset is
+  swallowed as the block's closing newline (no blank); placing it after the
+  `\x1b[0m` makes it a real blank line. Using `out.write_all(b"\n")` (not the
+  `println!` macro) is required so the blank lands in the right write buffer.
+  This is the fix for the follow-up report that the answer started on the line
+  immediately after the reasoning with no empty line.
 
 **Verification:**
 - Replaying the real captured final turn through the fixed `ConsoleOutput`
   (PTY): the reasoning (incl. its trailing list "…Let me write it.") now renders
   **before** the answer; nothing leaks below it; the held answer's last
-  paragraph is present.
-- New regression test `output::tests::reasoning_with_trailing_list_renders_before_answer`
-  captures stdout at the fd level and asserts a trailing-list reasoning block
-  renders before the answer. It **fails** against the old `write(b"\n\n")` commit
-  and **passes** with `flush()`. Full suite: 158 passed.
+  paragraph is present; and a blank line separates the reasoning from the
+  answer.
+- New regression test
+  `output::tests::reasoning_before_answer_has_blank_line_separator` captures
+  stdout at the fd level and asserts a trailing-list reasoning block renders
+  **before** the answer **and** is separated from it by a blank line. It
+  **fails** against the old `write(b"\n\n")` commit / missing blank and
+  **passes** with `flush()` + the `out`-written blank. Full suite: 158 passed.
