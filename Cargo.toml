@@ -31,7 +31,6 @@ termimad = "0.34.1"
 codewandler-markdown-terminal = "0.2.1"
 codewandler-markdown-stream = "0.2.1"
 duct = { version = "1.1.1", features = ["timeout"] }
-duct_sh = "1.0.0"
 async-trait = "0.1"
 crossterm = "0.29"
 fuzzy-matcher = "0.3"

@@ -1,4 +1,3 @@
-use duct_sh::sh_dangerous;
 use rig_core::tool_macro as rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -38,7 +37,7 @@ fn get_path(path: &str) -> Result<PathBuf, ToolError> {
 fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
     let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
 
-    // When a path policy is active (sandbox enabled with explicit bindings),
+    // When a path policy is active (sandbox active with explicit bindings),
     // rewrite via the remap table, then enforce coverage + mode.
     if let Some(policy) = current_path_policy() {
         let host = policy.resolve(path);
@@ -278,9 +277,6 @@ fn sandbox_config() -> Arc<Option<SandboxConfig>> {
 fn current_path_policy() -> Option<crate::config::PathPolicy> {
     let cfg = sandbox_config();
     let c = cfg.as_ref().as_ref()?;
-    if !c.enabled.unwrap_or(false) {
-        return None;
-    }
     let cwd = std::env::current_dir().ok()?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     resolve_path_policy(c, &cwd, home.as_deref())
@@ -322,10 +318,12 @@ fn resolve_timeout(
 }
 
 /// Run a shell command through the sandbox helper. Applies a wall-clock
-/// timeout (so a hung command reaps and releases the blocking thread) and,
-/// when enabled, wraps the command in a Bubblewrap namespace. `bwrap` is
-/// required at startup (see `check_runtime_deps`), so its absence is handled
-/// before any command runs; when disabled, the command runs unsandboxed.
+/// timeout (so a hung command reaps and releases the blocking thread) and
+/// always wraps the command in a Bubblewrap namespace. `bwrap` is required at
+/// startup (see `check_runtime_deps`), so its absence is handled before any
+/// command runs; if no sandbox config is set, the command is refused rather
+/// than run unsandboxed — there is no plain-shell fallback (and no enable
+/// switch).
 ///
 /// `override_timeout` is the LLM-supplied per-call timeout (seconds) from the
 /// bash tool's `timeout` argument; when `None`, the configured sandbox default
@@ -338,8 +336,8 @@ pub(crate) async fn run_sandboxed(
     let cfg = sandbox_config();
 
     // The LLM may override the configured default timeout per command. The
-    // timeout is independent of whether sandboxing is active, so a disabled
-    // (or bwrap-absent) config still enforces it.
+    // timeout is enforced whenever the command actually runs; an unset sandbox
+    // config is refused before the timeout is relevant (see the closure below).
     let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs);
     let timeout = resolve_timeout(override_timeout, configured)?;
 
@@ -349,64 +347,46 @@ pub(crate) async fn run_sandboxed(
     let cmd = cmd.to_string();
     let cfg = cfg.clone();
     let output = tokio::task::spawn_blocking(move || {
-        // Decide sandboxing here: `bwrap` is required at startup, so its
-        // absence is handled before any command runs; we only gate on the
-        // configured `enabled` flag.
-        let effective = match cfg.as_ref().as_ref() {
-            Some(c) if c.enabled.unwrap_or(false) => Some(c),
-            _ => None,
-        };
-        match effective {
-            Some(c) => {
-                // Sandboxed: redirect output to a host temp file bound into the
-                // namespace (bwrap bypasses duct's stdout pipe).
-                let out_path = make_out_path()?;
-                let expr = build_bwrap_expr(&cmd, c, &out_path, false)?;
-                let handle = expr.unchecked().start()?;
-                let result = match timeout {
-                    None => handle
-                        .wait()
-                        .map(|_| ())
-                        .map_err(|e| ToolError::Io(e.to_string())),
-                    Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
-                        Ok(Some(_)) => Ok(()),
-                        Ok(None) => {
-                            let _ = handle.kill();
-                            Err(ToolError::Generic(format!(
-                                "command timed out after {secs}s"
-                            )))
-                        }
-                        Err(e) => Err(ToolError::Io(e.to_string())),
-                    },
-                };
-                // Read whatever the command wrote, regardless of exit/timeout,
-                // then clean up the temp file.
-                let captured = std::fs::read(&out_path).unwrap_or_default();
-                let _ = std::fs::remove_file(&out_path);
-                result.map(|_| captured)
-            }
+        // Sandboxing is mandatory: every shell command runs inside the bwrap
+        // namespace. There is deliberately no unsandboxed fallback — running a
+        // command outside the sandbox would grant it full access to the host
+        // filesystem. `bwrap` is required at startup (see `check_runtime_deps`)
+        // and the resolved config is always `Some(..)`, so this error only fires
+        // if the sandbox was never configured/published.
+        let cfg = match cfg.as_ref().as_ref() {
+            Some(c) => c,
             None => {
-                // Unsandboxed: capture combined output directly via duct.
-                let expr = sh_dangerous(&cmd).stderr_to_stdout().stdout_capture();
-                let handle = expr.unchecked().start()?;
-                match timeout {
-                    None => handle
-                        .wait()
-                        .map(|o| o.stdout.clone())
-                        .map_err(|e| ToolError::Io(e.to_string())),
-                    Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
-                        Ok(Some(o)) => Ok(o.stdout.clone()),
-                        Ok(None) => {
-                            let _ = handle.kill();
-                            Err(ToolError::Generic(format!(
-                                "command timed out after {secs}s"
-                            )))
-                        }
-                        Err(e) => Err(ToolError::Io(e.to_string())),
-                    },
-                }
+                return Err(ToolError::Generic(
+                    "sandbox not configured; refusing to run command".into(),
+                ))
             }
-        }
+        };
+        // Sandboxed: redirect output to a host temp file bound into the
+        // namespace (bwrap bypasses duct's stdout pipe).
+        let out_path = make_out_path()?;
+        let expr = build_bwrap_expr(&cmd, cfg, &out_path, false)?;
+        let handle = expr.unchecked().start()?;
+        let result = match timeout {
+            None => handle
+                .wait()
+                .map(|_| ())
+                .map_err(|e| ToolError::Io(e.to_string())),
+            Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => {
+                    let _ = handle.kill();
+                    Err(ToolError::Generic(format!(
+                        "command timed out after {secs}s"
+                    )))
+                }
+                Err(e) => Err(ToolError::Io(e.to_string())),
+            },
+        };
+        // Read whatever the command wrote, regardless of exit/timeout,
+        // then clean up the temp file.
+        let captured = std::fs::read(&out_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+        result.map(|_| captured)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -992,7 +972,6 @@ mod sandbox_tests {
         timeout_secs: Option<u64>,
     ) -> SandboxConfig {
         SandboxConfig {
-            enabled: Some(true),
             timeout_secs,
             network: Some(false),
             memory_mb: None,
@@ -1099,27 +1078,6 @@ mod sandbox_tests {
             .await
             .unwrap();
         assert_eq!(out, "PROC_OK");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn unsandboxed_timeout_still_enforced() {
-        // No bwrap needed: disabled sandbox still applies the timeout.
-        set_sandbox(Some(SandboxConfig {
-            enabled: Some(false),
-            timeout_secs: Some(1),
-            network: None,
-            memory_mb: None,
-            pid_isolation: None,
-            drop_caps: None,
-            tmp_size_mb: None,
-            ro: vec![],
-            rw: vec![],
-            env: None,
-        }));
-        let res = run_sandboxed("sleep 30", None).await;
-        assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("timed out"));
     }
 
     // ---- Phase 1b: LLM-configurable per-call timeout override ----
@@ -1322,7 +1280,6 @@ mod sandbox_tests {
     /// Set a sandbox with an explicit `env` policy.
     fn sandbox_with_env(env: EnvPolicy) -> SandboxConfig {
         SandboxConfig {
-            enabled: Some(true),
             timeout_secs: Some(30),
             network: Some(false),
             memory_mb: None,
@@ -1413,12 +1370,16 @@ mod sandbox_tests {
 
     #[tokio::test]
     #[serial]
-    async fn unsandboxed_captures_stdout() {
-        // When the sandbox is disabled, output must still be captured (not
-        // leaked to the parent's stdout / returned empty).
+    async fn missing_sandbox_is_refused() {
+        // With no sandbox config set, a command must be refused rather than run
+        // unsandboxed through a plain shell.
         set_sandbox(None);
-        let out = run_sandboxed("echo hi-there", None).await.unwrap();
-        assert_eq!(out.trim(), "hi-there");
+        let res = run_sandboxed("echo hi-there", None).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().to_string().contains("sandbox not configured"),
+            "expected refusal, not an unsandboxed run"
+        );
     }
 
     #[tokio::test]

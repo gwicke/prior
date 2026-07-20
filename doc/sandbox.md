@@ -24,8 +24,10 @@ wraps the command in a Bubblewrap (`bwrap`) namespace.
   what access** (`ro-bind` / `bind`), including **path remapping** where the
   in-sandbox path differs from the host path.
 - Allow memory, network, PID, and device isolation.
-- Degrade gracefully: if `bwrap` is missing, fall back to unsandboxed
-  execution (timeout still enforced) and warn.
+- **No unsandboxed fallback.** `bwrap` is required at startup (see
+  `check_runtime_deps`); if it is absent the process fails closed. A command is
+  *never* run outside the sandbox — if the resolved sandbox config is disabled
+  or unset, the command is refused rather than executed by a plain shell.
 
 ---
 
@@ -39,7 +41,8 @@ Extend `Config` so that sandbox settings live under the existing
 auto_allow = ["^cargo test"]
 
 [tool_config.bash.sandbox]
-enabled = true            # default: true if bwrap present, else false
+# No `enabled` switch: the sandbox is always active when `bwrap` is present
+# (and `bwrap` is required at startup, so picocode fails closed without it).
 timeout_secs = 120        # default: 120
 network = false           # default: false (unshare network)
 memory_mb = 1024          # default: none (unlimited)
@@ -74,9 +77,6 @@ pub struct ToolSettings {
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct SandboxConfig {
-    /// Master switch. Default: true if `bwrap` is on PATH, else false.
-    #[serde(default)]
-    pub enabled: Option<bool>,
     /// Wall-clock timeout for the whole command. Default 120s. 0/None = no timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -198,11 +198,14 @@ Single function used by `Bash` and `agent_browser`. Pseudocode:
 
 ```rust
 fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
-    // 1. Build the duct expression.
-    let expr = if cfg.enabled_and_bwrap_present() {
+    // 1. Build the duct expression. There is no unsandboxed fallback and no
+    //    enable switch: the sandbox is always active, so a present `cfg` always
+    //    routes through bwrap. A missing config is refused rather than run by a
+    //    plain shell.
+    let expr = if cfg.is_present() {
         build_bwrap_expr(cmd, cfg)   // returns a duct::Expression wrapping bwrap
     } else {
-        sh_dangerous(cmd)            // plain, still timeouted below
+        return Err(ToolError::Generic("sandbox not configured; refusing to run unsandboxed"));
     };
 
     // 2. Always apply a timeout (duct implements this with a killer thread
@@ -301,11 +304,10 @@ only `PWD`) followed by `--setenv NAME VALUE` for each variable the policy
 permits. This makes the policy explicit and verifiable (inspect the `--setenv`
 args) rather than relying on bwrap's inheritance behavior.
 
-> **Caveat:** env isolation depends on bwrap's `--clearenv`/`--setenv`. When
-> `bwrap` is absent the sandbox degrades to unsandboxed execution (timeout
-> still enforced) and the environment is **not** sanitized — the same as
-> running the command directly. Keep `bwrap` present in any environment that
-> handles real secrets.
+> **Caveat:** env isolation depends on bwrap's `--clearenv`/`--setenv`. `bwrap`
+> is required at startup, so the sandbox is always active when a command runs;
+> the environment is sanitized every time. There is no unsandboxed execution
+> path, so a command is never run with the host environment unsanitized.
 
 ### Path-binding special case
 
@@ -320,13 +322,13 @@ with zero config.
 
 ## Fallback & detection
 
-- At startup (or first bash call) probe `is_tool_available("bwrap")` once and
-  cache the result.
-- If `sandbox.enabled == true` but bwrap is absent, log a warning
-  (`output`) and degrade to unsandboxed-but-timeouted execution rather than
-  failing. This keeps CI/container images without bwrap functional.
-- If `sandbox.enabled == false` explicitly, never invoke bwrap (useful for
-  local debugging where the agent must reach the host freely).
+- `bwrap` is required at startup (`check_runtime_deps` fails closed if it is
+  absent), so the tool layer can assume it is always present.
+- There is **no unsandboxed fallback and no enable switch.** The sandbox is
+  always active whenever a config is present. If no sandbox config is set,
+  `run_sandboxed` refuses the command outright (returns an error) rather than
+  executing it via a plain shell. Sandboxing is always the failure mode — never
+  a degraded, unsandboxed run.
 
 ---
 
@@ -488,7 +490,7 @@ non-shell enforcement keys off the *rewritten host* path.
   `write_file("/tmp/x")` and a shell `echo > /tmp/x` resolve to the *same* host
   file (`./scratch/x`); a read of `/tmp/x` via either tool sees the same bytes.
 - Empty `paths` + sandbox on keeps the CWD-visible default (read-only) behavior
-  for non-shell tools, matching the shell fallback.
+  for non-shell tools, matching the sandboxed shell path.
 
 ---
 
@@ -521,11 +523,11 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 - [ ] Route `Bash::call` and `agent_browser` through `run_sandboxed`.
 - [ ] Apply `duct` `.timeout(Duration::from_secs(timeout_secs))` inside the
       helper (skip when `timeout_secs == 0/None`).
-- [ ] Cache `is_tool_available("bwrap")` once; when absent, helper uses plain
-      `sh_dangerous` (timeout still applied).
+- [ ] The sandbox is always active when a config is present (bwrap required at
+      startup); the helper refuses only when no sandbox config is set.
 - [ ] Unit/integration tests: `echo` works; `sleep 30` with 1s timeout is
-      killed/errors; fallback path executes without bwrap.
-- [ ] Verify existing `Bash`/`agent_browser` behavior unchanged when unsandboxed.
+      killed/errors; an unset sandbox config is refused.
+- [ ] Verify existing `Bash`/`agent_browser` behavior unchanged when sandboxed.
 
 ### Phase 2 — bwrap sandboxing (shell tools)
 
@@ -537,8 +539,6 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
       (if `pid_isolation`); `--cap-drop ALL` (if `drop_caps`);
       `--die-with-parent`.
 - [x] Memory wrapper: `prlimit --as=<MB*1024*1024> -- <argv>` (direct argv, no shell); `ulimit -v` shell-builtin fallback when `prlimit` absent.
-- [ ] Default `enabled` to `true` only when bwrap detected; warn on
-      enabled-but-absent.
 - [ ] Integration tests (tempfile): ro/rw remap round-trip; `network:false`
       blocks connect, `network:true` allows; OOM under `memory_mb`.
 - [ ] Wire `tool_config.bash.sandbox` through `build_rig_agent` →

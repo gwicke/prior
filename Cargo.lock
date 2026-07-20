@@ -589,15 +589,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "duct_sh"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8139179d1d133ab7153920ba3812915b17c61e2514a6f98b1fd03f2c07668d1"
-dependencies = [
- "duct",
-]
-
-[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,7 +1494,6 @@ dependencies = [
  "console",
  "crossterm",
  "duct",
- "duct_sh",
  "futures",
  "fuzzy-matcher",
  "globset",
