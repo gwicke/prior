@@ -259,10 +259,10 @@ pub struct AgentConfig {
     /// Resolved sandbox configuration for shell tool execution. `None` means
     /// sandboxing is disabled (plain `sh_dangerous`, timeout still enforced).
     pub sandbox: Option<crate::config::SandboxConfig>,
-    /// Shared, live-editable `show_thinking` display mode. The `Output` impl
+    /// Shared, live-editable `show_reasoning` display mode. The `Output` impl
     /// holds a clone and reads it on every thinking event, so `/set
-    /// show_thinking …` updates the rendering immediately (no agent rebuild).
-    pub show_thinking_handle: crate::settings::ShowThinkingHandle,
+    /// show_reasoning …` updates the rendering immediately (no agent rebuild).
+    pub show_reasoning_handle: crate::settings::ShowReasoningHandle,
 }
 
 /// Sentinel env-var value that triggers the interactive device-code OAuth

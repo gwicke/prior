@@ -1189,7 +1189,7 @@ impl Repl {
                 entries.iter().map(Self::model_candidate).collect()
             }
             SettingKey::ToolCallLimit => Vec::new(),
-            SettingKey::ShowThinking => vec![
+            SettingKey::ShowReasoning => vec![
                 ValueCandidate { display: "disabled".into(), value: "disabled".into(), desc: "show neither indicator nor reasoning text".into() },
                 ValueCandidate { display: "indicator".into(), value: "indicator".into(), desc: "show only a Thinking… spinner".into() },
                 ValueCandidate { display: "content".into(), value: "content".into(), desc: "show the reasoning text (default)".into() },
@@ -2058,11 +2058,11 @@ mod tests {
                 true
             )
         );
-        // `show_thinking` resolves to its own key in value mode.
+        // `show_reasoning` resolves to its own key in value mode.
         assert_eq!(
-            Repl::parse_settings("show_thinking indicator"),
+            Repl::parse_settings("show_reasoning indicator"),
             (
-                Some(crate::settings::SettingKey::ShowThinking),
+                Some(crate::settings::SettingKey::ShowReasoning),
                 "indicator".to_string(),
                 true
             )

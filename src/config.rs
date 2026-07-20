@@ -31,7 +31,7 @@ pub struct Config {
     pub default_thinking_level: Option<String>,
     /// How reasoning is shown: `disabled` | `indicator` | `content`.
     #[serde(default)]
-    pub show_thinking: Option<String>,
+    pub show_reasoning: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

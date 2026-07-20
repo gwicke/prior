@@ -15,7 +15,7 @@ use markdown_terminal::{Renderer, Theme};
 use libc;
 use crossterm::event::{self, Event, KeyCode};
 use crate::repl::Repl;
-use crate::settings::{ShowThinking, ShowThinkingHandle};
+use crate::settings::{ShowReasoning, ShowReasoningHandle};
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -95,14 +95,14 @@ pub trait Output: Send + Sync {
 
 pub struct QuietOutput {
     spinner: Mutex<Option<ProgressBar>>,
-    show_thinking: ShowThinkingHandle,
+    show_reasoning: ShowReasoningHandle,
 }
 
 impl QuietOutput {
-    pub fn new(show_thinking: ShowThinkingHandle) -> Self {
+    pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
         Self {
             spinner: Mutex::new(None),
-            show_thinking,
+            show_reasoning,
         }
     }
 
@@ -145,7 +145,7 @@ impl Output for QuietOutput {
     fn display_separator(&self) {}
     fn display_thinking(&self, message: &str) {
         // Indicator mode => show the spinner; otherwise suppress it.
-        if *self.show_thinking.lock().unwrap() != ShowThinking::Indicator {
+        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Indicator {
             return;
         }
         let mut spinner_lock = self.spinner.lock().unwrap();
@@ -286,9 +286,9 @@ pub struct ConsoleOutput {
     /// Buffered assistant answer text while `answer_held` is true. Flushed at
     /// the turn boundary.
     answer_buffer: Mutex<String>,
-    /// Live `show_thinking` display mode. Read on every thinking event so a
-    /// `/set show_thinking …` change applies immediately (no agent rebuild).
-    show_thinking: ShowThinkingHandle,
+    /// Live `show_reasoning` display mode. Read on every thinking event so a
+    /// `/set show_reasoning …` change applies immediately (no agent rebuild).
+    show_reasoning: ShowReasoningHandle,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -394,7 +394,7 @@ fn get_preview(args: &Value) -> String {
 }
 
 impl ConsoleOutput {
-    pub fn new(show_thinking: ShowThinkingHandle) -> Self {
+    pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
         Self {
             spinner: Mutex::new(None),
             row: Mutex::new(1),
@@ -408,7 +408,7 @@ impl ConsoleOutput {
             dim_on: Mutex::new(false),
             answer_held: Mutex::new(false),
             answer_buffer: Mutex::new(String::new()),
-            show_thinking,
+            show_reasoning,
         }
     }
 
@@ -471,7 +471,7 @@ impl ConsoleOutput {
 
 impl Default for ConsoleOutput {
     fn default() -> Self {
-        Self::new(crate::settings::default_show_thinking_handle())
+        Self::new(crate::settings::default_show_reasoning_handle())
     }
 }
 
@@ -753,7 +753,7 @@ impl Output for ConsoleOutput {
 
     fn stream_thinking(&self, delta: &str) {
         // Content mode => stream the reasoning text; otherwise suppress it.
-        if *self.show_thinking.lock().unwrap() != ShowThinking::Content {
+        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Content {
             return;
         }
         let live = *self.live.lock().unwrap();
@@ -1081,7 +1081,7 @@ impl Output for ConsoleOutput {
     fn display_thinking(&self, message: &str) {
         // Indicator mode => show the spinner; otherwise suppress it (content
         // mode shows the reasoning text, disabled shows nothing).
-        if *self.show_thinking.lock().unwrap() != ShowThinking::Indicator {
+        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Indicator {
             return;
         }
         let mut spinner_lock = self.spinner.lock().unwrap();
@@ -1573,7 +1573,7 @@ mod tests {
         // flushed *below* the reasoning rather than above it. Reasoning renders
         // inline immediately (see `stream_thinking`), so withholding the answer
         // is what guarantees the `[thinking][answer]` emission order.
-        let out = ConsoleOutput::new(crate::settings::default_show_thinking_handle());
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response_inner(true); // force the live/TTY path
         out.set_answer_hold(true); // reasoning enabled → hold the answer
         // Answer arrives first, then a trailing reasoning delta.
@@ -1597,7 +1597,7 @@ mod tests {
     fn answer_not_withheld_when_reasoning_disabled() {
         // Without answer-holding, the answer renders inline (not buffered), so
         // this path is unaffected by the fix.
-        let out = ConsoleOutput::new(crate::settings::default_show_thinking_handle());
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response_inner(true);
         out.set_answer_hold(false);
         out.stream_text("ZQANSWERZQ");

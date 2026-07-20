@@ -195,17 +195,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .or(config.default_persona.clone());
 
     let quiet = args.quiet || recipe.as_ref().map(|r| r.quiet).unwrap_or(false);
-    let show_thinking = config
-        .show_thinking
+    let show_reasoning = config
+        .show_reasoning
         .as_deref()
-        .and_then(picocode::settings::ShowThinking::parse_opt)
+        .and_then(picocode::settings::ShowReasoning::parse_opt)
         .unwrap_or_default();
-    let show_thinking_handle: picocode::settings::ShowThinkingHandle =
-        std::sync::Arc::new(std::sync::Mutex::new(show_thinking));
+    let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
+        std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
     let output: Arc<dyn picocode::Output> = if quiet {
-        Arc::new(picocode::QuietOutput::new(show_thinking_handle.clone()))
+        Arc::new(picocode::QuietOutput::new(show_reasoning_handle.clone()))
     } else {
-        Arc::new(ConsoleOutput::new(show_thinking_handle.clone()))
+        Arc::new(ConsoleOutput::new(show_reasoning_handle.clone()))
     };
 
     let system_message_extension = picocode::agent::load_agents_md();
@@ -238,7 +238,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         thinking_level,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sandbox,
-        show_thinking_handle,
+        show_reasoning_handle,
     };
     let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {
