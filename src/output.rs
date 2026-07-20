@@ -802,19 +802,26 @@ impl ConsoleOutput {
     }
 
     /// Render one full-width dark-grey panel row for `text` (plain, no ANSI).
-    /// `text` is wrapped to one column shy of the terminal width and painted
-    /// dim (or red for errors), indented by a single column so the tool output
-    /// reads as a distinct block. The grey background is painted onto *every*
-    /// segment — the leading indent, each text piece, *and* the trailing
-    /// padding — so the panel stays solid across the whole row. That per-segment
-    /// painting matters because a coloured diff marker (`-`/`+`) carries its own
-    /// `\x1b[0m`; wrapping the whole line under one background would let that
-    /// reset drop the grey behind the remaining (dim) text. Padding uses
-    /// display-column width so wide/CJK characters keep the panel edge aligned.
-    fn tool_panel(&self, text: &str, is_error: bool) {
+    /// `text` is wrapped to the available width and painted dim (or red for
+    /// errors). When `indent` is set, a single leading column is left (still on
+    /// the grey background) so the panel reads as the *output* of a command
+    /// whose own line is left flush. The grey background is painted onto *every*
+    /// segment — the leading indent (if any), each text piece, *and* the
+    /// trailing padding — so the panel stays solid across the whole row. That
+    /// per-segment painting matters because a coloured diff marker (`-`/`+`)
+    /// carries its own `\x1b[0m`; wrapping the whole line under one background
+    /// would let that reset drop the grey behind the remaining (dim) text.
+    /// Padding uses display-column width so wide/CJK characters keep the panel
+    /// edge aligned.
+    fn tool_panel(&self, text: &str, is_error: bool, indent: bool) {
         let width = term_width();
-        // Leave one column for the indent; keep the background full-width.
-        let inner = width.saturating_sub(1).max(1);
+        // When indented, leave one column for the indent; keep the background
+        // full-width in both cases.
+        let inner = if indent {
+            width.saturating_sub(1).max(1)
+        } else {
+            width.max(1)
+        };
         let lines = if text.is_empty() {
             vec![String::new()]
         } else {
@@ -822,11 +829,14 @@ impl ConsoleOutput {
         };
         for line in lines {
             let vis = UnicodeWidthStr::width(line.as_str());
-            // +1 covers the leading indent so the row still fills `width`.
+            // The +1 (when indented) covers the leading indent so the row still
+            // fills `width`.
             let pad = if width == 0 {
                 0
-            } else {
+            } else if indent {
                 width.saturating_sub(vis + 1)
+            } else {
+                width.saturating_sub(vis)
             };
             // Foreground content painted on the grey background. Only a leading
             // diff indicator (`-`/`+`) is recoloured (red/green); the rest stays
@@ -852,7 +862,11 @@ impl ConsoleOutput {
             };
             let row = format!(
                 "{}{}{}",
-                style(" ").on_true_color(22, 22, 26),
+                if indent {
+                    style(" ").on_true_color(22, 22, 26).to_string()
+                } else {
+                    String::new()
+                },
                 content,
                 style(" ".repeat(pad)).on_true_color(22, 22, 26),
             );
@@ -1093,10 +1107,13 @@ impl Output for ConsoleOutput {
             println!();
             self.note_lines(1);
         }
-        // Dark-grey panel box (no `⏺`, no tree line-art; 1-char indent).
-        self.tool_panel(&label, false);
+        // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
+        // the first line and is left flush; its output — the trailing
+        // diff/preview lines — is indented one column so the command's output
+        // reads as a distinct block.
+        self.tool_panel(&label, false, false);
         for line in &extra {
-            self.tool_panel(line, false);
+            self.tool_panel(line, false, true);
         }
     }
 
@@ -1131,19 +1148,21 @@ impl Output for ConsoleOutput {
         let lines: Vec<_> = cleaned.lines().collect();
 
         if lines.is_empty() {
-            self.tool_panel("(empty)", false);
+            self.tool_panel("(empty)", false, true);
             return;
         }
 
         // Render each output line as its own dark-grey panel row (no `│`/`└`
-        // tree art; 1-char indent), matching the tool-call box. Errors are red.
+        // tree art). The result is command output, so it is indented one column
+        // to sit beneath the command line; the leading indent is shared by the
+        // first output line too. Errors are red.
         let show_max = if is_error { usize::MAX } else { 4 };
         for (printed, line) in lines.iter().enumerate() {
             if printed >= show_max {
                 break;
             }
-            for wline in wrap(line, term_width().max(1)) {
-                self.tool_panel(&wline, is_error);
+            for wline in wrap(line, term_width().saturating_sub(1).max(1)) {
+                self.tool_panel(&wline, is_error, true);
             }
         }
 
@@ -1151,6 +1170,7 @@ impl Output for ConsoleOutput {
             self.tool_panel(
                 &format!("... +{} lines", lines.len() - show_max),
                 false,
+                true,
             );
         }
     }
