@@ -1589,6 +1589,7 @@ use rig_core::OneOrMany;
                 to: probe.clone(),
             }],
             env: None,
+            max_output_bytes: None,
         };
 
         // In-memory `Output`: replays a fixed script and records what is shown.

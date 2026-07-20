@@ -33,6 +33,9 @@ auto_allow = [
 [tool_config.bash.sandbox]
 # Wall-clock timeout for the whole command (seconds). 0 = no timeout.
 timeout_secs = 120
+# Maximum combined stdout+stderr (bytes) to retain from a single command.
+# Output beyond this is truncated with a notice. Default 20480 (20 KiB).
+# max_output_bytes = 20480
 # Give the sandbox network access (default false => network unshared).
 network = false
 # Virtual-memory cap in MB (default none).

@@ -361,32 +361,15 @@ pub(crate) async fn run_sandboxed(
                 ))
             }
         };
-        // Sandboxed: redirect output to a host temp file bound into the
-        // namespace (bwrap bypasses duct's stdout pipe).
-        let out_path = make_out_path()?;
-        let expr = build_bwrap_expr(&cmd, cfg, &out_path, false)?;
-        let handle = expr.unchecked().start()?;
-        let result = match timeout {
-            None => handle
-                .wait()
-                .map(|_| ())
-                .map_err(|e| ToolError::Io(e.to_string())),
-            Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => {
-                    let _ = handle.kill();
-                    Err(ToolError::Generic(format!(
-                        "command timed out after {secs}s"
-                    )))
-                }
-                Err(e) => Err(ToolError::Io(e.to_string())),
-            },
-        };
-        // Read whatever the command wrote, regardless of exit/timeout,
-        // then clean up the temp file.
-        let captured = std::fs::read(&out_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&out_path);
-        result.map(|_| captured)
+        // Sandboxed: stream combined stdout+stderr with a bounded reader. bwrap
+        // forwards the child's stdio to its inherited fds, so we read the pipe
+        // in fixed chunks and keep at most `max_output_bytes` (configurable:
+        // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB) in
+        // memory — no temp file and no unbounded `read_to_end` (see
+        // `capture_bounded`).
+        let cap = cfg.max_output_bytes();
+        let expr = build_bwrap_expr(&cmd, cfg, false)?;
+        capture_bounded(expr, timeout, cap)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
@@ -407,58 +390,18 @@ pub(crate) async fn run_sandboxed_ro(
 ) -> Result<String, ToolError> {
     let argv = argv.to_vec();
     let cfg = cfg.clone();
+    let cap = cfg.max_output_bytes();
     let output = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ToolError> {
         let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
-        let handle = expr
-            .stdout_capture()
-            .stderr_capture()
-            .unchecked()
-            .start()
-            .map_err(|e| ToolError::Io(e.to_string()))?;
-        // Capture stdout + stderr directly (bwrap forwards the child's stdio to
-        // the inherited fds). Combine them the way the shell path's `2>&1` does.
-        let captured = match timeout {
-            None => handle
-                .wait()
-                .map_err(|e| ToolError::Io(e.to_string())),
-            Some(secs) => match handle.wait_timeout(std::time::Duration::from_secs(secs)) {
-                Ok(Some(o)) => Ok(o),
-                Ok(None) => {
-                    let _ = handle.kill();
-                    Err(ToolError::Generic(format!(
-                        "command timed out after {secs}s"
-                    )))
-                }
-                Err(e) => Err(ToolError::Io(e.to_string())),
-            },
-        }?;
-        let mut v = captured.stdout.clone();
-        if !captured.stderr.is_empty() {
-            v.push(b'\n');
-            v.extend_from_slice(&captured.stderr);
-        }
-        Ok(v)
+        // Stream merged stdout+stderr in bounded chunks (matches the shell
+        // path: bwrap forwards stdio to inherited fds; stderr is merged in,
+        // as `2>&1` would do). Output is capped to `cap` (configurable:
+        // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB).
+        capture_bounded(expr, timeout, cap)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
     Ok(String::from_utf8_lossy(&output).to_string())
-}
-
-/// Create a unique host temp file for capturing sandboxed command output.
-fn make_out_path() -> Result<std::path::PathBuf, ToolError> {
-    let name = format!(
-        "picocode-out-{}-{}.txt",
-        std::process::id(),
-        // Nanosecond-ish uniqueness without extra deps.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let path = std::env::temp_dir().join(name);
-    // Ensure the file exists so bwrap can bind it.
-    std::fs::write(&path, b"").map_err(|e| ToolError::Io(e.to_string()))?;
-    Ok(path)
 }
 
 /// Trim combined output and normalize empty results.
@@ -474,6 +417,120 @@ fn trim_output(out: Vec<u8>) -> String {
 /// Cap output to the first `n` lines (token economy for large greps).
 fn cap_lines(s: &str, n: usize) -> String {
     s.lines().take(n).collect::<Vec<_>>().join("\n")
+}
+
+/// Stream merged stdout+stderr from a started bwrap expression in bounded
+/// chunks, returning at most `max_bytes` of output.
+///
+/// Unlike [`duct::Expression::stdout_capture`], which materializes the *entire*
+/// child stream into an unbounded `Vec` (a `read_to_end` with no size limit),
+/// this reads through an `os_pipe` `ReaderHandle` in fixed 8 KiB chunks and
+/// keeps at most `max_bytes` in memory. Once the cap is reached the pipe is
+/// still **drained** (so the child never blocks on a full kernel buffer), but
+/// the surplus bytes are discarded. stderr is merged into stdout via
+/// `stderr_to_stdout`, matching the shell `2>&1` semantics both callers want.
+///
+/// The wall-clock `timeout` is enforced by a watchdog thread. `ReaderHandle`
+/// has no `wait_timeout`, so the watchdog sleeps for `timeout` and then calls
+/// `kill()`, which closes the child's pipe and unblocks the reading thread.
+/// `read()` is a blocking syscall, so the read loop is *not* a busy-wait: the
+/// thread parks in the kernel until data/EOF arrives and the timeout check runs
+/// only once per returned chunk.
+fn capture_bounded(
+    expr: duct::Expression,
+    timeout: Option<u64>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ToolError> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let handle = expr
+        .stderr_to_stdout()
+        .unchecked()
+        .reader()
+        .map_err(|e| ToolError::Io(e.to_string()))?;
+    let handle = Arc::new(handle);
+
+    // Watchdog: if the command runs past `timeout`, kill it so the blocked
+    // `read` below returns. Only direct children (bwrap) are killed; bwrap's
+    // `--die-with-parent`/namespace reaping handles the sandbox internals, the
+    // same limitation the previous `wait_timeout` + `kill` path already had.
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let guard: Option<std::thread::JoinHandle<()>> = timeout.map(|secs| {
+        let w = handle.clone();
+        let flag = timed_out.clone();
+        std::thread::Builder::new()
+            .name("sandbox-timeout".to_string())
+            .spawn(move || {
+                std::thread::sleep(Duration::from_secs(secs));
+                flag.store(true, Ordering::SeqCst);
+                let _ = w.kill();
+            })
+            .map_err(|e| ToolError::Io(e.to_string()))
+            .expect("sandbox timeout thread")
+    });
+
+    let mut out: Vec<u8> = Vec::with_capacity(max_bytes.min(8192).max(1));
+    let mut buf = [0u8; 8192];
+    let mut total: usize = 0;
+    let mut exceeded = false;
+    let mut reader: &duct::ReaderHandle = &handle;
+
+    loop {
+        match (&mut reader).read(&mut buf) {
+            // EOF: `read` already waited on the inner handle.
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if !exceeded {
+                    let room = max_bytes.saturating_sub(out.len());
+                    if n <= room {
+                        out.extend_from_slice(&buf[..n]);
+                    } else {
+                        out.extend_from_slice(&buf[..room]);
+                        exceeded = true;
+                    }
+                }
+            }
+            Err(e) => {
+                // A read error after the watchdog fired means we killed the
+                // child; report a timeout rather than a spurious IO error.
+                if timed_out.load(Ordering::SeqCst) {
+                    return Err(ToolError::Generic(format!(
+                        "command timed out after {}s",
+                        timeout.unwrap_or(0)
+                    )));
+                }
+                return Err(ToolError::Io(e.to_string()));
+            }
+        }
+    }
+
+    // If the watchdog fired (and the command was killed), report a timeout
+    // instead of handing back a partial/empty result.
+    if timed_out.load(Ordering::SeqCst) {
+        if let Some(g) = guard {
+            let _ = g.join();
+        }
+        return Err(ToolError::Generic(format!(
+            "command timed out after {}s",
+            timeout.unwrap_or(0)
+        )));
+    }
+    if let Some(g) = guard {
+        let _ = g.join();
+    }
+
+    if exceeded {
+        let dropped = total.saturating_sub(max_bytes);
+        let note = format!(
+            "\n\n[output truncated: {dropped} bytes dropped, cap is {max_bytes} bytes]"
+        );
+        out.extend_from_slice(note.as_bytes());
+    }
+    Ok(out)
 }
 
 /// Read-only system directories bound into every sandbox so the shell and
@@ -693,39 +750,24 @@ fn build_bwrap_args(
 }
 
 /// Build a `duct` expression that runs `cmd` inside a bwrap namespace, with its
-/// combined output redirected into the bound host temp file `out_path` (the
-/// shell path). Used by the bash tool.
-///
-/// NOTE: the shell payload explicitly redirects its output to `/tmp/.picocode-out`
-/// (which is bound from `out_path`) rather than relying on the inherited fd, so
-/// the parent reads it back from `out_path` after the process exits.
+/// combined stdout/stderr captured directly by duct (bwrap forwards the child's
+/// stdio to its inherited fds — the same mechanism the read-only argv path uses
+/// for grep/rg). No temp file is involved; the caller captures the output via
+/// `stdout_capture`/`stderr_capture`. Used by the bash tool.
 fn build_bwrap_expr(
     cmd: &str,
     cfg: &SandboxConfig,
-    out_path: &std::path::Path,
     read_only: bool,
 ) -> Result<duct::Expression, ToolError> {
     let mut args = build_bwrap_args(cfg, read_only)?;
 
-    // Bind the host temp output file into the namespace (read-write) AFTER all
-    // user binds (this is appended in `build_bwrap_expr`, which runs after
-    // `build_bwrap_args` has emitted the user bindings). Because mounts apply
-    // in order, a file bind at `/tmp/.picocode-out` layers on top of whatever
-    // `/tmp` mount is already present — whether the scratch tmpfs added in
-    // `build_bwrap_args` (when the user configured no `/tmp` binding) or the
-    // user's own `/tmp` remap. Either way the file is reachable at
-    // `/tmp/.picocode-out` and is never shadowed by a later mount.
-    args.push("--bind".into());
-    args.push(out_path.to_string_lossy().to_string());
-    args.push("/tmp/.picocode-out".into());
-
     // The user command is a shell string, so it must run via `sh -c`. We use a
-    // two-level shell: the outer `sh -c` sets up the output redirection and
-    // `exec`s an inner `sh -c` that actually interprets the (single-quoted)
-    // user command, so pipes/redirections inside it work. `exec` replaces the
-    // outer shell so only one shell process runs the command.
+    // two-level shell: the outer `sh -c` `exec`s an inner `sh -c` that actually
+    // interprets the (single-quoted) user command, so pipes/redirections inside
+    // it work. `exec` replaces the outer shell so only one shell process runs
+    // the command. Output is captured by the caller (direct stdout reads).
     let cmd_quoted = sh_single_quote(&cmd);
-    let payload = format!("exec sh -c {cmd_quoted} > /tmp/.picocode-out 2>&1");
+    let payload = format!("exec sh -c {cmd_quoted}");
     let target: Vec<String> = vec!["sh".into(), "-c".into(), payload];
 
     // Apply the memory cap as a `prlimit --as=…` wrapper when available (direct
@@ -981,6 +1023,7 @@ mod sandbox_tests {
             ro,
             rw,
             env: None,
+            max_output_bytes: None,
         }
     }
 
@@ -1289,6 +1332,7 @@ mod sandbox_tests {
             ro: vec![],
             rw: vec![],
             env: Some(env),
+            max_output_bytes: None,
         }
     }
 
@@ -1389,8 +1433,8 @@ mod sandbox_tests {
             return;
         }
         set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
-        // A multi-statement command: the trailing `> /tmp/.picocode-out`
-        // redirect must scope the *whole* command, not just the last segment.
+        // A multi-statement command: bwrap captures the *whole* command's
+        // combined output directly, not just the last segment.
         let multi = run_sandboxed("echo a; echo b; echo c", None).await.unwrap();
         assert!(
             multi.contains("a") && multi.contains("b") && multi.contains("c"),

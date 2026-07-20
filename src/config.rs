@@ -91,7 +91,17 @@ pub struct SandboxConfig {
     /// deny-secrets default (see [`DEFAULT_ENV_DISALLOW`]) is applied.
     #[serde(default)]
     pub env: Option<EnvPolicy>,
+    /// Maximum combined stdout+stderr (bytes) to retain from a single sandboxed
+    /// command. Output beyond this is truncated with a notice. Default:
+    /// [`DEFAULT_MAX_OUTPUT_BYTES`].
+    #[serde(default)]
+    pub max_output_bytes: Option<usize>,
 }
+
+/// Default cap on combined stdout+stderr (bytes) retained per sandboxed
+/// command. Output beyond this is truncated with a notice. Overridable via the
+/// `[tool_config.bash.sandbox]` `max_output_bytes` setting.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 20 * 1024; // 20 KiB
 
 impl SandboxConfig {
     /// Merge this (user-provided) config with built-in defaults.
@@ -110,7 +120,17 @@ impl SandboxConfig {
             ro: self.ro.clone(),
             rw: self.rw.clone(),
             env: self.env.clone(),
+            max_output_bytes: self.max_output_bytes.or(Some(DEFAULT_MAX_OUTPUT_BYTES)),
         }
+    }
+
+    /// Effective output size cap in bytes for a sandboxed command.
+    ///
+    /// Returns the user-configured `max_output_bytes`, falling back to
+    /// [`DEFAULT_MAX_OUTPUT_BYTES`]. Used by the bash and grep/rg reader paths
+    /// to bound how much child output is kept in memory.
+    pub fn max_output_bytes(&self) -> usize {
+        self.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
     }
 }
 
@@ -583,6 +603,7 @@ mod tests {
             ro: vec![],
             rw: vec![],
             env: None,
+            max_output_bytes: None,
         };
         let d = raw.with_defaults();
         assert_eq!(d.timeout_secs, Some(5));
@@ -591,6 +612,14 @@ mod tests {
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
         assert_eq!(d.tmp_size_mb, Some(256));
+        // Output cap defaults when unset.
+        assert_eq!(d.max_output_bytes, Some(DEFAULT_MAX_OUTPUT_BYTES));
+        // ...and a user value is preserved.
+        let raw2 = SandboxConfig {
+            max_output_bytes: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(raw2.with_defaults().max_output_bytes, Some(4096));
     }
 
     #[test]
@@ -607,6 +636,7 @@ mod tests {
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
         assert_eq!(d.tmp_size_mb, Some(256));
+        assert_eq!(d.max_output_bytes, Some(DEFAULT_MAX_OUTPUT_BYTES));
     }
 
     #[test]
