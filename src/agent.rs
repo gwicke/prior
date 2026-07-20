@@ -1016,7 +1016,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     Ok(new_agent) => {
                         agent = Some(new_agent);
                         config = new_cfg;
-                        recent_models.push(format!("{}/{}", config.provider, config.model));
+                        recent_models.push(format!("{}:{}", config.provider, config.model));
                         // No confirmation line: the `/model <provider:model>` input
                         // line (emitted by `read_input`) is the record of the change.
                     }

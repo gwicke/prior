@@ -59,18 +59,11 @@ impl ModelEntry {
     /// prefix, e.g. `tencent/hy3:free` → `tencent:hy3:free` (the namespace is
     /// stripped).
     pub fn qualified_parts(&self) -> (String, String) {
-        if self.provider == "openrouter" {
-            ("openrouter".to_string(), self.id.clone())
-        } else {
-            let model = self
-                .id
-                .split_once('/')
-                .map(|(_, m)| m)
-                .unwrap_or(&self.id)
-                .to_string();
-            (self.provider.clone(), model)
-        }
-    }
+    self.id
+        .split_once(':')
+        .map(|(p, m)| (p.to_string(), m.to_string()))
+        .unwrap_or_else(|| (self.provider.clone(), self.id.clone()))
+}
 
     /// The `provider:model` string (see [`ModelEntry::qualified_parts`]).
     pub fn qualified(&self) -> String {
@@ -162,7 +155,8 @@ pub fn parse_openrouter(value: &Value) -> Vec<ModelEntry> {
         let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let id = id.to_string();
+        let raw_id = id.to_string();
+        let id = format!("openrouter:{}", raw_id);
         let context_length = m.get("context_length").and_then(|v| v.as_u64());
         let (prompt_cost, completion_cost) = m
             .get("pricing")
@@ -276,20 +270,24 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
     let mut debug_count = 0usize;
     for e in or_entries {
         out.push(e.clone());
-        if let Some((ns, model)) = e.id.split_once('/') {
-            if provider_available(ns) {
-                let (pc, cc, source) = direct_price(ns, model, e.prompt_cost, e.completion_cost);
-                out.push(ModelEntry {
-                    provider: ns.to_string(),
-                    id: e.id.clone(),
-                    display: format!("{}:{}", ns, model),
-                    context_length: e.context_length,
-                    prompt_cost: pc,
-                    completion_cost: cc,
-                    reasoning: e.reasoning,
-                    cost_source: source,
-                });
-                debug_count += 1;
+        // e.id is "openrouter:deepseek/deepseek-v4-flash" — strip the
+        // "openrouter:" prefix to get the original OpenRouter API id.
+        if let Some(or_id) = e.id.strip_prefix("openrouter:") {
+            if let Some((ns, model)) = or_id.split_once('/') {
+                if provider_available(ns) {
+                    let (pc, cc, source) = direct_price(ns, model, e.prompt_cost, e.completion_cost);
+                    out.push(ModelEntry {
+                        provider: ns.to_string(),
+                        id: format!("{}:{}", ns, model),
+                        display: format!("{}:{}", ns, model),
+                        context_length: e.context_length,
+                        prompt_cost: pc,
+                        completion_cost: cc,
+                        reasoning: e.reasoning,
+                        cost_source: source,
+                    });
+                    debug_count += 1;
+                }
             }
         }
     }
@@ -328,7 +326,7 @@ fn static_fallback() -> Vec<ModelEntry> {
         .filter(|(p, _, _, _, _, _)| provider_available(p))
         .map(|(p, m, ctx, pc, cc, r)| ModelEntry {
             provider: p.to_string(),
-            id: format!("{}/{}", p, m),
+            id: format!("{}:{}", p, m),
             display: format!("{}:{}", p, m),
             context_length: Some(*ctx),
             prompt_cost: Some(*pc),
@@ -410,7 +408,8 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         let retained = entries.len();
         entries.retain(|e| {
             if e.provider == provider {
-                let model = e.id.splitn(2, '/').nth(1).unwrap_or(&e.id);
+                // Extract model name from "provider:model" format.
+                let model = e.id.splitn(2, ':').nth(1).unwrap_or(&e.id);
                 live_set.contains(model)
             } else {
                 true
@@ -421,7 +420,7 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
             eprintln!("[debug-providers] liveness_prune: pruned {} stale entries for {}", pruned, provider);
         }
         for m in live {
-            let id = format!("{}/{}", provider, m);
+            let id = format!("{}:{}", provider, m);
             if !entries.iter().any(|e| e.id == id) {
                 entries.push(ModelEntry {
                     provider: provider.to_string(),
@@ -547,8 +546,18 @@ fn dedupe(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                 out.push(e);
             }
             Some(&idx) => {
+                // Prefer Direct-priced entries over estimates.
                 if e.cost_source == CostSource::Direct
                     && out[idx].cost_source != CostSource::Direct
+                {
+                    out[idx] = e;
+                }
+                // When both have the same cost source, prefer the direct
+                // (non-OpenRouter) entry so the model appears as
+                // `provider:model` rather than `openrouter:provider/model`.
+                else if e.cost_source == out[idx].cost_source
+                    && e.provider != "openrouter"
+                    && out[idx].provider == "openrouter"
                 {
                     out[idx] = e;
                 }
@@ -644,7 +653,7 @@ mod tests {
         let entries = parse_openrouter(&payload);
         assert_eq!(entries.len(), 2);
         let first = &entries[0];
-        assert_eq!(first.id, "deepseek/deepseek-v4-flash");
+        assert_eq!(first.id, "openrouter:deepseek/deepseek-v4-flash");
         assert_eq!(first.context_length, Some(1048576));
         assert_eq!(first.prompt_cost, Some(0.435));
         assert_eq!(first.completion_cost, Some(0.87));
@@ -670,8 +679,8 @@ mod tests {
     fn qualified_parts_keeps_namespace_for_openrouter() {
         let or = ModelEntry {
             provider: "openrouter".into(),
-            id: "tencent/hy3:free".into(),
-            display: "tencent/hy3:free".into(),
+            id: "openrouter:tencent/hy3:free".into(),
+            display: "openrouter:tencent/hy3:free".into(),
             context_length: None,
             prompt_cost: None,
             completion_cost: None,
@@ -683,7 +692,7 @@ mod tests {
 
         let direct = ModelEntry {
             provider: "tencent".into(),
-            id: "tencent/hy3:free".into(),
+            id: "tencent:hy3:free".into(),
             display: "tencent:hy3:free".into(),
             context_length: None,
             prompt_cost: None,
@@ -735,7 +744,7 @@ mod tests {
         // OR-routed entries kept too.
         assert!(entries
             .iter()
-            .any(|e| e.provider == "openrouter" && e.id == "deepseek/deepseek-chat"));
+            .any(|e| e.provider == "openrouter" && e.id == "openrouter:deepseek/deepseek-chat"));
         // anthropic available -> direct entry; priced from DIRECT_PRICING (Direct),
         // reasoning preserved.
         let anthropic_direct = entries
@@ -750,7 +759,7 @@ mod tests {
     fn format_option_shows_est_for_openrouter_fallback() {
         let direct = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/deepseek-chat".into(),
+            id: "deepseek:deepseek-chat".into(),
             display: "deepseek:deepseek-chat".into(),
             context_length: Some(128_000),
             prompt_cost: Some(0.0),
@@ -765,7 +774,7 @@ mod tests {
         // No local price -> OpenRouter price shown, tagged (est).
         let est = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/deepseek-v4-flash".into(),
+            id: "deepseek:deepseek-v4-flash".into(),
             display: "deepseek:deepseek-v4-flash".into(),
             context_length: Some(128_000),
             prompt_cost: Some(0.435),
@@ -779,7 +788,7 @@ mod tests {
         // Missing cost entirely -> no per-M line, no (est) tag.
         let missing = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/unknown".into(),
+            id: "deepseek:unknown".into(),
             display: "deepseek:unknown".into(),
             context_length: None,
             prompt_cost: None,
@@ -797,7 +806,7 @@ mod tests {
         // Direct price -> plain `$p/$c`, no `est`/reasoning tags.
         let direct = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/deepseek-chat".into(),
+            id: "deepseek:deepseek-chat".into(),
             display: "deepseek:deepseek-chat".into(),
             context_length: Some(128_000),
             prompt_cost: Some(0.0),
@@ -811,7 +820,7 @@ mod tests {
         // OpenRouter estimate + reasoning -> `~` prefix on cost, `✓` on reason.
         let est = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/deepseek-v4-flash".into(),
+            id: "deepseek:deepseek-v4-flash".into(),
             display: "deepseek:deepseek-v4-flash".into(),
             context_length: Some(1048576),
             prompt_cost: Some(0.435),
@@ -828,7 +837,7 @@ mod tests {
         // Missing fields -> em dash placeholders.
         let missing = ModelEntry {
             provider: "deepseek".into(),
-            id: "deepseek/unknown".into(),
+            id: "deepseek:unknown".into(),
             display: "deepseek:unknown".into(),
             context_length: None,
             prompt_cost: None,
