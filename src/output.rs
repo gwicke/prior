@@ -592,6 +592,28 @@ impl ConsoleOutput {
         *r = (*r + n - 1).min(h - 1) + 1;
     }
 
+    /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
+    /// start a fresh thinking parser.
+    ///
+    /// Uses `StreamParser::flush()` — **not** `write(b"\n\n")` — so
+    /// lookahead-dependent blocks (bullet/numbered lists, tables, fenced code)
+    /// are emitted *now*. A blank line cannot close a GFM list (the parser must
+    /// see a non-list line or EOF), so `write(b"\n\n")` left such reasoning
+    /// stranded in the parser until `end_response`'s `flush()` — which runs
+    /// *after* the answer parser, so the reasoning printed *below* the answer.
+    /// The thinking *renderer* is kept so post-tool thinking reads as one
+    /// continuous faded stream. See `doc/reasoning_order_opus.md` §4.
+    fn commit_thinking(&self, out: &mut io::Stdout) {
+        let events = {
+            let mut tparser = self.thinking_parser.lock().unwrap();
+            let events = tparser.flush();
+            *tparser = StreamParser::new_gfm();
+            events
+        };
+        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        let _ = trenderer.feed(&events, out);
+    }
+
     /// Render any answer text held back while reasoning was streaming, after
     /// committing the thinking paragraph so the layout reads `[thinking][answer]`.
     /// Renders the answer through a *local* parser so `self.parser` stays empty
@@ -612,16 +634,16 @@ impl ConsoleOutput {
         // thinking→answer boundary handling in `stream_text`.
         let was_thinking = *self.dim_on.lock().unwrap();
         if was_thinking {
-            let mut tparser = self.thinking_parser.lock().unwrap();
-            let events = tparser.write(b"\n\n");
-            let mut trenderer = self.thinking_renderer.lock().unwrap();
-            let _ = trenderer.feed(&events, &mut out);
+            self.commit_thinking(&mut out);
         }
         self.ensure_dim(false, &mut out);
         // Render the answer with a local parser so `self.parser` is left empty
-        // for the caller's renderer reset.
+        // for the caller's renderer reset. `flush()` (not just `write`) so the
+        // answer's final, blank-line-unterminated paragraph is emitted rather
+        // than dropped (a `write`-only parser holds the last block back).
         let mut local_parser = StreamParser::new_gfm();
-        let events = local_parser.write(buffer.as_bytes());
+        let mut events = local_parser.write(buffer.as_bytes());
+        events.extend(local_parser.flush());
         let mut renderer = self.renderer.lock().unwrap();
         let _ = renderer.feed(&events, &mut out);
         println!();
@@ -729,16 +751,11 @@ impl Output for ConsoleOutput {
         let was_thinking = *self.dim_on.lock().unwrap();
         if was_thinking {
             // Thinking just ended: normalize the thinking→answer boundary to a
-            // single paragraph gap. Commit any still-open thinking paragraph
-            // (while dim is still on) and emit one blank line, so the answer
-            // starts on a fresh paragraph regardless of whether a tool call
-            // intervened in between (the tool path already prints its own gap).
-            {
-                let mut tparser = self.thinking_parser.lock().unwrap();
-                let events = tparser.write(b"\n\n");
-                let mut trenderer = self.thinking_renderer.lock().unwrap();
-                let _ = trenderer.feed(&events, &mut out);
-            }
+            // single paragraph gap. Commit all still-buffered thinking (while dim
+            // is still on) and emit one blank line, so the answer starts on a
+            // fresh paragraph regardless of whether a tool call intervened in
+            // between (the tool path already prints its own gap).
+            self.commit_thinking(&mut out);
             self.ensure_dim(false, &mut out);
             println!();
             self.note_lines(1);
@@ -793,7 +810,11 @@ impl Output for ConsoleOutput {
             // transition already emits one blank).
             {
                 let mut parser = self.parser.lock().unwrap();
-                let events = parser.write(b"\n\n");
+                // `flush()` (not `write("\n\n")`) so a segment whose answer text
+                // ends in a list/table is emitted now rather than stranded; then
+                // start a fresh answer parser + renderer for the next segment.
+                let events = parser.flush();
+                *parser = StreamParser::new_gfm();
                 let mut renderer = self.renderer.lock().unwrap();
                 let _ = renderer.feed(&events, &mut out);
                 let mut theme = Theme::default();
@@ -801,15 +822,10 @@ impl Output for ConsoleOutput {
                 *renderer = Renderer::new(theme, term_width());
             }
             if !flushed {
-                // Commit thinking (don't reset: post-tool thinking continues in
-                // the same thinking renderer so it reads as one continuous
-                // faded stream).
-                {
-                    let mut parser = self.thinking_parser.lock().unwrap();
-                    let events = parser.write(b"\n\n");
-                    let mut renderer = self.thinking_renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
-                }
+                // Commit thinking (the thinking renderer is kept — post-tool
+                // thinking continues as one continuous faded stream; only the
+                // parser is reset, inside `commit_thinking`).
+                self.commit_thinking(&mut out);
                 self.ensure_dim(false, &mut out);
                 println!();
                 self.note_lines(1);
@@ -1604,6 +1620,57 @@ mod tests {
         assert!(
             out.answer_buffer.lock().unwrap().is_empty(),
             "answer must render inline (not buffered) when holding is off"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reasoning_with_trailing_list_renders_before_answer() {
+        // Regression for the reasoning-below-answer bug (see
+        // `doc/reasoning_order_opus.md` §4). A GFM list cannot be closed by a
+        // blank line — the streaming parser must see a non-list line or EOF —
+        // so committing the thinking parser with `write(b"\n\n")` stranded
+        // list-structured reasoning until `end_response`'s `flush()`, which runs
+        // *after* the answer parser, printing the reasoning below the answer.
+        // The fix commits thinking with `flush()` (`commit_thinking`). Here we
+        // capture stdout at the fd level and assert the reasoning list item is
+        // emitted BEFORE the answer text.
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let saved = unsafe { libc::dup(1) };
+        unsafe { libc::dup2(tmp.as_file().as_raw_fd(), 1) };
+
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_response_inner(true); // live/TTY path
+        out.set_answer_hold(false); // NOHOLD: reasoning renders inline
+        // Markers are unique to this test: the fd-level redirect is process-wide,
+        // so parallel tests' stdout lands in the same capture file — a shared
+        // marker (e.g. "ANSWER") could false-match another test's output.
+        // Reasoning that ENDS in a bullet list (the stranding trigger):
+        out.stream_thinking("Plan:\n- step PICOCODE_RTLIST_MARK one\n- step two");
+        // Then the answer text:
+        out.stream_text("PICOCODE_RTANSWER_MARK done.");
+        out.end_response();
+
+        let _ = std::io::stdout().flush();
+        unsafe {
+            libc::dup2(saved, 1);
+            libc::close(saved);
+        }
+
+        let captured = std::fs::read_to_string(tmp.path()).unwrap();
+        let plain = strip_ansi(&captured);
+        let list_pos = plain
+            .find("PICOCODE_RTLIST_MARK")
+            .unwrap_or_else(|| panic!("reasoning list item must be rendered; got:\n{plain}"));
+        let ans_pos = plain
+            .find("PICOCODE_RTANSWER_MARK")
+            .unwrap_or_else(|| panic!("answer must be rendered; got:\n{plain}"));
+        assert!(
+            list_pos < ans_pos,
+            "reasoning (trailing list) must render BEFORE the answer; got:\n{plain}"
         );
     }
 }
