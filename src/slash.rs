@@ -12,6 +12,7 @@ pub enum SlashKind {
     Persona,
     Stat,
     Quit,
+    Sandbox,
 }
 
 /// A registered slash command.
@@ -59,6 +60,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/quit",
             help: "Quit the session",
             kind: SlashKind::Quit,
+        },
+        SlashCommand {
+            name: "/sandbox",
+            help: "Manage session path bindings: add_ro | add_rw | remove",
+            kind: SlashKind::Sandbox,
         },
     ];
     COMMANDS
@@ -140,8 +146,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_seven_commands() {
-        assert_eq!(registry().len(), 7);
+    fn registry_has_eight_commands() {
+        assert_eq!(registry().len(), 8);
     }
 
     #[test]
@@ -162,7 +168,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 7);
+        assert_eq!(r.len(), 8);
     }
 
     #[test]
