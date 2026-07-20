@@ -541,31 +541,33 @@ milliseconds, not after the command/stream finishes.
 **Goal:** The session `history` survives all turn-ending paths; errors preserve
 the user's prompt; model switches don't break tool-call pairing.
 
-- [ ] **2a. Preserve user prompt on non-cancellation errors.**
-  `src/agent.rs:196-197`.  Before `return Err(...)`, construct a partial
-  turn from the still-live locals (`input`, `output`, `history`) and
-  commit it:
-
+- [x] **2a. Preserve user prompt on non-cancellation errors.**
+  `src/agent.rs:198-216`.  Before `return Err(...)`, construct a partial
+  turn from the still-live locals (`input`, `output`) and commit it via
+  `h.extend()`:
   ```rust
-  let mut partial = vec![Message::user(input)];
-  if !output.is_empty() {
-      partial.push(Message::assistant(&output));
+  if let Some(ref mut h) = history {
+      let mut partial = vec![Message::user(input)];
+      if !output.is_empty() {
+          partial.push(Message::assistant(&output));
+      }
+      let to_commit = maybe_strip_reasoning(partial, …);
+      let to_commit = normalize_call_ids(to_commit);
+      h.extend(to_commit);
   }
-  persist_turn(&mut history, Some(partial), None, …);
   self.output.end_response();
   return Err(crate::PicocodeError::Other(e.to_string()));
   ```
-
   This ensures a subsequent `prompt()` or steering message sees the
   user's input (and any partial assistant text) rather than having it
   silently dropped.
 
-- [ ] **2b. Normalise `call_id` at persist time for cross-provider safety.**
-  In `persist_turn` (or in the tool-result recording path in
-  `CodeAgent::prompt`), ensure every `ToolResult` in the committed
-  `conversation` has `call_id = Some(…)` set.  If the run already set it
-  (rig does when the tool call had one), leave it; if it's `None`, set
-  `call_id = Some(tool_result.id.clone())`.
+- [x] **2b. Normalise `call_id` at persist time for cross-provider safety.**
+  Added `normalize_call_ids()` in `src/agent.rs:308-334`, a helper that
+  walks committed messages and sets `call_id = Some(id)` on every
+  `ToolResult` where it's `None`.  Wired into both branches of
+  `persist_turn` (append and replace).  Also applied in the error-preservation
+  path (2a) before the `extend()`.
 
   This fixes the OpenAI Responses API `require_call_id()` gap
   (§6.5.4) without needing pi's `transformMessages` layer.  The tool
@@ -582,6 +584,40 @@ the user's prompt; model switches don't break tool-call pairing.
   - Normal successful turn → no regression (still appends once).
   - `<Esc>` cancellation → no regression (still replaces with
     `full_history`).
+
+#### Learnings from implementation
+
+- **`persist_turn` not reused in the error path.** The doc sketch called
+  `persist_turn(&mut history, Some(partial), None, …)`, but the actual
+  code constructs the partial turn from `input`/`output` locals and calls
+  `maybe_strip_reasoning` + `normalize_call_ids` inline before extending.
+  This is because `persist_turn`'s `final_history` branch appends the turn
+  as-is, but reasoning stripping and call-id normalisation must also happen
+  — and the code already has `self.reasoning_in_context`, `self.provider`,
+  etc. accessible.  The inline approach is clearer than threading four
+  extra args through `persist_turn` for this single call site.
+
+- **Error path uses `vec![Message::user(input)]`, not `Vec::clone(h)`.**  
+  Unlike the cancel path (which copies the full prior history because the
+  `cancel_notify` branch fires before the `PromptCancelled` error arrives),
+  the error path constructs a minimal turn from only the current `input`
+  and `output`.  This is safe because `history` already holds the prior
+  turns — they are not lost — so the partial turn is just appended to
+  them.  Using `Vec::clone(h)` would duplicate the priors inside the
+  partial, creating double-entry on every error.
+
+- **`normalize_call_ids` only touches `Message::User`.**  Tool results in
+  rig live inside `UserContent::ToolResult(...)` (the tool's output is
+  returned as a user-role message).  `AssistantContent` never carries a
+  `ToolResult`, so the helper only iterates `Message::User` variants.
+  Assistant messages pass through unchanged.
+
+- **Phase 2 does not actually depend on Phase 1.**  The doc claimed
+  "cancellation path is also an error path; same `persist_turn` code,"
+  but the error-preservation path (2a) operates on the non-cancellation
+  error branch — it has no dependency on the tool-cancel channel or rig
+  fork changes.  Phase 2 can be implemented and tested independently of
+  Phase 1.
 
 ---
 
@@ -652,43 +688,28 @@ steering message that follows sees the full conversation.
 
 #### 6.5.3 Non-cancellation streaming errors
 
-Any `StreamingError` that is *not* `PromptCancelled` (network timeout, API
-error, malformed response, provider 5xx) hits `agent.rs:196-197`:
+Fixed in Phase 2a (`src/agent.rs:198-216`).  Any `StreamingError` that is *not*
+`PromptCancelled` (network timeout, API error, malformed response, provider 5xx)
+now commits the partial turn before returning the error:
 
 ```rust
+if let Some(ref mut h) = history {
+    let mut partial = vec![Message::user(input)];
+    if !output.is_empty() {
+        partial.push(Message::assistant(&output));
+    }
+    let to_commit = maybe_strip_reasoning(partial, …);
+    let to_commit = normalize_call_ids(to_commit);
+    h.extend(to_commit);
+}
 self.output.end_response();
 return Err(crate::PicocodeError::Other(e.to_string()));
 ```
 
-This path returns before `persist_turn` is called, so `history` is **unchanged**
-— prior turns survive, but the failed turn's context (current user input, any
-partial assistant text) is silently dropped.  The user sees an error in
-`run_interactive` (`agent.rs:1269-1271`) and their input is gone.
-
-**Can we preserve the user prompt?**  Yes — the locals are still live at the
-error site:
-
-- `input: &str` — the user's original prompt (passed to `stream_prompt` at
-  line 103)
-- `output: String` — any partial assistant text accumulated during streaming
-  (lines 136–138)
-- `history` — the mutable session-history reference
-
-We can construct a minimal partial turn and commit it before the `return Err`:
-
-```rust
-let mut partial = vec![Message::user(input)];
-if !output.is_empty() {
-    partial.push(Message::assistant(&output));
-}
-persist_turn(&mut history, Some(partial), None, …);
-```
-
-Passing this as `final_history` (the "append" branch of `persist_turn`) means it
-is appended to the existing session `history`.  The next prompt — or a queued
-steering message — sees the user's input, any partial assistant text, and all
-prior turns.  The error is still surfaced to the user; the only difference is
-that they don't have to re-type their question.
+The `input` and `output` locals are still live at the error site — `input` is the
+user's original prompt (passed to `stream_prompt` at line 103), `output` is any
+partial assistant text accumulated during streaming (lines 136–138).  The partial
+turn is appended to the existing session `history`, so prior turns survive intact.
 
 **What about partial assistant text being garbled?**  It may be mid-sentence or
 contain incomplete JSON from a failed tool-call parse.  Including it is still
@@ -710,8 +731,7 @@ the tool anyway because the tool result is not in the canonical `conversation`.
 The impact is a wasted tool call, which is acceptable for the error-recovery
 path.
 
-**Updated status: prior turns preserved, user prompt + partial text committed.
-A strict improvement over the current silent-drop behaviour.**
+**Status: fixed.** Prior turns preserved, user prompt + partial text committed.
 
 #### 6.5.4 Model / provider switch (`/model`, `/thinking`, `/persona`)
 
@@ -759,19 +779,16 @@ apply:
 
    **Current status for picocode:** picocode uses `openai::Client` which
    targets the Chat Completions API (not Responses API), so the `call_id`
-   gap is **theoretical** — it works today.  A future Responses API target
-   would need mitigation.
+   gap was **theoretical** — it worked before.  The mitigation described
+   below is now implemented proactively (Phase 2b).
 
-   **Simplest mitigation — set `call_id` at persist time:** In rig's tool
-   execution path (`run/mod.rs:1035-1043`), the tool result's `call_id` is
-   set from `tool_call.call_id` if present, else left as `None`.  For the
-   steering re-drive, we can normalise at persist time: when committing a
-   tool result to the canonical `conversation`, always set
-   `call_id = Some(id.clone())` if the tool call had no `call_id`.  This
-   way every provider sees a `call_id` it can use, and the pair is
-   preserved because both call and result use the same string.  This is
-   simpler than pi's `transformMessages` because rig already pairs calls
-   with results in the run — no need to track pending calls.
+   **Mitigation implemented — `normalize_call_ids` at persist time**
+   (`src/agent.rs:308-334`): Before committing any turn to the canonical
+   `conversation`, every `ToolResult` is normalized so that a missing
+   `call_id` is set to `Some(id)`.  This is simpler than pi's
+   `transformMessages` because rig already pairs calls with results in the
+   run — no need to track pending calls.  The helper is wired into both
+   branches of `persist_turn` and into the error-preservation path (2a).
 
    **Summary:**
 
@@ -797,8 +814,8 @@ apply:
    only uses `Bash`, `ReadFile`, `WriteFile`, etc.), so this is not a concern
    here.
 
-**Status: conversation survives, but the OpenAI Responses API has a `call_id`
-gap that must be fixed before a multi-provider steering session can target it.**
+**Status: conversation survives.  The OpenAI Responses API `call_id` gap is
+mitigated by `normalize_call_ids` at persist time (§2b).**
 
 #### 6.5.5 Summary of context preservation
 
@@ -808,17 +825,17 @@ gap that must be fixed before a multi-provider steering session can target it.**
 | `<Esc>` cancellation | ✓ (replaced) | ✓ (partial committed) | Full history incl. partial turn |
 | Network/API error | ✓ (no mutation) | ✓ (user prompt + partial text committed) | Prior turns + failed prompt |
 | `/model` switch (Chat Completions) | ✓ (unmodified) | N/A | Prior turns from old provider — works |
-| `/model` switch (Responses API) | ✓ (but `require_call_id` may reject tool-call history) | N/A | `call_id` gap; fix: set `call_id = Some(id)` at persist time |
+| `/model` switch (Responses API) | ✓ (unmodified) | N/A | Call_id gap **fixed** via `normalize_call_ids` at persist time (§2b) |
 
 ---
 
 ## 7. Summary — phased implementation
 
-| Phase | What | Depends on |
-|-------|------|------------|
-| **1 — Immediate cancellation** | `capture_bounded` watchdog channel wiring (§6.2.2), rig fork `CancellationToken` (§6.2.1), in-flight reader plumbing (§1c–1g) | — |
-| **2 — Context preservation** | User prompt on errors (§6.5.3 fix), `call_id` normalisation (§2b), cross-provider verification (§2c–2d) | Phase 1 (cancellation path is also an error path; same `persist_turn` code) |
-| **3 — Steering** | `PendingMessageQueue` + `SteeringSession` (§2), re-drive loop (§3), UI design (stdin sharing, TUI integration) | Phase 1 + 2 (responsive abort + reliable context) |
+| Phase | What | Status | Depends on |
+|-------|------|--------|------------|
+| **1 — Immediate cancellation** | `capture_bounded` watchdog channel wiring (§6.2.2), rig fork `CancellationToken` (§6.2.1), in-flight reader plumbing (§1c–1g) | ❌ Not started | — |
+| **2 — Context preservation** | User prompt on errors (§6.5.3 fix), `call_id` normalisation (§2b), cross-provider verification (§2c–2d) | ✅ 2a–2b coded; 2c–2d need manual test | (see note) |
+| **3 — Steering** | `PendingMessageQueue` + `SteeringSession` (§2), re-drive loop (§3), UI design (stdin sharing, TUI integration) | ❌ Not started | Phase 1 + 2 |
 
 Implementing `pi`-style steering on rig is mostly *orchestration* — rig already
 provides every primitive `pi` had to build by hand.  The provider-agnostic
