@@ -296,6 +296,12 @@ pub struct ConsoleOutput {
     /// without doubling the divider that a preceding text segment already
     /// printed.
     last_was_tool: Mutex<bool>,
+    /// The most recent tool call's `(name, args)`, captured in
+    /// `display_tool_call` and read back in `display_tool_result` so the result
+    /// can be rendered tool-aware (e.g. strip `read_file` line-number gutters
+    /// and pick a syntax-highlight language). The hook always fires a call
+    /// immediately before its result, so this is safe to read on the result.
+    last_tool: Mutex<Option<(String, Value)>>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -383,6 +389,87 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
     }
     out
+}
+
+/// Highlight a single physical line of `text` as `lang` using the *same*
+/// markdown code-block formatter the answer/result path uses
+/// (`markdown_terminal` driven by `markdown_stream` via `render_markdown`).
+///
+/// Returns **foreground-only** ANSI (no background) so the caller can layer the
+/// dark-grey tool panel on top via `paint_panel`. `color` off (non-TTY) returns
+/// the line untouched. The renderer's 2-space code indent and trailing newline
+/// are stripped, leaving one line of styled text. Each call builds a fresh
+/// fenced block, so the formatter is fully isolated/flushed per line.
+fn highlight_code_fg(text: &str, lang: &str, color: bool) -> String {
+    if !color || text.is_empty() {
+        return text.to_string();
+    }
+    let md = format!("```{lang}\n{text}\n```\n");
+    let rendered = render_markdown(&md, term_width(), true);
+    let body = rendered
+        .strip_prefix("  ")
+        .unwrap_or_else(|| rendered.strip_prefix(' ').unwrap_or(&rendered));
+    body.trim_end_matches('\n').to_string()
+}
+
+/// Language id used to colorize a tool *command* label (e.g. `read …`,
+/// `$ ls …`). Any non-empty id engages token highlighting; the highlighter is
+/// language-agnostic for tokens, so `bash` is a safe, consistent default.
+fn command_lang(_name: &str) -> &'static str {
+    "bash"
+}
+
+/// Guess a syntax-highlight id from a file path's extension, for coloring
+/// `read_file` output. Unknown extensions fall back to `text` (no token
+/// highlighting, just the uniform code color).
+fn guess_lang(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("rs") => "rust",
+        Some("py") => "python",
+        Some("js" | "mjs" | "cjs") => "javascript",
+        Some("ts") => "typescript",
+        Some("tsx") => "tsx",
+        Some("jsx") => "jsx",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("c" | "h") => "c",
+        Some("cpp" | "cc" | "cxx" | "c++" | "hpp") => "cpp",
+        Some("rb") => "ruby",
+        Some("sh" | "bash" | "zsh") => "bash",
+        Some("json") => "json",
+        Some("toml") => "toml",
+        Some("yaml" | "yml") => "yaml",
+        Some("md" | "markdown") => "markdown",
+        Some("html" | "htm") => "html",
+        Some("css") => "css",
+        Some("sql") => "sql",
+        Some("xml") => "xml",
+        Some("php") => "php",
+        Some("swift") => "swift",
+        Some("kt" | "kts") => "kotlin",
+        Some("diff") => "diff",
+        _ => "text",
+    }
+}
+
+/// Drop the `NNNN| ` line-number gutter that `read_file` prepends to each line,
+/// so the displayed file content is clean (the model still receives the numbers
+/// in the raw tool result). Lines without a numeric gutter are returned as-is.
+fn strip_read_lineno(line: &str) -> &str {
+    if let Some(pos) = line.find('|') {
+        let (gutter, rest) = line.split_at(pos);
+        let g = gutter.trim();
+        if !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()) {
+            return rest
+                .strip_prefix("| ")
+                .unwrap_or_else(|| rest.strip_prefix('|').unwrap_or(rest));
+        }
+    }
+    line
 }
 
 /// Build a human-readable one-line *label* for a tool call plus any optional
@@ -530,6 +617,7 @@ impl ConsoleOutput {
             answer_buffer: Mutex::new(String::new()),
             show_reasoning,
             last_was_tool: Mutex::new(false),
+            last_tool: Mutex::new(None),
         }
     }
 
@@ -801,18 +889,45 @@ impl ConsoleOutput {
         *self.last_was_tool.lock().unwrap() = true;
     }
 
-    /// Render one full-width dark-grey panel row for `text` (plain, no ANSI).
+    /// Paint the dark-grey tool-panel background behind `content`, which already
+    /// carries any *foreground* ANSI it needs — dim text, red/green diff
+    /// markers, or syntax-highlight tokens from `highlight_code_fg`. The
+    /// background is re-applied after every internal `\x1b[0m` the highlighter
+    /// emitted, so the grey stays solid across a whole line even when the
+    /// content changes foreground color several times. `indent` leaves one
+    /// leading column so the line reads as a command's *output*; padding uses
+    /// display-column width so wide/CJK characters keep the panel edge aligned.
+    fn paint_panel(&self, content: &str, indent: bool) {
+        const BG: &str = "\x1b[48;2;22;22;26m";
+        const RESET: &str = "\x1b[0m";
+        // Prepend the background and re-apply it after each reset, so a token's
+        // own `\x1b[0m` cannot drop the grey behind the rest of the line.
+        let painted = format!("{BG}{}", content.replace(RESET, &format!("{RESET}{BG}")));
+        let vis = UnicodeWidthStr::width(strip_ansi(&painted).as_str());
+        let width = term_width();
+        let pad = if width == 0 {
+            0
+        } else if indent {
+            width.saturating_sub(vis + 1)
+        } else {
+            width.saturating_sub(vis)
+        };
+        let row = format!(
+            "{}{}{}{}",
+            if indent { format!("{BG} ") } else { String::new() },
+            painted,
+            format!("{BG}"),
+            format!("{}{}", " ".repeat(pad), RESET),
+        );
+        println!("{}", row);
+        self.note_lines(1);
+        self.note_tool();
+    }
+
+    /// Render one full-width dark-grey panel row for plain `text` (no ANSI).
     /// `text` is wrapped to the available width and painted dim (or red for
-    /// errors). When `indent` is set, a single leading column is left (still on
-    /// the grey background) so the panel reads as the *output* of a command
-    /// whose own line is left flush. The grey background is painted onto *every*
-    /// segment — the leading indent (if any), each text piece, *and* the
-    /// trailing padding — so the panel stays solid across the whole row. That
-    /// per-segment painting matters because a coloured diff marker (`-`/`+`)
-    /// carries its own `\x1b[0m`; wrapping the whole line under one background
-    /// would let that reset drop the grey behind the remaining (dim) text.
-    /// Padding uses display-column width so wide/CJK characters keep the panel
-    /// edge aligned.
+    /// errors); `-`/`+` diff markers keep their red/green. For pre-styled /
+    /// syntax-highlighted content, call `paint_panel` directly.
     fn tool_panel(&self, text: &str, is_error: bool, indent: bool) {
         let width = term_width();
         // When indented, leave one column for the indent; keep the background
@@ -828,52 +943,19 @@ impl ConsoleOutput {
             wrap(text, inner)
         };
         for line in lines {
-            let vis = UnicodeWidthStr::width(line.as_str());
-            // The +1 (when indented) covers the leading indent so the row still
-            // fills `width`.
-            let pad = if width == 0 {
-                0
-            } else if indent {
-                width.saturating_sub(vis + 1)
-            } else {
-                width.saturating_sub(vis)
-            };
-            // Foreground content painted on the grey background. Only a leading
-            // diff indicator (`-`/`+`) is recoloured (red/green); the rest stays
-            // dim. The indicator and the remainder are kept as separate
-            // background-painted segments so the indicator's internal reset
-            // cannot drop the background behind the rest of the line.
+            // Foreground-only styling here; `paint_panel` adds the grey
+            // background (and re-applies it across any internal resets).
             let content = if is_error {
-                style(line.to_string()).red().on_true_color(22, 22, 26).to_string()
+                style(line.clone()).red().to_string()
             } else if let Some(rest) = line.strip_prefix("- ") {
-                format!(
-                    "{}{}",
-                    style("-").red().on_true_color(22, 22, 26),
-                    style(format!(" {rest}")).dim().on_true_color(22, 22, 26),
-                )
+                format!("{}{}", style("-").red(), style(format!(" {rest}")).dim())
             } else if let Some(rest) = line.strip_prefix("+ ") {
-                format!(
-                    "{}{}",
-                    style("+").green().on_true_color(22, 22, 26),
-                    style(format!(" {rest}")).dim().on_true_color(22, 22, 26),
-                )
+                format!("{}{}", style("+").green(), style(format!(" {rest}")).dim())
             } else {
-                style(line.to_string()).dim().on_true_color(22, 22, 26).to_string()
+                style(line.clone()).dim().to_string()
             };
-            let row = format!(
-                "{}{}{}",
-                if indent {
-                    style(" ").on_true_color(22, 22, 26).to_string()
-                } else {
-                    String::new()
-                },
-                content,
-                style(" ".repeat(pad)).on_true_color(22, 22, 26),
-            );
-            println!("{}", row);
-            self.note_lines(1);
+            self.paint_panel(&content, indent);
         }
-        self.note_tool();
     }
 
     fn create_spinner(message: &str) -> ProgressBar {
@@ -1103,6 +1185,11 @@ impl Output for ConsoleOutput {
         // previous block was also a tool (call or result) — that separates
         // consecutive tool calls without doubling the segment's divider.
         let (label, extra) = get_preview(name, args);
+        // Remember the tool so `display_tool_result` can render the result
+        // tool-aware (strip `read_file` line-number gutters, pick a highlight
+        // language). The hook always fires the call immediately before its
+        // result, so this is safe to read back on the result.
+        *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
         if *self.last_was_tool.lock().unwrap() {
             println!();
             self.note_lines(1);
@@ -1110,8 +1197,12 @@ impl Output for ConsoleOutput {
         // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
         // the first line and is left flush; its output — the trailing
         // diff/preview lines — is indented one column so the command's output
-        // reads as a distinct block.
-        self.tool_panel(&label, false, false);
+        // reads as a distinct block. The command itself is syntax-highlighted
+        // through the same formatter the answer/result path uses (flushed per
+        // block via a fresh fenced code render).
+        let color = std::io::stdout().is_terminal();
+        let label_styled = highlight_code_fg(&label, command_lang(name), color);
+        self.paint_panel(&label_styled, false);
         for line in &extra {
             self.tool_panel(line, false, true);
         }
@@ -1152,21 +1243,66 @@ impl Output for ConsoleOutput {
             return;
         }
 
-        // Render each output line as its own dark-grey panel row (no `│`/`└`
-        // tree art). The result is command output, so it is indented one column
-        // to sit beneath the command line; the leading indent is shared by the
-        // first output line too. Errors are red.
-        let show_max = if is_error { usize::MAX } else { 4 };
+        // Which tool produced this result (set by `display_tool_call`). Drives
+        // read-specific line-number stripping and language guessing.
+        let tool = self.last_tool.lock().unwrap().clone();
+        let is_read = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("read_file"))
+            .unwrap_or(false);
+        let read_path = tool
+            .as_ref()
+            .and_then(|(_, a)| a.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let color = std::io::stdout().is_terminal();
+        // Error output is shown verbatim (red). Everything else is highlighted:
+        // `read_file` output is colored by the file's guessed language, bash
+        // command output gets token highlighting, and other tools' output is
+        // colored uniformly (no meaningful grammar to tokenize).
+        let lang = if is_read {
+            guess_lang(read_path)
+        } else {
+            match tool.as_ref().map(|(n, _)| n.as_str()) {
+                Some("bash") => "bash",
+                _ => "text",
+            }
+        };
+
+        // Read results drop the `NNNN| ` line-number gutter and show up to 10
+        // lines; other results keep the previous 4-line default. Errors show
+        // everything.
+        let show_max = if is_error {
+            usize::MAX
+        } else if is_read {
+            10
+        } else {
+            4
+        };
+
+        let width = term_width();
+        let inner = width.saturating_sub(1).max(1);
         for (printed, line) in lines.iter().enumerate() {
             if printed >= show_max {
                 break;
             }
-            for wline in wrap(line, term_width().saturating_sub(1).max(1)) {
-                self.tool_panel(&wline, is_error, true);
+            // `read_file` renders `NNNN| content`; drop the gutter for display
+            // (the model still gets the numbers in the raw tool result).
+            let visible = if is_read { strip_read_lineno(line) } else { line };
+            for wline in wrap(visible, inner) {
+                if is_error {
+                    self.tool_panel(&wline, true, true);
+                } else {
+                    // Syntax-highlight through the result-path formatter, then
+                    // layer the grey tool panel on top (flushed per line).
+                    let styled = highlight_code_fg(&wline, lang, color);
+                    self.paint_panel(&styled, true);
+                }
             }
         }
 
-        if lines.len() > show_max {
+        if lines.len() > show_max && !is_error {
             self.tool_panel(
                 &format!("... +{} lines", lines.len() - show_max),
                 false,
@@ -1969,5 +2105,26 @@ mod tests {
             ans_line > 0 && lines[ans_line - 1].trim().is_empty(),
             "answer must be separated from reasoning by a blank line; got:\n{plain}"
         );
+    }
+
+    #[test]
+    fn tmp_verify_tool_render_helpers() {
+        // line-number gutter stripping
+        assert_eq!(strip_read_lineno("   1| fn main()"), "fn main()");
+        assert_eq!(strip_read_lineno("  12| let x = a | b;"), "let x = a | b;");
+        assert_eq!(strip_read_lineno("no gutter here"), "no gutter here");
+        assert_eq!(strip_read_lineno("   5| "), "");
+        // language guessing
+        assert_eq!(guess_lang("src/output.rs"), "rust");
+        assert_eq!(guess_lang("a/b.py"), "python");
+        assert_eq!(guess_lang("x.unknown"), "text");
+        // highlighting: colored path keeps the source text and emits ANSI
+        let colored = highlight_code_fg("let x = 1;", "rust", true);
+        // ANSI escapes break the literal substring, so strip them first
+        let plain = strip_ansi(&colored);
+        assert!(plain.contains("let x = 1;"), "highlighting must not drop content; got plain={plain:?} from colored={colored:?}");
+        assert!(colored.contains('\x1b'), "color path must emit ANSI");
+        // non-color path returns the line untouched
+        assert_eq!(highlight_code_fg("let x = 1;", "rust", false), "let x = 1;");
     }
 }
