@@ -261,24 +261,659 @@ pub struct ReplCtx {
 
 /// A candidate value shown in a setting's value-pick overlay.
 #[derive(Clone)]
-struct ValueCandidate {
+pub(crate) struct ValueCandidate {
     display: String,
     value: String,
     desc: String,
 }
 
-/// All state produced by the overlay-computation phase and consumed by the
-/// key-dispatch phase.  Keeps the same data model (`kind: u8`, loose bridge
-/// variables) but packages them so the event loop can pass them cleanly
-/// between `compute_overlay` and `handle_overlay_key`.
-struct OverlayState {
-    kind: u8,
-    opts: Vec<String>,
-    active: Option<usize>,
-    title: String,
-    cur_word: String,
-    cur_filter: String,
-    value_cands: Vec<ValueCandidate>,
+// ── Option A: ActiveOverlay enum ───────────────────────────────────────
+
+/// What the caller should do after an overlay handles Enter.
+enum OverlayAction {
+    /// Overlay consumed the key; editor/state already updated, continue loop.
+    Continue,
+    /// Return this InputAction from `read_input`.
+    Action(InputAction),
+}
+
+/// A single overlay "variant" that carries its own pre-computed data so
+/// Tab/Enter/Esc handlers never need to re-query the buffer or re-filter.
+///
+/// Eliminates `kind: u8`, the three parallel match ladders, `help_view`,
+/// `cur_word`/`cur_filter` bridge variables, and the `value_cands` hack.
+pub(crate) enum ActiveOverlay {
+    None,
+    Help,
+
+    CommandList {
+        cmds: Vec<crate::fuzzy::Ranked<'static, slash::SlashCommand>>,
+    },
+
+    Model {
+        entries: Vec<model_catalog::ModelEntry>,
+        _filter: String,
+        /// Index of the currently-active model (for the `*` marker).
+        active: Option<usize>,
+    },
+
+    Thinking {
+        levels: Vec<thinking::ThinkingLevel>,
+    },
+
+    Settings {
+        rows: Vec<(crate::settings::SettingMeta, String)>,
+        _filter: String,
+    },
+
+    SettingsVal {
+        key: crate::settings::SettingKey,
+        cands: Vec<ValueCandidate>,
+        _filter: String,
+    },
+
+    Persona {
+        cands: Vec<ValueCandidate>,
+        _filter: String,
+        /// Index of the currently-active persona (for the `*` marker).
+        active: Option<usize>,
+    },
+
+    Stat {
+        lines: Vec<String>,
+    },
+
+    Sandbox {
+        items: Vec<String>,
+        _filter: String,
+    },
+
+    PathComplete {
+        completions: Vec<String>,
+        completion_pos: Option<(usize, usize)>,
+    },
+}
+
+impl ActiveOverlay {
+    /// Construct the overlay from the current buffer and external state.
+    fn from_buffer(
+        buf: &str,
+        ctx: &ReplCtx,
+        settings: &SettingsStore,
+        help_view: bool,
+        path_completions: &[String],
+    ) -> Self {
+        if help_view {
+            return ActiveOverlay::Help;
+        }
+        if buf.is_empty() || !buf.starts_with('/') {
+            // Path-completions overlay when Tab was pressed on a bare prompt.
+            if !path_completions.is_empty() {
+                return ActiveOverlay::PathComplete {
+                    completions: path_completions.to_vec(),
+                    completion_pos: None,
+                };
+            }
+            return ActiveOverlay::None;
+        }
+        let after = &buf[1..];
+        let (word, rest) = if let Some((w, r)) = after.split_once(' ') {
+            (w, r)
+        } else if matches!(
+            after,
+            "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
+                | "s" | "persona" | "personas" | "p" | "stat" | "stats"
+                | "sandbox" | "sb"
+        ) {
+            (after, "")
+        } else {
+            ("", after)
+        };
+        match word {
+            "model" | "models" | "m" => {
+                let filter = rest.trim().to_string();
+                let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
+                ActiveOverlay::Model { entries, _filter: filter, active }
+            }
+            "thinking" | "think" | "t" => {
+                let filter = rest.trim().to_string();
+                let levels = Repl::thinking_overlay_entries(&filter);
+                ActiveOverlay::Thinking { levels }
+            }
+            "persona" | "personas" | "p" => {
+                let filter = rest.trim().to_string();
+                let cands = Repl::setting_value_candidates(
+                    crate::settings::SettingKey::DefaultPersona,
+                    ctx,
+                );
+                let filtered: Vec<ValueCandidate> = if filter.is_empty() {
+                    cands
+                } else {
+                    crate::fuzzy::fuzzy_filter(&cands, &filter, |c| c.display.clone())
+                        .into_iter()
+                        .map(|r| r.item.clone())
+                        .collect()
+                };
+                let active = filtered.iter().position(|c| {
+                    !c.value.is_empty() && ctx.persona.as_deref() == Some(c.value.as_str())
+                });
+                ActiveOverlay::Persona { cands: filtered, _filter: filter, active }
+            }
+            "set" | "s" => {
+                let filter = rest.to_string();
+                let (skey, vq, is_value) = Repl::parse_settings(rest);
+                if is_value {
+                    if let Some(k) = skey {
+                        let cands = Repl::filtered_value_candidates(k, ctx, &vq);
+                        ActiveOverlay::SettingsVal { key: k, cands, _filter: filter }
+                    } else {
+                        ActiveOverlay::Settings { rows: vec![], _filter: filter }
+                    }
+                } else {
+                    let rows = settings.overlay_rows(&filter);
+                    ActiveOverlay::Settings { rows, _filter: filter }
+                }
+            }
+            "stat" | "stats" => {
+                let lines = crate::agent::session_stats_lines(
+                    &ctx.provider, &ctx.model, ctx.session_usage,
+                );
+                ActiveOverlay::Stat { lines }
+            }
+            "sandbox" | "sb" => {
+                let filter = rest.trim().to_string();
+                let mut items = Vec::new();
+                let mut active = None;
+                Repl::sandbox_overlay_entries(&filter, &mut items, &mut active);
+                ActiveOverlay::Sandbox { items, _filter: filter }
+            }
+            _ => {
+                let cmds = slash::filter_commands(rest);
+                ActiveOverlay::CommandList { cmds }
+            }
+        }
+    }
+
+    /// Display parameters: `(title, logical options, active index, wrap_opts)`.
+    /// The caller feeds these to `Repl::overlay_lines` for final rendering.
+    fn display_rows(&self) -> (&str, Vec<String>, Option<usize>, bool) {
+        match self {
+            ActiveOverlay::None => ("", vec![], None, false),
+            ActiveOverlay::Help => {
+                let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
+                ("Help  (any key closes)", lines, None, true)
+            }
+            ActiveOverlay::CommandList { cmds } => {
+                let opts: Vec<String> = cmds.iter().map(|r| {
+                    format!("{:<10} {}", r.item.name, r.item.help)
+                }).collect();
+                if opts.is_empty() {
+                    ("Commands  (type to filter, up/down, Tab/Enter select)",
+                     vec!["(no matching command)".into()], None, false)
+                } else {
+                    ("Commands  (type to filter, up/down, Tab/Enter select)",
+                     opts, None, true)
+                }
+            }
+            ActiveOverlay::Model { entries, active, .. } => {
+                if entries.is_empty() {
+                    return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
+                            vec!["(loading models... or no matches)".into()],
+                            None, false);
+                }
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Model", "Ctx", "Cost", "?"])
+                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Left])
+                    .with_min_widths(&[12, 5, 14, 3])
+                    .with_priorities(&[3, 1, 2, 1])
+                    .set_gap(2);
+                for e in entries {
+                    table.add_row(&[
+                        e.qualified(),
+                        model_catalog::ctx_cell(e),
+                        model_catalog::cost_cell(e),
+                        model_catalog::reason_cell(e),
+                    ]);
+                }
+                let rows = table.render_multiline(avail);
+                let opts: Vec<String> = rows.into_iter().enumerate().map(|(i, row)| {
+                    if model_catalog::provider_available(&entries[i].provider) {
+                        row
+                    } else {
+                        row.lines()
+                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }).collect();
+                ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
+                 opts, *active, false)
+            }
+            ActiveOverlay::Thinking { levels } => {
+                let opts: Vec<String> = levels.iter().map(|l| l.as_str().to_string()).collect();
+                if opts.is_empty() {
+                    ("Thinking levels  (up/down, Enter select, Esc back)",
+                     vec!["(no matches)".into()], None, false)
+                } else {
+                    ("Thinking levels  (up/down, Enter select, Esc back)",
+                     opts, None, false)
+                }
+            }
+            ActiveOverlay::Settings { rows, .. } => {
+                if rows.is_empty() {
+                    return ("Settings  (type to filter, up/down, Tab/Enter select, Esc back)",
+                            vec!["(no matching setting)".into()], None, false);
+                }
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Setting", "Value", "Description"])
+                    .with_aligns(&[Align::Left, Align::Left, Align::Left])
+                    .with_min_widths(&[22, 18, 26])
+                    .with_priorities(&[2, 2, 1])
+                    .set_gap(2);
+                for (meta, value) in rows {
+                    table.add_row(&[meta.name, value.as_str(), meta.description]);
+                }
+                let opts = table.render_multiline(avail);
+                ("Settings  (type to filter, up/down, Tab/Enter select, Esc back)",
+                 opts, None, false)
+            }
+            ActiveOverlay::SettingsVal { cands, .. } => {
+                if cands.is_empty() {
+                    return ("", vec!["(no candidates)".into()], None, false);
+                }
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Value", "Description"])
+                    .with_aligns(&[Align::Left, Align::Left])
+                    .with_min_widths(&[28, 30])
+                    .with_priorities(&[2, 1])
+                    .set_gap(2);
+                for c in cands {
+                    table.add_row(&[c.display.clone(), c.desc.clone()]);
+                }
+                let opts = table.render_multiline(avail);
+                // Title is set dynamically from the setting name
+                ("", opts, None, false)
+            }
+            ActiveOverlay::Persona { cands, active, .. } => {
+                if cands.is_empty() {
+                    return ("Personas  (up/down, Enter select, Esc back)",
+                            vec!["(no matching persona)".into()], None, false);
+                }
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Persona", "Description"])
+                    .with_aligns(&[Align::Left, Align::Left])
+                    .with_min_widths(&[20, 30])
+                    .with_priorities(&[2, 1])
+                    .set_gap(2);
+                for c in cands {
+                    table.add_row(&[c.display.clone(), c.desc.clone()]);
+                }
+                let opts = table.render_multiline(avail);
+                ("Personas  (up/down, Enter select, Esc back)",
+                 opts, *active, false)
+            }
+            ActiveOverlay::Stat { lines } => {
+                ("Session stats  (Esc clears input to close)",
+                 lines.clone(), None, true)
+            }
+            ActiveOverlay::Sandbox { items, .. } => {
+                ("Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)",
+                 items.clone(), None, false)
+            }
+            ActiveOverlay::PathComplete { completions, .. } => {
+                ("Path completions  (up/down, Tab/Enter select, Esc dismiss)",
+                 completions.clone(), None, false)
+            }
+        }
+    }
+
+    /// Title for overlays that need a dynamic title (e.g. SettingsVal uses
+    /// the setting name from its key).  Returns "" for variants that set the
+    /// title statically in `display_rows`.
+    fn title(&self) -> String {
+        match self {
+            ActiveOverlay::SettingsVal { key, .. } => {
+                let name = crate::settings::SETTINGS
+                    .iter()
+                    .find(|m| m.key == *key)
+                    .map(|m| m.name)
+                    .unwrap_or("?");
+                format!("{}  (type to filter, up/down, Enter select, Esc back)", name)
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Handle Tab on a selected row.  Mutates the editor in-place.
+    fn handle_tab(
+        &self,
+        sel: usize,
+        editor: &mut LineEditor,
+        path_completions: &mut Vec<String>,
+        completion_pos: &mut Option<(usize, usize)>,
+    ) {
+        match self {
+            ActiveOverlay::CommandList { cmds } => {
+                if let Some(c) = cmds.get(sel) {
+                    editor.set(&Repl::complete_command(&c.item));
+                }
+            }
+            ActiveOverlay::Model { entries, .. } => {
+                if let Some(e) = entries.get(sel) {
+                    let buf = editor.text();
+                    editor.set(&Repl::replace_last_token(&buf, &e.display));
+                }
+            }
+            ActiveOverlay::Thinking { levels } => {
+                if let Some(l) = levels.get(sel) {
+                    let buf = editor.text();
+                    editor.set(&Repl::replace_last_token(&buf, l.as_str()));
+                }
+            }
+            ActiveOverlay::Settings { rows, .. } => {
+                if let Some((meta, _)) = rows.get(sel) {
+                    editor.set(&format!("/set {} ", meta.name));
+                }
+            }
+            ActiveOverlay::SettingsVal { cands, key, .. } => {
+                if let Some(c) = cands.get(sel) {
+                    let buf = editor.text();
+                    let setting_name = crate::settings::SETTINGS
+                        .iter()
+                        .find(|m| m.key == *key)
+                        .map(|m| m.name)
+                        .unwrap_or("?");
+                    let trimmed = buf.trim_end();
+                    if trimmed.ends_with(setting_name) {
+                        editor.set(&format!("/set {} {}", setting_name, c.value));
+                    } else {
+                        editor.set(&Repl::replace_last_token(&buf, &c.value));
+                    }
+                }
+            }
+            ActiveOverlay::Persona { cands, .. } => {
+                if let Some(c) = cands.get(sel) {
+                    let buf = editor.text();
+                    let tok = if c.value.is_empty() {
+                        c.display.clone()
+                    } else {
+                        c.value.clone()
+                    };
+                    editor.set(&Repl::replace_last_token(&buf, &tok));
+                }
+            }
+            ActiveOverlay::Sandbox { .. } => {
+                let buf = editor.text();
+                let after = &buf["/sandbox".len()..].trim();
+                if let Some((sub, rest)) = after.split_once(' ') {
+                    let rest = rest.trim();
+                    match sub {
+                        "add_ro" | "add_rw" => {
+                            if !rest.is_empty() {
+                                let last_token = rest.split_whitespace().last().unwrap_or("");
+                                let completions = Repl::complete_path_prefix(last_token);
+                                if let Some(c) = completions.get(sel) {
+                                    editor.set(&Repl::replace_last_token(&buf, c));
+                                }
+                            }
+                        }
+                        "remove" => {
+                            if !rest.is_empty() {
+                                let binds = crate::sandbox_bindings::list();
+                                let last_token = rest.split_whitespace().last().unwrap_or("");
+                                let filtered: Vec<_> = crate::fuzzy::fuzzy_filter(
+                                    &binds, last_token,
+                                    |b| b.sandbox_path.to_string_lossy().to_string(),
+                                );
+                                if let Some(r) = filtered.get(sel) {
+                                    let path = r.item.sandbox_path.to_string_lossy().to_string();
+                                    editor.set(&Repl::replace_last_token(&buf, &path));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let subcommands = ["add_ro", "add_rw", "remove"];
+                    if let Some(c) = subcommands.get(sel) {
+                        editor.set(&format!("/sandbox {} ", c));
+                    }
+                }
+            }
+            ActiveOverlay::PathComplete { completions, completion_pos: pos } => {
+                if let Some(c) = completions.get(sel) {
+                    let buf = editor.text();
+                    if let Some((start, end)) = pos {
+                        editor.replace_range(*start, *end, c);
+                    } else {
+                        editor.set(&Repl::replace_last_token(&buf, c));
+                    }
+                    path_completions.clear();
+                    *completion_pos = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle Enter on a selected row.  Returns an action for the caller.
+    fn handle_enter<F: Fn(&LineEditor, &[&str], usize, &mut usize)>(
+        &self,
+        sel: usize,
+        editor: &mut LineEditor,
+        output: &dyn Output,
+        redraw: &F,
+        input_row: &mut usize,
+        settings: &mut SettingsStore,
+        dirty: &mut bool,
+        value_error: &mut Option<String>,
+        help_view: &mut bool,
+    ) -> OverlayAction {
+        match self {
+            ActiveOverlay::CommandList { cmds } => {
+                if let Some(cmd) = cmds.get(sel) {
+                    match cmd.item.kind {
+                        slash::SlashKind::Help => {
+                            *help_view = true;
+                            editor.set("");
+                        }
+                        slash::SlashKind::Quit => {
+                            redraw(&LineEditor::new(), &[], sel, input_row);
+                            output.display_plain("");
+                            return OverlayAction::Action(InputAction::Quit);
+                        }
+                        slash::SlashKind::Model => editor.set("/model "),
+                        slash::SlashKind::Thinking => editor.set("/thinking "),
+                        slash::SlashKind::Settings => editor.set("/set "),
+                        slash::SlashKind::Persona => editor.set("/persona "),
+                        slash::SlashKind::Stat => editor.set("/stat "),
+                        slash::SlashKind::Sandbox => editor.set("/sandbox "),
+                    }
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::Model { entries, .. } => {
+                if let Some(e) = entries.get(sel) {
+                    let (provider, model) = e.qualified_parts();
+                    let line = format!("/model {}", e.qualified());
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    OverlayAction::Action(InputAction::SetModel(provider, model))
+                } else {
+                    OverlayAction::Continue
+                }
+            }
+            ActiveOverlay::Thinking { levels } => {
+                if let Some(l) = levels.get(sel) {
+                    let line = format!("/thinking {}", l.as_str());
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    OverlayAction::Action(InputAction::SetThinking(l.as_str().to_string()))
+                } else {
+                    OverlayAction::Continue
+                }
+            }
+            ActiveOverlay::Persona { cands, .. } => {
+                if let Some(c) = cands.get(sel) {
+                    let name = if c.value.is_empty() {
+                        c.display.clone()
+                    } else {
+                        c.value.clone()
+                    };
+                    let line = format!("/persona {}", name);
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    OverlayAction::Action(InputAction::SetPersona(name))
+                } else {
+                    OverlayAction::Continue
+                }
+            }
+            ActiveOverlay::Settings { rows, .. } => {
+                if let Some((meta, _)) = rows.get(sel) {
+                    editor.set(&format!("/set {} ", meta.name));
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::SettingsVal { cands, key, .. } => {
+                let vq = &self.filter_for(editor);
+                let vq_eff = if vq.trim().is_empty() {
+                    cands.get(sel).map(|c| c.value.clone()).unwrap_or_default()
+                } else {
+                    vq.clone()
+                };
+                match settings.set_value(*key, &vq_eff) {
+                    Ok(()) => {
+                        *value_error = None;
+                        *dirty = true;
+                        if vq.trim().is_empty() {
+                            if let Some(name) =
+                                crate::settings::SETTINGS.iter().find(|m| m.key == *key).map(|m| m.name)
+                            {
+                                editor.set(&format!("/set {} {}", name, vq_eff));
+                            }
+                        }
+                        let line = editor.text();
+                        Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "/set", true);
+                    }
+                    Err(msg) => {
+                        *value_error = Some(msg);
+                    }
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::Sandbox { .. } => {
+                let buf = editor.text();
+                let after = &buf["/sandbox".len()..].trim();
+                if let Some((sub, path)) = after.split_once(' ') {
+                    let path = path.trim();
+                    match sub {
+                        "add_ro" | "add_rw" => {
+                            if !path.is_empty() {
+                                let parts: Vec<&str> = path.split_whitespace().collect();
+                                let host = parts[0];
+                                let sandbox = parts.get(1).unwrap_or(&"");
+                                let line = if sandbox.is_empty() {
+                                    format!("/sandbox {} {}", sub, host)
+                                } else {
+                                    format!("/sandbox {} {} {}", sub, host, sandbox)
+                                };
+                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                                return OverlayAction::Action(
+                                    InputAction::Sandbox(sub.to_string(), host.to_string(), sandbox.to_string()),
+                                );
+                            }
+                        }
+                        "remove" => {
+                            if !path.is_empty() {
+                                let sandbox = path.split_whitespace().next().unwrap_or("");
+                                let line = format!("/sandbox remove {}", sandbox);
+                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                                return OverlayAction::Action(
+                                    InputAction::Sandbox("remove".to_string(), sandbox.to_string(), String::new()),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let subcommands = ["add_ro", "add_rw", "remove"];
+                if let Some(c) = subcommands.get(sel) {
+                    editor.set(&format!("/sandbox {} ", c));
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::PathComplete { completions, completion_pos: pos } => {
+                if let Some(c) = completions.get(sel) {
+                    let buf = editor.text();
+                    if let Some((start, end)) = pos {
+                        editor.replace_range(*start, *end, c);
+                    } else {
+                        editor.set(&Repl::replace_last_token(&buf, c));
+                    }
+                }
+                OverlayAction::Continue
+            }
+            _ => OverlayAction::Continue,
+        }
+    }
+
+    /// Handle Escape.
+    fn handle_esc(
+        &self,
+        editor: &mut LineEditor,
+        path_completions: &mut Vec<String>,
+        completion_pos: &mut Option<(usize, usize)>,
+    ) {
+        match self {
+            ActiveOverlay::CommandList { .. }
+            | ActiveOverlay::Model { .. }
+            | ActiveOverlay::Thinking { .. }
+            | ActiveOverlay::Persona { .. }
+            | ActiveOverlay::Stat { .. }
+            | ActiveOverlay::Sandbox { .. } => {
+                editor.set("");
+            }
+            ActiveOverlay::Settings { .. } | ActiveOverlay::SettingsVal { .. } => {
+                let buf = editor.text();
+                if let Some(idx) = buf.rfind(' ') {
+                    editor.set(&buf[..idx]);
+                } else {
+                    editor.set("");
+                }
+            }
+            ActiveOverlay::PathComplete { .. } | ActiveOverlay::Help { .. } => {
+                path_completions.clear();
+                *completion_pos = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Return a discriminant value to detect "kind changes" for sel reset.
+    fn overlay_disc(&self) -> u8 {
+        match self {
+            ActiveOverlay::None => 0,
+            ActiveOverlay::Help => 1,
+            ActiveOverlay::CommandList { .. } => 2,
+            ActiveOverlay::Model { .. } => 3,
+            ActiveOverlay::Thinking { .. } => 4,
+            ActiveOverlay::Settings { .. } => 5,
+            ActiveOverlay::SettingsVal { .. } => 6,
+            ActiveOverlay::Persona { .. } => 7,
+            ActiveOverlay::Stat { .. } => 8,
+            ActiveOverlay::Sandbox { .. } => 9,
+            ActiveOverlay::PathComplete { .. } => 10,
+        }
+    }
+
+    /// Helper: extract the filter string from SettingsVal for Enter/re-entry.
+    fn filter_for(&self, editor: &LineEditor) -> String {
+        // For SettingsVal the filter is embedded in the buffer after `/set <key> `.
+        let buf = editor.text();
+        if let Some((_prefix, rest)) = buf.split_once(' ') {
+            if let Some((_key, val)) = rest.split_once(' ') {
+                return val.to_string();
+            }
+        }
+        String::new()
+    }
 }
 
 impl Repl {
@@ -298,625 +933,6 @@ impl Repl {
     /// reader thread while an LLM request is in flight.
     pub(crate) fn guard(&self) -> Arc<TermGuard> {
         self.guard.clone()
-    }
-
-    // ── Option D: extracted overlay phases ──────────────────────────────
-
-    /// Compute the overlay state from `buf` without side effects (aside from
-    /// populating the returned `OverlayState`).  Reads the bridge variables
-    /// `help_view` / `path_completions` that the key-dispatch phase wrote on
-    /// the previous iteration, but does **not** mutate them.
-    fn compute_overlay(
-        buf: &str,
-        ctx: &ReplCtx,
-        settings: &SettingsStore,
-        help_view: bool,
-        path_completions: &[String],
-        value_cands: &[ValueCandidate],
-    ) -> OverlayState {
-        let mut kind: u8 = 0;
-        let mut opts: Vec<String> = Vec::new();
-        let mut active: Option<usize> = None;
-        let mut title = String::new();
-        let mut cur_word = String::new();
-        let mut cur_filter = String::new();
-        let mut value_cands = value_cands.to_vec();
-        if help_view {
-            kind = 4;
-        } else if buf.starts_with('/') {
-            let after = &buf[1..];
-            let (word, rest) = if let Some((w, r)) = after.split_once(' ') {
-                (w, r)
-            } else if matches!(
-                after,
-                "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
-                    | "s" | "persona" | "personas" | "p" | "stat" | "stats"
-                    | "sandbox" | "sb"
-            ) {
-                (after, "")
-            } else {
-                ("", after)
-            };
-            match word {
-                "model" | "models" | "m" => {
-                    kind = 2;
-                    title = "Models  (up/down or PgUp/PgDn, Enter select, Esc back)".into();
-                    cur_word = "model".into();
-                    cur_filter = rest.trim().to_string();
-                    let (entries, act) = Self::model_overlay_entries(ctx, &cur_filter);
-                    active = act;
-                    if entries.is_empty() {
-                        opts.push("(loading models... or no matches)".into());
-                    } else {
-                        let avail = crate::output::term_width().saturating_sub(2);
-                        let mut table = Table::new(&["Model", "Ctx", "Cost", "?"])
-                            .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Left])
-                            .with_min_widths(&[12, 5, 14, 3])
-                            .with_priorities(&[3, 1, 2, 1])
-                            .set_gap(2);
-                        for e in &entries {
-                            table.add_row(&[
-                                e.qualified(),
-                                model_catalog::ctx_cell(e),
-                                model_catalog::cost_cell(e),
-                                model_catalog::reason_cell(e),
-                            ]);
-                        }
-                        let rows = table.render_multiline(avail);
-                        for (i, row) in rows.into_iter().enumerate() {
-                            let styled = if model_catalog::provider_available(&entries[i].provider) {
-                                row
-                            } else {
-                                row.lines()
-                                    .map(|l| format!("\x1b[2m{}\x1b[0m", l))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            };
-                            opts.push(styled);
-                        }
-                    }
-                }
-                "thinking" | "think" | "t" => {
-                    kind = 3;
-                    title = "Thinking levels  (up/down, Enter select, Esc back)".into();
-                    cur_word = "thinking".into();
-                    cur_filter = rest.trim().to_string();
-                    let levels = Self::thinking_overlay_entries(&cur_filter);
-                    opts = levels.iter().map(|l| l.as_str().to_string()).collect();
-                    if opts.is_empty() {
-                        opts.push("(no matches)".into());
-                    }
-                }
-                "persona" | "personas" | "p" => {
-                    kind = 6;
-                    title = "Personas  (up/down, Enter select, Esc back)".into();
-                    cur_word = "persona".into();
-                    cur_filter = rest.trim().to_string();
-                    let cands = Self::setting_value_candidates(
-                        crate::settings::SettingKey::DefaultPersona,
-                        ctx,
-                    );
-                    let filtered: Vec<ValueCandidate> = if cur_filter.is_empty() {
-                        cands
-                    } else {
-                        crate::fuzzy::fuzzy_filter(&cands, &cur_filter, |c| {
-                            c.display.clone()
-                        })
-                        .into_iter()
-                        .map(|r| r.item.clone())
-                        .collect()
-                    };
-                    if filtered.is_empty() {
-                        opts.push("(no matching persona)".into());
-                        active = None;
-                    } else {
-                        let avail = crate::output::term_width().saturating_sub(2);
-                        let mut table = Table::new(&["Persona", "Description"])
-                            .with_aligns(&[Align::Left, Align::Left])
-                            .with_min_widths(&[20, 30])
-                            .with_priorities(&[2, 1])
-                            .set_gap(2);
-                        for c in &filtered {
-                            table.add_row(&[c.display.clone(), c.desc.clone()]);
-                        }
-                        for row in table.render_multiline(avail) {
-                            opts.push(row);
-                        }
-                        active = filtered
-                            .iter()
-                            .position(|c| {
-                                !c.value.is_empty()
-                                    && ctx.persona.as_deref() == Some(c.value.as_str())
-                            });
-                    }
-                }
-                "set" | "s" => {
-                    kind = 5;
-                    cur_word = "set".into();
-                    cur_filter = rest.to_string();
-                    let (skey, vq, is_value) = Self::parse_settings(rest);
-                    if is_value {
-                        if let Some(k) = skey {
-                            let cands = Self::filtered_value_candidates(k, ctx, &vq);
-                            value_cands = cands.clone();
-                            let setting_name = crate::settings::SETTINGS
-                                .iter()
-                                .find(|m| m.key == k)
-                                .map(|m| m.name)
-                                .unwrap_or("?");
-                            title = format!(
-                                "{}  (type to filter, up/down, Enter select, Esc back)",
-                                setting_name,
-                            );
-                            if cands.is_empty() {
-                                opts.push("(no candidates)".into());
-                                active = None;
-                            } else {
-                                let avail = crate::output::term_width().saturating_sub(2);
-                                let mut table = Table::new(&["Value", "Description"])
-                                    .with_aligns(&[Align::Left, Align::Left])
-                                    .with_min_widths(&[28, 30])
-                                    .with_priorities(&[2, 1])
-                                    .set_gap(2);
-                                for c in &cands {
-                                    table.add_row(&[c.display.clone(), c.desc.clone()]);
-                                }
-                                for row in table.render_multiline(avail) {
-                                    opts.push(row);
-                                }
-                                let cur_val = settings.value(k);
-                                active = cands.iter().position(|c| c.value == cur_val);
-                            }
-                        } else {
-                            opts.push("(no matching setting)".into());
-                            active = None;
-                        }
-                    } else {
-                        title = "Settings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
-                        let entries = settings.overlay_rows(&cur_filter);
-                        if entries.is_empty() {
-                            opts.push("(no matching setting)".into());
-                            active = None;
-                        } else {
-                            let avail = crate::output::term_width().saturating_sub(2);
-                            let mut table = Table::new(&["Setting", "Value", "Description"])
-                                .with_aligns(&[Align::Left, Align::Left, Align::Left])
-                                .with_min_widths(&[22, 18, 26])
-                                .with_priorities(&[2, 2, 1])
-                                .set_gap(2);
-                            for (meta, value) in &entries {
-                                table.add_row(&[meta.name, value.as_str(), meta.description]);
-                            }
-                            for row in table.render_multiline(avail) {
-                                opts.push(row);
-                            }
-                            active = None;
-                        }
-                    }
-                }
-                "stat" | "stats" => {
-                    kind = 7;
-                    title = "Session stats  (Esc clears input to close)".into();
-                    cur_word = "stat".into();
-                    opts = crate::agent::session_stats_lines(
-                        &ctx.provider,
-                        &ctx.model,
-                        ctx.session_usage,
-                    );
-                    active = None;
-                }
-                "sandbox" | "sb" => {
-                    kind = 8;
-                    title = "Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
-                    cur_word = "sandbox".into();
-                    cur_filter = rest.trim().to_string();
-                    Self::sandbox_overlay_entries(&cur_filter, &mut opts, &mut active);
-                }
-                _ => {
-                    kind = 1;
-                    title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
-                    cur_word = rest.to_string();
-                    let ranked = slash::filter_commands(rest);
-                    for r in &ranked {
-                        opts.push(format!("{:<10} {}", r.item.name, r.item.help));
-                    }
-                    if opts.is_empty() {
-                        opts.push("(no matching command)".into());
-                    }
-                }
-            }
-        }
-        if kind == 0 && !path_completions.is_empty() {
-            kind = 9;
-            title = "Path completions  (up/down, Tab/Enter select, Esc dismiss)".into();
-            opts = path_completions.to_vec();
-            active = None;
-            cur_word = "path".into();
-            cur_filter.clear();
-        }
-        OverlayState { kind, opts, active, title, cur_word, cur_filter, value_cands }
-    }
-
-    /// Dispatch a key event while an overlay is active (`kind != 0`).
-    /// Returns `Some(InputAction)` when the loop should return (Enter
-    /// selection, or an editing key that submits/cancels), or `None` when the
-    /// key was consumed by the overlay and the loop should continue.
-    ///
-    /// Mutable references update the caller's bridge variables (`sel`,
-    /// `value_error`, `help_view`, `path_completions`, `completion_pos`,
-    /// etc.) and the editor itself.
-    #[allow(clippy::too_many_arguments)]
-    fn handle_overlay_key<F: Fn(&LineEditor, &[&str], usize, &mut usize)>(
-        key: event::KeyEvent,
-        kind: u8,
-        opts: &[String],
-        sel: &mut usize,
-        cur_word: &str,
-        cur_filter: &str,
-        value_cands: &[ValueCandidate],
-        path_completions: &mut Vec<String>,
-        completion_pos: &mut Option<(usize, usize)>,
-        value_error: &mut Option<String>,
-        help_view: &mut bool,
-        editor: &mut LineEditor,
-        history: &mut History,
-        nav: &mut Option<usize>,
-        draft: &mut String,
-        prompt: &str,
-        ctx: &ReplCtx,
-        settings: &mut SettingsStore,
-        dirty: &mut bool,
-        output: &dyn Output,
-        input_row: &mut usize,
-        redraw: &F,
-    ) -> Option<InputAction> {
-        match key.code {
-            KeyCode::Down => {
-                if *sel + 1 < opts.len() {
-                    *sel += 1;
-                }
-            }
-            KeyCode::Up => {
-                if *sel > 0 {
-                    *sel -= 1;
-                }
-            }
-            KeyCode::PageDown => {
-                let page = {
-                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                    (h as usize).saturating_sub(2).max(1)
-                };
-                *sel = (*sel + page).min(opts.len().saturating_sub(1));
-            }
-            KeyCode::PageUp => {
-                let page = {
-                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                    (h as usize).saturating_sub(2).max(1)
-                };
-                *sel = sel.saturating_sub(page);
-            }
-            KeyCode::Tab => {
-                let buf = editor.text();
-                match kind {
-                    1 => {
-                        let ranked = slash::filter_commands(cur_word);
-                        if let Some(c) = ranked.get(*sel) {
-                            editor.set(&Self::complete_command(&c.item));
-                        }
-                    }
-                    2 => {
-                        let (entries, _) = Self::model_overlay_entries(ctx, cur_filter);
-                        if let Some(e) = entries.get(*sel) {
-                            editor.set(&Self::replace_last_token(&buf, &e.display));
-                        }
-                    }
-                    3 => {
-                        let levels = Self::thinking_overlay_entries(cur_filter);
-                        if let Some(l) = levels.get(*sel) {
-                            editor.set(&Self::replace_last_token(&buf, l.as_str()));
-                        }
-                    }
-                    5 => {
-                        let (skey, _vq, is_value) = Self::parse_settings(cur_filter);
-                        if is_value {
-                            if let Some(k) = skey {
-                                if let Some(c) = value_cands.get(*sel) {
-                                    let setting_name = crate::settings::SETTINGS
-                                        .iter()
-                                        .find(|m| m.key == k)
-                                        .map(|m| m.name)
-                                        .unwrap_or("?");
-                                    let trimmed = buf.trim_end();
-                                    if trimmed.ends_with(setting_name) {
-                                        editor.set(&format!("/set {} {}", setting_name, c.value));
-                                    } else {
-                                        editor.set(&Self::replace_last_token(&buf, &c.value));
-                                    }
-                                }
-                            }
-                        } else {
-                            let entries = settings.overlay_rows(cur_filter);
-                            if let Some((meta, _)) = entries.get(*sel) {
-                                editor.set(&format!("/set {} ", meta.name));
-                            }
-                        }
-                    }
-                    6 => {
-                        let cands = Self::setting_value_candidates(
-                            crate::settings::SettingKey::DefaultPersona,
-                            ctx,
-                        );
-                        let filtered: Vec<ValueCandidate> = if cur_filter.is_empty() {
-                            cands
-                        } else {
-                            crate::fuzzy::fuzzy_filter(&cands, cur_filter, |c| {
-                                c.display.clone()
-                            })
-                            .into_iter()
-                            .map(|r| r.item.clone())
-                            .collect()
-                        };
-                        if let Some(c) = filtered.get(*sel) {
-                            let tok = if c.value.is_empty() {
-                                c.display.clone()
-                            } else {
-                                c.value.clone()
-                            };
-                            editor.set(&Self::replace_last_token(&buf, &tok));
-                        }
-                    }
-                    8 => {
-                        let buf = editor.text();
-                        let after = &buf["/sandbox".len()..].trim();
-                        if let Some((sub, rest)) = after.split_once(' ') {
-                            let rest = rest.trim();
-                            match sub {
-                                "add_ro" | "add_rw" => {
-                                    if !rest.is_empty() {
-                                        let last_token = rest.split_whitespace().last().unwrap_or("");
-                                        let completions = Self::complete_path_prefix(last_token);
-                                        if let Some(c) = completions.get(*sel) {
-                                            editor.set(&Self::replace_last_token(&buf, c));
-                                        }
-                                    }
-                                }
-                                "remove" => {
-                                    if !rest.is_empty() {
-                                        let binds = crate::sandbox_bindings::list();
-                                        let last_token = rest.split_whitespace().last().unwrap_or("");
-                                        let filtered: Vec<_> = crate::fuzzy::fuzzy_filter(
-                                            &binds, last_token,
-                                            |b| b.sandbox_path.to_string_lossy().to_string(),
-                                        );
-                                        if let Some(r) = filtered.get(*sel) {
-                                            let path = r.item.sandbox_path.to_string_lossy().to_string();
-                                            editor.set(&Self::replace_last_token(&buf, &path));
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            let subcommands = ["add_ro", "add_rw", "remove"];
-                            if let Some(c) = subcommands.get(*sel) {
-                                editor.set(&format!("/sandbox {} ", c));
-                            }
-                        }
-                    }
-                    9 => {
-                        if let Some(c) = path_completions.get(*sel) {
-                            let buf = editor.text();
-                            if let Some((start, end)) = *completion_pos {
-                                editor.replace_range(start, end, c);
-                            } else {
-                                editor.set(&Self::replace_last_token(&buf, c));
-                            }
-                            path_completions.clear();
-                            *completion_pos = None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Enter => {
-                if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                    match kind {
-                        1 => {
-                            let ranked = slash::filter_commands(cur_word);
-                            if let Some(cmd) = ranked.get(*sel) {
-                                match cmd.item.kind {
-                                    slash::SlashKind::Help => {
-                                        *help_view = true;
-                                        editor.set("");
-                                    }
-                                    slash::SlashKind::Quit => {
-                                        redraw(&LineEditor::new(), &[], *sel, input_row);
-                                        output.display_plain("");
-                                        return Some(InputAction::Quit);
-                                    }
-                                    slash::SlashKind::Model => {
-                                        editor.set("/model ");
-                                    }
-                                    slash::SlashKind::Thinking => {
-                                        editor.set("/thinking ");
-                                    }
-                                    slash::SlashKind::Settings => {
-                                        editor.set("/set ");
-                                    }
-                                    slash::SlashKind::Persona => {
-                                        editor.set("/persona ");
-                                    }
-                                    slash::SlashKind::Stat => {
-                                        editor.set("/stat ");
-                                    }
-                                    slash::SlashKind::Sandbox => {
-                                        editor.set("/sandbox ");
-                                    }
-                                }
-                            }
-                        }
-                        2 => {
-                            let (entries, _) = Self::model_overlay_entries(ctx, cur_filter);
-                            if let Some(e) = entries.get(*sel) {
-                                let (provider, model) = e.qualified_parts();
-                                let line = format!("/model {}", e.qualified());
-                                Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "", false);
-                                return Some(InputAction::SetModel(provider, model));
-                            }
-                        }
-                        3 => {
-                            let levels = Self::thinking_overlay_entries(cur_filter);
-                            if let Some(l) = levels.get(*sel) {
-                                let line = format!("/thinking {}", l.as_str());
-                                Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "", false);
-                                return Some(InputAction::SetThinking(l.as_str().to_string()));
-                            }
-                        }
-                        6 => {
-                            let cands = Self::setting_value_candidates(
-                                crate::settings::SettingKey::DefaultPersona,
-                                ctx,
-                            );
-                            let filtered = if cur_filter.is_empty() {
-                                cands
-                            } else {
-                                crate::fuzzy::fuzzy_filter(&cands, cur_filter, |c| {
-                                    c.display.clone()
-                                })
-                                .into_iter()
-                                .map(|r| r.item.clone())
-                                .collect()
-                            };
-                            if let Some(c) = filtered.get(*sel) {
-                                let name = if c.value.is_empty() {
-                                    c.display.clone()
-                                } else {
-                                    c.value.clone()
-                                };
-                                let line = format!("/persona {}", name);
-                                Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "", false);
-                                return Some(InputAction::SetPersona(name));
-                            }
-                        }
-                        5 => {
-                            let (skey, vq, is_value) = Self::parse_settings(cur_filter);
-                            if is_value {
-                                if let Some(k) = skey {
-                                    let vq_eff = if vq.trim().is_empty() {
-                                        value_cands.get(*sel).map(|c| c.value.clone()).unwrap_or_default()
-                                    } else {
-                                        vq.clone()
-                                    };
-                                    match settings.set_value(k, &vq_eff) {
-                                        Ok(()) => {
-                                            *value_error = None;
-                                            *dirty = true;
-                                            if vq.trim().is_empty() {
-                                                if let Some(name) =
-                                                    crate::settings::SETTINGS.iter().find(|m| m.key == k).map(|m| m.name)
-                                                {
-                                                    editor.set(&format!("/set {} {}", name, vq_eff));
-                                                }
-                                            }
-                                            let line = editor.text();
-                                            Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "/set", true);
-                                        }
-                                        Err(msg) => {
-                                            *value_error = Some(msg);
-                                        }
-                                    }
-                                }
-                            } else {
-                                let entries = settings.overlay_rows(cur_filter);
-                                if let Some((meta, _)) = entries.get(*sel) {
-                                    editor.set(&format!("/set {} ", meta.name));
-                                }
-                            }
-                        }
-                        8 => {
-                            let buf = editor.text();
-                            let after = &buf["/sandbox".len()..].trim();
-                            if let Some((sub, path)) = after.split_once(' ') {
-                                let path = path.trim();
-                                match sub {
-                                    "add_ro" | "add_rw" => {
-                                        if !path.is_empty() {
-                                            let parts: Vec<&str> = path.split_whitespace().collect();
-                                            let host = parts[0];
-                                            let sandbox = parts.get(1).unwrap_or(&"");
-                                            let line = if sandbox.is_empty() {
-                                                format!("/sandbox {} {}", sub, host)
-                                            } else {
-                                                format!("/sandbox {} {} {}", sub, host, sandbox)
-                                            };
-                                            Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "", false);
-                                            return Some(InputAction::Sandbox(sub.to_string(), host.to_string(), sandbox.to_string()));
-                                        }
-                                    }
-                                    "remove" => {
-                                        if !path.is_empty() {
-                                            let sandbox = path.split_whitespace().next().unwrap_or("");
-                                            let line = format!("/sandbox remove {}", sandbox);
-                                            Self::emit_commit(output, editor, redraw, *sel, input_row, &line, "", false);
-                                            return Some(InputAction::Sandbox("remove".to_string(), sandbox.to_string(), String::new()));
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            let subcommands = ["add_ro", "add_rw", "remove"];
-                            if let Some(c) = subcommands.get(*sel) {
-                                editor.set(&format!("/sandbox {} ", c));
-                            }
-                        }
-                        9 => {
-                            if let Some(c) = path_completions.get(*sel) {
-                                let buf = editor.text();
-                                if let Some((start, end)) = *completion_pos {
-                                    editor.replace_range(start, end, c);
-                                } else {
-                                    editor.set(&Self::replace_last_token(&buf, c));
-                                }
-                                path_completions.clear();
-                                *completion_pos = None;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            KeyCode::Esc => match kind {
-                1 | 2 | 3 | 6 | 7 | 8 => {
-                    editor.set("");
-                }
-                5 => {
-                    let buf = editor.text();
-                    if let Some(idx) = buf.rfind(' ') {
-                        editor.set(&buf[..idx]);
-                    } else {
-                        editor.set("");
-                    }
-                }
-                9 => {
-                    path_completions.clear();
-                    *completion_pos = None;
-                }
-                _ => {}
-            },
-            _ => {
-                if kind == 9 {
-                    path_completions.clear();
-                    *completion_pos = None;
-                }
-                if let Some(a) = Self::edit_key(key, editor, history, nav, draft, prompt) {
-                    if let InputAction::Submit(_) = &a {
-                        redraw(&LineEditor::new(), &[], *sel, input_row);
-                    }
-                    return Some(a);
-                }
-            }
-        }
-        None
     }
 
     /// Read a multi-line input in raw mode, with inline slash-command overlays.
@@ -961,23 +977,12 @@ impl Repl {
         let mut editor = LineEditor::new();
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
-        let mut sel: usize = 0; // selection within the active overlay
-        let mut last_kind: u8 = 0; // 0=None,1=Cmd,2=Model,3=Thinking,4=Help
+        let mut sel: usize = 0;
         let mut help_view = false;
-        // Command word / filter text captured when building the overlay, so the
-        // Enter handler can re-resolve the highlighted item without re-parsing.
-        // No initial value: assigned by compute_overlay at top of each iteration.
-        let mut cur_word;
-        let mut cur_filter;
         let mut value_error: Option<String> = None;
-        // Cached value candidates for the /set overlay, reused by the Enter
-        // handler so it indexes into the same list the user navigated.
-        let mut value_cands: Vec<ValueCandidate> = Vec::new();
-        // Path completions for Tab in the regular prompt (kind 9 overlay).
         let mut path_completions: Vec<String> = Vec::new();
-        // Cursor position (char indices) of the token being completed so that
-        // selection handlers replace the right token (not always the last one).
         let mut completion_pos: Option<(usize, usize)> = None;
+        let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -1105,33 +1110,33 @@ impl Repl {
                 input_row = output.cursor_row();
             }
             // --- Compute the overlay from the current buffer. ---
-            let buffer = editor.text();
-            let state = Self::compute_overlay(
-                &buffer, ctx, settings, help_view, &path_completions, &value_cands,
+            let overlay = ActiveOverlay::from_buffer(
+                &editor.text(), ctx, settings, help_view, &path_completions,
             );
-            let kind = state.kind;
-            let opts = state.opts;
-            let active = state.active;
-            let title = state.title;
-            cur_word = state.cur_word;
-            cur_filter = state.cur_filter;
-            value_cands = state.value_cands;
-            if kind != last_kind {
+            // Reset sel when the overlay kind changes (discriminant comparison).
+            let cur_disc = overlay.overlay_disc();
+            if cur_disc != last_disc {
                 sel = 0;
-                last_kind = kind;
+                last_disc = cur_disc;
             }
+            let (title, raw_opts, active, wrap) = overlay.display_rows();
+            let title = title.to_string();
+            let opts = raw_opts;
             let max_sel = opts.len().saturating_sub(1);
             if sel > max_sel {
                 sel = max_sel;
             }
-            let mut overlay_text = match kind {
-                0 => String::new(),
-                4 => Self::render_help_overlay(),
-                7 => Self::overlay_lines(&title, &opts, usize::MAX, None, true),
-                _ => Self::overlay_lines(&title, &opts, sel, active, kind == 1),
+            // Build the dynamic title for overlays that need it.
+            let dyn_title = overlay.title();
+            let effective_title = if dyn_title.is_empty() { title.as_str() } else { &dyn_title };
+            let mut overlay_text = match &overlay {
+                ActiveOverlay::None => String::new(),
+                ActiveOverlay::Help => Self::render_help_overlay(),
+                ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, usize::MAX, None, true),
+                _ => Self::overlay_lines(effective_title, &opts, sel, active, wrap),
             };
-            // Value-mode settings error: red header line above the regular overlay.
-            if kind == 5 && value_error.is_some() {
+            // Value-mode settings error: red header line.
+            if matches!(overlay, ActiveOverlay::SettingsVal { .. }) && value_error.is_some() {
                 let err = format!(
                     "\x1b[48;5;235m\x1b[31merror: {}\x1b[0m",
                     value_error.as_ref().unwrap()
@@ -1139,22 +1144,16 @@ impl Repl {
                 overlay_text = format!("{}\n{}", err, overlay_text);
             }
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
-            // `sel` indexes logical options; a wrapped option spans several
-            // visual lines, so center the window on the selected option's
-            // first visual line (the title accounts for the +1 offset).
             let focus = {
                 let sc = sel.min(opts.len());
-                let base = if kind == 5 && value_error.is_some() {
-                    2 // red header line + title
+                let base = if matches!(overlay, ActiveOverlay::SettingsVal { .. }) && value_error.is_some() {
+                    2
                 } else {
-                    1 // title
+                    1
                 };
                 base + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
             };
             redraw(&editor, &overlay_vec, focus, &mut input_row);
-            // The redraw used `prev_term_h` (the height *before* this resize) as
-            // its clear boundary; advance it now so the next resize is detected
-            // relative to the current size.
             prev_term_h.set(cur_h);
 
             // --- Read and dispatch one key. ---
@@ -1191,7 +1190,9 @@ impl Repl {
                     }
                     // Ctrl-E: external editor (only when no overlay is active).
                     if let KeyCode::Char('e') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && kind == 0 {
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(overlay, ActiveOverlay::None)
+                        {
                             let _ = self.guard.stop();
                             match edit_in_editor(&editor.text()) {
                                 Ok(new_text) => {
@@ -1211,7 +1212,7 @@ impl Repl {
                             continue;
                         }
                     }
-                    if kind == 4 {
+                    if matches!(overlay, ActiveOverlay::Help) {
                         // Any key dismisses /help and is passed through.
                         if let KeyCode::Char(c) = key.code {
                             if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1223,17 +1224,64 @@ impl Repl {
                         help_view = false;
                         continue;
                     }
-                    if kind != 0 {
-                        // Delegate to the overlay key handler (extracted per Option D).
-                        if let Some(action) = Self::handle_overlay_key(
-                            key, kind, &opts, &mut sel,
-                            &cur_word, &cur_filter, &value_cands,
-                            &mut path_completions, &mut completion_pos,
-                            &mut value_error, &mut help_view,
-                            &mut editor, history, &mut nav, &mut draft, prompt,
-                            ctx, settings, dirty, output, &mut input_row, &redraw,
-                        ) {
-                            return Some(action);
+                    // Active overlay key dispatch via enum methods.
+                    if !matches!(overlay, ActiveOverlay::None) {
+                        match key.code {
+                            KeyCode::Down => {
+                                if sel + 1 < opts.len() { sel += 1; }
+                            }
+                            KeyCode::Up => {
+                                if sel > 0 { sel -= 1; }
+                            }
+                            KeyCode::PageDown => {
+                                let page = {
+                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    (h as usize).saturating_sub(2).max(1)
+                                };
+                                sel = (sel + page).min(opts.len().saturating_sub(1));
+                            }
+                            KeyCode::PageUp => {
+                                let page = {
+                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    (h as usize).saturating_sub(2).max(1)
+                                };
+                                sel = sel.saturating_sub(page);
+                            }
+                            KeyCode::Tab => {
+                                overlay.handle_tab(sel, &mut editor,
+                                    &mut path_completions, &mut completion_pos);
+                            }
+                            KeyCode::Enter => {
+                                if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    match overlay.handle_enter(
+                                        sel, &mut editor, output, &redraw, &mut input_row,
+                                        settings, dirty, &mut value_error, &mut help_view,
+                                    ) {
+                                        OverlayAction::Continue => {}
+                                        OverlayAction::Action(action) => return Some(action),
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                overlay.handle_esc(&mut editor,
+                                    &mut path_completions, &mut completion_pos);
+                            }
+                            _ => {
+                                // Editing key while path-completion overlay is active
+                                // dismisses it (user is typing something else).
+                                if matches!(overlay, ActiveOverlay::PathComplete { .. }) {
+                                    path_completions.clear();
+                                    completion_pos = None;
+                                }
+                                if let Some(a) = Self::edit_key(
+                                    key, &mut editor, history, &mut nav, &mut draft, prompt)
+                                {
+                                    if let InputAction::Submit(_) = &a {
+                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                    }
+                                    return Some(a);
+                                }
+                            }
                         }
                         continue;
                     }
