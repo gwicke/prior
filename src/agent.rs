@@ -276,9 +276,11 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
     ///   from assistant messages before they enter the stored context (a cheap,
     ///   deterministic "Level 0" compaction that saves tokens). Ignored for
     ///   Anthropic-family providers (`provider`/`model` satisfy
-    ///   [`is_anthropic_family`]), which require reasoning to be replayed verbatim
-    ///   on the next turn (thinking+tool_use contract), so reasoning is always
-    ///   kept there.
+    ///   [`is_anthropic_family`]) **on turns that contain tool calls**, which
+    ///   require the leading reasoning to be replayed verbatim on the next turn
+    ///   (thinking+tool_use contract); reasoning is force-kept there. On
+    ///   Anthropic turns *without* tool calls, and on all other providers when
+    ///   the flag is `false`, reasoning is stripped normally.
     fn persist_turn(
         history: &mut Option<&mut Vec<Message>>,
         final_history: Option<Vec<Message>>,
@@ -300,7 +302,8 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
 
     /// Strip `AssistantContent::Reasoning` blocks when reasoning should *not* be
     /// kept in context. Returns the messages unchanged when `reasoning_in_context`
-    /// is `true` or the provider is Anthropic-family. Assistant messages left
+    /// is `true` or the provider is Anthropic-family **and the turn contains tool
+    /// calls** (the thinking+tool_use replay contract). Assistant messages left
     /// empty by the filter get a placeholder `Text` so the message stays
     /// well-formed and user/assistant alternation holds.
     fn maybe_strip_reasoning(
@@ -309,7 +312,9 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         provider: &str,
         model: &str,
     ) -> Vec<Message> {
-        if reasoning_in_context || is_anthropic_family(provider, model) {
+        if reasoning_in_context
+            || (is_anthropic_family(provider, model) && turn_has_tool_calls(&messages))
+        {
             return messages;
         }
         messages
@@ -331,6 +336,19 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
                 other => other,
             })
             .collect()
+    }
+
+    /// Whether the turn's persisted messages include at least one assistant
+    /// `ToolCall` block. Used to decide whether Anthropic-family reasoning must
+    /// be force-kept: the thinking+tool_use replay contract only applies on
+    /// turns that actually involve tool calls.
+    fn turn_has_tool_calls(messages: &[Message]) -> bool {
+        messages.iter().any(|m| match m {
+            Message::Assistant { content, .. } => content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+            _ => false,
+        })
     }
 
     /// Whether `provider`/`model` refers to an Anthropic-family model, for which
@@ -1354,7 +1372,9 @@ use rig_core::OneOrMany;
 
     // `reasoning_in_context=false` must drop reasoning blocks from assistant
     // messages for non-Anthropic providers, while keeping text (and keeping
-    // reasoning entirely for Anthropic-family or when the flag is true).
+    // reasoning entirely for Anthropic-family turns that involve tool calls, or
+    // when the flag is true). On an Anthropic turn *without* tool calls, the
+    // flag is honored and reasoning is stripped.
     #[test]
     fn strips_reasoning_for_non_anthropic_when_disabled() {
         let assistant = Message::Assistant {
@@ -1384,7 +1404,37 @@ use rig_core::OneOrMany;
             panic!("expected assistant message");
         }
 
-        // Anthropic-family: reasoning forced to be kept despite disabled.
+        // Anthropic-family WITHOUT tool calls: flag honored, reasoning stripped.
+        let stripped = maybe_strip_reasoning(msgs.clone(), false, "anthropic", "claude-3-5-sonnet");
+        if let Message::Assistant { content, .. } = &stripped[1] {
+            assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
+        } else {
+            panic!("expected assistant message");
+        }
+    }
+
+    // Anthropic-family turn WITH a tool call: the leading reasoning must be
+    // force-kept (thinking+tool_use replay contract), even with the flag off.
+    #[test]
+    fn anthropic_tool_call_turn_forces_reasoning_kept() {
+        let assistant = Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::Reasoning(Reasoning::new("hidden thought")),
+                AssistantContent::Text(Text::new("answer")),
+                AssistantContent::ToolCall(rig_core::message::ToolCall::new(
+                    "tool-1".into(),
+                    rig_core::message::ToolFunction::new(
+                        "Bash".to_string(),
+                        serde_json::json!({"cmd": "ls"}),
+                    ),
+                )),
+            ])
+            .unwrap(),
+        };
+        let msgs = vec![Message::user("q"), assistant];
+
         let forced = maybe_strip_reasoning(msgs, false, "anthropic", "claude-3-5-sonnet");
         if let Message::Assistant { content, .. } = &forced[1] {
             assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
