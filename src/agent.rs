@@ -919,6 +919,15 @@ fn guard<T: Tool>(
 /// provider's completion-model type).
 pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
     let mut config = config;
+    // Publish the resolved sandbox config immediately so that user-initiated
+    // `!`/`!!` shell commands use the same bwrap/timeout policy as the agent's
+    // `bash` tool — even before the agent is lazily created on the first
+    // normal prompt. `set_sandbox` is otherwise only called inside
+    // `build_rig_agent`, so without this the first `!`/`!!` (issued before any
+    // LLM turn) would run UNSANDBOXED. The sandbox config is constant for the
+    // session (`apply_to_config` never touches it), so publishing once here is
+    // sufficient.
+    set_sandbox(config.sandbox.clone());
     // Pending `/settings` changes that need an agent rebuild before the next
     // prompt. `read_input` only flips this flag; the rebuild stays here so it
     // can call the async `create_agent`.
@@ -1511,5 +1520,165 @@ use rig_core::OneOrMany;
         assert!(is_anthropic_family("openrouter", "anthropic/claude-3.5-sonnet"));
         assert!(!is_anthropic_family("openrouter", "openai/gpt-4o"));
         assert!(!is_anthropic_family("openai", "gpt-4o"));
+    }
+
+    // Regression test for the `!`/`!!` sandbox bug: user-initiated shell
+    // commands must run inside the same bwrap sandbox as the agent's `bash`
+    // tool, *even when the agent has not been created yet*. The sandbox config
+    // is published by `set_sandbox`, which used to be called only inside
+    // `build_rig_agent` — i.e. lazily on the first normal prompt. So a `!cmd`
+    // issued as the very first input (before any LLM turn) ran UNSANDBOXED.
+    //
+    // This test drives `run_interactive` with a scripted in-memory `Output`
+    // that feeds `!<cmd>` then `/q`, with the sandbox remapping a host file to
+    // a path that does not exist on the host. If the command runs sandboxed,
+    // the remap is visible and `cat` prints the file's content; if it runs
+    // unsandboxed, the path is absent and `cat` errors with "No such file".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bang_command_uses_sandbox_before_agent_created() {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use crate::config::{BindPath, SandboxConfig};
+        use crate::Output;
+        use crate::output::Confirmation;
+        use crate::settings::SettingsStore;
+        use crate::AgentConfig;
+        use std::sync::atomic::AtomicBool;
+
+        // bwrap is required for the sandbox to engage at all.
+        if std::process::Command::new("bwrap")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        // Reset the process-wide sandbox slot so the test is deterministic. The
+        // bug was precisely that `!`/`!!` ran with this still at `None`
+        // (unsandboxed) until the agent lazily created itself. With the fix,
+        // `run_interactive` republishes the resolved config before reading any
+        // input, overwriting this.
+        crate::tools::set_sandbox(None);
+
+        // Host file we remap into the sandbox at a path absent on the host.
+        let sentinel = "SANDBOX_REGRESSION_MARKER_12345";
+        let host_path = std::env::temp_dir().join(format!(
+            "picocode_sandbox_regr_{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&host_path, sentinel).unwrap();
+        let probe = "/sandbox_probe_xyz".to_string();
+
+        let sandbox = SandboxConfig {
+            enabled: Some(true),
+            timeout_secs: Some(30),
+            network: Some(false),
+            memory_mb: None,
+            pid_isolation: Some(true),
+            drop_caps: Some(true),
+            tmp_size_mb: Some(16),
+            ro: vec![],
+            rw: vec![BindPath::Remap {
+                from: host_path.display().to_string(),
+                to: probe.clone(),
+            }],
+            env: None,
+        };
+
+        // In-memory `Output`: replays a fixed script and records what is shown.
+        struct ScriptOutput {
+            inputs: Arc<Mutex<VecDeque<String>>>,
+            shown: Arc<Mutex<String>>,
+        }
+        impl Output for ScriptOutput {
+            fn display_text(&self, t: &str) {
+                self.shown.lock().unwrap().push_str(t);
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn display_plain(&self, t: &str) {
+                self.shown.lock().unwrap().push_str(t);
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn display_separator(&self) {
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn get_user_input(&self) -> String {
+                self.inputs
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| "/q".to_string())
+            }
+            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
+            fn display_tool_result(&self, _: &str) {}
+            fn display_error(&self, _: &str) {}
+            fn display_system(&self, _: &str) {}
+            fn confirm(&self, _: &str) -> Confirmation {
+                Confirmation::No
+            }
+            fn display_thinking(&self, _: &str) {}
+            fn stop_thinking(&self) {}
+            fn display_header(
+                &self,
+                _: &str,
+                _: &str,
+                _: bool,
+                _: usize,
+                _: Option<&str>,
+            ) {
+            }
+        }
+
+        let inputs = Arc::new(Mutex::new(VecDeque::from([
+            format!("!cat {}", probe),
+            "/q".to_string(),
+        ])));
+        let shown = Arc::new(Mutex::new(String::new()));
+        let out = ScriptOutput {
+            inputs,
+            shown: shown.clone(),
+        };
+
+        let config = AgentConfig {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            output: Arc::new(out),
+            yolo: true,
+            quiet: true,
+            thinking_level: None,
+            tool_call_limit: 10,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: Arc::new(AtomicBool::new(false)),
+            sandbox: Some(sandbox),
+            show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
+            reasoning_in_context: false,
+        };
+        let mut settings = SettingsStore::from_agent_config(&config, None);
+
+        // No normal prompt is ever submitted, so the agent is never created and
+        // `create_agent` (and its `set_sandbox`) is never called — exactly the
+        // pre-fix condition where `!` would otherwise run unsandboxed.
+        super::run_interactive(config, &mut settings)
+            .await
+            .unwrap();
+
+        let shown = shown.lock().unwrap().clone();
+        let _ = std::fs::remove_file(&host_path);
+
+        assert!(
+            !shown.contains("No such file"),
+            "bang command ran UNSANDBOXED (probe path {probe} absent); output:\n{shown}"
+        );
+        assert!(
+            shown.contains(sentinel),
+            "expected sandboxed `!` command to print the remapped host file content; output:\n{shown}"
+        );
     }
 }
