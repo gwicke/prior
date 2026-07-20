@@ -61,3 +61,4 @@ pub enum PicocodeError {
 }
 
 pub type Result<T> = std::result::Result<T, PicocodeError>;
+#[cfg(test)] mod test_hang_reader;

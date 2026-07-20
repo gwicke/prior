@@ -45,3 +45,16 @@ New entries
 - /info
     - version
     - configured providers
+- sandbox
+    - add_ro
+    - add_rw
+    - remove
+
+
+
+cancellation for tool commands
+preservation of context across models / on error
+caching improvements esp. for deepseek, openrouter
+session storage
+  resume / tree
+  /name
