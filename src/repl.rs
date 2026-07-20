@@ -842,7 +842,7 @@ impl Repl {
                                         }
                                     }
                                     5 => {
-                                        let (skey, vq, is_value) = Self::parse_settings(&cur_filter);
+                                        let (skey, _vq, is_value) = Self::parse_settings(&cur_filter);
                                         if is_value {
                                             if let Some(k) = skey {
                                                 // Use the cached candidates so we index the same

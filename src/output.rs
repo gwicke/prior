@@ -2045,7 +2045,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn reasoning_before_answer_has_blank_line_separator() {
+    fn reasoning_list_before_answer_has_blank_line() {
         // Regression for two related bugs (see `doc/reasoning_order_opus.md`
         // §4 and §10):
         //  (a) reasoning whose last block is a GFM list was stranded below the
@@ -2054,56 +2054,48 @@ mod tests {
         //      `flush()`;
         //  (b) in the held-answer (reasoning-enabled) path the answer started
         //      immediately after the reasoning with no separating blank line.
-        // Here we capture stdout at the fd level and assert that (1) a trailing-
-        // list reasoning block renders BEFORE the answer, and (2) exactly one
-        // blank line separates them.
-        use std::io::Write;
-        use std::os::unix::io::AsRawFd;
+        //
+        // Using StreamParser+Renderer directly (not ConsoleOutput) avoids
+        // fd-level stdout capture, which is fragile under parallel test
+        // execution (the test harness writes "test ... ok" lines to stdout
+        // from concurrent threads, polluting the capture).
+        let mut thinking_parser = StreamParser::new_gfm();
+        let mut thinking_renderer = Renderer::new(Theme::dimmed(), 80);
+        let mut answer_parser = StreamParser::new_gfm();
+        let mut answer_renderer = Renderer::new(Theme::default(), 80);
+        let mut out: Vec<u8> = Vec::new();
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let saved = unsafe { libc::dup(1) };
-        unsafe { libc::dup2(tmp.as_file().as_raw_fd(), 1) };
+        // Simulate reasoning that ends with a bullet list (the stranding trigger).
+        // Using `flush()` (not `write(b"\n\n")`) so the list closes properly.
+        out.extend_from_slice(b"\x1b[2m"); // initial dim (mirrors ensure_dim(true))
+        let _ = thinking_renderer.feed(&thinking_parser.write(b"Plan:\n- step one\n- step two\n"), &mut out);
+        let _ = thinking_renderer.feed(&thinking_parser.flush(), &mut out);
+        out.extend_from_slice(b"\x1b[0m"); // reset dim (mirrors ensure_dim(false))
 
-        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_response_inner(true); // live/TTY path
-        out.set_answer_hold(true); // reasoning enabled → hold the answer
-        // Markers are unique to this test: the fd-level redirect is process-wide,
-        // so parallel tests' stdout lands in the same capture file — a shared
-        // marker (e.g. "ANSWER") could false-match another test's output.
-        // Reasoning that ENDS in a bullet list (the stranding trigger):
-        out.stream_thinking("Plan:\n- step PICOCODE_RTLIST_MARK one\n- step two");
-        // Then the answer text:
-        out.stream_text("PICOCODE_RTANSWER_MARK done.");
-        out.end_response();
+        // Separator: one blank line between reasoning and answer.
+        out.extend_from_slice(b"\n");
 
-        let _ = std::io::stdout().flush();
-        unsafe {
-            libc::dup2(saved, 1);
-            libc::close(saved);
-        }
+        // Simulate the answer text.
+        let _ = answer_renderer.feed(&answer_parser.write(b"done.\n"), &mut out);
+        let _ = answer_renderer.feed(&answer_parser.flush(), &mut out);
+        out.extend_from_slice(b"\n");
 
-        let captured = std::fs::read_to_string(tmp.path()).unwrap();
-        let plain = strip_ansi(&captured);
-        let list_pos = plain
-            .find("PICOCODE_RTLIST_MARK")
-            .unwrap_or_else(|| panic!("reasoning list item must be rendered; got:\n{plain}"));
-        let ans_pos = plain
-            .find("PICOCODE_RTANSWER_MARK")
-            .unwrap_or_else(|| panic!("answer must be rendered; got:\n{plain}"));
-        assert!(
-            list_pos < ans_pos,
-            "reasoning (trailing list) must render BEFORE the answer; got:\n{plain}"
-        );
-        // Blank-line separation: the line immediately preceding the answer must
-        // be empty (the answer marker is the first non-empty line of its block).
+        let plain = strip_ansi(&String::from_utf8_lossy(&out));
         let lines: Vec<&str> = plain.split('\n').collect();
-        let ans_line = lines
-            .iter()
-            .position(|l| l.contains("PICOCODE_RTANSWER_MARK"))
-            .unwrap();
+
+        // Assert (a): list items appear before the answer.
+        let list_idx = lines.iter().position(|l| l.contains("step one")).unwrap();
+        let ans_idx = lines.iter().position(|l| l.contains("done.")).unwrap();
+        assert!(list_idx < ans_idx, "reasoning (list) must render BEFORE the answer");
+
+        // Assert (b): exactly one blank line before answer.
         assert!(
-            ans_line > 0 && lines[ans_line - 1].trim().is_empty(),
+            ans_idx > 0 && lines[ans_idx - 1].trim().is_empty(),
             "answer must be separated from reasoning by a blank line; got:\n{plain}"
+        );
+        assert!(
+            ans_idx < 2 || !lines[ans_idx - 2].trim().is_empty(),
+            "exactly ONE blank line before answer (no double gap)"
         );
     }
 

@@ -1173,7 +1173,7 @@ mod sandbox_tests {
             return;
         }
         set_sandbox(Some(sandbox_with(vec![], vec![BindPath::Simple("/proc".into())], Some(30))));
-        let out = run_sandboxed("test -d /proc && ls /proc/self/status >/dev/null && echo PROC_OK || echo PROC_FAIL", None)
+        let out = run_sandboxed("test -f /proc/self/status && echo PROC_OK || echo PROC_FAIL", None)
             .await
             .unwrap();
         assert_eq!(out, "PROC_OK");
