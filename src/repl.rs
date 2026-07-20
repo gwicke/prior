@@ -1777,8 +1777,11 @@ pub struct Layout {
 /// visual row, the `(start, end_exclusive)` char range **within `line`**, and if
 /// `cursor` is `Some`, the `(row, col)` where that char lands (`col` is the
 /// column within the row's *content*, not counting any prompt prefix).
-/// Long words and CJK (no spaces) are char-wrapped; spaces are break
-/// opportunities and dropped at row starts.
+/// Long words and CJK (no spaces) are char-wrapped; inter-word spaces are
+/// break opportunities. Leading whitespace (indentation) at the start of a
+/// line is preserved and counted toward the column/wrap width, so the cursor
+/// offset matches the on-screen text. Only the *trailing* break space at a
+/// wrap point is dropped (not carried to the next row's start).
 fn wrap_line(
     line: &[char],
     first_width: usize,
@@ -1800,6 +1803,10 @@ fn wrap_line(
                 cursor_pos = Some((row, col));
             }
             if col == 0 {
+                // Leading whitespace (indentation). Keep it in the rendered row
+                // (cur_start is unchanged) but count it toward the column so the
+                // cursor offset and wrap width match what's actually on screen.
+                col += 1;
                 i += 1;
                 continue;
             }
@@ -2346,6 +2353,38 @@ mod tests {
         assert_eq!(layout.rows, vec!["hi"]);
         // cursor at end; col includes the 2-char prompt prefix
         assert_eq!((layout.cursor_row, layout.cursor_col), (0, 4));
+    }
+
+    #[test]
+    fn layout_preserves_indent_and_cursor_offset() {
+        // Leading spaces (indentation) must be counted toward the cursor column
+        // and not silently dropped — otherwise the caret lands inside the indent.
+        let e = LineEditor::from_text("  ab"); // 2-space indent
+        // cursor at end of buffer (after "ab")
+        let layout = e.layout(80, "");
+        assert_eq!(layout.rows, vec!["  ab"]);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (0, 4));
+
+        // cursor in the middle of the indentation (position 1, after 1 space)
+        let mut e2 = LineEditor::from_text("  ab");
+        e2.home();
+        e2.right();
+        let layout2 = e2.layout(80, "");
+        assert_eq!((layout2.cursor_row, layout2.cursor_col), (0, 1));
+    }
+
+    #[test]
+    fn layout_indented_long_line_wraps_within_width() {
+        // width 6: an indented long line must wrap so no visual row overflows
+        // the terminal (previously leading spaces were free, causing overflow
+        // and a desynced cursor).
+        let e = LineEditor::from_text("  a b c");
+        let layout = e.layout(6, "");
+        for r in &layout.rows {
+            assert!(r.chars().count() <= 6, "row overflowed width: {:?}", r);
+        }
+        // Sanity: a non-indented line of the same shape still wraps identically.
+        assert!(layout.row_count >= 2);
     }
 
     #[test]
