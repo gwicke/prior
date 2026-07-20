@@ -24,6 +24,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -333,19 +334,41 @@ impl Repl {
         // (the terminal never scrolls back down on its own).
         let mut input_row = initial_row.max(1);
 
+        // Height of the screen as of the last redraw. `redraw` uses it as the
+        // lower bound for its clear, so a *grow* (maximize) that reveals
+        // scrollback below the old bottom does not get erased. It is kept one
+        // step behind the live size: the resize handling at the top of the loop
+        // re-anchors `input_row` via a DSR query *before* redrawing, and only
+        // advances `prev_term_h` to the new size *after* the redraw (see below).
+        // Interior mutability (`Cell`) lets the `redraw` closure read it without
+        // holding a mutable borrow across the loop.
+        let prev_term_h = Cell::new(
+            crossterm::terminal::size()
+                .map(|(_, h)| h.max(1) as usize)
+                .unwrap_or(24),
+        );
+
         // Render the input line at `input_row` and the live overlay directly
-        // *below* it. We clear from `input_row` to the end of the screen
-        // (`\x1b[0J`) and rewrite input + overlay; content *above* the input
-        // (greeter / status / divider / session) is untouched. When the overlay
-        // is taller than the space left, the terminal scrolls the overflow into
-        // its native scrollback (session preserved); `input_row` is adjusted by
-        // the scroll delta so the next redraw clears/writes at the right place
-        // (no duplication). See plan §3.7.
+        // *below* it. We clear the input + overlay rows (bounded at the previous
+        // screen bottom on a grow, so a maximize's revealed scrollback survives)
+        // and rewrite input + overlay; content *above* the input (greeter /
+        // status / divider / session) is untouched. When the overlay is taller
+        // than the space left, the terminal scrolls the overflow into its native
+        // scrollback (session preserved); `input_row` is adjusted by the scroll
+        // delta so the next redraw clears/writes at the right place (no
+        // duplication). See plan §3.7.
         let redraw = |editor: &LineEditor, overlay: &[&str], sel: usize,
                       current_row: &mut usize| {
             let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
             let w = w as usize;
             let term_h = h.max(1) as usize;
+            // Lower bound for the clear below: the *previous* screen bottom when
+            // the terminal just grew, so a maximize that reveals scrollback
+            // below the old bottom is not erased. `prev_term_h` is advanced only
+            // after the redraw (see the loop), and `input_row` is re-anchored to
+            // the real cursor before the redraw, so this is safe on both the
+            // top- and bottom-anchored reflow models.
+            let clear_to = prev_term_h.get().min(term_h);
             let row = (*current_row).max(1).min(term_h);
             let layout = editor.layout(w, prompt);
             let er = layout.row_count.max(1);
@@ -356,9 +379,13 @@ impl Repl {
             // Window the (possibly long) overlay around the selection.
             let win = Self::overlay_window(overlay.len(), n, sel);
             let mut s = String::new();
-            // Position at the input block's top row and clear to end of screen.
+            // Position at the input block's top row, then clear the rows the
+            // input + overlay will occupy — bounded at `clear_to` (the previous
+            // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
+            // bottom and wipe the scrollback a maximized window just revealed.
             s.push_str(&format!("\x1b[{};1H", row));
-            s.push_str("\x1b[0J");
+            s.push_str(&Self::clear_rows_to(row, clear_to));
+            s.push_str(&format!("\x1b[{};1H", row));
             s.push_str(&render_content(&layout, prompt));
             s.push_str(&cursor_positioning(&layout));
             if n > 0 {
@@ -408,6 +435,21 @@ impl Repl {
             // read correctly. Idempotent; a no-op on every normal iteration.
             if RESUMED.swap(false, Ordering::SeqCst) {
                 let _ = self.guard.start();
+            }
+            // Re-anchor `input_row` to the real cursor *before* we redraw, so no
+            // redraw ever runs with a stale `input_row` against a changed size.
+            // `crossterm::terminal::size()` reports the new size the instant the
+            // kernel resizes — typically *before* the `Resize` event is consumed
+            // below — so a redraw driven off that event would otherwise clear
+            // from the stale row down to the new bottom and wipe the scrollback a
+            // maximize just revealed. `prev_term_h` stays one step behind (it is
+            // advanced only after the redraw), so `redraw` uses it as the clear
+            // boundary and the revealed rows survive.
+            let cur_h = crossterm::terminal::size()
+                .map(|(_, h)| h.max(1) as usize)
+                .unwrap_or(24);
+            if cur_h != prev_term_h.get() {
+                input_row = output.cursor_row();
             }
             // --- Compute the overlay from the current buffer. ---
             let buffer = editor.text();
@@ -627,6 +669,10 @@ impl Repl {
                 base + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
             };
             redraw(&editor, &overlay_vec, focus, &mut input_row);
+            // The redraw used `prev_term_h` (the height *before* this resize) as
+            // its clear boundary; advance it now so the next resize is detected
+            // relative to the current size.
+            prev_term_h.set(cur_h);
 
             // --- Read and dispatch one key. ---
             match event::read() {
@@ -972,21 +1018,15 @@ impl Repl {
                     editor.insert_str(&text);
                 }
                 Ok(Event::Resize(_, _)) => {
-                    // The terminal changed size. Because the session history is
-                    // plain stdout on the primary screen (no alt buffer), the
-                    // terminal's native scroll reflows: a taller window reveals
-                    // older scrollback and the live input line's *visible* row
-                    // moves with it (it pins to the new bottom when the session
-                    // has overflowed, and stays put on a short session). `input_row`
-                    // is still the stale pre-resize row, and the loop-top `redraw`
-                    // clears from `input_row` to end-of-screen with `\x1b[0J`. If
-                    // `input_row` now sits above the input line, that clear wipes
-                    // the scrollback a maximized window just revealed — losing
-                    // history. Re-anchor `input_row` to the real cursor (a DSR
-                    // query) so the next `redraw` only clears below the actual
-                    // input line. Note: Ctrl-Z + maximize + fg is immune because
-                    // the process is stopped, SIGWINCH is dropped, and no
-                    // `redraw` ever runs.
+                    // Belt-and-suspenders re-anchor: the terminal changed size,
+                    // so `input_row` may now sit above the real input line. The
+                    // primary re-anchor already happens *before* the redraw at
+                    // the top of the loop (so a redraw never runs with a stale
+                    // `input_row` against the new size), but a `Resize` that
+                    // arrives after the top-of-loop check still benefits from a
+                    // DSR-driven refresh here. `redraw` clears only down to the
+                    // previous screen bottom (`prev_term_h`), so the scrollback
+                    // a maximized window just revealed is never clobbered.
                     input_row = output.cursor_row();
                 }
                 Ok(_) => {} // other events (mouse): ignored
@@ -1010,6 +1050,29 @@ impl Repl {
         } else {
             start
         }
+    }
+    /// Build the escape sequence that clears from `row` down to `clear_to`
+    /// (inclusive), erasing each line to its end with `\x1b[K`, without
+    /// touching anything above `row` or below `clear_to`. Returns an empty
+    /// string when `clear_to` is above `row` (nothing to clear).
+    ///
+    /// Used by `read_input`'s redraw so a terminal *grow* (maximize) clears
+    /// only up to the previous screen bottom and never wipes the scrollback a
+    /// maximized window reveals below it — a plain `\x1b[0J` would clear to
+    /// the new bottom and destroy that history. Extracted as a free function
+    /// (no TTY needed) so the boundary logic is unit-testable.
+    fn clear_rows_to(row: usize, clear_to: usize) -> String {
+        if clear_to < row {
+            return String::new();
+        }
+        let mut s = String::new();
+        for i in 0..(clear_to - row + 1) {
+            s.push_str("\x1b[K");
+            if i + 1 < clear_to - row + 1 {
+                s.push_str("\x1b[1E");
+            }
+        }
+        s
     }
     /// `avail` rows (≤ `overlay_len`), centered on `sel`. Returns the
     /// start index into the full overlay. Extracted so it can be unit-tested
@@ -2551,6 +2614,45 @@ mod tests {
         assert_eq!(Repl::next_input_row(2, 40, 1, 40), 1);
         // No pop-up: only the input block is rewritten in place.
         assert_eq!(Repl::next_input_row(35, 40, 1, 0), 35);
+    }
+
+    #[test]
+    fn clear_rows_to_bounds_clear_at_previous_bottom_on_grow() {
+        // Grew from 24 to 40 rows. Input at row 10 (top-anchored reflow: the
+        // cursor stays put). The revealed scrollback is rows 25..=40, *below*
+        // the old bottom. The clear must stop at the old bottom (24) and must
+        // NOT contain a clear-to-end-of-screen (`\x1b[0J`), which would wipe
+        // that reveal.
+        let seq = Repl::clear_rows_to(10, 24);
+        assert!(!seq.contains("\x1b[0J"), "must not clear to end of screen");
+        assert_eq!(seq.matches("\x1b[K").count(), 15, "one erase per row 10..=24");
+        // Each line is stepped to the next (col 1) except after the last row.
+        assert_eq!(seq.matches("\x1b[1E").count(), 14);
+        // Nothing below the old bottom (row 25) is referenced.
+        assert!(!seq.contains("\x1b[25;1H"));
+    }
+
+    #[test]
+    fn clear_rows_to_full_screen_on_no_resize() {
+        // No resize: clear_to == term_h, so the clear must cover every row
+        // from the input down to the bottom — equivalent to the old `\x1b[0J`.
+        let seq = Repl::clear_rows_to(3, 40);
+        assert_eq!(seq.matches("\x1b[K").count(), 38);
+        assert_eq!(seq.matches("\x1b[1E").count(), 37);
+    }
+
+    #[test]
+    fn clear_rows_to_no_clear_when_input_below_old_bottom() {
+        // Bottom-anchored grow: the cursor moved to the new bottom (40) but the
+        // previous bottom was 24. Clearing "below" the input would be upwards
+        // and must not happen; nothing is cleared so the revealed scrollback
+        // (above the new input) is preserved.
+        assert_eq!(Repl::clear_rows_to(40, 24), "");
+    }
+
+    #[test]
+    fn clear_rows_to_single_row() {
+        assert_eq!(Repl::clear_rows_to(5, 5), "\x1b[K");
     }
 
     #[test]
