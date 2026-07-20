@@ -532,6 +532,31 @@ impl Repl {
                                     });
                             }
                         }
+                        "set" | "s" => {
+                            kind = 5;
+                            title = "Settings  (type to filter, up/down, Tab/Enter select, Esc back)".into();
+                            cur_word = "set".into();
+                            cur_filter = rest.to_string();
+                            let entries = settings.overlay_rows(&cur_filter);
+                            if entries.is_empty() {
+                                opts.push("(no matching setting)".into());
+                                active = None;
+                            } else {
+                                let avail = term_width().saturating_sub(2);
+                                let mut table = Table::new(&["Setting", "Value", "Description"])
+                                    .with_aligns(&[Align::Left, Align::Left, Align::Left])
+                                    .with_min_widths(&[22, 18, 26])
+                                    .with_priorities(&[2, 2, 1])
+                                    .set_gap(2);
+                                for (meta, value) in &entries {
+                                    table.add_row(&[meta.name, value.as_str(), meta.description]);
+                                }
+                                for row in table.render_multiline(avail) {
+                                    opts.push(row);
+                                }
+                                active = None;
+                            }
+                        }
                         _ => {
                             kind = 1;
                             title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
@@ -1164,6 +1189,11 @@ impl Repl {
                 entries.iter().map(Self::model_candidate).collect()
             }
             SettingKey::ToolCallLimit => Vec::new(),
+            SettingKey::ShowThinking => vec![
+                ValueCandidate { display: "disabled".into(), value: "disabled".into(), desc: "show neither indicator nor reasoning text".into() },
+                ValueCandidate { display: "indicator".into(), value: "indicator".into(), desc: "show only a Thinking… spinner".into() },
+                ValueCandidate { display: "content".into(), value: "content".into(), desc: "show the reasoning text (default)".into() },
+            ],
         }
     }
 
@@ -2025,6 +2055,15 @@ mod tests {
             (
                 Some(crate::settings::SettingKey::DefaultPersona),
                 "my models/x y".to_string(),
+                true
+            )
+        );
+        // `show_thinking` resolves to its own key in value mode.
+        assert_eq!(
+            Repl::parse_settings("show_thinking indicator"),
+            (
+                Some(crate::settings::SettingKey::ShowThinking),
+                "indicator".to_string(),
                 true
             )
         );
