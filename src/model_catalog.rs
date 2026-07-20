@@ -454,6 +454,19 @@ pub fn catalog_cached() -> Vec<ModelEntry> {
     static_fallback()
 }
 
+/// Find a catalog entry matching `provider:model` (case-insensitive), using the
+/// cached catalog (or the curated static fallback) so the call is non-blocking.
+/// Prefers the `Direct`-priced copy when both a direct and an OpenRouter-routed
+/// entry exist. Returns `None` when no entry matches (e.g. an unknown model or a
+/// provider whose catalog wasn't fetched). Used by `/stat` to read the context
+/// window size and per-token pricing for the active model.
+pub fn lookup(provider: &str, model: &str) -> Option<ModelEntry> {
+    catalog_cached().into_iter().find(|e| {
+        let (p, m) = e.qualified_parts();
+        p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model)
+    })
+}
+
 /// Remove entries that share the same `id`. `extrapolate` keeps the
 /// OpenRouter-routed entry and adds a "direct" entry for every available
 /// provider namespace, so OpenRouter-native models (namespace `openrouter`)

@@ -10,6 +10,7 @@ pub enum SlashKind {
     Model,
     Settings,
     Persona,
+    Stat,
     Quit,
 }
 
@@ -48,6 +49,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/persona",
             help: "Set runtime persona (built-in name, file path, or 'none')",
             kind: SlashKind::Persona,
+        },
+        SlashCommand {
+            name: "/stat",
+            help: "Show session stats: context window, usage, cost, cache hit",
+            kind: SlashKind::Stat,
         },
         SlashCommand {
             name: "/quit",
@@ -131,8 +137,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_six_commands() {
-        assert_eq!(registry().len(), 6);
+    fn registry_has_seven_commands() {
+        assert_eq!(registry().len(), 7);
     }
 
     #[test]
@@ -153,7 +159,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 6);
+        assert_eq!(r.len(), 7);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::slash;
 use crate::thinking;
 use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
+use crate::agent::SessionUsage;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -240,6 +241,10 @@ pub struct ReplCtx {
     /// Currently active runtime persona name (None => none), for marking the
     /// active entry in the `/persona` overlay.
     pub persona: Option<String>,
+    /// Accumulated agent token usage (per-turn + session totals), snapshotted
+    /// by `run_interactive` each loop iteration so the `/stat` overlay can
+    /// render without direct access to the agent.
+    pub session_usage: SessionUsage,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -424,7 +429,7 @@ impl Repl {
                 } else if matches!(
                     after,
                     "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
-                        | "s" | "persona" | "personas" | "p"
+                        | "s" | "persona" | "personas" | "p" | "stat" | "stats"
                 ) {
                     (after, "")
                 } else {
@@ -557,6 +562,21 @@ impl Repl {
                                 active = None;
                             }
                         }
+                        "stat" | "stats" => {
+                            kind = 7;
+                            title = "Session stats  (Esc clears input to close)".into();
+                            cur_word = "stat".into();
+                            // Render straight from the agent's usage snapshot; no
+                            // filtering, no selection. Intermediate backspacing of
+                            // the buffer re-derives the overlay live (and falls
+                            // back to the command list once the word is gone).
+                            opts = crate::agent::session_stats_lines(
+                                &ctx.provider,
+                                &ctx.model,
+                                ctx.session_usage,
+                            );
+                            active = None;
+                        }
                         _ => {
                             kind = 1;
                             title = "Commands  (type to filter, up/down, Tab/Enter select)".into();
@@ -582,6 +602,7 @@ impl Repl {
             let mut overlay_text = match kind {
                 0 => String::new(),
                 4 => Self::render_help_overlay(),
+                7 => Self::overlay_lines(&title, &opts, usize::MAX, None, true),
                 _ => Self::overlay_lines(&title, &opts, sel, active, kind == 1),
             };
             // Value-mode settings error: red header line above the regular overlay.
@@ -775,6 +796,13 @@ impl Repl {
                                                     slash::SlashKind::Persona => {
                                                         editor.set("/persona ");
                                                     }
+                                                    slash::SlashKind::Stat => {
+                                                        // Open the `/stat` overlay (kind 7) on the
+                                                        // next loop iteration, mirroring `/set`. No
+                                                        // commit/submission — Esc or clearing the
+                                                        // input closes it.
+                                                        editor.set("/stat ");
+                                                    }
                                                 }
                                             }
                                         }
@@ -910,6 +938,9 @@ impl Repl {
                                     }
                                 }
                                 6 => {
+                                    editor.set("");
+                                }
+                                7 => {
                                     editor.set("");
                                 }
                                 _ => {}

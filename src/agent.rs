@@ -31,15 +31,49 @@ use rig_core::providers::{
 };
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 use async_trait::async_trait;
 
+/// Token-usage telemetry accumulated by an agent across a session.
+///
+/// The `last_*` fields reflect the most recent completion request and back the
+/// "current context size" reported by `/stat`; the `session_*` fields are the
+/// running sum across every completion call (each call re-sends the full
+/// history, so this approximates the billed token cost). A zeroed field means
+/// the provider reported no value (rig's `Usage` sentinel for missing metrics).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionUsage {
+    /// Input ("prompt") tokens of the most recent completion request — the
+    /// size of the context that would be re-sent on the next turn.
+    pub last_input_tokens: u64,
+    /// Output ("completion") tokens of the most recent completion request.
+    pub last_output_tokens: u64,
+    /// Cache-read tokens of the most recent completion request.
+    pub last_cached_input_tokens: u64,
+    /// Cache-write (creation) tokens of the most recent completion request.
+    pub last_cache_creation_input_tokens: u64,
+    /// Cumulative input tokens across the session.
+    pub session_input_tokens: u64,
+    /// Cumulative output tokens across the session.
+    pub session_output_tokens: u64,
+    /// Cumulative cache-read tokens across the session.
+    pub session_cached_input_tokens: u64,
+    /// Cumulative cache-write tokens across the session.
+    pub session_cache_creation_input_tokens: u64,
+    /// Cumulative reasoning tokens across the session.
+    pub session_reasoning_tokens: u64,
+}
+
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
     async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
+    /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
+    /// result means no completion call has reported usage yet.
+    fn session_usage(&self) -> SessionUsage;
 }
 
 #[async_trait]
@@ -117,7 +151,27 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                     _ => {}
                 },
                 Ok(MultiTurnStreamItem::StreamUserItem(_)) => {}
-                Ok(MultiTurnStreamItem::CompletionCall(_)) => {
+                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
+                    // Plumb per-request usage out of the stream (compaction's
+                    // prerequisite — doc/compaction.md §2.7). The last call's
+                    // `input_tokens` is the current context size; the sum across
+                    // calls approximates session cost. Zero-valued usage is rig's
+                    // sentinel for "provider reported nothing" (e.g. ollama), so
+                    // skip it to keep the telemetry honest.
+                    let u = call.usage;
+                    if u.has_values() {
+                        if let Ok(mut g) = self.usage.lock() {
+                            g.last_input_tokens = u.input_tokens;
+                            g.last_output_tokens = u.output_tokens;
+                            g.last_cached_input_tokens = u.cached_input_tokens;
+                            g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
+                            g.session_input_tokens += u.input_tokens;
+                            g.session_output_tokens += u.output_tokens;
+                            g.session_cached_input_tokens += u.cached_input_tokens;
+                            g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
+                            g.session_reasoning_tokens += u.reasoning_tokens;
+                        }
+                    }
                     // Commit the text so far before the tool call / result line.
                     self.output.end_response_segment();
                 }
@@ -179,6 +233,13 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         // methods, so there is no separate `display_markdown` here.
         let response = self.prompt(&input, None).await?;
         Ok(response)
+    }
+
+    fn session_usage(&self) -> SessionUsage {
+        self.usage
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_default()
     }
 }
 
@@ -301,6 +362,10 @@ pub struct CodeAgent<M: CompletionModel> {
     user_cancel: Arc<AtomicBool>,
     thinking_level: Option<String>,
     reasoning_in_context: bool,
+    /// Accumulated token-usage telemetry captured from the streaming run
+    /// (see [`SessionUsage`]). Backs `/stat` and is the measurement primitive
+    /// compaction will rely on (doc/compaction.md §2.7).
+    usage: Mutex<SessionUsage>,
 }
 
 #[derive(Clone)]
@@ -895,6 +960,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     model: config.model.clone(),
                     recent: recent_models.clone(),
                     persona: config.persona_name.clone(),
+                    // Snapshot the agent's accumulated token usage so the `/stat`
+                    // overlay can render without needing the agent directly.
+                    session_usage: agent
+                        .as_ref()
+                        .map(|a| a.session_usage())
+                        .unwrap_or_default(),
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
@@ -990,6 +1061,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 if input == "/q" || input == "exit" {
                     break;
                 }
+                // `/stat` is handled by the REPL overlay (typing it opens the
+                // stats panel); it is never submitted here, so there's nothing
+                // to do for that keyword.
                 // Reprint the submitted prompt via the `Output` impl so the
                 // session (and cursor tracking) stays correct; `read_input`
                 // cleared the input line on submit.
@@ -1083,6 +1157,80 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     Ok(())
 }
 
+/// Compute the `/stat` panel lines: context-window limit + current usage, an
+/// approximate session cost, and the cache hit rate (when the provider reports
+/// cache metrics). Reads the live model catalog for the window size and the
+/// per-token pricing, and the agent's accumulated [`SessionUsage`] for the
+/// per-turn / session totals. Returns plain lines so the REPL can render them
+/// in the `/stat` overlay (`render_plain` display).
+pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> Vec<String> {
+    let entry = model_catalog::lookup(provider, model);
+    let ctx_len = entry.as_ref().and_then(|e| e.context_length);
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Session stats — {}:{}", provider, model));
+
+    // Context window limit.
+    match ctx_len {
+        Some(max) => lines.push(format!("  context window limit : {} tokens", max)),
+        None => lines.push("  context window limit : unknown (model not in catalog)".to_string()),
+    }
+
+    // Current context usage (absolute + % of max).
+    let cur = usage.last_input_tokens;
+    if cur > 0 {
+        if let Some(max) = ctx_len {
+            let pct = (cur as f64 / max as f64) * 100.0;
+            lines.push(format!(
+                "  current usage        : {} tokens ({:.1}% of limit)",
+                cur, pct
+            ));
+        } else {
+            lines.push(format!("  current usage        : {} tokens", cur));
+        }
+    } else {
+        lines.push("  current usage        : n/a (no completion call recorded yet)".to_string());
+    }
+
+    // Approximate session cost.
+    let (pc, cc) = entry
+        .as_ref()
+        .map(|e| (e.prompt_cost, e.completion_cost))
+        .unwrap_or((None, None));
+    match (pc, cc) {
+        (Some(p), Some(c)) if p > 0.0 || c > 0.0 => {
+            let cost = (usage.session_input_tokens as f64 / 1_000_000.0) * p
+                + (usage.session_output_tokens as f64 / 1_000_000.0) * c;
+            lines.push(format!(
+                "  approx session cost : ${:.4} (in {} / out {} tokens)",
+                cost, usage.session_input_tokens, usage.session_output_tokens
+            ));
+        }
+        _ => lines.push("  approx session cost : n/a (no pricing in catalog)".to_string()),
+    }
+
+    // Cache hit rate (session-level: reads as a fraction of all input tokens).
+    let cached = usage.session_cached_input_tokens;
+    let creation = usage.session_cache_creation_input_tokens;
+    let total_in = usage.session_input_tokens;
+    if total_in > 0 && (cached > 0 || creation > 0) {
+        let hit = (cached as f64 / total_in as f64) * 100.0;
+        lines.push(format!(
+            "  cache hit rate       : {:.1}% (read {} / written {} / fresh {} tokens)",
+            hit,
+            cached,
+            creation,
+            total_in.saturating_sub(cached + creation)
+        ));
+    } else {
+        lines.push(
+            "  cache hit rate       : n/a (provider reported no cache metrics)".to_string(),
+        );
+    }
+
+    lines
+}
+
 impl<M: CompletionModel + 'static> CodeAgent<M> {
     pub fn new(
         agent: Agent<M>,
@@ -1107,6 +1255,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             user_cancel,
             thinking_level,
             reasoning_in_context,
+            usage: Mutex::new(SessionUsage::default()),
         }
     }
 }
