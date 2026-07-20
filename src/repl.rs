@@ -108,6 +108,13 @@ pub(crate) fn spawn_in_flight_reader(
                         }
                     } else if let KeyCode::Esc = key.code {
                         cancel.store(true, Ordering::SeqCst);
+                        // Wake any in-flight tool watchdog threads so the
+                        // shell command is killed immediately (not after the
+                        // timeout).  Sending on an unbounded mpsc channel is
+                        // non-blocking, so this is safe from the reader thread.
+                        for tx in crate::tools::TOOL_CANCEL_SENDERS.lock().unwrap().iter() {
+                            let _ = tx.send(());
+                        }
                     }
                 }
                 _ => {}
