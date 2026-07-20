@@ -129,72 +129,99 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             .map(|l| l != thinking::ThinkingLevel::Off)
             .unwrap_or(false);
         self.output.set_answer_hold(reasoning_expected);
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
-                    StreamedAssistantContent::Text(text) => {
-                        let delta = text.text();
-                        output.push_str(delta);
-                        self.output.stream_text(delta);
-                    }
-                    StreamedAssistantContent::Reasoning(reasoning) => {
-                        let t = reasoning_text(&reasoning);
-                        if !t.is_empty() {
-                            self.output.stream_thinking(&t);
+        loop {
+            tokio::select! {
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(MultiTurnStreamItem::StreamAssistantItem(content))) => match content {
+                            StreamedAssistantContent::Text(text) => {
+                                let delta = text.text();
+                                output.push_str(delta);
+                                self.output.stream_text(delta);
+                            }
+                            StreamedAssistantContent::Reasoning(reasoning) => {
+                                let t = reasoning_text(&reasoning);
+                                if !t.is_empty() {
+                                    self.output.stream_thinking(&t);
+                                }
+                            }
+                            StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                                if !reasoning.is_empty() {
+                                    self.output.stream_thinking(&reasoning);
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some(Ok(MultiTurnStreamItem::StreamUserItem(_))) => {}
+                        Some(Ok(MultiTurnStreamItem::CompletionCall(call))) => {
+                            // Plumb per-request usage out of the stream (compaction's
+                            // prerequisite — doc/compaction.md §2.7). The last call's
+                            // `input_tokens` is the current context size; the sum across
+                            // calls approximates session cost. Zero-valued usage is rig's
+                            // sentinel for "provider reported nothing" (e.g. ollama), so
+                            // skip it to keep the telemetry honest.
+                            let u = call.usage;
+                            if u.has_values() {
+                                if let Ok(mut g) = self.usage.lock() {
+                                    g.last_input_tokens = u.input_tokens;
+                                    g.last_output_tokens = u.output_tokens;
+                                    g.last_cached_input_tokens = u.cached_input_tokens;
+                                    g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                    g.session_input_tokens += u.input_tokens;
+                                    g.session_output_tokens += u.output_tokens;
+                                    g.session_cached_input_tokens += u.cached_input_tokens;
+                                    g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
+                                    g.session_reasoning_tokens += u.reasoning_tokens;
+                                }
+                            }
+                            // Commit the text so far before the tool call / result line.
+                            self.output.end_response_segment();
                         }
-                    }
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
-                        if !reasoning.is_empty() {
-                            self.output.stream_thinking(&reasoning);
+                        Some(Ok(MultiTurnStreamItem::FinalResponse(resp))) => {
+                            final_history = resp.messages().map(|h| h.to_vec());
                         }
-                    }
-                    _ => {}
-                },
-                Ok(MultiTurnStreamItem::StreamUserItem(_)) => {}
-                Ok(MultiTurnStreamItem::CompletionCall(call)) => {
-                    // Plumb per-request usage out of the stream (compaction's
-                    // prerequisite — doc/compaction.md §2.7). The last call's
-                    // `input_tokens` is the current context size; the sum across
-                    // calls approximates session cost. Zero-valued usage is rig's
-                    // sentinel for "provider reported nothing" (e.g. ollama), so
-                    // skip it to keep the telemetry honest.
-                    let u = call.usage;
-                    if u.has_values() {
-                        if let Ok(mut g) = self.usage.lock() {
-                            g.last_input_tokens = u.input_tokens;
-                            g.last_output_tokens = u.output_tokens;
-                            g.last_cached_input_tokens = u.cached_input_tokens;
-                            g.last_cache_creation_input_tokens = u.cache_creation_input_tokens;
-                            g.session_input_tokens += u.input_tokens;
-                            g.session_output_tokens += u.output_tokens;
-                            g.session_cached_input_tokens += u.cached_input_tokens;
-                            g.session_cache_creation_input_tokens += u.cache_creation_input_tokens;
-                            g.session_reasoning_tokens += u.reasoning_tokens;
+                        Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
+                        Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
+                            // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
+                            // as a terminal `PromptCancelled` error that carries the
+                            // in-flight full history. Capture it so an aborted turn is not
+                            // a total loss and cross-turn context survives (root cause #2).
+                            if let StreamingError::Prompt(prompt_err) = &e {
+                                if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
+                                    cancelled_history = Some(chat_history.clone());
+                                    aborted = true;
+                                    break;
+                                }
+                            }
+                            self.output.end_response();
+                            return Err(crate::PicocodeError::Other(e.to_string()));
                         }
+                        None => break,
                     }
-                    // Commit the text so far before the tool call / result line.
-                    self.output.end_response_segment();
                 }
-                Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
-                    final_history = resp.messages().map(|h| h.to_vec());
-                }
-                Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. }) => {}
-                Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {}
-                Ok(_) => {}
-                Err(e) => {
-                    // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
-                    // as a terminal `PromptCancelled` error that carries the
-                    // in-flight full history. Capture it so an aborted turn is not
-                    // a total loss and cross-turn context survives (root cause #2).
-                    if let StreamingError::Prompt(prompt_err) = &e {
-                        if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
-                            cancelled_history = Some(chat_history.clone());
-                            aborted = true;
-                            break;
+                _ = self.cancel_notify.notified() => {
+                    if self.user_cancel.load(Ordering::SeqCst) {
+                        // User pressed `<Esc>` — stop rendering and return control
+                        // to the REPL immediately. The stream is dropped, which
+                        // closes the HTTP connection; any running tool was already
+                        // killed by the watchdog (Phase 1a-d tool-cancel channel).
+                        //
+                        // Persist the partial turn before breaking, since we
+                        // won't receive a PromptCancelled error with full_history
+                        // (we're breaking out before the hook has a chance to fire).
+                        if let Some(h) = history.as_ref() {
+                            let mut partial = Vec::clone(h);
+                            partial.push(Message::user(input));
+                            if !output.is_empty() {
+                                partial.push(Message::assistant(&output));
+                            }
+                            cancelled_history = Some(partial);
                         }
+                        aborted = true;
+                        break;
                     }
-                    self.output.end_response();
-                    return Err(crate::PicocodeError::Other(e.to_string()));
                 }
             }
         }
@@ -378,6 +405,10 @@ pub struct CodeAgent<M: CompletionModel> {
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
+    /// Event-based cancel signal. The in-flight reader calls `notify_one()`
+    /// when `<Esc>` is pressed; the streaming loop selects on `notified()`
+    /// instead of polling with a sleep.
+    cancel_notify: Arc<tokio::sync::Notify>,
     thinking_level: Option<String>,
     reasoning_in_context: bool,
     /// Accumulated token-usage telemetry captured from the streaming run
@@ -404,6 +435,10 @@ pub struct AgentConfig {
     /// the user presses `Esc` during an LLM request; the `LoggingHook` bridge
     /// below turns it into a rig `CancelSignal` so the in-flight request stops.
     pub user_cancel: Arc<AtomicBool>,
+    /// Event-based cancel signal paired with `user_cancel`. The in-flight
+    /// reader calls `notify_one()` when `<Esc>` is pressed; the streaming
+    /// loop selects on `notified()` instead of polling.
+    pub cancel_notify: Arc<tokio::sync::Notify>,
     /// Resolved sandbox configuration for shell tool execution. `None` means
     /// the sandbox was never configured, in which case shell commands are
     /// refused rather than run unsandboxed. In normal operation `main.rs`
@@ -536,6 +571,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
+                config.cancel_notify.clone(),
                 config.thinking_level.clone(),
                 config.reasoning_in_context,
             ))
@@ -1029,6 +1065,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     let cancel = Arc::new(AtomicBool::new(false));
     // So `/model` etc. embed the same flag into the rebuilt agent.
     config.user_cancel = cancel.clone();
+    // Event-based cancel signal — the streaming loop selects on this instead
+    // of polling.  Paired with `user_cancel` above.
+    let cancel_notify = Arc::new(tokio::sync::Notify::new());
+    config.cancel_notify = cancel_notify.clone();
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
     if guard.is_some() {
@@ -1298,6 +1338,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         let handle = crate::repl::spawn_in_flight_reader(
                             g.clone(),
                             cancel.clone(),
+                            config.cancel_notify.clone(),
                             done.clone(),
                             confirm_gate,
                         );
@@ -1419,6 +1460,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
+        cancel_notify: Arc<tokio::sync::Notify>,
         thinking_level: Option<String>,
         reasoning_in_context: bool,
     ) -> Self {
@@ -1431,6 +1473,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             yolo,
             persona_name,
             user_cancel,
+            cancel_notify,
             thinking_level,
             reasoning_in_context,
             usage: Mutex::new(SessionUsage::default()),
@@ -1745,6 +1788,7 @@ use rig_core::OneOrMany;
             bash_auto_allow: None,
             agent_prompt: None,
             user_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             sandbox: Some(sandbox),
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,

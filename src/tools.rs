@@ -27,6 +27,17 @@ impl From<tokio::task::JoinError> for ToolError {
     }
 }
 
+/// Process-wide registry of tool-cancel senders.  When `<Esc>` is pressed,
+/// `spawn_in_flight_reader` sends `()` on every registered sender, which wakes
+/// the corresponding watchdog thread to kill the child process.
+///
+/// Registration is scoped: `capture_bounded` pushes a clone of its `cancel_tx`
+/// before spawning the watchdog and pops it (via a drop guard) when the
+/// function returns.  This ensures a stale sender never kills the *next* tool.
+pub(crate) static TOOL_CANCEL_SENDERS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<std::sync::mpsc::Sender<()>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 fn get_path(path: &str) -> Result<PathBuf, ToolError> {
     get_path_with(path, false)
 }
@@ -454,32 +465,55 @@ fn capture_bounded(
         .map_err(|e| ToolError::Io(e.to_string()))?;
     let handle = Arc::new(handle);
 
-    // Watchdog: if the command runs past `timeout`, kill it so the blocked
-    // `read` below returns. Only direct children (bwrap) are killed; bwrap's
-    // `--die-with-parent`/namespace reaping handles the sandbox internals, the
-    // same limitation the previous `wait_timeout` + `kill` path already had.
+    // Watchdog: if the command runs past `timeout`, OR the user presses `<Esc>`,
+    // kill the child so the blocked `read` below returns and we surface a clear
+    // error.  Only direct children (bwrap) are killed; bwrap's
+    // `--die-with-parent`/namespace reaping handles the sandbox internals.
     //
     // `cancel_tx` is the early-exit signal: dropping it closes the channel,
     // which unblocks `recv_timeout` in the watchdog thread immediately so that
     // `g.join()` returns promptly when the command finishes before the timeout.
-    // Without this, `g.join()` would stall for the full sleep duration on every
-    // successful (non-timed-out) command execution.
+    // A clone of `cancel_tx` is registered in the process-wide
+    // `TOOL_CANCEL_SENDERS` list so the in-flight reader thread can send `()`
+    // on it when `<Esc>` is pressed — waking the watchdog to kill the child.
     let timed_out = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+
+    // Register a clone of cancel_tx in the process-wide sender registry,
+    // so the in-flight reader thread can send `()` on it when `<Esc>` is
+    // pressed.  We deregister explicitly before `drop(cancel_tx)` below so
+    // the channel is fully disconnected and the watchdog exits promptly.
+    if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
+        senders.push(cancel_tx.clone());
+    }
+
     let guard: Option<std::thread::JoinHandle<()>> = timeout.map(|secs| {
         let w = handle.clone();
         let flag = timed_out.clone();
+        let cancel_flag = cancelled.clone();
         std::thread::Builder::new()
             .name("sandbox-timeout".to_string())
             .spawn(move || {
-                // Block until the timeout elapses *or* the main thread signals
-                // completion by dropping `cancel_tx` (Disconnected) or sending
-                // on it.  Only the true-timeout branch kills the child.
-                if let Err(mpsc::RecvTimeoutError::Timeout) =
-                    cancel_rx.recv_timeout(Duration::from_secs(secs))
-                {
-                    flag.store(true, Ordering::SeqCst);
-                    let _ = w.kill();
+                // Block until the timeout elapses *or* something sends on
+                // cancel_rx (either `cancel_tx` being dropped because the
+                // command finished, or a `send(())` from the in-flight reader
+                // when the user pressed `<Esc>`).
+                match cancel_rx.recv_timeout(Duration::from_secs(secs)) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Timeout elapsed: mark as timed out and kill.
+                        flag.store(true, Ordering::SeqCst);
+                        let _ = w.kill();
+                    }
+                    Ok(()) => {
+                        // Woken by a cancel signal (user pressed `<Esc>`).
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        let _ = w.kill();
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        // All senders dropped — command finished normally.
+                        // No kill needed.
+                    }
                 }
             })
             .map_err(|e| ToolError::Io(e.to_string()))
@@ -514,21 +548,32 @@ fn capture_bounded(
         }
     };
 
+    // Deregister from the process-wide cancel-sender registry BEFORE
+    // dropping `cancel_tx`, so the channel is fully disconnected and the
+    // watchdog's `recv_timeout` returns `Disconnected` immediately.
+    if let Ok(mut senders) = TOOL_CANCEL_SENDERS.lock() {
+        let _ = senders.pop();
+    }
+
     // Signal the watchdog to exit immediately: closing cancel_tx makes
     // recv_timeout return Disconnected, so the watchdog exits without killing
-    // anything.  If the watchdog already fired (Timeout branch), this is a
+    // anything.  If the watchdog already fired (Timeout/Cancel), this is a
     // no-op and join() returns as soon as the thread finishes its kill() call.
     drop(cancel_tx);
     if let Some(g) = guard {
         let _ = g.join();
     }
 
-    // Now that the watchdog has definitively finished, check its flag.
+    // Now that the watchdog has definitively finished, check its flags.
+    // Timeout takes precedence (more informative error), then cancel.
     if timed_out.load(Ordering::SeqCst) {
         return Err(ToolError::Generic(format!(
             "command timed out after {}s",
             timeout.unwrap_or(0)
         )));
+    }
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(ToolError::Generic("cancelled by user".into()));
     }
     if let Err(e) = io_result {
         return Err(ToolError::Io(e.to_string()));

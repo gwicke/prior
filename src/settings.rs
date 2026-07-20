@@ -586,6 +586,7 @@ mod tests {
             bash_auto_allow: None,
             agent_prompt: None,
             user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             sandbox: None,
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
