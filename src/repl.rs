@@ -394,7 +394,7 @@ impl Repl {
             s.push_str(&Self::clear_rows_to(row, clear_to));
             s.push_str(&format!("\x1b[{};1H", row));
             s.push_str(&render_content(&layout, prompt));
-            s.push_str(&cursor_positioning(&layout));
+            s.push_str(&cursor_positioning(&layout, prompt));
             if n > 0 {
                 // Move *below* the input block using a relative down-move. An absolute
                 // address would be out of range when the input sits on the bottom
@@ -2396,8 +2396,13 @@ fn render_content(layout: &Layout, prompt: &str) -> String {
 
 /// Cursor-positioning suffix that places the caret at `layout.cursor_row` /
 /// `layout.cursor_col` after [`render_content`] has been written.
-fn cursor_positioning(layout: &Layout) -> String {
+/// `prompt` is needed to account for the prompt prefix when the cursor is on
+/// the only row (rc == 1), which always includes the prompt.  Without it the
+/// left‑arrow adjustment would be off by the prompt width, placing the cursor
+/// too far right on the first character.
+fn cursor_positioning(layout: &Layout, prompt: &str) -> String {
     let rc = layout.row_count.max(1);
+    let pcols = prompt.chars().count();
     let last_row_len = if rc == 1 {
         layout
             .rows
@@ -2412,9 +2417,22 @@ fn cursor_positioning(layout: &Layout) -> String {
     if move_up > 0 {
         s.push_str(&format!("\x1b[{}A", move_up));
         s.push('\r');
-        s.push_str(&format!("\x1b[{}C", layout.cursor_col));
+        // Only emit CUF when cursor_col > 0; some terminals treat
+        // CSI 0 C (or missing param) as 1, which would shift the cursor
+        // one column to the right when we want column 0.
+        if layout.cursor_col > 0 {
+            s.push_str(&format!("\x1b[{}C", layout.cursor_col));
+        }
     } else {
-        let d = last_row_len.saturating_sub(layout.cursor_col);
+        // When the cursor is on the last (or only) row and the prompt prefix
+        // is present on row 0 (rc == 1), the distance from the rendered end
+        // to the cursor column must include the prompt prefix.
+        let effective_end_col = if rc == 1 {
+            pcols + last_row_len
+        } else {
+            last_row_len
+        };
+        let d = effective_end_col.saturating_sub(layout.cursor_col);
         if d > 0 {
             s.push_str(&format!("\x1b[{}D", d));
         }
@@ -2428,7 +2446,7 @@ fn cursor_positioning(layout: &Layout) -> String {
 fn render_input(layout: &Layout, prompt: &str) -> String {
     let mut s = String::from("\x1b[u\r\x1b[0J");
     s.push_str(&render_content(layout, prompt));
-    s.push_str(&cursor_positioning(layout));
+    s.push_str(&cursor_positioning(layout, prompt));
     s
 }
 
@@ -3075,6 +3093,478 @@ mod tests {
             let mut e = LineEditor::new();
             e.insert_str(s);
             e
+        }
+    }
+
+    // ===== Fuzz-like deterministic tests (pure model) =====
+
+    /// Verify that the layout invariants hold for a single editor state.
+    fn check_layout(e: &LineEditor, width: usize, prompt: &str) {
+        let layout = e.layout(width, prompt);
+        let rc = layout.row_count.max(1);
+        let pcols = prompt.chars().count();
+        assert!(
+            layout.cursor_row < rc,
+            "cursor_row {} >= row_count {} (text={:?})",
+            layout.cursor_row, rc, e.text()
+        );
+        if layout.cursor_row < layout.rows.len() {
+            let content_col = if layout.cursor_row == 0 {
+                layout.cursor_col.saturating_sub(pcols)
+            } else {
+                layout.cursor_col
+            };
+            let row_len = layout.rows[layout.cursor_row].chars().count();
+            assert!(
+                content_col <= row_len,
+                "content_col {} > row_len {} in rows={:?}, text={:?}, cursor={}",
+                content_col, row_len, layout.rows, e.text(), e.cursor
+            );
+        }
+    }
+
+    const STEP_KINDS: usize = 10;
+
+    fn apply_step(e: &mut LineEditor, step: usize, width: usize, prompt: &str) {
+        match step % STEP_KINDS {
+            0 => { e.insert('a'); }
+            1 => { e.insert(' '); }
+            2 => { e.insert('\n'); }
+            3 => { e.backspace(); }
+            4 => { e.left(); }
+            5 => { e.right(); }
+            6 => { e.home(); }
+            7 => { e.end(); }
+            8 => { e.insert('-'); }
+            9 => { e.insert_newline(); }
+            _ => unreachable!()
+        }
+        check_layout(e, width, prompt);
+    }
+
+    #[test]
+    fn fuzz_deterministic_sweep() {
+        let params: Vec<(usize, &str)> = vec![
+            (5, ""), (8, ""), (10, ""), (12, ""), (15, ""), (20, ""),
+            (40, ""), (80, ""),
+            (5, "> "), (8, "> "), (10, "> "), (12, "> "), (15, "> "),
+            (20, "> "), (40, "> "), (80, "> "),
+            (5, "$ "), (10, "$ "), (15, "$ "), (20, "$ "),
+            (5, ">>>"), (10, ">>>"), (20, ">>>"),
+        ];
+        let seeds = [1usize, 3, 7, 11, 13, 17, 19, 23, 29, 31];
+        let steps = 250;
+
+        for (pi, (width, prompt)) in params.iter().enumerate() {
+            for seed in seeds.iter() {
+                let mut e = LineEditor::new();
+                for s in 0..steps {
+                    let step = (seed * (s + 1) * (pi + 1)) % STEP_KINDS;
+                    apply_step(&mut e, step, *width, prompt);
+                }
+            }
+        }
+    }
+
+    fn exhaustive(text: &str, width: usize, prompt: &str) {
+        let mut e = LineEditor::new();
+        e.insert_str(text);
+        for pos in 0..=e.text().len() {
+            e.cursor = pos;
+            check_layout(&e, width, prompt);
+        }
+    }
+
+    #[test]
+    fn fuzz_exhaustive_realistic_texts() {
+        let cases = [
+            ("", 80, ""),
+            ("a", 80, ""),
+            ("hello world", 80, "> "),
+            ("abc\ndef", 5, ""),
+            ("abc\ndef", 10, "> "),
+            ("abc def ghi", 5, ""),
+            ("abc def ghi", 8, "> "),
+            ("abc def ghi jkl", 10, "> "),
+            ("- item 1\n- item 2", 80, ""),
+            ("Multi-line input: There are still bugs that affect cursor", 20, "> "),
+            ("  indented\n  too", 10, ""),
+            ("abc \ndef", 80, ""),
+            ("abc\n", 80, ""),
+            ("\n", 80, ""),
+            ("\n\n", 80, ""),
+            ("abc def ghi\njk lm", 80, "> "),
+            ("abc def ghi jkl mno\npqr stu", 10, "> "),
+            ("abc def ghi jkl mno pqr stu vwx yz", 12, ""),
+            ("- [ ] task\n- [x] done", 80, "> "),
+            ("a\nb\nc\nd\ne\nf\ng", 80, ""),
+            ("    fn main() {\n        println!(\"hello\");\n    }", 30, ""),
+            ("   ", 80, ""),
+            ("   \n   ", 80, ""),
+            ("abc def\n\nghi", 15, ""),
+            ("x", 1, ""),
+            ("x y", 1, ""),
+        ];
+        for (text, width, prompt) in &cases {
+            exhaustive(text, *width, prompt);
+        }
+    }
+
+    #[test]
+    fn fuzz_user_scenario_back_to_first_char() {
+        let w = 80usize;
+        let prompt = "> ";
+        let mut e = LineEditor::new();
+        for c in "abc def ghi".chars() { e.insert(c); }
+        e.insert_newline();
+        for c in "jk lm".chars() { e.insert(c); }
+        assert_eq!(e.text(), "abc def ghi\njk lm");
+        assert!(e.visual_up(w, prompt), "visual_up");
+        while e.cursor > 0 { e.left(); check_layout(&e, w, prompt); }
+        assert_eq!(e.cursor, 0, "cursor must reach position 0");
+        let before = e.text();
+        e.backspace();
+        assert_eq!(e.text(), before, "backspace at pos 0 no-op");
+    }
+
+    #[test]
+    fn fuzz_reproduce_user_report_exact_text() {
+        let w = 80usize;
+        let prompt = "> ";
+        let mut e = LineEditor::new();
+        for c in "some text and more".chars() { e.insert(c); }
+        e.insert_newline();
+        for c in "and even more text in this line".chars() { e.insert(c); }
+        assert_eq!(e.cursor, 50, "cursor at buffer end");
+        assert!(e.visual_up(w, prompt), "visual_up");
+        while e.cursor > 0 {
+            check_layout(&e, w, prompt);
+            e.left();
+        }
+        assert_eq!(e.cursor, 0, "cursor must reach position 0");
+    }
+
+    #[test]
+    fn fuzz_wrapped_first_line_nav_to_pos0() {
+        let w = 15usize;
+        let prompt = "> ";
+        let mut e = LineEditor::new();
+        for c in "abc def ghi jkl mno".chars() { e.insert(c); }
+        e.insert_newline();
+        for c in "stu vwx".chars() { e.insert(c); }
+        assert!(e.visual_up(w, prompt), "visual_up");
+        while e.cursor > 0 { e.left(); check_layout(&e, w, prompt); }
+        assert_eq!(e.cursor, 0, "cursor at position 0");
+    }
+
+    #[test]
+    fn fuzz_home_end_every_position() {
+        let text = "abc def ghi\njk lm\nnop qrs";
+        let mut e = LineEditor::new();
+        e.insert_str(text);
+        for pos in 0..=text.len() {
+            e.cursor = pos;
+            let home_pos = {
+                let mut i = e.cursor;
+                while i > 0 && e.buf[i - 1] != '\n' { i -= 1; }
+                i
+            };
+            let end_pos = {
+                let n = text.len();
+                let mut i = e.cursor;
+                while i < n && e.buf[i] != '\n' { i += 1; }
+                i
+            };
+            e.home();
+            assert_eq!(e.cursor, home_pos, "home from pos {}", pos);
+            check_layout(&e, 40, "> ");
+            e.end();
+            assert_eq!(e.cursor, end_pos, "end from pos {}", pos);
+            check_layout(&e, 40, "> ");
+            e.cursor = pos;
+        }
+    }
+
+    #[test]
+    fn fuzz_visual_up_down_roundtrip() {
+        let texts = [
+            "abc def ghi\njk lm",
+            "abc def ghi jkl\npqr stu",
+            "a\nb\nc\nd\ne",
+            "abc",
+            "a long line that will wrap at narrow widths",
+        ];
+        let widths = [5usize, 10, 20, 40];
+        for text in &texts {
+            for w in &widths {
+                let mut e = LineEditor::new();
+                e.insert_str(text);
+                for pos in 0..=text.len() {
+                    e.cursor = pos;
+                    if e.visual_up(*w, "> ") {
+                        assert!(e.visual_down(*w, "> "));
+                        check_layout(&e, *w, "> ");
+                    }
+                    e.cursor = pos;
+                    if e.visual_down(*w, "> ") {
+                        assert!(e.visual_up(*w, "> "));
+                        check_layout(&e, *w, "> ");
+                    }
+                    e.cursor = pos;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_insert_delete_patterns() {
+        let mut e = LineEditor::new();
+        for c in "hello world".chars() { e.insert(c); check_layout(&e, 80, "> "); }
+        for _ in 0.."hello world".len() { e.backspace(); check_layout(&e, 80, "> "); }
+        assert_eq!(e.text(), "");
+        e.insert_str("abc");
+        e.home();
+        e.insert('X');
+        check_layout(&e, 80, "> ");
+        assert_eq!(e.text(), "Xabc");
+    }
+
+    #[test]
+    fn fuzz_line_delete_keeps_invariants() {
+        let tests = ["abc def ghi", "abc def ghi\njk lm", "\nhello", "hello\n", "a\nb\nc"];
+        for text in &tests {
+            let mut e = LineEditor::new();
+            e.insert_str(text);
+            for pos in 0..=text.len() {
+                e.cursor = pos;
+                let mut e2 = LineEditor::new();
+                e2.insert_str(text);
+                e2.cursor = pos;
+                e2.delete_line_start();
+                check_layout(&e2, 80, "> ");
+                let mut e3 = LineEditor::new();
+                e3.insert_str(text);
+                e3.cursor = pos;
+                e3.delete_line_end();
+                check_layout(&e3, 80, "> ");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_single_row_narrow_widths() {
+        let texts = ["a", "ab", "abc", "abc def", "abc def ghi", "  indented"];
+        let widths = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        for text in &texts {
+            for w in &widths {
+                exhaustive(text, *w, "");
+                exhaustive(text, *w, "> ");
+                exhaustive(text, *w, "$ ");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_path_completion_preserves_layout() {
+        let tests = [("/home/user", "/home/user/project"), ("/tmp", "/tmp/data"), ("foo", "foobar")];
+        for (buf, replacement) in &tests {
+            let result = Repl::replace_last_token(buf, replacement);
+            let mut e = LineEditor::new();
+            e.insert_str(&result);
+            check_layout(&e, 80, "> ");
+        }
+    }
+
+    // ===== vt100 terminal-emulator tests =====
+    //
+    // Build the actual escape sequences the terminal would see (as emitted by
+    // `redraw`) and feed them through a real vt100 terminal emulator.  This
+    // checks both visible cell content and the final cursor position — the
+    // strongest test possible without a real TTY.
+    #[cfg(test)]
+    mod vt100_tests {
+        use vt100::Parser;
+        use crate::repl::LineEditor;
+
+        // Build the escape sequence the production `redraw` emits for the
+        // input region, minus the clear-down (which uses `\x1b[1E` that the
+        // vt100 parser doesn't implement).  The core positioning is:
+        //
+        // 1. `\x1b[{input_row};1H` — jump to input top row
+        // 2. `render_content(prompt)` — write prompt + rows with `\n` separators
+        // 3. `cursor_positioning(prompt)` — fine-tune cursor to the right cell
+        fn build_render(editor: &LineEditor, width: usize, prompt: &str,
+                        term_rows: usize, input_row: usize) -> Vec<u8> {
+            let row = input_row.max(1).min(term_rows);
+            let layout = editor.layout(width, prompt);
+            let mut s = String::new();
+            let pcols = prompt.chars().count();
+            let rc = layout.row_count.max(1);
+
+            // 1. Position at input top row
+            s.push_str(&format!("\x1b[{};1H", row));
+
+            // 2. Render content (use \r\n because the real terminal has
+            // OPOST/ONLCR which converts bare \n to \r\n)
+            for r in 0..rc {
+                if r > 0 { s.push_str("\r\n"); }
+                if r == 0 { s.push_str(prompt); }
+                if r < layout.rows.len() { s.push_str(&layout.rows[r]); }
+            }
+
+            // 3. cursor_positioning (same logic as the real function)
+            let last_row_len = if rc == 1 {
+                layout.rows.first().map(|x| x.chars().count()).unwrap_or(0)
+            } else {
+                layout.rows.last().map(|x| x.chars().count()).unwrap_or(0)
+            };
+            let move_up = (rc - 1).saturating_sub(layout.cursor_row);
+            if move_up > 0 {
+                s.push_str(&format!("\x1b[{}A", move_up));
+                s.push('\r');
+                if layout.cursor_col > 0 {
+                    s.push_str(&format!("\x1b[{}C", layout.cursor_col));
+                }
+            } else {
+                let effective_end_col = if rc == 1 { pcols + last_row_len } else { last_row_len };
+                let d = effective_end_col.saturating_sub(layout.cursor_col);
+                if d > 0 { s.push_str(&format!("\x1b[{}D", d)); }
+            }
+
+            s.into_bytes()
+        }
+
+        fn render_through_vt100(editor: &LineEditor, width: usize, prompt: &str,
+                                term_rows: usize, term_cols: usize,
+                                input_row: usize) -> (usize, usize, Vec<String>) {
+            let bytes = build_render(editor, width, prompt, term_rows, input_row);
+            let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
+            p.process(&bytes);
+            let screen = p.screen();
+            let (cr, cc) = screen.cursor_position();
+            let rows: Vec<String> = (0..term_rows)
+                .map(|r| {
+                    let mut s = String::new();
+                    for c in 0..term_cols {
+                        s.push(screen.cell(r as u16, c as u16).map(|cell| cell.contents()).unwrap_or(" ").chars().next().unwrap_or(' '));
+                    }
+                    s.trim_end().to_string()
+                })
+                .collect();
+            (cr as usize, cc as usize, rows)
+        }
+
+        #[test]
+        fn vt100_cursor_at_start_of_single_line() {
+            let mut e = LineEditor::new();
+            e.insert_str("Hello");
+            e.cursor = 0;
+            let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
+            // input_row=10 is 1-indexed; vt100 uses 0-indexed rows, so row = 9
+            assert_eq!((cr, cc), (9, 2), "cursor at start should be row 9 col 2");
+            assert!(rows[9].starts_with("> Hello"), "row 9: {:?}", rows[9]);
+        }
+
+        #[test]
+        fn vt100_cursor_at_start_of_multi_line() {
+            let mut e = LineEditor::new();
+            e.insert_str("abc def ghi\njk lm");
+            e.cursor = 0;
+            let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
+            assert_eq!((cr, cc), (9, 2), "cursor at start of multi-line should be row 9 col 2");
+            assert!(rows[9].starts_with("> abc"), "row 9: {:?}", rows[9]);
+        }
+
+        #[test]
+        fn vt100_cursor_at_mid_of_first_line() {
+            let mut e = LineEditor::new();
+            e.insert_str("abc def ghi\njk lm");
+            e.cursor = 4;
+            let (cr, cc, _) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
+            // cursor_col = pcols(2) + index(4) = 6
+            assert_eq!((cr, cc), (9, 6), "cursor at pos 4 should be row 9 col 6");
+        }
+
+        #[test]
+        fn vt100_cursor_at_start_of_second_line() {
+            let mut e = LineEditor::new();
+            e.insert_str("abc def ghi\njk lm");
+            e.cursor = 12;
+            let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
+            // cursor on second visual row (row 10 0-indexed), col 0
+            assert_eq!((cr, cc), (10, 0), "cursor at start of second line should be row 10 col 0");
+            assert!(rows[10].starts_with("jk lm"), "row 10: {:?}", rows[10]);
+        }
+
+        #[test]
+        fn vt100_user_exact_text_cursor_at_start() {
+            let mut e = LineEditor::new();
+            for c in "some text and more".chars() { e.insert(c); }
+            e.insert_newline();
+            for c in "and even more text in this line".chars() { e.insert(c); }
+            e.cursor = 0;
+            let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
+            // cursor_row=0 in layout → 0-indexed vt100 row = 9 + 0 = 9
+            assert_eq!((cr, cc), (9, 2),
+                "cursor at start should be (9,2), got ({},{})", cr, cc);
+            assert!(rows[9].starts_with("> some text and more"), "row 9: {:?}", rows[9]);
+            assert!(rows[10].starts_with("and even more text"), "row 10: {:?}", rows[10]);
+        }
+
+        #[test]
+        fn vt100_every_cursor_position_roundtrips() {
+            let text = "some text and more\nand even more text in this line";
+            let w = 80usize;
+            let prompt = "> ";
+            let mut e = LineEditor::new();
+            e.insert_str(text);
+            for pos in 0..=text.len() {
+                e.cursor = pos;
+                let layout = e.layout(w, prompt);
+                let (cr, cc, _) = render_through_vt100(&e, w, prompt, 24, 80, 10);
+                // vt100 rows are 0-indexed; input_row=10 1-indexed = 9 0-indexed
+                let expected_row = 9 + layout.cursor_row;
+                assert_eq!(
+                    (cr, cc), (expected_row, layout.cursor_col),
+                    "pos {}: expected ({},{}), got ({},{}); layout=({},{}), rows={:?}",
+                    pos, expected_row, layout.cursor_col, cr, cc,
+                    layout.cursor_row, layout.cursor_col, layout.rows
+                );
+            }
+        }
+
+        #[test]
+        fn vt100_narrow_width_exhaustive() {
+            let texts = ["a", "ab", "abc", "abc def", "  indented"];
+            let widths = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15];
+            for text in &texts {
+                for w in &widths {
+                    let mut e = LineEditor::new();
+                    e.insert_str(text);
+                    for pos in 0..=text.len() {
+                        e.cursor = pos;
+                        let layout = e.layout(*w, "> ");
+                        let (cr, cc, _) = render_through_vt100(&e, *w, "> ", 24, 80, 5);
+                        // input_row=5 1-indexed = 4 0-indexed
+                        assert_eq!(
+                            (cr, cc), (4 + layout.cursor_row, layout.cursor_col),
+                            "text={:?}, w={}, pos={}: rows={:?}",
+                            text, w, pos, layout.rows
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn vt100_single_row_no_prompt() {
+            let mut e = LineEditor::new();
+            e.insert_str("Hello");
+            e.cursor = 0;
+            let (cr, cc, rows) = render_through_vt100(&e, 80, "", 24, 80, 5);
+            // input_row=5 1-indexed = 4 0-indexed. No prompt, so col=0.
+            assert_eq!((cr, cc), (4, 0), "cursor at start without prompt should be row 4 col 0");
+            assert!(rows[4].starts_with("Hello"), "row 4: {:?}", rows[4]);
         }
     }
 }
