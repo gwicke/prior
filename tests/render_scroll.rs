@@ -349,6 +349,7 @@ fn settings_string_hierarchy_saves_and_errors() {
     }
     assert!(
         wait_for(&bytes, "default_model", Duration::from_secs(3)),
+        wait_for(&bytes, "default_model", Duration::from_secs(3)),
         "settings list not shown"
     );
     {
