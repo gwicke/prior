@@ -773,6 +773,39 @@ impl Repl {
                             let _ = self.guard.start();
                         }
                     }
+                    // Ctrl-E: external editor (only when no overlay is active).
+                    if let KeyCode::Char('e') = key.code {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && kind == 0 {
+                            let _ = self.guard.stop();
+                            match edit_in_editor(&editor.text()) {
+                                Ok(new_text) => {
+                                    editor.set(&new_text);
+                                }
+                                Err(e) => {
+                                    // Error already occurred; the current buffer
+                                    // is preserved.  The error message went to
+                                    // stderr (the editor's stderr) or was lost;
+                                    // show a brief inline note via eprintln.
+                                    let _ = io::stdout().write_all(
+                                        format!("\r\neditor error: {}\r\n", e).as_bytes()
+                                    );
+                                }
+                            }
+                            let _ = self.guard.start();
+                            // The editor took over the terminal; the cursor
+                            // position is now wherever the editor left it.
+                            // Re-anchor so the next redraw writes at the
+                            // correct screen row.
+                            input_row = output.cursor_row();
+                            // Reflect the (possibly changed) terminal size
+                            // in prev_term_h so the redraw's clear boundary
+                            // covers the full height.
+                            if let Ok((_, h)) = crossterm::terminal::size() {
+                                prev_term_h.set(h.max(1) as usize);
+                            }
+                            continue;
+                        }
+                    }
                     if kind == 4 {
                         // Any key dismisses /help and is passed through.
                         if let KeyCode::Char(c) = key.code {
@@ -1838,6 +1871,81 @@ impl Repl {
     }
 
 
+}
+
+/// Resolve the external editor command from environment variables.
+/// Priority: `$VISUAL` > `$EDITOR` > `"vim"`.
+/// Returns `(command, args)` where args may include flags e.g. `("emacs", ["-nw"])`.
+fn resolve_editor() -> (String, Vec<String>) {
+    let raw = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vim".into());
+    let parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
+    let cmd = parts.first().cloned().unwrap_or_else(|| "vim".into());
+    let args: Vec<String> = parts.into_iter().skip(1).collect();
+    (cmd, args)
+}
+
+/// Open `current` in `$EDITOR` (foreground child process) and return the
+/// modified text.  The editor inherits the terminal directly (stdin/stdout/
+/// stderr), so the caller must drop raw mode beforehand and re‑enter it
+/// afterwards.
+///
+/// A single trailing `\n` is stripped on read‑back because most editors add
+/// one.  Internal newlines and intentional trailing blank lines are preserved.
+/// The tempfile is cleaned up on every return path.
+fn edit_in_editor(current: &str) -> io::Result<String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let mut path = PathBuf::from(tmpdir);
+    path.push(format!("picocode_prompt_{}", std::process::id()));
+
+    // Write current content, mode 0600 so other users cannot read the
+    // prompt mid‑edit.
+    {
+        let mut f = std::fs::File::create(&path)?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.write_all(current.as_bytes())?;
+        f.flush()?;
+    }
+
+    // Launch editor.
+    let (cmd, mut args) = resolve_editor();
+    args.push(path.to_string_lossy().to_string());
+
+    let status = std::process::Command::new(&cmd)
+        .args(&args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&path);
+            e
+        })?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("editor exited with status {:?}", status.code()),
+        ));
+    }
+
+    // Read back.
+    let mut result = std::fs::read_to_string(&path).map_err(|e| {
+        let _ = std::fs::remove_file(&path);
+        e
+    })?;
+
+    // Strip exactly one trailing newline (most editors add one).
+    if result.ends_with('\n') {
+        result.pop();
+    }
+
+    let _ = std::fs::remove_file(&path);
+    Ok(result)
 }
 
 /// Generic file-path prefix completion. Lists the parent directory of `prefix`
@@ -3566,5 +3674,188 @@ mod tests {
             assert_eq!((cr, cc), (4, 0), "cursor at start without prompt should be row 4 col 0");
             assert!(rows[4].starts_with("Hello"), "row 4: {:?}", rows[4]);
         }
+    }
+
+    // ===== resolve_editor / edit_in_editor tests =====
+    //
+    // These tests modify environment variables (VISUAL / EDITOR) and must
+    // run serially to avoid races.  `ENV_LOCK` serialises them.
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Mutex;
+
+    /// Global mutex that serialises all env-var-modifying tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Save and restore environment variables around a test closure.
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved: Vec<(String, Option<String>)> = vars.iter().map(|(k, _)| {
+            (k.to_string(), std::env::var(k).ok())
+        }).collect();
+        for (k, v) in vars {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val); }
+                None => unsafe { std::env::remove_var(k); }
+            }
+        }
+        f();
+        for (k, v) in saved {
+            match v {
+                Some(val) => unsafe { std::env::set_var(&k, &val); }
+                None => unsafe { std::env::remove_var(&k); }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual() {
+        with_env(&[
+            ("VISUAL", Some("myeditor")),
+            ("EDITOR", Some("other")),
+        ], || {
+            let (cmd, args) = super::resolve_editor();
+            assert_eq!(cmd, "myeditor", "VISUAL must take priority");
+            assert!(args.is_empty(), "no flags: {:?}", args);
+        });
+    }
+
+    #[test]
+    fn resolve_editor_falls_back_to_editor() {
+        with_env(&[
+            ("VISUAL", None),
+            ("EDITOR", Some("nano")),
+        ], || {
+            let (cmd, args) = super::resolve_editor();
+            assert_eq!(cmd, "nano", "EDITOR fallback");
+            assert!(args.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_editor_defaults_to_vim() {
+        with_env(&[
+            ("VISUAL", None),
+            ("EDITOR", None),
+        ], || {
+            let (cmd, args) = super::resolve_editor();
+            assert_eq!(cmd, "vim", "default to vim");
+            assert!(args.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_editor_splits_flags() {
+        with_env(&[
+            ("VISUAL", Some("emacs -nw --no-site-file")),
+            ("EDITOR", None),
+        ], || {
+            let (cmd, args) = super::resolve_editor();
+            assert_eq!(cmd, "emacs");
+            assert_eq!(args, vec!["-nw", "--no-site-file"]);
+        });
+    }
+
+    /// Helper: run `edit_in_editor` with `current` content by setting
+    /// `EDITOR` to a shell script that writes `expected_output` to the file.
+    fn mock_edit(current: &str, editor_body: &str, expected_output: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("mock_editor.sh");
+        {
+            let mut f = std::fs::File::create(&script).expect("create script");
+            f.write_all(b"#!/bin/sh\n").unwrap();
+            f.write_all(editor_body.as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        with_env(&[
+            ("VISUAL", Some(script.to_string_lossy().as_ref())),
+            ("EDITOR", None),
+        ], || {
+            let result = super::edit_in_editor(current);
+            assert!(result.is_ok(), "edit_in_editor failed: {:?}", result.err());
+            assert_eq!(result.unwrap(), expected_output);
+        });
+    }
+
+    #[test]
+    fn edit_in_editor_roundtrip() {
+        mock_edit(
+            "hello world",
+            "printf '%s' 'edited content' > \"$1\"\n",
+            "edited content",
+        );
+    }
+
+    #[test]
+    fn edit_in_editor_empty_buffer() {
+        mock_edit(
+            "",
+            "printf '%s' 'new content' > \"$1\"\n",
+            "new content",
+        );
+    }
+
+    #[test]
+    fn edit_in_editor_trailing_newline_stripped() {
+        mock_edit(
+            "hello",
+            "printf '%s\\n' 'hello world' > \"$1\"\n",
+            "hello world",
+        );
+    }
+
+    #[test]
+    fn edit_in_editor_preserves_internal_newlines() {
+        mock_edit(
+            "line1\nline2\nline3",
+            "printf '%s\\n%s\\n%s' 'aaa' 'bbb' 'ccc' > \"$1\"\n",
+            "aaa\nbbb\nccc",
+        );
+    }
+
+    #[test]
+    fn edit_in_editor_keeps_trailing_blank_lines() {
+        // If the file ends with "a\n\n" (a, plus one blank line), stripping
+        // one trailing \n must leave "a\n" — the blank line is preserved.
+        mock_edit(
+            "a\n\n",
+            "printf '%s\\n\\n' 'a' > \"$1\"\n",
+            "a\n",
+        );
+    }
+
+    #[test]
+    fn edit_in_editor_nonzero_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("failing_editor.sh");
+        {
+            let mut f = std::fs::File::create(&script).expect("create script");
+            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
+            f.flush().unwrap();
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        with_env(&[
+            ("VISUAL", Some(script.to_string_lossy().as_ref())),
+            ("EDITOR", None),
+        ], || {
+            let result = super::edit_in_editor("original");
+            assert!(result.is_err(), "non-zero exit must return error");
+        });
+    }
+
+    #[test]
+    fn edit_in_editor_nonexistent_command() {
+        with_env(&[
+            ("VISUAL", Some("/nonexistent/editor_binary")),
+            ("EDITOR", None),
+        ], || {
+            let result = super::edit_in_editor("hello");
+            assert!(result.is_err(), "nonexistent command must return error");
+        });
     }
 }
