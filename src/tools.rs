@@ -277,8 +277,40 @@ pub(crate) fn set_sandbox(cfg: Option<SandboxConfig>) {
     *SANDBOX.lock().expect("sandbox lock poisoned") = Arc::new(cfg);
 }
 
-fn sandbox_config() -> Arc<Option<SandboxConfig>> {
+pub(crate) fn sandbox_config() -> Arc<Option<SandboxConfig>> {
     SANDBOX.lock().expect("sandbox lock poisoned").clone()
+}
+
+/// Run `ls -1p` inside the sandbox and return the listing.
+/// Returns `None` when no sandbox is configured, bwrap is unavailable,
+/// or the directory doesn't exist inside the sandbox.
+pub(crate) fn sandbox_list_dir(dir: &str) -> Option<Vec<String>> {
+    let cfg = sandbox_config();
+    let mut cfg = (*cfg).clone()?;
+    crate::sandbox_bindings::merge_into(&mut cfg);
+    let args = build_bwrap_args(&cfg, true).ok()?;
+
+    let output = std::process::Command::new("bwrap")
+        .args(&args)
+        .arg("--")
+        .args(["ls", "-1p", dir])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(
+        stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect(),
+    )
 }
 
 /// Resolve the active path policy for the non-shell file tools. Returns `None`
