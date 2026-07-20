@@ -56,9 +56,6 @@ pub struct ToolSettings {
 /// merged with built-in defaults by [`SandboxConfig::with_defaults`].
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct SandboxConfig {
-    /// Master switch. `None` means "auto": enabled only if `bwrap` is on PATH.
-    #[serde(default)]
-    pub enabled: Option<bool>,
     /// Wall-clock timeout (seconds) for the whole command. `None`/0 = no timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -99,11 +96,11 @@ pub struct SandboxConfig {
 impl SandboxConfig {
     /// Merge this (user-provided) config with built-in defaults.
     ///
-    /// `bwrap_present` controls the auto behavior of `enabled` when the user
-    /// did not set it explicitly.
-    pub fn with_defaults(&self, bwrap_present: bool) -> SandboxConfig {
+    /// The sandbox is always active — `bwrap` is required at startup and
+    /// `run_sandboxed` fails closed if it is missing, so there is no enable
+    /// switch to resolve here. This only fills in the remaining defaults.
+    pub fn with_defaults(&self) -> SandboxConfig {
         SandboxConfig {
-            enabled: self.enabled.or(Some(bwrap_present)),
             timeout_secs: self.timeout_secs.or(Some(120)),
             network: self.network.or(Some(false)),
             memory_mb: self.memory_mb,
@@ -305,7 +302,7 @@ impl RemapTable {
 /// Resolved path policy for the non-shell file tools.
 ///
 /// Built once from the sandbox config (see [`resolve_path_policy`]). When the
-/// policy is active (sandbox enabled with explicit bindings), every filesystem
+/// policy is active (sandbox active with explicit bindings), every filesystem
 /// access must fall under a binding, and writes require an `rw` binding. The
 /// `remap` table translates agent-visible (in-sandbox) paths like `/tmp` back
 /// to host paths so non-shell tools and the shell see the same files.
@@ -374,16 +371,13 @@ fn normalize(p: &Path) -> PathBuf {
     result
 }
 
-/// Build a [`PathPolicy`] from a sandbox config. Returns `None` when the
-/// sandbox is disabled or has no explicit bindings (permissive default).
+/// Build a [`PathPolicy`] from a sandbox config. Returns `None` when there are
+/// no explicit bindings (permissive default).
 pub fn resolve_path_policy(
     cfg: &SandboxConfig,
     cwd: &Path,
     home: Option<&Path>,
 ) -> Option<PathPolicy> {
-    if !cfg.enabled.unwrap_or(false) {
-        return None;
-    }
     if cfg.ro.is_empty() && cfg.rw.is_empty() {
         return None;
     }
@@ -580,7 +574,6 @@ mod tests {
     #[test]
     fn with_defaults_merges() {
         let raw = SandboxConfig {
-            enabled: None,
             timeout_secs: Some(5),
             network: None,
             memory_mb: Some(512),
@@ -591,8 +584,7 @@ mod tests {
             rw: vec![],
             env: None,
         };
-        let d = raw.with_defaults(true);
-        assert_eq!(d.enabled, Some(true));
+        let d = raw.with_defaults();
         assert_eq!(d.timeout_secs, Some(5));
         assert_eq!(d.network, Some(false));
         assert_eq!(d.memory_mb, Some(512));
@@ -602,31 +594,19 @@ mod tests {
     }
 
     #[test]
-    fn with_defaults_auto_disabled_without_bwrap() {
+    fn default_config_is_always_active() {
+        // There is no enable switch: a bare (empty) user config resolves to an
+        // active sandbox with the built-in defaults applied. `run()` guarantees
+        // `bwrap` is present at startup, so the sandbox can never be silently
+        // disabled just because the `[tool_config.bash.sandbox]` block was
+        // omitted.
         let raw = SandboxConfig::default();
-        assert_eq!(raw.with_defaults(false).enabled, Some(false));
-    }
-
-    #[test]
-    fn default_config_is_enabled_when_bwrap_present() {
-        // The bug: when no `[tool_config.bash.sandbox]` block is configured, the
-        // resolved config must still default to *enabled* as long as bwrap is
-        // present. `run()` guarantees bwrap is present (it fails closed at
-        // startup via `check_runtime_deps`), so the sandbox can never be
-        // silently disabled just because the config block was omitted.
-        let raw = SandboxConfig::default();
-        assert_eq!(raw.with_defaults(true).enabled, Some(true));
-    }
-
-    #[test]
-    fn explicit_disable_is_honored() {
-        // An explicit `enabled = false` is the only supported opt-out and must
-        // survive the merge with defaults, letting the command run unsandboxed.
-        let raw = SandboxConfig {
-            enabled: Some(false),
-            ..Default::default()
-        };
-        assert_eq!(raw.with_defaults(true).enabled, Some(false));
+        let d = raw.with_defaults();
+        assert_eq!(d.timeout_secs, Some(120));
+        assert_eq!(d.network, Some(false));
+        assert_eq!(d.pid_isolation, Some(true));
+        assert_eq!(d.drop_caps, Some(true));
+        assert_eq!(d.tmp_size_mb, Some(256));
     }
 
     #[test]
@@ -770,7 +750,7 @@ mod tests {
     #[test]
     fn env_policy_deserializes() {
         let cfg: SandboxConfig = toml_edit::de::from_str(
-            "enabled = true\n\n[env]\nmode = \"disallow\"\npatterns = [\"*_KEY\", \"AWS_*\"]\n",
+            "[env]\nmode = \"disallow\"\npatterns = [\"*_KEY\", \"AWS_*\"]\n",
         )
         .expect("env policy should parse");
         let p = cfg.env.expect("env present");

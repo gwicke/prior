@@ -26,10 +26,11 @@ auto_allow = [
   "^npm test",
 ]
 # Sandbox for the `bash` (and `agent-browser`) tools. Requires `bwrap`
-# (bubblewrap) on PATH; if `enabled` is left unset it auto-enables only
-# when bwrap is available, otherwise the command runs unsandboxed.
+# (bubblewrap) on PATH; picocode fails closed at startup if it is absent. An
+# unset sandbox config causes commands to be refused rather than run unsandboxed
+# (there is no plain-shell fallback and no enable switch — the sandbox is
+# always active when configured).
 [tool_config.bash.sandbox]
-enabled = true
 # Wall-clock timeout for the whole command (seconds). 0 = no timeout.
 timeout_secs = 120
 # Give the sandbox network access (default false => network unshared).

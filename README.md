@@ -124,7 +124,8 @@ Configure it under `tool_config.bash.sandbox` in `settings.toml` (see `settings.
 
 ```toml
 [tool_config.bash.sandbox]
-enabled = true          # auto-enabled only if bwrap is on PATH
+# The sandbox is always active when `bwrap` is present (required at startup),
+# so there is no `enabled` switch to toggle it off.
 timeout_secs = 120
 network = false         # unshare network by default
 memory_mb = 1024        # optional RLIMIT_AS cap
@@ -138,7 +139,7 @@ ro = []
 ```
 
 - **Deny-by-default filesystem**: when either `rw`/`ro` list is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.
-- When `bwrap` is absent, commands run unsandboxed (with the timeout still enforced) and a warning is printed.
+- `bwrap` is required at startup; if it is missing the process fails closed. There is no unsandboxed fallback — a command is never run outside the sandbox, and a disabled/unset sandbox config causes the command to be refused rather than executed by a plain shell.
 - This is defense-in-depth for an LLM-driven shell, not a jail against root — run picocode as an unprivileged user.
 
 See `doc/sandbox.md` for the full design.

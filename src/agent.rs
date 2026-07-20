@@ -405,7 +405,11 @@ pub struct AgentConfig {
     /// below turns it into a rig `CancelSignal` so the in-flight request stops.
     pub user_cancel: Arc<AtomicBool>,
     /// Resolved sandbox configuration for shell tool execution. `None` means
-    /// sandboxing is disabled (plain `sh_dangerous`, timeout still enforced).
+    /// the sandbox was never configured, in which case shell commands are
+    /// refused rather than run unsandboxed. In normal operation `main.rs`
+    /// always resolves this to a `Some(..)` (and `bwrap` is required at
+    /// startup), so commands always run inside the namespace. There is no
+    /// enable switch — the sandbox is always active when a config is present.
     pub sandbox: Option<crate::config::SandboxConfig>,
     /// Shared, live-editable `show_reasoning` display mode. The `Output` impl
     /// holds a clone and reads it on every thinking event, so `/set
@@ -1573,7 +1577,6 @@ use rig_core::OneOrMany;
         let probe = "/sandbox_probe_xyz".to_string();
 
         let sandbox = SandboxConfig {
-            enabled: Some(true),
             timeout_secs: Some(30),
             network: Some(false),
             memory_mb: None,
