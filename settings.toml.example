@@ -40,21 +40,22 @@ network = false
 # pid_isolation = true
 # drop_caps = true
 # tmp_size_mb = 256
-# Filesystem bindings. Each entry is either `{ ro = "PATH" }` / `{ rw = "PATH" }`
-# (identical host/in-sandbox path) or a remap
-# `{ rw = { from = "HOST", to = "SANDBOX" } }`. When `paths` is empty the
-# current directory is mounted read-only with a writable /tmp scratch area.
-# When `paths` is set, ONLY the listed paths are visible (deny by default) and
-# the non-shell file tools enforce the same policy, so a remap like /tmp below
-# is seen identically by the shell and by read/write.
-[[tool_config.bash.sandbox.paths]]
-rw = "."
+# Filesystem bindings. Bindings are split into two lists: `ro` for read-only
+# mounts and `rw` for read-write mounts. Each entry is either a bare PATH
+# (identical host/in-sandbox path) or a remap `{ from = "HOST", to = "SANDBOX" }`.
+# When BOTH lists are empty the current directory is mounted read-only with a
+# writable /tmp scratch area. When either list is set, ONLY the listed paths are
+# visible (deny by default) and the non-shell file tools enforce the same
+# policy, so a remap like /tmp below is seen identically by the shell and by
+# read/write.
+rw = [
+  ".",
+  { from = "./cache", to = "/var/cache/app" },
+]
 
-[[tool_config.bash.sandbox.paths]]
-rw = { from = "./cache", to = "/var/cache/app" }
-
-# [[tool_config.bash.sandbox.paths]]
-# ro = { from = "~/.cargo", to = "/opt/cargo" }
+ro = [
+  # { from = "~/.cargo", to = "/opt/cargo" },
+]
 
 # Environment policy for the sandboxed command. bwrap inherits the parent env
 # verbatim, so without this the LLM command could read host secrets (API keys,

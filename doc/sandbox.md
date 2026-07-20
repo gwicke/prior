@@ -46,21 +46,19 @@ memory_mb = 1024          # default: none (unlimited)
 pid_isolation = true      # default: true (--unshare-pid --pid)
 drop_caps = true           # default: true (--cap-drop ALL)
 tmp_size_mb = 256         # default: 256 (size of sandbox tmpfs at /tmp)
-# `paths` is an array of tables; each entry is `{ ro = "PATH" }` /
-# `{ rw = "PATH" }` (identical host/in-sandbox path) or a remap
-# `{ rw = { from = "HOST", to = "SANDBOX" } }`.
-[[tool_config.bash.sandbox.paths]]
-ro = "."
-[[tool_config.bash.sandbox.paths]]
-rw = "."
-[[tool_config.bash.sandbox.paths]]
-ro = "/usr"
-[[tool_config.bash.sandbox.paths]]
-rw = "./target"
-[[tool_config.bash.sandbox.paths]]
-ro = { from = "~/.cargo", to = "/opt/cargo" }
-[[tool_config.bash.sandbox.paths]]
-rw = { from = "./cache", to = "/var/cache/app" }
+# Bindings are split into two lists: `ro` (read-only) and `rw` (read-write).
+# Each entry is a bare PATH (identical host/in-sandbox path) or a remap
+# `{ from = "HOST", to = "SANDBOX" }`.
+ro = [
+  ".",
+  "/usr",
+  { from = "~/.cargo", to = "/opt/cargo" },
+]
+rw = [
+  ".",
+  "./target",
+  { from = "./cache", to = "/var/cache/app" },
+]
 ```
 
 ### Schema (Rust)
@@ -97,31 +95,24 @@ pub struct SandboxConfig {
     /// Size of the tmpfs mounted at /tmp inside the sandbox. Default 256 MB.
     #[serde(default)]
     pub tmp_size_mb: Option<u64>,
-    /// Filesystem bindings (see below).
+    /// Read-only filesystem bindings (bare path or `{ from, to }` remap).
     #[serde(default)]
-    pub paths: Vec<BindSpec>,
+    pub ro: Vec<BindPath>,
+    /// Read-write filesystem bindings (same shape as `ro`).
+    #[serde(default)]
+    pub rw: Vec<BindPath>,
 }
 
-/// A single filesystem binding for the sandbox.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// A single filesystem binding, parsed from a bare path or a `{ from, to }`
+/// remap. The read/write mode is implied by which list (`ro` vs `rw`) the
+/// binding is placed in, so it is not stored here.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(untagged)]
-pub enum BindSpec {
-    /// Short form: identical from/to. `ro: "."` or `rw: "./target"`.
-    Simple {
-        /// Host (and in-sandbox) path. Resolved relative to the agent CWD.
-        #[serde(rename = "ro")]
-        ro: String,
-    },
-    SimpleRw {
-        #[serde(rename = "rw")]
-        rw: String,
-    },
-    /// Remap form: different host path and in-sandbox path.
-    Remap {
-        mode: BindMode,            // "ro" | "rw"
-        from: String,              // host path (resolved relative to CWD if relative)
-        to: String,                // in-sandbox path (absolute or relative to sandbox root)
-    },
+pub enum BindPath {
+    /// Bare path, mounted read-only or read-write depending on the list.
+    Simple(String),
+    /// Explicit host→sandbox remap.
+    Remap { from: String, to: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -129,26 +120,24 @@ pub enum BindSpec {
 pub enum BindMode { Ro, Rw }
 ```
 
-> **Note on `untagged` + `ro`/`rw` keys:** Because `ro` and `rw` are mutually
-> exclusive and both render as a single string, the `Simple`/`SimpleRw` shapes
-> above are only safe if we parse `paths` as a custom `Visitor` or as a
-> `HashMap<String, String>` per entry. The recommended implementation parses
-> each entry with an explicit deserializer that accepts either
-> `{ "ro": "path" }` / `{ "rw": "path" }` or
-> `{ "mode": "ro", "from": "...", "to": "..." }`. See "Parsing" below.
+> **Note on the two-list design:** Instead of a single `paths` array where each
+> entry carries its own mode, bindings are split into two lists — `ro` and `rw`
+> — and the mode is implied by which list the entry lives in. Each entry is a
+> plain path string or a `{ from, to }` remap table. This is simpler to parse
+> (a plain `untagged` enum) and removes the per-entry `mode`/`ro`/`rw` ambiguity.
 
 ---
 
 ## The `paths` model
 
-Each entry declares one filesystem binding. Semantics mirror `bwrap`:
+Each entry in the `ro`/`rw` lists declares one filesystem binding. Semantics mirror `bwrap` (the list name selects the flag):
 
 | Config              | bwrap flag             | Meaning                                                        |
 | ------------------- | ---------------------- | -------------------------------------------------------------- |
-| `ro: P`            | `--ro-bind P P`        | Host `P` mounted read-only at the **same** path in-sandbox.    |
-| `rw: P`            | `--bind P P`           | Host `P` mounted read-write at the **same** path.              |
-| `ro:  {from,to}`   | `--ro-bind from to`    | Host `from` mounted read-only at in-sandbox `to`.              |
-| `rw:  {from,to}`   | `--bind from to`       | Host `from` mounted read-write at in-sandbox `to`.             |
+| `P`  (in `ro`)      | `--ro-bind P P`        | Host `P` mounted read-only at the **same** path in-sandbox.    |
+| `P`  (in `rw`)      | `--bind P P`           | Host `P` mounted read-write at the **same** path.              |
+| `{from,to}` (in `ro`) | `--ro-bind from to`  | Host `from` mounted read-only at in-sandbox `to`.              |
+| `{from,to}` (in `rw`) | `--bind from to`     | Host `from` mounted read-write at in-sandbox `to`.             |
 
 ### Resolution rules
 
@@ -237,8 +226,8 @@ fn run_sandboxed(cmd: &str, cfg: &SandboxConfig) -> Result<String, ToolError> {
 ```
 bwrap
   --ro-bind <cwd> <cwd>            # baseline: CWD visible read-only (if no path overrides)
-  [for each path in cfg.paths]
-      --ro-bind <from> <to>   | --bind <from> <to>
+  [for each path in cfg.ro]   --ro-bind <from> <to>
+  [for each path in cfg.rw]   --bind   <from> <to>
   --tmpfs /tmp  (size from tmp_size_mb, via --size)
   [--unshare-net]                       # unless network: true
   [--unshare-pid --pid]                 # if pid_isolation (default true)
@@ -320,12 +309,12 @@ args) rather than relying on bwrap's inheritance behavior.
 
 ### Path-binding special case
 
-When `cfg.paths` is **non-empty**, do **not** add the implicit
-`--ro-bind <cwd> <cwd>` baseline; the operator's list is authoritative
-(deny-by-default). When `paths` is empty and sandboxing is on, fall back to a
-single `--ro-bind <cwd> <cwd>` plus a writable tmpfs, so the common case
-"run commands in my project, read-only, with a scratch /tmp" works with zero
-config.
+When either binding list (`cfg.ro` or `cfg.rw`) is **non-empty**, do **not**
+add the implicit `--ro-bind <cwd> <cwd>` baseline; the operator's lists are
+authoritative (deny-by-default). When both lists are empty and sandboxing is on,
+fall back to a single `--ro-bind <cwd> <cwd>` plus a writable tmpfs, so the
+common case "run commands in my project, read-only, with a scratch /tmp" works
+with zero config.
 
 ---
 
@@ -362,8 +351,9 @@ config.
 
 ## Testing plan
 
-- **Unit:** parse `BindSpec` for all four forms (simple ro/rw, remap ro/rw);
-  assert `from`/`to` resolution (relative→CWD, `~`→home).
+- **Unit:** parse `BindPath` entries (bare path and `{ from, to }` remap) from
+  the `ro`/`rw` lists; assert `from`/`to` resolution (relative→CWD, `~`→home)
+  and that mode follows the list (ro→read-only, rw→read-write).
 - **Unit:** `build_bwrap_expr` produces the expected flag sequence for a
   representative `SandboxConfig` (assert arg vector contains
   `--ro-bind`, `--bind`, `--unshare-net`, `--cap-drop ALL`, memory wrapper).
@@ -508,19 +498,20 @@ Each phase is independently reviewable and keeps the tree buildable/testable.
 
 ### Phase 0 — Config schema & resolution (no behavior change)
 
-- [ ] Add `SandboxConfig`, `BindSpec`, `BindMode`, `ToolSettings.sandbox` to
-      `config.rs`.
-- [ ] Implement the `BindSpec` deserializer (explicit `Visitor` for
-      `{ro|rw: path}` vs `{mode, from, to}`).
+- [ ] Add `SandboxConfig` (with `ro`/`rw: Vec<BindPath>`), `BindPath`,
+      `BindMode`, `ToolSettings.sandbox` to `config.rs`.
+- [ ] Define `BindPath` as an untagged enum (`Simple(String)` /
+      `Remap { from, to }`); mode is implied by which list (`ro`/`rw`) it is in.
 - [ ] Add `ResolvedBind { mode, from: PathBuf, to: PathBuf }` and a
-      `resolve_paths(cwd, home, &[BindSpec]) -> Vec<ResolvedBind>` helper that
-      expands `~`, resolves relative paths, and validates `from` via
-      `validate_path`-style traversal.
+      `resolve_paths(cwd, home, &[BindPath], &[BindPath]) -> Vec<ResolvedBind>`
+      helper that expands `~`, resolves relative paths, and validates `from`
+      via `validate_path`-style traversal.
 - [ ] Add `RemapTable` (ordered `to -> from` map, longest-`to` prefix wins)
       built from the `ResolvedBind` list; this is the single source of truth for
       path translation shared by the shell wrapper and `validate_path`.
 - [ ] Add `Config::bash_sandbox() -> SandboxConfig` accessor (merges defaults).
-- [ ] Unit tests: parse all four `BindSpec` forms; resolve relative/`~`/absolute.
+- [ ] Unit tests: parse `BindPath` bare-path and remap forms from the `ro`/`rw`
+      lists; resolve relative/`~`/absolute; assert mode follows the list.
 - [ ] Update `settings.toml.example` with the full `sandbox:` block (commented).
 
 ### Phase 1 — Timeout + `run_sandboxed` refactor (shell tools)

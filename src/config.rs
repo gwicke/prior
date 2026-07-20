@@ -77,9 +77,19 @@ pub struct SandboxConfig {
     /// Size of the tmpfs mounted at /tmp inside the sandbox (MB). Default 256.
     #[serde(default)]
     pub tmp_size_mb: Option<u64>,
-    /// Filesystem bindings. See [`BindSpec`].
+    /// Read-only filesystem bindings. Each entry is either a bare path (mounted
+    /// at the same in-sandbox location) or an explicit `{ from, to }` remap.
+    /// Paths are resolved relative to the agent CWD (`~` expands to the home
+    /// directory). Only the bindings listed here (plus the read-only system
+    /// dirs `/usr`, `/bin`, `/lib`, `/lib64`, `/etc`) are visible inside the
+    /// sandbox; everything else on the host is hidden (deny-by-default).
     #[serde(default)]
-    pub paths: Vec<BindSpec>,
+    pub ro: Vec<BindPath>,
+    /// Read-write filesystem bindings (same shape as [`SandboxConfig::ro`]).
+    /// Writes require an `rw` binding; the non-shell file tools enforce the
+    /// same policy as the shell.
+    #[serde(default)]
+    pub rw: Vec<BindPath>,
     /// Environment-filter policy. See [`EnvPolicy`]. When unset, a built-in
     /// deny-secrets default (see [`DEFAULT_ENV_DISALLOW`]) is applied.
     #[serde(default)]
@@ -100,7 +110,8 @@ impl SandboxConfig {
             pid_isolation: self.pid_isolation.or(Some(true)),
             drop_caps: self.drop_caps.or(Some(true)),
             tmp_size_mb: self.tmp_size_mb.or(Some(256)),
-            paths: self.paths.clone(),
+            ro: self.ro.clone(),
+            rw: self.rw.clone(),
             env: self.env.clone(),
         }
     }
@@ -220,17 +231,19 @@ fn glob_match_impl(pat: &[u8], s: &[u8]) -> bool {
 
 /// A single filesystem binding for the sandbox.
 ///
-/// Two YAML forms are accepted (see [`BindSpecVisitor`]):
-/// - Simple (identical from/to): `{ ro: "path" }` or `{ rw: "path" }`.
-/// - Remap (different host vs in-sandbox path):
-///   `{ mode: "ro"|"rw", from: "host", to: "sandbox" }`.
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-pub struct BindSpec {
-    pub mode: BindMode,
-    /// Host path. Resolved relative to the agent CWD (or expanded from `~`).
-    pub from: String,
-    /// In-sandbox mount point. For the simple form this equals `from`.
-    pub to: String,
+/// Expressed either as a bare path (`from == to`, mounted at the same
+/// in-sandbox location) or as an explicit remap `{ from, to }`. The read/write
+/// mode is *not* carried here — it is implied by which list
+/// ([`SandboxConfig::ro`] vs [`SandboxConfig::rw`]) the binding is placed in.
+/// TOML accepts either a plain string or a `{ from, to }` table for each entry.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BindPath {
+    /// Bare path, mounted read-only or read-write depending on the list it is
+    /// in (`ro` vs `rw`), at the same in-sandbox location.
+    Simple(String),
+    /// Explicit host→sandbox remap.
+    Remap { from: String, to: String },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -371,10 +384,10 @@ pub fn resolve_path_policy(
     if !cfg.enabled.unwrap_or(false) {
         return None;
     }
-    if cfg.paths.is_empty() {
+    if cfg.ro.is_empty() && cfg.rw.is_empty() {
         return None;
     }
-    let binds = resolve_paths(cwd, home, &cfg.paths).ok()?;
+    let binds = resolve_paths(cwd, home, &cfg.ro, &cfg.rw).ok()?;
     Some(PathPolicy {
         remap: RemapTable::build(&binds),
         binds,
@@ -401,129 +414,49 @@ fn resolve_path(base: &Path, home: Option<&Path>, p: &str) -> PathBuf {
     }
 }
 
-/// Resolve `BindSpec`s into absolute [`ResolvedBind`]s.
+/// Resolve the `ro`/`rw` binding lists into absolute [`ResolvedBind`]s.
 ///
-/// `cwd` is the agent working directory; `home` is used to expand `~`.
-/// Relative `from`/`to` are resolved against `cwd`. The operator explicitly
-/// lists bindings, so any absolute host path is permitted (the deny-by-default
-/// root and the non-shell `validate_path` guard provide the real safety).
+/// The mode of each binding is implied by which list it came from (`ro` →
+/// read-only, `rw` → read-write). `cwd` is the agent working directory; `home`
+/// is used to expand `~`. Relative `from`/`to` are resolved against `cwd`. The
+/// operator explicitly lists bindings, so any absolute host path is permitted
+/// (the deny-by-default root and the non-shell `validate_path` guard provide
+/// the real safety).
 pub fn resolve_paths(
     cwd: &Path,
     home: Option<&Path>,
-    specs: &[BindSpec],
+    ro: &[BindPath],
+    rw: &[BindPath],
 ) -> Result<Vec<ResolvedBind>, String> {
-    let mut out = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let from = resolve_path(cwd, home, &spec.from);
-        // For the simple form, `to == from`; for remap form, `to` is the
-        // in-sandbox mount point (resolved relative to cwd like `from`).
-        let to = if spec.to == spec.from {
-            from.clone()
-        } else {
-            resolve_path(cwd, home, &spec.to)
-        };
-        out.push(ResolvedBind {
-            mode: spec.mode,
-            from,
-            to,
-        });
+    let mut out = Vec::with_capacity(ro.len() + rw.len());
+    for spec in ro {
+        out.push(resolve_one(cwd, home, spec, BindMode::Ro));
+    }
+    for spec in rw {
+        out.push(resolve_one(cwd, home, spec, BindMode::Rw));
     }
     Ok(out)
 }
 
-/// Custom deserializer for [`BindSpec`]: accepts either `{ ro|rw: path }` or
-/// `{ mode, from, to }`. The `serde(flatten)`/untagged approaches are fragile
-/// because `ro`/`rw` are mutually exclusive single-key variants, so we parse
-/// the map explicitly.
-impl<'de> Deserialize<'de> for BindSpec {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de::{MapAccess, Visitor};
-        use std::fmt;
-
-        struct BindSpecVisitor;
-
-        impl<'de> Visitor<'de> for BindSpecVisitor {
-            type Value = BindSpec;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a binding like { ro: \"path\" }, { rw: \"path\" }, or { mode, from, to }")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> Result<BindSpec, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                use serde::de::Error as _;
-
-                // A `ro`/`rw` value may be either a plain path string or a
-                // remap object `{ from, to }`.
-                #[derive(Deserialize)]
-                #[serde(untagged)]
-                enum BindValue {
-                    Path(String),
-                    Remap { from: String, to: String },
-                }
-
-                let mut ro: Option<BindValue> = None;
-                let mut rw: Option<BindValue> = None;
-                let mut mode: Option<BindMode> = None;
-                let mut from: Option<String> = None;
-                let mut to: Option<String> = None;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "ro" => ro = Some(map.next_value()?),
-                        "rw" => rw = Some(map.next_value()?),
-                        "mode" => mode = Some(map.next_value()?),
-                        "from" => from = Some(map.next_value()?),
-                        "to" => to = Some(map.next_value()?),
-                        other => {
-                            return Err(A::Error::unknown_field(
-                                other,
-                                &["ro", "rw", "mode", "from", "to"],
-                            ))
-                        }
-                    }
-                }
-
-                // Simple or remap form via `ro`/`rw`.
-                if let Some(v) = ro {
-                    if rw.is_some() || mode.is_some() || from.is_some() || to.is_some() {
-                        return Err(A::Error::custom(
-                            "simple/remap binding must only set 'ro' (or 'rw')",
-                        ));
-                    }
-                    let (mode, from, to) = match v {
-                        BindValue::Path(p) => (BindMode::Ro, p.clone(), p),
-                        BindValue::Remap { from, to } => (BindMode::Ro, from, to),
-                    };
-                    return Ok(BindSpec { mode, from, to });
-                }
-                if let Some(v) = rw {
-                    if mode.is_some() || from.is_some() || to.is_some() {
-                        return Err(A::Error::custom(
-                            "simple/remap binding must only set 'rw' (or 'ro')",
-                        ));
-                    }
-                    let (mode, from, to) = match v {
-                        BindValue::Path(p) => (BindMode::Rw, p.clone(), p),
-                        BindValue::Remap { from, to } => (BindMode::Rw, from, to),
-                    };
-                    return Ok(BindSpec { mode, from, to });
-                }
-
-                // Explicit remap form: { mode, from, to }.
-                let mode = mode.ok_or_else(|| A::Error::missing_field("mode"))?;
-                let from = from.ok_or_else(|| A::Error::missing_field("from"))?;
-                let to = to.ok_or_else(|| A::Error::missing_field("to"))?;
-                Ok(BindSpec { mode, from, to })
-            }
+/// Resolve a single [`BindPath`] (simple or remap) into a [`ResolvedBind`] with
+/// the given `mode` (which list the entry lives in).
+fn resolve_one(cwd: &Path, home: Option<&Path>, spec: &BindPath, mode: BindMode) -> ResolvedBind {
+    let (from, to) = match spec {
+        // Simple form: mounted at the same in-sandbox location as the host.
+        BindPath::Simple(p) => {
+            let from = resolve_path(cwd, home, p);
+            (from.clone(), from)
         }
-
-        deserializer.deserialize_map(BindSpecVisitor)
+        // Remap form: explicit host (`from`) and in-sandbox (`to`) paths.
+        BindPath::Remap { from, to } => (
+            resolve_path(cwd, home, from),
+            resolve_path(cwd, home, to),
+        ),
+    };
+    ResolvedBind {
+        mode,
+        from,
+        to,
     }
 }
 
@@ -601,40 +534,47 @@ pub fn read_prompt(prompt: Option<String>, prompt_file: Option<String>) -> crate
 mod tests {
     use super::*;
 
-    fn parse_bind(toml: &str) -> BindSpec {
-        toml_edit::de::from_str(toml).expect("bind spec should parse")
+    fn parse_bind(toml: &str) -> SandboxConfig {
+        toml_edit::de::from_str(toml).expect("sandbox config should parse")
     }
 
     #[test]
     fn bind_simple_ro() {
-        let b = parse_bind("ro = \"./src\"");
-        assert_eq!(b.mode, BindMode::Ro);
-        assert_eq!(b.from, "./src");
-        assert_eq!(b.to, "./src");
+        // The `ro` list takes bare paths (and `BindPath::Remap`) as read-only.
+        let cfg = parse_bind("ro = [\"./src\"]");
+        assert_eq!(cfg.ro, vec![BindPath::Simple("./src".to_string())]);
+        assert!(cfg.rw.is_empty());
     }
 
     #[test]
     fn bind_simple_rw() {
-        let b = parse_bind("rw = \"./target\"");
-        assert_eq!(b.mode, BindMode::Rw);
-        assert_eq!(b.from, "./target");
-        assert_eq!(b.to, "./target");
+        let cfg = parse_bind("rw = [\"./target\"]");
+        assert_eq!(cfg.rw, vec![BindPath::Simple("./target".to_string())]);
+        assert!(cfg.ro.is_empty());
     }
 
     #[test]
-    fn bind_remap_nested_rw() {
-        let b = parse_bind("rw = { from = \"./cache\", to = \"/var/cache/app\" }");
-        assert_eq!(b.mode, BindMode::Rw);
-        assert_eq!(b.from, "./cache");
-        assert_eq!(b.to, "/var/cache/app");
+    fn bind_remap_rw() {
+        let cfg = parse_bind("rw = [{ from = \"./cache\", to = \"/var/cache/app\" }]");
+        assert_eq!(
+            cfg.rw,
+            vec![BindPath::Remap {
+                from: "./cache".to_string(),
+                to: "/var/cache/app".to_string(),
+            }]
+        );
     }
 
     #[test]
-    fn bind_remap_explicit_mode() {
-        let b = parse_bind("mode = \"ro\"\nfrom = \"~/.cargo\"\nto = \"/opt/cargo\"");
-        assert_eq!(b.mode, BindMode::Ro);
-        assert_eq!(b.from, "~/.cargo");
-        assert_eq!(b.to, "/opt/cargo");
+    fn bind_remap_ro() {
+        let cfg = parse_bind("ro = [{ from = \"~/.cargo\", to = \"/opt/cargo\" }]");
+        assert_eq!(
+            cfg.ro,
+            vec![BindPath::Remap {
+                from: "~/.cargo".to_string(),
+                to: "/opt/cargo".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -647,7 +587,8 @@ mod tests {
             pid_isolation: None,
             drop_caps: None,
             tmp_size_mb: None,
-            paths: vec![],
+            ro: vec![],
+            rw: vec![],
             env: None,
         };
         let d = raw.with_defaults(true);
@@ -667,21 +608,48 @@ mod tests {
     }
 
     #[test]
+    fn default_config_is_enabled_when_bwrap_present() {
+        // The bug: when no `[tool_config.bash.sandbox]` block is configured, the
+        // resolved config must still default to *enabled* as long as bwrap is
+        // present. `run()` guarantees bwrap is present (it fails closed at
+        // startup via `check_runtime_deps`), so the sandbox can never be
+        // silently disabled just because the config block was omitted.
+        let raw = SandboxConfig::default();
+        assert_eq!(raw.with_defaults(true).enabled, Some(true));
+    }
+
+    #[test]
+    fn explicit_disable_is_honored() {
+        // An explicit `enabled = false` is the only supported opt-out and must
+        // survive the merge with defaults, letting the command run unsandboxed.
+        let raw = SandboxConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(raw.with_defaults(true).enabled, Some(false));
+    }
+
+    #[test]
     fn resolve_paths_resolves_relative_and_home() {
+        // `ro` entries resolve read-only; `rw` entries read-write. Mode is
+        // implied by which list the binding lives in, not stored per-binding.
         let binds = resolve_paths(
             Path::new("/work"),
             Some(Path::new("/home/u")),
+            &[BindPath::Simple(".".to_string())],
             &[
-                parse_bind("rw = \".\""),
-                parse_bind("rw = { from = \"./cache\", to = \"/var/cache/app\" }"),
-                parse_bind("ro = { from = \"~/.cargo\", to = \"/opt/cargo\" }"),
+                BindPath::Remap { from: "./cache".to_string(), to: "/var/cache/app".to_string() },
+                BindPath::Remap { from: "~/.cargo".to_string(), to: "/opt/cargo".to_string() },
             ],
         )
         .unwrap();
+        assert_eq!(binds[0].mode, BindMode::Ro);
         assert_eq!(binds[0].from, Path::new("/work"));
         assert_eq!(binds[0].to, Path::new("/work"));
+        assert_eq!(binds[1].mode, BindMode::Rw);
         assert_eq!(binds[1].from, Path::new("/work/cache"));
         assert_eq!(binds[1].to, Path::new("/var/cache/app"));
+        assert_eq!(binds[2].mode, BindMode::Rw);
         assert_eq!(binds[2].from, Path::new("/home/u/.cargo"));
         assert_eq!(binds[2].to, Path::new("/opt/cargo"));
     }
@@ -691,9 +659,11 @@ mod tests {
         let binds = resolve_paths(
             Path::new("/work"),
             None,
-            &[parse_bind("rw = { from = \"./scratch\", to = \"/tmp\" }")],
+            &[],
+            &[BindPath::Remap { from: "./scratch".to_string(), to: "/tmp".to_string() }],
         )
         .unwrap();
+        assert_eq!(binds[0].mode, BindMode::Rw);
         let table = RemapTable::build(&binds);
         assert_eq!(table.rewrite(Path::new("/tmp/x")), Path::new("/work/scratch/x"));
         // Non-remapped path is unchanged.
