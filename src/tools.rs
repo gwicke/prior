@@ -595,7 +595,7 @@ fn build_bwrap_args(
     let home = dirs_home();
 
     // Resolve the configured bindings (empty list => CWD-visible default).
-    let mut binds = resolve_paths(&cwd, home.as_deref(), &cfg.paths)
+    let mut binds = resolve_paths(&cwd, home.as_deref(), &cfg.ro, &cfg.rw)
         .map_err(|e| ToolError::Generic(format!("sandbox config error: {e}")))?;
     // Emit bindings most-specific-first: sort by the in-sandbox `to` path depth
     // so the deepest (most specific) binding is mounted LAST. bwrap resolves
@@ -945,7 +945,7 @@ mod tests {
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
-    use crate::config::{BindMode, BindSpec, EnvMode, EnvPolicy, SandboxConfig};
+    use crate::config::{BindPath, EnvMode, EnvPolicy, SandboxConfig};
     use serial_test::serial;
 
     fn bwrap_on_path() -> bool {
@@ -958,7 +958,11 @@ mod sandbox_tests {
             .unwrap_or(false)
     }
 
-    fn sandbox_with(paths: Vec<BindSpec>, timeout_secs: Option<u64>) -> SandboxConfig {
+    fn sandbox_with(
+        ro: Vec<BindPath>,
+        rw: Vec<BindPath>,
+        timeout_secs: Option<u64>,
+    ) -> SandboxConfig {
         SandboxConfig {
             enabled: Some(true),
             timeout_secs,
@@ -967,7 +971,8 @@ mod sandbox_tests {
             pid_isolation: Some(true),
             drop_caps: Some(true),
             tmp_size_mb: Some(16),
-            paths,
+            ro,
+            rw,
             env: None,
         }
     }
@@ -979,7 +984,7 @@ mod sandbox_tests {
             return;
         }
         // Default (empty paths): read-only CWD + writable tmpfs.
-        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
         let out = run_sandboxed("echo hello-world", None).await.unwrap();
         assert_eq!(out, "hello-world");
     }
@@ -990,7 +995,7 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
         let out = run_sandboxed("echo x > /tmp/probe && cat /tmp/probe", None).await.unwrap();
         assert_eq!(out, "x");
     }
@@ -1001,7 +1006,7 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        set_sandbox(Some(sandbox_with(vec![], Some(1))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(1))));
         let res = run_sandboxed("sleep 30", None).await;
         assert!(res.is_err(), "expected timeout error, got {:?}", res);
         assert!(res.unwrap_err().to_string().contains("timed out"));
@@ -1015,12 +1020,14 @@ mod sandbox_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         // Bind the temp dir read-write at /work inside the namespace.
-        let spec = BindSpec {
-            mode: BindMode::Rw,
-            from: dir.path().to_string_lossy().to_string(),
-            to: "/work".to_string(),
-        };
-        set_sandbox(Some(sandbox_with(vec![spec], Some(30))));
+        set_sandbox(Some(sandbox_with(
+            vec![],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/work".to_string(),
+            }],
+            Some(30),
+        )));
         let out = run_sandboxed("echo inside > /work/probe.txt && cat /work/probe.txt", None)
             .await
             .unwrap();
@@ -1041,7 +1048,8 @@ mod sandbox_tests {
             pid_isolation: None,
             drop_caps: None,
             tmp_size_mb: None,
-            paths: vec![],
+            ro: vec![],
+            rw: vec![],
             env: None,
         }));
         let res = run_sandboxed("sleep 30", None).await;
@@ -1056,7 +1064,7 @@ mod sandbox_tests {
     async fn bash_timeout_override_short_kills_hung_command() {
         // A short per-call override short-circuits the long configured default
         // and kills a hung command.
-        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(300))));
         let res = run_sandboxed("sleep 30", Some(1)).await;
         assert!(res.is_err(), "expected timeout error, got {:?}", res);
         assert!(res.unwrap_err().to_string().contains("timed out"));
@@ -1067,7 +1075,7 @@ mod sandbox_tests {
     async fn bash_timeout_override_positive_works() {
         // A generous override lets a quick command succeed even when the
         // configured default is too short.
-        set_sandbox(Some(sandbox_with(vec![], Some(1))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(1))));
         let out = run_sandboxed("echo ok", Some(30)).await.unwrap();
         assert_eq!(out, "ok");
     }
@@ -1075,7 +1083,7 @@ mod sandbox_tests {
     #[tokio::test]
     #[serial]
     async fn bash_timeout_override_zero_rejected() {
-        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(300))));
         let res = run_sandboxed("echo hi", Some(0)).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("invalid timeout"));
@@ -1084,7 +1092,7 @@ mod sandbox_tests {
     #[tokio::test]
     #[serial]
     async fn bash_timeout_override_above_max_rejected() {
-        set_sandbox(Some(sandbox_with(vec![], Some(300))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(300))));
         let res = run_sandboxed("echo hi", Some(super::MAX_TIMEOUT_SECS + 1)).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("invalid timeout"));
@@ -1094,8 +1102,8 @@ mod sandbox_tests {
 
     /// Set a sandbox with explicit bindings so the non-shell path policy is
     /// active (requires bwrap, like the shell sandbox).
-    fn sandbox_with_paths(paths: Vec<BindSpec>) {
-        set_sandbox(Some(sandbox_with(paths, Some(30))));
+    fn sandbox_with_paths(ro: Vec<BindPath>, rw: Vec<BindPath>) {
+        set_sandbox(Some(sandbox_with(ro, rw, Some(30))));
     }
 
     #[tokio::test]
@@ -1106,11 +1114,13 @@ mod sandbox_tests {
         }
         // CWD bound read-only.
         let cwd = std::env::current_dir().unwrap();
-        sandbox_with_paths(vec![BindSpec {
-            mode: BindMode::Ro,
-            from: cwd.to_string_lossy().to_string(),
-            to: cwd.to_string_lossy().to_string(),
-        }]);
+        sandbox_with_paths(
+            vec![BindPath::Remap {
+                from: cwd.to_string_lossy().to_string(),
+                to: cwd.to_string_lossy().to_string(),
+            }],
+            vec![],
+        );
         let res = super::write_file("should_fail.txt".to_string(), "x".to_string()).await;
         assert!(res.is_err(), "write under ro binding should be denied");
         assert!(res.unwrap_err().to_string().contains("read-only"));
@@ -1124,11 +1134,13 @@ mod sandbox_tests {
         }
         // Only a subdir is bound; writing elsewhere (still under CWD) is denied.
         let dir = tempfile::tempdir().unwrap();
-        sandbox_with_paths(vec![BindSpec {
-            mode: BindMode::Rw,
-            from: dir.path().to_string_lossy().to_string(),
-            to: dir.path().to_string_lossy().to_string(),
-        }]);
+        sandbox_with_paths(
+            vec![],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: dir.path().to_string_lossy().to_string(),
+            }],
+        );
         // The crate root is not bound, so this is rejected.
         let res = super::write_file("outside.txt".to_string(), "x".to_string()).await;
         assert!(res.is_err());
@@ -1148,18 +1160,16 @@ mod sandbox_tests {
         let dir = tempfile::tempdir().unwrap();
         let ro_sub = dir.path().join("ro");
         std::fs::create_dir_all(&ro_sub).unwrap();
-        sandbox_with_paths(vec![
-            BindSpec {
-                mode: BindMode::Rw,
-                from: dir.path().to_string_lossy().to_string(),
-                to: "/proj".to_string(),
-            },
-            BindSpec {
-                mode: BindMode::Ro,
+        sandbox_with_paths(
+            vec![BindPath::Remap {
                 from: ro_sub.to_string_lossy().to_string(),
                 to: "/proj/ro".to_string(),
-            },
-        ]);
+            }],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/proj".to_string(),
+            }],
+        );
         // Write under the rw parent succeeds.
         super::write_file("/proj/writable.txt".to_string(), "x".to_string())
             .await
@@ -1179,11 +1189,13 @@ mod sandbox_tests {
         // Bind a temp dir at the in-sandbox path /tmp (rw). Both the shell and
         // the non-shell tools must address the same host file.
         let dir = tempfile::tempdir().unwrap();
-        sandbox_with_paths(vec![BindSpec {
-            mode: BindMode::Rw,
-            from: dir.path().to_string_lossy().to_string(),
-            to: "/tmp".to_string(),
-        }]);
+        sandbox_with_paths(
+            vec![],
+            vec![BindPath::Remap {
+                from: dir.path().to_string_lossy().to_string(),
+                to: "/tmp".to_string(),
+            }],
+        );
 
         // Non-shell write to /tmp/x.
         super::write_file("/tmp/x.txt".to_string(), "from-tool".to_string())
@@ -1220,19 +1232,15 @@ mod sandbox_tests {
         let dir = tempfile::tempdir().unwrap();
         let ro_sub = dir.path().join("ro");
         std::fs::create_dir_all(&ro_sub).unwrap();
-        let specs = vec![
-            BindSpec {
-                mode: BindMode::Ro,
-                from: ro_sub.to_string_lossy().to_string(),
-                to: "/proj/ro".to_string(),
-            },
-            BindSpec {
-                mode: BindMode::Rw,
-                from: dir.path().to_string_lossy().to_string(),
-                to: "/proj".to_string(),
-            },
-        ];
-        set_sandbox(Some(sandbox_with(specs, Some(30))));
+        let specs_ro = vec![BindPath::Remap {
+            from: ro_sub.to_string_lossy().to_string(),
+            to: "/proj/ro".to_string(),
+        }];
+        let specs_rw = vec![BindPath::Remap {
+            from: dir.path().to_string_lossy().to_string(),
+            to: "/proj".to_string(),
+        }];
+        set_sandbox(Some(sandbox_with(specs_ro, specs_rw, Some(30))));
         let out = run_sandboxed(
             "touch /proj/ro/x; if [ -e /proj/ro/x ]; then echo WRITE_OK; else echo WRITE_DENIED; fi; \
              touch /proj/parent_file.txt; if [ -e /proj/parent_file.txt ]; then echo PARENT_OK; else echo PARENT_DENIED; fi",
@@ -1256,7 +1264,8 @@ mod sandbox_tests {
             pid_isolation: Some(true),
             drop_caps: Some(true),
             tmp_size_mb: Some(16),
-            paths: vec![],
+            ro: vec![],
+            rw: vec![],
             env: Some(env),
         }
     }
@@ -1268,7 +1277,7 @@ mod sandbox_tests {
             return;
         }
         // No `env` configured => built-in deny-secrets default (drops *_KEY etc).
-        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
         std::env::set_var("PICOCODE_TEST_KEY", "supersecret");
         // PATH must still be present for `cat` (external) to work, proving the
         // default is a blacklist, not a blanket wipe.
@@ -1353,7 +1362,7 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        set_sandbox(Some(sandbox_with(vec![], Some(30))));
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
         // A multi-statement command: the trailing `> /tmp/.picocode-out`
         // redirect must scope the *whole* command, not just the last segment.
         let multi = run_sandboxed("echo a; echo b; echo c", None).await.unwrap();

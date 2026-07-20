@@ -128,14 +128,16 @@ enabled = true          # auto-enabled only if bwrap is on PATH
 timeout_secs = 120
 network = false         # unshare network by default
 memory_mb = 1024        # optional RLIMIT_AS cap
-# Deny-by-default: only the listed paths are visible.
-[[tool_config.bash.sandbox.paths]]
-rw = "."
-[[tool_config.bash.sandbox.paths]]
-rw = { from = "./cache", to = "/var/cache/app" }  # remap
+# Deny-by-default: only the listed paths are visible. Split into read-only
+# (`ro`) and read-write (`rw`) lists; each entry is a bare path or a remap.
+rw = [
+  ".",
+  { from = "./cache", to = "/var/cache/app" },  # remap
+]
+ro = []
 ```
 
-- **Deny-by-default filesystem**: when `paths` is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.
+- **Deny-by-default filesystem**: when either `rw`/`ro` list is set, only the listed bindings are visible (plus read-only `/usr`, `/bin`, `/lib`, `/lib64`, `/etc` so tools can execute). The non-shell file tools (`read_file`, `write_file`, `edit_file`, `glob_files`, `grep_text`, `list_dir`, `make_dir`, `remove`, `move_file`, `copy_file`) enforce the **same** policy, so a remap like `/tmp` is seen identically by the shell and by the file tools. Writes require an `rw` binding; paths outside all bindings are denied.
 - When `bwrap` is absent, commands run unsandboxed (with the timeout still enforced) and a warning is printed.
 - This is defense-in-depth for an LLM-driven shell, not a jail against root — run picocode as an unprivileged user.
 

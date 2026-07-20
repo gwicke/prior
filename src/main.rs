@@ -215,11 +215,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| picocode::persona::get_persona(p));
 
     // Resolve the sandbox config: merge user settings with built-in defaults.
-    // `bwrap` is required at startup (see `check_runtime_deps`), so it is
-    // always present here.
-    let sandbox = config
-        .bash_sandbox_raw()
-        .map(|raw| raw.with_defaults(true));
+    // The sandbox is auto-enabled when `bwrap` is present, so we must always
+    // produce a config — even when the user supplied no
+    // `[tool_config.bash.sandbox]` block. If we only mapped over
+    // `bash_sandbox_raw()` (which returns `None` when that block is absent), a
+    // missing block would silently disable the sandbox, leaving commands
+    // running unsandboxed (and able to reach the whole host filesystem).
+    // Starting from a default config guarantees the auto-enable path in
+    // `with_defaults` is reached. `bwrap` is required at startup (see
+    // `check_runtime_deps`), so it is always present here.
+    let sandbox = Some(
+        config
+            .bash_sandbox_raw()
+            .cloned()
+            .unwrap_or_default()
+            .with_defaults(true),
+    );
 
     let agent_config = AgentConfig {
         provider: provider.clone(),
