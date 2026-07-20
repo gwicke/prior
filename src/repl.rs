@@ -940,7 +940,25 @@ impl Repl {
                 Ok(Event::Paste(text)) => {
                     editor.insert_str(&text);
                 }
-                Ok(_) => {} // resize/mouse: ignored (Stage 6 redraw)
+                Ok(Event::Resize(_, _)) => {
+                    // The terminal changed size. Because the session history is
+                    // plain stdout on the primary screen (no alt buffer), the
+                    // terminal's native scroll reflows: a taller window reveals
+                    // older scrollback and the live input line's *visible* row
+                    // moves with it (it pins to the new bottom when the session
+                    // has overflowed, and stays put on a short session). `input_row`
+                    // is still the stale pre-resize row, and the loop-top `redraw`
+                    // clears from `input_row` to end-of-screen with `\x1b[0J`. If
+                    // `input_row` now sits above the input line, that clear wipes
+                    // the scrollback a maximized window just revealed — losing
+                    // history. Re-anchor `input_row` to the real cursor (a DSR
+                    // query) so the next `redraw` only clears below the actual
+                    // input line. Note: Ctrl-Z + maximize + fg is immune because
+                    // the process is stopped, SIGWINCH is dropped, and no
+                    // `redraw` ever runs.
+                    input_row = output.cursor_row();
+                }
+                Ok(_) => {} // other events (mouse): ignored
                 Err(_) => return None,
             }
         }
