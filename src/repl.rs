@@ -327,6 +327,8 @@ impl Repl {
         let mut cur_word = String::new();
         let mut cur_filter = String::new();
         let mut value_error: Option<String> = None;
+        // Path completions for Tab in the regular prompt (kind 9 overlay).
+        let mut path_completions: Vec<String> = Vec::new();
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -643,6 +645,17 @@ impl Repl {
                         }
                     }
             }
+            // Path completions overlay for the regular prompt (Tab pressed
+            // while kind == 0).  Show the cached completions from the Tab
+            // handler below.
+            if kind == 0 && !path_completions.is_empty() {
+                kind = 9;
+                title = "Path completions  (up/down, Tab/Enter select, Esc dismiss)".into();
+                opts = path_completions.clone();
+                active = None;
+                cur_word = "path".into();
+                cur_filter.clear();
+            }
             if kind != last_kind {
                 sel = 0;
                 last_kind = kind;
@@ -859,6 +872,13 @@ impl Repl {
                                             }
                                         }
                                     }
+                                    9 => {
+                                        if let Some(c) = path_completions.get(sel) {
+                                            let buf = editor.text();
+                                            editor.set(&Self::replace_last_token(&buf, c));
+                                            path_completions.clear();
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1053,6 +1073,13 @@ impl Repl {
                                                 editor.set(&format!("/sandbox {} ", c));
                                             }
                                         }
+                                        9 => {
+                                            if let Some(c) = path_completions.get(sel) {
+                                                let buf = editor.text();
+                                                editor.set(&Self::replace_last_token(&buf, c));
+                                                path_completions.clear();
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1084,9 +1111,17 @@ impl Repl {
                                 8 => {
                                     editor.set("");
                                 }
+                                9 => {
+                                    path_completions.clear();
+                                }
                                 _ => {}
                             },
                             _ => {
+                                // Any editing key while the path-completion overlay is
+                                // active dismisses it (user is typing something else).
+                                if kind == 9 {
+                                    path_completions.clear();
+                                }
                                 if let Some(a) =
                                     Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                                 {
@@ -1100,6 +1135,29 @@ impl Repl {
                         continue;
                     }
                     // No overlay: normal editing.
+                    // Tab: file-path completion on the last whitespace-delimited token.
+                    if let KeyCode::Tab = key.code {
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT)
+                        {
+                            let buf = editor.text();
+                            let last_token = buf
+                                .split_whitespace()
+                                .last()
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            if !last_token.is_empty() {
+                                let completions = complete_path_prefix_impl(&last_token);
+                                if completions.len() == 1 {
+                                    editor.set(&Self::replace_last_token(&buf, &completions[0]));
+                                } else if !completions.is_empty() {
+                                    path_completions = completions;
+                                    sel = 0;
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(a) =
                         Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                     {
