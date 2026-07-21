@@ -1,6 +1,9 @@
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx};
 use crate::settings::SettingsStore;
+use crate::session::Session;
+use crate::session::repo::SessionRepo;
+use crate::session::storage::SessionStorage;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
     MoveFile, ReadFile, Remove, WriteFile,
@@ -19,7 +22,7 @@ use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
 use rig_core::completion::{CompletionModel, PromptError};
 use rig_core::message::Message;
-use rig_core::message::{AssistantContent, Text, ToolResult, UserContent};
+use rig_core::message::{AssistantContent, Text, ToolResult, ToolResultContent, UserContent};
 use rig_core::OneOrMany;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
@@ -69,7 +72,7 @@ pub struct SessionUsage {
 
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
-    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String>;
+    async fn prompt(&self, input: &str, session: Option<&Session>) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
     /// result means no completion call has reported usage yet.
@@ -81,7 +84,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
     async fn prompt(
         &self,
         input: &str,
-        mut history: Option<&mut Vec<Message>>,
+        session: Option<&Session>,
     ) -> Result<String> {
         self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
@@ -92,9 +95,29 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         // this point. See doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
 
-        // Clone the prior history (owned) so we can still write the updated
-        // history back through the `&mut` borrow afterwards.
-        let prior: Vec<Message> = history.as_ref().map(|h| (*h).clone()).unwrap_or_default();
+        // Build prior context from session, or use empty vec as fallback.
+        let prior: Vec<Message> = if let Some(s) = session {
+            match s.build_context().await {
+                Ok(ctx) => {
+                    // Apply reasoning stripping to the LLM-bound context.
+                    // The session stores pre-strip messages; stripping is
+                    // applied here before sending to the service.
+                    maybe_strip_reasoning(
+                        ctx.messages,
+                        self.reasoning_in_context,
+                        &self.provider,
+                        &self.model,
+                    )
+                }
+                Err(e) => {
+                    // Session index may be stale; log and fall back to empty.
+                    eprintln!("Warning: session build_context failed: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -200,19 +223,13 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                             // steering message sees the user's input and any partial
                             // assistant text, rather than having it silently dropped.
                             // See doc/pi_steering_rig.md §6.5.3.
-                            if let Some(ref mut h) = history {
-                                let mut partial = vec![Message::user(input)];
+                            if let Some(s) = session {
+                                let user_msg = Message::user(input);
+                                let _ = s.append_message(&user_msg).await;
                                 if !output.is_empty() {
-                                    partial.push(Message::assistant(&output));
+                                    let partial = Message::assistant(&output);
+                                    let _ = s.append_message(&partial).await;
                                 }
-                                let to_commit = maybe_strip_reasoning(
-                                    partial,
-                                    self.reasoning_in_context,
-                                    &self.provider,
-                                    &self.model,
-                                );
-                                let to_commit = normalize_call_ids(to_commit);
-                                h.extend(to_commit);
                             }
                             self.output.end_response();
                             return Err(crate::PicocodeError::Other(e.to_string()));
@@ -227,17 +244,12 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                         // closes the HTTP connection; any running tool was already
                         // killed by the watchdog (Phase 1a-d tool-cancel channel).
                         //
-                        // Persist the partial turn before breaking, since we
-                        // won't receive a PromptCancelled error with full_history
-                        // (we're breaking out before the hook has a chance to fire).
-                        if let Some(h) = history.as_ref() {
-                            let mut partial = Vec::clone(h);
-                            partial.push(Message::user(input));
-                            if !output.is_empty() {
-                                partial.push(Message::assistant(&output));
-                            }
-                            cancelled_history = Some(partial);
+                        // Capture partial turn for persistence.
+                        let mut partial = vec![Message::user(input)];
+                        if !output.is_empty() {
+                            partial.push(Message::assistant(&output));
                         }
+                        cancelled_history = Some(partial);
                         aborted = true;
                         break;
                     }
@@ -246,18 +258,22 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         }
         self.output.end_response();
 
-        // Persist history across turns. `persist_turn` appends a completed turn
-        // (fixing root cause #1, which previously *replaced* the whole history
-        // and dropped every earlier exchange) and, on cancellation, replaces
-        // with the in-flight full history (root cause #2).
-        persist_turn(
-            &mut history,
-            final_history,
-            cancelled_history,
-            self.reasoning_in_context,
-            &self.provider,
-            &self.model,
-        );
+        // Persist the turn into the session (or fallback to no persistence).
+        if let Some(s) = session {
+            // Store pre-strip messages (strip is applied to LLM context above,
+            // not at storage time — see doc/session_storage.md §4).
+            if let Some(fh) = final_history {
+                let to_commit = normalize_call_ids(fh);
+                for msg in to_commit {
+                    let _ = s.append_message(&msg).await;
+                }
+            } else if let Some(ch) = cancelled_history {
+                let to_commit = normalize_call_ids(ch);
+                for msg in to_commit {
+                    let _ = s.append_message(&msg).await;
+                }
+            }
+        }
 
         if aborted {
             return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
@@ -355,6 +371,7 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
     ///   (thinking+tool_use contract); reasoning is force-kept there. On
     ///   Anthropic turns *without* tool calls, and on all other providers when
     ///   the flag is `false`, reasoning is stripped normally.
+    #[allow(dead_code)]
     fn persist_turn(
         history: &mut Option<&mut Vec<Message>>,
         final_history: Option<Vec<Message>>,
@@ -1061,6 +1078,538 @@ fn guard<T: Tool>(
     }
 }
 
+/// Build session context data for the `/session` overlay.
+///
+/// Returns (sessions list, branch message previews).
+/// The current session id is passed in directly (avoids blocking_lock in async context).
+async fn build_session_ctx(
+    session: &Option<Session>,
+    repo: &Option<crate::session::repo::JsonlSessionRepo>,
+) -> (Vec<crate::repl::SessionMeta>, Vec<(String, String)>) {
+    let sessions = if let Some(repo) = repo {
+        let cwd = std::env::current_dir().ok();
+        repo.list(cwd.as_deref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| crate::repl::SessionMeta {
+                id: m.id,
+                name: m.name,
+                timestamp: m.timestamp,
+                cwd: m.cwd,
+                parent_session: m.parent_session.map(|p| p.display().to_string()),
+                message_count: m.message_count,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let branch_messages = if let Some(s) = session {
+        let branch = s.get_branch().await;
+        let mut msgs: Vec<(String, String)> = Vec::new();
+        for entry in &branch {
+            if let crate::session::SessionEntryContent::Message { message } = &entry.content {
+                if message.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    let preview = message
+                        .pointer("/content/0/text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    msgs.push((entry.id.clone(), preview));
+                }
+            }
+        }
+        msgs
+    } else {
+        Vec::new()
+    };
+
+    (sessions, branch_messages)
+}
+
+/// Result of handling a `/session` command.
+enum SessionCommandResult {
+    /// Input was not a session command (pass through).
+    NotSession,
+    /// Session command handled, current session unchanged.
+    Handled,
+    /// Session command created/resumed a new session with this ID.
+    Switched(String),
+    /// Session command deleted a session.
+    Deleted,
+}
+
+/// Parse the session name and remaining text from a `/session <rest>` string.
+fn parse_session_name_after(rest: &str) -> (String, String) {
+    if rest.starts_with('"') {
+        if let Some(end) = rest[1..].find('"').map(|i| i + 2) {
+            let n = rest[1..end - 1].to_string();
+            let after = rest[end..].trim().to_string();
+            (n, after)
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let n = parts.next().unwrap_or("").to_string();
+        (n, parts.next().unwrap_or("").to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Session replay helpers
+// ---------------------------------------------------------------------------
+
+/// One assistant segment: the content streamed between tool executions (or the
+/// whole final answer when there are no more tools to run in this turn).
+struct AssistantSegment {
+    /// Reasoning/thinking blocks in message order.
+    thinking: Vec<String>,
+    /// Answer text blocks in message order.
+    text: Vec<String>,
+    /// Tool calls from the assistant message: `(call_id, name, args)`.
+    /// Populated during grouping; matched against results when the following
+    /// `User { ToolResult }` message is processed.
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    /// Tool results keyed by call ID: `(call_id, text)`.
+    /// Populated when the subsequent `User { ToolResult }` message is seen.
+    tool_results: Vec<(String, String)>,
+}
+
+impl AssistantSegment {
+    fn new() -> Self {
+        Self {
+            thinking: Vec::new(),
+            text: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+}
+
+/// One complete conversation turn: the user's text prompt followed by the
+/// full chain of assistant segments (`text/reasoning → tool block → …`).
+struct ConversationTurn {
+    user_text: String,
+    segments: Vec<AssistantSegment>,
+}
+
+/// Group a flat `Vec<Message>` (from `SessionContext::messages`) into replay
+/// turns.
+///
+/// A `User { Text }` opens a new `ConversationTurn`. A `User { ToolResult }`
+/// populates `tool_results` on the most recent assistant segment — these
+/// always follow the assistant message that issued the calls. An `Assistant`
+/// message appends a new segment to the current turn.
+fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+
+    for msg in messages {
+        match msg {
+            Message::User { content } => {
+                let mut user_text: Option<String> = None;
+                let mut tool_results: Vec<(String, String)> = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        UserContent::Text(t) if user_text.is_none() => {
+                            user_text = Some(t.text.clone());
+                        }
+                        UserContent::ToolResult(tr) => {
+                            let text = tr
+                                .content
+                                .iter()
+                                .filter_map(|rc| match rc {
+                                    ToolResultContent::Text(t) => Some(t.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            tool_results.push((tr.id.clone(), text));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if let Some(txt) = user_text {
+                    // New conversation turn.
+                    turns.push(ConversationTurn { user_text: txt, segments: Vec::new() });
+                } else if !tool_results.is_empty() {
+                    // Attach to the most recent segment of the current turn.
+                    if let Some(turn) = turns.last_mut() {
+                        if let Some(seg) = turn.segments.last_mut() {
+                            seg.tool_results.extend(tool_results);
+                        }
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                if let Some(turn) = turns.last_mut() {
+                    let mut seg = AssistantSegment::new();
+                    for item in content.iter() {
+                        match item {
+                            AssistantContent::Reasoning(r) => {
+                                let t: String = r
+                                    .content
+                                    .iter()
+                                    .filter_map(|rc| match rc {
+                                        ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                                        ReasoningContent::Summary(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if !t.is_empty() {
+                                    seg.thinking.push(t);
+                                }
+                            }
+                            AssistantContent::Text(t) if !t.text.is_empty() => {
+                                seg.text.push(t.text.clone());
+                            }
+                            AssistantContent::ToolCall(tc) => {
+                                seg.tool_calls.push((
+                                    tc.id.clone(),
+                                    tc.function.name.clone(),
+                                    tc.function.arguments.clone(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    turn.segments.push(seg);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    turns
+}
+
+/// Replay stored session turns through the same Output event sequence the live
+/// streaming path uses (`PicoAgent::prompt`). Groups the flat message list
+/// into conversation turns, then drives:
+///
+///   `begin_response` / `set_answer_hold` /
+///   `stream_thinking` / `stream_text` /
+///   `end_response_segment` / `display_tool_call` / `display_tool_result` /
+///   `end_response`
+///
+/// in the identical order the live path produces, so `ConsoleOutput` renders
+/// replayed content exactly as it rendered the original live session.
+fn replay_recent_turns(
+    output: &Arc<dyn Output>,
+    ctx: &crate::session::SessionContext,
+    replay_turns: usize,
+) {
+    let turns = group_into_turns(&ctx.messages);
+    // Take the N most recent complete turns (accurate count, not a raw-message
+    // estimate like the old `len - replay_turns * 2 + 1` heuristic).
+    let start = turns.len().saturating_sub(replay_turns);
+
+    for (turn_idx, turn) in turns[start..].iter().enumerate() {
+        // Separator before each user prompt mirrors the top-of-loop separator
+        // in `run_interactive`. Skip it for the very first replayed turn: the
+        // loop already emitted one before the `/session resume` input was read.
+        if turn_idx > 0 {
+            output.display_separator();
+        }
+        output.display_plain(&turn.user_text);
+
+        if turn.segments.is_empty() {
+            continue;
+        }
+
+        // Pre-response separator: mirrors `run_interactive`'s separator between
+        // the submitted user prompt and the start of the agent response.
+        output.display_separator();
+
+        output.begin_response();
+        // Replay is non-streaming; content is already in the correct order.
+        // Answer-hold exists to reorder live-stream content that arrives out of
+        // sequence (reasoning after answer); it is never needed in replay.
+        output.set_answer_hold(false);
+
+        let seg_count = turn.segments.len();
+        for (seg_idx, segment) in turn.segments.iter().enumerate() {
+            let is_last_segment = seg_idx + 1 == seg_count;
+
+            for thinking in &segment.thinking {
+                output.stream_thinking(thinking);
+            }
+            for text in &segment.text {
+                output.stream_text(text);
+            }
+
+            if !segment.tool_calls.is_empty() {
+                // Flush the current text/reasoning block before the tool panel.
+                // Mirrors the `CompletionCall` stream event that fires in the
+                // live path immediately before `LoggingHook::on_tool_call`.
+                output.end_response_segment();
+                for (call_id, name, args) in &segment.tool_calls {
+                    output.display_tool_call(name, args);
+                    // Emit the matching result immediately after its call, so
+                    // `ConsoleOutput::last_tool` is always set when the result
+                    // renders (drives language guessing and gutter stripping).
+                    // A cancelled turn may have calls with no stored result;
+                    // skip `display_tool_result` rather than showing garbage.
+                    if let Some((_, result_text)) =
+                        segment.tool_results.iter().find(|(rid, _)| rid == call_id)
+                    {
+                        output.display_tool_result(result_text);
+                    }
+                }
+            } else if !is_last_segment {
+                // Defensive: a segment with no tool calls but more segments
+                // follow (shouldn't occur in a well-formed session). Flush to
+                // keep the renderer state clean.
+                output.end_response_segment();
+            }
+        }
+
+        output.end_response();
+    }
+}
+
+/// Parse and dispatch a `/session <name> <action>` command.
+
+/// Parse and dispatch a `/session <name> <action>` command.
+async fn handle_session_command(
+    input: &str,
+    session: &mut Option<Session>,
+    repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
+    config: &mut AgentConfig,
+    output: &Arc<dyn Output>,
+    settings: &SettingsStore,
+) -> SessionCommandResult {
+    let input = input.trim();
+    if !input.starts_with("/session") {
+        return SessionCommandResult::NotSession;
+    }
+
+    let rest = input["/session".len()..].trim();
+    if rest.is_empty() {
+        return SessionCommandResult::Handled;
+    }
+
+    let (name, after_name) = parse_session_name_after(rest);
+
+    if name.is_empty() {
+        return SessionCommandResult::Handled;
+    }
+
+    let (action, arg) = if let Some((a, r)) = after_name.split_once(char::is_whitespace) {
+        (a.to_string(), Some(r.trim().to_string()))
+    } else {
+        (after_name.clone(), None)
+    };
+
+    let action = action.to_lowercase();
+
+    let meta = if let Some(repo) = repo {
+        let cwd = std::env::current_dir().ok();
+        repo.list(cwd.as_deref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.name.as_deref() == Some(&name) || m.id == name)
+    } else {
+        None
+    };
+
+    match action.as_str() {
+        "resume" => {
+            if let Some(meta) = meta {
+                // Parse optional replay turn count from argument.
+                let replay_turns = arg
+                    .as_deref()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(settings.session_resume_replay_turns);
+
+                match repo.as_ref().unwrap().open(&meta).await {
+                    Ok((storage, index)) => {
+                        let new_session = Session::new_persisted(storage, index);
+                        let id = new_session.get_session_id().to_string();
+
+                        // Re-play recent turns through the full output path.
+                        if replay_turns > 0 {
+                            if let Ok(ctx) = new_session.build_context().await {
+                                // Separator between the echoed command line and
+                                // the replayed content, matching the separator
+                                // run_interactive emits before each agent response.
+                                output.display_separator();
+                                replay_recent_turns(output, &ctx, replay_turns);
+                            }
+                        }
+
+                        *session = Some(new_session);
+                        SessionCommandResult::Switched(id)
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot resume session: {}", e));
+                        SessionCommandResult::Handled
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
+            }
+        }
+        "fork" => {
+            if let Some(meta) = meta {
+                let cwd = match std::env::current_dir() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        config.output.display_text("Cannot determine current directory");
+                        return SessionCommandResult::Handled;
+                    }
+                };
+                match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
+                    Ok(new_storage) => {
+                        let index = new_storage.build_index().await.unwrap_or_else(|_| {
+                            let header = crate::session::SessionHeader::new(&cwd);
+                            crate::session::SessionIndex {
+                                header,
+                                entries: std::collections::HashMap::new(),
+                                leaf_id: None,
+                                children: std::collections::HashMap::new(),
+                                session_name: None,
+                            }
+                        });
+                        let new_session = Session::new_persisted(new_storage, index);
+                        let id = new_session.get_session_id().to_string();
+                        config.output.display_plain(&format!(
+                            "/session {} fork",
+                            meta.name.as_deref().unwrap_or(&meta.id)
+                        ));
+                        *session = Some(new_session);
+                        SessionCommandResult::Switched(id)
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot fork session: {}", e));
+                        SessionCommandResult::Handled
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
+            }
+        }
+        "rename" => {
+            let new_name = arg.unwrap_or_default();
+            if new_name.is_empty() {
+                config.output.display_text("Usage: /session <name> rename <newname>");
+                return SessionCommandResult::Handled;
+            }
+            if let Some(ref s) = session {
+                let cur_id = s.get_session_id().to_string();
+                if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
+                    let _ = s.set_session_name(&new_name).await;
+                    config.output.display_plain(&format!(
+                        "/session {} rename {}",
+                        meta.as_ref().and_then(|m| m.name.as_deref()).unwrap_or(&cur_id),
+                        new_name
+                    ));
+                } else if let Some(meta) = meta {
+                    match repo.as_ref().unwrap().open(&meta).await {
+                        Ok((storage, _index)) => {
+                            let s = Session::new_persisted(storage, crate::session::SessionIndex {
+                                header: crate::session::SessionHeader::new(
+                                    &std::env::current_dir().unwrap_or_default()
+                                ),
+                                entries: std::collections::HashMap::new(),
+                                leaf_id: None,
+                                children: std::collections::HashMap::new(),
+                                session_name: None,
+                            });
+                            let _ = s.set_session_name(&new_name).await;
+                            config.output.display_plain(&format!(
+                                "/session {} rename {}",
+                                meta.name.as_deref().unwrap_or(&meta.id),
+                                new_name
+                            ));
+                        }
+                        Err(e) => {
+                            config.output.display_text(&format!("Cannot open session: {}", e));
+                        }
+                    }
+                } else {
+                    config.output.display_text(&format!("Session not found: {}", name));
+                }
+            }
+            SessionCommandResult::Handled
+        }
+        "delete" => {
+            if let Some(meta) = meta {
+                if let Some(ref s) = session {
+                    if s.get_session_id() == meta.id {
+                        config.output.display_text("Cannot delete the current session");
+                        return SessionCommandResult::Handled;
+                    }
+                }
+                match repo.as_ref().unwrap().delete(&meta).await {
+                    Ok(()) => {
+                        config.output.display_plain(&format!(
+                            "/session {} delete",
+                            meta.name.as_deref().unwrap_or(&meta.id)
+                        ));
+                        SessionCommandResult::Deleted
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot delete session: {}", e));
+                        SessionCommandResult::Handled
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
+            }
+        }
+        _ => {
+            config.output.display_text(&format!("Unknown session action: {}", action));
+            SessionCommandResult::Handled
+        }
+    }
+}
+
+/// Ensure a session exists, creating one lazily if needed.
+/// Called on first actual turn (Submit or ! command), not at startup.
+pub(crate) async fn ensure_session(
+    session: &mut Option<Session>,
+    repo: &Option<crate::session::repo::JsonlSessionRepo>,
+) {
+    if session.is_some() {
+        return;
+    }
+    let repo = match repo {
+        Some(r) => r,
+        None => return,
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    match repo.create(&cwd).await {
+        Ok(storage) => {
+            let index = storage.build_index().await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: crate::session::SessionHeader::new(&cwd),
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
+            *session = Some(Session::new(storage, index));
+        }
+        Err(e) => {
+            eprintln!("Warning: cannot create session: {}", e);
+        }
+    }
+}
+
 /// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
@@ -1108,7 +1657,32 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
         config.output.display_plain(&status);
     }
 
-    let mut history = Vec::new();
+    // Persistent session storage.
+    // Session storage: create repo eagerly (just a path, no I/O) for /session
+    // overlay, but defer actual session file creation to the first turn
+    // to avoid empty sessions.
+    let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
+    let cwd = std::env::current_dir().ok();
+    let (mut session, mut repo) = if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
+        let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
+        // Repo is created eagerly (just a path); the session object is also
+        // created unconditionally here so the `/session` overlay can mark the
+        // current session from the start. `repo.create()` only opens the
+        // storage — the actual `.jsonl` file is written lazily on the first
+        // `append_message()` (Session::ensure_persisted) — so no empty session
+        // file is created if the user never takes a turn. Creating up front
+        // removes the mid-loop `ensure_session` calls (in the first-turn and
+        // `!`/`!!` paths).
+        (None, Some(repo))
+    } else {
+        (None, None)
+    };
+    ensure_session(&mut session, &repo).await;
+    let mut current_session_id = session
+        .as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
+
     let mut line_history = crate::repl::History::load();
     let mut recent_models: Vec<String> = Vec::new();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
@@ -1137,6 +1711,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
         let action = match repl.as_mut() {
             Some(r) => {
                 config.output.display_separator();
+
+                // Build session list for the /session overlay.
+                let (sessions, branch_messages) = build_session_ctx(
+                    &session, &repo,
+                ).await;
+
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
@@ -1148,6 +1728,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .as_ref()
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
+                    sessions,
+                    current_session_id: current_session_id.clone(),
+                    branch_messages,
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
@@ -1168,8 +1751,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         agent = Some(new_agent);
                         config = new_cfg;
                         recent_models.push(format!("{}:{}", config.provider, config.model));
-                        // No confirmation line: the `/model <provider:model>` input
-                        // line (emitted by `read_input`) is the record of the change.
+                        // Log model change to session.
+                        if let Some(ref s) = session {
+                            let _ = s.append_model_change(&config.provider, &config.model).await;
+                        }
                     }
                     Err(e) => config
                         .output
@@ -1185,7 +1770,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             Ok(new_agent) => {
                                 agent = Some(new_agent);
                                 config = new_cfg;
-                                // No confirmation line: the `/thinking <level>` input is self-documenting.
+                                // Log thinking change to session.
+                                if let Some(ref s) = session {
+                                    let _ = s.append_thinking_level_change(config.thinking_level.as_deref().unwrap_or("off")).await;
+                                }
                             }
                             Err(e) => {
                                 let msg = format!("Cannot set thinking: {}", e);
@@ -1301,6 +1889,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             .output
                             .display_plain("Usage: !<command> (capture output into context), or !!<command> (display only)");
                     } else {
+                        // Re-publish the resolved sandbox config immediately
+                        // before running the command. The config is held in a
+                        // process-wide global that other tests (and other
+                        // sessions) may mutate concurrently; pinning it here —
+                        // with no await between this and `run_sandboxed`'s read
+                        // of the global — keeps the `!`/`!!` path immune to
+                        // that race while preserving the "publish once" intent.
+                        set_sandbox(config.sandbox.clone());
                         match crate::tools::run_sandboxed(cmd, None).await {
                             Ok(out) => {
                                 let out = out.trim();
@@ -1315,15 +1911,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     // message naming the command, plus an
                                     // assistant message carrying the captured
                                     // output.
-                                    history.push(Message::user(format!(
+                                    let msg = Message::user(format!(
                                         "Ran shell command: {cmd}"
-                                    )));
-                                    history.push(Message::Assistant {
-                                        id: None,
-                                        content: OneOrMany::one(AssistantContent::Text(
-                                            Text::new(out.to_string()),
-                                        )),
-                                    });
+                                    ));
+                                    if let Some(ref s) = session {
+                                        let _ = s.append_message(&msg).await;
+                                        let reply = Message::Assistant {
+                                            id: None,
+                                            content: OneOrMany::one(AssistantContent::Text(
+                                                Text::new(out.to_string()),
+                                            )),
+                                        };
+                                        let _ = s.append_message(&reply).await;
+                                    }
                                 } else {
                                     config.output.display_plain(
                                         "(output was displayed but not added to context)",
@@ -1338,6 +1938,29 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         }
                     }
                     continue;
+                }
+                // Handle `/session <name> <action>` commands.
+                if input.starts_with("/session") {
+                    let out = config.output.clone();
+                    match handle_session_command(
+                        &input,
+                        &mut session,
+                        &mut repo,
+                        &mut config,
+                        &out,
+                        settings,
+                    ).await {
+                        SessionCommandResult::NotSession => {
+                            // Not a session command — fall through to normal prompt.
+                        }
+                        SessionCommandResult::Switched(new_id) => {
+                            current_session_id = new_id;
+                            continue;
+                        }
+                        _ => {
+                            continue;
+                        }
+                    }
                 }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
@@ -1405,7 +2028,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         let resp = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&input, Some(&mut history))
+                            .prompt(&input, session.as_ref())
                             .await;
                         done.store(true, Ordering::SeqCst);
                         let _ = handle.join();
@@ -1414,7 +2037,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&input, Some(&mut history))
+                            .prompt(&input, session.as_ref())
                             .await
                     }
                 };

@@ -35,25 +35,50 @@ pub trait Output: Send + Sync {
     fn display_markdown(&self, text: &str) {
         self.display_text(text);
     }
-    // ---- Streaming (Phase 2+) ----
-    // Default no-ops so existing impls keep compiling without change.
-    // `ConsoleOutput` overrides these to render incrementally (Phase 4 adds
-    // live in-place redraw; Phase 2 uses a render-once-per-segment buffer).
-    /// Called once when an agent response begins streaming.
+    // ---- Response event sequence ----
+    // Both the live streaming path (`PicoAgent::prompt`) and the session
+    // replay path (`replay_recent_turns`) drive these methods in the same
+    // order, so `ConsoleOutput` only needs one rendering implementation and
+    // replay output is guaranteed to match live output.
+    //
+    // Required call order per agent response:
+    //
+    //   begin_response()
+    //   set_answer_hold(bool)
+    //     ( stream_thinking(block) | stream_text(block) )*    ← segment N
+    //     [ end_response_segment()                            ← before each tool block
+    //         ( display_tool_call(name, args)
+    //           display_tool_result(result) )+
+    //         ( stream_thinking(block) | stream_text(block) )*  ← segment N+1
+    //     ]*
+    //   end_response()
+    //
+    // In the live path, blocks arrive as streaming deltas; in replay they
+    // arrive as complete strings. Default no-ops keep non-console impls
+    // (quiet / log / no-op) compiling without change.
+    /// Called once when an agent response begins; sets up per-response state.
     fn begin_response(&self) {}
-    /// A delta of assistant text.
+    /// A delta of assistant answer text (live path) or a complete text block
+    /// (replay path). Called once or more between `begin_response` and
+    /// `end_response` / `end_response_segment`.
     fn stream_text(&self, _delta: &str) {}
-    /// A delta of model reasoning/thinking (already gated by level upstream).
+    /// A delta of model reasoning/thinking (live) or a complete reasoning
+    /// block (replay). Already gated by `show_reasoning` level upstream;
+    /// implementations may render or suppress unconditionally.
     fn stream_thinking(&self, _delta: &str) {}
-    /// Commit the current text/thinking segment before a static line (tool
-    /// call, tool result, completion call) is printed.
+    /// Flush the current text/reasoning segment before a tool block. Called
+    /// once per tool-using segment, immediately before `display_tool_call`.
+    /// Mirrors the `CompletionCall` stream event that fires before tool
+    /// execution in the live path.
     fn end_response_segment(&self) {}
-    /// Called when the whole response finishes; commit the final live block.
+    /// Called once when the whole response is complete; flush the final
+    /// segment and reset per-response state.
     fn end_response(&self) {}
-    /// Enable/disable *answer holding*: when enabled (a reasoning-capable
-    /// turn), the assistant answer text is buffered and only emitted once the
-    /// turn ends, so that reasoning arriving *after* the answer is still shown
-    /// above it. Default no-op for outputs that don't stream incrementally.
+    /// Enable/disable answer holding for a reasoning-capable turn. When
+    /// `true`, answer text is buffered until the turn ends so that reasoning
+    /// arriving after the answer (a live-stream ordering artefact) still
+    /// renders above it. Always `false` in replay — content is already in
+    /// the correct sequence. Default no-op for non-console outputs.
     fn set_answer_hold(&self, _hold: bool) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);

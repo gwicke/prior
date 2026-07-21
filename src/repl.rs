@@ -257,6 +257,24 @@ pub struct ReplCtx {
     /// by `run_interactive` each loop iteration so the `/stat` overlay can
     /// render without direct access to the agent.
     pub session_usage: SessionUsage,
+    /// List of all sessions for the current CWD, for the `/session` overlay.
+    pub sessions: Vec<SessionMeta>,
+    /// The ID of the currently active session (empty if no session).
+    pub current_session_id: String,
+    /// Branch messages for the fork picker: (entry_id, preview_text) pairs
+    /// for user messages in the current session's branch.
+    pub branch_messages: Vec<(String, String)>,
+}
+
+/// Lightweight session metadata for the `/session` overlay.
+#[derive(Clone)]
+pub struct SessionMeta {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    pub cwd: String,
+    pub parent_session: Option<String>,
+    pub message_count: usize,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -332,6 +350,27 @@ pub(crate) enum ActiveOverlay {
     PathComplete {
         completions: Vec<String>,
         completion_pos: Option<(usize, usize)>,
+    },
+
+    /// `/session` overlay: list of sessions for the current CWD, filtered by
+    /// `_filter`. `names` mirrors `opts` (1:1 before any row wrapping) so Tab/
+    /// Enter can resolve the selected session without re-querying `ctx`.
+    Session {
+        opts: Vec<String>,
+        names: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
+    },
+
+    /// `/session <name> <action>` action menu for a single session.
+    SessionAction {
+        /// Display/completion name of the session (`name` or `id`).
+        session_name: String,
+        /// Whether this is the currently active session (resume/delete greyed).
+        is_current: bool,
+        opts: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
     },
 }
 
@@ -427,6 +466,30 @@ impl ActiveOverlay {
                 let mut active = None;
                 let sub = Repl::sandbox_overlay_entries(&filter, &mut items, &mut active);
                 ActiveOverlay::Sandbox { sub, items, _filter: filter }
+            }
+            "session" | "sessions" => {
+                let filter = rest.trim().to_string();
+                let filtered = Repl::filtered_sessions(ctx, &filter);
+                // When a filter is typed and resolves to exactly one session,
+                // jump straight to that session's action menu (kind 11).
+                if !filter.is_empty() && filtered.len() == 1 {
+                    let meta = filtered[0];
+                    let session_name = meta.name.clone().unwrap_or_else(|| meta.id.clone());
+                    let is_current = meta.id == ctx.current_session_id;
+                    let mut opts = Vec::new();
+                    let mut active = None;
+                    Repl::session_action_overlay_entries(meta, ctx, &filter, &mut opts, &mut active);
+                    ActiveOverlay::SessionAction { session_name, is_current, opts, active, _filter: filter }
+                } else {
+                    let mut opts = Vec::new();
+                    let mut active = None;
+                    Repl::session_overlay_entries(ctx, &filter, &mut opts, &mut active);
+                    let names: Vec<String> = filtered
+                        .iter()
+                        .map(|m| m.name.clone().unwrap_or_else(|| m.id.clone()))
+                        .collect();
+                    ActiveOverlay::Session { opts, names, active, _filter: filter }
+                }
             }
             _ => {
                 let cmds = slash::filter_commands(rest);
@@ -568,6 +631,19 @@ impl ActiveOverlay {
             ActiveOverlay::PathComplete { completions, .. } => {
                 ("Path completions  (up/down, Tab/Enter select, Esc dismiss)",
                  completions.clone(), None, false)
+            }
+            ActiveOverlay::Session { opts, active, .. } => {
+                if opts.is_empty() {
+                    ("Sessions  (up/down, Tab complete, Enter select, Esc back)",
+                     vec!["(no sessions)".into()], None, false)
+                } else {
+                    ("Sessions  (up/down, Tab complete, Enter select, Esc back)",
+                     opts.clone(), *active, false)
+                }
+            }
+            ActiveOverlay::SessionAction { opts, active, .. } => {
+                ("Session actions  (up/down, Tab/Enter select, Esc back)",
+                 opts.clone(), *active, false)
             }
         }
     }
@@ -753,6 +829,24 @@ impl ActiveOverlay {
                     *completion_pos = None;
                 }
             }
+            ActiveOverlay::Session { names, .. } => {
+                if let Some(name) = names.get(sel) {
+                    editor.set(&format!("/session {}", name));
+                }
+            }
+            ActiveOverlay::SessionAction { session_name, .. } => {
+                // Fill the chosen action into the buffer (stay in input).
+                let action = match sel {
+                    3 => "resume",
+                    4 => "fork",
+                    5 => "rename ",
+                    6 => "delete",
+                    _ => "",
+                };
+                if !action.is_empty() {
+                    editor.set(&format!("/session {} {}", session_name, action));
+                }
+            }
             _ => {}
         }
     }
@@ -789,6 +883,7 @@ impl ActiveOverlay {
                         slash::SlashKind::Persona => editor.set("/persona "),
                         slash::SlashKind::Stat => editor.set("/stat "),
                         slash::SlashKind::Sandbox => editor.set("/sandbox "),
+                        slash::SlashKind::Session => editor.set("/session "),
                     }
                 }
                 OverlayAction::Continue
@@ -952,6 +1047,42 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
+            ActiveOverlay::Session { names, .. } => {
+                // Selecting a session completes its name; the next loop
+                // iteration promotes the buffer to the action menu (kind 11).
+                if let Some(name) = names.get(sel) {
+                    editor.set(&format!("/session {}", name));
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::SessionAction { session_name, is_current, .. } => {
+                // Resume/delete are greyed out on the current session.
+                let is_greyed = (sel == 3 || sel == 6) && *is_current;
+                if is_greyed {
+                    OverlayAction::Continue
+                } else {
+                    let (action, commit) = match sel {
+                        3 => ("resume", true),
+                        4 => ("fork", true),
+                        5 => ("rename ", false),
+                        6 => ("delete", true),
+                        _ => ("", false),
+                    };
+                    if action.is_empty() {
+                        OverlayAction::Continue
+                    } else {
+                        let line = format!("/session {} {}", session_name, action);
+                        if commit {
+                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                            OverlayAction::Action(InputAction::Submit(line))
+                        } else {
+                            // `rename` keeps the user in input to type the new name.
+                            editor.set(&line);
+                            OverlayAction::Continue
+                        }
+                    }
+                }
+            }
             _ => OverlayAction::Continue,
         }
     }
@@ -984,6 +1115,19 @@ impl ActiveOverlay {
                 path_completions.clear();
                 *completion_pos = None;
             }
+            ActiveOverlay::Session { .. } => {
+                // Clear the session filter (go back to bare `/session`).
+                let buf = editor.text();
+                if let Some(idx) = buf.rfind(' ') {
+                    editor.set(&buf[..idx]);
+                } else {
+                    editor.set("");
+                }
+            }
+            ActiveOverlay::SessionAction { .. } => {
+                // Go back to the session list.
+                editor.set("/session ");
+            }
             _ => {}
         }
     }
@@ -1002,6 +1146,8 @@ impl ActiveOverlay {
             ActiveOverlay::Stat { .. } => 8,
             ActiveOverlay::Sandbox { .. } => 9,
             ActiveOverlay::PathComplete { .. } => 10,
+            ActiveOverlay::Session { .. } => 11,
+            ActiveOverlay::SessionAction { .. } => 12,
         }
     }
 
@@ -1734,6 +1880,7 @@ impl Repl {
                 ValueCandidate { display: "true".into(), value: "true".into(), desc: "keep reasoning blocks in the session context".into() },
                 ValueCandidate { display: "false".into(), value: "false".into(), desc: "drop reasoning from context to save tokens (default)".into() },
             ],
+            SettingKey::SessionResumeReplayTurns => Vec::new(),
         }
     }
 
@@ -1958,6 +2105,174 @@ impl Repl {
                 .map(|r| *r.item)
                 .collect()
         }
+    }
+
+    /// Build the `/session` overlay rows.
+    ///
+    /// Shows all sessions for the current CWD, filtered by `filter`.
+    /// Current session is marked with ◉ and sorted first.
+    /// Named sessions show their name; unnamed show timestamp + cwd.
+    fn session_overlay_entries(
+        ctx: &ReplCtx,
+        filter: &str,
+        opts: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        let avail = term_width().saturating_sub(2);
+        let mut table = Table::new(&["", "Session", "Turns"])
+            .with_aligns(&[Align::Left, Align::Left, Align::Right])
+            .with_min_widths(&[2, 30, 6])
+            .with_priorities(&[0, 2, 1])
+            .set_gap(2);
+
+        // Build sorted session list: current first, then by timestamp descending.
+        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_cur = a.id == ctx.current_session_id;
+            let b_cur = b.id == ctx.current_session_id;
+            if a_cur && !b_cur { std::cmp::Ordering::Less }
+            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+            else { b.timestamp.cmp(&a.timestamp) }
+        });
+
+        // Filter by name text if filter is non-empty.
+        let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
+            sorted.iter().collect()
+        } else {
+            let f = filter.to_lowercase();
+            sorted.iter().filter(|m| {
+                m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
+                    || m.id.to_lowercase().contains(&f)
+                    || m.cwd.to_lowercase().contains(&f)
+            }).collect()
+        };
+
+        if filtered.is_empty() {
+            opts.push("(no sessions)".into());
+            *active = None;
+            return;
+        }
+
+        for meta in &filtered {
+            let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
+            let display_name = meta.name.clone().unwrap_or_else(|| {
+                // Show a shortened representation: timestamp + cwd tail
+                let ts = Self::format_session_timestamp(&meta.timestamp);
+                let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
+                format!("{}  {}", ts, cwd_tail)
+            });
+            let turns = format!("{}", meta.message_count);
+            table.add_row(&[marker, &display_name, &turns]);
+        }
+
+        for row in table.render_multiline(avail) {
+            opts.push(row);
+        }
+
+        // Active is the position of the current session in the rendered rows.
+        // Since table rows may wrap, approximate by finding the first visible row.
+        *active = filtered.iter().position(|m| m.id == ctx.current_session_id);
+    }
+
+    /// Format an ISO 8601 timestamp for display: "today 14:32", "yesterday 09:15",
+    /// or "Jul 14 11:00".
+    fn format_session_timestamp(ts: &str) -> String {
+        // Parse "2025-01-01T14:32:00.000Z" → extract date components
+        let date_part = &ts[..10]; // "2025-01-01"
+        let time_part = if ts.len() >= 16 { &ts[11..16] } else { "??:??" }; // "14:32"
+
+        // Compute relative day
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d").to_string();
+
+        let day_label = if date_part == today {
+            "today"
+        } else if date_part == yesterday {
+            "yesterday"
+        } else {
+            // Show "Jul 14" format
+            let month = ts.get(5..7).unwrap_or("??");
+            let day = ts.get(8..10).unwrap_or("??");
+            let month_name = match month {
+                "01" => "Jan", "02" => "Feb", "03" => "Mar", "04" => "Apr",
+                "05" => "May", "06" => "Jun", "07" => "Jul", "08" => "Aug",
+                "09" => "Sep", "10" => "Oct", "11" => "Nov", "12" => "Dec",
+                _ => month,
+            };
+            return format!("{} {} {}", month_name, day, time_part);
+        };
+
+        format!("{} {}", day_label, time_part)
+    }
+
+    /// Build the per-session action menu overlay (kind 11).
+    ///
+    /// Shows session info and actions: resume, fork, rename, delete.
+    /// Indices: 0=info, 1=cwd, 2=blank, 3=resume, 4=fork, 5=rename, 6=delete.
+    fn session_action_overlay_entries(
+        meta: &SessionMeta,
+        ctx: &ReplCtx,
+        _filter: &str,
+        opts: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        let is_current = meta.id == ctx.current_session_id;
+        let ts = Self::format_session_timestamp(&meta.timestamp);
+        let name = meta.name.as_deref().unwrap_or(&meta.id);
+
+        // Info line (index 0)
+        let parent_hint = meta.parent_session.as_ref().map(|p| {
+            let short = p.rsplit('/').next().unwrap_or(p);
+            format!(" | parent: {}", short)
+        }).unwrap_or_default();
+        let info = format!(
+            "{}  {} turns | {}{}",
+            name,
+            meta.message_count,
+            ts,
+            parent_hint,
+        );
+        opts.push(info);
+
+        // cwd line (index 1)
+        let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
+        opts.push(format!("  dir: {}", cwd_tail));
+
+        // Blank separator (index 2)
+        opts.push(String::new());
+
+        // Actions (indices 3-6)
+        opts.push(if is_current { "\x1b[2m  resume (current)\x1b[0m".into() } else { "  resume".into() });
+        opts.push("  fork".into());
+        opts.push("  rename".into());
+        opts.push(if is_current { "\x1b[2m  delete (current)\x1b[0m".into() } else { "  delete".into() });
+
+        *active = if is_current { Some(3) } else { Some(4) };
+    }
+
+    /// Filter the sessions list by the given text (matches name, id, or cwd).
+    /// Returns a Vec<&SessionMeta> in display order (current first, then by timestamp).
+    fn filtered_sessions<'a>(ctx: &'a ReplCtx, filter: &str) -> Vec<&'a SessionMeta> {
+        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_cur = a.id == ctx.current_session_id;
+            let b_cur = b.id == ctx.current_session_id;
+            if a_cur && !b_cur { std::cmp::Ordering::Less }
+            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+            else { b.timestamp.cmp(&a.timestamp) }
+        });
+
+        if filter.is_empty() {
+            return sorted;
+        }
+
+        let f = filter.to_lowercase();
+        sorted.into_iter().filter(|m| {
+            m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
+                || m.id.to_lowercase().contains(&f)
+                || m.cwd.to_lowercase().contains(&f)
+        }).collect()
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.
@@ -2218,8 +2533,6 @@ impl Repl {
             _ => None,
         }
     }
-
-
 }
 
 /// Resolve the external editor command from environment variables.
