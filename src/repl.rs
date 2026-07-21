@@ -706,11 +706,22 @@ impl Repl {
                             Self::sandbox_overlay_entries(&cur_filter, &mut opts, &mut active);
                         }
                         "session" | "sessions" => {
-                            kind = 10;
-                            title = "Sessions  (up/down, Tab complete, Enter select, Esc back)".into();
-                            cur_word = "session".into();
-                            cur_filter = rest.trim().to_string();
-                            Self::session_overlay_entries(ctx, &cur_filter, &mut opts, &mut active);
+                            let filtered = Self::filtered_sessions(ctx, rest.trim());
+                            if !rest.trim().is_empty() && filtered.len() == 1 {
+                                kind = 11;
+                                title = "Session actions  (up/down, Tab/Enter select, Esc back)".into();
+                                cur_word = "session".into();
+                                cur_filter = rest.trim().to_string();
+                                Self::session_action_overlay_entries(
+                                    filtered[0], ctx, rest.trim(), &mut opts, &mut active,
+                                );
+                            } else {
+                                kind = 10;
+                                title = "Sessions  (up/down, Tab complete, Enter select, Esc back)".into();
+                                cur_word = "session".into();
+                                cur_filter = rest.trim().to_string();
+                                Self::session_overlay_entries(ctx, &cur_filter, &mut opts, &mut active);
+                            }
                         }
                         _ => {
                             kind = 1;
@@ -1015,11 +1026,26 @@ impl Repl {
                                         // Session list: complete the selected session name.
                                         let buf = editor.text();
                                         let after = &buf["/session".len()..].trim();
-                                        // Filter sessions to find the one at `sel` position.
                                         let filtered = Self::filtered_sessions(ctx, after);
                                         if let Some(meta) = filtered.get(sel) {
                                             let display = meta.name.clone().unwrap_or_else(|| meta.id.clone());
                                             editor.set(&format!("/session {}", display));
+                                        }
+                                    }
+                                    11 => {
+                                        // Action menu Tab: fill the action text (stay in input).
+                                        let buf = editor.text();
+                                        let after = &buf["/session".len()..];
+                                        let sess_name = Self::extract_session_name(after);
+                                        let action = match sel {
+                                            3 => "resume",
+                                            4 => "fork",
+                                            5 => "rename ",
+                                            6 => "delete",
+                                            _ => "",
+                                        };
+                                        if !action.is_empty() {
+                                            editor.set(&format!("/session {} {}", sess_name, action));
                                         }
                                     }
                                     _ => {}
@@ -1229,13 +1255,45 @@ impl Repl {
                                             }
                                         }
                                         10 => {
-                                            // Session list: set buffer to "/session <name> " for action.
+                                            // Session list: complete the name in the buffer.
                                             let buf = editor.text();
                                             let after = &buf["/session".len()..].trim();
                                             let filtered = Self::filtered_sessions(ctx, after);
                                             if let Some(meta) = filtered.get(sel) {
                                                 let display = meta.name.clone().unwrap_or_else(|| meta.id.clone());
-                                                editor.set(&format!("/session {} ", display));
+                                                editor.set(&format!("/session {}", display));
+                                            }
+                                        }
+                                        11 => {
+                                            // Action menu Enter: commit the action.
+                                            let buf = editor.text();
+                                            let after = &buf["/session".len()..];
+                                            let sess_name = Self::extract_session_name(after);
+                                            // Check if the selected action is greyed out (current session
+                                            // can't resume or delete itself).
+                                            let is_greyed = (sel == 3 || sel == 6) && {
+                                                let meta = Self::filtered_sessions(ctx, &sess_name);
+                                                meta.first().map(|m| m.id == ctx.current_session_id).unwrap_or(false)
+                                            };
+                                            if is_greyed {
+                                                // No-op on greyed entries.
+                                            } else {
+                                                let (action, commit) = match sel {
+                                                    3 => ("resume", true),
+                                                    4 => ("fork", true),
+                                                    5 => ("rename ", false),
+                                                    6 => ("delete", true),
+                                                    _ => ("", false),
+                                                };
+                                                if !action.is_empty() {
+                                                    let line = format!("/session {} {}", sess_name, action);
+                                                    if commit {
+                                                        Self::emit_commit(output, &mut editor, &redraw, sel, &mut input_row, &line, "", false);
+                                                        return Some(InputAction::Submit(line));
+                                                    } else {
+                                                        editor.set(&line);
+                                                    }
+                                                }
                                             }
                                         }
                                         _ => {}
@@ -1274,7 +1332,17 @@ impl Repl {
                                     completion_pos = None;
                                 }
                                 10 => {
-                                    editor.set("");
+                                    // Clear the session filter (go back to bare /session).
+                                    let buf = editor.text();
+                                    if let Some(idx) = buf.rfind(' ') {
+                                        editor.set(&buf[..idx]);
+                                    } else {
+                                        editor.set("");
+                                    }
+                                }
+                                11 => {
+                                    // Go back to session list.
+                                    editor.set("/session ");
                                 }
                                 _ => {}
                             },
@@ -1905,7 +1973,7 @@ impl Repl {
             let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
             let display_name = meta.name.clone().unwrap_or_else(|| {
                 // Show a shortened representation: timestamp + cwd tail
-                let ts = &meta.timestamp[..10]; // "2025-01-01"
+                let ts = Self::format_session_timestamp(&meta.timestamp);
                 let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
                 format!("{}  {}", ts, cwd_tail)
             });
@@ -1920,6 +1988,83 @@ impl Repl {
         // Active is the position of the current session in the rendered rows.
         // Since table rows may wrap, approximate by finding the first visible row.
         *active = filtered.iter().position(|m| m.id == ctx.current_session_id);
+    }
+
+    /// Format an ISO 8601 timestamp for display: "today 14:32", "yesterday 09:15",
+    /// or "Jul 14 11:00".
+    fn format_session_timestamp(ts: &str) -> String {
+        // Parse "2025-01-01T14:32:00.000Z" → extract date components
+        let date_part = &ts[..10]; // "2025-01-01"
+        let time_part = if ts.len() >= 16 { &ts[11..16] } else { "??:??" }; // "14:32"
+
+        // Compute relative day
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
+            .format("%Y-%m-%d").to_string();
+
+        let day_label = if date_part == today {
+            "today"
+        } else if date_part == yesterday {
+            "yesterday"
+        } else {
+            // Show "Jul 14" format
+            let month = ts.get(5..7).unwrap_or("??");
+            let day = ts.get(8..10).unwrap_or("??");
+            let month_name = match month {
+                "01" => "Jan", "02" => "Feb", "03" => "Mar", "04" => "Apr",
+                "05" => "May", "06" => "Jun", "07" => "Jul", "08" => "Aug",
+                "09" => "Sep", "10" => "Oct", "11" => "Nov", "12" => "Dec",
+                _ => month,
+            };
+            return format!("{} {} {}", month_name, day, time_part);
+        };
+
+        format!("{} {}", day_label, time_part)
+    }
+
+    /// Build the per-session action menu overlay (kind 11).
+    ///
+    /// Shows session info and actions: resume, fork, rename, delete.
+    /// Indices: 0=info, 1=cwd, 2=blank, 3=resume, 4=fork, 5=rename, 6=delete.
+    fn session_action_overlay_entries(
+        meta: &SessionMeta,
+        ctx: &ReplCtx,
+        _filter: &str,
+        opts: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        let is_current = meta.id == ctx.current_session_id;
+        let ts = Self::format_session_timestamp(&meta.timestamp);
+        let name = meta.name.as_deref().unwrap_or(&meta.id);
+
+        // Info line (index 0)
+        let parent_hint = meta.parent_session.as_ref().map(|p| {
+            let short = p.rsplit('/').next().unwrap_or(p);
+            format!(" | parent: {}", short)
+        }).unwrap_or_default();
+        let info = format!(
+            "{}  {} turns | {}{}",
+            name,
+            meta.message_count,
+            ts,
+            parent_hint,
+        );
+        opts.push(info);
+
+        // cwd line (index 1)
+        let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
+        opts.push(format!("  dir: {}", cwd_tail));
+
+        // Blank separator (index 2)
+        opts.push(String::new());
+
+        // Actions (indices 3-6)
+        opts.push(if is_current { "\x1b[2m  resume (current)\x1b[0m".into() } else { "  resume".into() });
+        opts.push("  fork".into());
+        opts.push("  rename".into());
+        opts.push(if is_current { "\x1b[2m  delete (current)\x1b[0m".into() } else { "  delete".into() });
+
+        *active = if is_current { Some(3) } else { Some(4) };
     }
 
     /// Filter the sessions list by the given text (matches name, id, or cwd).
@@ -1944,6 +2089,24 @@ impl Repl {
                 || m.id.to_lowercase().contains(&f)
                 || m.cwd.to_lowercase().contains(&f)
         }).collect()
+    }
+
+    /// Extract the session name from text after "/session ".
+    /// Handles both quoted names (`"my session"`) and bare names (`my-session`).
+    fn extract_session_name(after: &str) -> String {
+        let trimmed = after.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if trimmed.starts_with('"') {
+            if let Some(end) = trimmed[1..].find('"').map(|i| i + 2) {
+                trimmed[1..end-1].to_string()
+            } else {
+                trimmed[1..].to_string()
+            }
+        } else {
+            trimmed.split_whitespace().next().unwrap_or("").to_string()
+        }
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.
@@ -2168,8 +2331,6 @@ impl Repl {
             _ => None,
         }
     }
-
-
 }
 
 /// Resolve the external editor command from environment variables.
