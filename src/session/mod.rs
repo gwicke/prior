@@ -6,6 +6,7 @@
 pub mod types;
 pub mod storage;
 pub mod repo;
+pub mod session;
 
 #[cfg(test)]
 pub mod pi_compat_test;
@@ -17,3 +18,4 @@ pub use types::{
 };
 pub use storage::{SessionStorage, JsonlSessionStorage};
 pub use repo::{SessionRepo, JsonlSessionRepo};
+pub use session::Session;
