@@ -1,6 +1,9 @@
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx};
 use crate::settings::SettingsStore;
+use crate::session::Session;
+use crate::session::repo::SessionRepo;
+use crate::session::storage::SessionStorage;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
     MoveFile, ReadFile, Remove, WriteFile,
@@ -69,7 +72,7 @@ pub struct SessionUsage {
 
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
-    async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String>;
+    async fn prompt(&self, input: &str, session: Option<&Session>) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
     /// result means no completion call has reported usage yet.
@@ -81,7 +84,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
     async fn prompt(
         &self,
         input: &str,
-        mut history: Option<&mut Vec<Message>>,
+        session: Option<&Session>,
     ) -> Result<String> {
         self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
@@ -92,9 +95,29 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         // this point. See doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
 
-        // Clone the prior history (owned) so we can still write the updated
-        // history back through the `&mut` borrow afterwards.
-        let prior: Vec<Message> = history.as_ref().map(|h| (*h).clone()).unwrap_or_default();
+        // Build prior context from session, or use empty vec as fallback.
+        let prior: Vec<Message> = if let Some(s) = session {
+            match s.build_context().await {
+                Ok(ctx) => {
+                    // Apply reasoning stripping to the LLM-bound context.
+                    // The session stores pre-strip messages; stripping is
+                    // applied here before sending to the service.
+                    maybe_strip_reasoning(
+                        ctx.messages,
+                        self.reasoning_in_context,
+                        &self.provider,
+                        &self.model,
+                    )
+                }
+                Err(e) => {
+                    // Session index may be stale; log and fall back to empty.
+                    eprintln!("Warning: session build_context failed: {}", e);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -200,19 +223,13 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                             // steering message sees the user's input and any partial
                             // assistant text, rather than having it silently dropped.
                             // See doc/pi_steering_rig.md §6.5.3.
-                            if let Some(ref mut h) = history {
-                                let mut partial = vec![Message::user(input)];
+                            if let Some(s) = session {
+                                let user_msg = Message::user(input);
+                                let _ = s.append_message(&user_msg).await;
                                 if !output.is_empty() {
-                                    partial.push(Message::assistant(&output));
+                                    let partial = Message::assistant(&output);
+                                    let _ = s.append_message(&partial).await;
                                 }
-                                let to_commit = maybe_strip_reasoning(
-                                    partial,
-                                    self.reasoning_in_context,
-                                    &self.provider,
-                                    &self.model,
-                                );
-                                let to_commit = normalize_call_ids(to_commit);
-                                h.extend(to_commit);
                             }
                             self.output.end_response();
                             return Err(crate::PicocodeError::Other(e.to_string()));
@@ -227,17 +244,12 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                         // closes the HTTP connection; any running tool was already
                         // killed by the watchdog (Phase 1a-d tool-cancel channel).
                         //
-                        // Persist the partial turn before breaking, since we
-                        // won't receive a PromptCancelled error with full_history
-                        // (we're breaking out before the hook has a chance to fire).
-                        if let Some(h) = history.as_ref() {
-                            let mut partial = Vec::clone(h);
-                            partial.push(Message::user(input));
-                            if !output.is_empty() {
-                                partial.push(Message::assistant(&output));
-                            }
-                            cancelled_history = Some(partial);
+                        // Capture partial turn for persistence.
+                        let mut partial = vec![Message::user(input)];
+                        if !output.is_empty() {
+                            partial.push(Message::assistant(&output));
                         }
+                        cancelled_history = Some(partial);
                         aborted = true;
                         break;
                     }
@@ -246,18 +258,22 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
         }
         self.output.end_response();
 
-        // Persist history across turns. `persist_turn` appends a completed turn
-        // (fixing root cause #1, which previously *replaced* the whole history
-        // and dropped every earlier exchange) and, on cancellation, replaces
-        // with the in-flight full history (root cause #2).
-        persist_turn(
-            &mut history,
-            final_history,
-            cancelled_history,
-            self.reasoning_in_context,
-            &self.provider,
-            &self.model,
-        );
+        // Persist the turn into the session (or fallback to no persistence).
+        if let Some(s) = session {
+            // Store pre-strip messages (strip is applied to LLM context above,
+            // not at storage time — see doc/session_storage.md §4).
+            if let Some(fh) = final_history {
+                let to_commit = normalize_call_ids(fh);
+                for msg in to_commit {
+                    let _ = s.append_message(&msg).await;
+                }
+            } else if let Some(ch) = cancelled_history {
+                let to_commit = normalize_call_ids(ch);
+                for msg in to_commit {
+                    let _ = s.append_message(&msg).await;
+                }
+            }
+        }
 
         if aborted {
             return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
@@ -355,6 +371,7 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
     ///   (thinking+tool_use contract); reasoning is force-kept there. On
     ///   Anthropic turns *without* tool calls, and on all other providers when
     ///   the flag is `false`, reasoning is stripped normally.
+    #[allow(dead_code)]
     fn persist_turn(
         history: &mut Option<&mut Vec<Message>>,
         final_history: Option<Vec<Message>>,
@@ -1105,7 +1122,56 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
         config.output.display_plain(&status);
     }
 
-    let mut history = Vec::new();
+    // Persistent session storage.
+    let session: Option<Session> = {
+        let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
+        match sessions_dir {
+            Some(dir) => {
+                let cwd = match std::env::current_dir() {
+                    Ok(cwd) => Some(cwd),
+                    Err(e) => {
+                        config.output.display_plain(&format!(
+                            "Warning: cannot determine current directory, session disabled: {}",
+                            e
+                        ));
+                        None
+                    }
+                };
+                if let Some(cwd) = cwd {
+                    let repo = crate::session::repo::JsonlSessionRepo::new(dir);
+                    match repo.create(&cwd).await {
+                        Ok(storage) => {
+                            let index = storage.build_index().await
+                                .unwrap_or_else(|_| crate::session::SessionIndex {
+                                    header: crate::session::SessionHeader::new(&cwd),
+                                    entries: std::collections::HashMap::new(),
+                                    leaf_id: None,
+                                    children: std::collections::HashMap::new(),
+                                    session_name: None,
+                                });
+                            Some(Session::new(storage, index))
+                        }
+                        Err(e) => {
+                            config.output.display_plain(&format!(
+                                "Warning: cannot create session storage, session disabled: {}",
+                                e
+                            ));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            None => {
+                config.output.display_plain(
+                    "Warning: no app config directory found, session storage disabled",
+                );
+                None
+            }
+        }
+    };
+
     let mut line_history = crate::repl::History::load();
     let mut recent_models: Vec<String> = Vec::new();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
@@ -1165,8 +1231,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         agent = Some(new_agent);
                         config = new_cfg;
                         recent_models.push(format!("{}:{}", config.provider, config.model));
-                        // No confirmation line: the `/model <provider:model>` input
-                        // line (emitted by `read_input`) is the record of the change.
+                        // Log model change to session.
+                        if let Some(ref s) = session {
+                            let _ = s.append_model_change(&config.provider, &config.model).await;
+                        }
                     }
                     Err(e) => config
                         .output
@@ -1182,7 +1250,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             Ok(new_agent) => {
                                 agent = Some(new_agent);
                                 config = new_cfg;
-                                // No confirmation line: the `/thinking <level>` input is self-documenting.
+                                // Log thinking change to session.
+                                if let Some(ref s) = session {
+                                    let _ = s.append_thinking_level_change(config.thinking_level.as_deref().unwrap_or("off")).await;
+                                }
                             }
                             Err(e) => {
                                 let msg = format!("Cannot set thinking: {}", e);
@@ -1304,15 +1375,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     // message naming the command, plus an
                                     // assistant message carrying the captured
                                     // output.
-                                    history.push(Message::user(format!(
+                                    let msg = Message::user(format!(
                                         "Ran shell command: {cmd}"
-                                    )));
-                                    history.push(Message::Assistant {
-                                        id: None,
-                                        content: OneOrMany::one(AssistantContent::Text(
-                                            Text::new(out.to_string()),
-                                        )),
-                                    });
+                                    ));
+                                    if let Some(ref s) = session {
+                                        let _ = s.append_message(&msg).await;
+                                        let reply = Message::Assistant {
+                                            id: None,
+                                            content: OneOrMany::one(AssistantContent::Text(
+                                                Text::new(out.to_string()),
+                                            )),
+                                        };
+                                        let _ = s.append_message(&reply).await;
+                                    }
                                 } else {
                                     config.output.display_plain(
                                         "(output was displayed but not added to context)",
@@ -1394,7 +1469,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         let resp = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&input, Some(&mut history))
+                            .prompt(&input, session.as_ref())
                             .await;
                         done.store(true, Ordering::SeqCst);
                         let _ = handle.join();
@@ -1403,7 +1478,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&input, Some(&mut history))
+                            .prompt(&input, session.as_ref())
                             .await
                     }
                 };
