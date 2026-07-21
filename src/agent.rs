@@ -209,11 +209,29 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                         Some(Err(e)) => {
                             // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
                             // as a terminal `PromptCancelled` error that carries the
-                            // in-flight full history. Capture it so an aborted turn is not
-                            // a total loss and cross-turn context survives (root cause #2).
+                            // in-flight full history (`prior + new_messages`). We do NOT
+                            // persist that full history because (a) prior messages are
+                            // already in the session — appending them again duplicates
+                            // them, and (b) `new_messages` may end with an assistant
+                            // message containing `tool_calls` without matching tool
+                            // results (cancellation happened between model response and
+                            // tool execution). Persisting such an incomplete turn would
+                            // make the next LLM call fail with "assistant message with
+                            // 'tool_calls' must be followed by tool messages".
+                            //
+                            // Instead, persist only the user prompt and any partial
+                            // assistant TEXT that was streamed before the cancellation.
+                            // Tool calls are not accumulated in `output` (they arrive
+                            // as separate stream events), so the partial assistant
+                            // message is guaranteed to be text-only — safe for the
+                            // next turn's context.
                             if let StreamingError::Prompt(prompt_err) = &e {
-                                if let PromptError::PromptCancelled { chat_history, .. } = prompt_err.as_ref() {
-                                    cancelled_history = Some(chat_history.clone());
+                                if let PromptError::PromptCancelled { .. } = prompt_err.as_ref() {
+                                    let mut partial = vec![Message::user(input)];
+                                    if !output.is_empty() {
+                                        partial.push(Message::assistant(&output));
+                                    }
+                                    cancelled_history = Some(partial);
                                     aborted = true;
                                     break;
                                 }

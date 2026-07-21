@@ -1326,7 +1326,9 @@ mod tests {
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
-        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
@@ -1396,6 +1398,105 @@ mod tests {
             _ => panic!("expected ToolResult"),
         }).collect();
         assert_eq!(ids, ["tc_0", "tc_1", "tc_2"], "tool results must be in original order");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Verify that a tool-calling turn round-trips through the session
+    /// without creating dangling tool_calls on the next turn.
+    #[tokio::test]
+    async fn test_tool_call_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-session-toolrt-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+
+        // --- Turn 1: user asks about weather, assistant responds with tool
+        // call, tool executes, assistant gives final answer ---
+        session.append_message(&Message::user("weather")).await.unwrap();
+        session.append_message(&Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "call_abc".into(),
+                call_id: None,
+                function: ToolFunction::new("get_weather".to_string(), serde_json::json!({"city": "NYC"})),
+                signature: None,
+                additional_params: None,
+            })),
+        }).await.unwrap();
+        session.append_message(&Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
+                id: "call_abc".into(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::Text(Text::new("72F"))),
+            })),
+        }).await.unwrap();
+        session.append_message(&Message::assistant("It's 72F in NYC")).await.unwrap();
+
+        // Verify context is correct after turn 1
+        let ctx1 = session.build_context().await.unwrap();
+        assert_eq!(ctx1.messages.len(), 4, "turn 1 should have 4 messages");
+
+        // Check alternation: user -> assistant(toolCall) -> user(toolResult) -> assistant(text)
+        assert!(matches!(&ctx1.messages[0], Message::User { .. }));
+        assert!(matches!(&ctx1.messages[1], Message::Assistant { .. }));
+        assert!(matches!(&ctx1.messages[2], Message::User { .. }));
+        assert!(matches!(&ctx1.messages[3], Message::Assistant { .. }));
+
+        // Verify the tool call is present in message[1]
+        if let Message::Assistant { content, .. } = &ctx1.messages[1] {
+            let has_tool_call = content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)));
+            assert!(has_tool_call, "assistant message 1 should contain a tool call");
+        }
+
+        // Verify the tool result is in message[2]
+        if let Message::User { content } = &ctx1.messages[2] {
+            let has_tool_result = content.iter().any(|c| matches!(c, UserContent::ToolResult(_)));
+            assert!(has_tool_result, "user message 2 should contain a tool result");
+        }
+
+        // --- Turn 2: simulate a subsequent user message ---
+        session.append_message(&Message::user("forecast")).await.unwrap();
+
+        let ctx2 = session.build_context().await.unwrap();
+        // Should have 5 messages: 4 from turn 1 + 1 new user message
+        assert_eq!(ctx2.messages.len(), 5, "turn 2 should have 5 accumulated messages");
+
+        // Verify no dangling tool call: the last assistant(toolCall) must be
+        // followed by a tool result or another assistant message.
+        for i in 0..ctx2.messages.len().saturating_sub(1) {
+            let is_assistant_with_tool_call = match &ctx2.messages[i] {
+                Message::Assistant { content, .. } => {
+                    content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)))
+                }
+                _ => false,
+            };
+            if is_assistant_with_tool_call {
+                let next_is_tool_result = match &ctx2.messages[i + 1] {
+                    Message::User { content } => {
+                        content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))
+                    }
+                    _ => false,
+                };
+                assert!(
+                    next_is_tool_result,
+                    "assistant message {} with tool_calls must be followed by tool result (message {})",
+                    i, i + 1
+                );
+            }
+        }
 
         let _ = tokio::fs::remove_file(&path).await;
     }
