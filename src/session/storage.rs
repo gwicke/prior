@@ -73,6 +73,22 @@ impl JsonlSessionStorage {
         })
     }
 
+    /// Open an existing session file in read-only mode.
+    ///
+    /// Unlike `open_or_create`, this does not create the file or parent
+    /// directories, and does not request write access.  Useful for inspecting
+    /// external session stores (e.g. pi sessions on a read-only mount).
+    pub async fn open_readonly(path: PathBuf) -> crate::Result<Self> {
+        let file = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .await?;
+        Ok(Self {
+            path,
+            file: tokio::sync::Mutex::new(file),
+        })
+    }
+
     /// The path to the session file.
     pub fn path(&self) -> &PathBuf {
         &self.path
@@ -115,6 +131,12 @@ impl SessionStorage for JsonlSessionStorage {
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         let mut leaf_id: Option<String> = None;
         let mut session_name: Option<String> = None;
+        // Track whether ANY leaf entry was encountered. If at least one leaf
+        // entry exists, its value (even `None`) is authoritative. If no leaf
+        // entry exists, fall back to the last entry's ID (pi's sessions don't
+        // write leaf entries — the leaf is implicitly the last entry).
+        let mut saw_leaf_entry = false;
+        let mut last_entry_id: Option<String> = None;
 
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
@@ -143,9 +165,18 @@ impl SessionStorage for JsonlSessionStorage {
                             .or_default()
                             .push(entry.id.clone());
                     }
+                    let entry_id = entry.id.clone();
+
                     // Track leaf pointer.
                     if let SessionEntryContent::Leaf { target_id } = &entry.content {
                         leaf_id = target_id.clone();
+                        saw_leaf_entry = true;
+                    } else {
+                        // Non-leaf entries update the fallback tracker.
+                        // We only update last_entry_id for non-leaf entries
+                        // so that a trailing leaf entry doesn't poison the
+                        // fallback.
+                        last_entry_id = Some(entry_id.clone());
                     }
                     // Track session name.
                     if let SessionEntryContent::SessionInfo { name } = &entry.content {
@@ -168,6 +199,13 @@ impl SessionStorage for JsonlSessionStorage {
                     )));
                 }
             }
+        }
+
+        // If no explicit leaf entry was found, fall back to the last non-leaf
+        // entry's ID (pi's sessions don't write leaf entries — the leaf is
+        // implicitly the last entry in the file).
+        if !saw_leaf_entry {
+            leaf_id = last_entry_id;
         }
 
         Ok(SessionIndex {
@@ -292,7 +330,9 @@ mod tests {
         assert_eq!(index.entries.len(), 2);
         assert!(index.entries.contains_key("e1"));
         assert!(index.entries.contains_key("e2"));
-        assert!(index.leaf_id.is_none()); // no leaf entry yet
+        // Leaf falls back to the last entry's ID when no explicit leaf entry
+        // exists (pi-compatible behaviour).
+        assert_eq!(index.leaf_id, Some("e2".into()));
 
         // Cleanup
         let _ = tokio::fs::remove_file(&path).await;

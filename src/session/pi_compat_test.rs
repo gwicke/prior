@@ -129,7 +129,7 @@ mod tests {
             assert_eq!(header.version, 3);
 
             // 2. Build full index
-            let storage = match JsonlSessionStorage::open_or_create(file_path.clone()).await
+            let storage = match JsonlSessionStorage::open_readonly(file_path.clone()).await
             {
                 Ok(s) => s,
                 Err(e) => {
