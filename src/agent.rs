@@ -1159,62 +1159,218 @@ fn parse_session_name_after(rest: &str) -> (String, String) {
     }
 }
 
-/// Replay recent session messages through the same Output trait methods
-/// used by the live display path. No rendering logic duplication — every
-/// call delegates to the same `output.display_*` method the agent loop uses.
-fn replay_recent_turns(output: &Arc<dyn Output>, ctx: &crate::session::SessionContext, replay_turns: usize) {
-    let start = ctx.messages.len().saturating_sub(replay_turns * 2 + 1);
-    for (i, msg) in ctx.messages[start..].iter().enumerate() {
+// ---------------------------------------------------------------------------
+// Session replay helpers
+// ---------------------------------------------------------------------------
+
+/// One assistant segment: the content streamed between tool executions (or the
+/// whole final answer when there are no more tools to run in this turn).
+struct AssistantSegment {
+    /// Reasoning/thinking blocks in message order.
+    thinking: Vec<String>,
+    /// Answer text blocks in message order.
+    text: Vec<String>,
+    /// Tool calls from the assistant message: `(call_id, name, args)`.
+    /// Populated during grouping; matched against results when the following
+    /// `User { ToolResult }` message is processed.
+    tool_calls: Vec<(String, String, serde_json::Value)>,
+    /// Tool results keyed by call ID: `(call_id, text)`.
+    /// Populated when the subsequent `User { ToolResult }` message is seen.
+    tool_results: Vec<(String, String)>,
+}
+
+impl AssistantSegment {
+    fn new() -> Self {
+        Self {
+            thinking: Vec::new(),
+            text: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+}
+
+/// One complete conversation turn: the user's text prompt followed by the
+/// full chain of assistant segments (`text/reasoning → tool block → …`).
+struct ConversationTurn {
+    user_text: String,
+    segments: Vec<AssistantSegment>,
+}
+
+/// Group a flat `Vec<Message>` (from `SessionContext::messages`) into replay
+/// turns.
+///
+/// A `User { Text }` opens a new `ConversationTurn`. A `User { ToolResult }`
+/// populates `tool_results` on the most recent assistant segment — these
+/// always follow the assistant message that issued the calls. An `Assistant`
+/// message appends a new segment to the current turn.
+fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+
+    for msg in messages {
         match msg {
             Message::User { content } => {
-                for c in content.iter() {
-                    match c {
-                        UserContent::Text(t) => output.display_plain(&t.text),
+                let mut user_text: Option<String> = None;
+                let mut tool_results: Vec<(String, String)> = Vec::new();
+
+                for item in content.iter() {
+                    match item {
+                        UserContent::Text(t) if user_text.is_none() => {
+                            user_text = Some(t.text.clone());
+                        }
                         UserContent::ToolResult(tr) => {
-                            let text: String = tr.content.iter()
+                            let text = tr
+                                .content
+                                .iter()
                                 .filter_map(|rc| match rc {
-                                    ToolResultContent::Text(t) => Some(t.text.clone()),
+                                    ToolResultContent::Text(t) => Some(t.text.as_str()),
                                     _ => None,
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            if !text.is_empty() {
-                                output.display_tool_result(&text);
-                            }
+                            tool_results.push((tr.id.clone(), text));
                         }
                         _ => {}
+                    }
+                }
+
+                if let Some(txt) = user_text {
+                    // New conversation turn.
+                    turns.push(ConversationTurn { user_text: txt, segments: Vec::new() });
+                } else if !tool_results.is_empty() {
+                    // Attach to the most recent segment of the current turn.
+                    if let Some(turn) = turns.last_mut() {
+                        if let Some(seg) = turn.segments.last_mut() {
+                            seg.tool_results.extend(tool_results);
+                        }
                     }
                 }
             }
             Message::Assistant { content, .. } => {
-                for c in content.iter() {
-                    match c {
-                        AssistantContent::Text(t) => output.display_markdown(&t.text),
-                        AssistantContent::Reasoning(r) => {
-                            let text: String = r.content.iter().filter_map(|rc| match rc {
-                                ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                                ReasoningContent::Summary(s) => Some(s.as_str()),
-                                _ => None,
-                            }).collect::<Vec<_>>().join("\n");
-                            if !text.is_empty() {
-                                output.display_markdown(&text);
+                if let Some(turn) = turns.last_mut() {
+                    let mut seg = AssistantSegment::new();
+                    for item in content.iter() {
+                        match item {
+                            AssistantContent::Reasoning(r) => {
+                                let t: String = r
+                                    .content
+                                    .iter()
+                                    .filter_map(|rc| match rc {
+                                        ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                                        ReasoningContent::Summary(s) => Some(s.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                if !t.is_empty() {
+                                    seg.thinking.push(t);
+                                }
                             }
+                            AssistantContent::Text(t) if !t.text.is_empty() => {
+                                seg.text.push(t.text.clone());
+                            }
+                            AssistantContent::ToolCall(tc) => {
+                                seg.tool_calls.push((
+                                    tc.id.clone(),
+                                    tc.function.name.clone(),
+                                    tc.function.arguments.clone(),
+                                ));
+                            }
+                            _ => {}
                         }
-                        AssistantContent::ToolCall(tc) => {
-                            output.display_tool_call(&tc.function.name, &tc.function.arguments);
-                        }
-                        _ => {}
                     }
+                    turn.segments.push(seg);
                 }
             }
             _ => {}
         }
-        // Separator between turns (after assistant → next user boundary).
-        if let Some(next) = ctx.messages.get(start + i + 1) {
-            if matches!(msg, Message::Assistant { .. }) && matches!(next, Message::User { .. }) {
-                output.display_separator();
+    }
+
+    turns
+}
+
+/// Replay stored session turns through the same Output event sequence the live
+/// streaming path uses (`PicoAgent::prompt`). Groups the flat message list
+/// into conversation turns, then drives:
+///
+///   `begin_response` / `set_answer_hold` /
+///   `stream_thinking` / `stream_text` /
+///   `end_response_segment` / `display_tool_call` / `display_tool_result` /
+///   `end_response`
+///
+/// in the identical order the live path produces, so `ConsoleOutput` renders
+/// replayed content exactly as it rendered the original live session.
+fn replay_recent_turns(
+    output: &Arc<dyn Output>,
+    ctx: &crate::session::SessionContext,
+    replay_turns: usize,
+) {
+    let turns = group_into_turns(&ctx.messages);
+    // Take the N most recent complete turns (accurate count, not a raw-message
+    // estimate like the old `len - replay_turns * 2 + 1` heuristic).
+    let start = turns.len().saturating_sub(replay_turns);
+
+    for (turn_idx, turn) in turns[start..].iter().enumerate() {
+        // Separator before each user prompt mirrors the top-of-loop separator
+        // in `run_interactive`. Skip it for the very first replayed turn: the
+        // loop already emitted one before the `/session resume` input was read.
+        if turn_idx > 0 {
+            output.display_separator();
+        }
+        output.display_plain(&turn.user_text);
+
+        if turn.segments.is_empty() {
+            continue;
+        }
+
+        // Pre-response separator: mirrors `run_interactive`'s separator between
+        // the submitted user prompt and the start of the agent response.
+        output.display_separator();
+
+        output.begin_response();
+        // Replay is non-streaming; content is already in the correct order.
+        // Answer-hold exists to reorder live-stream content that arrives out of
+        // sequence (reasoning after answer); it is never needed in replay.
+        output.set_answer_hold(false);
+
+        let seg_count = turn.segments.len();
+        for (seg_idx, segment) in turn.segments.iter().enumerate() {
+            let is_last_segment = seg_idx + 1 == seg_count;
+
+            for thinking in &segment.thinking {
+                output.stream_thinking(thinking);
+            }
+            for text in &segment.text {
+                output.stream_text(text);
+            }
+
+            if !segment.tool_calls.is_empty() {
+                // Flush the current text/reasoning block before the tool panel.
+                // Mirrors the `CompletionCall` stream event that fires in the
+                // live path immediately before `LoggingHook::on_tool_call`.
+                output.end_response_segment();
+                for (call_id, name, args) in &segment.tool_calls {
+                    output.display_tool_call(name, args);
+                    // Emit the matching result immediately after its call, so
+                    // `ConsoleOutput::last_tool` is always set when the result
+                    // renders (drives language guessing and gutter stripping).
+                    // A cancelled turn may have calls with no stored result;
+                    // skip `display_tool_result` rather than showing garbage.
+                    if let Some((_, result_text)) =
+                        segment.tool_results.iter().find(|(rid, _)| rid == call_id)
+                    {
+                        output.display_tool_result(result_text);
+                    }
+                }
+            } else if !is_last_segment {
+                // Defensive: a segment with no tool calls but more segments
+                // follow (shouldn't occur in a well-formed session). Flush to
+                // keep the renderer state clean.
+                output.end_response_segment();
             }
         }
+
+        output.end_response();
     }
 }
 
@@ -1281,14 +1437,14 @@ async fn handle_session_command(
                         // Re-play recent turns through the full output path.
                         if replay_turns > 0 {
                             if let Ok(ctx) = new_session.build_context().await {
+                                // Separator between the echoed command line and
+                                // the replayed content, matching the separator
+                                // run_interactive emits before each agent response.
+                                output.display_separator();
                                 replay_recent_turns(output, &ctx, replay_turns);
                             }
                         }
 
-                        config.output.display_plain(&format!(
-                            "/session {} resume",
-                            meta.name.as_deref().unwrap_or(&meta.id)
-                        ));
                         *session = Some(new_session);
                         SessionCommandResult::Switched(id)
                     }
