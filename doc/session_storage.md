@@ -1104,37 +1104,31 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 ## Implementation Plan — Phase 2: Session Object
 
-**Goal:** `Session` wrapper with context building, append helpers, forking.
+**Goal:** `Session` wrapper with context building (pi AgentMessage → rig Message), append helpers, and forking.
+
+**Status: Complete.** 13 unit tests pass. pi↔rig message round-trip verified for all content types (text, reasoning, tool calls, tool results). Tool-result batching (consecutive pi `toolResult` entries → single rig `Message::User`) verified.
+
+### Lessons Learned from Phase 2
+
+1. **`Session` must be `Send + Sync`.** Both `storage` and `index` are wrapped in `Arc<AsyncMutex<>>` so append helpers take `&self` not `&mut self`. Essential for Phase 3 where `Session` is shared by reference.
+
+2. **`build_context()` is async.** Index access goes through an async mutex, so `get_branch()` and `build_context()` are async methods. This affects `PicoAgent::prompt()` and all callers.
+
+3. **Leaf pointer updated automatically.** Every append helper writes a `type:"leaf"` entry to storage AND updates the in-memory index. No separate `set_leaf()` call needed.
+
+4. **Tool-result batching works.** Forward scan in `extract_messages()` correctly groups consecutive pi `toolResult` entries into a single `Message::User` with multiple `UserContent::ToolResult` items.
+
+5. **`rig_message_to_pi_entries()` returns `Vec<SessionEntry>`.** A single rig `Message::User` with `ToolResult` items produces multiple pi entries. The append helper iterates and writes each.
+
+6. **`Message::assistant()` convenience doesn't capture `id`.** When the agent returns a `responseId`, construct `Message::Assistant` manually with `id: Some(...)`.
 
 ### Checklist
 
-- [ ] **2.1 Implement `src/session/session.rs`**
-  - [ ] `Session::open()` — build index
-  - [ ] `Session::get_branch()` — leaf → root walk
-  - [ ] `Session::build_context()` — branch → messages + metadata
-  - [ ] `Session::apply_transforms()` — compaction support (identity for now)
-  - [ ] `Session::extract_messages()` — pi AgentMessage → rig Message
-  - [ ] `Session::derive_thinking_level()` — find latest ThinkingLevelChange
-  - [ ] `Session::derive_model()` — find latest ModelChange
-  - [ ] `Session::append_message()` — create entry, write to storage
-  - [ ] `Session::append_model_change()` — create entry, write
-  - [ ] `Session::append_thinking_level_change()` — create entry, write
-  - [ ] `Session::set_leaf()` — update leaf pointer
-  - [ ] `Session::set_session_name()` — write session_info entry
+- [x] **2.1 Implement `src/session/session.rs`** — `Session::new()`, `get_branch()`, `build_context()`, `apply_transforms()`, all append helpers, in-memory leaf updates
+- [x] **2.2 pi↔rig conversion** — `pi_message_to_rig()`, `rig_message_to_pi_entries()`, toolResult batching, 9 round-trip tests
+- [x] **2.3 Integration tests** — branch→context, metadata derivation, append→re-read, session name
 
-- [ ] **2.2 pi AgentMessage ↔ rig Message conversion**
-  - [ ] `pi_message_to_rig()` — handle user, assistant, toolResult roles
-  - [ ] `rig_message_to_pi()` — handle text, reasoning, toolCall content
-  - [ ] Unit tests: round-trip every content type
-  - [ ] Unit tests: pi session → build_context() → correct rig Messages
-
-- [ ] **2.3 Integration test: branch → context**
-  - [ ] Build a multi-turn session tree
-  - [ ] Verify `build_context()` returns messages in correct order
-  - [ ] Verify thinking level and model derivation
-  - [ ] Verify fork creates independent tree
-
-**Estimated size:** ~400 lines + ~200 lines of tests
+**Estimated size:** ~625 lines of Rust + ~550 lines of tests (actual)
 
 ---
 
@@ -1142,42 +1136,65 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 **Goal:** Replace `history: Vec<Message>` with `Session`. This is the riskiest phase — must preserve correctness of cancellation handling, reasoning stripping, and tool result batching.
 
+### Context from Phases 1–2
+
+- `Session` is `Send + Sync`: both storage and index behind `Arc<AsyncMutex<>>`. All methods take `&self`.
+- `build_context()` is async: callers must `.await` it.
+- `append_message()` takes `&self` and `&Message`, returns the entry ID.
+- `persist_turn()` and `history: Vec<Message>` must continue working alongside `Session` during migration.
+- `normalize_call_ids()` still applied before storage (cross-provider `call_id` safety).
+- `maybe_strip_reasoning()` applied ONLY in the LLM-bound context (via `build_context()` + downstream stripping). Storage preserves the full pre-strip message.
+
+### Changes needed in `agent.rs`
+
+**`prompt()` signature change:**
+
+```rust
+// Current:
+async fn prompt(&self, input: &str, history: Option<&mut Vec<Message>>) -> Result<String>;
+
+// New:
+async fn prompt(&self, input: &str, session: Option<&Session>) -> Result<String>;
+```
+
+When `session` is `Some`, `prompt()` calls `session.build_context().await` for prior context and writes back via `session.append_message()`. When `None`, the old `history` path is used as fallback.
+
 ### Checklist
 
-- [ ] **3.1 Add session initialization to `run_interactive()`**
-  - [ ] At `run_interactive` entry: create `SessionRepo`
-  - [ ] On first turn (or from `/resume`): call `repo.create(cwd)` or `repo.open(meta)`
-  - [ ] Store `Session` alongside (or replacing) `history: Vec<Message>`
+- [ ] **3.1 Session initialization in `run_interactive()`**
+  - Create `JsonlSessionRepo` at startup (`~/.picocode/sessions/`)
+  - On first turn: create `Session` via `repo.create(cwd)`
+  - Store as `Option<Session>` in loop state
 
 - [ ] **3.2 Modify `PicoAgent::prompt()` signature**
-  - [ ] Add `&mut Session` parameter (optional, for backward compat with tests)
-  - [ ] Update all callers
+  - Change `history: Option<&mut Vec<Message>>` → `session: Option<&Session>`
+  - When `session.is_some()`: use `session.build_context().await` for prior context
+  - When `session.is_none()`: use existing `history` path (fallback)
+  - Update all callers
 
 - [ ] **3.3 Replace `persist_turn()` calls with session operations**
-  - [ ] Successful turn → `session.append_message(user_msg)` + `session.append_message(assistant_msg)`
-  - [ ] Cancelled turn → `session.append_message(user_msg)` + `session.append_message(partial_assistant_msg)`
-  - [ ] `!`/`!!` shell commands → `session.append_message(user)` + `session.append_message(assistant)`
-  - [ ] Reasoning stripping still happens in `build_context()` (before sending to LLM), NOT at storage time
-  - [ ] `normalize_call_ids()` still applied to messages before storage
+  - Successful turn: `session.append_message(user_msg)` + `session.append_message(assistant_msg)`
+  - Cancelled turn: same pattern (partial assistant text is a valid message)
+  - `!`/`!!` shell commands: same pattern
+  - `normalize_call_ids()` still applied before storage
+  - `maybe_strip_reasoning()` NOT applied at storage time
 
 - [ ] **3.4 Update slash commands**
-  - [ ] `/model` → after agent rebuild, `session.append_model_change(provider, model)`
-  - [ ] `/thinking` → after rebuild, `session.append_thinking_level_change(level)`
-  - [ ] Leaf pointer: update on each new turn so resume picks up latest
+  - `/model` → `session.append_model_change(provider, model)`
+  - `/thinking` → `session.append_thinking_level_change(level)`
 
-- [ ] **3.5 Migration: keep `history` as fallback**
-  - [ ] If session storage is unavailable (e.g., ~/.picocode not writable), fall back to `Vec<Message>`
-  - [ ] Detect at startup, log a warning
+- [ ] **3.5 Fallback: keep `history` vec operational**
+  - If `~/.picocode/sessions/` is not writable, skip session creation, log warning
+  - Fall through to existing `history` code path when no session active
 
-- [ ] **3.6 Regression tests**
-  - [ ] `successful_turn_appends_to_history` — verify `build_context()` returns correct messages
-  - [ ] `aborted_turn_keeps_prior_and_no_duplication` — verify cancellation preserves context
-  - [ ] `strips_reasoning_for_non_anthropic_when_disabled` — verify stripping in build_context
-  - [ ] `anthropic_tool_call_turn_forces_reasoning_kept` — verify Anthropic tool-turn contract
+- [ ] **3.6 Regression tests (adapt existing)**
+  - `successful_turn_appends_to_history` — adapt to session + `build_context()`
+  - `aborted_turn_keeps_prior_and_no_duplication` — adapt to session
+  - New: `create_session_and_append_turn` — end-to-end test
 
-**Estimated size:** ~300 lines changed in `agent.rs`
+**Estimated size:** ~300–400 lines changed in `agent.rs`
 
----
+------
 
 ## Implementation Plan — Phase 4: REPL Commands
 
@@ -1339,7 +1356,8 @@ src/
 | Phase | What | Tests | Risk |
 |---|---|---|---|
 | ✅ 1 | Types + Storage | 30 unit, 78 pi files | Low |
-| 2 | Session Object | Unit tests, round-trip | Low |
+| ✅ 2 | Session Object  | 13 unit, full round-trip | Low |
+| 3 | Wire into agent loop | Regression tests | Medium |
 | 3 | Wire into agent loop | Regression tests | Medium |
 | 4 | REPL commands | Manual testing | Low |
 | 5 | Session selector UI | Manual testing | Low |
