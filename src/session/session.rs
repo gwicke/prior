@@ -522,6 +522,35 @@ fn pi_content_to_toolresult_content(
 // rig Message → pi AgentMessage conversion
 // ---------------------------------------------------------------------------
 
+/// ID for the i-th content entry within a multi-item `Message::User`.
+/// i=0 uses `base_id` directly; subsequent entries are `{base_id}-{i}`.
+fn content_entry_id(base_id: &str, i: usize) -> String {
+    if i == 0 {
+        base_id.to_string()
+    } else {
+        format!("{}-{}", base_id, i)
+    }
+}
+
+/// `parent_id` for the i-th content entry within a multi-item `Message::User`.
+///
+/// Entries must form a **linear chain** so that `get_path_to_root` visits
+/// every one of them:
+///   i=0 → outer `parent_id`   (the preceding leaf in the session tree)
+///   i=1 → `base_id`            (the i=0 entry)
+///   i≥2 → `{base_id}-{i-1}`   (the immediately preceding entry)
+///
+/// The previous code always used `base_id` for every i>0, which created a
+/// star/tree topology.  `get_path_to_root` then only followed one branch
+/// (the leaf → root path), silently dropping all intermediate siblings.
+fn content_entry_parent(base_id: &str, i: usize, outer_parent: &Option<String>) -> Option<String> {
+    match i {
+        0 => outer_parent.clone(),
+        1 => Some(base_id.to_string()),
+        _ => Some(format!("{}-{}", base_id, i - 1)),
+    }
+}
+
 /// Convert a rig `Message` to one or more pi `AgentMessage` entries.
 ///
 /// Most messages produce a single entry, but a `Message::User` containing
@@ -540,16 +569,8 @@ pub(crate) fn rig_message_to_pi_entries(
                 match c {
                     UserContent::Text(t) => {
                         let entry = SessionEntry {
-                            id: if i == 0 {
-                                base_id.to_string()
-                            } else {
-                                format!("{}-{}", base_id, i)
-                            },
-                            parent_id: if i == 0 {
-                                parent_id.clone()
-                            } else {
-                                Some(base_id.to_string())
-                            },
+                            id: content_entry_id(base_id, i),
+                            parent_id: content_entry_parent(base_id, i, parent_id),
                             timestamp: Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             content: SessionEntryContent::Message {
@@ -579,16 +600,8 @@ pub(crate) fn rig_message_to_pi_entries(
                             .collect();
 
                         let entry = SessionEntry {
-                            id: if i == 0 {
-                                base_id.to_string()
-                            } else {
-                                format!("{}-{}", base_id, i)
-                            },
-                            parent_id: if i == 0 {
-                                parent_id.clone()
-                            } else {
-                                Some(base_id.to_string())
-                            },
+                            id: content_entry_id(base_id, i),
+                            parent_id: content_entry_parent(base_id, i, parent_id),
                             timestamp: Utc::now()
                                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             content: SessionEntryContent::Message {
@@ -1288,6 +1301,101 @@ mod tests {
         assert_eq!(ctx.messages[0], Message::user("hello"));
         assert_eq!(ctx.messages[1], Message::assistant("hi there"));
         assert_eq!(ctx.messages[2], Message::user("follow up"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Regression test: a `Message::User` with N tool results must survive a
+    /// full roundtrip (store → `build_context`) with **all** results present and
+    /// in the original order.
+    ///
+    /// The previous bug set `parent_id = base_id` for every i>0 entry,
+    /// creating a star topology.  `get_path_to_root` then only visited the
+    /// last entry's branch, silently dropping all intermediate siblings (i=1,
+    /// i=2, … i=N-2).  With three tool results the middle one (i=1) was lost,
+    /// which caused the API to reject the next request with
+    /// "insufficient tool messages following tool_calls message".
+    #[tokio::test]
+    async fn test_multiple_tool_results_all_preserved() {
+        use rig_core::message::{ToolResult, ToolResultContent};
+
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-session2-toolresults-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        // User prompt.
+        session.append_message(&Message::user("summarise the project")).await.unwrap();
+
+        // Assistant turn with three tool calls.
+        let assistant_with_tools = Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::ToolCall(rig_core::message::ToolCall {
+                    id: "tc_0".into(), call_id: None,
+                    function: rig_core::message::ToolFunction::new("read_file".into(), serde_json::json!({})),
+                    signature: None, additional_params: None,
+                }),
+                AssistantContent::ToolCall(rig_core::message::ToolCall {
+                    id: "tc_1".into(), call_id: None,
+                    function: rig_core::message::ToolFunction::new("read_file".into(), serde_json::json!({})),
+                    signature: None, additional_params: None,
+                }),
+                AssistantContent::ToolCall(rig_core::message::ToolCall {
+                    id: "tc_2".into(), call_id: None,
+                    function: rig_core::message::ToolFunction::new("list_dir".into(), serde_json::json!({})),
+                    signature: None, additional_params: None,
+                }),
+            ]).unwrap(),
+        };
+        session.append_message(&assistant_with_tools).await.unwrap();
+
+        // Three tool results in one User message.
+        let tool_results = Message::User {
+            content: OneOrMany::many(vec![
+                UserContent::ToolResult(ToolResult {
+                    id: "tc_0".into(), call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 0"))),
+                }),
+                UserContent::ToolResult(ToolResult {
+                    id: "tc_1".into(), call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 1"))),
+                }),
+                UserContent::ToolResult(ToolResult {
+                    id: "tc_2".into(), call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 2"))),
+                }),
+            ]).unwrap(),
+        };
+        session.append_message(&tool_results).await.unwrap();
+
+        // Final assistant response.
+        session.append_message(&Message::assistant("here is the summary")).await.unwrap();
+
+        // --- Verify roundtrip ---
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 4, "user + assistant(tools) + user(results) + assistant(final)");
+
+        // The tool-result user message must contain all three results.
+        let tool_result_msg = &ctx.messages[2];
+        let Message::User { content } = tool_result_msg else {
+            panic!("expected User message at index 2, got {:?}", tool_result_msg);
+        };
+        assert_eq!(content.len(), 3, "all three tool results must be present after roundtrip");
+
+        let ids: Vec<&str> = content.iter().map(|c| match c {
+            UserContent::ToolResult(tr) => tr.id.as_str(),
+            _ => panic!("expected ToolResult"),
+        }).collect();
+        assert_eq!(ids, ["tc_0", "tc_1", "tc_2"], "tool results must be in original order");
 
         let _ = tokio::fs::remove_file(&path).await;
     }
