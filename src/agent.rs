@@ -1080,20 +1080,12 @@ fn guard<T: Tool>(
 
 /// Build session context data for the `/session` overlay.
 ///
-/// Returns (sessions list, current session id, branch message previews).
+/// Returns (sessions list, branch message previews).
+/// The current session id is passed in directly (avoids blocking_lock in async context).
 async fn build_session_ctx(
     session: &Option<Session>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
-    _output: &Arc<dyn Output>,
-) -> (Vec<crate::repl::SessionMeta>, String, Vec<(String, String)>) {
-    let current_session_id = session
-        .as_ref()
-        .and_then(|s| {
-            let index = s.index().blocking_lock();
-            Some(index.header.id.clone())
-        })
-        .unwrap_or_default();
-
+) -> (Vec<crate::repl::SessionMeta>, Vec<(String, String)>) {
     let sessions = if let Some(repo) = repo {
         let cwd = std::env::current_dir().ok();
         repo.list(cwd.as_deref())
@@ -1135,7 +1127,19 @@ async fn build_session_ctx(
         Vec::new()
     };
 
-    (sessions, current_session_id, branch_messages)
+    (sessions, branch_messages)
+}
+
+/// Result of handling a `/session` command.
+enum SessionCommandResult {
+    /// Input was not a session command (pass through).
+    NotSession,
+    /// Session command handled, current session unchanged.
+    Handled,
+    /// Session command created/resumed a new session with this ID.
+    Switched(String),
+    /// Session command deleted a session.
+    Deleted,
 }
 
 /// Parse the session name and remaining text from a `/session <rest>` string.
@@ -1156,35 +1160,28 @@ fn parse_session_name_after(rest: &str) -> (String, String) {
 }
 
 /// Parse and dispatch a `/session <name> <action>` command.
-///
-/// Returns `true` if the input was a session command (handled or errored),
-/// `false` if it should be treated as a normal prompt.
 async fn handle_session_command(
     input: &str,
     session: &mut Option<Session>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
     config: &mut AgentConfig,
-) -> bool {
+) -> SessionCommandResult {
     let input = input.trim();
     if !input.starts_with("/session") {
-        return false;
+        return SessionCommandResult::NotSession;
     }
 
     let rest = input["/session".len()..].trim();
     if rest.is_empty() {
-        // Bare `/session` — let the overlay handle it.
-        return true;
+        return SessionCommandResult::Handled;
     }
 
-    // Parse: <name> <action> [<arg>]
-    // Name may be quoted: "<name>" <action>
     let (name, after_name) = parse_session_name_after(rest);
 
     if name.is_empty() {
-        return true;
+        return SessionCommandResult::Handled;
     }
 
-    // Parse action and argument from after_name
     let (action, arg) = if let Some((a, r)) = after_name.split_once(char::is_whitespace) {
         (a.to_string(), Some(r.trim().to_string()))
     } else {
@@ -1193,16 +1190,13 @@ async fn handle_session_command(
 
     let action = action.to_lowercase();
 
-    // We need the sessions list to find the session by name.
     let meta = if let Some(repo) = repo {
         let cwd = std::env::current_dir().ok();
         repo.list(cwd.as_deref())
             .await
             .unwrap_or_default()
             .into_iter()
-            .find(|m| {
-                m.name.as_deref() == Some(&name) || m.id == name
-            })
+            .find(|m| m.name.as_deref() == Some(&name) || m.id == name)
     } else {
         None
     };
@@ -1212,32 +1206,37 @@ async fn handle_session_command(
             if let Some(meta) = meta {
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
-                        *session = Some(Session::new(storage, index));
+                        let new_session = Session::new(storage, index);
+                        let id = new_session.get_session_id().to_string();
                         config.output.display_plain(&format!(
                             "/session {} resume",
                             meta.name.as_deref().unwrap_or(&meta.id)
                         ));
+                        *session = Some(new_session);
+                        SessionCommandResult::Switched(id)
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Cannot resume session: {}", e));
+                        SessionCommandResult::Handled
                     }
                 }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
             }
         }
         "fork" => {
             if let Some(meta) = meta {
-                let cwd = std::env::current_dir().ok();
-                let cwd = if let Some(c) = cwd { c } else {
-                    config.output.display_text("Cannot determine current directory");
-                    return true;
+                let cwd = match std::env::current_dir() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        config.output.display_text("Cannot determine current directory");
+                        return SessionCommandResult::Handled;
+                    }
                 };
-                // Fork from the session's leaf
-match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
+                match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
                     Ok(new_storage) => {
                         let index = new_storage.build_index().await.unwrap_or_else(|_| {
-                            // Minimal index if build fails
                             let header = crate::session::SessionHeader::new(&cwd);
                             crate::session::SessionIndex {
                                 header,
@@ -1248,69 +1247,74 @@ match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
                             }
                         });
                         let new_session = Session::new(new_storage, index);
-                        let name = meta.name.as_deref().unwrap_or(&meta.id);
+                        let id = new_session.get_session_id().to_string();
                         config.output.display_plain(&format!(
-                            "/session {} fork", name
+                            "/session {} fork",
+                            meta.name.as_deref().unwrap_or(&meta.id)
                         ));
                         *session = Some(new_session);
+                        SessionCommandResult::Switched(id)
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Cannot fork session: {}", e));
+                        SessionCommandResult::Handled
                     }
                 }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
             }
         }
         "rename" => {
             let new_name = arg.unwrap_or_default();
             if new_name.is_empty() {
                 config.output.display_text("Usage: /session <name> rename <newname>");
-                return true;
+                return SessionCommandResult::Handled;
             }
             if let Some(ref s) = session {
-                let cur_id = s.index().blocking_lock().header.id.clone();
+                let cur_id = s.get_session_id().to_string();
                 if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
                     let _ = s.set_session_name(&new_name).await;
                     config.output.display_plain(&format!(
-                        "/session {} rename {}", 
+                        "/session {} rename {}",
                         meta.as_ref().and_then(|m| m.name.as_deref()).unwrap_or(&cur_id),
                         new_name
                     ));
                 } else if let Some(meta) = meta {
-                    // Open the session, rename, close
-                    let (storage, _index) = match repo.as_ref().unwrap().open(&meta).await {
-                        Ok(pair) => pair,
+                    match repo.as_ref().unwrap().open(&meta).await {
+                        Ok((storage, _index)) => {
+                            let s = Session::new(storage, crate::session::SessionIndex {
+                                header: crate::session::SessionHeader::new(
+                                    &std::env::current_dir().unwrap_or_default()
+                                ),
+                                entries: std::collections::HashMap::new(),
+                                leaf_id: None,
+                                children: std::collections::HashMap::new(),
+                                session_name: None,
+                            });
+                            let _ = s.set_session_name(&new_name).await;
+                            config.output.display_plain(&format!(
+                                "/session {} rename {}",
+                                meta.name.as_deref().unwrap_or(&meta.id),
+                                new_name
+                            ));
+                        }
                         Err(e) => {
                             config.output.display_text(&format!("Cannot open session: {}", e));
-                            return true;
                         }
-                    };
-                    let s = Session::new(storage, crate::session::SessionIndex {
-                        header: crate::session::SessionHeader::new(&std::env::current_dir().unwrap_or_default()),
-                        entries: std::collections::HashMap::new(),
-                        leaf_id: None,
-                        children: std::collections::HashMap::new(),
-                        session_name: None,
-                    });
-                    let _ = s.set_session_name(&new_name).await;
-                    config.output.display_plain(&format!(
-                        "/session {} rename {}", 
-                        meta.name.as_deref().unwrap_or(&meta.id),
-                        new_name
-                    ));
+                    }
                 } else {
                     config.output.display_text(&format!("Session not found: {}", name));
                 }
             }
+            SessionCommandResult::Handled
         }
         "delete" => {
             if let Some(meta) = meta {
                 if let Some(ref s) = session {
-                    let cur_id = s.index().blocking_lock().header.id.clone();
-                    if cur_id == meta.id {
+                    if s.get_session_id() == meta.id {
                         config.output.display_text("Cannot delete the current session");
-                        return true;
+                        return SessionCommandResult::Handled;
                     }
                 }
                 match repo.as_ref().unwrap().delete(&meta).await {
@@ -1319,20 +1323,23 @@ match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
                             "/session {} delete",
                             meta.name.as_deref().unwrap_or(&meta.id)
                         ));
+                        SessionCommandResult::Deleted
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Cannot delete session: {}", e));
+                        SessionCommandResult::Handled
                     }
                 }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
+                SessionCommandResult::Handled
             }
         }
         _ => {
             config.output.display_text(&format!("Unknown session action: {}", action));
+            SessionCommandResult::Handled
         }
     }
-    true
 }
 
 /// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
@@ -1431,6 +1438,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
 
 
     let mut line_history = crate::repl::History::load();
+    let mut current_session_id = session.as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
     let mut recent_models: Vec<String> = Vec::new();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
@@ -1460,8 +1470,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 config.output.display_separator();
 
                 // Build session list for the /session overlay.
-                let (sessions, current_session_id, branch_messages) = build_session_ctx(
-                    &session, &repo, &config.output,
+                let (sessions, branch_messages) = build_session_ctx(
+                    &session, &repo,
                 ).await;
 
                 let ctx = ReplCtx {
@@ -1476,7 +1486,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
                     sessions,
-                    current_session_id,
+                    current_session_id: current_session_id.clone(),
                     branch_messages,
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
@@ -1672,17 +1682,22 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 }
                 // Handle `/session <name> <action>` commands.
                 if input.starts_with("/session") {
-                    let handled = handle_session_command(
+                    match handle_session_command(
                         &input,
                         &mut session,
                         &mut repo,
                         &mut config,
-                    ).await;
-                    // Skip if it was a session command (whether handled or errored).
-                    // If it returned false (shouldn't happen since we check starts_with),
-                    // fall through to normal prompt.
-                    if handled {
-                        continue;
+                    ).await {
+                        SessionCommandResult::NotSession => {
+                            // Not a session command — fall through to normal prompt.
+                        }
+                        SessionCommandResult::Switched(new_id) => {
+                            current_session_id = new_id;
+                            continue;
+                        }
+                        _ => {
+                            continue;
+                        }
                     }
                 }
                 // `/stat` is handled by the REPL overlay (typing it opens the

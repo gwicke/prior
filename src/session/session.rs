@@ -36,6 +36,9 @@ pub struct Session {
     /// In-memory index (rebuilt on open). Wrapped in Arc+Mutex so append
     /// helpers can update the leaf pointer through `&self`.
     pub(crate) index: Arc<AsyncMutex<SessionIndex>>,
+    /// Cached session ID, set on construction — avoids a lock for the common
+    /// case of reading the session identifier.
+    pub(crate) session_id: String,
 }
 
 impl Session {
@@ -43,10 +46,17 @@ impl Session {
     ///
     /// Typically returned by `JsonlSessionRepo::open()`.
     pub fn new(storage: JsonlSessionStorage, index: SessionIndex) -> Self {
+        let session_id = index.header.id.clone();
         Self {
             storage: Arc::new(AsyncMutex::new(storage)),
             index: Arc::new(AsyncMutex::new(index)),
+            session_id,
         }
+    }
+
+    /// The session's unique identifier (UUIDv7 from the header).
+    pub fn get_session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Rebuild the in-memory index from the storage file.
