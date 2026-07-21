@@ -509,7 +509,7 @@ impl Repl {
                     after,
                     "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
                         | "s" | "persona" | "personas" | "p" | "stat" | "stats"
-                        | "sandbox" | "sb"
+                        | "sandbox" | "sb" | "session" | "sessions"
                 ) {
                     (after, "")
                 } else {
@@ -704,6 +704,13 @@ impl Repl {
                             cur_word = "sandbox".into();
                             cur_filter = rest.trim().to_string();
                             Self::sandbox_overlay_entries(&cur_filter, &mut opts, &mut active);
+                        }
+                        "session" | "sessions" => {
+                            kind = 10;
+                            title = "Sessions  (up/down, Tab complete, Enter select, Esc back)".into();
+                            cur_word = "session".into();
+                            cur_filter = rest.trim().to_string();
+                            Self::session_overlay_entries(ctx, &cur_filter, &mut opts, &mut active);
                         }
                         _ => {
                             kind = 1;
@@ -1004,6 +1011,17 @@ impl Repl {
                                             completion_pos = None;
                                         }
                                     }
+                                    10 => {
+                                        // Session list: complete the selected session name.
+                                        let buf = editor.text();
+                                        let after = &buf["/session".len()..].trim();
+                                        // Filter sessions to find the one at `sel` position.
+                                        let filtered = Self::filtered_sessions(ctx, after);
+                                        if let Some(meta) = filtered.get(sel) {
+                                            let display = meta.name.clone().unwrap_or_else(|| meta.id.clone());
+                                            editor.set(&format!("/session {}", display));
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -1210,6 +1228,16 @@ impl Repl {
                                                 completion_pos = None;
                                             }
                                         }
+                                        10 => {
+                                            // Session list: set buffer to "/session <name> " for action.
+                                            let buf = editor.text();
+                                            let after = &buf["/session".len()..].trim();
+                                            let filtered = Self::filtered_sessions(ctx, after);
+                                            if let Some(meta) = filtered.get(sel) {
+                                                let display = meta.name.clone().unwrap_or_else(|| meta.id.clone());
+                                                editor.set(&format!("/session {} ", display));
+                                            }
+                                        }
                                         _ => {}
                                     }
                                 }
@@ -1244,6 +1272,9 @@ impl Repl {
                                 9 => {
                                     path_completions.clear();
                                     completion_pos = None;
+                                }
+                                10 => {
+                                    editor.set("");
                                 }
                                 _ => {}
                             },
@@ -1822,6 +1853,97 @@ impl Repl {
                 .map(|r| *r.item)
                 .collect()
         }
+    }
+
+    /// Build the `/session` overlay rows.
+    ///
+    /// Shows all sessions for the current CWD, filtered by `filter`.
+    /// Current session is marked with ◉ and sorted first.
+    /// Named sessions show their name; unnamed show timestamp + cwd.
+    fn session_overlay_entries(
+        ctx: &ReplCtx,
+        filter: &str,
+        opts: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        let avail = term_width().saturating_sub(2);
+        let mut table = Table::new(&["", "Session", "Turns"])
+            .with_aligns(&[Align::Left, Align::Left, Align::Right])
+            .with_min_widths(&[2, 30, 6])
+            .with_priorities(&[0, 2, 1])
+            .set_gap(2);
+
+        // Build sorted session list: current first, then by timestamp descending.
+        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_cur = a.id == ctx.current_session_id;
+            let b_cur = b.id == ctx.current_session_id;
+            if a_cur && !b_cur { std::cmp::Ordering::Less }
+            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+            else { b.timestamp.cmp(&a.timestamp) }
+        });
+
+        // Filter by name text if filter is non-empty.
+        let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
+            sorted.iter().collect()
+        } else {
+            let f = filter.to_lowercase();
+            sorted.iter().filter(|m| {
+                m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
+                    || m.id.to_lowercase().contains(&f)
+                    || m.cwd.to_lowercase().contains(&f)
+            }).collect()
+        };
+
+        if filtered.is_empty() {
+            opts.push("(no sessions)".into());
+            *active = None;
+            return;
+        }
+
+        for meta in &filtered {
+            let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
+            let display_name = meta.name.clone().unwrap_or_else(|| {
+                // Show a shortened representation: timestamp + cwd tail
+                let ts = &meta.timestamp[..10]; // "2025-01-01"
+                let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
+                format!("{}  {}", ts, cwd_tail)
+            });
+            let turns = format!("{}", meta.message_count);
+            table.add_row(&[marker, &display_name, &turns]);
+        }
+
+        for row in table.render_multiline(avail) {
+            opts.push(row);
+        }
+
+        // Active is the position of the current session in the rendered rows.
+        // Since table rows may wrap, approximate by finding the first visible row.
+        *active = filtered.iter().position(|m| m.id == ctx.current_session_id);
+    }
+
+    /// Filter the sessions list by the given text (matches name, id, or cwd).
+    /// Returns a Vec<&SessionMeta> in display order (current first, then by timestamp).
+    fn filtered_sessions<'a>(ctx: &'a ReplCtx, filter: &str) -> Vec<&'a SessionMeta> {
+        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
+        sorted.sort_by(|a, b| {
+            let a_cur = a.id == ctx.current_session_id;
+            let b_cur = b.id == ctx.current_session_id;
+            if a_cur && !b_cur { std::cmp::Ordering::Less }
+            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+            else { b.timestamp.cmp(&a.timestamp) }
+        });
+
+        if filter.is_empty() {
+            return sorted;
+        }
+
+        let f = filter.to_lowercase();
+        sorted.into_iter().filter(|m| {
+            m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
+                || m.id.to_lowercase().contains(&f)
+                || m.cwd.to_lowercase().contains(&f)
+        }).collect()
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.
