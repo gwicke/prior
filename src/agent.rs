@@ -22,7 +22,7 @@ use rig_core::tool::ToolContext;
 use rig_core::client::{CompletionClient, ProviderClient};
 use rig_core::completion::{CompletionModel, PromptError};
 use rig_core::message::Message;
-use rig_core::message::{AssistantContent, Text, ToolResult, UserContent};
+use rig_core::message::{AssistantContent, Text, ToolResult, ToolResultContent, UserContent};
 use rig_core::OneOrMany;
 use rig_core::agent::MultiTurnStreamItem;
 use rig_core::message::ReasoningContent;
@@ -1159,53 +1159,90 @@ fn parse_session_name_after(rest: &str) -> (String, String) {
     }
 }
 
-/// Render a subset of a Message for session resume replay.
-/// Returns a short one-line preview of the message role and content.
-fn render_message_preview(msg: &Message) -> String {
-    match msg {
-        Message::User { content } => {
-            let text = content
-                .iter()
-                .filter_map(|c| match c {
-                    UserContent::Text(t) => Some(t.text.clone()),
-                    UserContent::ToolResult(tr) => {
-                        Some(format!("[result: {} items]", tr.content.len()))
+/// Replay recent session messages through the full Output rendering path.
+/// Uses the same rendering methods as a live session:
+/// - User messages via `display_plain`
+/// - Tool results via `display_text`
+/// - Assistant text via `display_markdown`
+/// - Separator between turns
+fn replay_recent_turns(output: &Arc<dyn Output>, ctx: &crate::session::SessionContext, replay_turns: usize) {
+    let start = ctx.messages.len().saturating_sub(replay_turns * 2 + 1);
+    for (i, msg) in ctx.messages[start..].iter().enumerate() {
+        match msg {
+            Message::User { content } => {
+                let has_tool_result = content.iter().any(|c| matches!(c, UserContent::ToolResult(_)));
+                let has_text = content.iter().any(|c| matches!(c, UserContent::Text(_)));
+                if has_text {
+                    let texts: Vec<&str> = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    for t in texts {
+                        output.display_plain(t);
                     }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            // Truncate to a reasonable length
-            let text = if text.len() > 200 {
-                format!("{}…", &text[..200])
-            } else {
-                text
-            };
-            format!("❯ {}", text)
-        }
-        Message::Assistant { content, .. } => {
-            let text = content
-                .iter()
-                .filter_map(|c| match c {
-                    AssistantContent::Text(t) => Some(t.text.clone()),
-                    AssistantContent::ToolCall(tc) => {
-                        Some(format!("[tool: {}]", tc.function.name))
+                }
+                if has_tool_result {
+                    for c in content.iter() {
+                        if let UserContent::ToolResult(tr) = c {
+                            let text: String = tr.content.iter()
+                                .filter_map(|rc| match rc {
+                                    ToolResultContent::Text(t) => Some(t.text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !text.is_empty() {
+                                output.display_text(&text);
+                            }
+                        }
                     }
-                    AssistantContent::Reasoning(_) => None,
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            let text = if text.len() > 200 {
-                format!("{}…", &text[..200])
-            } else {
-                text
-            };
-            format!("◈ {}", text)
+                }
+            }
+            Message::Assistant { content, .. } => {
+                let text_parts: Vec<String> = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.clone()),
+                        AssistantContent::Reasoning(r) => {
+                            let t: Vec<&str> = r.content.iter().filter_map(|rc| match rc {
+                                ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                                ReasoningContent::Summary(s) => Some(s.as_str()),
+                                _ => None,
+                            }).collect();
+                            if t.is_empty() { None }
+                            else { Some(t.join("\n")) }
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            Some(format!("Tool call: {} with {}", tc.function.name, tc.function.arguments))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for part in &text_parts {
+                    output.display_markdown(part);
+                }
+            }
+            _ => {}
         }
-        _ => String::new(),
+        // Separator between turns (odd i = assistant → next user)
+        if i + 1 < ctx.messages[start..].len() {
+            if let Some(next) = ctx.messages[start..].get(i + 1) {
+                match (msg, next) {
+                    (Message::Assistant { .. }, Message::User { .. }) => {
+                        output.display_separator();
+                    }
+                    (Message::User { .. }, Message::Assistant { .. }) => {}
+                    _ => {}
+                }
+            }
+        }
     }
 }
+
+/// Parse and dispatch a `/session <name> <action>` command.
 
 /// Parse and dispatch a `/session <name> <action>` command.
 async fn handle_session_command(
@@ -1265,16 +1302,11 @@ async fn handle_session_command(
                         let new_session = Session::new(storage, index);
                         let id = new_session.get_session_id().to_string();
 
-                        // Re-play recent turns.
+                        // Re-play recent turns through the full output path.
                         if replay_turns > 0 {
                             if let Ok(ctx) = new_session.build_context().await {
-                                let start = ctx.messages.len().saturating_sub(replay_turns * 2);
-                                for msg in &ctx.messages[start..] {
-                                    let text = render_message_preview(msg);
-                                    output.display_plain(&text);
-                                }
+                                replay_recent_turns(output, &ctx, replay_turns);
                             }
-                            output.display_separator();
                         }
 
                         config.output.display_plain(&format!(
