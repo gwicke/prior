@@ -103,6 +103,25 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("zai", "glm-4.6", 128_000, 0.0, 0.0, false),
 ];
 
+/// All known provider names, in one place.  Kept in sync with
+/// [`required_env_vars`] match arms (every arm name must appear here).
+const KNOWN_PROVIDERS: &[&str] = &[
+    "anthropic", "openai", "azure", "cohere", "chatgpt", "copilot",
+    "deepseek", "doubleword", "gemini", "google", "groq", "huggingface",
+    "hyperbolic", "llamafile", "mira", "minimax", "mistral", "moonshot",
+    "ollama", "openrouter", "perplexity", "together", "xai", "xiaomimimo", "zai",
+];
+
+/// Does picocode know about this provider name?  Unknown providers cannot
+/// have their API key verified, so OpenRouter-extrapolated entries must not
+/// be created for them (they would appear as "live" in the overlay even
+/// though no API key can be configured).
+pub fn is_known_provider(provider: &str) -> bool {
+    KNOWN_PROVIDERS
+        .iter()
+        .any(|k| k.eq_ignore_ascii_case(provider))
+}
+
 fn required_env_vars(provider: &str) -> &'static [&'static str] {
     match provider.to_ascii_lowercase().as_str() {
         "anthropic" => &["ANTHROPIC_API_KEY"],
@@ -274,7 +293,7 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         // "openrouter:" prefix to get the original OpenRouter API id.
         if let Some(or_id) = e.id.strip_prefix("openrouter:") {
             if let Some((ns, model)) = or_id.split_once('/') {
-                if provider_available(ns) {
+                if is_known_provider(ns) && provider_available(ns) {
                     let (pc, cc, source) = direct_price(ns, model, e.prompt_cost, e.completion_cost);
                     out.push(ModelEntry {
                         provider: ns.to_string(),
@@ -582,15 +601,7 @@ pub fn set_debug_providers(enabled: bool) {
 /// logging.
 pub fn list_available_providers() -> Vec<(String, bool, Vec<String>)> {
     let mut out: Vec<(String, bool, Vec<String>)> = Vec::new();
-    // Collect unique provider names from `required_env_vars`'s match arms.
-    // We enumerate them explicitly to match the static registry.
-    let known = &[
-        "anthropic", "openai", "azure", "cohere", "chatgpt", "copilot",
-        "deepseek", "doubleword", "gemini", "google", "groq", "huggingface",
-        "hyperbolic", "llamafile", "mira", "minimax", "mistral", "moonshot",
-        "ollama", "openrouter", "perplexity", "together", "xai", "xiaomimimo", "zai",
-    ];
-    for p in known {
+    for p in KNOWN_PROVIDERS {
         let vars = required_env_vars(p);
         let available = provider_available(p);
         let env_list: Vec<String> = vars.iter().map(|v| {
