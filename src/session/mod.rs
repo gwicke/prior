@@ -7,6 +7,9 @@ pub mod types;
 pub mod storage;
 pub mod repo;
 
+#[cfg(test)]
+pub mod pi_compat_test;
+
 pub use types::{
     encode_cwd, decode_cwd, session_filename, parse_session_filename,
     SessionHeader, SessionEntry, SessionEntryContent,

@@ -451,4 +451,150 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
     }
+
+    // ------------------------------------------------------------------
+    // 1.6 Integration test: pi wire format compatibility
+    // ------------------------------------------------------------------
+
+    /// A manually crafted pi-format JSONL session string. Uses pi's exact
+    /// wire format: camelCase, `type`-tagged entries, `"type":"session"`
+    /// header with `"version":3`.
+    const PI_FORMAT_JSONL: &str = r#"{"type":"session","version":3,"id":"pi-session-1","timestamp":"2025-01-01T00:00:00.000Z","cwd":"/home/test"}
+{"type":"message","id":"m1","parentId":null,"timestamp":"2025-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+{"type":"thinking_level_change","id":"m2","parentId":"m1","timestamp":"2025-01-01T00:00:02.000Z","thinkingLevel":"high"}
+{"type":"model_change","id":"m3","parentId":"m2","timestamp":"2025-01-01T00:00:03.000Z","provider":"anthropic","modelId":"claude-3-5-sonnet"}
+{"type":"message","id":"m4","parentId":"m3","timestamp":"2025-01-01T00:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi there"},{"type":"thinking","thinking":"step by step"}]}}
+{"type":"leaf","id":"l1","parentId":"m4","timestamp":"2025-01-01T00:00:05.000Z","targetId":"m4"}"#;
+
+    #[tokio::test]
+    async fn test_read_pi_format_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-pi-compat-{}",
+            std::process::id()
+        ));
+        let path = dir.join("pi-format.jsonl");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(&path, PI_FORMAT_JSONL).await.unwrap();
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let index = storage.build_index().await.unwrap();
+
+        // Verify header
+        assert_eq!(index.header.kind, "session");
+        assert_eq!(index.header.version, 3);
+        assert_eq!(index.header.id, "pi-session-1");
+        assert_eq!(index.header.cwd, "/home/test");
+
+        // Verify entries
+        assert_eq!(index.entries.len(), 5);
+        assert!(index.entries.contains_key("m1"));
+        assert!(index.entries.contains_key("m4"));
+
+        // Verify message entry content (pi-format AgentMessage)
+        let m1 = &index.entries["m1"];
+        match &m1.content {
+            SessionEntryContent::Message { message } => {
+                assert_eq!(message["role"], "user");
+                assert_eq!(message["content"][0]["type"], "text");
+                assert_eq!(message["content"][0]["text"], "hello");
+            }
+            _ => panic!("expected Message variant"),
+        }
+
+        // Verify thinking_level_change
+        let m2 = &index.entries["m2"];
+        match &m2.content {
+            SessionEntryContent::ThinkingLevelChange { thinking_level } => {
+                assert_eq!(thinking_level, "high");
+            }
+            _ => panic!("expected ThinkingLevelChange"),
+        }
+
+        // Verify model_change
+        let m3 = &index.entries["m3"];
+        match &m3.content {
+            SessionEntryContent::ModelChange { provider, model_id } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(model_id, "claude-3-5-sonnet");
+            }
+            _ => panic!("expected ModelChange"),
+        }
+
+        // Verify assistant message with reasoning
+        let m4 = &index.entries["m4"];
+        match &m4.content {
+            SessionEntryContent::Message { message } => {
+                assert_eq!(message["role"], "assistant");
+                assert_eq!(message["content"][1]["type"], "thinking");
+                assert_eq!(message["content"][1]["thinking"], "step by step");
+            }
+            _ => panic!("expected Message variant"),
+        }
+
+        // Verify leaf
+        let l1 = &index.entries["l1"];
+        match &l1.content {
+            SessionEntryContent::Leaf { target_id } => {
+                assert_eq!(target_id.as_deref(), Some("m4"));
+            }
+            _ => panic!("expected Leaf variant"),
+        }
+        assert_eq!(index.leaf_id, Some("m4".into()));
+
+        // Verify parent-child relationships
+        assert_eq!(index.children.get("m1").unwrap(), &vec!["m2"]);
+        assert_eq!(index.children.get("m3").unwrap(), &vec!["m4"]);
+
+        // Verify path-to-root
+        let branch = storage.get_path_to_root(&index, "m4");
+        assert_eq!(branch.len(), 4); // m1 -> m2 -> m3 -> m4 (4 entries, leaf is separate)
+        assert_eq!(branch[0].id, "m1");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_picocode_output_is_pi_compatible() {
+        let (storage, path) = create_temp_storage().await;
+
+        // Write header
+        let header = SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+
+        // Write an entry
+        let entry = SessionEntry {
+            id: "e1".into(),
+            parent_id: Some("p0".into()),
+            timestamp: "t1".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+            },
+        };
+        storage.append_entry(&entry).await.unwrap();
+
+        // Read back raw content and verify no snake_case leaked
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2); // header + entry
+
+        // Verify header is pi-format (camelCase)
+        assert!(lines[0].contains("\"type\":\"session\""));
+        assert!(lines[0].contains("\"version\":3"));
+        assert!(lines[0].contains("\"cwd\":\"/test\""));
+        // Must NOT contain snake_case fields
+        assert!(!lines[0].contains("parent_session"));
+        assert!(!lines[0].contains("kind"));
+
+        // Verify entry is pi-format (camelCase, type-tagged)
+        assert!(lines[1].contains("\"type\":\"message\""));
+        assert!(lines[1].contains("\"parentId\":\"p0\""));
+        assert!(lines[1].contains("\"role\":\"user\""));
+        // Must NOT contain snake_case
+        assert!(!lines[1].contains("parent_id"));
+        assert!(!lines[1].contains("thinking_level"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
 }
