@@ -12,10 +12,8 @@
 //! Messages are stored as raw `serde_json::Value` in pi's `AgentMessage` format.
 //! The conversion to rig's `Message` happens only in `build_context()`.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use async_trait::async_trait;
 
 use chrono::Utc;
 use rig_core::message::{

@@ -1580,7 +1580,6 @@ async fn handle_session_command(
 pub(crate) async fn ensure_session(
     session: &mut Option<Session>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
-    config: &AgentConfig,
 ) {
     if session.is_some() {
         return;
@@ -1661,7 +1660,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     // to avoid empty sessions.
     let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
     let cwd = std::env::current_dir().ok();
-    let (mut session, mut repo) = if let (Some(dir), Some(cwd)) = (&sessions_dir, &cwd) {
+    let (mut session, mut repo) = if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
         let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
         // Don't call repo.create() yet — do it on first turn.
         (None, Some(repo))
@@ -1855,7 +1854,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 // LLM-initiated tool call. This skips the LLM prompt entirely.
                 // Ensure session exists before shell commands that capture.
                 if input.starts_with("!!") || input.starts_with('!') {
-                    ensure_session(&mut session, &repo, &config).await;
+                    ensure_session(&mut session, &repo).await;
                     if let Some(id) = session.as_ref().map(|s| s.get_session_id().to_string()) {
                         current_session_id = id;
                     }
@@ -1982,7 +1981,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
                 // Ensure session exists lazily on first turn.
-                ensure_session(&mut session, &repo, &config).await;
+                ensure_session(&mut session, &repo).await;
                 let session_id = session.as_ref().map(|s| s.get_session_id().to_string());
                 if let Some(id) = session_id {
                     current_session_id = id;
