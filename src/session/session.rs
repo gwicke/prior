@@ -219,9 +219,19 @@ impl Session {
         let leaf_entry = SessionEntry::new_leaf(last_id.clone(), None);
         storage.append_entry(&leaf_entry).await?;
 
-        // Update in-memory index leaf.
+        // Update in-memory index: insert entries, track parent-child
+        // relationships, and advance the leaf pointer.  Without this the
+        // in-memory `entries` map becomes stale and `get_branch()` /
+        // `build_context()` cannot follow the parent chain — every
+        // subsequent turn would see an empty conversation history.
         {
             let mut index = self.index.lock().await;
+            for pi_entry in &pi_entries {
+                index.entries.insert(pi_entry.id.clone(), pi_entry.clone());
+                if let Some(ref pid) = pi_entry.parent_id {
+                    index.children.entry(pid.clone()).or_default().push(pi_entry.id.clone());
+                }
+            }
             index.leaf_id = last_id.clone();
         }
 
@@ -238,7 +248,7 @@ impl Session {
         let entry = SessionEntry::new_model_change(
             provider.to_string(),
             model_id.to_string(),
-            parent_id,
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -249,6 +259,10 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
             index.leaf_id = Some(id.clone());
         }
         Ok(id)
@@ -263,7 +277,7 @@ impl Session {
         };
         let entry = SessionEntry::new_thinking_level_change(
             level.to_string(),
-            parent_id,
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -274,6 +288,10 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
             index.leaf_id = Some(id.clone());
         }
         Ok(id)
@@ -288,7 +306,7 @@ impl Session {
         };
         let entry = SessionEntry::new_session_info(
             Some(name.to_string()),
-            parent_id,
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -299,6 +317,10 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
             index.leaf_id = Some(id.clone());
         }
         Ok(id)
@@ -1205,6 +1227,67 @@ mod tests {
             .unwrap();
         let index2 = ro.build_index().await.unwrap();
         assert_eq!(index2.session_name.as_deref(), Some("my-analysis"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_index_updated_after_append() {
+        // Regression test: after appending messages and metadata entries,
+        // build_context() must return the correct messages using the
+        // IN-MEMORY index (without re-opening from disk). The bug was that
+        // append operations wrote to disk and updated leaf_id but never
+        // inserted entries into index.entries, so get_branch() returned empty.
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-session2-inmem-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        // --- Turn 1: append a user + assistant message ---
+        session.append_message(&Message::user("hello")).await.unwrap();
+        session.append_message(&Message::assistant("hi there")).await.unwrap();
+
+        // Verify context without re-opening from disk
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 2, "should have both turn-1 messages");
+        assert_eq!(ctx.messages[0], Message::user("hello"));
+        assert_eq!(ctx.messages[1], Message::assistant("hi there"));
+
+        // --- Model change ---
+        session.append_model_change("anthropic", "claude-3-5-sonnet").await.unwrap();
+
+        // Verify context still includes the original messages
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 2, "model change must not drop messages");
+        assert_eq!(ctx.messages[0], Message::user("hello"));
+        assert_eq!(ctx.messages[1], Message::assistant("hi there"));
+        assert_eq!(ctx.model.as_deref(), Some("claude-3-5-sonnet"));
+
+        // --- Thinking level change ---
+        session.append_thinking_level_change("high").await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 2, "thinking change must not drop messages");
+        assert_eq!(ctx.thinking_level.as_deref(), Some("high"));
+
+        // --- Turn 2: another user message ---
+        session.append_message(&Message::user("follow up")).await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 3, "should accumulate across turns");
+        assert_eq!(ctx.messages[0], Message::user("hello"));
+        assert_eq!(ctx.messages[1], Message::assistant("hi there"));
+        assert_eq!(ctx.messages[2], Message::user("follow up"));
 
         let _ = tokio::fs::remove_file(&path).await;
     }
