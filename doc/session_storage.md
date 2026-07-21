@@ -1332,6 +1332,30 @@ Every append operation that changes the current position updates the leaf pointe
 
 Full UUIDv7 strings (not pi's abbreviated 8-char format). The `uuid` crate with `v7` feature provides `Uuid::now_v7()`. A `uuid::timestamp::context::Context` (monotonic counter) should be created at agent startup and shared across the session to guard against clock rewinds.
 
+### 7. Resume Semantics
+
+When resuming a session:
+
+- **Replacement, not overlay.** The current `Session` object is dropped and
+  replaced with the resumed one. The session file is re-read and the in-memory
+  `SessionIndex` is rebuilt from scratch.
+- **LLM receives full context.** `build_context()` returns every message from
+  leaf to root. The first prompt after resume sees the entire prior conversation
+  as history.
+- **No content re-displayed.** No messages are re-rendered to the user's
+  terminal. Rationale:
+  - Terminal scrollback is the user's visual record. If the terminal is still
+    open, everything is there.
+  - Re-rendering hundreds of markdown messages on resume is expensive and noisy.
+  - The session name in the status line (future Phase 5) is sufficient visual
+    feedback.
+- **Next prompt continues normally.** The resumed session is indistinguishable
+  from one that was never interrupted. Persistence via `append_message()` works
+  the same way after resume as before.
+
+Resume is purely about restoring the LLM's context window. Visual continuity
+is the terminal's responsibility.
+
 ---
 
 ## Open Questions (Updated)

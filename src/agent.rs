@@ -1159,12 +1159,62 @@ fn parse_session_name_after(rest: &str) -> (String, String) {
     }
 }
 
+/// Render a subset of a Message for session resume replay.
+/// Returns a short one-line preview of the message role and content.
+fn render_message_preview(msg: &Message) -> String {
+    match msg {
+        Message::User { content } => {
+            let text = content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    UserContent::ToolResult(tr) => {
+                        Some(format!("[result: {} items]", tr.content.len()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            // Truncate to a reasonable length
+            let text = if text.len() > 200 {
+                format!("{}…", &text[..200])
+            } else {
+                text
+            };
+            format!("❯ {}", text)
+        }
+        Message::Assistant { content, .. } => {
+            let text = content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.clone()),
+                    AssistantContent::ToolCall(tc) => {
+                        Some(format!("[tool: {}]", tc.function.name))
+                    }
+                    AssistantContent::Reasoning(_) => None,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let text = if text.len() > 200 {
+                format!("{}…", &text[..200])
+            } else {
+                text
+            };
+            format!("◈ {}", text)
+        }
+        _ => String::new(),
+    }
+}
+
 /// Parse and dispatch a `/session <name> <action>` command.
 async fn handle_session_command(
     input: &str,
     session: &mut Option<Session>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
     config: &mut AgentConfig,
+    output: &Arc<dyn Output>,
+    settings: &SettingsStore,
 ) -> SessionCommandResult {
     let input = input.trim();
     if !input.starts_with("/session") {
@@ -1204,10 +1254,29 @@ async fn handle_session_command(
     match action.as_str() {
         "resume" => {
             if let Some(meta) = meta {
+                // Parse optional replay turn count from argument.
+                let replay_turns = arg
+                    .as_deref()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(settings.session_resume_replay_turns);
+
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
                         let new_session = Session::new(storage, index);
                         let id = new_session.get_session_id().to_string();
+
+                        // Re-play recent turns.
+                        if replay_turns > 0 {
+                            if let Ok(ctx) = new_session.build_context().await {
+                                let start = ctx.messages.len().saturating_sub(replay_turns * 2);
+                                for msg in &ctx.messages[start..] {
+                                    let text = render_message_preview(msg);
+                                    output.display_plain(&text);
+                                }
+                            }
+                            output.display_separator();
+                        }
+
                         config.output.display_plain(&format!(
                             "/session {} resume",
                             meta.name.as_deref().unwrap_or(&meta.id)
@@ -1682,11 +1751,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 }
                 // Handle `/session <name> <action>` commands.
                 if input.starts_with("/session") {
+                    let out = config.output.clone();
                     match handle_session_command(
                         &input,
                         &mut session,
                         &mut repo,
                         &mut config,
+                        &out,
+                        settings,
                     ).await {
                         SessionCommandResult::NotSession => {
                             // Not a session command — fall through to normal prompt.

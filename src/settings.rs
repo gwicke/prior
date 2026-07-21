@@ -97,6 +97,8 @@ pub enum SettingKey {
     ShowReasoning,
     /// `true` | `false` — keep reasoning blocks in the session context.
     ReasoningInContext,
+    /// positive integer — number of turns to replay on session resume.
+    SessionResumeReplayTurns,
 }
 
 /// How a setting's *value* may be completed. Drive a value-autocomplete
@@ -163,6 +165,12 @@ pub static SETTINGS: &[SettingMeta] = &[
         description: "Keep reasoning in session context: true | false",
         kind: ValueKind::Enum(&["true", "false"]),
     },
+    SettingMeta {
+        key: SettingKey::SessionResumeReplayTurns,
+        name: "session_resume_replay_turns",
+        description: "Turns to replay on session resume (0 = none)",
+        kind: ValueKind::Int,
+    },
 ];
 
 /// In-memory mirror of the five managed settings, plus the optional file to
@@ -179,6 +187,9 @@ pub struct SettingsStore {
     /// `true` keeps reasoning blocks in the stored session context; `false`
     /// (default) drops them to save tokens. Forced `true` for Anthropic models.
     pub reasoning_in_context: bool,
+    /// Number of most recent turns to replay on session resume.
+    /// 0 = no replay. Default: 3.
+    pub session_resume_replay_turns: usize,
     pub path: Option<PathBuf>,
 }
 
@@ -207,6 +218,7 @@ impl SettingsStore {
                 .as_str()
                 .to_string(),
             reasoning_in_context: cfg.reasoning_in_context,
+            session_resume_replay_turns: 3,
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -233,11 +245,12 @@ impl SettingsStore {
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "content".to_string()),
             reasoning_in_context: cfg.reasoning_in_context.unwrap_or(false),
+            session_resume_replay_turns: 3,
             path: path.map(|p| p.to_path_buf()),
         }
     }
 
-    /// Apply the five managed settings onto an `AgentConfig`, overwriting only
+    /// Apply the managed settings onto an `AgentConfig`, overwriting only
     /// the fields `/settings` controls. Used by `run_interactive` to live-apply
     /// pending `/settings` changes; the non-settings fields (output, agent/
     /// system prompt, bash auto-allow, cancel flag, …) are preserved. This is
@@ -289,6 +302,7 @@ impl SettingsStore {
             SettingKey::DefaultThinking => self.default_thinking_level.clone(),
             SettingKey::ShowReasoning => self.show_reasoning.clone(),
             SettingKey::ReasoningInContext => self.reasoning_in_context.to_string(),
+            SettingKey::SessionResumeReplayTurns => self.session_resume_replay_turns.to_string(),
         }
     }
 
@@ -352,6 +366,13 @@ impl SettingsStore {
                     other
                 )),
             },
+            SettingKey::SessionResumeReplayTurns => {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| format!("session_resume_replay_turns must be a non-negative integer (got '{}')", value.trim()))?;
+                Ok(())
+            }
         }
     }
 
@@ -461,6 +482,9 @@ impl SettingsStore {
                 self.reasoning_in_context =
                     matches!(value.trim().to_ascii_lowercase().as_str(), "true")
             }
+            SettingKey::SessionResumeReplayTurns => {
+                self.session_resume_replay_turns = value.trim().parse().unwrap_or(self.session_resume_replay_turns)
+            }
         }
     }
 }
@@ -500,6 +524,7 @@ mod tests {
             default_thinking_level: "off".into(),
             show_reasoning: "content".into(),
             reasoning_in_context: false,
+            session_resume_replay_turns: 3,
             path: Some(path.to_path_buf()),
         }
     }
@@ -632,7 +657,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().join("picocode.toml").as_path());
         let all = s.overlay_rows("");
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         let filtered = s.overlay_rows("model");
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.key, SettingKey::DefaultModel);
@@ -711,8 +736,8 @@ mod tests {
         let opts: Vec<String> = table.render(200);
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
-        // title + 7 single-line options (pre-formatted rows are NOT wrapped).
-        assert_eq!(lines.len(), 8, "pre-formatted rows must not be word-wrapped");
+        // title + 8 single-line options (pre-formatted rows are NOT wrapped).
+        assert_eq!(lines.len(), 9, "pre-formatted rows must not be word-wrapped");
         // Strip ANSI so visible column positions compare cleanly (the selected
         // row carries an extra color escape that must not affect alignment).
         fn strip_ansi(s: &str) -> String {

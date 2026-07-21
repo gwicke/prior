@@ -1697,6 +1697,7 @@ impl Repl {
                 ValueCandidate { display: "true".into(), value: "true".into(), desc: "keep reasoning blocks in the session context".into() },
                 ValueCandidate { display: "false".into(), value: "false".into(), desc: "drop reasoning from context to save tokens (default)".into() },
             ],
+            SettingKey::SessionResumeReplayTurns => Vec::new(),
         }
     }
 
