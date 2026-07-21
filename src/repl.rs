@@ -324,6 +324,7 @@ pub(crate) enum ActiveOverlay {
     },
 
     Sandbox {
+        sub: Option<&'static str>,
         items: Vec<String>,
         _filter: String,
     },
@@ -424,8 +425,8 @@ impl ActiveOverlay {
                 let filter = rest.trim().to_string();
                 let mut items = Vec::new();
                 let mut active = None;
-                Repl::sandbox_overlay_entries(&filter, &mut items, &mut active);
-                ActiveOverlay::Sandbox { items, _filter: filter }
+                let sub = Repl::sandbox_overlay_entries(&filter, &mut items, &mut active);
+                ActiveOverlay::Sandbox { sub, items, _filter: filter }
             }
             _ => {
                 let cmds = slash::filter_commands(rest);
@@ -556,8 +557,12 @@ impl ActiveOverlay {
                 ("Session stats  (Esc clears input to close)",
                  lines.clone(), None, true)
             }
-            ActiveOverlay::Sandbox { items, .. } => {
-                ("Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)",
+            ActiveOverlay::Sandbox { items, sub, .. } => {
+                let title = match sub {
+                    Some("remove") => "Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)",
+                    _ => "Sandbox bindings  (type to filter, up/down, Tab/Enter select, Esc back)",
+                };
+                (title,
                  items.clone(), None, false)
             }
             ActiveOverlay::PathComplete { completions, .. } => {
@@ -642,64 +647,98 @@ impl ActiveOverlay {
                     editor.set(&Repl::replace_last_token(&buf, &tok));
                 }
             }
-            ActiveOverlay::Sandbox { .. } => {
+            ActiveOverlay::Sandbox { sub, .. } => {
                 let buf = editor.text();
-                let after = &buf["/sandbox".len()..].trim();
-                if let Some((sub, rest)) = after.split_once(' ') {
-                    let rest = rest.trim();
-                    match sub {
-                        "add_ro" | "add_rw" => {
-                            if !rest.is_empty() {
-                                let last_token = rest.split_whitespace().last().unwrap_or("");
-                                let uses_tilde = last_token.starts_with('~');
-                                let expanded = if uses_tilde {
-                                    crate::path_util::expand_tilde(last_token).to_string_lossy().into_owned()
-                                } else {
-                                    last_token.to_string()
-                                };
-                                let completions = Repl::complete_path_prefix(&expanded);
-                                // Round-trip `~`-prefixed results back to `~`.
-                                let home = if uses_tilde {
-                                    std::env::var("HOME").map(|h| {
-                                        if h.ends_with('/') { h } else { format!("{}/", h) }
-                                    }).ok()
-                                } else {
-                                    None
-                                };
-                                let completions: Vec<String> = completions.into_iter().map(|c| {
-                                    if let Some(ref home) = home {
-                                        if let Some(rest) = c.strip_prefix(home) {
-                                            return format!("~/{}", rest);
-                                        }
+                match sub {
+                    Some("add_ro") | Some("add_rw") => {
+                        let after = &buf["/sandbox".len()..].trim();
+                        let rest = after.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                        if !rest.is_empty() {
+                            let last_token = rest.split_whitespace().last().unwrap_or("");
+                            let uses_tilde = last_token.starts_with('~');
+                            let expanded = if uses_tilde {
+                                crate::path_util::expand_tilde(last_token).to_string_lossy().into_owned()
+                            } else {
+                                last_token.to_string()
+                            };
+                            let completions = Repl::complete_path_prefix(&expanded);
+                            // Round-trip `~`-prefixed results back to `~`.
+                            let home = if uses_tilde {
+                                std::env::var("HOME").map(|h| {
+                                    if h.ends_with('/') { h } else { format!("{}/", h) }
+                                }).ok()
+                            } else {
+                                None
+                            };
+                            let completions: Vec<String> = completions.into_iter().map(|c| {
+                                if let Some(ref home) = home {
+                                    if let Some(rest) = c.strip_prefix(home) {
+                                        return format!("~/{}", rest);
                                     }
-                                    c
-                                }).collect();
-                                if let Some(c) = completions.get(sel) {
-                                    editor.set(&Repl::replace_last_token(&buf, c));
                                 }
+                                c
+                            }).collect();
+                            if let Some(c) = completions.get(sel) {
+                                editor.set(&Repl::replace_last_token(&buf, c));
                             }
                         }
-                        "remove" => {
-                            if !rest.is_empty() {
-                                let binds = crate::sandbox_bindings::list();
-                                let last_token = rest.split_whitespace().last().unwrap_or("");
-                                let filtered: Vec<_> = crate::fuzzy::fuzzy_filter(
-                                    &binds, last_token,
-                                    |b| b.sandbox_path.to_string_lossy().to_string(),
-                                );
-                                if let Some(r) = filtered.get(sel) {
-                                    let path = r.item.sandbox_path.to_string_lossy().to_string();
-                                    editor.set(&Repl::replace_last_token(&buf, &path));
-                                }
-                            }
+                    }
+                    Some("remove") => {
+                        let buf = editor.text();
+                        let filter = buf["/sandbox".len()..].trim()
+                            .split_once(' ')
+                            .map(|(_, r)| r.trim())
+                            .unwrap_or("");
+                        let combined = crate::sandbox_bindings::combined_list();
+                        let filtered: Vec<_> = if filter.is_empty() {
+                            combined
+                        } else {
+                            crate::fuzzy::fuzzy_filter(&combined, filter, |b| {
+                                let mode_str = if b.mode == crate::config::BindMode::Ro { "ro" } else { "rw" };
+                                let src = if b.is_excluded { "excluded" } else if b.is_session { "session" } else { "cfg" };
+                                format!("{} {} {} {}",
+                                    b.host_path.to_string_lossy(),
+                                    b.sandbox_path.to_string_lossy(),
+                                    mode_str,
+                                    src)
+                            })
+                            .into_iter()
+                            .map(|r| r.item.clone())
+                            .collect()
+                        };
+                        if let Some(r) = filtered.get(sel) {
+                            let path = r.sandbox_path.to_string_lossy().to_string();
+                            // If the buffer doesn't have a space after "remove" yet,
+                            // insert one so the path is properly tokenized.
+                            let trimmed = buf.trim_end();
+                            let new_buf = if trimmed.ends_with("remove") && !buf.ends_with(' ') {
+                                format!("{} {}", trimmed, path)
+                            } else {
+                                Repl::replace_last_token(&buf, &path)
+                            };
+                            editor.set(&new_buf);
                         }
-                        _ => {}
                     }
-                } else {
-                    let subcommands = ["add_ro", "add_rw", "remove"];
-                    if let Some(c) = subcommands.get(sel) {
-                        editor.set(&format!("/sandbox {} ", c));
+                    None => {
+                        let buf = editor.text();
+                        let filter = buf["/sandbox".len()..].trim();
+                        let subcommands = ["add_ro", "add_rw", "remove"];
+                        let helptext = ["Make path available read-only",
+                                        "Make path available read-write",
+                                        "Remove a path from the bindings"];
+                        // Replicate the same prefix/contains filtering as
+                        // `sandbox_overlay_entries` to map sel → subcommand name.
+                        let filtered: Vec<&str> = subcommands.iter().enumerate()
+                            .filter(|(i, name)| {
+                                name.starts_with(filter) || helptext[*i].contains(filter)
+                            })
+                            .map(|(_, name)| *name)
+                            .collect();
+                        if let Some(c) = filtered.get(sel) {
+                            editor.set(&format!("/sandbox {} ", c));
+                        }
                     }
+                    _ => {}
                 }
             }
             ActiveOverlay::PathComplete { completions, completion_pos: pos } => {
@@ -820,44 +859,85 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::Sandbox { .. } => {
+            ActiveOverlay::Sandbox { sub, .. } => {
                 let buf = editor.text();
-                let after = &buf["/sandbox".len()..].trim();
-                if let Some((sub, path)) = after.split_once(' ') {
-                    let path = path.trim();
-                    match sub {
-                        "add_ro" | "add_rw" => {
-                            if !path.is_empty() {
-                                let parts: Vec<&str> = path.split_whitespace().collect();
-                                let host = parts[0];
-                                let sandbox = parts.get(1).unwrap_or(&"");
-                                let line = if sandbox.is_empty() {
-                                    format!("/sandbox {} {}", sub, host)
-                                } else {
-                                    format!("/sandbox {} {} {}", sub, host, sandbox)
-                                };
-                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                                return OverlayAction::Action(
-                                    InputAction::Sandbox(sub.to_string(), host.to_string(), sandbox.to_string()),
-                                );
-                            }
+                match sub {
+                    Some("add_ro") | Some("add_rw") => {
+                        let after = &buf["/sandbox".len()..].trim();
+                        let path = after.split_once(' ').map(|(_, r)| r.trim()).unwrap_or("");
+                        if !path.is_empty() {
+                            let parts: Vec<&str> = path.split_whitespace().collect();
+                            let host = parts[0];
+                            let sandbox_path = parts.get(1).unwrap_or(&"");
+                            let line = if sandbox_path.is_empty() {
+                                format!("/sandbox {} {}", sub.as_ref().unwrap_or(&""), host)
+                            } else {
+                                format!("/sandbox {} {} {}", sub.as_ref().unwrap_or(&""), host, sandbox_path)
+                            };
+                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                            return OverlayAction::Action(
+                                InputAction::Sandbox(sub.as_ref().unwrap_or(&"").to_string(), host.to_string(), sandbox_path.to_string()),
+                            );
                         }
-                        "remove" => {
-                            if !path.is_empty() {
-                                let sandbox = path.split_whitespace().next().unwrap_or("");
-                                let line = format!("/sandbox remove {}", sandbox);
-                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                                return OverlayAction::Action(
-                                    InputAction::Sandbox("remove".to_string(), sandbox.to_string(), String::new()),
-                                );
-                            }
-                        }
-                        _ => {}
+                        editor.set(&format!("/sandbox {} ", sub.as_ref().unwrap_or(&"")));
                     }
-                }
-                let subcommands = ["add_ro", "add_rw", "remove"];
-                if let Some(c) = subcommands.get(sel) {
-                    editor.set(&format!("/sandbox {} ", c));
+                    Some("remove") => {
+                        let buf = editor.text();
+                        let filter = buf["/sandbox".len()..].trim()
+                            .split_once(' ')
+                            .map(|(_, r)| r.trim())
+                            .unwrap_or("");
+                        let (sub_cmd, sandbox_path) = {
+                            let combined = crate::sandbox_bindings::combined_list();
+                            let filtered: Vec<_> = if filter.is_empty() {
+                                combined
+                            } else {
+                                crate::fuzzy::fuzzy_filter(&combined, filter, |b| {
+                                    let mode_str = if b.mode == crate::config::BindMode::Ro { "ro" } else { "rw" };
+                                    let src = if b.is_excluded { "excluded" } else if b.is_session { "session" } else { "cfg" };
+                                    format!("{} {} {} {}",
+                                        b.host_path.to_string_lossy(),
+                                        b.sandbox_path.to_string_lossy(),
+                                        mode_str,
+                                        src)
+                                })
+                                .into_iter()
+                                .map(|r| r.item.clone())
+                                .collect()
+                            };
+                            let sub = filtered.get(sel)
+                                .map(|b| if b.is_session { "remove" } else { "exclude" })
+                                .unwrap_or("remove");
+                            let path = filtered.get(sel)
+                                .map(|b| b.sandbox_path.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            (sub, path)
+                        };
+                        if !sandbox_path.is_empty() {
+                            let line = format!("/sandbox {} {}", sub_cmd, sandbox_path);
+                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                            return OverlayAction::Action(
+                                InputAction::Sandbox(sub_cmd.to_string(), sandbox_path, String::new()),
+                            );
+                        }
+                    }
+                    None => {
+                        let filter = buf["/sandbox".len()..].trim();
+                        let subcommands = ["add_ro", "add_rw", "remove"];
+                        let helptext = ["Make path available read-only",
+                                        "Make path available read-write",
+                                        "Remove a path from the bindings"];
+                        let filtered: Vec<&str> = subcommands.iter().enumerate()
+                            .filter(|(i, name)| {
+                                name.starts_with(filter) || helptext[*i].contains(filter)
+                            })
+                            .map(|(_, name)| *name)
+                            .collect();
+                        if let Some(c) = filtered.get(sel) {
+                            editor.set(&format!("/sandbox {} ", c));
+                        }
+                    }
+                    _ => {}
                 }
                 OverlayAction::Continue
             }
@@ -1889,7 +1969,7 @@ impl Repl {
         filter: &str,
         opts: &mut Vec<String>,
         active: &mut Option<usize>,
-    ) {
+    ) -> Option<&'static str> {
         let subcommands = [
             ("add_ro", "Make path available read-only"),
             ("add_rw", "Make path available read-write"),
@@ -1902,11 +1982,14 @@ impl Repl {
                 opts.push(format!("{:<10} {}", name, help));
             }
             *active = None;
-            return;
+            return None;
         }
 
         let (sub, path) = if let Some((w, r)) = filter.split_once(' ') {
             (w, r)
+        } else if subcommands.iter().any(|(n, _)| *n == filter) {
+            // Exact subcommand match: enter its mode with an empty path.
+            (filter, "")
         } else {
             // Fuzzy-filter on sub-commands.
             for (name, help) in &subcommands {
@@ -1918,7 +2001,7 @@ impl Repl {
                 opts.push("(no matching command)".into());
             }
             *active = None;
-            return;
+            return None;
         };
 
         match sub {
@@ -1927,7 +2010,7 @@ impl Repl {
                 if path.is_empty() {
                     opts.push("(type a path and press Tab to complete)".into());
                     *active = None;
-                    return;
+                    return Some("add_ro");
                 }
                 // The last token is the one being typed; show file completions.
                 let last_token = path.split_whitespace().last().unwrap_or("");
@@ -1963,20 +2046,27 @@ impl Repl {
                     }
                 }
                 *active = None;
+                return Some("add_ro");
             }
             "remove" => {
                 let path = path.trim();
-                let binds = crate::sandbox_bindings::list();
-                if binds.is_empty() {
-                    opts.push("(no session bindings to remove)".into());
+                let combined = crate::sandbox_bindings::combined_list();
+                if combined.is_empty() {
+                    opts.push("(no bindings configured)".into());
                     *active = None;
-                    return;
+                    return Some("remove");
                 }
                 let filtered: Vec<_> = if path.is_empty() {
-                    binds
+                    combined
                 } else {
-                    crate::fuzzy::fuzzy_filter(&binds, path, |b| {
-                        b.sandbox_path.to_string_lossy().to_string()
+                    crate::fuzzy::fuzzy_filter(&combined, path, |b| {
+                        let mode_str = if b.mode == crate::config::BindMode::Ro { "ro" } else { "rw" };
+                        let src = if b.is_excluded { "excluded" } else if b.is_session { "session" } else { "cfg" };
+                        format!("{} {} {} {}",
+                            b.host_path.to_string_lossy(),
+                            b.sandbox_path.to_string_lossy(),
+                            mode_str,
+                            src)
                     })
                     .into_iter()
                     .map(|r| r.item.clone())
@@ -1985,26 +2075,29 @@ impl Repl {
                 if filtered.is_empty() {
                     opts.push("(no matching bindings)".into());
                 } else {
+                    let avail = term_width().saturating_sub(2);
+                    let mut table = Table::new(&["From", "To", "Mode", "Src"])
+                        .with_aligns(&[Align::Left, Align::Left, Align::Center, Align::Left])
+                        .with_min_widths(&[10, 10, 4, 5])
+                        .with_priorities(&[2, 2, 1, 1])
+                        .set_gap(2);
                     for b in &filtered {
-                        let mode = if b.mode == crate::config::BindMode::Ro {
-                            "ro"
-                        } else {
-                            "rw"
-                        };
-                        let host = b.host_path.display();
-                        let sandbox = b.sandbox_path.display();
-                        if b.host_path == b.sandbox_path {
-                            opts.push(format!("{}  ({})", sandbox, mode));
-                        } else {
-                            opts.push(format!("{} → {}  ({})", host, sandbox, mode));
-                        }
+                        let from = b.host_path.to_string_lossy().to_string();
+                        let to = b.sandbox_path.to_string_lossy().to_string();
+                        let mode = if b.mode == crate::config::BindMode::Ro { "ro" } else { "rw" };
+                        let src = if b.is_excluded { "excluded" } else if b.is_session { "session" } else { "cfg" };
+                        table.add_row(&[from.as_str(), to.as_str(), mode, src]);
                     }
+                    let rows = table.render_multiline(avail);
+                    opts.extend(rows);
                 }
                 *active = None;
+                return Some("remove");
             }
             _ => {
                 opts.push("(unknown subcommand: use add_ro, add_rw, or remove)".into());
                 *active = None;
+                return None;
             }
         }
     }

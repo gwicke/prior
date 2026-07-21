@@ -4,6 +4,11 @@
 //! the live `SandboxConfig` before each `bwrap` invocation, but are **never**
 //! persisted to `settings.toml`.
 //!
+//! Also stores a snapshot of the **base** config (from `settings.toml`) so the
+//! `/sandbox remove` overlay can list **all** bindings (both config-provided
+//! and ad-hoc session binds) and the user can temporarily exclude config
+//! shares.
+//!
 //! All public functions are thread-safe (backed by a `Mutex`).
 
 use std::path::PathBuf;
@@ -23,9 +28,63 @@ pub struct SessionBind {
     pub mode: BindMode,
 }
 
+/// A binding as shown in the combined overlay (config + session).
+#[derive(Debug, Clone)]
+pub struct CombinedBind {
+    pub host_path: PathBuf,
+    pub sandbox_path: PathBuf,
+    pub mode: BindMode,
+    /// `true` for ad-hoc session binds; `false` for config-provided binds.
+    pub is_session: bool,
+    /// `true` when a config-provided binding has been excluded by the user.
+    pub is_excluded: bool,
+}
+
 /// Global session-scoped additional bindings.
 static SESSION_BINDS: LazyLock<Mutex<Vec<SessionBind>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Snapshot of the *original* sandbox config (before session merge), captured
+/// at startup so we can distinguish config-provided bindings from ad-hoc ones.
+static BASE_CONFIG: LazyLock<Mutex<Option<SandboxConfig>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Sandbox paths (resolved, in-sandbox) that the user has temporarily excluded
+/// from the config.  These are skipped during [`merge_into`].
+static EXCLUDED: LazyLock<Mutex<Vec<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Store the original (non-merged) sandbox config so we can list config-
+/// provided bindings in the remove overlay and rebuild correctly on merge.
+pub fn set_base(cfg: Option<SandboxConfig>) {
+    if let Ok(mut b) = BASE_CONFIG.lock() {
+        *b = cfg;
+    }
+}
+
+/// Mark a config-provided sandbox path as excluded (temporarily removed).
+pub fn exclude(sandbox_path: &str) -> Result<(), String> {
+    let resolved = resolve_sandbox_path(sandbox_path);
+    let mut exc = EXCLUDED.lock().map_err(|e| format!("lock error: {}", e))?;
+    if !exc.contains(&resolved) {
+        exc.push(resolved);
+    }
+    Ok(())
+}
+
+/// Remove a path from the exclusion list (re-enable a config binding).
+#[allow(dead_code)]
+pub fn remove_exclude(sandbox_path: &str) -> Result<(), String> {
+    let resolved = resolve_sandbox_path(sandbox_path);
+    let mut exc = EXCLUDED.lock().map_err(|e| format!("lock error: {}", e))?;
+    exc.retain(|p| *p != resolved);
+    Ok(())
+}
+
+/// Return a copy of the currently excluded sandbox paths.
+pub fn list_excluded() -> Vec<PathBuf> {
+    EXCLUDED.lock().map(|e| e.clone()).unwrap_or_default()
+}
 
 /// Add a read-only path binding for the session.
 ///
@@ -104,14 +163,104 @@ pub fn list() -> Vec<SessionBind> {
         .unwrap_or_default()
 }
 
+/// Return the combined list of all visible bindings: config-provided (minus
+/// excluded) plus session-provided.  The result distinguishes origin so the
+/// overlay can display and fuzzy-match the full picture.
+pub fn combined_list() -> Vec<CombinedBind> {
+    let base = BASE_CONFIG.lock().ok().and_then(|b| b.clone());
+    let excluded = EXCLUDED.lock().map(|e| e.clone()).unwrap_or_default();
+    let binds = list();
+    let cwd = std::env::current_dir().ok();
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let mut out: Vec<CombinedBind> = Vec::new();
+
+    // Resolve a single BindPath (config entry) into a CombinedBind.
+    let resolve_cfg = |spec: &crate::config::BindPath, mode: BindMode| -> CombinedBind {
+        let (from, to) = match spec {
+            crate::config::BindPath::Simple(p) => {
+                let r = path_util::resolve_with_home(p, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
+                (r.clone(), r)
+            }
+            crate::config::BindPath::Remap { from, to } => {
+                let f = path_util::resolve_with_home(from, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
+                let t = path_util::resolve_with_home(to, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
+                (f, t)
+            }
+        };
+        CombinedBind {
+            host_path: from,
+            sandbox_path: to.clone(),
+            mode,
+            is_session: false,
+            is_excluded: excluded.contains(&to),
+        }
+    };
+
+    if let Some(ref cfg) = base {
+        for spec in &cfg.ro {
+            out.push(resolve_cfg(spec, BindMode::Ro));
+        }
+        for spec in &cfg.rw {
+            out.push(resolve_cfg(spec, BindMode::Rw));
+        }
+    }
+
+    // Session bindings: track which sandbox paths have a session override so we
+    // can suppress the corresponding config entry (session wins on conflict).
+    let session_paths: Vec<PathBuf> = binds.iter().map(|b| b.sandbox_path.clone()).collect();
+
+    // Remove config entries overridden by session bindings.
+    out.retain(|cb| {
+        if cb.is_session {
+            return true;
+        }
+        !session_paths.contains(&cb.sandbox_path)
+    });
+
+    for b in &binds {
+        out.push(CombinedBind {
+            host_path: b.host_path.clone(),
+            sandbox_path: b.sandbox_path.clone(),
+            mode: b.mode,
+            is_session: true,
+            is_excluded: false,
+        });
+    }
+
+    out
+}
+
 /// Merge session bindings into a `SandboxConfig` **clone**.
 ///
-/// This appends the temporary bindings to the appropriate `ro`/`rw` lists.
-/// The original config is not mutated; callers should clone their config
-/// first and pass the clone here.
+/// Rebuilds the config's `ro`/`rw` lists from scratch: starts with the base
+/// config (minus any excluded paths), then appends session bindings (which
+/// override matching config entries via bwrap's "last wins" semantics).
+/// Callers should clone their config first and pass the clone here.
 pub fn merge_into(cfg: &mut SandboxConfig) {
+    let base = BASE_CONFIG.lock().ok().and_then(|b| b.clone());
+    let excluded = EXCLUDED.lock().map(|e| e.clone()).unwrap_or_default();
     let binds = list();
 
+    // Rebuild from base config, skipping excluded paths.
+    cfg.ro.clear();
+    cfg.rw.clear();
+
+    if let Some(ref base_cfg) = base {
+        for spec in &base_cfg.ro {
+            let to = sandbox_path_of(spec);
+            if !excluded.contains(&to) {
+                cfg.ro.push(spec.clone());
+            }
+        }
+        for spec in &base_cfg.rw {
+            let to = sandbox_path_of(spec);
+            if !excluded.contains(&to) {
+                cfg.rw.push(spec.clone());
+            }
+        }
+    }
+
+    // Append session bindings.
     for b in &binds {
         let from = b.host_path.to_string_lossy().to_string();
         let to = b.sandbox_path.to_string_lossy().to_string();
@@ -126,6 +275,23 @@ pub fn merge_into(cfg: &mut SandboxConfig) {
         match b.mode {
             BindMode::Ro => cfg.ro.push(bind),
             BindMode::Rw => cfg.rw.push(bind),
+        }
+    }
+}
+
+/// Extract the in-sandbox destination path from a `BindPath`.
+fn sandbox_path_of(spec: &crate::config::BindPath) -> PathBuf {
+    match spec {
+        crate::config::BindPath::Simple(p) => {
+            // Resolve tilde/relative so we can compare with excluded paths.
+            let cwd = std::env::current_dir().ok();
+            let home = std::env::var("HOME").ok().map(PathBuf::from);
+            path_util::resolve_with_home(p, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref())
+        }
+        crate::config::BindPath::Remap { to, .. } => {
+            let cwd = std::env::current_dir().ok();
+            let home = std::env::var("HOME").ok().map(PathBuf::from);
+            path_util::resolve_with_home(to, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref())
         }
     }
 }

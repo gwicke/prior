@@ -1067,6 +1067,9 @@ fn guard<T: Tool>(
 /// provider's completion-model type).
 pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
     let mut config = config;
+    // Store the original (non-merged) sandbox config so the remove overlay
+    // can list config-provided bindings and allow temporary exclusion.
+    crate::sandbox_bindings::set_base(config.sandbox.clone());
     // Publish the resolved sandbox config immediately so that user-initiated
     // `!`/`!!` shell commands use the same bwrap/timeout policy as the agent's
     // `bash` tool — even before the agent is lazily created on the first
@@ -1237,6 +1240,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     "add_ro" => crate::sandbox_bindings::add_ro(&path, &sandbox_path),
                     "add_rw" => crate::sandbox_bindings::add_rw(&path, &sandbox_path),
                     "remove" => crate::sandbox_bindings::remove(&path),
+                    "exclude" => crate::sandbox_bindings::exclude(&path),
                     _ => Err(format!("unknown sandbox subcommand: {}", sub)),
                 };
                 match result {
@@ -1250,7 +1254,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         crate::sandbox_bindings::merge_into(&mut merged);
                         crate::tools::set_sandbox(Some(merged.clone()));
                         config.sandbox = Some(merged);
-                        let msg = if sandbox_path.is_empty() {
+                        let msg = if sub == "exclude" {
+                            format!("sandbox: excluded {} (ok)", path)
+                        } else if sandbox_path.is_empty() {
                             format!("sandbox: {} {} (ok)", sub, path)
                         } else {
                             format!("sandbox: {} {} → {} (ok)", sub, path, sandbox_path)
