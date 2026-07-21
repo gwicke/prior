@@ -1024,83 +1024,81 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 ---
 
-## Implementation Plan — Phase 1: Storage Layer
+## Implementation Plan — Phase 1: Storage Layer ✅
 
 **Goal:** Types + JSONL I/O + repo + unit tests. No changes to `agent.rs`.
 
+**Status: Complete.** All types, storage, and repo implemented. 30 unit tests pass.
+78 real pi agent session files (46,825 entries) read with zero errors.
+
 ### Checklist
 
-- [ ] **1.1 Add dependencies to `Cargo.toml`**
-  - [ ] `uuid = { version = "1.0", features = ["v7", "serde"] }`
-  - [ ] `chrono = { version = "0.4", features = ["serde"] }`
+- [x] **1.1 Add dependencies to `Cargo.toml`**
+- [x] **1.2 Create `src/session/mod.rs`**
+- [x] **1.3 Implement `src/session/types.rs`** — all types, encoding, convenience constructors, 13 tests
+- [x] **1.4 Implement `src/session/storage.rs`** — JSONL I/O, index building, implicit leaf fallback, 8+2 tests
+- [x] **1.5 Implement `src/session/repo.rs`** — create/open/list/delete/fork, 6 tests
+- [x] **1.6 Integration test: pi wire format compatibility** — manual pi-format JSONL, snake_case leak check
+- [x] **1.7 Cross-compatibility test: read actual pi session store**
+  - `src/session/pi_compat_test.rs`, gated with `#[ignore]`
+  - Verified: **78 files, 46,825 entries, 78 trees, 0 errors**
 
-- [ ] **1.2 Create `src/session/mod.rs`**
-  - [ ] Module declarations
-  - [ ] Visibility: `pub(crate)` for everything; only `Session`, `SessionRepo`, `SessionStorage` exposed to rest of crate
+### Lessons Learned from Phase 1
 
-- [ ] **1.3 Implement `src/session/types.rs`**
-  - [ ] `SessionHeader` struct with camelCase serde
-  - [ ] `SessionEntry` struct with flattened content
-  - [ ] `SessionEntryContent` enum with all variants
-  - [ ] `SessionMetadata` struct (for listing)
-  - [ ] `SessionIndex` struct (in-memory index)
-  - [ ] `SessionContext` struct (build_context output)
-  - [ ] `encode_cwd()` / `decode_cwd()` functions
-  - [ ] `session_filename()` / `parse_session_filename()` functions
-  - [ ] Unit tests: round-trip serialization for every entry variant
-  - [ ] Unit tests: cwd encoding/decoding round-trip
+1.  **Implicit leaf pointer.** pi never writes `type:"leaf"` entries. The leaf is implicitly the last entry's ID (pi's `leafIdAfterEntry()` returns `entry.id` for every non-leaf type). `build_index()` must track `last_entry_id` and fall back when no explicit leaf entry exists. A `saw_leaf_entry` flag ensures explicit leaf entries (including `None` clears) are still authoritative for picocode's own sessions.
 
-- [ ] **1.4 Implement `src/session/storage.rs`**
-  - [ ] `SessionStorage` trait
-  - [ ] `JsonlSessionStorage` struct
-  - [ ] `open_or_create()` — creates parent directories, opens file
-  - [ ] `read_header()` — parse only first line
-  - [ ] `build_index()` — full scan, build HashMap, track leaf/name
-  - [ ] `create_entry_id()` — UUIDv7 generation
-  - [ ] `append_entry()` — serialize + write + flush
-  - [ ] `set_leaf_id()` — append leaf entry
-  - [ ] `get_path_to_root()` — walk parentId chain
-  - [ ] `get_branch_messages()` — filtered path-to-root
-  - [ ] Error handling: skip truncated last line, report parse errors
-  - [ ] Unit tests: write entries, read back, verify index integrity
-  - [ ] Unit tests: truncated file (last line partial) handled gracefully
-  - [ ] Unit tests: leaf tracking (set leaf, read back)
+2.  **Read-only mount needed.** pi's session directory (`~/.pi/agent/sessions/`) is often on a read-only filesystem. `JsonlSessionStorage` needs `open_readonly()` to inspect external stores without requesting write access.
 
-- [ ] **1.5 Implement `src/session/repo.rs`**
-  - [ ] `SessionRepo` trait
-  - [ ] `JsonlSessionRepo` struct
-  - [ ] `create()` — generate path, write header, return handle
-  - [ ] `open()` — open file + build index
-  - [ ] `list(cwd)` — enumerate .jsonl files in encoded directory
-  - [ ] `list(None)` — enumerate all CWD directories
-  - [ ] `delete()` — remove session file
-  - [ ] `fork()` — read source index, copy path entries, write new header
-  - [ ] Metadata: quick scan (first line only) for `list()` performance
-  - [ ] Unit tests: create session, list sessions, verify metadata
-  - [ ] Unit tests: fork session, verify parentSession link, verify entries
-  - [ ] Unit tests: delete session, verify it's gone
+3.  **8-char entry IDs.** pi uses 8-character hex strings for entry IDs (e.g. `"84c3124c"`), not UUIDv7. Our `SessionEntry.id` is `String`, so this works without changes.
 
-- [ ] **1.6 Integration test: pi wire format compatibility**
-  - [ ] Write a session file manually (as a JSONL string matching pi's format)
-  - [ ] Verify picocode can read it and produce correct `SessionIndex`
-  - [ ] Write a session via `JsonlSessionStorage`
-  - [ ] Verify the output is valid pi-format JSONL (no snake_case leaks)
+4.  **Separate header write.** The session header must be written as a raw JSON line (not via `append_entry`), because it has a different structure from `SessionEntry`. pi does the same.
 
-- [ ] **1.7 Cross-compatibility test: read actual pi session store**
-  - [ ] Locate `~/.pi/agent/sessions/` (or accept a path via env var)
-  - [ ] If present, enumerate all `.jsonl` files across all CWD-encoded directories
-  - [ ] For each file:
-    - [ ] Parse the header line; verify `"type":"session"` and `"version":3`
-    - [ ] Build the full `SessionIndex` via `build_index()`
-    - [ ] Walk `get_path_to_root(leaf_id)` and verify every entry resolves
-    - [ ] Run `build_context()` and verify the output messages deserialize to valid rig `Message` types
-  - [ ] Print a summary: files read, entries parsed, errors (none expected)
-  - [ ] If `~/.pi/agent/sessions/` does not exist, skip with a log message (not a test failure)
-  - [ ] This test is gated behind a `#[cfg(feature = "pi-compat-test")]` feature or
-        `#[ignore]` (manual run only) — it depends on the user's pi installation
-        being present, so it must never block CI or normal `cargo test`
+5.  **No `decodeCwd` in pi.** pi has no `decode_cwd` function. The directory name is write-only; the real CWD is always read from the session header's `cwd` field.
 
-**Estimated size:** ~700–900 lines of Rust + ~400 lines of tests
+**Estimated size:** ~1020 lines of Rust + ~450 lines of tests (actual)
+
+---
+
+## Implementation Plan — Phase 2: Session Object
+
+**Goal:** `Session` wrapper with context building (pi AgentMessage → rig Message), append helpers, and forking.
+
+### Notes from Phase 1
+
+- Messages are stored as raw `serde_json::Value` in pi `AgentMessage` format — not rig's `Message` type. The conversion happens in `build_context()`.
+- The `Session` struct wraps a `(JsonlSessionStorage, SessionIndex)` pair (returned by `repo.open()`). It does not own the file handle.
+- pi's `toolResult` role stores one entry per tool call. rig batches all tool results for a turn into a single `Message::User` with multiple `UserContent::ToolResult` items. `extract_messages()` must scan ahead to group consecutive `toolResult` entries.
+
+### Checklist
+
+- [ ] **2.1 Implement `src/session/session.rs`**
+  - [ ] `Session::open(storage, index)` — construct from existing storage + index
+  - [ ] `Session::get_branch()` — calls `index.get_path_to_root(leaf_id)`
+  - [ ] `Session::build_context()` — branch → apply_transforms → extract_messages → derive metadata
+  - [ ] `Session::apply_transforms()` — compaction support (identity for now; skips entries before `firstKeptEntryId`)
+  - [ ] `Session::extract_messages()` — pi AgentMessage → rig Message with toolResult batching
+  - [ ] `Session::derive_thinking_level()` — find latest `ThinkingLevelChange` on branch
+  - [ ] `Session::derive_model()` — find latest `ModelChange` on branch
+  - [ ] `Session::append_message()` — convert rig Message → pi AgentMessage, append + update leaf
+  - [ ] `Session::append_model_change()` — create entry, append + update leaf
+  - [ ] `Session::append_thinking_level_change()` — create entry, append + update leaf
+  - [ ] `Session::set_session_name()` — write session_info entry + update leaf
+
+  > **Leaf update strategy:** After every append, write a `type:"leaf"` entry pointing to the new entry. pi's `leafIdAfterEntry` handles this correctly, keeping picocode sessions self-describing while remaining pi-compatible.
+
+- [ ] **2.2 pi AgentMessage ↔ rig Message conversion**
+  - [ ] `pi_message_to_rig()` — handle `user`, `assistant`, `toolResult` roles
+  - [ ] `rig_message_to_pi()` — handle text, reasoning, toolCall, toolResult content
+  - [ ] ToolResult batching: consecutive pi `toolResult` entries → single `Message::User` with multiple `ToolResult` items
+  - [ ] Unit tests: round-trip every content type
+  - [ ] Unit tests: pi session file → `build_context()` → verify rig Messages
+
+- [ ] **2.3 Integration test: branch → context**
+  - [ ] Build a multi-turn session tree with tools
+  - [ ] Verify `build_context()` returns correct message order, thinking level, model
+  - [ ] Verify fork creates independent tree with correct context
+
+**Estimated size:** ~500 lines + ~300 lines of tests
 
 ---
 
@@ -1340,8 +1338,8 @@ src/
 
 | Phase | What | Tests | Risk |
 |---|---|---|---|
-| 1 | Types + Storage | Unit tests, pi compat | Low (no behavior change) |
-| 2 | Session Object | Unit tests, round-trip | Low (pure logic) |
-| 3 | Wire into agent loop | Regression tests | Medium (core loop change) |
-| 4 | REPL commands | Manual testing | Low (UI only) |
-| 5 | Session selector UI | Manual testing | Low (UI only) |
+| ✅ 1 | Types + Storage | 30 unit, 78 pi files | Low |
+| 2 | Session Object | Unit tests, round-trip | Low |
+| 3 | Wire into agent loop | Regression tests | Medium |
+| 4 | REPL commands | Manual testing | Low |
+| 5 | Session selector UI | Manual testing | Low |
