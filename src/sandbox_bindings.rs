@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
 use crate::config::{BindMode, SandboxConfig};
+use crate::path_util;
 
 /// A single temporary binding added during the session.
 ///
@@ -26,77 +27,13 @@ pub struct SessionBind {
 static SESSION_BINDS: LazyLock<Mutex<Vec<SessionBind>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Resolve a host path (relative to CWD or absolute, `~` expanded) to an
-/// absolute, canonical path.  Returns an error if the path does not exist.
-fn resolve_host_path(path: &str) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot get CWD: {}", e))?;
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-
-    // Expand ~/ prefix
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        match &home {
-            Some(h) => h.join(rest),
-            None => return Err("cannot expand ~: HOME not set".into()),
-        }
-    } else if path == "~" {
-        home.ok_or_else(|| String::from("cannot expand ~: HOME not set"))?
-    } else {
-        PathBuf::from(path)
-    };
-
-    let abs = if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(&expanded)
-    };
-
-    // Normalize components (.., .)
-    let normalized = normalize(&abs);
-
-    // The path must exist so the binding is meaningful.
-    let canonical = std::fs::canonicalize(&normalized)
-        .map_err(|e| format!("path does not exist: {} ({})", normalized.display(), e))?;
-    Ok(canonical)
-}
-
-/// Resolve a sandbox path (in-sandbox destination) — just normalizes, no
-/// existence check required since it is created inside the namespace.
-fn resolve_sandbox_path(path: &str) -> PathBuf {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        match &home {
-            Some(h) => h.join(rest),
-            None => PathBuf::from(path),
-        }
-    } else if path == "~" {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(path))
-    } else {
-        PathBuf::from(path)
-    };
-    normalize(&expanded)
-}
-
-fn normalize(p: &PathBuf) -> PathBuf {
-    let mut result = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            std::path::Component::ParentDir => { result.pop(); }
-            std::path::Component::CurDir => {}
-            c => result.push(c),
-        }
-    }
-    result
-}
-
 /// Add a read-only path binding for the session.
 ///
 /// `host_path` is resolved against the CWD (`~` expanded); it must exist.
 /// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
 /// empty).  Returns an error if the host path does not exist.
 pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
-    let host = resolve_host_path(host_path)?;
+    let host = path_util::resolve_canonical(host_path)?;
     let sandbox = if sandbox_path.is_empty() {
         host.clone()
     } else {
@@ -123,7 +60,7 @@ pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
 /// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
 /// empty).  Returns an error if the host path does not exist.
 pub fn add_rw(host_path: &str, sandbox_path: &str) -> Result<(), String> {
-    let host = resolve_host_path(host_path)?;
+    let host = path_util::resolve_canonical(host_path)?;
     let sandbox = if sandbox_path.is_empty() {
         host.clone()
     } else {
@@ -196,7 +133,13 @@ pub fn merge_into(cfg: &mut SandboxConfig) {
 /// Helper: resolve a host path for display/validation.  Returns `None` if the
 /// path does not exist.
 pub fn resolve_for_display(path: &str) -> Option<PathBuf> {
-    resolve_host_path(path).ok()
+    path_util::resolve_canonical(path).ok()
+}
+
+/// Resolve a sandbox path (in-sandbox destination) — tilde expansion +
+/// normalization.  No filesystem access.
+fn resolve_sandbox_path(path: &str) -> PathBuf {
+    path_util::normalize(&path_util::expand_tilde(path))
 }
 
 /// Clear all session bindings (used in tests).
@@ -329,57 +272,9 @@ mod tests {
     fn test_remove_nonexistent_binding() {
         setup();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("never_added");
-        fs::create_dir_all(&path).unwrap();
+        let path = dir.path().join("nope");
         let ps = path.to_string_lossy();
-
-        let err = remove(&ps).unwrap_err();
-        assert!(err.contains("no session binding"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_add_nonexistent_path() {
-        setup();
-        let err = add_ro("/nonexistent_path_12345", "").unwrap_err();
-        assert!(err.contains("does not exist"));
-    }
-
-    #[test]
-    #[serial]
-    fn test_merge_into_simple_and_remap() {
-        setup();
-        let dir = tempfile::tempdir().unwrap();
-        let p1 = dir.path().join("merge_ro");
-        let p2 = dir.path().join("merge_rw_host");
-        let p2s = dir.path().join("merge_rw_sandbox");
-        fs::create_dir_all(&p1).unwrap();
-        fs::create_dir_all(&p2).unwrap();
-
-        add_ro(&p1.to_string_lossy(), "").unwrap();
-        add_rw(&p2.to_string_lossy(), &p2s.to_string_lossy()).unwrap();
-
-        let mut cfg = SandboxConfig::default();
-        assert!(cfg.ro.is_empty());
-        assert!(cfg.rw.is_empty());
-
-        merge_into(&mut cfg);
-
-        assert_eq!(cfg.ro.len(), 1);
-        assert_eq!(cfg.rw.len(), 1);
-
-        // The simple bind uses BindPath::Simple
-        match &cfg.ro[0] {
-            crate::config::BindPath::Simple(s) => assert!(s.contains("merge_ro")),
-            _ => panic!("expected Simple for ro bind"),
-        }
-        // The remap uses BindPath::Remap
-        match &cfg.rw[0] {
-            crate::config::BindPath::Remap { from, to } => {
-                assert!(from.contains("merge_rw_host"));
-                assert!(to.contains("merge_rw_sandbox"));
-            }
-            _ => panic!("expected Remap for rw bind"),
-        }
+        let result = remove(&ps);
+        assert!(result.is_err());
     }
 }

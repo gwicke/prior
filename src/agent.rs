@@ -1241,10 +1241,15 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 };
                 match result {
                     Ok(()) => {
-                        // Re-publish the sandbox config with session bindings merged.
+                        // Re-publish the sandbox config with session bindings merged,
+                        // AND update `config.sandbox` so the merged version survives
+                        // a subsequent lazy agent creation (which calls
+                        // `set_sandbox(config.sandbox.clone())` inside
+                        // `build_rig_agent`).
                         let mut merged = config.sandbox.clone().unwrap_or_default();
                         crate::sandbox_bindings::merge_into(&mut merged);
-                        crate::tools::set_sandbox(Some(merged));
+                        crate::tools::set_sandbox(Some(merged.clone()));
+                        config.sandbox = Some(merged);
                         let msg = if sandbox_path.is_empty() {
                             format!("sandbox: {} {} (ok)", sub, path)
                         } else {

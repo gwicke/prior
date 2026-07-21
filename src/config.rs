@@ -1,3 +1,4 @@
+use crate::path_util;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -378,17 +379,7 @@ impl PathPolicy {
 
 /// Normalize `..` / `.` components without touching the filesystem.
 fn normalize(p: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            c => result.push(c),
-        }
-    }
-    result
+    path_util::normalize(p)
 }
 
 /// Build a [`PathPolicy`] from a sandbox config. Returns `None` when there are
@@ -411,21 +402,7 @@ pub fn resolve_path_policy(
 
 /// Resolve a possibly-relative or `~`-prefixed path against `cwd`/`home`.
 fn resolve_path(base: &Path, home: Option<&Path>, p: &str) -> PathBuf {
-    let expanded = if let Some(rest) = p.strip_prefix("~/") {
-        match home {
-            Some(h) => h.join(rest),
-            None => PathBuf::from(p),
-        }
-    } else if p == "~" {
-        home.map(|h| h.to_path_buf()).unwrap_or_else(|| PathBuf::from(p))
-    } else {
-        PathBuf::from(p)
-    };
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        base.join(expanded)
-    }
+    path_util::resolve_with_home(p, base, home)
 }
 
 /// Resolve the `ro`/`rw` binding lists into absolute [`ResolvedBind`]s.

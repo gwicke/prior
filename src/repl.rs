@@ -651,7 +651,29 @@ impl ActiveOverlay {
                         "add_ro" | "add_rw" => {
                             if !rest.is_empty() {
                                 let last_token = rest.split_whitespace().last().unwrap_or("");
-                                let completions = Repl::complete_path_prefix(last_token);
+                                let uses_tilde = last_token.starts_with('~');
+                                let expanded = if uses_tilde {
+                                    crate::path_util::expand_tilde(last_token).to_string_lossy().into_owned()
+                                } else {
+                                    last_token.to_string()
+                                };
+                                let completions = Repl::complete_path_prefix(&expanded);
+                                // Round-trip `~`-prefixed results back to `~`.
+                                let home = if uses_tilde {
+                                    std::env::var("HOME").map(|h| {
+                                        if h.ends_with('/') { h } else { format!("{}/", h) }
+                                    }).ok()
+                                } else {
+                                    None
+                                };
+                                let completions: Vec<String> = completions.into_iter().map(|c| {
+                                    if let Some(ref home) = home {
+                                        if let Some(rest) = c.strip_prefix(home) {
+                                            return format!("~/{}", rest);
+                                        }
+                                    }
+                                    c
+                                }).collect();
                                 if let Some(c) = completions.get(sel) {
                                     editor.set(&Repl::replace_last_token(&buf, c));
                                 }
@@ -1078,6 +1100,21 @@ impl Repl {
                         s.push('\n');
                     }
                 }
+                // Reposition the cursor back on the input line after drawing
+                // the overlay below it.  The cursor was placed at
+                // `(row + cursor_row, cursor_col)` by `cursor_positioning`
+                // above; the overlay moved it down as it drew.  Rather than
+                // a relative move that breaks when the terminal scrolls,
+                // compute the *visual* row after the scroll and use an
+                // absolute position.
+                //
+                // The cursor after the overlay is at viewport row
+                // `row + er + n` (er = total input rows, n = overlay count).
+                // Anything past `term_h` causes the terminal to scroll,
+                // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
+                let delta = (row + er + n).saturating_sub(term_h);
+                let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
+                s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
             }
             let _ = io::stdout().write_all(s.as_bytes());
             let _ = io::stdout().flush();
@@ -1894,7 +1931,30 @@ impl Repl {
                 }
                 // The last token is the one being typed; show file completions.
                 let last_token = path.split_whitespace().last().unwrap_or("");
-                let completions = Self::complete_path_prefix(last_token);
+                // Expand ~/ prefix before listing files, then round-trip back.
+                let uses_tilde = last_token.starts_with('~');
+                let expanded = if uses_tilde {
+                    crate::path_util::expand_tilde(last_token).to_string_lossy().into_owned()
+                } else {
+                    last_token.to_string()
+                };
+                let completions = Self::complete_path_prefix(&expanded);
+                // Round-trip ~-prefixed results back to ~ for display.
+                let home = if uses_tilde {
+                    std::env::var("HOME")
+                        .map(|h| if h.ends_with('/') { h } else { format!("{}/", h) })
+                        .ok()
+                } else {
+                    None
+                };
+                let completions: Vec<String> = completions.into_iter().map(|c| {
+                    if let Some(ref home) = home {
+                        if let Some(rest) = c.strip_prefix(home) {
+                            return format!("~/{}", rest);
+                        }
+                    }
+                    c
+                }).collect();
                 if completions.is_empty() {
                     opts.push("(no matching path)".into());
                 } else {
@@ -2148,15 +2208,7 @@ fn edit_in_editor(current: &str) -> io::Result<String> {
 /// unchanged.  Used by path completion to resolve `~` before calling `ls`
 /// inside the sandbox (which doesn't do shell expansion).
 fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}/{}", home.trim_end_matches('/'), rest);
-        }
-    }
-    path.to_string()
+    crate::path_util::expand_tilde(path).to_string_lossy().into_owned()
 }
 
 /// Generic file-path prefix completion. Lists the parent directory of `prefix`

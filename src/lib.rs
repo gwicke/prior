@@ -14,6 +14,7 @@ pub mod thinking;
 pub mod table;
 pub mod sandbox_bindings;
 pub mod settings;
+pub mod path_util;
 
 pub use config::{Config, Recipe, ToolSettings};
 pub use settings::{SettingKey, SettingsStore, ShowReasoning, ShowReasoningHandle};
