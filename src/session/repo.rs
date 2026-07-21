@@ -113,10 +113,9 @@ impl SessionRepo for JsonlSessionRepo {
     async fn create(&self, cwd: &Path) -> crate::Result<JsonlSessionStorage> {
         let path = self.session_file_path(cwd);
         let storage = JsonlSessionStorage::open_or_create(path).await?;
-
-        let header = SessionHeader::new(cwd);
-        storage.write_header(&header).await?;
-
+        // Header is NOT written here — it's deferred to Session::ensure_persisted
+        // which fires on the first append_message(). This avoids creating empty
+        // .jsonl files for sessions where no turn is ever taken.
         Ok(storage)
     }
 
@@ -226,6 +225,16 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// Create a session via repo.create() and immediately persist it (write header).
+    /// repo.create() no longer writes the header — it's deferred to Session's
+    /// first append. Tests that need listing/reading must persist explicitly.
+    async fn create_persisted(repo: &JsonlSessionRepo, cwd: &Path) -> crate::session::storage::JsonlSessionStorage {
+        let storage = repo.create(cwd).await.unwrap();
+        let header = crate::session::SessionHeader::new(cwd);
+        storage.write_header(&header).await.unwrap();
+        storage
+    }
+
     /// Create a temporary repo for testing.
     async fn create_test_repo() -> (JsonlSessionRepo, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -251,8 +260,9 @@ mod tests {
         let (repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test/project");
 
-        // Create a session
-        let storage = repo.create(cwd).await.unwrap();
+        // Create a session and write header explicitly (repo.create no longer
+        // writes the header — it's deferred to the first append).
+        let storage = create_persisted(&repo, cwd).await;
         let header = storage.read_header().await.unwrap();
         assert_eq!(header.cwd, "/home/test/project");
 
@@ -271,8 +281,8 @@ mod tests {
         let (repo, base_dir) = create_test_repo().await;
 
         // Create sessions in different CWDs
-        let _ = repo.create(Path::new("/home/test/a")).await.unwrap();
-        let _ = repo.create(Path::new("/home/test/b")).await.unwrap();
+        let _ = create_persisted(&repo, Path::new("/home/test/a")).await;
+        let _ = create_persisted(&repo, Path::new("/home/test/b")).await;
 
         // List all sessions (no CWD filter)
         let sessions = repo.list(None).await.unwrap();
@@ -294,7 +304,7 @@ mod tests {
         let (repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
-        let storage = repo.create(cwd).await.unwrap();
+        let storage = create_persisted(&repo, cwd).await;
         let _header_meta = storage.read_header().await.unwrap();
 
         let sessions = repo.list(Some(cwd)).await.unwrap();
@@ -313,8 +323,11 @@ mod tests {
         let (repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
-        // Create source session with a few entries
+        // Create source session with a few entries.
+        // Must write header explicitly since repo.create defers it.
         let source_storage = repo.create(cwd).await.unwrap();
+        let header = crate::session::SessionHeader::new(cwd);
+        source_storage.write_header(&header).await.unwrap();
 
         let entry1 = SessionEntry {
             id: "e1".into(),
@@ -366,7 +379,7 @@ mod tests {
         let (repo, base_dir) = create_test_repo().await;
         let cwd = Path::new("/home/test");
 
-        let storage = repo.create(cwd).await.unwrap();
+        let storage = create_persisted(&repo, cwd).await;
 
         // Write a couple message entries
         let entry = SessionEntry {

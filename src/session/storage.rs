@@ -42,34 +42,31 @@ pub trait SessionStorage: Send + Sync {
 
 /// Concrete [`SessionStorage`] that reads/writes a single JSONL file.
 ///
-/// The file is opened with both read and append access on creation.  A
-/// `tokio::sync::Mutex` guards the write handle so that concurrent async
-/// consumers do not interleave writes.
+/// The file is opened lazily — the first write call creates the file and
+/// parent directories.  A `tokio::sync::Mutex` guards the write handle so
+/// that concurrent async consumers do not interleave writes.
 pub struct JsonlSessionStorage {
     path: PathBuf,
-    /// Mutex-protected write handle.  We keep one handle for writes and
-    /// re-open a separate read handle for full-scan operations.
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    /// Mutex-protected optional write handle.  `None` until the first write
+    /// operation opens (or creates) the file.
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
 }
 
 impl JsonlSessionStorage {
     /// Open (or create) a session file at `path`.
     ///
-    /// Creates parent directories if they do not exist.  The file is created
-    /// lazily — an empty file will lack a header and `build_index` will error.
+    /// The file is NOT opened or created immediately — that happens on the
+    /// first write call.  This avoids creating empty files for sessions that
+    /// never receive a message.
     pub async fn open_or_create(path: PathBuf) -> crate::Result<Self> {
+        // Parent directories ARE created eagerly so that the repo's directory
+        // structure is visible for listing even before any writes.
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)
-            .await?;
         Ok(Self {
             path,
-            file: tokio::sync::Mutex::new(file),
+            file: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -85,8 +82,26 @@ impl JsonlSessionStorage {
             .await?;
         Ok(Self {
             path,
-            file: tokio::sync::Mutex::new(file),
+            file: tokio::sync::Mutex::new(Some(file)),
         })
+    }
+
+    /// Ensure the write handle is open, creating the file if needed.
+    async fn ensure_open(&self) -> crate::Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            if let Some(parent) = self.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&self.path)
+                .await?;
+            *guard = Some(file);
+        }
+        Ok(guard)
     }
 
     /// The path to the session file.
@@ -101,9 +116,11 @@ impl JsonlSessionStorage {
     pub async fn write_header(&self, header: &SessionHeader) -> crate::Result<()> {
         let mut line = serde_json::to_string(header)?;
         line.push('\n');
-        let mut file = self.file.lock().await;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        let mut guard = self.ensure_open().await?;
+        if let Some(ref mut file) = *guard {
+            tokio::io::AsyncWriteExt::write_all(file, line.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(file).await?;
+        }
         Ok(())
     }
 
@@ -224,9 +241,11 @@ impl SessionStorage for JsonlSessionStorage {
     async fn append_entry(&self, entry: &SessionEntry) -> crate::Result<()> {
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
-        let mut file = self.file.lock().await;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await?;
+        let mut guard = self.ensure_open().await?;
+        if let Some(ref mut file) = *guard {
+            tokio::io::AsyncWriteExt::write_all(file, line.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(file).await?;
+        }
         Ok(())
     }
 

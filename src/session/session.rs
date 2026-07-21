@@ -12,7 +12,10 @@
 //! Messages are stored as raw `serde_json::Value` in pi's `AgentMessage` format.
 //! The conversion to rig's `Message` happens only in `build_context()`.
 
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use async_trait::async_trait;
 
 use chrono::Utc;
 use rig_core::message::{
@@ -39,19 +42,53 @@ pub struct Session {
     /// Cached session ID, set on construction — avoids a lock for the common
     /// case of reading the session identifier.
     pub(crate) session_id: String,
+    /// Whether the session has been persisted to disk (header written).
+    /// Set `true` on the first append. Avoids empty `.jsonl` files for
+    /// sessions where no turn was ever taken.
+    persisted: AtomicBool,
 }
 
 impl Session {
     /// Construct a `Session` from an existing storage handle and index.
     ///
-    /// Typically returned by `JsonlSessionRepo::open()`.
+    /// Typically returned by `JsonlSessionRepo::open()`. The session is NOT
+    /// persisted to disk until the first `append_message()` call (prevents
+    /// empty `.jsonl` files for sessions with no turns).
     pub fn new(storage: JsonlSessionStorage, index: SessionIndex) -> Self {
         let session_id = index.header.id.clone();
         Self {
             storage: Arc::new(AsyncMutex::new(storage)),
             index: Arc::new(AsyncMutex::new(index)),
             session_id,
+            persisted: AtomicBool::new(false),
         }
+    }
+
+    /// Construct a `Session` that is already persisted (e.g. after resuming
+    /// an existing session or loading from a file). The header write is
+    /// skipped on the first `append_message()`.
+    pub fn new_persisted(storage: JsonlSessionStorage, index: SessionIndex) -> Self {
+        let session_id = index.header.id.clone();
+        Self {
+            storage: Arc::new(AsyncMutex::new(storage)),
+            index: Arc::new(AsyncMutex::new(index)),
+            session_id,
+            persisted: AtomicBool::new(true),
+        }
+    }
+
+    /// Ensure the session header is written to disk. No-op after the first
+    /// call. Called automatically by `append_message()` — callers do not
+    /// need to invoke this manually.
+    pub async fn ensure_persisted(&self) -> crate::Result<()> {
+        if self.persisted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let storage = self.storage.lock().await;
+        let index = self.index.lock().await;
+        storage.write_header(&index.header).await?;
+        self.persisted.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// The session's unique identifier (UUIDv7 from the header).
@@ -165,6 +202,7 @@ impl Session {
     ///
     /// Converts the rig `Message` to pi's `AgentMessage` format before storage.
     pub async fn append_message(&self, msg: &Message) -> crate::Result<String> {
+        self.ensure_persisted().await?;
         let entry_id = uuid::Uuid::now_v7().to_string();
         let parent_id = {
             let index = self.index.lock().await;
@@ -194,6 +232,7 @@ impl Session {
 
     /// Append a model/provider change entry.
     pub async fn append_model_change(&self, provider: &str, model_id: &str) -> crate::Result<String> {
+        self.ensure_persisted().await?;
         let parent_id = {
             let index = self.index.lock().await;
             index.leaf_id.clone()
@@ -219,6 +258,7 @@ impl Session {
 
     /// Append a thinking level change entry.
     pub async fn append_thinking_level_change(&self, level: &str) -> crate::Result<String> {
+        self.ensure_persisted().await?;
         let parent_id = {
             let index = self.index.lock().await;
             index.leaf_id.clone()
@@ -243,6 +283,7 @@ impl Session {
 
     /// Write a session name entry.
     pub async fn set_session_name(&self, name: &str) -> crate::Result<String> {
+        self.ensure_persisted().await?;
         let parent_id = {
             let index = self.index.lock().await;
             index.leaf_id.clone()
@@ -698,7 +739,7 @@ mod tests {
             .unwrap();
         let index = ro.build_index().await.unwrap();
 
-        let session = Session::new(ro, index);
+        let session = Session::new_persisted(ro, index);
 
         // Cleanup marker
         (session, path)
@@ -1087,7 +1128,7 @@ mod tests {
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
 
-        let session = Session::new(storage, index);
+        let session = Session::new_persisted(storage, index);
         let _ = session.append_message(&Message::user("append test")).await.unwrap();
 
         // Re-open read-only to verify
@@ -1095,7 +1136,7 @@ mod tests {
             .await
             .unwrap();
         let index2 = ro.build_index().await.unwrap();
-        let session2 = Session::new(ro, index2);
+        let session2 = Session::new_persisted(ro, index2);
         let ctx = session2.build_context().await.unwrap();
         assert_eq!(ctx.messages.len(), 1);
         assert_eq!(ctx.messages[0], Message::user("append test"));
@@ -1119,7 +1160,7 @@ mod tests {
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
 
-        let session = Session::new(storage, index);
+        let session = Session::new_persisted(storage, index);
         session.append_message(&Message::user("q1")).await.unwrap();
         session.append_model_change("anthropic", "claude-3-5-sonnet").await.unwrap();
         session.append_thinking_level_change("high").await.unwrap();
@@ -1129,7 +1170,7 @@ mod tests {
             .await
             .unwrap();
         let index2 = ro.build_index().await.unwrap();
-        let session2 = Session::new(ro, index2);
+        let session2 = Session::new_persisted(ro, index2);
         let ctx = session2.build_context().await.unwrap();
         // Should have the user message
         assert_eq!(ctx.messages.len(), 1);
@@ -1157,7 +1198,7 @@ mod tests {
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
 
-        let session = Session::new(storage, index);
+        let session = Session::new_persisted(storage, index);
         session.set_session_name("my-analysis").await.unwrap();
 
         // Re-open and verify session name

@@ -1159,34 +1159,18 @@ fn parse_session_name_after(rest: &str) -> (String, String) {
     }
 }
 
-/// Replay recent session messages through the full Output rendering path.
-/// Uses the same rendering methods as a live session:
-/// - User messages via `display_plain`
-/// - Tool results via `display_text`
-/// - Assistant text via `display_markdown`
-/// - Separator between turns
+/// Replay recent session messages through the same Output trait methods
+/// used by the live display path. No rendering logic duplication — every
+/// call delegates to the same `output.display_*` method the agent loop uses.
 fn replay_recent_turns(output: &Arc<dyn Output>, ctx: &crate::session::SessionContext, replay_turns: usize) {
     let start = ctx.messages.len().saturating_sub(replay_turns * 2 + 1);
     for (i, msg) in ctx.messages[start..].iter().enumerate() {
         match msg {
             Message::User { content } => {
-                let has_tool_result = content.iter().any(|c| matches!(c, UserContent::ToolResult(_)));
-                let has_text = content.iter().any(|c| matches!(c, UserContent::Text(_)));
-                if has_text {
-                    let texts: Vec<&str> = content
-                        .iter()
-                        .filter_map(|c| match c {
-                            UserContent::Text(t) => Some(t.text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    for t in texts {
-                        output.display_plain(t);
-                    }
-                }
-                if has_tool_result {
-                    for c in content.iter() {
-                        if let UserContent::ToolResult(tr) = c {
+                for c in content.iter() {
+                    match c {
+                        UserContent::Text(t) => output.display_plain(&t.text),
+                        UserContent::ToolResult(tr) => {
                             let text: String = tr.content.iter()
                                 .filter_map(|rc| match rc {
                                     ToolResultContent::Text(t) => Some(t.text.clone()),
@@ -1195,48 +1179,40 @@ fn replay_recent_turns(output: &Arc<dyn Output>, ctx: &crate::session::SessionCo
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             if !text.is_empty() {
-                                output.display_text(&text);
+                                output.display_tool_result(&text);
                             }
                         }
+                        _ => {}
                     }
                 }
             }
             Message::Assistant { content, .. } => {
-                let text_parts: Vec<String> = content
-                    .iter()
-                    .filter_map(|c| match c {
-                        AssistantContent::Text(t) => Some(t.text.clone()),
+                for c in content.iter() {
+                    match c {
+                        AssistantContent::Text(t) => output.display_markdown(&t.text),
                         AssistantContent::Reasoning(r) => {
-                            let t: Vec<&str> = r.content.iter().filter_map(|rc| match rc {
+                            let text: String = r.content.iter().filter_map(|rc| match rc {
                                 ReasoningContent::Text { text, .. } => Some(text.as_str()),
                                 ReasoningContent::Summary(s) => Some(s.as_str()),
                                 _ => None,
-                            }).collect();
-                            if t.is_empty() { None }
-                            else { Some(t.join("\n")) }
+                            }).collect::<Vec<_>>().join("\n");
+                            if !text.is_empty() {
+                                output.display_markdown(&text);
+                            }
                         }
                         AssistantContent::ToolCall(tc) => {
-                            Some(format!("Tool call: {} with {}", tc.function.name, tc.function.arguments))
+                            output.display_tool_call(&tc.function.name, &tc.function.arguments);
                         }
-                        _ => None,
-                    })
-                    .collect();
-                for part in &text_parts {
-                    output.display_markdown(part);
+                        _ => {}
+                    }
                 }
             }
             _ => {}
         }
-        // Separator between turns (odd i = assistant → next user)
-        if i + 1 < ctx.messages[start..].len() {
-            if let Some(next) = ctx.messages[start..].get(i + 1) {
-                match (msg, next) {
-                    (Message::Assistant { .. }, Message::User { .. }) => {
-                        output.display_separator();
-                    }
-                    (Message::User { .. }, Message::Assistant { .. }) => {}
-                    _ => {}
-                }
+        // Separator between turns (after assistant → next user boundary).
+        if let Some(next) = ctx.messages.get(start + i + 1) {
+            if matches!(msg, Message::Assistant { .. }) && matches!(next, Message::User { .. }) {
+                output.display_separator();
             }
         }
     }
@@ -1299,7 +1275,7 @@ async fn handle_session_command(
 
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
-                        let new_session = Session::new(storage, index);
+                        let new_session = Session::new_persisted(storage, index);
                         let id = new_session.get_session_id().to_string();
 
                         // Re-play recent turns through the full output path.
@@ -1347,7 +1323,7 @@ async fn handle_session_command(
                                 session_name: None,
                             }
                         });
-                        let new_session = Session::new(new_storage, index);
+                        let new_session = Session::new_persisted(new_storage, index);
                         let id = new_session.get_session_id().to_string();
                         config.output.display_plain(&format!(
                             "/session {} fork",
@@ -1384,7 +1360,7 @@ async fn handle_session_command(
                 } else if let Some(meta) = meta {
                     match repo.as_ref().unwrap().open(&meta).await {
                         Ok((storage, _index)) => {
-                            let s = Session::new(storage, crate::session::SessionIndex {
+                            let s = Session::new_persisted(storage, crate::session::SessionIndex {
                                 header: crate::session::SessionHeader::new(
                                     &std::env::current_dir().unwrap_or_default()
                                 ),
@@ -1443,6 +1419,42 @@ async fn handle_session_command(
     }
 }
 
+/// Ensure a session exists, creating one lazily if needed.
+/// Called on first actual turn (Submit or ! command), not at startup.
+pub(crate) async fn ensure_session(
+    session: &mut Option<Session>,
+    repo: &Option<crate::session::repo::JsonlSessionRepo>,
+    config: &AgentConfig,
+) {
+    if session.is_some() {
+        return;
+    }
+    let repo = match repo {
+        Some(r) => r,
+        None => return,
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    match repo.create(&cwd).await {
+        Ok(storage) => {
+            let index = storage.build_index().await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: crate::session::SessionHeader::new(&cwd),
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
+            *session = Some(Session::new(storage, index));
+        }
+        Err(e) => {
+            eprintln!("Warning: cannot create session: {}", e);
+        }
+    }
+}
+
 /// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
@@ -1488,60 +1500,21 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     }
 
     // Persistent session storage.
-    let (mut session, mut repo): (Option<Session>, Option<crate::session::repo::JsonlSessionRepo>) = {
-        let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
-        match sessions_dir {
-            Some(dir) => {
-                let cwd = match std::env::current_dir() {
-                    Ok(cwd) => Some(cwd),
-                    Err(e) => {
-                        config.output.display_plain(&format!(
-                            "Warning: cannot determine current directory, session disabled: {}",
-                            e
-                        ));
-                        None
-                    }
-                };
-                if let Some(cwd) = cwd {
-                    let repo = crate::session::repo::JsonlSessionRepo::new(dir);
-                    match repo.create(&cwd).await {
-                        Ok(storage) => {
-                            let index = storage.build_index().await
-                                .unwrap_or_else(|_| crate::session::SessionIndex {
-                                    header: crate::session::SessionHeader::new(&cwd),
-                                    entries: std::collections::HashMap::new(),
-                                    leaf_id: None,
-                                    children: std::collections::HashMap::new(),
-                                    session_name: None,
-                                });
-                            (Some(Session::new(storage, index)), Some(repo))
-                        }
-                        Err(e) => {
-                            config.output.display_plain(&format!(
-                                "Warning: cannot create session storage, session disabled: {}",
-                                e
-                            ));
-                            (None, None)
-                        }
-                    }
-                } else {
-                    (None, None)
-                }
-            }
-            None => {
-                config.output.display_plain(
-                    "Warning: no app config directory found, session storage disabled",
-                );
-                (None, None)
-            }
-        }
+    // Session storage: create repo eagerly (just a path, no I/O) for /session
+    // overlay, but defer actual session file creation to the first turn
+    // to avoid empty sessions.
+    let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
+    let cwd = std::env::current_dir().ok();
+    let (mut session, mut repo) = if let (Some(dir), Some(cwd)) = (&sessions_dir, &cwd) {
+        let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
+        // Don't call repo.create() yet — do it on first turn.
+        (None, Some(repo))
+    } else {
+        (None, None)
     };
-
+    let mut current_session_id = String::new();
 
     let mut line_history = crate::repl::History::load();
-    let mut current_session_id = session.as_ref()
-        .map(|s| s.get_session_id().to_string())
-        .unwrap_or_default();
     let mut recent_models: Vec<String> = Vec::new();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
@@ -1724,7 +1697,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 // model-initiated shelling are identical. No confirmation is
                 // required: the user typed it explicitly, unlike the
                 // LLM-initiated tool call. This skips the LLM prompt entirely.
+                // Ensure session exists before shell commands that capture.
                 if input.starts_with("!!") || input.starts_with('!') {
+                    ensure_session(&mut session, &repo, &config).await;
+                    if let Some(id) = session.as_ref().map(|s| s.get_session_id().to_string()) {
+                        current_session_id = id;
+                    }
                     let (capture, cmd) = if input.starts_with("!!") {
                         (false, &input[2..])
                     } else {
@@ -1846,6 +1824,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             continue;
                         }
                     }
+                }
+                // Ensure session exists lazily on first turn.
+                ensure_session(&mut session, &repo, &config).await;
+                let session_id = session.as_ref().map(|s| s.get_session_id().to_string());
+                if let Some(id) = session_id {
+                    current_session_id = id;
                 }
                 let response = {
                     if let Some(g) = &guard {
