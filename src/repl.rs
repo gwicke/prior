@@ -257,6 +257,24 @@ pub struct ReplCtx {
     /// by `run_interactive` each loop iteration so the `/stat` overlay can
     /// render without direct access to the agent.
     pub session_usage: SessionUsage,
+    /// List of all sessions for the current CWD, for the `/session` overlay.
+    pub sessions: Vec<SessionMeta>,
+    /// The ID of the currently active session (empty if no session).
+    pub current_session_id: String,
+    /// Branch messages for the fork picker: (entry_id, preview_text) pairs
+    /// for user messages in the current session's branch.
+    pub branch_messages: Vec<(String, String)>,
+}
+
+/// Lightweight session metadata for the `/session` overlay.
+#[derive(Clone)]
+pub struct SessionMeta {
+    pub id: String,
+    pub name: Option<String>,
+    pub timestamp: String,
+    pub cwd: String,
+    pub parent_session: Option<String>,
+    pub message_count: usize,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -1029,6 +1047,9 @@ impl Repl {
                                                     }
                                                     slash::SlashKind::Sandbox => {
                                                         editor.set("/sandbox ");
+                                                    }
+                                                    slash::SlashKind::Session => {
+                                                        editor.set("/session ");
                                                     }
                                                 }
                                             }

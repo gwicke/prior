@@ -1078,6 +1078,263 @@ fn guard<T: Tool>(
     }
 }
 
+/// Build session context data for the `/session` overlay.
+///
+/// Returns (sessions list, current session id, branch message previews).
+async fn build_session_ctx(
+    session: &Option<Session>,
+    repo: &Option<crate::session::repo::JsonlSessionRepo>,
+    _output: &Arc<dyn Output>,
+) -> (Vec<crate::repl::SessionMeta>, String, Vec<(String, String)>) {
+    let current_session_id = session
+        .as_ref()
+        .and_then(|s| {
+            let index = s.index().blocking_lock();
+            Some(index.header.id.clone())
+        })
+        .unwrap_or_default();
+
+    let sessions = if let Some(repo) = repo {
+        let cwd = std::env::current_dir().ok();
+        repo.list(cwd.as_deref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| crate::repl::SessionMeta {
+                id: m.id,
+                name: m.name,
+                timestamp: m.timestamp,
+                cwd: m.cwd,
+                parent_session: m.parent_session.map(|p| p.display().to_string()),
+                message_count: m.message_count,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let branch_messages = if let Some(s) = session {
+        let branch = s.get_branch().await;
+        let mut msgs: Vec<(String, String)> = Vec::new();
+        for entry in &branch {
+            if let crate::session::SessionEntryContent::Message { message } = &entry.content {
+                if message.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    let preview = message
+                        .pointer("/content/0/text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    msgs.push((entry.id.clone(), preview));
+                }
+            }
+        }
+        msgs
+    } else {
+        Vec::new()
+    };
+
+    (sessions, current_session_id, branch_messages)
+}
+
+/// Parse the session name and remaining text from a `/session <rest>` string.
+fn parse_session_name_after(rest: &str) -> (String, String) {
+    if rest.starts_with('"') {
+        if let Some(end) = rest[1..].find('"').map(|i| i + 2) {
+            let n = rest[1..end - 1].to_string();
+            let after = rest[end..].trim().to_string();
+            (n, after)
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let n = parts.next().unwrap_or("").to_string();
+        (n, parts.next().unwrap_or("").to_string())
+    }
+}
+
+/// Parse and dispatch a `/session <name> <action>` command.
+///
+/// Returns `true` if the input was a session command (handled or errored),
+/// `false` if it should be treated as a normal prompt.
+async fn handle_session_command(
+    input: &str,
+    session: &mut Option<Session>,
+    repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
+    config: &mut AgentConfig,
+) -> bool {
+    let input = input.trim();
+    if !input.starts_with("/session") {
+        return false;
+    }
+
+    let rest = input["/session".len()..].trim();
+    if rest.is_empty() {
+        // Bare `/session` — let the overlay handle it.
+        return true;
+    }
+
+    // Parse: <name> <action> [<arg>]
+    // Name may be quoted: "<name>" <action>
+    let (name, after_name) = parse_session_name_after(rest);
+
+    if name.is_empty() {
+        return true;
+    }
+
+    // Parse action and argument from after_name
+    let (action, arg) = if let Some((a, r)) = after_name.split_once(char::is_whitespace) {
+        (a.to_string(), Some(r.trim().to_string()))
+    } else {
+        (after_name.clone(), None)
+    };
+
+    let action = action.to_lowercase();
+
+    // We need the sessions list to find the session by name.
+    let meta = if let Some(repo) = repo {
+        let cwd = std::env::current_dir().ok();
+        repo.list(cwd.as_deref())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| {
+                m.name.as_deref() == Some(&name) || m.id == name
+            })
+    } else {
+        None
+    };
+
+    match action.as_str() {
+        "resume" => {
+            if let Some(meta) = meta {
+                match repo.as_ref().unwrap().open(&meta).await {
+                    Ok((storage, index)) => {
+                        *session = Some(Session::new(storage, index));
+                        config.output.display_plain(&format!(
+                            "/session {} resume",
+                            meta.name.as_deref().unwrap_or(&meta.id)
+                        ));
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot resume session: {}", e));
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+            }
+        }
+        "fork" => {
+            if let Some(meta) = meta {
+                let cwd = std::env::current_dir().ok();
+                let cwd = if let Some(c) = cwd { c } else {
+                    config.output.display_text("Cannot determine current directory");
+                    return true;
+                };
+                // Fork from the session's leaf
+match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
+                    Ok(new_storage) => {
+                        let index = new_storage.build_index().await.unwrap_or_else(|_| {
+                            // Minimal index if build fails
+                            let header = crate::session::SessionHeader::new(&cwd);
+                            crate::session::SessionIndex {
+                                header,
+                                entries: std::collections::HashMap::new(),
+                                leaf_id: None,
+                                children: std::collections::HashMap::new(),
+                                session_name: None,
+                            }
+                        });
+                        let new_session = Session::new(new_storage, index);
+                        let name = meta.name.as_deref().unwrap_or(&meta.id);
+                        config.output.display_plain(&format!(
+                            "/session {} fork", name
+                        ));
+                        *session = Some(new_session);
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot fork session: {}", e));
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+            }
+        }
+        "rename" => {
+            let new_name = arg.unwrap_or_default();
+            if new_name.is_empty() {
+                config.output.display_text("Usage: /session <name> rename <newname>");
+                return true;
+            }
+            if let Some(ref s) = session {
+                let cur_id = s.index().blocking_lock().header.id.clone();
+                if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
+                    let _ = s.set_session_name(&new_name).await;
+                    config.output.display_plain(&format!(
+                        "/session {} rename {}", 
+                        meta.as_ref().and_then(|m| m.name.as_deref()).unwrap_or(&cur_id),
+                        new_name
+                    ));
+                } else if let Some(meta) = meta {
+                    // Open the session, rename, close
+                    let (storage, _index) = match repo.as_ref().unwrap().open(&meta).await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            config.output.display_text(&format!("Cannot open session: {}", e));
+                            return true;
+                        }
+                    };
+                    let s = Session::new(storage, crate::session::SessionIndex {
+                        header: crate::session::SessionHeader::new(&std::env::current_dir().unwrap_or_default()),
+                        entries: std::collections::HashMap::new(),
+                        leaf_id: None,
+                        children: std::collections::HashMap::new(),
+                        session_name: None,
+                    });
+                    let _ = s.set_session_name(&new_name).await;
+                    config.output.display_plain(&format!(
+                        "/session {} rename {}", 
+                        meta.name.as_deref().unwrap_or(&meta.id),
+                        new_name
+                    ));
+                } else {
+                    config.output.display_text(&format!("Session not found: {}", name));
+                }
+            }
+        }
+        "delete" => {
+            if let Some(meta) = meta {
+                if let Some(ref s) = session {
+                    let cur_id = s.index().blocking_lock().header.id.clone();
+                    if cur_id == meta.id {
+                        config.output.display_text("Cannot delete the current session");
+                        return true;
+                    }
+                }
+                match repo.as_ref().unwrap().delete(&meta).await {
+                    Ok(()) => {
+                        config.output.display_plain(&format!(
+                            "/session {} delete",
+                            meta.name.as_deref().unwrap_or(&meta.id)
+                        ));
+                    }
+                    Err(e) => {
+                        config.output.display_text(&format!("Cannot delete session: {}", e));
+                    }
+                }
+            } else {
+                config.output.display_text(&format!("Session not found: {}", name));
+            }
+        }
+        _ => {
+            config.output.display_text(&format!("Unknown session action: {}", action));
+        }
+    }
+    true
+}
+
 /// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
@@ -1123,7 +1380,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     }
 
     // Persistent session storage.
-    let session: Option<Session> = {
+    let (mut session, mut repo): (Option<Session>, Option<crate::session::repo::JsonlSessionRepo>) = {
         let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
         match sessions_dir {
             Some(dir) => {
@@ -1149,28 +1406,29 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     children: std::collections::HashMap::new(),
                                     session_name: None,
                                 });
-                            Some(Session::new(storage, index))
+                            (Some(Session::new(storage, index)), Some(repo))
                         }
                         Err(e) => {
                             config.output.display_plain(&format!(
                                 "Warning: cannot create session storage, session disabled: {}",
                                 e
                             ));
-                            None
+                            (None, None)
                         }
                     }
                 } else {
-                    None
+                    (None, None)
                 }
             }
             None => {
                 config.output.display_plain(
                     "Warning: no app config directory found, session storage disabled",
                 );
-                None
+                (None, None)
             }
         }
     };
+
 
     let mut line_history = crate::repl::History::load();
     let mut recent_models: Vec<String> = Vec::new();
@@ -1200,6 +1458,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
         let action = match repl.as_mut() {
             Some(r) => {
                 config.output.display_separator();
+
+                // Build session list for the /session overlay.
+                let (sessions, current_session_id, branch_messages) = build_session_ctx(
+                    &session, &repo, &config.output,
+                ).await;
+
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
@@ -1211,6 +1475,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .as_ref()
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
+                    sessions,
+                    current_session_id,
+                    branch_messages,
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
@@ -1402,6 +1669,21 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         }
                     }
                     continue;
+                }
+                // Handle `/session <name> <action>` commands.
+                if input.starts_with("/session") {
+                    let handled = handle_session_command(
+                        &input,
+                        &mut session,
+                        &mut repo,
+                        &mut config,
+                    ).await;
+                    // Skip if it was a session command (whether handled or errored).
+                    // If it returned false (shouldn't happen since we check starts_with),
+                    // fall through to normal prompt.
+                    if handled {
+                        continue;
+                    }
                 }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
