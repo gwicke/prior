@@ -1118,35 +1118,81 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 ## Implementation Plan — Phase 4: REPL Commands
 
-**Goal:** Session management via slash commands.
+**Goal:** Session management via slash commands (`/sessions`, `/name`, `/fork`).
+
+### Status
+Pending. Phase 3 left `run_interactive()` with an `Option<Session>` created at startup, but no way to list, name, fork, or resume sessions. The `repo` is not stored — only the session handle.
+
+### Architecture context (from codebase analysis)
+
+The slash command pipeline has three layers:
+
+1. **`slash.rs` (registry + parsing):** `SlashIntent` enum with `Help`, `Model`, `Thinking`, `Unknown`. Used only for fuzzy-filtering in the command overlay and for `run_interactive()` in `agent.rs` (only for `/help` and `/unknown` bare-slash handling).
+
+2. **`repl.rs` (input + overlay):** `InputAction` enum returned by `read_input()`. Currently has `Submit`, `SetModel`, `SetThinking`, `SetPersona`, `Quit`, `Sandbox`. Overlay kind codes: 1=Commands, 2=Model, 3=Thinking, 5=Settings, 6=Persona, 7=Stat, 8=Sandbox, 9=Path.
+
+3. **`agent.rs` (dispatch):** `run_interactive()` matches on `InputAction` in the main loop. Session lives as `Option<Session>` at function scope. The `JsonlSessionRepo` is **not stored** — only created ephemerally during session init.
+
+### Key constraints
+
+- **Repo must be stored** alongside the session for `/sessions` (list), `/fork` (create), and `/resume` (open). Need to add `repo: Option<JsonlSessionRepo>` to `run_interactive()` state.
+- **`InputAction` needs new variants:** `Sessions`, `NameSession(String)`, `ForkSession(String)`. No `/resume` or `/session <name>` for now — those require session switching which demands reopening a different session and replacing the current `Session` in the loop state.
+- **In-band vs overlay:** Commands that take arguments (`/name my-session`, `/fork e1`) can be handled as direct text input without a TUI overlay. Commands that need selection (`/sessions`, fork picker) need new overlay codes.
+- **Existing overlay pattern:** All overlays follow the same structure in `repl.rs`: kind code → title + opts + active → `overlay_lines()` → Enter/Tab dispatch inline in the key handler. `/sessions` would use kind code 10, fork picker kind code 11.
 
 ### Checklist
 
-- [ ] **4.1 Add `SlashKind` variants to `src/slash.rs`**
-  - [ ] `Sessions` — `/sessions`: list past sessions
-  - [ ] `Session` — `/session <name>`: show/resume by name
-  - [ ] `Resume` — `/resume <id>`: resume by ID
-  - [ ] `Name` — `/name <name>`: name current session
-  - [ ] `Fork` — `/fork`: interactive fork picker
+- [ ] **4.1 Store repo in `run_interactive()`**
+  - [ ] At session init: keep `repo: Option<JsonlSessionRepo>` alongside `session: Option<Session>`
+  - [ ] `repo` is `None` when session creation was skipped (no config dir, unwritable, etc.)
 
-- [ ] **4.2 Update `SlashIntent` parsing**
-  - [ ] Parse `sessions`, `session <name>`, `resume <id>`, `name <name>`, `fork`
+- [ ] **4.2 Add `InputAction` variants to `src/repl.rs`**
+  - [ ] `Sessions` — open session list overlay (no argument)
+  - [ ] `NameSession(String)` — set session name (`/name my-session`)
+  - [ ] `ForkSession(String)` — fork at a specific entry ID (`/fork <entry_id>`)
 
-- [ ] **4.3 Implement dispatch in `run_interactive()`**
-  - [ ] `/sessions` → call `repo.list(cwd)`, display as table
-  - [ ] `/session <name>` → find session by name, call `repo.open()`, switch
-  - [ ] `/resume <id>` → find by ID, switch
-  - [ ] `/name <name>` → call `session.set_session_name(name)`
-  - [ ] `/fork` → open fork picker overlay (list user messages), call `repo.fork()`, switch
+- [ ] **4.3 Add slash commands to `src/slash.rs`**
+  - [ ] `SlashKind::Sessions` — `/sessions`: list past sessions
+  - [ ] `SlashKind::Name` — `/name <name>`: name current session
+  - [ ] `SlashKind::Fork` — `/fork`: interactive fork picker
+  - [ ] Register in `registry()` with help text
+  - [ ] Update `render_help()` with new commands
+  - [ ] Update `registry_has_eight_commands` test assertion
 
-- [ ] **4.4 Add TUI overlays in `src/repl.rs`**
-  - [ ] Session list overlay (reuse `Repl::select` pattern from `/model`)
-  - [ ] Fork picker overlay (list user messages with preview, select fork point)
+- [ ] **4.4 Implement `/sessions` (kind 10 overlay)**
+  - [ ] In `repl.rs`, detect `sessions` command word → kind = 10
+  - [ ] `ReplCtx` needs new fields: `sessions_list: Vec<SessionMetadata>`, `current_session_id: String`
+  - [ ] `run_interactive()` populates `ReplCtx.sessions_list` from `repo.list(cwd)` each loop
+  - [ ] Overlay renders: timestamp | name | messages (using `Table`)
+  - [ ] Enter selects a session → new `InputAction::ResumeSession(meta)` action needed (or defer to Phase 5)
+  - [ ] `d` key in overlay deletes session → confirm dialog → `repo.delete()`
 
-- [ ] **4.5 Update `/help`**
-  - [ ] Document new commands
+- [ ] **4.5 Implement `/name` (direct text command)**
+  - [ ] In `run_interactive()`, detect `/name <name>` input before the Submit handler
+  - [ ] Call `session.set_session_name(name).await`
+  - [ ] Display confirmation: "Session named: {name}"
 
-**Estimated size:** ~250 lines across `slash.rs`, `agent.rs`, `repl.rs`
+- [ ] **4.6 Implement `/fork` (kind 11 overlay)**
+  - [ ] In `repl.rs`, detect `fork` command word → kind = 11
+  - [ `] `ReplCtx` needs `branch_messages: Vec<(String, String)>` — (entry_id, preview) pairs
+  - [ ] `run_interactive()` populates from `session.get_branch()` filtered to user messages
+  - [ ] Overlay renders: preview (first 80 chars) of each user message
+  - [ ] Enter selects fork point → `InputAction::ForkSession(entry_id)`
+  - [ ] Dispatch in `run_interactive()`: `repo.fork(&source_meta, &entry_id, cwd)` → create new `Session` → replace current
+  - [ ] Display confirmation: "Forked new session {id}"
+
+- [ ] **4.7 Update `/help`**
+  - [ ] Add `/sessions`, `/name`, `/fork` to `render_help()`
+
+### Notes from Phase 3
+
+- `/resume <id>` and `/session <name>` are deferred to Phase 5 (Session Selector UI). They require session switching which is a larger change: replacing the `Session` in the loop state mid-stream, including updating the `ReplCtx` and re-building the in-memory index.
+- `/fork` is feasible in Phase 4 because it creates a *new* session rather than switching to an existing one. The current session is replaced with the fork.
+- The repo's `list()` method is fast enough for inline overlay rendering (it only reads the first line of each `.jsonl` file). For large session stores (>100 files), the overlay response may be noticeable but is still under 50ms.
+- Session name is stored in the JSONL file as a `session_info` entry. `set_session_name()` appends a `session_info` entry and updates the leaf. The name is re-read on the next `list()` call.
+- Deleting a session removes the `.jsonl` file. The repo's `delete()` method wraps `tokio::fs::remove_file()`.
+
+**Estimated size:** ~350 lines across `slash.rs`, `repl.rs`, `agent.rs`
 
 ---
 
@@ -1278,4 +1324,6 @@ src/
 | ✅ 1 | Types + Storage | 30 unit, 78 pi files | Low |
 | ✅ 2 | Session Object  | 13 unit, full round-trip | Low |
 | ✅ 3 | Wire into agent loop | 267 pass, 9 agent | Medium |
+| 4 | REPL commands | Manual testing + unit | Low |
+| 5 | Session selector UI | Manual testing | Low |
 
