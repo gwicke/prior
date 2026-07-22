@@ -734,7 +734,7 @@ mod tests {
         // Render wide enough that nothing ellipsizes (no multi-byte '…' to
         // confuse byte-based find); wrap_opts=false keeps rows intact.
         let opts: Vec<String> = table.render(200);
-        let out = crate::repl::Repl::overlay_lines("Settings", &opts, 0, None, false);
+        let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
         // title + 8 single-line options (pre-formatted rows are NOT wrapped).
         assert_eq!(lines.len(), 9, "pre-formatted rows must not be word-wrapped");
@@ -810,7 +810,7 @@ mod tests {
         assert!(first_opt_lines[2][desc_start..].starts_with("new sessions"));
         // overlay_lines must preserve the multi-line option as visual lines
         // (title + every visual line of every option).
-        let out = crate::repl::Repl::overlay_lines("Settings", &opts, 0, None, false);
+        let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
         let expected = 1 + opts.iter().map(|o| o.matches('\n').count() + 1).sum::<usize>();
         assert_eq!(out.lines().count(), expected);
     }

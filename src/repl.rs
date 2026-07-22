@@ -375,11 +375,26 @@ pub(crate) enum ActiveOverlay {
     SessionAction {
         /// Display/completion name of the session (`name` or `id`).
         session_name: String,
-        /// Whether this is the currently active session (resume/delete greyed).
+        /// Whether this is the currently active session.
         is_current: bool,
+        /// Pre-rendered info header rows (name, turns, age, parent, dir).
+        header: Vec<String>,
+        /// Action labels (resume/fork/rename/delete).
         opts: Vec<String>,
         active: Option<usize>,
         _filter: String,
+    },
+
+    /// Confirmation dialog (e.g. before deleting a session).
+    Confirm {
+        /// Pre-rendered header lines (the prompt, word-wrapped).
+        header: Vec<String>,
+        /// The buffer text to submit if confirmed.
+        confirm_action: String,
+        /// Previous `session_name` to go back to on cancel/esc.
+        session_name: String,
+        opts: Vec<String>,
+        active: Option<usize>,
     },
 
     /// `/tree` overlay: visual session entry tree.
@@ -488,24 +503,59 @@ impl ActiveOverlay {
             }
             "session" | "sessions" => {
                 let filter = rest.trim().to_string();
+
+                // Check for delete confirmation: buffer is `/session <name> delete`
+                // or `/session <name> delete current` (for current session → /clear).
+                if !filter.is_empty() {
+                    let (name_part, after_name) = crate::agent::parse_session_name_after(&filter);
+                    if !name_part.is_empty() {
+                        let action = after_name.split_once(char::is_whitespace)
+                            .map(|(a, _)| a)
+                            .unwrap_or(&after_name);
+                        if action == "delete" || action == "delete_current" {
+                            let single = Repl::filtered_sessions(ctx, &name_part);
+                            if single.len() == 1 {
+                                let meta = single[0];
+                                let display_name = meta.name.as_deref().unwrap_or(&meta.id);
+                                let is_current = meta.id == ctx.current_session_id;
+                                let (prompt, confirm_action) = if action == "delete_current" || is_current {
+                                    (format!("Delete the current session and start a new one? '{}' will be permanently deleted from disk.", display_name),
+                                     "/clear".to_string())
+                                } else {
+                                    (format!("Delete session '{}'? This will permanently delete it from disk.", display_name),
+                                     format!("/session {} delete", meta.id))
+                                };
+                                return ActiveOverlay::Confirm {
+                                    header: crate::output::wrap(&prompt, crate::output::term_width().saturating_sub(2)),
+                                    confirm_action,
+                                    session_name: meta.id.clone(),
+                                    opts: vec!["Cancel".into(), "Confirm".into()],
+                                    active: Some(0),
+                                };
+                            }
+                        }
+                    }
+                }
+
                 let filtered = Repl::filtered_sessions(ctx, &filter);
                 // When a filter is typed and resolves to exactly one session,
-                // jump straight to that session's action menu (kind 11).
+                // jump straight to that session's action menu.
                 if !filter.is_empty() && filtered.len() == 1 {
                     let meta = filtered[0];
-                    let session_name = meta.name.clone().unwrap_or_else(|| meta.id.clone());
+                    let session_name = meta.id.clone();
                     let is_current = meta.id == ctx.current_session_id;
+                    let mut header = Vec::new();
                     let mut opts = Vec::new();
                     let mut active = None;
-                    Repl::session_action_overlay_entries(meta, ctx, &filter, &mut opts, &mut active);
-                    ActiveOverlay::SessionAction { session_name, is_current, opts, active, _filter: filter }
+                    Repl::session_action_overlay_entries(meta, ctx, &filter, &mut header, &mut opts, &mut active);
+                    ActiveOverlay::SessionAction { session_name, is_current, header, opts, active, _filter: filter }
                 } else {
                     let mut opts = Vec::new();
                     let mut active = None;
                     Repl::session_overlay_entries(ctx, &filter, &mut opts, &mut active);
                     let names: Vec<String> = filtered
                         .iter()
-                        .map(|m| m.name.clone().unwrap_or_else(|| m.id.clone()))
+                        .map(|m| m.id.clone())
                         .collect();
                     ActiveOverlay::Session { opts, names, active, _filter: filter }
                 }
@@ -684,6 +734,10 @@ impl ActiveOverlay {
                 ("Session actions  (up/down, Tab/Enter select, Esc back)",
                  opts.clone(), *active, false)
             }
+            ActiveOverlay::Confirm { opts, active, .. } => {
+                ("Session actions  (up/down, Tab/Enter select, Esc back)",
+                 opts.clone(), *active, false)
+            }
             ActiveOverlay::Tree { rows, active, .. } => {
                 ("Tree  (up/down, Enter navigate, Esc back)",
                  rows.clone(), *active, false)
@@ -691,9 +745,6 @@ impl ActiveOverlay {
         }
     }
 
-    /// Title for overlays that need a dynamic title (e.g. SettingsVal uses
-    /// the setting name from its key).  Returns "" for variants that set the
-    /// title statically in `display_rows`.
     fn title(&self) -> String {
         match self {
             ActiveOverlay::SettingsVal { key, .. } => {
@@ -877,17 +928,31 @@ impl ActiveOverlay {
                     editor.set(&format!("/session {}", name));
                 }
             }
-            ActiveOverlay::SessionAction { session_name, .. } => {
+            ActiveOverlay::SessionAction { session_name, opts, .. } => {
                 // Fill the chosen action into the buffer (stay in input).
-                let action = match sel {
-                    3 => "resume",
-                    4 => "fork",
-                    5 => "rename ",
-                    6 => "delete",
-                    _ => "",
-                };
-                if !action.is_empty() {
-                    editor.set(&format!("/session {} {}", session_name, action));
+                if let Some(label) = opts.get(sel) {
+                    let action_str = match label.as_str() {
+                        "resume" => "resume",
+                        "fork" => "fork",
+                        "rename" => "rename ",
+                        "delete" => "delete",
+                        _ => "",
+                    };
+                    if !action_str.is_empty() {
+                        editor.set(&format!("/session {} {}", session_name, action_str));
+                    }
+                }
+            }
+            ActiveOverlay::Confirm { session_name, opts, .. } => {
+                // Tab fills "confirm" action into buffer.
+                if let Some(label) = opts.get(sel) {
+                    let confirm_str = match label.as_str() {
+                        "Confirm" => "confirm",
+                        _ => "",
+                    };
+                    if !confirm_str.is_empty() {
+                        editor.set(&format!("/session {} confirm", session_name));
+                    }
                 }
             }
             ActiveOverlay::Tree { .. } => {
@@ -931,6 +996,11 @@ impl ActiveOverlay {
                         slash::SlashKind::Sandbox => editor.set("/sandbox "),
                         slash::SlashKind::Session => editor.set("/session "),
                         slash::SlashKind::Tree => editor.set("/tree "),
+                        slash::SlashKind::Clear => {
+                            redraw(&LineEditor::new(), &[], sel, input_row);
+                            output.display_plain("");
+                            return OverlayAction::Action(InputAction::Submit("/clear".into()));
+                        }
                     }
                 }
                 OverlayAction::Continue
@@ -1110,32 +1180,58 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::SessionAction { session_name, is_current, .. } => {
-                // Resume/delete are greyed out on the current session.
-                let is_greyed = (sel == 3 || sel == 6) && *is_current;
-                if is_greyed {
-                    OverlayAction::Continue
-                } else {
-                    let (action, commit) = match sel {
-                        3 => ("resume", true),
-                        4 => ("fork", true),
-                        5 => ("rename ", false),
-                        6 => ("delete", true),
-                        _ => ("", false),
-                    };
-                    if action.is_empty() {
-                        OverlayAction::Continue
-                    } else {
-                        let line = format!("/session {} {}", session_name, action);
-                        if commit {
+            ActiveOverlay::SessionAction { session_name, is_current, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    match label.as_str() {
+                        "resume" => {
+                            let line = format!("/session {} resume", session_name);
                             Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
                             OverlayAction::Action(InputAction::Submit(line))
-                        } else {
-                            // `rename` keeps the user in input to type the new name.
+                        }
+                        "fork" => {
+                            let line = format!("/session {} fork", session_name);
+                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                            OverlayAction::Action(InputAction::Submit(line))
+                        }
+                        "rename" => {
+                            // Keep the user in input to type the new name.
+                            let line = format!("/session {} rename ", session_name);
                             editor.set(&line);
                             OverlayAction::Continue
                         }
+                        "delete" => {
+                            // Set buffer to trigger confirmation overlay.
+                            // `from_buffer` will detect `<name> delete` and show Confirm.
+                            let line = if *is_current {
+                                format!("/session {} delete_current", session_name)
+                            } else {
+                                format!("/session {} delete", session_name)
+                            };
+                            editor.set(&line);
+                            OverlayAction::Continue
+                        }
+                        _ => OverlayAction::Continue,
                     }
+                } else {
+                    OverlayAction::Continue
+                }
+            }
+            ActiveOverlay::Confirm { confirm_action, session_name, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    match label.as_str() {
+                        "Confirm" => {
+                            let line = confirm_action.clone();
+                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                            OverlayAction::Action(InputAction::Submit(line))
+                        }
+                        _ => {
+                            // Cancel — go back to the session action menu.
+                            editor.set(&format!("/session {}", session_name));
+                            OverlayAction::Continue
+                        }
+                    }
+                } else {
+                    OverlayAction::Continue
                 }
             }
             ActiveOverlay::Tree { targets, .. } => {
@@ -1190,6 +1286,10 @@ impl ActiveOverlay {
                 // Go back to the session list.
                 editor.set("/session ");
             }
+            ActiveOverlay::Confirm { session_name, .. } => {
+                // Go back to the session action menu.
+                editor.set(&format!("/session {}", session_name));
+            }
             ActiveOverlay::Tree { .. } => {
                 editor.set("");
             }
@@ -1213,7 +1313,8 @@ impl ActiveOverlay {
             ActiveOverlay::PathComplete { .. } => 10,
             ActiveOverlay::Session { .. } => 11,
             ActiveOverlay::SessionAction { .. } => 12,
-            ActiveOverlay::Tree { .. } => 13,
+            ActiveOverlay::Confirm { .. } => 13,
+            ActiveOverlay::Tree { .. } => 14,
         }
     }
 
@@ -1461,8 +1562,14 @@ impl Repl {
             let mut overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::Help => Self::render_help_overlay(),
-                ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, usize::MAX, None, true),
-                _ => Self::overlay_lines(effective_title, &opts, sel, active, wrap),
+                ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
+                ActiveOverlay::SessionAction { header, .. } => {
+                    Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
+                }
+                ActiveOverlay::Confirm { header, .. } => {
+                    Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
+                }
+                _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
             // Value-mode settings error: red header line.
             if matches!(overlay, ActiveOverlay::SettingsVal { .. }) && value_error.is_some() {
@@ -1771,6 +1878,7 @@ impl Repl {
     pub fn overlay_lines(
         title: &str,
         options: &[String],
+        header: Option<&[String]>,
         sel: usize,
         active: Option<usize>,
         wrap_opts: bool,
@@ -1780,6 +1888,7 @@ impl Repl {
         const C_SEL: &str = "\x1b[1;36m"; // bold cyan: cursor selection
         const C_ACT: &str = "\x1b[32m"; // green: currently-active model
         const C_RESET: &str = "\x1b[0m";
+        const BG_HEADER: &str = "\x1b[48;5;237m"; // slightly lighter for header
         let tw = term_width().max(1);
         let opt_w = tw.saturating_sub(2); // "> " / "* " / "  " marker
         let mut rows: Vec<(usize, String, bool)> = Vec::new();
@@ -1804,6 +1913,15 @@ impl Repl {
         };
         let mut out = String::new();
         out.push_str(&bg_line(title, BG));
+        // Render header rows (non-selectable info) if present.
+        if let Some(hdr) = header {
+            for hline in hdr {
+                for subline in hline.split('\n') {
+                    out.push('\n');
+                    out.push_str(&format!("{}{:<width$}{}", BG_HEADER, subline, C_RESET, width = tw));
+                }
+            }
+        }
         for (i, line, first) in &rows {
             // The 2-char marker area prefixes every line (including wrapped
             // continuation lines) so all visual lines of one option stay
@@ -1839,7 +1957,7 @@ impl Repl {
     /// dismisses it (see `read_input`).
     fn render_help_overlay() -> String {
         let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
-        Self::overlay_lines("Help  (any key closes)", &lines, usize::MAX, None, true)
+        Self::overlay_lines("Help  (any key closes)", &lines, None, usize::MAX, None, true)
     }
 
     /// Resolve the catalog id of the currently-active model. OpenRouter routes
@@ -2201,16 +2319,18 @@ impl Repl {
             else { b.timestamp.cmp(&a.timestamp) }
         });
 
-        // Filter by name text if filter is non-empty.
+        // Fuzzy-filter by name, prompt preview, id, and cwd.
         let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
             sorted.iter().collect()
         } else {
-            let f = filter.to_lowercase();
-            sorted.iter().filter(|m| {
-                m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
-                    || m.id.to_lowercase().contains(&f)
-                    || m.cwd.to_lowercase().contains(&f)
-            }).collect()
+            crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+                let name = m.name.as_deref().unwrap_or("");
+                let preview = m.first_prompt_preview.as_deref().unwrap_or("");
+                format!("{} {} {} {}", name, preview, m.id, m.cwd)
+            })
+            .iter()
+            .map(|r| r.item)
+            .collect()
         };
 
         if filtered.is_empty() {
@@ -2330,14 +2450,17 @@ impl Repl {
         if trimmed.is_empty() { String::new() } else { trimmed }
     }
 
-    /// Build the per-session action menu overlay (kind 11).
+    /// Build the per-session action menu overlay.
     ///
-    /// Shows session info and actions: resume, fork, rename, delete.
-    /// Indices: 0=info, 1=cwd, 2=blank, 3=resume, 4=fork, 5=rename, 6=delete.
+    /// Renders a header (using Table for width management) with session identity
+    /// info, and populates `opts` with the available actions.
+    /// Actions: resume (if not current), fork, rename, delete (always shown).
+    /// Cursor starts on resume (or fork if current) for zero-key common case.
     fn session_action_overlay_entries(
         meta: &SessionMeta,
         ctx: &ReplCtx,
         _filter: &str,
+        header: &mut Vec<String>,
         opts: &mut Vec<String>,
         active: &mut Option<usize>,
     ) {
@@ -2345,34 +2468,47 @@ impl Repl {
         let ts = Self::format_session_timestamp(&meta.timestamp);
         let name = meta.name.as_deref().unwrap_or(&meta.id);
 
-        // Info line (index 0)
-        let parent_hint = meta.parent_session.as_ref().map(|p| {
-            let short = p.rsplit('/').next().unwrap_or(p);
-            format!(" | parent: {}", short)
-        }).unwrap_or_default();
-        let info = format!(
-            "{}  {} turns | {}{}",
-            name,
-            meta.message_count,
-            ts,
-            parent_hint,
-        );
-        opts.push(info);
+        // Build a header table with session identity and metadata.
+        let avail = crate::output::term_width().saturating_sub(2);
+        let mut table = crate::table::Table::new(&["Session", "Turns", "Age", "Parent/Dir"])
+            .with_aligns(&[
+                crate::table::Align::Left,
+                crate::table::Align::Right,
+                crate::table::Align::Right,
+                crate::table::Align::Left,
+            ])
+            .with_min_widths(&[20, 5, 11, 12])
+            .with_priorities(&[3, 1, 1, 2])
+            .set_gap(2);
 
-        // cwd line (index 1)
-        let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
-        opts.push(format!("  dir: {}", cwd_tail));
+        let marker = if is_current { "◉ " } else { "  " };
+        let parent_display = meta.parent_session.as_ref().map(|p| {
+            format!("parent: {}", p.rsplit('/').next().unwrap_or(p))
+        }).unwrap_or_else(|| {
+            format!("dir: {}", meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd))
+        });
 
-        // Blank separator (index 2)
-        opts.push(String::new());
+        table.add_row(&[
+            &format!("{}{}", marker, name),
+            &meta.message_count.to_string(),
+            &ts,
+            &parent_display,
+        ]);
 
-        // Actions (indices 3-6)
-        opts.push(if is_current { "\x1b[2m  resume (current)\x1b[0m".into() } else { "  resume".into() });
-        opts.push("  fork".into());
-        opts.push("  rename".into());
-        opts.push(if is_current { "\x1b[2m  delete (current)\x1b[0m".into() } else { "  delete".into() });
+        for row in table.render(avail) {
+            header.push(row);
+        }
 
-        *active = if is_current { Some(3) } else { Some(4) };
+        // Actions (always shown; resume conditionally absent).
+        if !is_current {
+            opts.push("resume".into());
+        }
+        opts.push("fork".into());
+        opts.push("rename".into());
+        opts.push("delete".into());
+
+        // Cursor starts on resume (if available) or fork.
+        *active = if is_current { Some(1) } else { Some(0) };
     }
 
     /// Filter the sessions list by the given text (matches name, id, or cwd).
@@ -2391,12 +2527,15 @@ impl Repl {
             return sorted;
         }
 
-        let f = filter.to_lowercase();
-        sorted.into_iter().filter(|m| {
-            m.name.as_deref().map(|n| n.to_lowercase().contains(&f)).unwrap_or(false)
-                || m.id.to_lowercase().contains(&f)
-                || m.cwd.to_lowercase().contains(&f)
-        }).collect()
+        // Fuzzy-filter by name, prompt preview, id, and cwd.
+        crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+            let name = m.name.as_deref().unwrap_or("");
+            let preview = m.first_prompt_preview.as_deref().unwrap_or("");
+            format!("{} {} {} {}", name, preview, m.id, m.cwd)
+        })
+        .into_iter()
+        .map(|r| *r.item)
+        .collect()
     }
 
     // ── /tree overlay rendering ──────────────────────────────────────────
@@ -4171,7 +4310,7 @@ mod tests {
             "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
             "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
         ];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
+        let out = Repl::overlay_lines("Select a model:", &opts, None, 0, None, true);
         assert_eq!(out.matches("Select a model:").count(), 1);
         assert!(out.contains("> a: alpha"));
         assert!(out.contains("  b: beta"));
@@ -4181,7 +4320,7 @@ mod tests {
     fn render_select_wraps_long_option_with_aligned_continuation() {
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
         let opts = vec![long.to_string()];
-        let out = Repl::overlay_lines("Select a model:", &opts, 0, None, true);
+        let out = Repl::overlay_lines("Select a model:", &opts, None, 0, None, true);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[1].contains("> "), "first row is the marker row");
         let cont: Vec<&&str> = lines

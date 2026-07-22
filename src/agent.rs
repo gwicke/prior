@@ -960,7 +960,7 @@ Your mission is to assist the user in their development tasks by utilizing a set
 4. **Tool Mastery**:
    - `read_file`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
    - `bash`: Your window to the system. Use it for compilation, testing, and complex automation.
-   - `agent_browser`: Use for external documentation, searching for solutions, or web-related debugging.
+   - `w3m in the shell`: Use for external documentation, searching for solutions, or web-related debugging.
 5. **Context**: You are working in the directory provided below. All paths are relative to this directory.
 
 ### GUIDING PRINCIPLES
@@ -1184,7 +1184,7 @@ enum SessionCommandResult {
 }
 
 /// Parse the session name and remaining text from a `/session <rest>` string.
-fn parse_session_name_after(rest: &str) -> (String, String) {
+pub(crate) fn parse_session_name_after(rest: &str) -> (String, String) {
     if rest.starts_with('"') {
         if let Some(end) = rest[1..].find('"').map(|i| i + 2) {
             let n = rest[1..end - 1].to_string();
@@ -2141,6 +2141,24 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             continue;
                         }
                     }
+                }
+                // Handle `/clear`: delete current session and start fresh.
+                if input == "/clear" || input.starts_with("/clear ") {
+                    if let Some(ref s) = session {
+                        let id = s.get_session_id().to_string();
+                        if let Some(ref r) = repo {
+                            // Find the session meta to delete it.
+                            let cwd = std::env::current_dir().ok();
+                            let metas = r.list(cwd.as_deref()).await.unwrap_or_default();
+                            if let Some(meta) = metas.iter().find(|m| m.id == id) {
+                                let _ = r.delete(meta).await;
+                            }
+                        }
+                    }
+                    session = None;
+                    current_session_id = String::new();
+                    config.output.display_plain("/clear");
+                    continue;
                 }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
