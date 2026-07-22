@@ -2595,6 +2595,9 @@ impl Repl {
                 format!("custom msg: {}", custom_type)
             }
         };
+        // Normalise whitespace (newlines → spaces, collapse runs) like the
+        // /session first-prompt preview does.
+        let body = Self::sanitise_single_line(&body);
         // Prepend resolved label if this node has one from a Label entry.
         if let Some(l) = _label {
             if !body.is_empty() {
