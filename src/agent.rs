@@ -2215,6 +2215,91 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     config.output.display_plain("/clear");
                     continue;
                 }
+                // Handle `/replay [N[t|l]]`: re-render session history.
+                if input == "/replay" || input.starts_with("/replay ") {
+                    if let Some(ref s) = session {
+                        let arg = input["/replay".len()..].trim();
+                        if arg.ends_with('l') {
+                            // Line-based limit: capture full replay (with full ANSI
+                            // rendering) via a Vec<u8> writer, then display only the
+                            // last N lines.
+                            let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
+                            if n > 0 {
+                                match s.build_context().await {
+                                    Ok(ctx) => {
+                                        let turns = group_into_turns(&ctx.messages);
+                                        if turns.is_empty() {
+                                            config.output.display_text("Session is empty");
+                                        } else {
+                                            let total = turns.len();
+                                            // Capture full replay (full ANSI rendering)
+                                            // via writer swap.
+                                            config.output.begin_capture();
+                                            if total > 0 {
+                                                config.output.display_separator();
+                                            }
+                                            replay_recent_turns(&config.output, &ctx, total);
+                                            let bytes = config.output.end_capture();
+                                            let captured = String::from_utf8_lossy(&bytes);
+                                            let lines: Vec<&str> = captured.lines().collect();
+                                            let start = lines.len().saturating_sub(n);
+                                            use std::io::Write as _;
+                                            let stdout = std::io::stdout();
+                                            let mut handle = stdout.lock();
+                                            for line in &lines[start..] {
+                                                let _ = writeln!(handle, "{}", line);
+                                            }
+                                            let _ = handle.flush();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        config.output.display_text(&format!("Cannot replay session: {}", e));
+                                    }
+                                }
+                            } else {
+                                // `0l` — replay all (same as bare `/replay`).
+                                match s.build_context().await {
+                                    Ok(ctx) => {
+                                        let turns = group_into_turns(&ctx.messages);
+                                        let total = turns.len();
+                                        if total > 0 {
+                                            config.output.display_separator();
+                                        }
+                                        replay_recent_turns(&config.output, &ctx, total);
+                                    }
+                                    Err(e) => {
+                                        config.output.display_text(&format!("Cannot replay session: {}", e));
+                                    }
+                                }
+                            }
+                        } else {
+                            // Turn-based limit: N or Nt (or no arg).
+                            let replay_turns: Option<usize> = if arg.is_empty() {
+                                None
+                            } else {
+                                let clean = arg.trim_end_matches('t').trim();
+                                Some(clean.parse::<usize>().ok().unwrap_or(usize::MAX))
+                            };
+                            match s.build_context().await {
+                                Ok(ctx) => {
+                                    let turns = group_into_turns(&ctx.messages);
+                                    let total = turns.len();
+                                    let count = replay_turns.unwrap_or(total).min(total);
+                                    if count > 0 {
+                                        config.output.display_separator();
+                                    }
+                                    replay_recent_turns(&config.output, &ctx, count);
+                                }
+                                Err(e) => {
+                                    config.output.display_text(&format!("Cannot replay session: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        config.output.display_text("No active session to replay");
+                    }
+                    continue;
+                }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
                 // to do for that keyword.
