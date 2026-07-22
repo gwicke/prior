@@ -284,6 +284,10 @@ pub struct SessionMeta {
     pub message_count: usize,
     /// A short preview of the first user message in the session.
     pub first_prompt_preview: Option<String>,
+    /// Full text of the last user message (for detail display).
+    pub last_prompt_text: Option<String>,
+    /// Timestamp of the last user message.
+    pub last_prompt_timestamp: Option<String>,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -380,6 +384,8 @@ pub(crate) enum ActiveOverlay {
     SessionAction {
         /// Display/completion name of the session (`name` or `id`).
         session_name: String,
+        /// The session's current name (if any), for pre-filling rename.
+        current_name: Option<String>,
         /// Whether this is the currently active session.
         is_current: bool,
         /// Pre-rendered info header rows (name, turns, age, parent, dir).
@@ -587,7 +593,8 @@ impl ActiveOverlay {
                     let mut opts = Vec::new();
                     let mut active = None;
                     Repl::session_action_overlay_entries(meta, ctx, &filter, &mut header, &mut opts, &mut active);
-                    ActiveOverlay::SessionAction { session_name, is_current, header, opts, active, _filter: filter }
+                    let current_name = meta.name.clone();
+                    ActiveOverlay::SessionAction { session_name, current_name, is_current, header, opts, active, _filter: filter }
                 } else {
                     let mut opts = Vec::new();
                     let mut active = None;
@@ -971,13 +978,32 @@ impl ActiveOverlay {
                     editor.set(&format!("/session {}", name));
                 }
             }
-            ActiveOverlay::SessionAction { session_name, opts, .. } => {
+            ActiveOverlay::SessionAction { session_name, current_name, opts, .. } => {
                 // Fill the chosen action into the buffer (stay in input).
                 if let Some(label) = opts.get(sel) {
                     let action_str = match label.as_str() {
                         _ if label.starts_with("resume") => "resume",
                         "fork" => "fork",
-                        "rename" => "rename ",
+                        "rename" => {
+                            // Pre-fill the current name for editing if nothing typed yet.
+                            let buf = editor.text();
+                            let rest = &buf["/session".len()..].trim();
+                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
+                            let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                            if trailing.is_empty() {
+                                let default = current_name.clone().unwrap_or_default();
+                                if default.is_empty() {
+                                    "rename "
+                                } else {
+                                    editor.set(&format!("/session {} rename {}", session_name, default));
+                                    ""
+                                }
+                            } else {
+                                let line = format!("/session {} rename {}", session_name, trailing);
+                                editor.set(&line);
+                                ""
+                            }
+                        }
                         "delete" => "delete",
                         _ => "",
                     };
@@ -1234,7 +1260,7 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::SessionAction { session_name, is_current, opts, .. } => {
+            ActiveOverlay::SessionAction { session_name, current_name, is_current, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
                     match label.as_str() {
                         _ if label.starts_with("resume") => {
@@ -1257,10 +1283,22 @@ impl ActiveOverlay {
                             OverlayAction::Action(InputAction::Submit(line))
                         }
                         "rename" => {
-                            // Keep the user in input to type the new name.
-                            let line = format!("/session {} rename ", session_name);
-                            editor.set(&line);
-                            OverlayAction::Continue
+                            // If the user already typed text after "rename", submit it.
+                            // Otherwise pre-fill the current name (if any) for editing.
+                            let buf = editor.text();
+                            let rest = &buf["/session".len()..].trim();
+                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
+                            let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                            if trailing.is_empty() {
+                                let default = current_name.clone().unwrap_or_default();
+                                let line = format!("/session {} rename {}", session_name, default);
+                                editor.set(&line);
+                                OverlayAction::Continue
+                            } else {
+                                let line = format!("/session {} rename {}", session_name, trailing);
+                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                                OverlayAction::Action(InputAction::Submit(line))
+                            }
                         }
                         "delete" => {
                             // Set buffer to trigger confirmation overlay.
@@ -2433,6 +2471,8 @@ impl Repl {
                 parent_session: m.parent_session.map(|p| p.display().to_string()),
                 message_count: m.message_count,
                 first_prompt_preview: m.first_prompt_preview,
+                last_prompt_text: m.last_prompt_text,
+                last_prompt_timestamp: m.last_prompt_timestamp,
             })
             .collect();
         metas.sort_by(|a, b| {
@@ -2623,6 +2663,24 @@ impl Repl {
             header.push(row);
         }
 
+        // ── Extra detail rows (non-selectable, full-width) ─────────────
+        // Use a separate single-column table so the text spans the full avail width.
+        let mut detail_table = crate::table::Table::new(&[""])
+            .with_min_widths(&[10])
+            .with_priorities(&[1]);
+        {
+            let first_text = meta.first_prompt_preview.as_deref().unwrap_or("(none)");
+            detail_table.add_row(&[&format!("{}: {}", &meta.timestamp, first_text)]);
+        }
+        {
+            let last_text = meta.last_prompt_text.as_deref().unwrap_or("(none)");
+            let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
+            detail_table.add_row(&[&format!("{}: {}", last_ts, last_text)]);
+        }
+        for row in detail_table.render(avail) {
+            header.push(row);
+        }
+
         // Actions (always shown; resume conditionally absent).
         // Labels carry a hint about the optional [N[t|l]] syntax for resume.
         if !is_current {
@@ -2694,6 +2752,8 @@ impl Repl {
                 parent_session: m.parent_session.map(|p| p.display().to_string()),
                 message_count: m.message_count,
                 first_prompt_preview: m.first_prompt_preview,
+                last_prompt_text: m.last_prompt_text,
+                last_prompt_timestamp: m.last_prompt_timestamp,
             })
             .collect();
 

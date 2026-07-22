@@ -239,6 +239,10 @@ pub struct SessionMetadata {
     pub token_count: Option<u64>,
     /// A short preview of the first user message in the session.
     pub first_prompt_preview: Option<String>,
+    /// Full text of the last user message (for detail display).
+    pub last_prompt_text: Option<String>,
+    /// Timestamp of the last user message.
+    pub last_prompt_timestamp: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
