@@ -45,6 +45,12 @@ path-clean = "1.0"
 uuid = { version = "1.0", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
+[features]
+default = []
+# Optional feature that gates the `confirm_probe` test helper binary and its
+# integration test.  Not needed for normal use or `cargo install`.
+test-utils = []
+
 [lib]
 name = "picocode"
 path = "src/lib.rs"
@@ -52,6 +58,20 @@ path = "src/lib.rs"
 [[bin]]
 name = "picocode"
 path = "src/main.rs"
+
+# Test-only binary used by the confirm_raw_mode integration test.
+# Gated behind `test-utils` so `cargo install --path .` does not install it.
+[[bin]]
+name = "confirm_probe"
+path = "src/bin/confirm_probe.rs"
+required-features = ["test-utils"]
+
+# Gate the integration test that depends on `confirm_probe` behind the same
+# feature so it's skipped when test-utils is not enabled.
+[[test]]
+name = "confirm_raw_mode"
+path = "tests/confirm_raw_mode.rs"
+required-features = ["test-utils"]
 
 [dev-dependencies]
 tempfile = "3.24.0"
