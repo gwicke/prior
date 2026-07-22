@@ -260,8 +260,8 @@ pub struct ReplCtx {
     /// by `run_interactive` each loop iteration so the `/stat` overlay can
     /// render without direct access to the agent.
     pub session_usage: SessionUsage,
-    /// List of all sessions for the current CWD, for the `/session` overlay.
-    pub sessions: Vec<SessionMeta>,
+    /// Session repository (if available), for on-demand loading in `/session` overlay.
+    pub repo: Option<crate::session::repo::JsonlSessionRepo>,
     /// The ID of the currently active session (empty if no session).
     pub current_session_id: String,
     /// Branch messages for the fork picker: (entry_id, preview_text) pairs
@@ -538,7 +538,7 @@ impl ActiveOverlay {
                         if action == "delete" || action == "delete_current" {
                             let single = Repl::filtered_sessions(ctx, &name_part);
                             if single.len() == 1 {
-                                let meta = single[0];
+                                let meta = &single[0];
                                 let display_name = meta.name.as_deref().unwrap_or(&meta.id);
                                 let is_current = meta.id == ctx.current_session_id;
                                 let (prompt, confirm_action) = if action == "delete_current" || is_current {
@@ -580,7 +580,7 @@ impl ActiveOverlay {
                 // When a filter is typed and resolves to exactly one session,
                 // jump straight to that session's action menu.
                 if !filter.is_empty() && filtered.len() == 1 {
-                    let meta = filtered[0];
+                    let meta = &filtered[0];
                     let session_name = meta.id.clone();
                     let is_current = meta.id == ctx.current_session_id;
                     let mut header = Vec::new();
@@ -1047,7 +1047,7 @@ impl ActiveOverlay {
                         slash::SlashKind::Persona => editor.set("/persona "),
                         slash::SlashKind::Stat => editor.set("/stat "),
                         slash::SlashKind::Sandbox => editor.set("/sandbox "),
-                        slash::SlashKind::Session => editor.set("/session "),
+                        slash::SlashKind::Session => editor.set("/session path:. "),
                         slash::SlashKind::Tree => editor.set("/tree "),
                         slash::SlashKind::Clear => {
                             redraw(&LineEditor::new(), &[], sel, input_row);
@@ -2314,7 +2314,11 @@ impl Repl {
     /// `//help`. A trailing space opens the argument slot (matching the
     /// Enter handler's `editor.set("/model ")`, etc.).
     fn complete_command(c: &slash::SlashCommand) -> String {
-        format!("{} ", c.name)
+        if c.name == "/session" {
+            format!("/session path:. ")
+        } else {
+            format!("{} ", c.name)
+        }
     }
 
     fn model_overlay_entries(
@@ -2392,25 +2396,46 @@ impl Repl {
 
     /// Build the `/session` overlay rows.
     ///
-    /// Shows all sessions for the current CWD, filtered by `filter`.
+    /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
     /// Current session is marked with ◉ and sorted first.
-    /// Each row shows: marker · session name (with first-prompt preview) · turns + relative age.
+    /// Each row shows: marker · session name (with first-prompt preview) · dir · turns + relative age.
     fn session_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
         opts: &mut Vec<String>,
         active: &mut Option<usize>,
     ) {
+        let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
+
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Session", ""])
-            .with_aligns(&[Align::Left, Align::Left, Align::Right])
-            .with_min_widths(&[2, 30, 10])
-            .with_priorities(&[0, 2, 1])
+        let mut table = Table::new(&["", "Session", "Dir", ""])
+            .with_aligns(&[Align::Left, Align::Left, Align::Left, Align::Right])
+            .with_min_widths(&[2, 20, 10, 10])
+            .with_priorities(&[0, 2, 2, 1])
             .set_gap(2);
 
-        // Build sorted session list: current first, then by timestamp descending.
-        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
-        sorted.sort_by(|a, b| {
+        // Load sessions synchronously from disk.
+        let cwd_filter = dir_filter.as_ref()
+            .and_then(|d| if d.is_empty() { None } else { Some(std::path::Path::new(d)) });
+        let all = if let Some(ref repo) = ctx.repo {
+            repo.list_sessions_sync(cwd_filter)
+        } else {
+            Vec::new()
+        };
+
+        // Map to SessionMeta and sort.
+        let mut metas: Vec<SessionMeta> = all.into_iter()
+            .map(|m| SessionMeta {
+                id: m.id,
+                name: m.name,
+                timestamp: m.timestamp,
+                cwd: m.cwd,
+                parent_session: m.parent_session.map(|p| p.display().to_string()),
+                message_count: m.message_count,
+                first_prompt_preview: m.first_prompt_preview,
+            })
+            .collect();
+        metas.sort_by(|a, b| {
             let a_cur = a.id == ctx.current_session_id;
             let b_cur = b.id == ctx.current_session_id;
             if a_cur && !b_cur { std::cmp::Ordering::Less }
@@ -2419,10 +2444,10 @@ impl Repl {
         });
 
         // Fuzzy-filter by name, prompt preview, id, and cwd.
-        let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
-            sorted.iter().collect()
+        let filtered: Vec<&SessionMeta> = if fuzzy_filter.is_empty() {
+            metas.iter().collect()
         } else {
-            crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
+            crate::fuzzy::fuzzy_filter_bonus(&metas, &fuzzy_filter, |m| {
                 let name = m.name.as_deref().unwrap_or("");
                 let preview = m.first_prompt_preview.as_deref().unwrap_or("");
                 format!("{} {} {} {}", name, preview, m.id, m.cwd)
@@ -2440,9 +2465,6 @@ impl Repl {
 
         for meta in &filtered {
             let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
-            // Build the session display: name + separator + first prompt preview.
-            // The preview is sanitised to a single line (newlines → space,
-            // multiple spaces collapsed) so the table cell never wraps.
             let name_part = meta.name.clone().unwrap_or_default();
             let raw_preview = meta.first_prompt_preview.as_deref().unwrap_or("");
             let preview = Self::sanitise_single_line(raw_preview);
@@ -2453,21 +2475,24 @@ impl Repl {
             } else if !preview.is_empty() {
                 preview
             } else {
-                // Fallback: just show cwd tail
-                meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd).to_string()
+                "(no messages)".to_string()
             };
-            // Right-side info: turns + relative age
+            let dir_display = meta.cwd.rsplit('/')
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/");
             let rel = Self::relative_time(&meta.timestamp);
             let info = format!("{}  {}", meta.message_count, rel);
-            table.add_row(&[marker, &display_name, &info]);
+            table.add_row(&[marker, &display_name, &dir_display, &info]);
         }
 
         for row in table.render(avail) {
             opts.push(row);
         }
 
-        // Active is the position of the current session in the rendered rows.
-        // Since table rows may wrap, approximate by finding the first visible row.
         *active = filtered.iter().position(|m| m.id == ctx.current_session_id);
     }
 
@@ -2611,11 +2636,69 @@ impl Repl {
         *active = if is_current { Some(1) } else { Some(0) };
     }
 
-    /// Filter the sessions list by the given text (matches name, id, or cwd).
-    /// Returns a Vec<&SessionMeta> in display order (current first, then by timestamp).
-    fn filtered_sessions<'a>(ctx: &'a ReplCtx, filter: &str) -> Vec<&'a SessionMeta> {
-        let mut sorted: Vec<&SessionMeta> = ctx.sessions.iter().collect();
-        sorted.sort_by(|a, b| {
+    /// Parse a session filter, extracting an optional `path:/some/dir` prefix.
+    /// `path:.` is expanded to the current working directory.
+    /// Returns `(Some(directory) | None, remaining_filter_text)`.
+    fn parse_session_path_filter(filter: &str) -> (Option<String>, String) {
+        let trimmed = filter.trim();
+        if let Some(rest) = trimmed.strip_prefix("path:") {
+            let rest = rest.trim_start();
+            let (raw_path, after) = if let Some((path_val, after)) = rest.split_once(char::is_whitespace) {
+                (path_val, after.trim())
+            } else {
+                (rest, "")
+            };
+            let dir = if raw_path.is_empty() || raw_path == "." {
+                // Expand `.` to the current working directory.
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some(raw_path.to_string())
+            };
+            (dir, after.to_string())
+        } else {
+            (None, trimmed.to_string())
+        }
+    }
+
+    /// Load sessions from the repo (if available) and filter by `path:` + fuzzy text.
+    /// Returns owned `Vec<SessionMeta>` — loaded fresh each call, discarded after use.
+    fn filtered_sessions(ctx: &ReplCtx, filter: &str) -> Vec<SessionMeta> {
+        let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
+
+        // Determine which CWD to pass to the sync loader:
+        // - `path:.` or `path:<explicit>` → load only that directory
+        // - bare filter (no path:) → load all
+        let cwd_filter = dir_filter.as_ref()
+            .and_then(|d| {
+                if d.is_empty() { None }
+                else { Some(std::path::Path::new(d)) }
+            });
+
+        // Load sessions synchronously from disk.
+        let all = if let Some(ref repo) = ctx.repo {
+            repo.list_sessions_sync(cwd_filter)
+        } else {
+            Vec::new()
+        };
+
+        // Map to SessionMeta.
+        let mut metas: Vec<SessionMeta> = all.into_iter()
+            .map(|m| SessionMeta {
+                id: m.id,
+                name: m.name,
+                timestamp: m.timestamp,
+                cwd: m.cwd,
+                parent_session: m.parent_session.map(|p| p.display().to_string()),
+                message_count: m.message_count,
+                first_prompt_preview: m.first_prompt_preview,
+            })
+            .collect();
+
+        // Sort: current session first, then by timestamp descending.
+        metas.sort_by(|a, b| {
             let a_cur = a.id == ctx.current_session_id;
             let b_cur = b.id == ctx.current_session_id;
             if a_cur && !b_cur { std::cmp::Ordering::Less }
@@ -2623,18 +2706,18 @@ impl Repl {
             else { b.timestamp.cmp(&a.timestamp) }
         });
 
-        if filter.is_empty() {
-            return sorted;
+        if fuzzy_filter.is_empty() {
+            return metas;
         }
 
         // Fuzzy-filter by name, prompt preview, id, and cwd.
-        crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
+        crate::fuzzy::fuzzy_filter_bonus(&metas, &fuzzy_filter, |m| {
             let name = m.name.as_deref().unwrap_or("");
             let preview = m.first_prompt_preview.as_deref().unwrap_or("");
             format!("{} {} {} {}", name, preview, m.id, m.cwd)
         })
         .into_iter()
-        .map(|r| *r.item)
+        .map(|r| r.item.clone())
         .collect()
     }
 

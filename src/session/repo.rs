@@ -54,6 +54,7 @@ pub trait SessionRepo: Send + Sync {
 ///   └── <cwd-encoded>/
 ///        └── <timestamp>_<uuid>.jsonl
 /// ```
+#[derive(Clone)]
 pub struct JsonlSessionRepo {
     base_dir: PathBuf,
 }
@@ -135,6 +136,74 @@ impl JsonlSessionRepo {
             token_count: None,
             first_prompt_preview,
         })
+    }
+    /// Quick-read metadata from a single JSONL file (header only) — sync version.
+    fn read_metadata_sync(path: &Path) -> Option<SessionMetadata> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let first_line = content.lines().next()?;
+        let header: SessionHeader = serde_json::from_str(first_line).ok()?;
+
+        let mut message_count = 0usize;
+        let mut first_prompt_preview = None::<String>;
+        let mut name: Option<String> = None;
+
+        for line in content.lines().skip(1) {
+            if line.contains("\"type\":\"message\"") {
+                message_count += 1;
+                if first_prompt_preview.is_none() && line.contains("\"role\":\"user\"") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        let text = val
+                            .pointer("/message/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let preview: String = text.chars().collect();
+                        if !preview.is_empty() {
+                            first_prompt_preview = Some(preview);
+                        }
+                    }
+                }
+            } else if line.contains("\"type\":\"session_info\"") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
+                        if !n.is_empty() {
+                            name = Some(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(SessionMetadata {
+            id: header.id,
+            timestamp: header.timestamp,
+            cwd: header.cwd,
+            path: path.to_path_buf(),
+            name,
+            parent_session: header.parent_session,
+            message_count,
+            token_count: None,
+            first_prompt_preview,
+        })
+    }
+
+    /// Synchronously list all session files under a given directory.
+    /// Used by the overlay (avoids async machinery on each keystroke).
+    fn list_sessions_in_dir(dir: &Path) -> Vec<SessionMetadata> {
+        let mut sessions = Vec::new();
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return sessions,
+        };
+        for entry in read_dir.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "jsonl") {
+                if let Some(meta) = Self::read_metadata_sync(&path) {
+                    sessions.push(meta);
+                }
+            }
+        }
+        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sessions
     }
 }
 
@@ -243,6 +312,38 @@ impl JsonlSessionRepo {
             }
         }
         Ok(dirs)
+    }
+
+    /// Synchronously list all session metadata, optionally filtered by CWD.
+    /// Mirrors the async `SessionRepo::list` but uses std::fs for direct use
+    /// in the overlay (avoiding async machinery on each keystroke).
+    pub(crate) fn list_sessions_sync(&self, cwd: Option<&Path>) -> Vec<SessionMetadata> {
+        let dirs: Vec<PathBuf> = if let Some(cwd) = cwd {
+            let dir = self.session_dir(cwd);
+            if dir.try_exists().unwrap_or(false) {
+                vec![dir]
+            } else {
+                return Vec::new();
+            }
+        } else {
+            let mut dirs = Vec::new();
+            if let Ok(read_dir) = std::fs::read_dir(&self.base_dir) {
+                for entry in read_dir.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    }
+                }
+            }
+            dirs
+        };
+
+        let mut sessions = Vec::new();
+        for dir in &dirs {
+            sessions.extend(Self::list_sessions_in_dir(dir));
+        }
+        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        sessions
     }
 }
 

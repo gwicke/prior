@@ -1114,32 +1114,13 @@ fn guard<T: Tool>(
 /// Returns `(sessions list, branch message previews, session tree, leaf_id)`.
 async fn build_session_ctx(
     session: &Option<Session>,
-    repo: &Option<crate::session::repo::JsonlSessionRepo>,
 ) -> (
     Vec<crate::repl::SessionMeta>,
     Vec<(String, String)>,
     Vec<crate::session::SessionTreeNode>,
     Option<String>,
 ) {
-    let sessions = if let Some(repo) = repo {
-        let cwd = std::env::current_dir().ok();
-        repo.list(cwd.as_deref())
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| crate::repl::SessionMeta {
-                id: m.id,
-                name: m.name,
-                timestamp: m.timestamp,
-                cwd: m.cwd,
-                parent_session: m.parent_session.map(|p| p.display().to_string()),
-                message_count: m.message_count,
-                first_prompt_preview: m.first_prompt_preview,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let sessions = Vec::new(); // loaded on demand by the `/session` overlay
 
     let branch_messages = if let Some(s) = session {
         let branch = s.get_branch().await;
@@ -1451,6 +1432,16 @@ async fn handle_session_command(
     }
 
     let rest = input["/session".len()..].trim();
+
+    // Strip leading path: filter if the user typed it manually (overlay-only token).
+    let rest = if let Some(r) = rest.strip_prefix("path:") {
+        r.trim_start().split_once(char::is_whitespace)
+            .map(|(_, after)| after.trim())
+            .unwrap_or("")
+    } else {
+        rest
+    };
+
     if rest.is_empty() {
         return SessionCommandResult::Handled;
     }
@@ -1470,8 +1461,7 @@ async fn handle_session_command(
     let action = action.to_lowercase();
 
     let meta = if let Some(repo) = repo {
-        let cwd = std::env::current_dir().ok();
-        repo.list(cwd.as_deref())
+        repo.list(None)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -1905,8 +1895,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 config.output.display_separator();
 
                 // Build session context data for REPL overlays.
-                let (sessions, branch_messages, tree, leaf_id) = build_session_ctx(
-                    &session, &repo,
+                let (_sessions, branch_messages, tree, leaf_id) = build_session_ctx(
+                    &session,
                 ).await;
 
                 let ctx = ReplCtx {
@@ -1920,7 +1910,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .as_ref()
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
-                    sessions,
+                    repo: repo.clone(),
                     current_session_id: current_session_id.clone(),
                     branch_messages,
                     tree,
