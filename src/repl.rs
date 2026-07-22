@@ -468,7 +468,7 @@ impl ActiveOverlay {
                 let filtered: Vec<ValueCandidate> = if filter.is_empty() {
                     cands
                 } else {
-                    crate::fuzzy::fuzzy_filter(&cands, &filter, |c| c.display.clone())
+                    crate::fuzzy::fuzzy_filter_bonus(&cands, &filter, |c| c.display.clone())
                         .into_iter()
                         .map(|r| r.item.clone())
                         .collect()
@@ -560,7 +560,23 @@ impl ActiveOverlay {
                     }
                 }
 
-                let filtered = Repl::filtered_sessions(ctx, &filter);
+                // When the filter is `<name> <action>` with a known action, strip
+                // the action and show the action menu for that session.
+                let lookup_filter = if !filter.is_empty() {
+                    let (name_part, after) = crate::agent::parse_session_name_after(&filter);
+                    let known_action = after.split_once(char::is_whitespace)
+                        .map(|(a, _)| a)
+                        .unwrap_or(&after);
+                    if !name_part.is_empty() && matches!(known_action, "resume" | "fork" | "rename" | "delete") {
+                        name_part
+                    } else {
+                        filter.clone()
+                    }
+                } else {
+                    filter.clone()
+                };
+
+                let filtered = Repl::filtered_sessions(ctx, &lookup_filter);
                 // When a filter is typed and resolves to exactly one session,
                 // jump straight to that session's action menu.
                 if !filter.is_empty() && filtered.len() == 1 {
@@ -959,14 +975,24 @@ impl ActiveOverlay {
                 // Fill the chosen action into the buffer (stay in input).
                 if let Some(label) = opts.get(sel) {
                     let action_str = match label.as_str() {
-                        "resume" => "resume",
+                        _ if label.starts_with("resume") => "resume",
                         "fork" => "fork",
                         "rename" => "rename ",
                         "delete" => "delete",
                         _ => "",
                     };
                     if !action_str.is_empty() {
-                        editor.set(&format!("/session {} {}", session_name, action_str));
+                        // Preserve any argument already typed after the action
+                        // (e.g. "10l" in "/session <id> resume 10l").
+                        let buf = editor.text();
+                        let rest = &buf["/session".len()..].trim();
+                        let (_name, after_name) = crate::agent::parse_session_name_after(rest);
+                        let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
+                        if trailing.is_empty() {
+                            editor.set(&format!("/session {} {}", session_name, action_str));
+                        } else {
+                            editor.set(&format!("/session {} {} {}", session_name, action_str.trim(), trailing));
+                        }
                     }
                 }
             }
@@ -1211,8 +1237,17 @@ impl ActiveOverlay {
             ActiveOverlay::SessionAction { session_name, is_current, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
                     match label.as_str() {
-                        "resume" => {
-                            let line = format!("/session {} resume", session_name);
+                        _ if label.starts_with("resume") => {
+                            // Preserve any argument already typed after the action (e.g. "10l").
+                            let buf = editor.text();
+                            let rest = &buf["/session".len()..].trim();
+                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
+                            let after_action = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
+                            let line = if after_action.is_empty() {
+                                format!("/session {} resume", session_name)
+                            } else {
+                                format!("/session {} resume {}", session_name, after_action)
+                            };
                             Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
                             OverlayAction::Action(InputAction::Submit(line))
                         }
@@ -2117,7 +2152,7 @@ impl Repl {
         if vq.trim().is_empty() {
             cands
         } else {
-            crate::fuzzy::fuzzy_filter(&cands, vq, |c| c.display.clone())
+            crate::fuzzy::fuzzy_filter_bonus(&cands, vq, |c| c.display.clone())
                 .into_iter()
                 .map(|r| r.item.clone())
                 .collect()
@@ -2348,7 +2383,7 @@ impl Repl {
         if filter.trim().is_empty() {
             all.to_vec()
         } else {
-            crate::fuzzy::fuzzy_filter(&all, filter, |l| l.as_str().to_string())
+            crate::fuzzy::fuzzy_filter_bonus(&all, filter, |l| l.as_str().to_string())
                 .into_iter()
                 .map(|r| *r.item)
                 .collect()
@@ -2387,7 +2422,7 @@ impl Repl {
         let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
             sorted.iter().collect()
         } else {
-            crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+            crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
                 let name = m.name.as_deref().unwrap_or("");
                 let preview = m.first_prompt_preview.as_deref().unwrap_or("");
                 format!("{} {} {} {}", name, preview, m.id, m.cwd)
@@ -2564,8 +2599,9 @@ impl Repl {
         }
 
         // Actions (always shown; resume conditionally absent).
+        // Labels carry a hint about the optional [N[t|l]] syntax for resume.
         if !is_current {
-            opts.push("resume [N[t|l]]".into());
+            opts.push("resume  [N[t|l] replay length]".into());
         }
         opts.push("fork".into());
         opts.push("rename".into());
@@ -2592,7 +2628,7 @@ impl Repl {
         }
 
         // Fuzzy-filter by name, prompt preview, id, and cwd.
-        crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+        crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
             let name = m.name.as_deref().unwrap_or("");
             let preview = m.first_prompt_preview.as_deref().unwrap_or("");
             format!("{} {} {} {}", name, preview, m.id, m.cwd)

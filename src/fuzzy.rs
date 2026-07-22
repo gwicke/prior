@@ -16,10 +16,33 @@ pub struct Ranked<'a, T> {
 /// `to_text` extracts the searchable text for each item. An empty/whitespace
 /// query returns all items in their original order (score 0). Results are sorted
 /// best-first (descending score).
+///
+/// When `bonus_prefix` is true, items whose search text starts with the query
+/// receive a score bonus large enough to always rank them above subsequence-only
+/// matches.
 pub fn fuzzy_filter<'a, T>(
     items: &'a [T],
     query: &str,
     to_text: impl Fn(&T) -> String,
+) -> Vec<Ranked<'a, T>> {
+    fuzzy_filter_impl(items, query, to_text, false)
+}
+
+/// Like [`fuzzy_filter`] but adds a large bonus to items whose text starts
+/// with the query, ensuring strict prefix matches always rank first.
+pub fn fuzzy_filter_bonus<'a, T>(
+    items: &'a [T],
+    query: &str,
+    to_text: impl Fn(&T) -> String,
+) -> Vec<Ranked<'a, T>> {
+    fuzzy_filter_impl(items, query, to_text, true)
+}
+
+fn fuzzy_filter_impl<'a, T>(
+    items: &'a [T],
+    query: &str,
+    to_text: impl Fn(&T) -> String,
+    bonus_prefix: bool,
 ) -> Vec<Ranked<'a, T>> {
     if query.trim().is_empty() {
         return items
@@ -31,9 +54,20 @@ pub fn fuzzy_filter<'a, T>(
     let mut scored: Vec<(i64, &'a T)> = items
         .iter()
         .filter_map(|item| {
-            matcher
-                .fuzzy_match(&to_text(item), query)
-                .map(|score| (score, item))
+            let text = to_text(item);
+            let base_score = matcher.fuzzy_match(&text, query)?;
+            let ql = query.to_lowercase();
+            let score = if bonus_prefix && text.split_whitespace()
+                .next()
+                .map(|first| first.trim_start_matches('/').to_lowercase().starts_with(&ql))
+                .unwrap_or(false)
+            {
+                // Large enough that any prefix match beats any subsequence-only match
+                base_score + 10_000
+            } else {
+                base_score
+            };
+            Some((score, item))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
