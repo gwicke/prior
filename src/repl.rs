@@ -1128,7 +1128,10 @@ impl ActiveOverlay {
             ActiveOverlay::Tree { targets, .. } => {
                 if let Some(target_id) = targets.get(sel) {
                     let line = format!("/tree {}", target_id);
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    // Silent navigation: clear overlay and editor without
+                    // echoing the command to the output.
+                    redraw(&LineEditor::new(), &[], sel, input_row);
+                    editor.set("");
                     return OverlayAction::Action(InputAction::Submit(line));
                 }
                 OverlayAction::Continue
@@ -2454,13 +2457,13 @@ impl Repl {
             let is_last_child = i == nodes.len() - 1;
 
             // Build tree-drawing prefix. The root level shows no connector;
-            // children use ├─ or └─.
+            // children use ├─ or └─. Indent = 2 per branching level.
             let connector = if indent > 0 {
                 if is_last_child { "└─ " } else { "├─ " }
             } else {
                 "  "
             };
-            let prefix = " ".repeat(indent.saturating_sub(2)) + connector;
+            let prefix = " ".repeat(indent) + connector;
 
             // Build the entry display label.
             let label = Self::entry_display_label(&node.entry, node.label.as_deref());
@@ -2468,8 +2471,10 @@ impl Repl {
             // Skip entries whose display label is empty (meta entries).
             if label.is_empty() {
                 // Still recurse into children so the tree isn't broken.
+                // Children appear at the same indent (meta entry takes no
+                // visual space).
                 Self::flatten_tree_rows(
-                    &node.children, indent + 2, is_last_child,
+                    &node.children, indent, is_last_child,
                     leaf_id, active_path, rows, targets,
                 );
                 continue;
@@ -2488,9 +2493,16 @@ impl Repl {
             rows.push(row);
             targets.push(node.entry.id.clone());
 
-            // Recurse into children with increased indent.
+            // Only increase indent when the node actually branches
+            // (multiple children). A single-child linear chain stays flat.
+            let child_indent = if node.children.len() > 1 {
+                indent + 2
+            } else {
+                indent
+            };
+            // Recurse into children with the computed indent.
             Self::flatten_tree_rows(
-                &node.children, indent + 2, is_last_child,
+                &node.children, child_indent, is_last_child,
                 leaf_id, active_path, rows, targets,
             );
         }
@@ -2509,13 +2521,45 @@ impl Repl {
                         Self::sanitise_single_line(text)
                     }
                     Some("assistant") => {
-                        let text = message.pointer("/content/0/text")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if text.is_empty() {
-                            "(assistant)".into()
+                        // Parse content blocks: skip reasoning, show tool calls
+                        // or text. Matches the live render's get_preview format.
+                        let content_arr = message.get("content").and_then(|c| c.as_array());
+                        let mut text = String::new();
+                        let mut tool_call_label: Option<String> = None;
+                        if let Some(arr) = content_arr {
+                            for item in arr {
+                                match item.get("type").and_then(|t| t.as_str()) {
+                                    Some("text") => {
+                                        if text.is_empty() {
+                                            text = item.get("text")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                        }
+                                    }
+                                    Some("toolCall") => {
+                                        if tool_call_label.is_none() {
+                                            let name = item.get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("tool");
+                                            let args = item.get("arguments");
+                                            tool_call_label = Some(
+                                                Self::tool_preview_label(name, args)
+                                            );
+                                        }
+                                    }
+                                    // Skip thinking/reasoning blocks
+                                    _ => {}
+                                }
+                            }
+                        }
+                        // Prefer tool call label; fall back to text.
+                        if let Some(label) = tool_call_label {
+                            label
+                        } else if !text.is_empty() {
+                            Self::sanitise_single_line(&text)
                         } else {
-                            Self::sanitise_single_line(text)
+                            "(assistant)".into()
                         }
                     }
                     Some("toolResult") => "(tool result)".into(),
@@ -2558,6 +2602,71 @@ impl Repl {
             }
         }
         body
+    }
+
+    /// Format a tool call preview for the tree overlay, matching the live
+    /// render's `get_preview` style from `output.rs`.
+    fn tool_preview_label(name: &str, args: Option<&serde_json::Value>) -> String {
+        use serde_json::Value;
+        let get_str = |key: &str| {
+            args.and_then(|a| a.as_object())
+                .and_then(|o| o.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        let get_u64 = |key: &str| {
+            args.and_then(|a| a.as_object())
+                .and_then(|o| o.get(key))
+                .and_then(|v| v.as_u64())
+        };
+        match name {
+            "read_file" => {
+                let path = get_str("path").unwrap_or_default();
+                let offset = get_u64("offset").unwrap_or(0);
+                let limit = get_u64("limit").unwrap_or(0);
+                let mut s = format!("read {}", path);
+                if limit > 0 {
+                    s.push_str(&format!(" [{}..{}]", offset + 1, offset + limit));
+                } else if offset > 0 {
+                    s.push_str(&format!(" [{}..]", offset + 1));
+                }
+                s
+            }
+            "bash" => {
+                let cmd = get_str("cmd").unwrap_or_default();
+                format!("$ {}", cmd.trim())
+            }
+            s if s.starts_with("grep") => {
+                let pat = get_str("pat").or_else(|| get_str("pattern")).unwrap_or_default();
+                let path = get_str("path").unwrap_or_default();
+                format!("grep {} {}", pat, path)
+            }
+            s if s.starts_with("list") => {
+                let path = get_str("path").unwrap_or_default();
+                format!("ls {}", path)
+            }
+            "edit_file" => {
+                let path = get_str("path").unwrap_or_default();
+                format!("edit {}", path)
+            }
+            _ => {
+                let first = args
+                    .and_then(|a| a.as_object())
+                    .and_then(|o| o.values().next())
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    })
+                    .unwrap_or_default();
+                if first.len() > 50 {
+                    format!("{} {}...", name, &first[..47])
+                } else if first.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{} {}", name, first.replace('\n', " "))
+                }
+            }
+        }
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.
