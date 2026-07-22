@@ -2540,7 +2540,7 @@ impl Repl {
 
         // Actions (always shown; resume conditionally absent).
         if !is_current {
-            opts.push("resume".into());
+            opts.push("resume [N[t|l]]".into());
         }
         opts.push("fork".into());
         opts.push("rename".into());
