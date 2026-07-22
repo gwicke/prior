@@ -275,6 +275,8 @@ pub struct SessionMeta {
     pub cwd: String,
     pub parent_session: Option<String>,
     pub message_count: usize,
+    /// A short preview of the first user message in the session.
+    pub first_prompt_preview: Option<String>,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -1048,6 +1050,14 @@ impl ActiveOverlay {
                 OverlayAction::Continue
             }
             ActiveOverlay::Session { names, .. } => {
+                if names.is_empty() {
+                    // No sessions match the filter (e.g. `/session <name> rename newname`
+                    // after the action menu selected "rename"). Submit the buffer so the
+                    // command reaches `handle_session_command` instead of doing nothing.
+                    let line = editor.text();
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    return OverlayAction::Action(InputAction::Submit(line));
+                }
                 // Selecting a session completes its name; the next loop
                 // iteration promotes the buffer to the action menu (kind 11).
                 if let Some(name) = names.get(sel) {
@@ -2111,7 +2121,7 @@ impl Repl {
     ///
     /// Shows all sessions for the current CWD, filtered by `filter`.
     /// Current session is marked with ◉ and sorted first.
-    /// Named sessions show their name; unnamed show timestamp + cwd.
+    /// Each row shows: marker · session name (with first-prompt preview) · turns + relative age.
     fn session_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
@@ -2119,9 +2129,9 @@ impl Repl {
         active: &mut Option<usize>,
     ) {
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Session", "Turns"])
+        let mut table = Table::new(&["", "Session", ""])
             .with_aligns(&[Align::Left, Align::Left, Align::Right])
-            .with_min_widths(&[2, 30, 6])
+            .with_min_widths(&[2, 30, 10])
             .with_priorities(&[0, 2, 1])
             .set_gap(2);
 
@@ -2155,17 +2165,29 @@ impl Repl {
 
         for meta in &filtered {
             let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
-            let display_name = meta.name.clone().unwrap_or_else(|| {
-                // Show a shortened representation: timestamp + cwd tail
-                let ts = Self::format_session_timestamp(&meta.timestamp);
-                let cwd_tail = meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd);
-                format!("{}  {}", ts, cwd_tail)
-            });
-            let turns = format!("{}", meta.message_count);
-            table.add_row(&[marker, &display_name, &turns]);
+            // Build the session display: name + separator + first prompt preview.
+            // The preview is sanitised to a single line (newlines → space,
+            // multiple spaces collapsed) so the table cell never wraps.
+            let name_part = meta.name.clone().unwrap_or_default();
+            let raw_preview = meta.first_prompt_preview.as_deref().unwrap_or("");
+            let preview = Self::sanitise_single_line(raw_preview);
+            let display_name = if !name_part.is_empty() && !preview.is_empty() {
+                format!("{}: {}", name_part, preview)
+            } else if !name_part.is_empty() {
+                name_part
+            } else if !preview.is_empty() {
+                preview
+            } else {
+                // Fallback: just show cwd tail
+                meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd).to_string()
+            };
+            // Right-side info: turns + relative age
+            let rel = Self::relative_time(&meta.timestamp);
+            let info = format!("{}  {}", meta.message_count, rel);
+            table.add_row(&[marker, &display_name, &info]);
         }
 
-        for row in table.render_multiline(avail) {
+        for row in table.render(avail) {
             opts.push(row);
         }
 
@@ -2204,6 +2226,52 @@ impl Repl {
         };
 
         format!("{} {}", day_label, time_part)
+    }
+
+    /// Format a timestamp as a compact relative duration: "30s", "4m", "5h", "2d".
+    fn relative_time(ts: &str) -> String {
+        let dt = chrono::DateTime::parse_from_rfc3339(ts)
+            .or_else(|_| {
+                // Try UTC-only format: "2025-01-01T14:32:00.000Z" without offset
+                chrono::DateTime::parse_from_str(
+                    &format!("{}Z", ts.trim_end_matches('Z')),
+                    "%+",
+                )
+            });
+        let Ok(dt) = dt else { return "?".to_string() };
+        let elapsed = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
+        let secs = elapsed.num_seconds().max(0);
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            format!("{}m", secs / 60)
+        } else if secs < 86400 {
+            format!("{}h", secs / 3600)
+        } else {
+            format!("{}d", secs / 86400)
+        }
+    }
+
+    /// Collapse a string to a single visual line: replace any whitespace-run
+    /// (including newlines, tabs, etc.) with a single space, so it fits cleanly
+    /// in a one-line table cell.
+    fn sanitise_single_line(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_space = false;
+        for c in s.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                out.push(c);
+                prev_space = false;
+            }
+        }
+        // Trim leading/trailing whitespace that was collapsed.
+        let trimmed = out.trim().to_string();
+        if trimmed.is_empty() { String::new() } else { trimmed }
     }
 
     /// Build the per-session action menu overlay (kind 11).

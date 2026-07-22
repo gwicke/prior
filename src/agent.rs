@@ -1117,6 +1117,7 @@ async fn build_session_ctx(
                 cwd: m.cwd,
                 parent_session: m.parent_session.map(|p| p.display().to_string()),
                 message_count: m.message_count,
+                first_prompt_preview: m.first_prompt_preview,
             })
             .collect()
     } else {

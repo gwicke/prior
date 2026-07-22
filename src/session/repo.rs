@@ -88,22 +88,52 @@ impl JsonlSessionRepo {
         let first_line = content.lines().next()?;
         let header: SessionHeader = serde_json::from_str(first_line).ok()?;
 
-        // Count message entries by scanning for the "type":"message" pattern.
-        // This is a cheap heuristic — we don't parse every line.
-        let message_count = content
-            .lines()
-            .filter(|l| l.contains("\"type\":\"message\""))
-            .count();
+        // Count message entries, extract the first user prompt, and track name.
+        let mut message_count = 0usize;
+        let mut first_prompt_preview = None::<String>;
+        let mut name: Option<String> = None;
+
+        for line in content.lines().skip(1) {
+            if line.contains("\"type\":\"message\"") {
+                message_count += 1;
+                // Capture the first user message text.
+                if first_prompt_preview.is_none() && line.contains("\"role\":\"user\"") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        let text = val
+                            .pointer("/message/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        // No artificial cap — the overlay table's fit()/ellipsis
+                        // mechanism limits the display length at render time
+                        // so the preview can fill the entire cell width.
+                        let preview: String = text.chars().collect();
+                        if !preview.is_empty() {
+                            first_prompt_preview = Some(preview);
+                        }
+                    }
+                }
+            } else if line.contains("\"type\":\"session_info\"") {
+                // Extract the name from the most recent SessionInfo entry.
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
+                        if !n.is_empty() {
+                            name = Some(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         Some(SessionMetadata {
             id: header.id,
             timestamp: header.timestamp,
             cwd: header.cwd,
             path: path.to_path_buf(),
-            name: None,
+            name,
             parent_session: header.parent_session,
             message_count,
             token_count: None,
+            first_prompt_preview,
         })
     }
 }

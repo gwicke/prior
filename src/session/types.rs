@@ -237,6 +237,8 @@ pub struct SessionMetadata {
     pub message_count: usize,
     /// Total token count (from usage on the leaf branch, if tracked).
     pub token_count: Option<u64>,
+    /// A short preview of the first user message in the session.
+    pub first_prompt_preview: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
