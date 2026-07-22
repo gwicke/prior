@@ -242,6 +242,8 @@ pub enum InputAction {
     Quit,
     /// Sandbox operation: (subcommand, path, sandbox_path).
     Sandbox(String, String, String),
+    /// Navigate the session tree to a target entry.
+    NavigateTree(String),
 }
 
 /// Context the REPL needs to render slash overlays and to re-emit recent
@@ -1127,12 +1129,8 @@ impl ActiveOverlay {
             }
             ActiveOverlay::Tree { targets, .. } => {
                 if let Some(target_id) = targets.get(sel) {
-                    let line = format!("/tree {}", target_id);
-                    // Silent navigation: clear overlay and editor without
-                    // echoing the command to the output.
-                    redraw(&LineEditor::new(), &[], sel, input_row);
                     editor.set("");
-                    return OverlayAction::Action(InputAction::Submit(line));
+                    return OverlayAction::Action(InputAction::NavigateTree(target_id.clone()));
                 }
                 OverlayAction::Continue
             }

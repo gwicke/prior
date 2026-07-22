@@ -1966,6 +1966,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
             }
+            InputAction::NavigateTree(target_id) => {
+                if let Some(ref s) = session {
+                    let old_leaf_id = s.get_leaf_id().await;
+                    if old_leaf_id.as_deref() == Some(target_id.as_str()) {
+                        continue;
+                    }
+                    let _ = s.move_leaf(Some(target_id.clone())).await;
+                    config.output.display_plain(&format!(
+                        "/tree navigated ({})",
+                        &target_id[..target_id.len().min(8)],
+                    ));
+                }
+            }
             InputAction::Submit(input) => {
                 if input.is_empty() {
                     continue;
