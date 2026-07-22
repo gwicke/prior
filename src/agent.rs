@@ -1717,6 +1717,51 @@ pub(crate) async fn ensure_session(
     }
 }
 
+/// Load the list of recently-used model IDs from `recent_models.txt`.
+/// Returns an empty vec if the file doesn't exist or can't be read.
+fn load_recent_models() -> Vec<String> {
+    let path = match crate::platform::recent_models_path() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Atomically write the list of recently-used model IDs to `recent_models.txt`.
+/// Writes to a temp file in the same directory, then renames (atomic on POSIX).
+fn save_recent_models(models: &[String]) {
+    let path = match crate::platform::recent_models_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let dir = match path.parent() {
+        Some(d) => d,
+        None => return,
+    };
+    // Build the content as one model id per line.
+    let content = models.join("\n") + "\n";
+    // Write to a temporary file in the same directory, then atomically rename.
+    let tmp_name = format!(".recent_models.tmp.{}", std::process::id());
+    let tmp_path = dir.join(&tmp_name);
+    match std::fs::write(&tmp_path, &content) {
+        Ok(()) => {
+            let _ = std::fs::rename(&tmp_path, &path);
+        }
+        Err(_) => {
+            // Best-effort cleanup on write failure.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+}
+
 /// Interactive chat loop. Owns the `Box<dyn PicoAgent>` and the `AgentConfig`
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
@@ -1791,7 +1836,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
         .unwrap_or_default();
 
     let mut line_history = crate::repl::History::load();
-    let mut recent_models: Vec<String> = Vec::new();
+    let mut recent_models: Vec<String> = load_recent_models();
+    // Also seed the model switch from the configured default model so it
+    // appears in the recent list on first run (if present and available).
+    let default_seed = format!("{}:{}", config.provider, config.model);
+    if !recent_models.contains(&default_seed) {
+        recent_models.push(default_seed.clone());
+    }
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
     // current request.
@@ -1859,7 +1910,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     Ok(new_agent) => {
                         agent = Some(new_agent);
                         config = new_cfg;
-                        recent_models.push(format!("{}:{}", config.provider, config.model));
+                        let model_id = format!("{}:{}", config.provider, config.model);
+                        // Push to front, remove duplicates from lower down.
+                        recent_models.retain(|m| m != &model_id);
+                        recent_models.insert(0, model_id);
+                        save_recent_models(&recent_models);
                         // Log model change to session.
                         if let Some(ref s) = session {
                             let _ = s.append_model_change(&config.provider, &config.model).await;

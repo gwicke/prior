@@ -2247,18 +2247,43 @@ impl Repl {
         ctx: &ReplCtx,
         filter: &str,
     ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
-        let mut entries = model_catalog::catalog_cached();
+        let entries = model_catalog::catalog_cached();
         let active_id = Self::active_entry_id(&entries, &ctx.provider, &ctx.model);
-        entries.sort_by(|a, b| {
-            Self::model_rank(&a.id, &active_id, &ctx.recent)
-                .cmp(&Self::model_rank(&b.id, &active_id, &ctx.recent))
-                .then_with(|| a.display.cmp(&b.display))
-        });
         let filtered: Vec<model_catalog::ModelEntry> = if filter.trim().is_empty() {
-            entries
+            // No filter: show the top 10 most recently used (available) models
+            // first, then the rest of the catalog alphabetically.
+            let mut seen = std::collections::HashSet::new();
+            let mut recent_shown = Vec::new();
+            for recent_id in &ctx.recent {
+                if recent_shown.len() >= 10 {
+                    break;
+                }
+                // Find the catalog entry that best matches this recent id.
+                // Prefer a Direct entry over an OpenRouter entry when both exist.
+                if let Some(e) = entries.iter().find(|e| e.id == *recent_id && model_catalog::provider_available(&e.provider)) {
+                    if seen.insert(e.id.clone()) {
+                        recent_shown.push(e.clone());
+                    }
+                }
+            }
+            // Sort remaining entries alphabetically.
+            let mut rest: Vec<model_catalog::ModelEntry> = entries
+                .into_iter()
+                .filter(|e| !seen.contains(&e.id))
+                .collect();
+            rest.sort_by(|a, b| a.display.cmp(&b.display));
+            recent_shown.extend(rest);
+            recent_shown
         } else {
+            // With filter: fuzzy-match across all catalog entries (current behaviour).
+            let mut sorted: Vec<model_catalog::ModelEntry> = entries;
+            sorted.sort_by(|a, b| {
+                Self::model_rank(&a.id, &active_id, &ctx.recent)
+                    .cmp(&Self::model_rank(&b.id, &active_id, &ctx.recent))
+                    .then_with(|| a.display.cmp(&b.display))
+            });
             crate::fuzzy::fuzzy_filter(
-                &entries,
+                &sorted,
                 filter,
                 // Searchable text leads with the `provider:model` display (so a
                 // `provider:model` query matches directly) and also includes the

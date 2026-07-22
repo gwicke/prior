@@ -3,6 +3,7 @@ name = "picocode"
 version = "0.6.0"
 authors = ["Dotan Nahum <dotan@rng0.io>"]
 edition = "2021"
+default-run = "picocode"
 description = "The tiny, high-performance Rust coding agent that speaks every LLM."
 license = "MIT"
 repository = "https://github.com/jondot/picocode"

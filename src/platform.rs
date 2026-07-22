@@ -43,6 +43,12 @@ pub fn config_path() -> Option<PathBuf> {
     app_config_dir().map(|d| d.join("settings.toml"))
 }
 
+/// Recently-used models file: `<app_dir>/recent_models.txt`.
+/// One `provider:model` per line, most recent first.
+pub fn recent_models_path() -> Option<PathBuf> {
+    app_config_dir().map(|d| d.join("recent_models.txt"))
+}
+
 /// Resolve the config file path actually used at runtime.
 ///
 /// An explicit `--config` argument always wins. Otherwise the platform config
