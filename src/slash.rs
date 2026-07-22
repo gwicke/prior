@@ -14,6 +14,7 @@ pub enum SlashKind {
     Quit,
     Sandbox,
     Session,
+    Tree,
 }
 
 /// A registered slash command.
@@ -71,6 +72,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/session",
             help: "List, rename, resume, fork, or delete sessions",
             kind: SlashKind::Session,
+        },
+        SlashCommand {
+            name: "/tree",
+            help: "Navigate session history — select a point to continue from",
+            kind: SlashKind::Tree,
         },
     ];
     COMMANDS
@@ -152,8 +158,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_nine_commands() {
-        assert_eq!(registry().len(), 9);
+    fn registry_has_ten_commands() {
+        assert_eq!(registry().len(), 10);
     }
 
     #[test]
@@ -180,7 +186,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 9);
+        assert_eq!(r.len(), 10);
     }
 
     #[test]

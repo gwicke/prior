@@ -1096,14 +1096,18 @@ fn guard<T: Tool>(
     }
 }
 
-/// Build session context data for the `/session` overlay.
+/// Build session context data for the REPL overlays.
 ///
-/// Returns (sessions list, branch message previews).
-/// The current session id is passed in directly (avoids blocking_lock in async context).
+/// Returns `(sessions list, branch message previews, session tree, leaf_id)`.
 async fn build_session_ctx(
     session: &Option<Session>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
-) -> (Vec<crate::repl::SessionMeta>, Vec<(String, String)>) {
+) -> (
+    Vec<crate::repl::SessionMeta>,
+    Vec<(String, String)>,
+    Vec<crate::session::SessionTreeNode>,
+    Option<String>,
+) {
     let sessions = if let Some(repo) = repo {
         let cwd = std::env::current_dir().ok();
         repo.list(cwd.as_deref())
@@ -1146,7 +1150,12 @@ async fn build_session_ctx(
         Vec::new()
     };
 
-    (sessions, branch_messages)
+    let (tree, leaf_id) = match session {
+        Some(s) => (s.get_tree().await, s.get_leaf_id().await),
+        None => (Vec::new(), None),
+    };
+
+    (sessions, branch_messages, tree, leaf_id)
 }
 
 /// Result of handling a `/session` command.
@@ -1731,8 +1740,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
             Some(r) => {
                 config.output.display_separator();
 
-                // Build session list for the /session overlay.
-                let (sessions, branch_messages) = build_session_ctx(
+                // Build session context data for REPL overlays.
+                let (sessions, branch_messages, tree, leaf_id) = build_session_ctx(
                     &session, &repo,
                 ).await;
 
@@ -1750,6 +1759,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     sessions,
                     current_session_id: current_session_id.clone(),
                     branch_messages,
+                    tree,
+                    leaf_id,
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }

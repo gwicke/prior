@@ -19,6 +19,7 @@ use crate::slash;
 use crate::thinking;
 use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
+use crate::session::{SessionTreeNode, SessionEntry, SessionEntryContent};
 use crate::agent::SessionUsage;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
@@ -264,6 +265,10 @@ pub struct ReplCtx {
     /// Branch messages for the fork picker: (entry_id, preview_text) pairs
     /// for user messages in the current session's branch.
     pub branch_messages: Vec<(String, String)>,
+    /// Pre-built session entry tree (empty if no session), used by `/tree`.
+    pub tree: Vec<SessionTreeNode>,
+    /// Current leaf entry ID (for highlighting in the tree).
+    pub leaf_id: Option<String>,
 }
 
 /// Lightweight session metadata for the `/session` overlay.
@@ -374,6 +379,15 @@ pub(crate) enum ActiveOverlay {
         active: Option<usize>,
         _filter: String,
     },
+
+    /// `/tree` overlay: visual session entry tree.
+    Tree {
+        rows: Vec<String>,
+        /// Entry IDs, 1:1 with `rows`, for Enter resolution.
+        targets: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
+    },
 }
 
 impl ActiveOverlay {
@@ -406,7 +420,7 @@ impl ActiveOverlay {
             after,
             "" | "model" | "thinking" | "set"
                 | "persona" | "stat"
-                | "sandbox" | "session"
+                | "sandbox" | "session" | "tree"
         ) {
             (after, "")
         } else {
@@ -493,6 +507,15 @@ impl ActiveOverlay {
                         .collect();
                     ActiveOverlay::Session { opts, names, active, _filter: filter }
                 }
+            }
+            "tree" => {
+                let filter = rest.trim().to_string();
+                let mut rows = Vec::new();
+                let mut targets = Vec::new();
+                let mut active = None;
+                Repl::tree_overlay_entries(&ctx.tree, ctx.leaf_id.as_deref(), &filter,
+                    &mut rows, &mut targets, &mut active);
+                ActiveOverlay::Tree { rows, targets, active, _filter: filter }
             }
             _ => {
                 let cmds = slash::filter_commands(rest);
@@ -647,6 +670,10 @@ impl ActiveOverlay {
             ActiveOverlay::SessionAction { opts, active, .. } => {
                 ("Session actions  (up/down, Tab/Enter select, Esc back)",
                  opts.clone(), *active, false)
+            }
+            ActiveOverlay::Tree { rows, active, .. } => {
+                ("Tree  (up/down, Enter navigate, Esc back)",
+                 rows.clone(), *active, false)
             }
         }
     }
@@ -850,6 +877,9 @@ impl ActiveOverlay {
                     editor.set(&format!("/session {} {}", session_name, action));
                 }
             }
+            ActiveOverlay::Tree { .. } => {
+                // Tab on tree: no-op for now (future: copy entry text).
+            }
             _ => {}
         }
     }
@@ -887,6 +917,7 @@ impl ActiveOverlay {
                         slash::SlashKind::Stat => editor.set("/stat "),
                         slash::SlashKind::Sandbox => editor.set("/sandbox "),
                         slash::SlashKind::Session => editor.set("/session "),
+                        slash::SlashKind::Tree => editor.set("/tree "),
                     }
                 }
                 OverlayAction::Continue
@@ -1094,6 +1125,14 @@ impl ActiveOverlay {
                     }
                 }
             }
+            ActiveOverlay::Tree { targets, .. } => {
+                if let Some(target_id) = targets.get(sel) {
+                    let line = format!("/tree {}", target_id);
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    return OverlayAction::Action(InputAction::Submit(line));
+                }
+                OverlayAction::Continue
+            }
             _ => OverlayAction::Continue,
         }
     }
@@ -1139,6 +1178,9 @@ impl ActiveOverlay {
                 // Go back to the session list.
                 editor.set("/session ");
             }
+            ActiveOverlay::Tree { .. } => {
+                editor.set("");
+            }
             _ => {}
         }
     }
@@ -1159,6 +1201,7 @@ impl ActiveOverlay {
             ActiveOverlay::PathComplete { .. } => 10,
             ActiveOverlay::Session { .. } => 11,
             ActiveOverlay::SessionAction { .. } => 12,
+            ActiveOverlay::Tree { .. } => 13,
         }
     }
 
@@ -2344,6 +2387,179 @@ impl Repl {
         }).collect()
     }
 
+    // ── /tree overlay rendering ──────────────────────────────────────────
+
+    /// Build `/tree` overlay rows from a pre-built session tree.
+    fn tree_overlay_entries(
+        tree: &[SessionTreeNode],
+        leaf_id: Option<&str>,
+        filter: &str,
+        rows: &mut Vec<String>,
+        targets: &mut Vec<String>,
+        active: &mut Option<usize>,
+    ) {
+        if tree.is_empty() {
+            rows.push("(no session)".into());
+            return;
+        }
+
+        // Build active-path set by walking from leaf_id up through the tree.
+        // Since tree nodes lack parent pointers, we collect IDs from the leaf
+        // upward using a flat pass. (O(n) for the whole tree.)
+        let active_path: std::collections::HashSet<String> = leaf_id
+            .map(|lid| {
+                let mut path = std::collections::HashSet::new();
+                // Walk all roots looking for leaf_id; record ancestors as we go.
+                collect_active_path(tree, lid, &mut path);
+                path
+            })
+            .unwrap_or_default();
+
+        Self::flatten_tree_rows(tree, 0, false, leaf_id, &active_path, rows, targets);
+
+        // Apply text filter (fuzzy match on display rows).
+        if !filter.is_empty() {
+            let f = filter.to_lowercase();
+            let mut filtered_rows: Vec<String> = Vec::new();
+            let mut filtered_targets: Vec<String> = Vec::new();
+            for (i, row) in rows.iter().enumerate() {
+                if row.to_lowercase().contains(&f) {
+                    filtered_rows.push(row.clone());
+                    if let Some(t) = targets.get(i) {
+                        filtered_targets.push(t.clone());
+                    }
+                }
+            }
+            *rows = filtered_rows;
+            *targets = filtered_targets;
+        }
+
+        // Highlight current leaf.
+        if let Some(lid) = leaf_id {
+            *active = targets.iter().position(|t| t == lid);
+        }
+    }
+
+    /// Recursively flatten tree nodes into display rows with indentation.
+    fn flatten_tree_rows(
+        nodes: &[SessionTreeNode],
+        indent: usize,
+        _is_last_parent: bool,
+        leaf_id: Option<&str>,
+        active_path: &std::collections::HashSet<String>,
+        rows: &mut Vec<String>,
+        targets: &mut Vec<String>,
+    ) {
+        for (i, node) in nodes.iter().enumerate() {
+            let is_last_child = i == nodes.len() - 1;
+
+            // Build tree-drawing prefix. The root level shows no connector;
+            // children use ├─ or └─.
+            let connector = if indent > 0 {
+                if is_last_child { "└─ " } else { "├─ " }
+            } else {
+                "  "
+            };
+            let prefix = " ".repeat(indent.saturating_sub(2)) + connector;
+
+            // Build the entry display label.
+            let label = Self::entry_display_label(&node.entry, node.label.as_deref());
+
+            // Skip entries whose display label is empty (meta entries).
+            if label.is_empty() {
+                // Still recurse into children so the tree isn't broken.
+                Self::flatten_tree_rows(
+                    &node.children, indent + 2, is_last_child,
+                    leaf_id, active_path, rows, targets,
+                );
+                continue;
+            }
+
+            // Highlight active path and current leaf.
+            let is_on_active_path = active_path.contains(&node.entry.id);
+            let is_current = leaf_id == Some(node.entry.id.as_str());
+            let marker = if is_current { " ◉" } else { "" };
+            let row = if is_on_active_path {
+                format!("{}{}{}", prefix, label, marker)
+            } else {
+                format!("\x1b[2m{}{}{}\x1b[0m", prefix, label, marker)
+            };
+
+            rows.push(row);
+            targets.push(node.entry.id.clone());
+
+            // Recurse into children with increased indent.
+            Self::flatten_tree_rows(
+                &node.children, indent + 2, is_last_child,
+                leaf_id, active_path, rows, targets,
+            );
+        }
+    }
+
+    /// Build a display label for one tree entry.
+    /// Returns an empty string for meta entries that should be skipped.
+    fn entry_display_label(entry: &SessionEntry, _label: Option<&str>) -> String {
+        let body = match &entry.content {
+            SessionEntryContent::Message { message } => {
+                match message.get("role").and_then(|r| r.as_str()) {
+                    Some("user") => {
+                        let text = message.pointer("/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("(user)");
+                        Self::sanitise_single_line(text)
+                    }
+                    Some("assistant") => {
+                        let text = message.pointer("/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if text.is_empty() {
+                            "(assistant)".into()
+                        } else {
+                            Self::sanitise_single_line(text)
+                        }
+                    }
+                    Some("toolResult") => "(tool result)".into(),
+                    _ => "(unknown)".into(),
+                }
+            }
+            SessionEntryContent::ThinkingLevelChange { thinking_level } => {
+                format!("thinking: {}", thinking_level)
+            }
+            SessionEntryContent::ModelChange { provider, model_id } => {
+                format!("model: {}/{}", provider, model_id)
+            }
+            SessionEntryContent::ActiveToolsChange { .. } => String::new(),
+            SessionEntryContent::BranchSummary { summary, .. } => {
+                let s = Self::sanitise_single_line(summary);
+                if s.is_empty() { "[S] (branch summary)".into() } else { format!("[S] {}", s) }
+            }
+            SessionEntryContent::Compaction { summary, .. } => {
+                let s = Self::sanitise_single_line(summary);
+                if s.is_empty() { "[C] (compacted)".into() } else { format!("[C] {}", s) }
+            }
+            SessionEntryContent::Label { target_id, label } => {
+                let l = label.as_deref().unwrap_or("(label)");
+                format!("[L] {} -> {}", l, target_id)
+            }
+            // Meta entries: skip.
+            SessionEntryContent::SessionInfo { .. } => String::new(),
+            SessionEntryContent::Leaf { .. } => String::new(),
+            SessionEntryContent::Custom { custom_type, .. } => {
+                format!("custom: {}", custom_type)
+            }
+            SessionEntryContent::CustomMessage { custom_type, .. } => {
+                format!("custom msg: {}", custom_type)
+            }
+        };
+        // Prepend resolved label if this node has one from a Label entry.
+        if let Some(l) = _label {
+            if !body.is_empty() {
+                return format!("[{}] {}", l, body);
+            }
+        }
+        body
+    }
+
     /// Build the `/sandbox` overlay rows for `filter`.
     ///
     /// When `filter` is empty, shows the three sub-commands (add_ro, add_rw, remove).
@@ -3299,6 +3515,25 @@ fn cursor_positioning(layout: &Layout, prompt: &str) -> String {
         }
     }
     s
+}
+
+/// Recursively search the tree for `leaf_id` and collect all ancestor IDs
+/// (including the leaf itself) into `out`. Returns `true` if found in this
+/// subtree (short-circuits further searching).
+fn collect_active_path(
+    nodes: &[SessionTreeNode],
+    leaf_id: &str,
+    out: &mut std::collections::HashSet<String>,
+) -> bool {
+    for node in nodes {
+        if node.entry.id == leaf_id
+            || collect_active_path(&node.children, leaf_id, out)
+        {
+            out.insert(node.entry.id.clone());
+            return true;
+        }
+    }
+    false
 }
 
 /// `render_input` is only used by the unit tests below; gate it so the
