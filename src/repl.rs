@@ -515,9 +515,20 @@ impl ActiveOverlay {
                 let mut rows = Vec::new();
                 let mut targets = Vec::new();
                 let mut active = None;
-                Repl::tree_overlay_entries(&ctx.tree, ctx.leaf_id.as_deref(), &filter,
-                    &mut rows, &mut targets, &mut active);
-                ActiveOverlay::Tree { rows, targets, active, _filter: filter }
+                Repl::tree_overlay_entries(
+                    &ctx.tree,
+                    ctx.leaf_id.as_deref(),
+                    &filter,
+                    &mut rows,
+                    &mut targets,
+                    &mut active,
+                );
+                ActiveOverlay::Tree {
+                    rows,
+                    targets,
+                    active,
+                    _filter: filter,
+                }
             }
             _ => {
                 let cmds = slash::filter_commands(rest);
@@ -2391,6 +2402,7 @@ impl Repl {
     // ── /tree overlay rendering ──────────────────────────────────────────
 
     /// Build `/tree` overlay rows from a pre-built session tree.
+    /// Uses the same `Table` infrastructure as `/session` for consistent rendering.
     fn tree_overlay_entries(
         tree: &[SessionTreeNode],
         leaf_id: Option<&str>,
@@ -2405,103 +2417,93 @@ impl Repl {
         }
 
         // Build active-path set by walking from leaf_id up through the tree.
-        // Since tree nodes lack parent pointers, we collect IDs from the leaf
-        // upward using a flat pass. (O(n) for the whole tree.)
         let active_path: std::collections::HashSet<String> = leaf_id
             .map(|lid| {
                 let mut path = std::collections::HashSet::new();
-                // Walk all roots looking for leaf_id; record ancestors as we go.
                 collect_active_path(tree, lid, &mut path);
                 path
             })
             .unwrap_or_default();
 
-        Self::flatten_tree_rows(tree, 0, false, leaf_id, &active_path, rows, targets);
+        // Precompute flat entries: (indent, label, entry_id, is_on_active_path, is_current)
+        let mut flat: Vec<(usize, String, String, bool, bool)> = Vec::new();
+        Self::flatten_tree_nodes(tree, 0, leaf_id, &active_path, &mut flat);
 
-        // Apply text filter (fuzzy match on display rows).
+        // Apply text filter (fuzzy match on display labels).
         if !filter.is_empty() {
             let f = filter.to_lowercase();
-            let mut filtered_rows: Vec<String> = Vec::new();
-            let mut filtered_targets: Vec<String> = Vec::new();
-            for (i, row) in rows.iter().enumerate() {
-                if row.to_lowercase().contains(&f) {
-                    filtered_rows.push(row.clone());
-                    if let Some(t) = targets.get(i) {
-                        filtered_targets.push(t.clone());
-                    }
-                }
-            }
-            *rows = filtered_rows;
-            *targets = filtered_targets;
+            flat.retain(|(_, label, _, _, _)| label.to_lowercase().contains(&f));
         }
+
+        if flat.is_empty() {
+            rows.push("(no matches)".into());
+            return;
+        }
+
+        // Render via Table for column alignment like /session.
+        let avail = term_width().saturating_sub(2);
+        let mut table = Table::new(&["", "Entry"])
+            .with_aligns(&[Align::Left, Align::Left])
+            .with_min_widths(&[2, 20])
+            .with_priorities(&[0, 1])
+            .set_gap(1);
+
+        for (indent, label, entry_id, is_active, is_curr) in &flat {
+            let marker = if *is_curr { "◉" } else { " " };
+            let display = if *is_active {
+                format!("{:indent$}{}", "", label, indent = indent)
+            } else {
+                format!("\x1b[2m{:indent$}{}\x1b[0m", "", label, indent = indent)
+            };
+            table.add_row(&[marker, &display]);
+            targets.push(entry_id.clone());
+        }
+
+        *rows = table.render(avail);
 
         // Highlight current leaf.
         if let Some(lid) = leaf_id {
-            *active = targets.iter().position(|t| t == lid);
+            *active = flat.iter().position(|(_, _, id, _, _)| id == lid);
         }
     }
 
-    /// Recursively flatten tree nodes into display rows with indentation.
-    fn flatten_tree_rows(
+    /// Recursively flatten tree nodes into entries for table rendering.
+    /// `indent` is the number of leading spaces (0 = root, 2 = branch child, …).
+    /// Indent only increases at branching points (multiple children).
+    fn flatten_tree_nodes(
         nodes: &[SessionTreeNode],
         indent: usize,
-        _is_last_parent: bool,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
-        rows: &mut Vec<String>,
-        targets: &mut Vec<String>,
+        out: &mut Vec<(usize, String, String, bool, bool)>,
     ) {
-        for (i, node) in nodes.iter().enumerate() {
-            let is_last_child = i == nodes.len() - 1;
-
-            // Build tree-drawing prefix. The root level shows no connector;
-            // children use ├─ or └─. Indent = 2 per branching level.
-            let connector = if indent > 0 {
-                if is_last_child { "└─ " } else { "├─ " }
-            } else {
-                "  "
-            };
-            let prefix = " ".repeat(indent) + connector;
-
-            // Build the entry display label.
+        for node in nodes {
             let label = Self::entry_display_label(&node.entry, node.label.as_deref());
 
-            // Skip entries whose display label is empty (meta entries).
             if label.is_empty() {
-                // Still recurse into children so the tree isn't broken.
-                // Children appear at the same indent (meta entry takes no
-                // visual space).
-                Self::flatten_tree_rows(
-                    &node.children, indent, is_last_child,
-                    leaf_id, active_path, rows, targets,
+                // Meta entry: skip visual row but still descend.
+                let child_indent = if node.children.len() > 1 {
+                    indent + 2
+                } else {
+                    indent
+                };
+                Self::flatten_tree_nodes(
+                    &node.children, child_indent, leaf_id, active_path, out,
                 );
                 continue;
             }
 
-            // Highlight active path and current leaf.
-            let is_on_active_path = active_path.contains(&node.entry.id);
+            let is_active = active_path.contains(&node.entry.id);
             let is_current = leaf_id == Some(node.entry.id.as_str());
-            let marker = if is_current { " ◉" } else { "" };
-            let row = if is_on_active_path {
-                format!("{}{}{}", prefix, label, marker)
-            } else {
-                format!("\x1b[2m{}{}{}\x1b[0m", prefix, label, marker)
-            };
+            out.push((indent, label.clone(), node.entry.id.clone(), is_active, is_current));
 
-            rows.push(row);
-            targets.push(node.entry.id.clone());
-
-            // Only increase indent when the node actually branches
-            // (multiple children). A single-child linear chain stays flat.
             let child_indent = if node.children.len() > 1 {
                 indent + 2
             } else {
                 indent
             };
-            // Recurse into children with the computed indent.
-            Self::flatten_tree_rows(
-                &node.children, child_indent, is_last_child,
-                leaf_id, active_path, rows, targets,
+            Self::flatten_tree_nodes(
+                &node.children, child_indent, leaf_id, active_path, out,
             );
         }
     }
