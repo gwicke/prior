@@ -2165,8 +2165,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     if let Some(ref s) = session {
                         let arg = input["/replay".len()..].trim();
                         if arg.ends_with('l') {
-                            // Line-based limit: build markdown of the full session
-                            // content, tail the lines, and render via display_markdown.
+                            // Line-based limit: capture full replay (with full ANSI
+                            // rendering) via a Vec<u8> writer, then display only the
+                            // last N lines.
                             let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
                             if n > 0 {
                                 match s.build_context().await {
@@ -2175,36 +2176,25 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                         if turns.is_empty() {
                                             config.output.display_text("Session is empty");
                                         } else {
-                                            // Build a markdown string of the full session.
-                                            let mut md = String::new();
-                                            for turn in &turns {
-                                                md.push_str("## User\n\n");
-                                                md.push_str(&turn.user_text);
-                                                md.push_str("\n\n");
-                                                if !turn.segments.is_empty() {
-                                                    md.push_str("## Assistant\n\n");
-                                                    for seg in &turn.segments {
-                                                        for t in &seg.text {
-                                                            md.push_str(t);
-                                                            md.push('\n');
-                                                        }
-                                                        for t in &seg.thinking {
-                                                            md.push_str(&format!("> {}\n\n", t));
-                                                        }
-                                                        for (_, name, args) in &seg.tool_calls {
-                                                            md.push_str(&format!("**Tool Call:** `{}`\n\n```json\n{}\n```\n\n", name, args));
-                                                        }
-                                                        for (_, result) in &seg.tool_results {
-                                                            md.push_str(&format!("```\n{}\n```\n\n", result));
-                                                        }
-                                                    }
-                                                }
+                                            let total = turns.len();
+                                            // Capture full replay (full ANSI rendering)
+                                            // via writer swap.
+                                            config.output.begin_capture();
+                                            if total > 0 {
+                                                config.output.display_separator();
                                             }
-                                            let lines: Vec<&str> = md.lines().collect();
+                                            replay_recent_turns(&config.output, &ctx, total);
+                                            let bytes = config.output.end_capture();
+                                            let captured = String::from_utf8_lossy(&bytes);
+                                            let lines: Vec<&str> = captured.lines().collect();
                                             let start = lines.len().saturating_sub(n);
-                                            let tail_md = lines[start..].join("\n");
-                                            config.output.display_separator();
-                                            config.output.display_markdown(&tail_md);
+                                            use std::io::Write as _;
+                                            let stdout = std::io::stdout();
+                                            let mut handle = stdout.lock();
+                                            for line in &lines[start..] {
+                                                let _ = writeln!(handle, "{}", line);
+                                            }
+                                            let _ = handle.flush();
                                         }
                                     }
                                     Err(e) => {

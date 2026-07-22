@@ -97,6 +97,13 @@ pub trait Output: Send + Sync {
         limit: usize,
         persona: Option<&str>,
     );
+    /// Begin capturing rendered output into a byte buffer.  Returns `None`
+    /// for non-console implementations.  Must be paired with a subsequent
+    /// call to [`end_capture`] which returns the captured bytes.
+    fn begin_capture(&self) {}
+    /// End a previous [`begin_capture`] and return the captured bytes.
+    /// Returns an empty vec for non-console implementations.
+    fn end_capture(&self) -> Vec<u8> { Vec::new() }
     /// Print plain text with no decorative prefix (used for the startup
     /// hint/status line and REPL-originated confirmations). Advances the
     /// tracked cursor by the wrapped line count.
@@ -285,6 +292,10 @@ pub struct ConsoleOutput {
     /// Whether the current response is being rendered live (TTY) or buffered
     /// (non-TTY). Decided once per response in `begin_response`.
     live: Mutex<bool>,
+    /// The destination for rendered output.  Defaults to `std::io::stdout()`;
+    /// a `Vec<u8>` writer is used by the `/replay Nl` capture path so the
+    /// fully-rendered ANSI output can be tailed and re-printed.
+    writer: Mutex<Box<dyn io::Write + Send>>,
     /// Incremental GFM markdown parser for the current response (TTY only).
     /// Fed the streamed deltas; emits events for *completed* blocks so the
     /// renderer can print them once, avoiding whole-document re-renders.
@@ -327,6 +338,9 @@ pub struct ConsoleOutput {
     /// and pick a syntax-highlight language). The hook always fires a call
     /// immediately before its result, so this is safe to read on the result.
     last_tool: Mutex<Option<(String, Value)>>,
+    /// Stores the previous writer during a capture session (see
+    /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
+    saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -633,6 +647,7 @@ impl ConsoleOutput {
             reader_paused: Arc::new(AtomicBool::new(false)),
             text_buffer: Mutex::new(String::new()),
             live: Mutex::new(false),
+            writer: Mutex::new(Box::new(io::stdout())),
             parser: Mutex::new(StreamParser::new_gfm()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             thinking_parser: Mutex::new(StreamParser::new_gfm()),
@@ -643,13 +658,14 @@ impl ConsoleOutput {
             show_reasoning,
             last_was_tool: Mutex::new(false),
             last_tool: Mutex::new(None),
+            saved_writer: Mutex::new(None),
         }
     }
 
     /// Toggle the global dim SGR on stdout to match `on`, emitting the escape
     /// only when the state actually changes. Used so streamed thinking reads
     /// faded without re-rendering any already-emitted content.
-    fn ensure_dim(&self, on: bool, out: &mut io::Stdout) {
+    fn ensure_dim(&self, on: bool, out: &mut dyn io::Write) {
         let mut dim = self.dim_on.lock().unwrap();
         if *dim != on {
             let _ = if on {
@@ -695,12 +711,37 @@ impl ConsoleOutput {
             let mut trenderer = self.thinking_renderer.lock().unwrap();
             *trenderer = Renderer::new(Theme::dimmed(), term_width());
             *self.dim_on.lock().unwrap() = false;
-            println!();
+            let mut w = self.writer.lock().unwrap();
+            let _ = writeln!(w);
+            drop(w);
             self.note_lines(1);
             self.note_text();
         } else {
             *self.text_buffer.lock().unwrap() = String::new();
         }
+    }
+
+    /// Swap the output writer for a `Cursor<Vec<u8>>` capture buffer.
+    /// Call [`end_capture`] to restore the original writer and retrieve
+    /// the captured bytes.
+    fn begin_capture_inner(&self) {
+        let mut writer = self.writer.lock().unwrap();
+        let old = std::mem::replace(&mut *writer, Box::new(std::io::Cursor::new(Vec::new())));
+        *self.saved_writer.lock().unwrap() = Some(old);
+    }
+
+    /// End a capture session: restore the original writer and return the
+    /// captured bytes.
+    fn end_capture_inner(&self) -> Vec<u8> {
+        let mut writer = self.writer.lock().unwrap();
+        let saved = self.saved_writer.lock().unwrap().take();
+        let old = saved.expect("end_capture without begin_capture");
+        let current = std::mem::replace(&mut *writer, old);
+        // Safety: we know current is a Box<Cursor<Vec<u8>>> because
+        // begin_capture_inner always creates one.
+        let raw = Box::into_raw(current);
+        let cursor = unsafe { Box::from_raw(raw as *mut std::io::Cursor<Vec<u8>>) };
+        cursor.into_inner()
     }
 }
 
@@ -838,7 +879,7 @@ impl ConsoleOutput {
     /// *after* the answer parser, so the reasoning printed *below* the answer.
     /// The thinking *renderer* is kept so post-tool thinking reads as one
     /// continuous faded stream. See `doc/reasoning_order_opus.md` §4.
-    fn commit_thinking(&self, out: &mut io::Stdout) {
+    fn commit_thinking<W: io::Write>(&self, out: &mut W) {
         let events = {
             let mut tparser = self.thinking_parser.lock().unwrap();
             let events = tparser.flush();
@@ -864,12 +905,12 @@ impl ConsoleOutput {
         if buffer.is_empty() {
             return false;
         }
-        let mut out = std::io::stdout();
+        let mut out = self.writer.lock().unwrap();
         // Commit the (dimmed) thinking paragraph first, mirroring the
         // thinking→answer boundary handling in `stream_text`.
         let was_thinking = *self.dim_on.lock().unwrap();
         if was_thinking {
-            self.commit_thinking(&mut out);
+            self.commit_thinking(&mut *out);
         }
         // Turn off dimming and emit one blank line so the answer starts on a
         // fresh paragraph. The blank line MUST come *after* `ensure_dim(false)`
@@ -877,7 +918,7 @@ impl ConsoleOutput {
         // own, so a `\n` placed before the reset would be swallowed as the
         // block's closing newline instead of a blank separator. Ordering this
         // exactly like `stream_text`'s transition is what guarantees the gap.
-        self.ensure_dim(false, &mut out);
+        self.ensure_dim(false, &mut *out);
         // Blank line between reasoning and answer, written to `out` (the same
         // handle the reasoning/answer use) so it lands in the right place.
         let _ = out.write_all(b"\n");
@@ -890,16 +931,18 @@ impl ConsoleOutput {
         let mut events = local_parser.write(buffer.as_bytes());
         events.extend(local_parser.flush());
         let mut renderer = self.renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut out);
-        println!();
+        let _ = renderer.feed(&events, &mut *out);
+        let _ = writeln!(out);
         self.note_lines(1);
         self.note_text();
+        drop(out);
         true
     }
 
-    fn separator() {
+    fn separator(&self) {
         let width = term_width();
-        println!("{}", style("─".repeat(width)).dim());
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out, "{}", style("─".repeat(width)).dim());
     }
 
     /// Record that the most recent output block was ordinary text/answer (not a
@@ -944,7 +987,9 @@ impl ConsoleOutput {
             format!("{BG}"),
             format!("{}{}", " ".repeat(pad), RESET),
         );
-        println!("{}", row);
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out, "{}", row);
+        drop(out);
         self.note_lines(1);
         self.note_tool();
     }
@@ -1013,16 +1058,15 @@ impl Output for ConsoleOutput {
 
     fn display_plain(&self, text: &str) {
         self.stop_thinking();
-        // Count *visible* lines only; `text` may carry ANSI color escapes
-        // that must not be treated as visible width (or the cursor-row
-        // tracker over-advances and wraps to the top of the screen).
         let w = term_width();
         let n = if text.is_empty() {
             1
         } else {
             wrap(&strip_ansi(text), w).len().max(1)
         };
-        println!("{}", text);
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out, "{}", text);
+        drop(out);
         self.note_lines(n);
     }
 
@@ -1030,9 +1074,11 @@ impl Output for ConsoleOutput {
         self.stop_thinking();
         let color = std::io::stdout().is_terminal();
         let rendered = render_markdown(text, term_width(), color);
-        println!();
-        print!("{}", rendered);
-        println!();
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out);
+        let _ = write!(out, "{}", rendered);
+        let _ = writeln!(out);
+        drop(out);
         // +2 for the leading/trailing blank lines; the DSR query corrects drift.
         let n = rendered.lines().count().max(1) + 2;
         self.note_lines(n);
@@ -1040,10 +1086,12 @@ impl Output for ConsoleOutput {
 
     fn display_text(&self, text: &str) {
         self.stop_thinking();
-        println!();
-        print!("{} ", style("⏺").cyan());
-        termimad::print_inline(text);
-        println!();
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out);
+        let _ = write!(out, "{} ", style("⏺").cyan());
+        let _ = write!(out, "{}", termimad::inline(text));
+        let _ = writeln!(out);
+        drop(out);
         let n = wrap(text, term_width()).len() + 1;
         self.note_lines(n);
     }
@@ -1074,7 +1122,7 @@ impl Output for ConsoleOutput {
         // (code lines line-by-line, paragraphs on close), so there is no whole
         // document re-render, no in-place cursor gymnastics, and scrollback
         // stays clean.
-        let mut out = std::io::stdout();
+        let mut out = self.writer.lock().unwrap();
         let was_thinking = *self.dim_on.lock().unwrap();
         if was_thinking {
             // Thinking just ended: normalize the thinking→answer boundary to a
@@ -1082,8 +1130,8 @@ impl Output for ConsoleOutput {
             // is still on) and emit one blank line, so the answer starts on a
             // fresh paragraph regardless of whether a tool call intervened in
             // between (the tool path already prints its own gap).
-            self.commit_thinking(&mut out);
-            self.ensure_dim(false, &mut out);
+            self.commit_thinking(&mut *out);
+            self.ensure_dim(false, &mut *out);
             // Blank line between reasoning and answer, written to `out` so it
             // lands in the right place (a `println!` here can land in a
             // different write buffer and be lost).
@@ -1091,12 +1139,13 @@ impl Output for ConsoleOutput {
             self.note_lines(1);
             self.note_text();
         } else {
-            self.ensure_dim(false, &mut out);
+            self.ensure_dim(false, &mut *out);
         }
         let mut parser = self.parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
         let mut renderer = self.renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut out);
+        let _ = renderer.feed(&events, &mut *out);
+        drop(out);
     }
 
     fn stream_thinking(&self, delta: &str) {
@@ -1116,23 +1165,23 @@ impl Output for ConsoleOutput {
         // renderer using a faded theme whose `reset` re-applies the dim SGR,
         // so inline formatting (bold/code) does not clear the fading. The
         // initial dim is turned on once per run via `ensure_dim`.
-        let mut out = std::io::stdout();
-        self.ensure_dim(true, &mut out);
+        let mut out = self.writer.lock().unwrap();
+        self.ensure_dim(true, &mut *out);
         let mut parser = self.thinking_parser.lock().unwrap();
         let events = parser.write(delta.as_bytes());
         let mut renderer = self.thinking_renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut out);
+        let _ = renderer.feed(&events, &mut *out);
+        drop(out);
     }
 
     fn end_response_segment(&self) {
         self.stop_thinking();
         let live = *self.live.lock().unwrap();
         if live {
-            let mut out = std::io::stdout();
-            // Flush any answer held back while reasoning was streaming. When it
-            // flushes, it has already committed the thinking paragraph and
-            // printed the gap, so we skip that part below.
+            // Call flush_held_answer BEFORE locking the writer (it locks it
+            // internally).
             let flushed = self.flush_held_answer();
+            let mut out = self.writer.lock().unwrap();
             // Commit any open answer paragraph so the tool call/result prints
             // below, then start a *fresh* answer renderer for the next segment.
             // This drops the renderer's `pending_gap`, which otherwise fires at
@@ -1147,7 +1196,7 @@ impl Output for ConsoleOutput {
                 let events = parser.flush();
                 *parser = StreamParser::new_gfm();
                 let mut renderer = self.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut out);
+                let _ = renderer.feed(&events, &mut *out);
                 let mut theme = Theme::default();
                 theme.clickable_links = true; // real TTY path
                 *renderer = Renderer::new(theme, term_width());
@@ -1156,12 +1205,13 @@ impl Output for ConsoleOutput {
                 // Commit thinking (the thinking renderer is kept — post-tool
                 // thinking continues as one continuous faded stream; only the
                 // parser is reset, inside `commit_thinking`).
-                self.commit_thinking(&mut out);
-                self.ensure_dim(false, &mut out);
+                self.commit_thinking(&mut *out);
+                self.ensure_dim(false, &mut *out);
                 let _ = out.write_all(b"\n");
                 self.note_lines(1);
                 self.note_text();
             }
+            drop(out);
         } else {
             self.flush_text();
         }
@@ -1171,31 +1221,31 @@ impl Output for ConsoleOutput {
         self.stop_thinking();
         let live = *self.live.lock().unwrap();
         if live {
-            let mut out = std::io::stdout();
-            // Flush any answer held back while reasoning was streaming. When it
-            // flushes, the answer and thinking are already finalized below, so
-            // skip the redundant finalize.
+            // Call flush_held_answer BEFORE locking the writer (it locks it
+            // internally).
             let flushed = self.flush_held_answer();
+            let mut out = self.writer.lock().unwrap();
             if !flushed {
                 // Finalize the answer document.
                 {
                     let mut parser = self.parser.lock().unwrap();
                     let events = parser.flush();
                     let mut renderer = self.renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
+                    let _ = renderer.feed(&events, &mut *out);
                 }
                 // Finalize thinking (it was rendered inline + dimmed as it streamed).
                 {
                     let mut parser = self.thinking_parser.lock().unwrap();
                     let events = parser.flush();
                     let mut renderer = self.thinking_renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
+                    let _ = renderer.feed(&events, &mut *out);
                 }
-                self.ensure_dim(false, &mut out);
-                println!();
+                self.ensure_dim(false, &mut *out);
+                let _ = writeln!(out);
                 self.note_lines(1);
                 self.note_text();
             }
+            drop(out);
         } else {
             self.flush_text();
             // Non-TTY thinking already streamed to stderr; stdout stays clean.
@@ -1216,7 +1266,9 @@ impl Output for ConsoleOutput {
         // result, so this is safe to read back on the result.
         *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
         if *self.last_was_tool.lock().unwrap() {
-            println!();
+            let mut out = self.writer.lock().unwrap();
+            let _ = writeln!(out);
+            drop(out);
             self.note_lines(1);
         }
         // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
@@ -1338,9 +1390,12 @@ impl Output for ConsoleOutput {
 
     fn get_user_input(&self) -> String {
         self.stop_thinking();
-        use std::io::{self, Write};
-        print!("{} ", style("❯").bold().blue());
-        let _ = io::stdout().flush();
+        use std::io::{self, Write as _};
+        {
+            let mut out = self.writer.lock().unwrap();
+            let _ = write!(out, "{} ", style("❯").bold().blue());
+            let _ = out.flush();
+        }
         let mut input = String::new();
         let _ = io::stdin().read_line(&mut input);
         input.trim().to_string()
@@ -1352,13 +1407,17 @@ impl Output for ConsoleOutput {
 
     fn display_error(&self, error: &str) {
         self.stop_thinking();
-        println!("{} Error: {}", style("⏺").red(), error);
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out, "{} Error: {}", style("⏺").red(), error);
+        drop(out);
         self.note_lines(1);
     }
 
     fn display_system(&self, text: &str) {
         self.stop_thinking();
-        println!("{}", style(text).bold().dim());
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out, "{}", style(text).bold().dim());
+        drop(out);
         self.note_lines(1);
     }
 
@@ -1462,7 +1521,7 @@ impl Output for ConsoleOutput {
 
     fn display_separator(&self) {
         self.stop_thinking();
-        Self::separator();
+        self.separator();
         self.note_lines(1);
     }
 
@@ -1503,12 +1562,13 @@ impl Output for ConsoleOutput {
             "  ██       ██  ",
         ];
 
-        println!();
+        let mut out = self.writer.lock().unwrap();
+        let _ = writeln!(out);
         for line in avatar {
             let padding = width.saturating_sub(15) / 2;
-            println!("{}{}", " ".repeat(padding), style(line).cyan());
+            let _ = writeln!(out, "{}{}", " ".repeat(padding), style(line).cyan());
         }
-        println!();
+        let _ = writeln!(out);
 
         let status = |active, label, color: fn(StyledObject<String>) -> StyledObject<String>| {
             let s = style(format!("[{}] {}", if active { "x" } else { " " }, label));
@@ -1523,24 +1583,33 @@ impl Output for ConsoleOutput {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into());
 
-        print!(
-            "{} | {} ({})",
+        let _ = write!(
+            out, "{} | {} ({})",
             style("picocode").bold(),
             style(provider).cyan(),
             style(model).blue(),
         );
 
         if let Some(p) = persona {
-            print!(" | {}", style(p).magenta());
+            let _ = write!(out, " | {}", style(p).magenta());
         }
 
-        println!(
-            " | {} | {} | {}",
+        let _ = writeln!(
+            out, " | {} | {} | {}",
             status(yolo, "yolo", |s| s.red()),
             style(format!("limit:{}", limit)).yellow(),
             style(cwd).dim()
         );
         self.note_lines(9);
+        drop(out);
+    }
+
+    fn begin_capture(&self) {
+        self.begin_capture_inner();
+    }
+
+    fn end_capture(&self) -> Vec<u8> {
+        self.end_capture_inner()
     }
 }
 
