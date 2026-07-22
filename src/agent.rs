@@ -77,6 +77,9 @@ pub trait PicoAgent: Send + Sync {
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
     /// result means no completion call has reported usage yet.
     fn session_usage(&self) -> SessionUsage;
+    /// Generate a concise summary of the given text using the agent's model.
+    /// Used by `/tree --summarize` to summarise abandoned branches.
+    async fn summarize(&self, prompt: &str) -> Result<String>;
 }
 
 #[async_trait]
@@ -320,6 +323,16 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             .lock()
             .map(|g| *g)
             .unwrap_or_default()
+    }
+
+    async fn summarize(&self, prompt: &str) -> Result<String> {
+        use rig_core::completion::Chat;
+        let msg = Message::user(prompt);
+        let mut history: Vec<Message> = vec![];
+        self.agent
+            .chat(msg, &mut history)
+            .await
+            .map_err(|e| crate::PicocodeError::Other(format!("summarize: {}", e)))
     }
 }
 
@@ -1616,11 +1629,36 @@ fn parse_tree_args(rest: &str) -> (String, bool) {
     (target, summarize)
 }
 
+/// Build a summarization prompt from a list of session entries.
+/// Produces a concise [role] / text transcript of the abandoned branch.
+fn build_summary_prompt(entries: &[crate::session::SessionEntry]) -> String {
+    let mut text = String::from("Summarize the following conversation branch concisely. Focus on the key decisions, findings, and outcomes:\n\n");
+    for entry in entries {
+        if let crate::session::SessionEntryContent::Message { message } = &entry.content {
+            if let Some(role) = message.get("role").and_then(|r| r.as_str()) {
+                let content = message
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                if !content.is_empty() {
+                    text.push_str(&format!("[{}] {}\n", role, content));
+                }
+            }
+        }
+    }
+    text
+}
+
 /// Walk from `old_leaf` to root and from `new_target` to root, find the common
 /// ancestor, and return `(abandoned_entries, common_ancestor_id)`.
 ///
 /// `get_path_to_root` returns entries in root→leaf order.
-#[allow(dead_code)]
 fn collect_entries_for_branch_summary(
     index: &crate::session::SessionIndex,
     old_leaf: &str,
@@ -2013,7 +2051,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 // Handle `/tree <target_id>` commands — navigate session tree.
                 if input.starts_with("/tree") {
                     let rest = input["/tree".len()..].trim();
-                    let (target_id, _summarize) = parse_tree_args(rest);
+                    let (target_id, summarize) = parse_tree_args(rest);
                     if target_id.is_empty() {
                         // No target: the overlay is already open from from_buffer.
                         continue;
@@ -2025,12 +2063,44 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             continue; // already at this position
                         }
 
+                        // Summarize the abandoned branch if requested.
+                        if summarize {
+                            if let Some(old_leaf) = old_leaf_id.as_deref() {
+                                let (abandoned, common_ancestor_id) = {
+                                    let index = s.index().lock().await;
+                                    collect_entries_for_branch_summary(&index, old_leaf, &target_id)
+                                };
+                                if !abandoned.is_empty() {
+                                    config.output.display_thinking("Summarizing abandoned branch...");
+                                    let prompt = build_summary_prompt(&abandoned);
+                                    if let Some(ref agent) = agent {
+                                        match agent.summarize(&prompt).await {
+                                            Ok(summary) => {
+                                                let _ = s.append_branch_summary(
+                                                    &common_ancestor_id,
+                                                    &summary,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                config.output.display_text(&format!(
+                                                    "Summary failed: {}",
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         // Move the leaf pointer. The next prompt() call reads the
                         // new branch via build_context() automatically.
                         let _ = s.move_leaf(Some(target_id.clone())).await;
 
                         config.output.display_plain(&format!(
-                            "/tree navigated ({})",
+                            "/tree {} ({})",
+                            if summarize { "navigated + summarized" } else { "navigated" },
                             &target_id[..target_id.len().min(8)],
                         ));
                     }
