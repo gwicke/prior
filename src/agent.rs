@@ -1341,6 +1341,25 @@ fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
 ///
 /// in the identical order the live path produces, so `ConsoleOutput` renders
 /// replayed content exactly as it rendered the original live session.
+
+/// Parse a replay-length argument: plain number `N`, `Nt` (turns), or `Nl`
+/// (lines).  Returns `(count, is_lines)`.  An empty/whitespace input returns
+/// `(default, false)`.
+pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return (default, false);
+    }
+    if arg.ends_with('l') {
+        let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
+        if n == 0 { (usize::MAX, false) } else { (n, true) }
+    } else {
+        let clean = arg.trim_end_matches('t').trim();
+        let n: usize = clean.parse().unwrap_or(default);
+        (n, false)
+    }
+}
+
 fn replay_recent_turns(
     output: &Arc<dyn Output>,
     ctx: &crate::session::SessionContext,
@@ -1464,25 +1483,40 @@ async fn handle_session_command(
     match action.as_str() {
         "resume" => {
             if let Some(meta) = meta {
-                // Parse optional replay turn count from argument.
-                let replay_turns = arg
+                // Parse optional replay length from argument: N, Nt, or Nl.
+                let default = settings.session_resume_replay_turns;
+                let (count, is_lines) = arg
                     .as_deref()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(settings.session_resume_replay_turns);
+                    .map(|s| crate::agent::parse_replay_len_arg(s, default))
+                    .unwrap_or((default, false));
 
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
                         let new_session = Session::new_persisted(storage, index);
                         let id = new_session.get_session_id().to_string();
 
-                        // Re-play recent turns through the full output path.
-                        if replay_turns > 0 {
+                        if count > 0 {
                             if let Ok(ctx) = new_session.build_context().await {
-                                // Separator between the echoed command line and
-                                // the replayed content, matching the separator
-                                // run_interactive emits before each agent response.
                                 output.display_separator();
-                                replay_recent_turns(output, &ctx, replay_turns);
+                                if is_lines {
+                                    // Line-based: capture full replay via writer, tail lines.
+                                    output.begin_capture();
+                                    let total = group_into_turns(&ctx.messages).len();
+                                    replay_recent_turns(output, &ctx, total);
+                                    let bytes = output.end_capture();
+                                    let captured = String::from_utf8_lossy(&bytes);
+                                    let lines: Vec<&str> = captured.lines().collect();
+                                    let start = lines.len().saturating_sub(count);
+                                    use std::io::Write as _;
+                                    let stdout = std::io::stdout();
+                                    let mut handle = stdout.lock();
+                                    for line in &lines[start..] {
+                                        let _ = writeln!(handle, "{}", line);
+                                    }
+                                    let _ = handle.flush();
+                                } else {
+                                    replay_recent_turns(output, &ctx, count);
+                                }
                             }
                         }
 
@@ -2273,13 +2307,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 }
                             }
                         } else {
-                            // Turn-based limit: N or Nt (or no arg).
-                            let replay_turns: Option<usize> = if arg.is_empty() {
-                                None
+                            // Turn-based limit: N or Nt (or no arg).  Empty arg means all.
+                            let (count, _is_lines) = if arg.is_empty() {
+                                (0, false)
                             } else {
-                                let clean = arg.trim_end_matches('t').trim();
-                                Some(clean.parse::<usize>().ok().unwrap_or(usize::MAX))
+                                parse_replay_len_arg(arg, 0)
                             };
+                            let replay_turns = if count == 0 { None } else { Some(count) };
                             match s.build_context().await {
                                 Ok(ctx) => {
                                     let turns = group_into_turns(&ctx.messages);
