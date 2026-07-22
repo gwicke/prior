@@ -389,7 +389,7 @@ impl SettingsStore {
         let filtered: Vec<&SettingMeta> = if filter.trim().is_empty() {
             SETTINGS.iter().collect()
         } else {
-            crate::fuzzy::fuzzy_filter(SETTINGS, filter, |m| format!("{} {}", m.name, m.description))
+            crate::fuzzy::fuzzy_filter_bonus(SETTINGS, filter, |m| format!("{} {}", m.name, m.description))
                 .into_iter()
                 .map(|r| r.item)
                 .collect()

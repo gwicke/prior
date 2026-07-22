@@ -468,7 +468,7 @@ impl ActiveOverlay {
                 let filtered: Vec<ValueCandidate> = if filter.is_empty() {
                     cands
                 } else {
-                    crate::fuzzy::fuzzy_filter(&cands, &filter, |c| c.display.clone())
+                    crate::fuzzy::fuzzy_filter_bonus(&cands, &filter, |c| c.display.clone())
                         .into_iter()
                         .map(|r| r.item.clone())
                         .collect()
@@ -2152,7 +2152,7 @@ impl Repl {
         if vq.trim().is_empty() {
             cands
         } else {
-            crate::fuzzy::fuzzy_filter(&cands, vq, |c| c.display.clone())
+            crate::fuzzy::fuzzy_filter_bonus(&cands, vq, |c| c.display.clone())
                 .into_iter()
                 .map(|r| r.item.clone())
                 .collect()
@@ -2358,7 +2358,7 @@ impl Repl {
         if filter.trim().is_empty() {
             all.to_vec()
         } else {
-            crate::fuzzy::fuzzy_filter(&all, filter, |l| l.as_str().to_string())
+            crate::fuzzy::fuzzy_filter_bonus(&all, filter, |l| l.as_str().to_string())
                 .into_iter()
                 .map(|r| *r.item)
                 .collect()
@@ -2397,7 +2397,7 @@ impl Repl {
         let filtered: Vec<&&SessionMeta> = if filter.is_empty() {
             sorted.iter().collect()
         } else {
-            crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+            crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
                 let name = m.name.as_deref().unwrap_or("");
                 let preview = m.first_prompt_preview.as_deref().unwrap_or("");
                 format!("{} {} {} {}", name, preview, m.id, m.cwd)
@@ -2603,7 +2603,7 @@ impl Repl {
         }
 
         // Fuzzy-filter by name, prompt preview, id, and cwd.
-        crate::fuzzy::fuzzy_filter(&sorted, filter, |m| {
+        crate::fuzzy::fuzzy_filter_bonus(&sorted, filter, |m| {
             let name = m.name.as_deref().unwrap_or("");
             let preview = m.first_prompt_preview.as_deref().unwrap_or("");
             format!("{} {} {} {}", name, preview, m.id, m.cwd)

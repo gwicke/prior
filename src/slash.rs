@@ -96,7 +96,7 @@ pub fn registry() -> &'static [SlashCommand] {
 
 /// Fuzzy-filter the command registry by `query` (matches on name + help text).
 pub fn filter_commands(query: &str) -> Vec<fuzzy::Ranked<'static, SlashCommand>> {
-    fuzzy::fuzzy_filter(registry(), query, |c| format!("{} {}", c.name, c.help))
+    fuzzy::fuzzy_filter_bonus(registry(), query, |c| format!("{} {}", c.name, c.help))
 }
 
 /// Parse the text after a leading `/` into a dispatch intent.
