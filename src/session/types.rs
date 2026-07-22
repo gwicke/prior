@@ -263,6 +263,19 @@ pub struct SessionIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Session tree (for `/tree` overlay)
+// ---------------------------------------------------------------------------
+
+/// A node in the session entry tree, used for the `/tree` overlay.
+#[derive(Debug, Clone)]
+pub struct SessionTreeNode {
+    pub entry: SessionEntry,
+    pub children: Vec<SessionTreeNode>,
+    /// Resolved label text, if any Label entry targets this node.
+    pub label: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Session context (build_context output)
 // ---------------------------------------------------------------------------
 
@@ -329,6 +342,45 @@ impl SessionEntry {
             content: SessionEntryContent::ThinkingLevelChange { thinking_level },
         }
     }
+
+    /// Create a new branch_summary entry.
+    pub fn new_branch_summary(from_id: String, summary: String, parent_id: Option<String>) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            parent_id,
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content: SessionEntryContent::BranchSummary { from_id, summary },
+        }
+    }
+
+    /// Create a new compaction entry.
+    pub fn new_compaction(
+        summary: String,
+        first_kept_entry_id: String,
+        tokens_before: u64,
+        parent_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            parent_id,
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content: SessionEntryContent::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+            },
+        }
+    }
+
+    /// Create a new label entry.
+    pub fn new_label(target_id: String, label: Option<String>, parent_id: Option<String>) -> Self {
+        Self {
+            id: Uuid::now_v7().to_string(),
+            parent_id,
+            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            content: SessionEntryContent::Label { target_id, label },
+        }
+    }
 }
 
 impl SessionIndex {
@@ -353,6 +405,110 @@ impl SessionIndex {
         }
         path.reverse();
         path
+    }
+
+    /// Build the full entry tree, rooted at entries with no parent.
+    /// Children are sorted so the branch containing `preferred_id`
+    /// (typically the current leaf) appears first.
+    ///
+    /// Performance notes (ref critique #4 in doc/tree.md):
+    /// - `labels` is a pre-computed `target_id → label` map to avoid O(n²)
+    /// - `active_path` is built once via `get_path_to_root`
+    pub fn build_tree(&self, preferred_id: Option<&str>) -> Vec<SessionTreeNode> {
+        // Precompute label map: target_id -> label
+        let mut labels: std::collections::HashMap<&str, Option<&str>> =
+            std::collections::HashMap::new();
+        for entry in self.entries.values() {
+            if let SessionEntryContent::Label { target_id, label } = &entry.content {
+                labels.insert(target_id.as_str(), label.as_deref());
+            }
+        }
+
+        // Precompute active-path set from preferred_id → root
+        let active_path: std::collections::HashSet<String> = preferred_id
+            .map(|leaf| {
+                let path = self.get_path_to_root(leaf);
+                path.iter().map(|e| e.id.clone()).collect()
+            })
+            .unwrap_or_default();
+
+        // Identify root entries: those whose parent_id is None
+        // or references an entry not in the map.
+        let roots: Vec<&str> = self
+            .entries
+            .keys()
+            .filter(|id| {
+                self.entries.get(id.as_str()).and_then(|e| e.parent_id.as_deref())
+                    .map(|pid| !self.entries.contains_key(pid))
+                    .unwrap_or(true)
+            })
+            .map(|s| s.as_str())
+            .collect();
+
+        let mut out: Vec<SessionTreeNode> = roots
+            .iter()
+            .filter_map(|id| self.build_subtree(id, &active_path, &labels))
+            .collect();
+
+        // Sort: subtree containing preferred_id first
+        if let Some(_pref) = preferred_id {
+            out.sort_by_key(|n| {
+                if active_path.contains(n.entry.id.as_str()) {
+                    0
+                } else {
+                    1
+                }
+            });
+        }
+
+        out
+    }
+
+    /// Recursively build a subtree rooted at `entry_id`.
+    /// Skips entries whose content is a Leaf or SessionInfo (meta entries).
+    fn build_subtree<'a>(
+        &'a self,
+        entry_id: &str,
+        active_path: &std::collections::HashSet<String>,
+        labels: &std::collections::HashMap<&str, Option<&str>>,
+    ) -> Option<SessionTreeNode> {
+        let entry = self.entries.get(entry_id)?.clone();
+
+        // Skip meta entries that should not appear as tree nodes.
+        if matches!(
+            entry.content,
+            SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
+        ) {
+            return None;
+        }
+
+        let children: Vec<SessionTreeNode> = self
+            .children
+            .get(entry_id)
+            .map(|child_ids| {
+                let mut v: Vec<SessionTreeNode> = child_ids
+                    .iter()
+                    .filter_map(|cid| self.build_subtree(cid, active_path, labels))
+                    .collect();
+                // Sort: branch containing preferred_id first
+                v.sort_by_key(|c| {
+                    if active_path.contains(c.entry.id.as_str()) {
+                        0
+                    } else {
+                        1
+                    }
+                });
+                v
+            })
+            .unwrap_or_default();
+
+        let label = labels.get(entry_id).copied().flatten().map(String::from);
+
+        Some(SessionTreeNode {
+            entry,
+            children,
+            label,
+        })
     }
 }
 

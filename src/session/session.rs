@@ -326,6 +326,122 @@ impl Session {
         Ok(id)
     }
 
+    // ------------------------------------------------------------------
+    // Tree navigation
+    // ------------------------------------------------------------------
+
+    /// Look up a single entry by ID.
+    pub async fn get_entry(&self, id: &str) -> Option<SessionEntry> {
+        let index = self.index.lock().await;
+        index.entries.get(id).cloned()
+    }
+
+    /// Return the current leaf entry ID.
+    pub async fn get_leaf_id(&self) -> Option<String> {
+        let index = self.index.lock().await;
+        index.leaf_id.clone()
+    }
+
+    /// Build a recursive tree from the in-memory index.
+    pub async fn get_tree(&self) -> Vec<SessionTreeNode> {
+        let index = self.index.lock().await;
+        let leaf_id = index.leaf_id.clone();
+        index.build_tree(leaf_id.as_deref())
+    }
+
+    /// Move the leaf pointer to a new entry.
+    ///
+    /// Writes a `Leaf` pointer record to storage and updates `leaf_id` only.
+    /// Matches the existing append helpers: the `Leaf` entry is a pointer
+    /// record, NOT a tree node — written with parent `None` and deliberately
+    /// never inserted into `entries`/`children`.
+    pub async fn move_leaf(&self, new_leaf_id: Option<String>) -> crate::Result<()> {
+        self.ensure_persisted().await?;
+        let leaf_entry = SessionEntry::new_leaf(new_leaf_id.clone(), None);
+        {
+            let storage = self.storage.lock().await;
+            storage.append_entry(&leaf_entry).await?;
+        }
+        {
+            let mut index = self.index.lock().await;
+            index.leaf_id = new_leaf_id;
+        }
+        Ok(())
+    }
+
+    /// Write a BranchSummary entry and advance leaf.
+    pub async fn append_branch_summary(
+        &self, from_id: &str, summary: &str,
+    ) -> crate::Result<String> {
+        self.ensure_persisted().await?;
+        let parent_id = { self.index.lock().await.leaf_id.clone() };
+        let entry = SessionEntry::new_branch_summary(
+            from_id.to_string(), summary.to_string(), parent_id.clone(),
+        );
+        let id = entry.id.clone();
+        let storage = self.storage.lock().await;
+        storage.append_entry(&entry).await?;
+        let leaf = SessionEntry::new_leaf(Some(id.clone()), None);
+        storage.append_entry(&leaf).await?;
+        {
+            let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
+            index.leaf_id = Some(id.clone());
+        }
+        Ok(id)
+    }
+
+    /// Write a Compaction entry and advance leaf.
+    pub async fn append_compaction(
+        &self, summary: &str, first_kept_entry_id: &str, tokens_before: u64,
+    ) -> crate::Result<String> {
+        self.ensure_persisted().await?;
+        let parent_id = { self.index.lock().await.leaf_id.clone() };
+        let entry = SessionEntry::new_compaction(
+            summary.to_string(), first_kept_entry_id.to_string(), tokens_before, parent_id.clone(),
+        );
+        let id = entry.id.clone();
+        let storage = self.storage.lock().await;
+        storage.append_entry(&entry).await?;
+        let leaf = SessionEntry::new_leaf(Some(id.clone()), None);
+        storage.append_entry(&leaf).await?;
+        {
+            let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
+            index.leaf_id = Some(id.clone());
+        }
+        Ok(id)
+    }
+
+    /// Write a Label entry attached to a target entry.
+    /// Does NOT advance the leaf (labels are metadata, not navigation points).
+    pub async fn append_label(
+        &self, target_id: &str, label: &str,
+    ) -> crate::Result<String> {
+        self.ensure_persisted().await?;
+        let parent_id = { self.index.lock().await.leaf_id.clone() };
+        let entry = SessionEntry::new_label(
+            target_id.to_string(), Some(label.to_string()), parent_id.clone(),
+        );
+        let id = entry.id.clone();
+        let storage = self.storage.lock().await;
+        storage.append_entry(&entry).await?;
+        {
+            let mut index = self.index.lock().await;
+            index.entries.insert(entry.id.clone(), entry);
+            if let Some(ref pid) = parent_id {
+                index.children.entry(pid.clone()).or_default().push(id.clone());
+            }
+        }
+        Ok(id)
+    }
+
     /// Access the storage (for repo-level operations like forking).
     pub fn storage(&self) -> Arc<AsyncMutex<JsonlSessionStorage>> {
         self.storage.clone()

@@ -402,10 +402,11 @@ impl ActiveOverlay {
         let (word, rest) = if let Some((w, r)) = after.split_once(' ') {
             (w, r)
         } else if matches!(
+            // Open without trailing space
             after,
-            "" | "model" | "models" | "m" | "thinking" | "think" | "t" | "set"
-                | "s" | "persona" | "personas" | "p" | "stat" | "stats"
-                | "sandbox" | "sb"
+            "" | "model" | "thinking" | "set"
+                | "persona" | "stat"
+                | "sandbox" | "session"
         ) {
             (after, "")
         } else {
