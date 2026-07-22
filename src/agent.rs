@@ -1603,6 +1603,47 @@ async fn handle_session_command(
     }
 }
 
+/// Parse `/tree <target_id> [--summarize]` arguments.
+fn parse_tree_args(rest: &str) -> (String, bool) {
+    let mut summarize = false;
+    let mut target = String::new();
+    for part in rest.split_whitespace() {
+        match part {
+            "--summarize" | "-s" => summarize = true,
+            id => target = id.to_string(),
+        }
+    }
+    (target, summarize)
+}
+
+/// Walk from `old_leaf` to root and from `new_target` to root, find the common
+/// ancestor, and return `(abandoned_entries, common_ancestor_id)`.
+///
+/// `get_path_to_root` returns entries in root→leaf order.
+#[allow(dead_code)]
+fn collect_entries_for_branch_summary(
+    index: &crate::session::SessionIndex,
+    old_leaf: &str,
+    new_target: &str,
+) -> (Vec<crate::session::SessionEntry>, String) {
+    let old_path = index.get_path_to_root(old_leaf);
+    let new_path = index.get_path_to_root(new_target);
+
+    let common_len = old_path.iter()
+        .zip(new_path.iter())
+        .take_while(|(a, b)| a.id == b.id)
+        .count();
+
+    let common_ancestor_id = common_len
+        .checked_sub(1)
+        .and_then(|i| old_path.get(i))
+        .map(|e| e.id.clone())
+        .unwrap_or_default();
+
+    let abandoned = old_path.into_iter().skip(common_len).collect();
+    (abandoned, common_ancestor_id)
+}
+
 /// Ensure a session exists, creating one lazily if needed.
 /// Called on first actual turn (Submit or ! command), not at startup.
 pub(crate) async fn ensure_session(
@@ -1966,6 +2007,32 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     .display_text(&format!("shell error: {}", e));
                             }
                         }
+                    }
+                    continue;
+                }
+                // Handle `/tree <target_id>` commands — navigate session tree.
+                if input.starts_with("/tree") {
+                    let rest = input["/tree".len()..].trim();
+                    let (target_id, _summarize) = parse_tree_args(rest);
+                    if target_id.is_empty() {
+                        // No target: the overlay is already open from from_buffer.
+                        continue;
+                    }
+
+                    if let Some(ref s) = session {
+                        let old_leaf_id = s.get_leaf_id().await;
+                        if old_leaf_id.as_deref() == Some(target_id.as_str()) {
+                            continue; // already at this position
+                        }
+
+                        // Move the leaf pointer. The next prompt() call reads the
+                        // new branch via build_context() automatically.
+                        let _ = s.move_leaf(Some(target_id.clone())).await;
+
+                        config.output.display_plain(&format!(
+                            "/tree navigated ({})",
+                            &target_id[..target_id.len().min(8)],
+                        ));
                     }
                     continue;
                 }
