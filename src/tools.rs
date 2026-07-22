@@ -624,7 +624,7 @@ fn capture_bounded(
 /// Read-only system directories bound into every sandbox so the shell and
 /// common tools can execute. They are read-only, so the host OS stays hidden
 /// from writes; only explicitly declared bindings add writable/project paths.
-const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc"];
+const ESSENTIAL_RO_DIRS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
 
 /// Single-quote a string for safe embedding as a single argument inside a
 /// `sh -c` payload. The only shell metacharacter not inert inside single
@@ -743,6 +743,25 @@ fn build_bwrap_args(
             args.push(dir.to_string());
             args.push(dir.to_string());
         }
+    }
+    // Mount /etc: when the user binds sub-paths of /etc, we create an
+    // empty directory first so their mounts have a place to land.  When
+    // nothing references /etc at all, fall back to ro-binding the whole
+    // directory (old behavior).  When an exact /etc bind is configured,
+    // the user takes full control and we add nothing extra.
+    let etc_exact = binds.iter().any(|b| b.to == std::path::Path::new("/etc"));
+    let etc_sub   = binds.iter().any(|b| b.to.starts_with("/etc/"));
+    if etc_exact {
+        // User provides their own /etc binding.
+    } else if etc_sub {
+        // User binds sub-paths under /etc; create the empty directory first.
+        args.push("--dir".into());
+        args.push("/etc".into());
+    } else if std::path::Path::new("/etc").is_dir() {
+        // No /etc bindings at all — ro-bind the full directory.
+        args.push("--ro-bind".into());
+        args.push("/etc".into());
+        args.push("/etc".into());
     }
 
     if binds.is_empty() {
