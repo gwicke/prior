@@ -1546,10 +1546,6 @@ async fn handle_session_command(
                         });
                         let new_session = Session::new_persisted(new_storage, index);
                         let id = new_session.get_session_id().to_string();
-                        config.output.display_plain(&format!(
-                            "/session {} fork",
-                            meta.name.as_deref().unwrap_or(&meta.id)
-                        ));
                         *session = Some(new_session);
                         SessionCommandResult::Switched(id)
                     }
@@ -1573,11 +1569,6 @@ async fn handle_session_command(
                 let cur_id = s.get_session_id().to_string();
                 if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
                     let _ = s.set_session_name(&new_name).await;
-                    config.output.display_plain(&format!(
-                        "/session {} rename {}",
-                        meta.as_ref().and_then(|m| m.name.as_deref()).unwrap_or(&cur_id),
-                        new_name
-                    ));
                 } else if let Some(meta) = meta {
                     match repo.as_ref().unwrap().open(&meta).await {
                         Ok((storage, _index)) => {
@@ -1591,11 +1582,6 @@ async fn handle_session_command(
                                 session_name: None,
                             });
                             let _ = s.set_session_name(&new_name).await;
-                            config.output.display_plain(&format!(
-                                "/session {} rename {}",
-                                meta.name.as_deref().unwrap_or(&meta.id),
-                                new_name
-                            ));
                         }
                         Err(e) => {
                             config.output.display_text(&format!("Cannot open session: {}", e));
@@ -1617,10 +1603,6 @@ async fn handle_session_command(
                 }
                 match repo.as_ref().unwrap().delete(&meta).await {
                     Ok(()) => {
-                        config.output.display_plain(&format!(
-                            "/session {} delete",
-                            meta.name.as_deref().unwrap_or(&meta.id)
-                        ));
                         SessionCommandResult::Deleted
                     }
                     Err(e) => {
@@ -2236,7 +2218,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                     session = None;
                     current_session_id = String::new();
-                    config.output.display_plain("/clear");
                     continue;
                 }
                 // Handle `/replay [N[t|l]]`: re-render session history.

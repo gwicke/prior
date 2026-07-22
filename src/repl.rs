@@ -1051,7 +1051,7 @@ impl ActiveOverlay {
                         slash::SlashKind::Tree => editor.set("/tree "),
                         slash::SlashKind::Clear => {
                             redraw(&LineEditor::new(), &[], sel, input_row);
-                            output.display_plain("");
+                            output.display_plain("/clear");
                             return OverlayAction::Action(InputAction::Submit("/clear".into()));
                         }
                         slash::SlashKind::Replay => editor.set("/replay "),
