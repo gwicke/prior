@@ -2160,6 +2160,101 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     config.output.display_plain("/clear");
                     continue;
                 }
+                // Handle `/replay [N[t|l]]`: re-render session history.
+                if input == "/replay" || input.starts_with("/replay ") {
+                    if let Some(ref s) = session {
+                        let arg = input["/replay".len()..].trim();
+                        if arg.ends_with('l') {
+                            // Line-based limit: build markdown of the full session
+                            // content, tail the lines, and render via display_markdown.
+                            let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
+                            if n > 0 {
+                                match s.build_context().await {
+                                    Ok(ctx) => {
+                                        let turns = group_into_turns(&ctx.messages);
+                                        if turns.is_empty() {
+                                            config.output.display_text("Session is empty");
+                                        } else {
+                                            // Build a markdown string of the full session.
+                                            let mut md = String::new();
+                                            for turn in &turns {
+                                                md.push_str("## User\n\n");
+                                                md.push_str(&turn.user_text);
+                                                md.push_str("\n\n");
+                                                if !turn.segments.is_empty() {
+                                                    md.push_str("## Assistant\n\n");
+                                                    for seg in &turn.segments {
+                                                        for t in &seg.text {
+                                                            md.push_str(t);
+                                                            md.push('\n');
+                                                        }
+                                                        for t in &seg.thinking {
+                                                            md.push_str(&format!("> {}\n\n", t));
+                                                        }
+                                                        for (_, name, args) in &seg.tool_calls {
+                                                            md.push_str(&format!("**Tool Call:** `{}`\n\n```json\n{}\n```\n\n", name, args));
+                                                        }
+                                                        for (_, result) in &seg.tool_results {
+                                                            md.push_str(&format!("```\n{}\n```\n\n", result));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            let lines: Vec<&str> = md.lines().collect();
+                                            let start = lines.len().saturating_sub(n);
+                                            let tail_md = lines[start..].join("\n");
+                                            config.output.display_separator();
+                                            config.output.display_markdown(&tail_md);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        config.output.display_text(&format!("Cannot replay session: {}", e));
+                                    }
+                                }
+                            } else {
+                                // `0l` — replay all (same as bare `/replay`).
+                                match s.build_context().await {
+                                    Ok(ctx) => {
+                                        let turns = group_into_turns(&ctx.messages);
+                                        let total = turns.len();
+                                        if total > 0 {
+                                            config.output.display_separator();
+                                        }
+                                        replay_recent_turns(&config.output, &ctx, total);
+                                    }
+                                    Err(e) => {
+                                        config.output.display_text(&format!("Cannot replay session: {}", e));
+                                    }
+                                }
+                            }
+                        } else {
+                            // Turn-based limit: N or Nt (or no arg).
+                            let replay_turns: Option<usize> = if arg.is_empty() {
+                                None
+                            } else {
+                                let clean = arg.trim_end_matches('t').trim();
+                                Some(clean.parse::<usize>().ok().unwrap_or(usize::MAX))
+                            };
+                            match s.build_context().await {
+                                Ok(ctx) => {
+                                    let turns = group_into_turns(&ctx.messages);
+                                    let total = turns.len();
+                                    let count = replay_turns.unwrap_or(total).min(total);
+                                    if count > 0 {
+                                        config.output.display_separator();
+                                    }
+                                    replay_recent_turns(&config.output, &ctx, count);
+                                }
+                                Err(e) => {
+                                    config.output.display_text(&format!("Cannot replay session: {}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        config.output.display_text("No active session to replay");
+                    }
+                    continue;
+                }
                 // `/stat` is handled by the REPL overlay (typing it opens the
                 // stats panel); it is never submitted here, so there's nothing
                 // to do for that keyword.

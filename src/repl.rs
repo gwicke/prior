@@ -350,6 +350,11 @@ pub(crate) enum ActiveOverlay {
         lines: Vec<String>,
     },
 
+    /// Help text for the `/replay` command syntax.
+    ReplayHelp {
+        lines: Vec<String>,
+    },
+
     Sandbox {
         sub: Option<&'static str>,
         items: Vec<String>,
@@ -436,7 +441,7 @@ impl ActiveOverlay {
             // Open without trailing space
             after,
             "" | "model" | "thinking" | "set"
-                | "persona" | "stat"
+                | "persona" | "stat" | "replay"
                 | "sandbox" | "session" | "tree"
         ) {
             (after, "")
@@ -493,6 +498,24 @@ impl ActiveOverlay {
                     &ctx.provider, &ctx.model, ctx.session_usage,
                 );
                 ActiveOverlay::Stat { lines }
+            }
+            "replay" => {
+                if rest.trim().is_empty() {
+                    let lines = vec![
+                        "Replay the full history of the current session.".into(),
+                        "".into(),
+                        "Optional length filters (appended after /replay):".into(),
+                        "  10      last 10 agent turns (same as 10t)".into(),
+                        "  10t     last 10 agent turns".into(),
+                        "  10l     last 10 output lines".into(),
+                        "".into(),
+                        "Examples:  /replay    /replay 5    /replay 50l".into(),
+                    ];
+                    ActiveOverlay::ReplayHelp { lines }
+                } else {
+                    // Non-empty arg → no overlay, submit directly.
+                    ActiveOverlay::None
+                }
             }
             "sandbox" | "sb" => {
                 let filter = rest.trim().to_string();
@@ -707,6 +730,10 @@ impl ActiveOverlay {
             }
             ActiveOverlay::Stat { lines } => {
                 ("Session stats  (Esc clears input to close)",
+                 lines.clone(), None, true)
+            }
+            ActiveOverlay::ReplayHelp { lines } => {
+                ("History replay  (type a length filter or Esc to cancel)",
                  lines.clone(), None, true)
             }
             ActiveOverlay::Sandbox { items, sub, .. } => {
@@ -1001,6 +1028,7 @@ impl ActiveOverlay {
                             output.display_plain("");
                             return OverlayAction::Action(InputAction::Submit("/clear".into()));
                         }
+                        slash::SlashKind::Replay => editor.set("/replay "),
                     }
                 }
                 OverlayAction::Continue
@@ -1241,6 +1269,15 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
+            ActiveOverlay::ReplayHelp { .. } => {
+                let line = editor.text();
+                if !line.trim().is_empty() {
+                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                    OverlayAction::Action(InputAction::Submit(line))
+                } else {
+                    OverlayAction::Continue
+                }
+            }
             _ => OverlayAction::Continue,
         }
     }
@@ -1258,6 +1295,7 @@ impl ActiveOverlay {
             | ActiveOverlay::Thinking { .. }
             | ActiveOverlay::Persona { .. }
             | ActiveOverlay::Stat { .. }
+            | ActiveOverlay::ReplayHelp { .. }
             | ActiveOverlay::Sandbox { .. } => {
                 editor.set("");
             }
@@ -1309,6 +1347,7 @@ impl ActiveOverlay {
             ActiveOverlay::SettingsVal { .. } => 6,
             ActiveOverlay::Persona { .. } => 7,
             ActiveOverlay::Stat { .. } => 8,
+            ActiveOverlay::ReplayHelp { .. } => 15,
             ActiveOverlay::Sandbox { .. } => 9,
             ActiveOverlay::PathComplete { .. } => 10,
             ActiveOverlay::Session { .. } => 11,
@@ -1562,7 +1601,7 @@ impl Repl {
             let mut overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::Help => Self::render_help_overlay(),
-                ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
+                ActiveOverlay::Stat { .. } | ActiveOverlay::ReplayHelp { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
                 ActiveOverlay::SessionAction { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }

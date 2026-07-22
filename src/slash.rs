@@ -16,6 +16,7 @@ pub enum SlashKind {
     Session,
     Tree,
     Clear,
+    Replay,
 }
 
 /// A registered slash command.
@@ -83,6 +84,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/clear",
             help: "Delete the current session and start a new one",
             kind: SlashKind::Clear,
+        },
+        SlashCommand {
+            name: "/replay",
+            help: "Re-render session history. Optional: N or Nt = last N turns, Nl = last N output lines",
+            kind: SlashKind::Replay,
         },
     ];
     COMMANDS
@@ -164,8 +170,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_eleven_commands() {
-        assert_eq!(registry().len(), 11);
+    fn registry_has_twelve_commands() {
+        assert_eq!(registry().len(), 12);
     }
 
     #[test]
@@ -192,7 +198,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 11);
+        assert_eq!(r.len(), 12);
     }
 
     #[test]
