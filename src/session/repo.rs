@@ -92,24 +92,29 @@ impl JsonlSessionRepo {
         // Count message entries, extract the first user prompt, and track name.
         let mut message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
+        let mut last_prompt_text: Option<String> = None;
+        let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
 
         for line in content.lines().skip(1) {
             if line.contains("\"type\":\"message\"") {
                 message_count += 1;
-                // Capture the first user message text.
-                if first_prompt_preview.is_none() && line.contains("\"role\":\"user\"") {
+                if line.contains("\"role\":\"user\"") {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         let text = val
                             .pointer("/message/content/0/text")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        // No artificial cap — the overlay table's fit()/ellipsis
-                        // mechanism limits the display length at render time
-                        // so the preview can fill the entire cell width.
-                        let preview: String = text.chars().collect();
-                        if !preview.is_empty() {
-                            first_prompt_preview = Some(preview);
+                        let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            if first_prompt_preview.is_none() {
+                                let preview: String = text.chars().collect();
+                                first_prompt_preview = Some(preview);
+                            }
+                            last_prompt_text = Some(text.chars().collect());
+                            if !ts.is_empty() {
+                                last_prompt_timestamp = Some(ts.to_string());
+                            }
                         }
                     }
                 }
@@ -135,6 +140,8 @@ impl JsonlSessionRepo {
             message_count,
             token_count: None,
             first_prompt_preview,
+            last_prompt_text,
+            last_prompt_timestamp,
         })
     }
     /// Quick-read metadata from a single JSONL file (header only) — sync version.
@@ -145,24 +152,34 @@ impl JsonlSessionRepo {
 
         let mut message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
+        let mut last_prompt_text: Option<String> = None;
+        let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
 
         for line in content.lines().skip(1) {
             if line.contains("\"type\":\"message\"") {
                 message_count += 1;
-                if first_prompt_preview.is_none() && line.contains("\"role\":\"user\"") {
+                if line.contains("\"role\":\"user\"") {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         let text = val
                             .pointer("/message/content/0/text")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        let preview: String = text.chars().collect();
-                        if !preview.is_empty() {
-                            first_prompt_preview = Some(preview);
+                        let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            if first_prompt_preview.is_none() {
+                                let preview: String = text.chars().collect();
+                                first_prompt_preview = Some(preview);
+                            }
+                            last_prompt_text = Some(text.chars().collect());
+                            if !ts.is_empty() {
+                                last_prompt_timestamp = Some(ts.to_string());
+                            }
                         }
                     }
                 }
             } else if line.contains("\"type\":\"session_info\"") {
+                // Extract the name from the most recent SessionInfo entry.
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
                         if !n.is_empty() {
@@ -183,6 +200,8 @@ impl JsonlSessionRepo {
             message_count,
             token_count: None,
             first_prompt_preview,
+            last_prompt_text,
+            last_prompt_timestamp,
         })
     }
 
@@ -276,8 +295,15 @@ impl SessionRepo for JsonlSessionRepo {
             JsonlSessionStorage::open_or_create(source.path.clone()).await?;
         let source_index = source_storage.build_index().await?;
 
+        // Empty fork_entry_id means "fork the entire session" (root to leaf).
+        let effective_leaf = if fork_entry_id.is_empty() {
+            source_index.leaf_id.as_deref().unwrap_or("")
+        } else {
+            fork_entry_id
+        };
+
         // Collect entries from root to fork_entry_id (path-to-root reversed).
-        let path_to_root = source_index.get_path_to_root(fork_entry_id);
+        let path_to_root = source_index.get_path_to_root(effective_leaf);
 
         // Create the new session file manually (don't use self.create() because
         // we need to set parent_session in the header).
