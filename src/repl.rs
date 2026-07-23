@@ -3005,7 +3005,7 @@ impl Repl {
                 .and_then(|v| v.as_u64())
         };
         match name {
-            "read_file" => {
+            "read" | "read_file" => {
                 let path = get_str("path").unwrap_or_default();
                 let offset = get_u64("offset").unwrap_or(0);
                 let limit = get_u64("limit").unwrap_or(0);
@@ -3018,21 +3018,39 @@ impl Repl {
                 s
             }
             "bash" => {
-                let cmd = get_str("cmd").unwrap_or_default();
+                let cmd = get_str("command")
+                    .or_else(|| get_str("cmd"))
+                    .unwrap_or_default();
                 format!("$ {}", cmd.trim())
             }
             s if s.starts_with("grep") => {
-                let pat = get_str("pat").or_else(|| get_str("pattern")).unwrap_or_default();
+                let pat = get_str("pattern")
+                    .or_else(|| get_str("pat"))
+                    .unwrap_or_default();
                 let path = get_str("path").unwrap_or_default();
                 format!("grep {} {}", pat, path)
             }
-            s if s.starts_with("list") => {
+            s if s == "ls" || s.starts_with("list") => {
                 let path = get_str("path").unwrap_or_default();
                 format!("ls {}", path)
             }
-            "edit_file" => {
+            "edit" | "edit_file" => {
                 let path = get_str("path").unwrap_or_default();
-                format!("edit {}", path)
+                // Try canonical format (edits array) with oldText/newText.
+                if let Some(edits_array) = args
+                    .and_then(|a| a.as_object())
+                    .and_then(|o| o.get("edits"))
+                    .and_then(|v| v.as_array())
+                {
+                    if let Some(first) = edits_array.first() {
+                        let old_text = first.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
+                        format!("edit {} [{}..]", path, Self::count_lines_before(old_text))
+                    } else {
+                        format!("edit {}", path)
+                    }
+                } else {
+                    format!("edit {}", path)
+                }
             }
             _ => {
                 let first = args
@@ -3052,6 +3070,12 @@ impl Repl {
                 }
             }
         }
+    }
+
+    /// Count the number of lines before `text`, returning a 1-based line number.
+    /// This approximates a line count for the old edit text.
+    fn count_lines_before(text: &str) -> usize {
+        text.matches('\n').count() + 1
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.

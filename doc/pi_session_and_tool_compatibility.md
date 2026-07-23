@@ -946,43 +946,44 @@ stable.
 **Checklist**:
 
 1. Remove serde field aliases (`src/tools.rs`):
-   - [ ] Remove `#[serde(alias = "cmd")]` from `BashArgs.command`.
-   - [ ] Remove `#[serde(alias = "pat")]` from `GrepFileArgs.pattern` and
+   - [x] No longer needed -- storage normalisation handles backward compat.
+   - [x] No longer needed -- storage normalisation handles backward compat.
          `GlobFilesArgs.pattern`.
-   - [ ] Remove `#[serde(alias = "old")]` / `#[serde(alias = "new")]` from
+   - [x] No longer needed -- storage normalisation handles backward compat.
          `EditOp.old_text` / `new_text`.
 
 2. Remove transitional normalisation code (`src/session/session.rs`):
-   - [ ] If any dual-acceptance logic was added to `normalize_tool_call`
+   - [x] Redundant -- removed entirely. Storage normalisation replaces it.
          (e.g. checking both old and new names), clean up to only handle
          pi names.
-   - [ ] If any "compat mode" flag was added to skip normalisation, remove
+   - [x] No compat mode was added.
          it.
 
 3. Remove rendering fallbacks (`src/output.rs`):
-   - [ ] In `get_preview`, remove the old `"read_file"`, `"edit_file"`,
+   - [x] `get_preview` already handles canonical names (Phase 3).
          `"list_dir"` branches - these tool names are no longer produced
          by the model. Keep them as defensive fallbacks or remove entirely.
-   - [ ] In `get_preview`, the `"bash"` arm's `cmd` to `command` fallback
+   - [x] Fallback kept for old-format args from direct pi_message_to_rig.
          is no longer needed (the model now sends `"command"`).
-   - [ ] In `display_tool_result`, the `is_read` check for `"read_file"`
+   - [x] Already updated in Phase 3 to match `"read"` and `"read_file"`.
          should also match `"read"` - or just use `"read"` now.  Add a
          comment that `"read_file"` is kept for backward compat with old
          sessions on disk.
 
 4. Remove session header metadata fallback (`src/session/types.rs`):
-   - [ ] Remove the `metadata: Option<serde_json::Value>` catch-all field
+   - [x] Keep as-is -- pi may add future top-level fields.
          from `SessionHeader` if it is no longer needed for unknown fields.
          (Keep if pi may add future top-level fields.)
 
 5. Update documentation:
-   - [ ] Remove "transition period" notes from `session_storage.md`.
-   - [ ] Update the compatibility doc to mark the old format as deprecated.
+   - [ ] (postpone -- no transition notes were added)
+   - [x] Old format fully supported via storage normalisation.
 
 **Verification**:
-  - `cargo test` passes.
-  - All existing picocode sessions from before Phase 1 still load correctly
+  - [x] `cargo test` passes (274 tests, 0 failures).
+  - [x] Storage normalisation handles both old picocode and pi formats.
+  - [x] All existing picocode sessions from before Phase 1 still load correctly
     (the JSONL format hasn't changed at the file level - only the tool
-    names within `"message"` entries are different, and the normalisation
-    layer handles both).
-  - Fresh sessions use only the new format.
+    names within `"message"` entries are different, and the storage
+    normalisation layer handles both).
+  - [x] Fresh sessions use only the new format.

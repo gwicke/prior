@@ -12,6 +12,100 @@ use uuid::Uuid;
 use crate::session::types::*;
 
 // ---------------------------------------------------------------------------
+// In-place normalisation helpers (called during build_index)
+// ---------------------------------------------------------------------------
+
+/// Canonical tool-name mappings.  Every consumer (replay, tree overlay,
+/// context building) sees these names; no downstream normalisation needed.
+const CANONICAL_NAMES: &[(&str, &str)] = &[
+    ("read_file", "read"),
+    ("write_file", "write"),
+    ("edit_file", "edit"),
+    ("grep_text", "grep"),
+    ("list_dir", "ls"),
+    ("glob_files", "find"),
+];
+
+/// Rename argument fields in `args` from old/pi names to canonical names.
+fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
+    let Some(obj) = args.as_object_mut() else { return };
+    match name {
+        "bash" => {
+            // Pi uses "command"; old picocode used "cmd".
+            if let Some(cmd) = obj.remove("cmd") {
+                obj.insert("command".into(), cmd);
+            }
+        }
+        "grep" => {
+            // Canonical is "pattern". Accept both "pat" (old) and "pattern" (pi).
+            if let Some(pat) = obj.remove("pat") {
+                obj.insert("pattern".into(), pat);
+            }
+            obj.remove("glob");
+            obj.remove("ignoreCase");
+            obj.remove("literal");
+            obj.remove("context");
+            obj.remove("limit");
+        }
+        "ls" => {
+            obj.remove("limit");
+        }
+        "find" => {
+            if let Some(pat) = obj.remove("pat") {
+                obj.insert("pattern".into(), pat);
+            }
+            obj.remove("limit");
+        }
+        "edit" => {
+            // Canonical is edits[{oldText,newText}]. Old picocode format used
+            // top-level old/new/all. Pi's format is already canonical.
+            if obj.contains_key("old") {
+                let old_val = obj.remove("old").unwrap();
+                let new_val = obj.remove("new").unwrap_or(serde_json::Value::Null);
+                let path = obj.get("path").cloned();
+                let path = path.unwrap_or(serde_json::Value::Null);
+                *args = serde_json::json!({
+                    "path": path,
+                    "edits": [{"oldText": old_val, "newText": new_val}]
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalise tool-call entries in a `SessionEntry` in place, so that the
+/// in-memory representation uses canonical tool names and argument fields.
+/// Operates on the raw `serde_json::Value` inside `Message` entries.
+fn normalize_entry_in_place(entry: &mut SessionEntry) {
+    let message = match &mut entry.content {
+        SessionEntryContent::Message { message } => message,
+        _ => return,
+    };
+    let Some(arr) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for item in arr.iter_mut() {
+        if item.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let name = match item.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let canonical = CANONICAL_NAMES
+            .iter()
+            .find(|(old, _)| *old == name.as_str())
+            .map(|(_, new)| *new)
+            .unwrap_or(name.as_str());
+        item["name"] = serde_json::Value::String(canonical.to_string());
+        if let Some(args) = item.get_mut("arguments") {
+            normalize_args_in_place(canonical, args);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
 
@@ -173,7 +267,13 @@ impl SessionStorage for JsonlSessionStorage {
             // newline in source), skip gracefully.
             let is_last = (i + 2) == line_count; // +2 because we skip index 0
             match serde_json::from_str::<SessionEntry>(line) {
-                Ok(entry) => {
+                Ok(mut entry) => {
+                    // Normalise tool call names and arguments so that every
+                    // downstream consumer sees canonical names.  This happens
+                    // at the storage boundary (JSONL -> in-memory) so there is
+                    // exactly one obvious place for the transformation.
+                    normalize_entry_in_place(&mut entry);
+
                     // Track parent-child relationships.
                     if let Some(ref pid) = entry.parent_id {
                         children
