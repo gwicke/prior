@@ -285,9 +285,12 @@ pub struct SessionMeta {
     /// A short preview of the first user message in the session.
     pub first_prompt_preview: Option<String>,
     /// Full text of the last user message (for detail display).
+    /// Only populated in the detail view via `read_metadata_detail`.
     pub last_prompt_text: Option<String>,
     /// Timestamp of the last user message.
     pub last_prompt_timestamp: Option<String>,
+    /// Path to the `.jsonl` file on disk.
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
@@ -2473,6 +2476,7 @@ impl Repl {
                 first_prompt_preview: m.first_prompt_preview,
                 last_prompt_text: m.last_prompt_text,
                 last_prompt_timestamp: m.last_prompt_timestamp,
+                path: Some(m.path),
             })
             .collect();
         metas.sort_by(|a, b| {
@@ -2678,7 +2682,14 @@ impl Repl {
             detail_table.add_row(&[&format!("{}: {}", &meta.timestamp, first_text)]);
         }
         {
-            let last_text = meta.last_prompt_text.as_deref().unwrap_or("(none)");
+            // Lazily load the full last prompt text only in the detail view.
+            let last_text = meta.last_prompt_text.clone()
+                .or_else(|| {
+                    let path = meta.path.as_ref()?;
+                    let detail = crate::session::repo::JsonlSessionRepo::read_metadata_detail(path)?;
+                    detail.last_prompt_text
+                })
+                .unwrap_or_else(|| "(none)".to_string());
             let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
             detail_table.add_row(&[&format!("{}: {}", last_ts, last_text)]);
         }
@@ -2759,6 +2770,7 @@ impl Repl {
                 first_prompt_preview: m.first_prompt_preview,
                 last_prompt_text: m.last_prompt_text,
                 last_prompt_timestamp: m.last_prompt_timestamp,
+                path: Some(m.path),
             })
             .collect();
 

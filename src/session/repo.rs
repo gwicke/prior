@@ -141,6 +141,8 @@ impl JsonlSessionRepo {
     }
 
     /// Quick-read metadata from a single JSONL file (header only).
+    /// Does NOT populate `last_prompt_text` — use `read_metadata_detail`
+    /// for the full detail (called once when viewing a single session).
     async fn read_metadata(path: &Path) -> Option<SessionMetadata> {
         let content = tokio::fs::read_to_string(path).await.ok()?;
         let first_line = content.lines().next()?;
@@ -149,7 +151,6 @@ impl JsonlSessionRepo {
         // Count message entries, extract the first user prompt, and track name.
         let mut message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
-        let mut last_prompt_text: Option<String> = None;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
 
@@ -168,7 +169,6 @@ impl JsonlSessionRepo {
                                 let preview: String = text.chars().collect();
                                 first_prompt_preview = Some(preview);
                             }
-                            last_prompt_text = Some(text.chars().collect());
                             if !ts.is_empty() {
                                 last_prompt_timestamp = Some(ts.to_string());
                             }
@@ -197,12 +197,77 @@ impl JsonlSessionRepo {
             message_count,
             token_count: None,
             first_prompt_preview,
-            last_prompt_text,
+            last_prompt_text: None,
             last_prompt_timestamp,
         })
     }
     /// Quick-read metadata from a single JSONL file (header only) — sync version.
+    /// Does NOT populate `last_prompt_text` — use `read_metadata_detail`
+    /// for the full detail (called once when viewing a single session).
     fn read_metadata_sync(path: &Path) -> Option<SessionMetadata> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let first_line = content.lines().next()?;
+        let header: SessionHeader = serde_json::from_str(first_line).ok()?;
+
+        let mut message_count = 0usize;
+        let mut first_prompt_preview = None::<String>;
+        let mut last_prompt_timestamp: Option<String> = None;
+        let mut name: Option<String> = None;
+
+        for line in content.lines().skip(1) {
+            if line.contains("\"type\":\"message\"") {
+                message_count += 1;
+                if line.contains("\"role\":\"user\"") {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        let text = val
+                            .pointer("/message/content/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            if first_prompt_preview.is_none() {
+                                let preview: String = text.chars().collect();
+                                first_prompt_preview = Some(preview);
+                            }
+                            if !ts.is_empty() {
+                                last_prompt_timestamp = Some(ts.to_string());
+                            }
+                        }
+                    }
+                }
+            } else if line.contains("\"type\":\"session_info\"") {
+                // Extract the name from the most recent SessionInfo entry.
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
+                        if !n.is_empty() {
+                            name = Some(n.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(SessionMetadata {
+            id: header.id,
+            timestamp: header.timestamp,
+            cwd: header.cwd,
+            path: path.to_path_buf(),
+            name,
+            parent_session: header.parent_session,
+            message_count,
+            token_count: None,
+            first_prompt_preview,
+            last_prompt_text: None,
+            last_prompt_timestamp,
+        })
+    }
+
+    /// Full metadata read including `last_prompt_text`.
+    ///
+    /// Unlike `read_metadata_sync`, this loads the last user message text
+    /// in full. Only call this when viewing a single session's detail
+    /// (one file read, not N per keystroke).
+    pub(crate) fn read_metadata_detail(path: &Path) -> Option<SessionMetadata> {
         let content = std::fs::read_to_string(path).ok()?;
         let first_line = content.lines().next()?;
         let header: SessionHeader = serde_json::from_str(first_line).ok()?;
@@ -236,7 +301,6 @@ impl JsonlSessionRepo {
                     }
                 }
             } else if line.contains("\"type\":\"session_info\"") {
-                // Extract the name from the most recent SessionInfo entry.
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
                         if !n.is_empty() {
@@ -261,7 +325,6 @@ impl JsonlSessionRepo {
             last_prompt_timestamp,
         })
     }
-
 }
 
 #[async_trait]
