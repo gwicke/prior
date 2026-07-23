@@ -506,6 +506,114 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
     messages
 }
 
+/// Normalise tool call arguments from pi schema to picocode schema.
+///
+/// Pi uses different tool names and argument field names than picocode's
+/// internal representation.  This function maps pi's format to picocode's
+/// canonical format so the rest of the pipeline (replay, rendering, context
+/// building) sees a single, uniform view.
+///
+/// The canonical format (post Phase 2+3) matches pi's naming:
+///
+///   Pi name  | Canonical   | Args
+///   ---------|-------------|-------------------------------
+///   bash     | bash        | command, timeout
+///   read     | read        | path, offset, limit
+///   write    | write       | path, content
+///   edit     | edit        | path, edits[{oldText,newText}]
+///   grep     | grep        | pattern, path
+///   ls       | ls          | path
+///   find     | find        | pattern, path
+///
+/// Old picocode sessions (pre-Phase 1) used different names:
+/// `read_file`, `write_file`, `edit_file`, `grep_text`, `list_dir`,
+/// `glob_files`, and bash used `cmd` instead of `command`.
+/// This function normalises those to the canonical format.
+///
+/// Idempotent: if `tc.function.name` is already canonical the function
+/// returns without mutation.
+fn normalize_tool_call(tc: &mut ToolCall) {
+    let args = &mut tc.function.arguments;
+
+    match tc.function.name.as_str() {
+        // bash — pi and canonical use "command"; old picocode used "cmd".
+        "bash" => {
+            if let Some(cmd_val) = args.as_object_mut().and_then(|m| m.remove("cmd")) {
+                args.as_object_mut().unwrap().insert("command".into(), cmd_val);
+            }
+        }
+        // read — canonical name is "read", args unchanged.
+        "read" => {
+            // Already canonical.
+        }
+        "read_file" => {
+            tc.function.name = "read".into();
+            // args (path, offset, limit) unchanged.
+        }
+        // write — canonical name is "write", args unchanged.
+        "write" => {}
+        "write_file" => {
+            tc.function.name = "write".into();
+        }
+        // edit — canonical name is "edit" with edits[{oldText,newText}].
+        "edit" => {
+            // Already canonical — no transformation needed.
+        }
+        "edit_file" => {
+            // Old picocode sessions: {path, old, new, all} → canonical format.
+            tc.function.name = "edit".into();
+            let path = args.get("path").cloned().unwrap_or(serde_json::Value::Null);
+            let old_val = args.get("old").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let new_val = args.get("new").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            *args = serde_json::json!({
+                "path": path,
+                "edits": [{"oldText": old_val, "newText": new_val}]
+            });
+        }
+        // grep — canonical name is "grep" with "pattern".
+        "grep" => {
+            // If args still use "pat" (from old pi format before normalisation
+            // or from a pre-Phase-2 session), rename to "pattern".
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(pat) = obj.remove("pat") {
+                    obj.insert("pattern".into(), pat);
+                }
+                // Drop fields picocode doesn't use.
+                obj.remove("glob");
+                obj.remove("ignoreCase");
+                obj.remove("literal");
+                obj.remove("context");
+                obj.remove("limit");
+            }
+        }
+        "grep_text" => {
+            tc.function.name = "grep".into();
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(pat) = obj.remove("pat") {
+                    obj.insert("pattern".into(), pat);
+                }
+            }
+        }
+        // ls — canonical name is "ls".
+        "ls" => {}
+        "list_dir" => {
+            tc.function.name = "ls".into();
+        }
+        // find — canonical name is "find" with "pattern".
+        "find" => {}
+        "glob_files" => {
+            tc.function.name = "find".into();
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(pat) = obj.remove("pat") {
+                    obj.insert("pattern".into(), pat);
+                }
+            }
+        }
+        // Already canonical, or an unknown tool — nothing to do.
+        _ => {}
+    }
+}
+
 /// Convert a single pi AgentMessage (user or assistant) to a rig Message.
 fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
     let role = value.get("role")?.as_str()?;
@@ -600,13 +708,14 @@ fn pi_content_to_assistant_content(
                 let id = item.get("id")?.as_str()?.to_string();
                 let name = item.get("name")?.as_str()?.to_string();
                 let arguments = item.get("arguments")?.clone();
-                let tc = ToolCall {
+                let mut tc = ToolCall {
                     id,
                     call_id: None,
                     function: ToolFunction::new(name, arguments),
                     signature: None,
                     additional_params: None,
                 };
+                                normalize_tool_call(&mut tc);
                 items.push(AssistantContent::ToolCall(tc));
             }
             _ => {}
@@ -1009,7 +1118,8 @@ mod tests {
                     AssistantContent::ToolCall(tc) => {
                         assert_eq!(tc.id, "tc_001");
                         assert_eq!(tc.function.name, "bash");
-                        assert_eq!(tc.function.arguments["cmd"], "ls");
+                        // Normalisation renames "cmd" to the canonical "command".
+                        assert_eq!(tc.function.arguments["command"], "ls");
                     }
                     _ => panic!("expected ToolCall"),
                 }
@@ -1459,17 +1569,17 @@ mod tests {
             content: OneOrMany::many(vec![
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
                     id: "tc_0".into(), call_id: None,
-                    function: rig_core::message::ToolFunction::new("read_file".into(), serde_json::json!({})),
+                    function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
                     id: "tc_1".into(), call_id: None,
-                    function: rig_core::message::ToolFunction::new("read_file".into(), serde_json::json!({})),
+                    function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
                     id: "tc_2".into(), call_id: None,
-                    function: rig_core::message::ToolFunction::new("list_dir".into(), serde_json::json!({})),
+                    function: rig_core::message::ToolFunction::new("ls".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
             ]).unwrap(),
@@ -1617,3 +1727,262 @@ mod tests {
         let _ = tokio::fs::remove_file(&path).await;
     }
 }
+
+    #[test]
+    fn test_normalize_tool_call_bash() {
+        // Canonical is "bash" with "command"; old picocode used "cmd".
+        let mut tc = ToolCall {
+            id: "tc_001".into(),
+            call_id: None,
+            function: ToolFunction::new("bash".into(), serde_json::json!({"command": "ls -la"})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "bash");
+        assert_eq!(tc.function.arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_bash_old_cmd() {
+        // Old picocode sessions used "cmd" — should be renamed to "command".
+        let mut tc = ToolCall {
+            id: "tc_001b".into(),
+            call_id: None,
+            function: ToolFunction::new("bash".into(), serde_json::json!({"cmd": "ls -la"})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "bash");
+        assert_eq!(tc.function.arguments["command"], "ls -la");
+        assert!(tc.function.arguments.get("cmd").is_none());
+    }
+
+    #[test]
+    fn test_normalize_tool_call_read() {
+        // Canonical is "read".
+        let mut tc = ToolCall {
+            id: "tc_002".into(),
+            call_id: None,
+            function: ToolFunction::new("read".into(), serde_json::json!({"path": "src/main.rs", "offset": 10, "limit": 20})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "read");
+        assert_eq!(tc.function.arguments["path"], "src/main.rs");
+        assert_eq!(tc.function.arguments["offset"], 10);
+        assert_eq!(tc.function.arguments["limit"], 20);
+    }
+
+    #[test]
+    fn test_normalize_tool_call_read_file_old() {
+        // Old picocode sessions used "read_file" — should be renamed to "read".
+        let mut tc = ToolCall {
+            id: "tc_002b".into(),
+            call_id: None,
+            function: ToolFunction::new("read_file".into(), serde_json::json!({"path": "src/main.rs"})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "read");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_write() {
+        // Canonical is "write".
+        let mut tc = ToolCall {
+            id: "tc_003".into(),
+            call_id: None,
+            function: ToolFunction::new("write".into(), serde_json::json!({"path": "out.txt", "content": "hello"})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "write");
+        assert_eq!(tc.function.arguments["content"], "hello");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_edit() {
+        // Canonical is "edit" with edits[{oldText,newText}] — unchanged.
+        let mut tc = ToolCall {
+            id: "tc_004".into(),
+            call_id: None,
+            function: ToolFunction::new("edit".into(), serde_json::json!({
+                "path": "src/main.rs",
+                "edits": [{"oldText": "foo", "newText": "bar"}]
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "edit");
+        assert_eq!(tc.function.arguments["path"], "src/main.rs");
+        assert_eq!(tc.function.arguments["edits"][0]["oldText"], "foo");
+        assert_eq!(tc.function.arguments["edits"][0]["newText"], "bar");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_edit_file_old() {
+        // Old picocode sessions used "edit_file" with old/new/all.
+        let mut tc = ToolCall {
+            id: "tc_004b".into(),
+            call_id: None,
+            function: ToolFunction::new("edit_file".into(), serde_json::json!({
+                "path": "src/main.rs",
+                "old": "foo",
+                "new": "bar",
+                "all": false,
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "edit");
+        assert_eq!(tc.function.arguments["edits"][0]["oldText"], "foo");
+        assert_eq!(tc.function.arguments["edits"][0]["newText"], "bar");
+        assert!(tc.function.arguments.get("old").is_none());
+        assert!(tc.function.arguments.get("all").is_none());
+    }
+
+    #[test]
+    fn test_normalize_tool_call_grep() {
+        // Canonical is "grep" with "pattern".
+        let mut tc = ToolCall {
+            id: "tc_005".into(),
+            call_id: None,
+            function: ToolFunction::new("grep".into(), serde_json::json!({
+                "pattern": "fn main",
+                "path": "src/",
+                "glob": "*.rs",
+                "context": 3,
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "grep");
+        assert_eq!(tc.function.arguments["pattern"], "fn main");
+        assert_eq!(tc.function.arguments["path"], "src/");
+        // Extra fields should be dropped.
+        assert!(tc.function.arguments.get("glob").is_none());
+        assert!(tc.function.arguments.get("context").is_none());
+        assert!(tc.function.arguments.get("ignoreCase").is_none());
+        assert!(tc.function.arguments.get("literal").is_none());
+        assert!(tc.function.arguments.get("limit").is_none());
+    }
+
+    #[test]
+    fn test_normalize_tool_call_grep_text_old() {
+        // Old picocode sessions used "grep_text" with "pat".
+        let mut tc = ToolCall {
+            id: "tc_005b".into(),
+            call_id: None,
+            function: ToolFunction::new("grep_text".into(), serde_json::json!({
+                "pat": "fn main",
+                "path": "src/",
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "grep");
+        assert_eq!(tc.function.arguments["pattern"], "fn main");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_ls() {
+        // Canonical is "ls".
+        let mut tc = ToolCall {
+            id: "tc_006".into(),
+            call_id: None,
+            function: ToolFunction::new("ls".into(), serde_json::json!({"path": "."})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "ls");
+        assert_eq!(tc.function.arguments["path"], ".");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_list_dir_old() {
+        // Old picocode sessions used "list_dir".
+        let mut tc = ToolCall {
+            id: "tc_006b".into(),
+            call_id: None,
+            function: ToolFunction::new("list_dir".into(), serde_json::json!({"path": "."})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "ls");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_find() {
+        // Canonical is "find" with "pattern".
+        let mut tc = ToolCall {
+            id: "tc_007".into(),
+            call_id: None,
+            function: ToolFunction::new("find".into(), serde_json::json!({
+                "pattern": "*.ts",
+                "path": "src/",
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "find");
+        assert_eq!(tc.function.arguments["pattern"], "*.ts");
+        assert_eq!(tc.function.arguments["path"], "src/");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_glob_files_old() {
+        // Old picocode sessions used "glob_files" with "pat".
+        let mut tc = ToolCall {
+            id: "tc_007b".into(),
+            call_id: None,
+            function: ToolFunction::new("glob_files".into(), serde_json::json!({
+                "pat": "*.ts",
+                "path": "src/",
+            })),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "find");
+        assert_eq!(tc.function.arguments["pattern"], "*.ts");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_idempotent() {
+        // Already canonical should be unchanged.
+        let mut tc = ToolCall {
+            id: "tc_008".into(),
+            call_id: None,
+            function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "read");
+    }
+
+    #[test]
+    fn test_normalize_tool_call_unknown_passthrough() {
+        // Unknown tool name should be unchanged.
+        let mut tc = ToolCall {
+            id: "tc_009".into(),
+            call_id: None,
+            function: ToolFunction::new("unknown_tool".into(), serde_json::json!({"x": 1})),
+            signature: None,
+            additional_params: None,
+        };
+        normalize_tool_call(&mut tc);
+        assert_eq!(tc.function.name, "unknown_tool");
+    }

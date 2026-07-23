@@ -17,6 +17,7 @@ use libc;
 use crossterm::event::{self, Event, KeyCode};
 use crate::repl::Repl;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
+use crate::tools::EditOp;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -526,7 +527,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
     let get_u64 = |key: &str| obj.and_then(|o| o.get(key)).and_then(|v| v.as_u64());
 
     match name.to_lowercase().as_str() {
-        "read_file" => {
+        "read" | "read_file" => {
             let path = get_str("path").unwrap_or("");
             let offset = get_u64("offset").unwrap_or(0);
             let limit = get_u64("limit").unwrap_or(0);
@@ -543,29 +544,53 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
         }
         "bash" => {
             // Show the *entire* command line; never shorten it. Prefix with `$`
-            // so it reads like a shell prompt.
-            let cmd = get_str("cmd").unwrap_or("").trim();
+            // so it reads like a shell prompt. The canonical field is "command";
+            // old sessions may have "cmd".
+            let cmd = get_str("command")
+                .or_else(|| get_str("cmd"))
+                .unwrap_or("")
+                .trim();
             (format!("$ {}", cmd), Vec::new())
         }
         s if s.starts_with("grep") => {
-            // Grep_* family: label as `grep`, showing the full pattern and the
-            // full search path (never truncated).
-            let pat = get_str("pat")
-                .or_else(|| get_str("pattern"))
+            // Grep tool: show pattern (from "pattern" or "pat") and path.
+            let pat = get_str("pattern")
+                .or_else(|| get_str("pat"))
                 .unwrap_or("");
             let path = get_str("path").unwrap_or("");
             (format!("grep {} {}", pat, path), Vec::new())
         }
-        s if s.starts_with("list") => {
-            // `list_dir` (and any `List_*` variant): shorten to `ls`.
+        s if s == "ls" || s.starts_with("list") => {
+            // `ls` (canonical) or `list_dir` / `List*` (old): shorten to `ls`.
             let path = get_str("path").unwrap_or("");
             (format!("ls {}", path), Vec::new())
         }
-        "edit_file" => {
+        "edit" | "edit_file" => {
             let path = get_str("path").unwrap_or("");
-            let old = get_str("old").unwrap_or("");
-            let new = get_str("new").unwrap_or("");
-            let (range, diff) = edit_preview(path, old, new);
+            // Try canonical format (edits array) first, fall back to old format.
+            let edits: Vec<EditOp> = if let Some(edits_array) =
+                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
+            {
+                edits_array
+                    .iter()
+                    .filter_map(|e| {
+                        Some(EditOp {
+                            old_text: e.get("oldText")?.as_str()?.to_string(),
+                            new_text: e.get("newText")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            let (range, diff) = if !edits.is_empty() {
+                edit_preview(path, &edits)
+            } else {
+                // Old format: old/new fields.
+                let old = get_str("old").unwrap_or("");
+                let new_str = get_str("new").unwrap_or("");
+                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string() }])
+            };
             let mut s = format!("edit {}", path);
             if let Some(r) = range {
                 s.push_str(&format!(" [{}]", r));
@@ -590,23 +615,28 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
     }
 }
 
-/// Best-effort line range + diff preview for an `edit_file` call.
+/// Best-effort line range + diff preview for an edit tool call.
 ///
-/// Locates `old` in the current file contents (the edit has not run yet, so the
-/// text still matches) to derive the 1-based `[start..end]` line window, and
-/// emits a compact `-`/`+` preview of the change. A failed read or a missing
-/// `old` both degrade gracefully to `(None, [])` so the caller just prints
-/// `edit <path>` with no range/diff.
-fn edit_preview(path: &str, old: &str, new: &str) -> (Option<String>, Vec<String>) {
+/// Uses the first edit in the `edits` slice. Locates `old_text` in the current
+/// file contents (the edit has not run yet, so the text still matches) to
+/// derive the 1-based `[start..end]` line window, and emits a compact `-`/`+`
+/// preview of the change. A failed read, missing old_text, or empty edits all
+/// degrade gracefully to `(None, [])` so the caller just prints `edit <path>`
+/// with no range/diff.
+fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
+    let first = match edits.first() {
+        Some(e) => e,
+        None => return (None, Vec::new()),
+    };
     let Ok(content) = std::fs::read_to_string(path) else {
         return (None, Vec::new());
     };
-    let Some(idx) = content.find(old) else {
+    let Some(idx) = content.find(&first.old_text) else {
         return (None, Vec::new());
     };
-    // 1-based line number of the first line of `old`.
+    // 1-based line number of the first line of `old_text`.
     let start = content[..idx].matches('\n').count() + 1;
-    let end = start + old.matches('\n').count();
+    let end = start + first.old_text.matches('\n').count();
     let range = if start == end {
         format!("{start}")
     } else {
@@ -616,8 +646,8 @@ fn edit_preview(path: &str, old: &str, new: &str) -> (Option<String>, Vec<String
     // Compact diff preview: removed lines, then added lines, capped so huge
     // replacements don't flood the scrollback.
     const MAX: usize = 8;
-    let old_lines: Vec<&str> = old.split('\n').collect();
-    let new_lines: Vec<&str> = new.split('\n').collect();
+    let old_lines: Vec<&str> = first.old_text.split('\n').collect();
+    let new_lines: Vec<&str> = first.new_text.split('\n').collect();
     let clip = |lines: &[&str]| -> Vec<String> {
         if lines.len() > MAX {
             lines[..MAX - 1]
@@ -1325,7 +1355,7 @@ impl Output for ConsoleOutput {
         let tool = self.last_tool.lock().unwrap().clone();
         let is_read = tool
             .as_ref()
-            .map(|(n, _)| n.eq_ignore_ascii_case("read_file"))
+            .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
             .unwrap_or(false);
         let read_path = tool
             .as_ref()

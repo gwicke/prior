@@ -954,11 +954,11 @@ const DEFAULT_AGENT_PROMPT: &str = r#"You are picocode, a world-class software e
 Your mission is to assist the user in their development tasks by utilizing a set of specialized tools. You operate within a specific codebase and must maintain its integrity while delivering high-quality solutions.
 
 ### WORKFLOW & STRATEGY
-1. **Understand Before Acting**: Always start by exploring the codebase. Use `list_dir` to see the structure and `read_file` or `grep_text` to understand existing logic and patterns.
-2. **Be Precise**: When editing files, use `edit_file` with enough context in `old_string` to ensure a unique match. Avoid replacing large blocks if a small change suffices.
+1. **Understand Before Acting**: Always start by exploring the codebase. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
+2. **Be Precise**: When editing files, use `edit` with enough context in `oldText` to ensure a unique match. You can pass multiple edits at once via the `edits` array. Avoid replacing large blocks if a small change suffices.
 3. **Verify Everything**: After modifying code, verify the results. Run tests or build commands via `bash`. Read the modified file to ensure the change was applied correctly.
 4. **Tool Mastery**:
-   - `read_file`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
+   - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
    - `bash`: Your window to the system. Use it for compilation, testing, and complex automation.
    - `w3m in the shell`: Use for external documentation, searching for solutions (use duckduckgo.com), or web-related debugging.
 5. **Context**: You are working in the directory provided below. All paths are relative to this directory.
@@ -1026,7 +1026,7 @@ fn build_rig_agent<M: CompletionModel>(
         Some(Arc::new(move |args| {
             auto_allow.iter().any(|pattern| {
                 regex::Regex::new(pattern)
-                    .map(|re| re.is_match(&args.cmd))
+                    .map(|re| re.is_match(&args.command))
                     .unwrap_or(false)
             })
         })),

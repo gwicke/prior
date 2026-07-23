@@ -99,6 +99,7 @@ fn walk_files(base: &std::path::Path) -> impl Iterator<Item = ignore::DirEntry> 
 }
 
 #[rig_tool(
+    name = "read",
     description = "Read file with line numbers",
     required(path, offset, limit)
 )]
@@ -118,52 +119,66 @@ pub async fn read_file(path: String, offset: u64, limit: u64) -> Result<String, 
     Ok(lines.concat())
 }
 
-#[rig_tool(description = "Write content to file", required(path, content))]
+#[rig_tool(name = "write", description = "Write content to file", required(path, content))]
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
     fs::write(get_path_with(&path, true)?, content).await?;
     Ok("ok".into())
 }
 
-#[rig_tool(
-    description = "Replace old with new in file (old must be unique unless all=true)",
-    required(path, old, new, all)
-)]
-pub async fn edit_file(
-    path: String,
-    old: String,
-    new: String,
-    all: bool,
-) -> Result<String, ToolError> {
-    let p = get_path_with(&path, true)?;
-    let text = fs::read_to_string(&p).await?;
-    if !text.contains(&old) {
-        return Ok("error: old_string not found".into());
-    }
-    let count = text.matches(&old).count();
-    if !all && count > 1 {
-        return Ok(format!(
-            "error: old_string appears {count} times, must be unique (use all=true)"
-        ));
-    }
-    fs::write(
-        p,
-        if all {
-            text.replace(&old, &new)
-        } else {
-            text.replacen(&old, &new, 1)
-        },
-    )
-    .await?;
-    Ok("ok".into())
+/// A single targeted text replacement within a file.
+#[derive(Deserialize, Serialize, JsonSchema)]
+pub struct EditOp {
+    /// Exact text to replace. Must be unique in the file and must not
+    /// overlap with any other edit's old_text in the same call.
+    #[serde(rename = "oldText")]
+    pub old_text: String,
+    /// Replacement text.
+    #[serde(rename = "newText")]
+    pub new_text: String,
 }
 
 #[rig_tool(
-    description = "Find files by pattern, sorted by mtime",
-    required(pat, path)
+    name = "edit",
+    description = "Replace text in file using one or more targeted edits. Each edit must match unique text. Edits target the original file, not the output of previous edits.",
+    required(path, edits)
 )]
-pub async fn glob_files(pat: String, path: String) -> Result<String, ToolError> {
+pub async fn edit_file(
+    path: String,
+    edits: Vec<EditOp>,
+) -> Result<String, ToolError> {
+    let p = get_path_with(&path, true)?;
+    let text = fs::read_to_string(&p).await?;
+    for (i, edit) in edits.iter().enumerate() {
+        if !text.contains(&edit.old_text) {
+            return Ok(format!(
+                "error: old_string '{}' (edit #{}) not found",
+                edit.old_text, i + 1
+            ));
+        }
+        let count = text.matches(&edit.old_text).count();
+        if count > 1 {
+            return Ok(format!(
+                "error: old_string '{}' (edit #{}) appears {count} times, must be unique",
+                edit.old_text, i + 1
+            ));
+        }
+    }
+    let mut result = text;
+    for edit in &edits {
+        result = result.replacen(&edit.old_text, &edit.new_text, 1);
+    }
+    fs::write(&p, result).await?;
+    Ok(format!("Successfully replaced {} block(s) in {}", edits.len(), path))
+}
+
+#[rig_tool(
+    name = "find",
+    description = "Find files by pattern, sorted by mtime",
+    required(pattern, path)
+)]
+pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolError> {
     let base = get_path(&path)?;
-    let matcher = globset::Glob::new(&pat)
+    let matcher = globset::Glob::new(&pattern)
         .map_err(|e| ToolError::Generic(e.to_string()))?
         .compile_matcher();
     let entries = tokio::task::spawn_blocking(move || {
@@ -188,8 +203,8 @@ pub async fn glob_files(pat: String, path: String) -> Result<String, ToolError> 
     Ok(if res.is_empty() { "none".into() } else { res })
 }
 
-#[rig_tool(description = "Search files for a regex pattern (ripgrep)", required(pat, path))]
-pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
+#[rig_tool(name = "grep", description = "Search files for a regex pattern (ripgrep)", required(pattern, path))]
+pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolError> {
     // Validate the search root against the active path policy (or cwd bounds);
     // ripgrep itself runs confined inside a read-only sandbox.
     let _ = get_path(&path)?;
@@ -216,7 +231,7 @@ pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
         "--max-count".into(),
         "500".into(),
         "-e".into(),
-        pat,
+        pattern,
         path,
     ];
     let raw = run_sandboxed_ro(&argv, &cfg, timeout).await?;
@@ -231,7 +246,7 @@ pub async fn grep_text(pat: String, path: String) -> Result<String, ToolError> {
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct BashArgs {
     /// The shell command to execute.
-    pub cmd: String,
+    pub command: String,
     /// Optional timeout in seconds for this command. Overrides the configured
     /// default (`tool_config.bash.sandbox.timeout_secs`). Must be a positive
     /// finite number; values above the maximum are rejected. Leave unset to use
@@ -262,7 +277,7 @@ impl rig_core::tool::Tool for Bash {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
-        run_sandboxed(&args.cmd, args.timeout).await
+        run_sandboxed(&args.command, args.timeout).await
     }
 }
 
@@ -917,7 +932,7 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-#[rig_tool(description = "List files and directories in a path", required(path))]
+#[rig_tool(name = "ls", description = "List files and directories in a path", required(path))]
 pub async fn list_dir(path: String) -> Result<String, ToolError> {
     let base = get_path(&path)?;
 
