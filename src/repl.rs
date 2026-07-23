@@ -2480,7 +2480,11 @@ impl Repl {
             let b_cur = b.id == ctx.current_session_id;
             if a_cur && !b_cur { std::cmp::Ordering::Less }
             else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-            else { b.timestamp.cmp(&a.timestamp) }
+            else {
+                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
+                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
+                b_ts.cmp(a_ts)
+            }
         });
 
         // Fuzzy-filter by name, prompt preview, id, and cwd.
@@ -2524,7 +2528,8 @@ impl Repl {
                 .rev()
                 .collect::<Vec<_>>()
                 .join("/");
-            let rel = Self::relative_time(&meta.timestamp);
+            let rel_ts = meta.last_prompt_timestamp.as_ref().unwrap_or(&meta.timestamp);
+            let rel = Self::relative_time(rel_ts);
             let info = format!("{}  {}", meta.message_count, rel);
             table.add_row(&[marker, &display_name, &dir_display, &info]);
         }
@@ -2757,13 +2762,17 @@ impl Repl {
             })
             .collect();
 
-        // Sort: current session first, then by timestamp descending.
+        // Sort: current session first, then by last modification timestamp descending.
         metas.sort_by(|a, b| {
             let a_cur = a.id == ctx.current_session_id;
             let b_cur = b.id == ctx.current_session_id;
             if a_cur && !b_cur { std::cmp::Ordering::Less }
             else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-            else { b.timestamp.cmp(&a.timestamp) }
+            else {
+                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
+                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
+                b_ts.cmp(a_ts)
+            }
         });
 
         if fuzzy_filter.is_empty() {

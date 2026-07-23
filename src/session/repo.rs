@@ -4,7 +4,10 @@
 //! sessions are stored under `base_dir/<cwd-encoded>/<timestamp>_<uuid>.jsonl`.
 //! The CWD-based directory structure groups sessions by working directory.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use chrono::Utc;
 
@@ -57,13 +60,67 @@ pub trait SessionRepo: Send + Sync {
 #[derive(Clone)]
 pub struct JsonlSessionRepo {
     base_dir: PathBuf,
+    /// Shared session metadata cache for the sync listing path (overlay).
+    /// Clone shares the same `Arc`, so all copies see updates.
+    cache: Arc<Mutex<Option<SessionMetaCache>>>,
 }
+
+// ---------------------------------------------------------------------------
+// Session metadata cache (for sync listing path)
+// ---------------------------------------------------------------------------
+
+/// Cached metadata for one session directory (one encoded-CWD subdirectory).
+struct CachedDir {
+    /// mtime of the directory itself.
+    dir_mtime: Option<SystemTime>,
+    /// Per-file mtime for each `.jsonl` in this directory.
+    file_mtimes: HashMap<PathBuf, SystemTime>,
+    /// Sorted sessions (most recent first, by `timestamp`).
+    sessions: Vec<SessionMetadata>,
+}
+
+/// Lightweight cache for session metadata listings.
+///
+/// Validates freshness by comparing directory and file mtimes.
+/// A full re-scan is triggered at most once every 2 seconds.
+struct SessionMetaCache {
+    /// When the last validation completed (monotonic clock).
+    last_validated_at: Instant,
+    /// Per-directory cached state, keyed by the resolved directory path.
+    dirs: HashMap<PathBuf, CachedDir>,
+}
+
+impl SessionMetaCache {
+    fn new() -> Self {
+        Self {
+            // Start far enough in the past so the first call always validates.
+            last_validated_at: Instant::now() - Duration::from_secs(10),
+            dirs: HashMap::new(),
+        }
+    }
+
+    /// Return cached sessions for the given directories, merged and sorted.
+    fn get_sessions(&self, dirs: &[PathBuf]) -> Vec<SessionMetadata> {
+        let mut all = Vec::new();
+        for dir in dirs {
+            if let Some(d) = self.dirs.get(dir) {
+                all.extend(d.sessions.iter().cloned());
+            }
+        }
+        all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        all
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JsonlSessionRepo implementation
+// ---------------------------------------------------------------------------
 
 impl JsonlSessionRepo {
     /// Create a new repo rooted at `base_dir` (typically
     /// `~/.picocode/sessions/`).
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self { base_dir, cache: Arc::new(Mutex::new(None)) }
     }
 
     /// The absolute base directory for session storage.
@@ -205,25 +262,6 @@ impl JsonlSessionRepo {
         })
     }
 
-    /// Synchronously list all session files under a given directory.
-    /// Used by the overlay (avoids async machinery on each keystroke).
-    fn list_sessions_in_dir(dir: &Path) -> Vec<SessionMetadata> {
-        let mut sessions = Vec::new();
-        let read_dir = match std::fs::read_dir(dir) {
-            Ok(r) => r,
-            Err(_) => return sessions,
-        };
-        for entry in read_dir.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "jsonl") {
-                if let Some(meta) = Self::read_metadata_sync(&path) {
-                    sessions.push(meta);
-                }
-            }
-        }
-        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        sessions
-    }
 }
 
 #[async_trait]
@@ -349,7 +387,11 @@ impl JsonlSessionRepo {
     /// Synchronously list all session metadata, optionally filtered by CWD.
     /// Mirrors the async `SessionRepo::list` but uses std::fs for direct use
     /// in the overlay (avoiding async machinery on each keystroke).
+    ///
+    /// Uses a 2-second debounced cache validated by directory + file mtimes.
+    /// Within the debounce window, returns cached results with zero I/O.
     pub(crate) fn list_sessions_sync(&self, cwd: Option<&Path>) -> Vec<SessionMetadata> {
+        // Resolve directories to scan.
         let dirs: Vec<PathBuf> = if let Some(cwd) = cwd {
             let dir = self.session_dir(cwd);
             if dir.try_exists().unwrap_or(false) {
@@ -370,12 +412,76 @@ impl JsonlSessionRepo {
             dirs
         };
 
-        let mut sessions = Vec::new();
-        for dir in &dirs {
-            sessions.extend(Self::list_sessions_in_dir(dir));
+        if dirs.is_empty() {
+            return Vec::new();
         }
-        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        sessions
+
+        // Lock cache and check debounce.
+        let mut cache_guard = self.cache.lock().unwrap();
+        if let Some(ref cache) = *cache_guard {
+            if cache.last_validated_at.elapsed() < Duration::from_secs(2) {
+                return cache.get_sessions(&dirs);
+            }
+        }
+
+        // Validate (or initialise) the cache.
+        let cache: &mut SessionMetaCache = cache_guard.get_or_insert_with(SessionMetaCache::new);
+        cache.last_validated_at = Instant::now();
+
+        for dir in &dirs {
+            let dir_meta = std::fs::symlink_metadata(dir).ok();
+            let dir_mtime = dir_meta.and_then(|m| m.modified().ok());
+            let cached = cache.dirs.get(dir);
+
+            if cached.and_then(|c| c.dir_mtime) == dir_mtime && cached.is_some() {
+                continue;  // directory untouched, all files inside are unchanged
+            }
+
+            // Re-scan: stat each .jsonl, only re-read changed/new files.
+            let mut sessions = Vec::new();
+            let mut file_mtimes: HashMap<PathBuf, SystemTime> = HashMap::new();
+
+            if let Ok(read_dir) = std::fs::read_dir(dir) {
+                for entry in read_dir.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if !path.extension().map_or(false, |e| e == "jsonl") {
+                        continue;
+                    }
+                    let file_mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+
+                    // Reuse cached metadata if file mtime matches.
+                    if let Some(file_mt) = file_mtime {
+                        let cached_mt = cached
+                            .and_then(|c| c.file_mtimes.get(&path).copied());
+                        if Some(file_mt) == cached_mt {
+                            if let Some(old) = cached
+                                .and_then(|c| c.sessions.iter().find(|s| s.path == path))
+                            {
+                                sessions.push(old.clone());
+                                file_mtimes.insert(path, file_mt);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Cache miss or changed file: re-read metadata.
+                    if let Some(meta) = Self::read_metadata_sync(&path) {
+                        if let Some(mt) = file_mtime {
+                            file_mtimes.insert(path, mt);
+                        }
+                        sessions.push(meta);
+                    }
+                }
+            }
+
+            sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            cache.dirs.insert(
+                dir.clone(),
+                CachedDir { dir_mtime, file_mtimes, sessions },
+            );
+        }
+
+        cache.get_sessions(&dirs)
     }
 }
 
