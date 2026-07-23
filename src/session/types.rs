@@ -80,6 +80,15 @@ pub struct SessionHeader {
     /// Optional metadata blob.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    /// Provider name (pi-compatible top-level metadata).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model ID (pi-compatible top-level metadata).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Thinking level (pi-compatible top-level metadata).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
 }
 
 impl SessionHeader {
@@ -94,13 +103,41 @@ impl SessionHeader {
             cwd: cwd.to_string_lossy().to_string(),
             parent_session: None,
             metadata: None,
+            provider: None,
+            model_id: None,
+            thinking_level: None,
         }
     }
 
-    /// Create a new session header with a parent session link (for forks).
-    pub fn forked(cwd: &std::path::Path, parent: PathBuf) -> Self {
+    /// Create a new session header with optional model context metadata.
+    pub fn with_model_context(
+        cwd: &std::path::Path,
+        provider: Option<String>,
+        model_id: Option<String>,
+        thinking_level: Option<String>,
+    ) -> Self {
+        Self {
+            provider,
+            model_id,
+            thinking_level,
+            ..Self::new(cwd)
+        }
+    }
+
+    /// Create a new session header with a parent session link (for forks),
+    /// carrying forward the parent's provider/model/thinking metadata.
+    pub fn forked(
+        cwd: &std::path::Path,
+        parent: PathBuf,
+        provider: Option<String>,
+        model_id: Option<String>,
+        thinking_level: Option<String>,
+    ) -> Self {
         Self {
             parent_session: Some(parent),
+            provider,
+            model_id,
+            thinking_level,
             ..Self::new(cwd)
         }
     }

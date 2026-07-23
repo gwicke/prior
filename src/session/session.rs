@@ -135,6 +135,13 @@ impl Session {
         let messages = extract_messages(&transformed);
         let thinking_level = derive_thinking_level(&transformed);
         let model = derive_model(&transformed);
+
+        // If deriving from entries yielded nothing, fall back to the session
+        // header's provider/model/thinking metadata (pi stores these at the
+        // top level of the header, not as separate entries).
+        let index = self.index.lock().await;
+        let thinking_level = thinking_level.or_else(|| index.header.thinking_level.clone());
+        let model = model.or_else(|| index.header.model_id.clone());
         Ok(SessionContext {
             messages,
             thinking_level,
@@ -2158,4 +2165,45 @@ mod tests {
         assert!(read_ok, "should have a read tool result with toolName 'read'");
 
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[test]
+    fn test_header_metadata_roundtrip() {
+        // Create a header with provider/model/thinking set.
+        let cwd = std::path::Path::new("/test");
+        let header = SessionHeader::with_model_context(
+            cwd,
+            Some("anthropic".into()),
+            Some("claude-sonnet-4-5".into()),
+            Some("off".into()),
+        );
+        assert_eq!(header.provider.as_deref(), Some("anthropic"));
+        assert_eq!(header.model_id.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(header.thinking_level.as_deref(), Some("off"));
+
+        // Serialise and deserialise to verify roundtrip.
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(json.contains("\"provider\":\"anthropic\""));
+        assert!(json.contains("\"modelId\":\"claude-sonnet-4-5\""));
+        assert!(json.contains("\"thinkingLevel\":\"off\""));
+
+        let deserialised: SessionHeader = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialised.provider.as_deref(), Some("anthropic"));
+        assert_eq!(deserialised.model_id.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(deserialised.thinking_level.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn test_header_metadata_absent_by_default() {
+        // A default header should have no model metadata.
+        let cwd = std::path::Path::new("/test");
+        let header = SessionHeader::new(cwd);
+        assert!(header.provider.is_none());
+        assert!(header.model_id.is_none());
+        assert!(header.thinking_level.is_none());
+
+        let json = serde_json::to_string(&header).unwrap();
+        assert!(!json.contains("\"provider\""));
+        assert!(!json.contains("\"modelId\""));
+        assert!(!json.contains("\"thinkingLevel\""));
     }

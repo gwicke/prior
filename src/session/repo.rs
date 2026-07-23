@@ -310,7 +310,13 @@ impl SessionRepo for JsonlSessionRepo {
         let path = self.session_file_path(cwd);
         let new_storage = JsonlSessionStorage::open_or_create(path).await?;
 
-        let header = SessionHeader::forked(cwd, source.path.clone());
+        let header = SessionHeader::forked(
+            cwd,
+            source.path.clone(),
+            source_index.header.provider.clone(),
+            source_index.header.model_id.clone(),
+            source_index.header.thinking_level.clone(),
+        );
         new_storage.write_header(&header).await?;
 
         // Write the forked entries in root→leaf order.

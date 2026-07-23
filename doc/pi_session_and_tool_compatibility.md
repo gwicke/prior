@@ -877,49 +877,48 @@ when no `ModelChange`/`ThinkingLevelChange` entries exist.
 
   - `src/session/types.rs`
   - `src/session/session.rs`
-  - `src/session/storage.rs` (if header parsing changes)
+  - `src/session/storage.rs` (no changes needed)
   - `src/agent.rs` (where session is created or resumed)
 
 **Checklist**:
 
 1. Update `SessionHeader` struct (`src/session/types.rs`):
-   - [ ] Add `provider: Option<String>` with `#[serde(skip_serializing_if =
+   - [x] Add `provider: Option<String>` with `#[serde(skip_serializing_if =
          "Option::is_none")]`.
-   - [ ] Add `model_id: Option<String>` with `#[serde(rename = "modelId",
+   - [x] Add `model_id: Option<String>` with `#[serde(skip_serializing_if,
          skip_serializing_if = "Option::is_none")]`.
-   - [ ] Add `thinking_level: Option<String>` with `#[serde(rename =
-         "thinkingLevel", skip_serializing_if = "Option::is_none")]`.
+   - [x] Add `thinking_level: Option<String>` with `#[serde(skip_serializing_if, skip_serializing_if = "Option::is_none")]`.
 
 2. Update `SessionHeader::new()` and `::forked()`:
-   - [ ] Accept optional `provider`, `model_id`, `thinking_level` params.
-   - [ ] Set them on the header.
+   - [x] Accept optional `provider`, `model_id`, `thinking_level` params.
+   - [x] Set them on the header.
 
 3. Wire into session creation (`src/agent.rs`):
-   - [ ] At the point where a new `Session` is created (in
+   - [x] At the point where a new `Session` is created (in
          `run_interactive` or the agent loop), pass the current
          provider/model/thinking level into `SessionHeader::new()`.
 
 4. Wire into session resume (`src/session/session.rs`):
-   - [ ] In `Session::new_persisted` or a new `restore_model_context()`
+   - [x] In `build_context()`: fall back to header `model_id` /
          method, check whether the index already has `ModelChange` /
          `ThinkingLevelChange` entries.
-   - [ ] If not, and the header has `provider`/`model_id`/`thinking_level`,
+   - [x] If no `ModelChange`/`ThinkingLevelChange` entries found on branch,
          synthesise virtual entries at the root of the entry tree so
          `build_context()` returns the correct values.
-   - [ ] The virtual entries are in-memory only; they are never written to
+   - [x] (approach: direct fallback in `build_context` instead of virtual entries)
          the JSONL file (which already has the header metadata).
 
 5. Update `SessionContext` derivation in `session.rs`:
-   - [ ] `derive_model()` currently scans entries for `ModelChange` entries.
+   - [x] No change needed -- `build_context` fallback makes this unnecessary.
          It should also check a passed-in default from the header.
-   - [ ] `derive_thinking_level()` similarly.
-   - [ ] Alternatively, the synthesis approach (step 4) makes this
+   - [x] No change needed -- `build_context` fallback makes this unnecessary.
+   - [x] (see step 4 -- direct fallback approach used instead)
          unnecessary - `build_context()` already works.
 
 6. Add a roundtrip test:
-   - [ ] Create a session header with provider/model/thinking set.
-   - [ ] Serialise to JSON, deserialise back.
-   - [ ] Assert the fields survive the roundtrip.
+   - [x] `test_header_metadata_roundtrip`: serialise/deserialise roundtrip.
+   - [x] `test_header_metadata_absent_by_default`: default header has no metadata.
+   - [x] Both tests pass.
 
 **Verification**:
   - `cargo test session::` passes (especially

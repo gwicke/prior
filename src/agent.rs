@@ -1693,6 +1693,9 @@ fn collect_entries_for_branch_summary(
 pub(crate) async fn ensure_session(
     session: &mut Option<Session>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
+    provider: Option<String>,
+    model: Option<String>,
+    thinking_level: Option<String>,
 ) {
     if session.is_some() {
         return;
@@ -1709,7 +1712,9 @@ pub(crate) async fn ensure_session(
         Ok(storage) => {
             let index = storage.build_index().await
                 .unwrap_or_else(|_| crate::session::SessionIndex {
-                    header: crate::session::SessionHeader::new(&cwd),
+                    header: crate::session::SessionHeader::with_model_context(
+                        &cwd, provider, model, thinking_level,
+                    ),
                     entries: std::collections::HashMap::new(),
                     leaf_id: None,
                     children: std::collections::HashMap::new(),
@@ -1835,7 +1840,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     } else {
         (None, None)
     };
-    ensure_session(&mut session, &repo).await;
+    ensure_session(
+        &mut session,
+        &repo,
+        Some(config.provider.clone()),
+        Some(config.model.clone()),
+        config.thinking_level.clone(),
+    ).await;
     let mut current_session_id = session
         .as_ref()
         .map(|s| s.get_session_id().to_string())
