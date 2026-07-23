@@ -12,6 +12,7 @@
 //! Messages are stored as raw `serde_json::Value` in pi's `AgentMessage` format.
 //! The conversion to rig's `Message` happens only in `build_context()`.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -44,6 +45,10 @@ pub struct Session {
     /// Set `true` on the first append. Avoids empty `.jsonl` files for
     /// sessions where no turn was ever taken.
     persisted: AtomicBool,
+    /// Tracks `call_id → tool_name` across `append_message` calls so that
+    /// tool result entries written to JSONL carry the correct `"toolName"`
+    /// field (pi-compatible) instead of the placeholder `"tool"`.
+    tool_name_by_call_id: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Session {
@@ -59,6 +64,7 @@ impl Session {
             index: Arc::new(AsyncMutex::new(index)),
             session_id,
             persisted: AtomicBool::new(false),
+            tool_name_by_call_id: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +78,7 @@ impl Session {
             index: Arc::new(AsyncMutex::new(index)),
             session_id,
             persisted: AtomicBool::new(true),
+            tool_name_by_call_id: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -207,7 +214,38 @@ impl Session {
             index.leaf_id.clone()
         };
 
-        let pi_entries = rig_message_to_pi_entries(msg, &entry_id, &parent_id);
+        // Before serialising, extract tool call names from an Assistant message
+        // so tool result entries can carry the correct "toolName".
+        if let Message::Assistant { content, .. } = msg {
+            let mut map = self.tool_name_by_call_id.lock().unwrap();
+            for item in content.iter() {
+                if let AssistantContent::ToolCall(tc) = item {
+                    map.insert(tc.id.clone(), tc.function.name.clone());
+                }
+            }
+        }
+
+        let mut pi_entries = rig_message_to_pi_entries(msg, &entry_id, &parent_id);
+
+        // Post-process tool result entries: set "toolName" from the call_id
+        // lookup map instead of the placeholder "tool".
+        {
+            let map = self.tool_name_by_call_id.lock().unwrap();
+            for pi_entry in &mut pi_entries {
+                if let SessionEntryContent::Message { message } = &mut pi_entry.content {
+                    if message.get("role").and_then(|v| v.as_str()) == Some("toolResult") {
+                        if let Some(call_id) =
+                            message.get("toolCallId").and_then(|v| v.as_str())
+                        {
+                            if let Some(tool_name) = map.get(call_id) {
+                                message["toolName"] =
+                                    serde_json::Value::String(tool_name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let storage = self.storage.lock().await;
         for pi_entry in &pi_entries {
@@ -1985,4 +2023,139 @@ mod tests {
         };
         normalize_tool_call(&mut tc);
         assert_eq!(tc.function.name, "unknown_tool");
+    }
+
+    #[tokio::test]
+    async fn test_toolname_in_toolresult() {
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-toolname-test-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+
+        // Turn: user -> assistant(read tool call) -> user(tool result) -> assistant
+        session.append_message(&Message::user("read file")).await.unwrap();
+        session.append_message(&Message::Assistant {
+            id: None,
+            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
+                id: "tc_read".into(),
+                call_id: None,
+                function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
+                signature: None,
+                additional_params: None,
+            })),
+        }).await.unwrap();
+        session.append_message(&Message::User {
+            content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
+                id: "tc_read".into(),
+                call_id: None,
+                content: OneOrMany::one(ToolResultContent::Text(Text::new("file contents"))),
+            })),
+        }).await.unwrap();
+        session.append_message(&Message::assistant("done")).await.unwrap();
+
+        // Read back the JSONL file and check toolName in tool result entries.
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut found_tool_result = false;
+        for line in raw.lines().skip(1) {
+            if line.contains("\"role\":\"toolResult\"") {
+                found_tool_result = true;
+                assert!(
+                    line.contains("\"toolName\":\"read\""),
+                    "expected toolName 'read' in tool result, got: {}",
+                    line
+                );
+            }
+        }
+        assert!(found_tool_result, "should have found a tool result entry");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_toolname_multiple_tools() {
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-multitool-test-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+
+        // Turn: assistant calls two different tools, then user provides results.
+        session.append_message(&Message::user("do things")).await.unwrap();
+        session.append_message(&Message::Assistant {
+            id: None,
+            content: OneOrMany::many(vec![
+                AssistantContent::ToolCall(ToolCall {
+                    id: "tc_bash".into(),
+                    call_id: None,
+                    function: ToolFunction::new("bash".into(), serde_json::json!({"command": "ls"})),
+                    signature: None,
+                    additional_params: None,
+                }),
+                AssistantContent::ToolCall(ToolCall {
+                    id: "tc_read".into(),
+                    call_id: None,
+                    function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
+                    signature: None,
+                    additional_params: None,
+                }),
+            ]).unwrap(),
+        }).await.unwrap();
+        session.append_message(&Message::User {
+            content: OneOrMany::many(vec![
+                UserContent::ToolResult(RigToolResult {
+                    id: "tc_bash".into(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text::new("file1.txt"))),
+                }),
+                UserContent::ToolResult(RigToolResult {
+                    id: "tc_read".into(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::Text(Text::new("content"))),
+                }),
+            ]).unwrap(),
+        }).await.unwrap();
+        session.append_message(&Message::assistant("all done")).await.unwrap();
+
+        // Read back and verify toolName values.
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut bash_ok = false;
+        let mut read_ok = false;
+        for line in raw.lines().skip(1) {
+            if line.contains("\"role\":\"toolResult\"") {
+                if line.contains("\"toolName\":\"bash\"") {
+                    bash_ok = true;
+                } else if line.contains("\"toolName\":\"read\"") {
+                    read_ok = true;
+                } else {
+                    panic!("unexpected toolName in tool result: {}", line);
+                }
+            }
+        }
+        assert!(bash_ok, "should have a bash tool result with toolName 'bash'");
+        assert!(read_ok, "should have a read tool result with toolName 'read'");
+
+        let _ = tokio::fs::remove_file(&path).await;
     }

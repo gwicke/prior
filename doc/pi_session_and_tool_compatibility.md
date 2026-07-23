@@ -826,10 +826,10 @@ set the correct `toolName`.
 **Checklist**:
 
 1. Add `tool_name_by_call_id: HashMap<String, String>` field to `Session`:
-   - [ ] Initialize in `Session::new()` and `Session::new_persisted()`.
+   - [x] Initialize in `Session::new()` and `Session::new_persisted()`.
 
 2. In `Session::append_message`, before calling `rig_message_to_pi_entries`:
-   - [ ] If message is `Message::Assistant`, iterate `content` for
+   - [x] If message is `Message::Assistant`, iterate `content` for
          `ToolCall` items and insert `tc.id` to `tc.function.name` into
          the map.  This way the map is ready for the subsequent
          tool-result append.
@@ -848,21 +848,21 @@ set the correct `toolName`.
          comment noting it is a placeholder.
 
 5. Add unit tests:
-   - [ ] `test_toolname_in_toolresult`: Create a session, append a tool
+   - [x] `test_toolname_in_toolresult`: Single tool call + result, JSONL
          call + result, read back the JSONL file, assert `"toolName"`
          matches the tool's pi name.
-   - [ ] `test_toolname_multiple_tools`: Multiple tool calls with different
+   - [x] `test_toolname_multiple_tools`: Two tool calls (bash + read),
          names, verify each result gets the correct tool name.
 
 6. Verify on-disk format:
-   - [ ] Start a new session, run a turn with tool calls (e.g. `bash` and
+   - [x] Start a new session, run a turn with tool calls (e.g. `bash` and
          `read`).
    - [ ] Inspect the `.jsonl` file -- tool results should have
          `"toolName": "bash"`, `"toolName": "read"`, etc.
 
 **Verification**:
-   - [ ] `cargo test session::` passes.
-   - [ ] `cargo test` passes.
+   - [x] `cargo test session::` passes.
+   - [x] `cargo test` passes (287 tests).
    - [ ] Manual: run picocode, make a tool call, inspect `.jsonl` file.
 
 ---
