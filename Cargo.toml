@@ -14,7 +14,9 @@ categories = ["command-line-utilities", "development-tools"]
 exclude = ["picocode.gif", ".github/"]
 
 [dependencies]
-rig-core = { version = "0.40", features = ["derive"] }
+rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
+rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
+rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -78,6 +80,7 @@ tempfile = "3.24.0"
 portable-pty = "0.8"
 vt100 = "0.16"
 serial_test = "3.1"
+rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["test-utils"] }
 
 # Fork of codewandler-markdown-terminal adding OSC 8 clickable inline links
 # (gated by Theme.clickable_links) and a faded `Theme::dimmed()` for streamed
@@ -88,4 +91,3 @@ serial_test = "3.1"
 [patch.crates-io]
 codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
 codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "41d0922" }
-rig-core = { git = "file:///home/gabriel/src/rig", rev = "39ff227587bda9fd37991518d6fb220a34173f8a" }

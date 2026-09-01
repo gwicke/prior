@@ -12,26 +12,25 @@ use crate::Output;
 use crate::Result;
 use crate::model_catalog;
 use crate::thinking;
+use chrono::Utc;
 use console::style;
-use rig_core::agent::{
+use rig_agent::agent::{
     Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    HookContext, ModelTurnAction, ModelTurnFinished, ObservationAction, StreamingError, ToolCall,
-    ToolCallAction, ToolResultAction, ToolResultEvent,
+    HookContext, ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, NoToolConfig, ObservationAction,
+    StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
-use rig_core::tool::ToolContext;
-use rig_core::client::{CompletionClient, ProviderClient};
-use rig_core::completion::{CompletionModel, PromptError};
-use rig_core::message::Message;
-use rig_core::message::{AssistantContent, Text, ToolResult, ToolResultContent, UserContent};
-use rig_core::OneOrMany;
-use rig_core::agent::MultiTurnStreamItem;
-use rig_core::message::ReasoningContent;
-use rig_core::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig_agent::client::AgentClientExt;
+use rig_agent::completion::{Chat, PromptError};
+use rig_agent::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig_agent::tool::ToolContext;
+use rig_core::client::CompletionClient;
+use rig_core::message::{AssistantContent, Message, ReasoningContent, Text, ToolResultContent, UserContent};
 use futures::StreamExt;
 use rig_core::providers::{
-    anthropic, azure, chatgpt, cohere, copilot, doubleword, deepseek, gemini, groq, huggingface, hyperbolic, llamafile, mira,
+    anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamacpp, mira,
     minimax, mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai, xiaomimimo, zai,
 };
+use rig_reqwest::client::{DefaultTransportBuilder, DefaultTransportClient};
 use serde_json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -83,7 +82,7 @@ pub trait PicoAgent: Send + Sync {
 }
 
 #[async_trait]
-impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
+impl PicoAgent for CodeAgent {
     async fn prompt(
         &self,
         input: &str,
@@ -130,6 +129,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
             .add_hook(LoggingHook {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
+                message_logger: self.message_logger.clone(),
             })
             .max_turns(self.tool_call_limit)
             .history(prior)
@@ -165,7 +165,7 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                                 output.push_str(delta);
                                 self.output.stream_text(delta);
                             }
-                            StreamedAssistantContent::Reasoning(reasoning) => {
+                            StreamedAssistantContent::Reasoning { reasoning, .. } => {
                                 let t = reasoning_text(&reasoning);
                                 if !t.is_empty() {
                                     self.output.stream_thinking(&t);
@@ -208,7 +208,6 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
                         }
                         Some(Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })) => {}
                         Some(Ok(MultiTurnStreamItem::ModelTurnRetried { .. })) => {}
-                        Some(Ok(_)) => {}
                         Some(Err(e)) => {
                             // `<Esc>` (or any hook Stop/Terminate) terminates the rig run
                             // as a terminal `PromptCancelled` error that carries the
@@ -326,7 +325,6 @@ impl<M: CompletionModel + 'static> PicoAgent for CodeAgent<M> {
     }
 
     async fn summarize(&self, prompt: &str) -> Result<String> {
-        use rig_core::completion::Chat;
         let msg = Message::user(prompt);
         let mut history: Vec<Message> = vec![];
         self.agent
@@ -346,38 +344,18 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
             ReasoningContent::Summary(s) => s.clone(),
             ReasoningContent::Encrypted(s) => s.clone(),
             ReasoningContent::Redacted { data } => data.clone(),
-            _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-    /// Ensure every `ToolResult` in the given messages has `call_id` set.
-    ///
-    /// If `call_id` is `None`, set it to the tool result's own `id`. This is
-    /// the Phase 2b fix for cross-provider safety: the OpenAI Responses API
-    /// requires `call_id` to be present on every tool result, and normalising
-    /// at persist time avoids the need for pi's `transformMessages` layer.
-    /// See doc/pi_steering_rig.md §6.5.4.
+    /// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
+    /// always present — minted at the provider boundary when the provider
+    /// issued no id — so the old cross-provider `call_id` normalisation is
+    /// inherently satisfied. Kept as a named passthrough so the persist path
+    /// reads the same. See doc/pi_steering_rig.md §6.5.4.
     fn normalize_call_ids(messages: Vec<Message>) -> Vec<Message> {
-        messages.into_iter().map(|m| match m {
-            Message::User { content } => {
-                let items: Vec<UserContent> = content.into_iter().map(|c| match c {
-                    UserContent::ToolResult(tr) => {
-                        UserContent::ToolResult(ToolResult {
-                            call_id: tr.call_id.or_else(|| Some(tr.id.clone())),
-                            ..tr
-                        })
-                    }
-                    other => other,
-                }).collect();
-                Message::User {
-                    content: OneOrMany::many(items)
-                        .expect("OneOrMany never empty after iterating over non-empty content"),
-                }
-            }
-            other => other,
-        }).collect()
+        messages
     }
 
     /// Merge a finished (or aborted) turn into the session `history`.
@@ -450,10 +428,9 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
                         .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
                         .collect();
                     let content = if kept.is_empty() {
-                        OneOrMany::one(AssistantContent::Text(Text::new("[reasoning stripped]")))
+                        vec![AssistantContent::Text(Text::new("[reasoning stripped]"))]
                     } else {
-                        OneOrMany::many(kept)
-                            .expect("assistant content non-empty after filtering reasoning")
+                        kept
                     };
                     Message::Assistant { id, content }
                 }
@@ -493,8 +470,8 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         .unwrap_or(false)
 }
 
-pub struct CodeAgent<M: CompletionModel> {
-    agent: Agent<M>,
+pub struct CodeAgent {
+    agent: Agent,
     output: Arc<dyn Output>,
     tool_call_limit: usize,
     provider: String,
@@ -508,6 +485,9 @@ pub struct CodeAgent<M: CompletionModel> {
     cancel_notify: Arc<tokio::sync::Notify>,
     thinking_level: Option<String>,
     reasoning_in_context: bool,
+    /// Optional path to JSONL file for logging raw messages sent/received.
+    /// Passed as `Some(Arc<MessageLogger>)` to `LoggingHook` if set.
+    message_logger: Option<Arc<MessageLogger>>,
     /// Accumulated token-usage telemetry captured from the streaming run
     /// (see [`SessionUsage`]). Backs `/stat` and is the measurement primitive
     /// compaction will rely on (doc/compaction.md §2.7).
@@ -551,6 +531,9 @@ pub struct AgentConfig {
     /// drops them at store time (cheap token savings); forced `true` for
     /// Anthropic-family providers (thinking+tool_use replay contract).
     pub reasoning_in_context: bool,
+    /// Optional path to JSONL file for logging raw messages sent/received.
+    /// When Some, messages are appended to this file in JSONL format.
+    pub message_log_path: Option<String>,
 }
 
 /// Sentinel env-var value that triggers the interactive device-code OAuth
@@ -659,6 +642,12 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.sandbox.clone(),
             );
 
+            let message_logger = if let Some(path) = &config.message_log_path {
+                Some(Arc::new(MessageLogger::new(path.clone(), config.provider.clone(), model.clone())))
+            } else {
+                None
+            };
+
             Box::new(CodeAgent::new(
                 rig_agent,
                 config.output,
@@ -671,6 +660,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.cancel_notify.clone(),
                 config.thinking_level.clone(),
                 config.reasoning_in_context,
+                message_logger,
             ))
         }};
     }
@@ -790,9 +780,10 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             check_env!("HYPERBOLIC_API_KEY");
             build!(hyperbolic::Client::from_env()?)
         }
-        "llamafile" => {
-            check_env!("LLAMAFILE_API_BASE_URL");
-            build!(llamafile::Client::from_env()?)
+        "llamafile" | "llamacpp" => {
+            // llamacpp's client defaults to `http://localhost:8080`; the
+            // `LLAMACPP_API_BASE_URL` env var is optional.
+            build!(llamacpp::Client::from_env()?)
         }
         "mira" => {
             check_env!("MIRA_API_KEY");
@@ -882,17 +873,28 @@ pub fn load_agents_md() -> Option<String> {
 struct LoggingHook {
     output: Arc<dyn Output>,
     user_cancel: Arc<AtomicBool>,
+    message_logger: Option<Arc<MessageLogger>>,
 }
 
 impl AgentHook for LoggingHook {
     async fn on_completion_call(
         &self,
         _ctx: &HookContext,
-        _event: CompletionCallEvent<'_>,
+        event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
             CompletionCallAction::Stop("cancelled by user".into())
         } else {
+            // `--log-messages`: capture the exact context sent to the model on
+            // this call — the full history plus the current prompt — under one
+            // turn id shared with the matching response.
+            if let Some(logger) = &self.message_logger {
+                let turn_id = logger.advance_turn();
+                for m in event.history {
+                    logger.log_message("sent", m, turn_id).await;
+                }
+                logger.log_message("sent", event.prompt, turn_id).await;
+            }
             CompletionCallAction::Continue
         }
     }
@@ -902,6 +904,10 @@ impl AgentHook for LoggingHook {
         _ctx: &HookContext,
         _event: CompletionResponseEvent<'_>,
     ) -> ObservationAction {
+        // Note: rig only fires `on_completion_response` on the *blocking*
+        // surface. The streaming surface (which picocode uses via
+        // `stream_prompt`) fires `on_model_turn_finished` instead, so the
+        // received-message logging lives there — see below.
         if self.user_cancel.load(Ordering::SeqCst) {
             ObservationAction::Stop("cancelled by user".into())
         } else {
@@ -912,11 +918,24 @@ impl AgentHook for LoggingHook {
     async fn on_model_turn_finished(
         &self,
         _ctx: &HookContext,
-        _event: ModelTurnFinished<'_>,
+        event: ModelTurnFinished<'_>,
     ) -> ModelTurnAction {
         if self.user_cancel.load(Ordering::SeqCst) {
             ModelTurnAction::Stop("cancelled by user".into())
         } else {
+            // `--log-messages`: capture the assistant content received for
+            // this turn, tagged with the same turn id as the request that
+            // produced it. Fires on both the blocking and streaming surfaces
+            // (the streaming one never calls `on_completion_response`), so
+            // this is the single place the received side is logged.
+            if let Some(logger) = &self.message_logger {
+                let msg = Message::Assistant {
+                    id: event.identity.message_id.clone(),
+                    content: event.content.clone(),
+                };
+                let turn_id = logger.current_turn_id();
+                logger.log_message("received", &msg, turn_id).await;
+            }
             ModelTurnAction::Continue
         }
     }
@@ -970,8 +989,8 @@ Your mission is to assist the user in their development tasks by utilizing a set
 - **Communication**: Keep explanations brief and focused on the "how" and "why" of your technical decisions.
 "#;
 
-fn build_rig_agent<M: CompletionModel>(
-    builder: AgentBuilder<M>,
+fn build_rig_agent(
+    builder: AgentBuilder<NoToolConfig>,
     yolo: bool,
     output: Arc<dyn Output>,
     system_message_extension: Option<String>,
@@ -980,7 +999,7 @@ fn build_rig_agent<M: CompletionModel>(
     agent_prompt: Option<String>,
     additional_params: Option<serde_json::Value>,
     sandbox: Option<crate::config::SandboxConfig>,
-) -> Agent<M> {
+) -> Agent {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -1250,7 +1269,7 @@ fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            tool_results.push((tr.id.clone(), text));
+                            tool_results.push((tr.call.clone().into_string(), text));
                         }
                         _ => {}
                     }
@@ -1293,7 +1312,7 @@ fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
                             }
                             AssistantContent::ToolCall(tc) => {
                                 seg.tool_calls.push((
-                                    tc.id.clone(),
+                                    tc.id.clone().into_string(),
                                     tc.function.name.clone(),
                                     tc.function.arguments.clone(),
                                 ));
@@ -2112,9 +2131,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                         let _ = s.append_message(&msg).await;
                                         let reply = Message::Assistant {
                                             id: None,
-                                            content: OneOrMany::one(AssistantContent::Text(
-                                                Text::new(out.to_string()),
-                                            )),
+                                            content: vec![AssistantContent::Text(Text::new(
+                                                out.to_string(),
+                                            ))],
                                         };
                                         let _ = s.append_message(&reply).await;
                                     }
@@ -2487,9 +2506,9 @@ pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> 
     lines
 }
 
-impl<M: CompletionModel + 'static> CodeAgent<M> {
+impl CodeAgent {
     pub fn new(
-        agent: Agent<M>,
+        agent: Agent,
         output: Arc<dyn Output>,
         tool_call_limit: usize,
         provider: String,
@@ -2500,6 +2519,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
         cancel_notify: Arc<tokio::sync::Notify>,
         thinking_level: Option<String>,
         reasoning_in_context: bool,
+        message_logger: Option<Arc<MessageLogger>>,
     ) -> Self {
         Self {
             agent,
@@ -2513,6 +2533,7 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
             cancel_notify,
             thinking_level,
             reasoning_in_context,
+            message_logger,
             usage: Mutex::new(SessionUsage::default()),
         }
     }
@@ -2522,10 +2543,11 @@ impl<M: CompletionModel + 'static> CodeAgent<M> {
 mod tests {
     use rig_core::message::Reasoning;
 
-    use super::{create_private_dir, is_anthropic_family, maybe_strip_reasoning, persist_turn, reasoning_text};
-    use rig_core::message::Message;
-use rig_core::message::{AssistantContent, Text};
-use rig_core::OneOrMany;
+    use super::{
+        create_private_dir, is_anthropic_family, maybe_strip_reasoning, message_role, persist_turn,
+        reasoning_text, MessageLogger,
+    };
+    use rig_core::message::{AssistantContent, Message, Text};
 
     #[test]
     fn reasoning_text_extracts_text_block() {
@@ -2537,6 +2559,171 @@ use rig_core::OneOrMany;
     fn reasoning_text_extracts_text_with_signature() {
         let r = Reasoning::new_with_signature("with sig", Some("sig".to_string()));
         assert_eq!(reasoning_text(&r), "with sig");
+    }
+
+    /// `--log-messages` must actually create the file and write one valid JSONL
+    /// line per message, tagged with direction/role/turn. Regression test for
+    /// the logger being wired but never called (no file created).
+    #[tokio::test]
+    async fn message_logger_writes_jsonl_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-msglog-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("messages.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let logger = MessageLogger::new(
+            path.display().to_string(),
+            "test".to_string(),
+            "test-model".to_string(),
+        );
+
+        // One round trip: history + prompt sent, assistant reply received,
+        // all under the same turn id.
+        let turn = logger.advance_turn();
+        assert_eq!(turn, 1);
+        logger
+            .log_message("sent", &Message::user("prior"), turn)
+            .await;
+        logger
+            .log_message("sent", &Message::user("hello"), turn)
+            .await;
+        logger
+            .log_message(
+                "received",
+                &Message::Assistant {
+                    id: Some("resp-1".into()),
+                    content: vec![AssistantContent::Text(Text::new("hi"))],
+                },
+                logger.current_turn_id(),
+            )
+            .await;
+
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .expect("log file must be created on first write");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 3, "three messages logged: {raw}");
+
+        let sent: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(sent["direction"], "sent");
+        assert_eq!(sent["role"], "user");
+        assert_eq!(sent["turn_id"], 1);
+        // rig `Message` serializes with an internal `role` tag.
+        assert_eq!(sent["message"]["role"], "user");
+        assert_eq!(sent["message"]["content"][0]["type"], "text");
+        assert_eq!(sent["message"]["content"][0]["text"], "prior");
+
+        let received: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(received["direction"], "received");
+        assert_eq!(received["role"], "assistant");
+        assert_eq!(received["turn_id"], 1);
+        assert_eq!(received["message"]["role"], "assistant");
+        assert_eq!(received["message"]["content"][0]["type"], "text");
+        assert_eq!(received["message"]["content"][0]["text"], "hi");
+
+        // message_role helper agrees with the serialized role.
+        assert_eq!(message_role(&Message::user("x")), "user");
+        assert_eq!(
+            message_role(&Message::Assistant {
+                id: None,
+                content: vec![],
+            }),
+            "assistant"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// End-to-end: a real streaming run through `LoggingHook` must log both the
+    /// context sent (`on_completion_call`) and the assistant content received
+    /// (`on_model_turn_finished`) — the streaming surface never calls
+    /// `on_completion_response`, so the received side must come from the
+    /// per-turn hook. Regression test for "all messages marked sent".
+    #[tokio::test]
+    async fn streaming_run_logs_sent_and_received() {
+        use futures::StreamExt;
+        use rig_agent::agent::{AgentBuilder, MultiTurnStreamItem};
+        use rig_agent::streaming::StreamingPrompt;
+        use rig_core::completion::Usage;
+        use rig_core::test_utils::{MockCompletionModel, MockStreamEvent, mock_final};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        use super::LoggingHook;
+
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-msglog-stream-{}",
+            std::process::id()
+        ));
+        let path = dir.join("messages.jsonl");
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let logger = Arc::new(MessageLogger::new(
+            path.display().to_string(),
+            "test".to_string(),
+            "test-model".to_string(),
+        ));
+
+        // One scripted streaming turn: text + terminal record.
+        let model = MockCompletionModel::from_stream_turns([[
+            MockStreamEvent::Text("hello there".to_string()),
+            MockStreamEvent::FinalResponse(mock_final(Usage::new())),
+        ]]);
+        let agent = AgentBuilder::new(model).build();
+
+        let mut stream = agent
+            .stream_prompt("hi")
+            .add_hook(LoggingHook {
+                output: Arc::new(crate::NoOutput),
+                user_cancel: Arc::new(AtomicBool::new(false)),
+                message_logger: Some(logger.clone()),
+            })
+            .max_turns(1)
+            .await;
+
+        let mut final_text = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    rig_agent::streaming::StreamedAssistantContent::Text(t),
+                )) => final_text.push_str(t.text()),
+                Ok(_) => {}
+                Err(e) => panic!("stream error: {e}"),
+            }
+        }
+        assert_eq!(final_text, "hello there");
+
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .expect("log file must be created");
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let sent: Vec<_> = lines
+            .iter()
+            .filter(|l| l["direction"] == "sent")
+            .collect();
+        let received: Vec<_> = lines
+            .iter()
+            .filter(|l| l["direction"] == "received")
+            .collect();
+
+        // One user prompt sent, one assistant reply received.
+        assert_eq!(sent.len(), 1, "expected exactly one sent message: {raw}");
+        assert_eq!(received.len(), 1, "expected exactly one received message: {raw}");
+        assert_eq!(received[0]["role"], "assistant");
+        assert_eq!(
+            received[0]["message"]["content"][0]["text"],
+            "hello there"
+        );
+        // Both sides of the same turn share a turn id.
+        assert_eq!(sent[0]["turn_id"], received[0]["turn_id"]);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[cfg(unix)]
@@ -2619,11 +2806,10 @@ use rig_core::OneOrMany;
     fn strips_reasoning_for_non_anthropic_when_disabled() {
         let assistant = Message::Assistant {
             id: None,
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::Reasoning(Reasoning::new("hidden thought")),
                 AssistantContent::Text(Text::new("answer")),
-            ])
-            .unwrap(),
+            ],
         };
         let msgs = vec![Message::user("q"), assistant];
 
@@ -2660,18 +2846,17 @@ use rig_core::OneOrMany;
     fn anthropic_tool_call_turn_forces_reasoning_kept() {
         let assistant = Message::Assistant {
             id: None,
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::Reasoning(Reasoning::new("hidden thought")),
                 AssistantContent::Text(Text::new("answer")),
                 AssistantContent::ToolCall(rig_core::message::ToolCall::new(
-                    "tool-1".into(),
+                    rig_core::message::ToolCallId::new("tool-1").unwrap(),
                     rig_core::message::ToolFunction::new(
                         "Bash".to_string(),
                         serde_json::json!({"cmd": "ls"}),
                     ),
                 )),
-            ])
-            .unwrap(),
+            ],
         };
         let msgs = vec![Message::user("q"), assistant];
 
@@ -2829,6 +3014,7 @@ use rig_core::OneOrMany;
             sandbox: Some(sandbox),
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
+            message_log_path: None,
         };
         let mut settings = SettingsStore::from_agent_config(&config, None);
 
@@ -2850,5 +3036,109 @@ use rig_core::OneOrMany;
             shown.contains(sentinel),
             "expected sandboxed `!` command to print the remapped host file content; output:\n{shown}"
         );
+    }
+}
+
+/// Human-readable role label for a rig [`Message`], used in the JSONL log.
+fn message_role(msg: &Message) -> &'static str {
+    match msg {
+        Message::System { .. } => "system",
+        Message::User { .. } => "user",
+        Message::Assistant { .. } => "assistant",
+    }
+}
+
+/// JSONL message logger for debugging LLM interactions.
+///
+/// Writes one JSON object per line capturing a raw rig [`Message`] (as sent to
+/// or received from the model) with timestamp, direction, role, and turn id.
+/// The file is created lazily on the first write; parent directories are
+/// created as needed. Enabled with `--log-messages <file>`.
+pub struct MessageLogger {
+    file: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    path: std::path::PathBuf,
+    turn_counter: std::sync::atomic::AtomicU64,
+    provider: String,
+    model: String,
+}
+
+impl MessageLogger {
+    /// Create a new MessageLogger that writes to the specified path.
+    /// The file is created lazily on first write.
+    pub fn new(path: String, provider: String, model: String) -> Self {
+        Self {
+            file: tokio::sync::Mutex::new(None),
+            path: std::path::PathBuf::from(path),
+            turn_counter: std::sync::atomic::AtomicU64::new(0),
+            provider,
+            model,
+        }
+    }
+
+    /// Advance to the next completion call, returning its 1-based turn id.
+    ///
+    /// Every message logged under the same turn id belongs to one
+    /// request/response round trip: the full context sent (history + prompt)
+    /// and the assistant content received in reply.
+    pub fn advance_turn(&self) -> u64 {
+        self.turn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Current turn id (without incrementing) — used by the response side to
+    /// tag the reply with the same turn id as the request that produced it.
+    pub fn current_turn_id(&self) -> u64 {
+        self.turn_counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Log a raw rig `Message` as one JSONL line.
+    ///
+    /// Failures (unwritable path, disk full) are reported to stderr and
+    /// swallowed so message logging never breaks the conversation.
+    pub async fn log_message(&self, direction: &str, message: &Message, turn_id: u64) {
+        let entry = serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "direction": direction,
+            "role": message_role(message),
+            "message": message,
+            "turn_id": turn_id,
+            "provider": self.provider,
+            "model": self.model,
+        });
+
+        if let Err(e) = self.write_line(&entry).await {
+            eprintln!("Warning: failed to write to message log: {}", e);
+        }
+    }
+
+    /// Ensure the file handle is open, creating the file if needed.
+    async fn ensure_file_open(&self) -> Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
+        let mut guard = self.file.lock().await;
+        if guard.is_none() {
+            // Create parent directories
+            if let Some(parent) = self.path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            // Open (or create) the file for appending
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .await?;
+            *guard = Some(file);
+        }
+        Ok(guard)
+    }
+
+    /// Write a JSON line to the file.
+    async fn write_line(&self, entry: &serde_json::Value) -> Result<()> {
+        let guard = self.ensure_file_open().await?;
+        if let Some(file) = guard.as_ref() {
+            let line = serde_json::to_string(entry)?;
+            let mut file = file.try_clone().await?;
+            use tokio::io::AsyncWriteExt;
+            file.write_all(line.as_bytes()).await?;
+            file.write_all(b"\n").await?;
+        }
+        Ok(())
     }
 }

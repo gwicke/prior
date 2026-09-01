@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         show_reasoning_handle: picocode::settings::default_show_reasoning_handle(),
         reasoning_in_context: false,
+        message_log_path: None,
     }).await?;
 
     println!("--- Picocode Library Example ---");

@@ -339,6 +339,16 @@ pub struct ConsoleOutput {
     /// and pick a syntax-highlight language). The hook always fires a call
     /// immediately before its result, so this is safe to read on the result.
     last_tool: Mutex<Option<(String, Value)>>,
+    /// Whether the most recent write to the terminal ended with a *blank*
+    /// line. Blank-emitting calls (`end_response_segment`, `end_response`,
+    /// `flush_held_answer`, `display_text`, `display_markdown`) consult and
+    /// update it so two consecutive blank-emitters collapse to a single empty
+    /// line instead of stacking. Rig emits a terminal `CompletionCall` item for
+    /// the final text-only turn, so `end_response_segment` then `end_response`
+    /// would otherwise print two blank lines before the loop's separator; the
+    /// error path (`end_response` then `display_text`) would do the same above
+    /// the error line.
+    last_blank: Mutex<bool>,
     /// Stores the previous writer during a capture session (see
     /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
     saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
@@ -688,6 +698,7 @@ impl ConsoleOutput {
             show_reasoning,
             last_was_tool: Mutex::new(false),
             last_tool: Mutex::new(None),
+            last_blank: Mutex::new(false),
             saved_writer: Mutex::new(None),
         }
     }
@@ -745,6 +756,7 @@ impl ConsoleOutput {
             let _ = writeln!(w);
             drop(w);
             self.note_lines(1);
+            self.set_blank(true);
             self.note_text();
         } else {
             *self.text_buffer.lock().unwrap() = String::new();
@@ -918,6 +930,10 @@ impl ConsoleOutput {
         };
         let mut trenderer = self.thinking_renderer.lock().unwrap();
         let _ = trenderer.feed(&events, out);
+        if !events.is_empty() {
+            // Committed thinking is content, not a blank separator.
+            self.set_blank(false);
+        }
     }
 
     /// Render any answer text held back while reasoning was streaming, after
@@ -951,8 +967,13 @@ impl ConsoleOutput {
         self.ensure_dim(false, &mut *out);
         // Blank line between reasoning and answer, written to `out` (the same
         // handle the reasoning/answer use) so it lands in the right place.
-        let _ = out.write_all(b"\n");
-        self.note_lines(1);
+        // Skipped when the previous write already ended with a blank (a prior
+        // segment or response boundary), so the gap stays a single empty line.
+        if !self.ended_blank() {
+            let _ = out.write_all(b"\n");
+            self.note_lines(1);
+            self.set_blank(true);
+        }
         // Render the answer with a local parser so `self.parser` is left empty
         // for the caller's renderer reset. `flush()` (not just `write`) so the
         // answer's final, blank-line-unterminated paragraph is emitted rather
@@ -962,8 +983,10 @@ impl ConsoleOutput {
         events.extend(local_parser.flush());
         let mut renderer = self.renderer.lock().unwrap();
         let _ = renderer.feed(&events, &mut *out);
+        self.set_blank(false);
         let _ = writeln!(out);
         self.note_lines(1);
+        self.set_blank(true);
         self.note_text();
         drop(out);
         true
@@ -973,6 +996,9 @@ impl ConsoleOutput {
         let width = term_width();
         let mut out = self.writer.lock().unwrap();
         let _ = writeln!(out, "{}", style("─".repeat(width)).dim());
+        drop(out);
+        // The rule is content, not a blank separator.
+        self.set_blank(false);
     }
 
     /// Record that the most recent output block was ordinary text/answer (not a
@@ -985,6 +1011,19 @@ impl ConsoleOutput {
     /// Record that the most recent output block was a tool panel.
     fn note_tool(&self) {
         *self.last_was_tool.lock().unwrap() = true;
+    }
+
+    /// Whether the last write to the terminal ended with a blank line. Used by
+    /// blank-emitting methods to collapse consecutive blanks to one.
+    fn ended_blank(&self) -> bool {
+        *self.last_blank.lock().unwrap()
+    }
+
+    /// Record whether the last write to the terminal ended with a blank line.
+    /// Content lines (text, tool panels, the separator rule) set `false`;
+    /// deliberately-emitted empty lines set `true`.
+    fn set_blank(&self, blank: bool) {
+        *self.last_blank.lock().unwrap() = blank;
     }
 
     /// Paint the dark-grey tool-panel background behind `content`, which already
@@ -1022,6 +1061,8 @@ impl ConsoleOutput {
         drop(out);
         self.note_lines(1);
         self.note_tool();
+        // A panel row is content, not a blank separator.
+        self.set_blank(false);
     }
 
     /// Render one full-width dark-grey panel row for plain `text` (no ANSI).
@@ -1098,6 +1139,8 @@ impl Output for ConsoleOutput {
         let _ = writeln!(out, "{}", text);
         drop(out);
         self.note_lines(n);
+        // Plain text is content, not a blank separator.
+        self.set_blank(false);
     }
 
     fn display_markdown(&self, text: &str) {
@@ -1105,25 +1148,45 @@ impl Output for ConsoleOutput {
         let color = std::io::stdout().is_terminal();
         let rendered = render_markdown(text, term_width(), color);
         let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out);
+        // Leading blank separates the block from the content above; skipped when
+        // the previous write already ended with a blank line so consecutive
+        // blocks (e.g. an error right after `end_response`) stay one line apart.
+        let skipped_blank = self.ended_blank();
+        if !skipped_blank {
+            let _ = writeln!(out);
+            self.set_blank(true);
+        }
         let _ = write!(out, "{}", rendered);
         let _ = writeln!(out);
         drop(out);
-        // +2 for the leading/trailing blank lines; the DSR query corrects drift.
-        let n = rendered.lines().count().max(1) + 2;
+        // +2 for the leading/trailing blank lines (minus the skipped leading
+        // blank); the DSR query corrects drift.
+        let n = rendered.lines().count().max(1) + 2 - usize::from(skipped_blank);
         self.note_lines(n);
+        // Rendered markdown is content, not a blank separator.
+        self.set_blank(false);
     }
 
     fn display_text(&self, text: &str) {
         self.stop_thinking();
         let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out);
+        // Leading blank separates the message from the content above; skipped
+        // when the previous write already ended with a blank line (e.g. the
+        // error path, where `end_response` printed its trailing blank first), so
+        // the message sits exactly one empty line below the prior block.
+        let skipped_blank = self.ended_blank();
+        if !skipped_blank {
+            let _ = writeln!(out);
+            self.set_blank(true);
+        }
         let _ = write!(out, "{} ", style("⏺").cyan());
         let _ = write!(out, "{}", termimad::inline(text));
         let _ = writeln!(out);
         drop(out);
-        let n = wrap(text, term_width()).len() + 1;
+        let n = wrap(text, term_width()).len() + usize::from(!skipped_blank);
         self.note_lines(n);
+        // The message line is content, not a blank separator.
+        self.set_blank(false);
     }
 
     fn begin_response(&self) {
@@ -1165,8 +1228,11 @@ impl Output for ConsoleOutput {
             // Blank line between reasoning and answer, written to `out` so it
             // lands in the right place (a `println!` here can land in a
             // different write buffer and be lost).
-            let _ = out.write_all(b"\n");
-            self.note_lines(1);
+            if !self.ended_blank() {
+                let _ = out.write_all(b"\n");
+                self.note_lines(1);
+                self.set_blank(true);
+            }
             self.note_text();
         } else {
             self.ensure_dim(false, &mut *out);
@@ -1176,6 +1242,10 @@ impl Output for ConsoleOutput {
         let mut renderer = self.renderer.lock().unwrap();
         let _ = renderer.feed(&events, &mut *out);
         drop(out);
+        // Emitted text is content, not a blank separator.
+        if !events.is_empty() {
+            self.set_blank(false);
+        }
     }
 
     fn stream_thinking(&self, delta: &str) {
@@ -1202,6 +1272,10 @@ impl Output for ConsoleOutput {
         let mut renderer = self.thinking_renderer.lock().unwrap();
         let _ = renderer.feed(&events, &mut *out);
         drop(out);
+        // Streamed thinking is content, not a blank separator.
+        if !events.is_empty() {
+            self.set_blank(false);
+        }
     }
 
     fn end_response_segment(&self) {
@@ -1227,6 +1301,10 @@ impl Output for ConsoleOutput {
                 *parser = StreamParser::new_gfm();
                 let mut renderer = self.renderer.lock().unwrap();
                 let _ = renderer.feed(&events, &mut *out);
+                if !events.is_empty() {
+                    // Committed answer text is content, not a blank separator.
+                    self.set_blank(false);
+                }
                 let mut theme = Theme::default();
                 theme.clickable_links = true; // real TTY path
                 *renderer = Renderer::new(theme, term_width());
@@ -1237,8 +1315,16 @@ impl Output for ConsoleOutput {
                 // parser is reset, inside `commit_thinking`).
                 self.commit_thinking(&mut *out);
                 self.ensure_dim(false, &mut *out);
-                let _ = out.write_all(b"\n");
-                self.note_lines(1);
+                // Blank line between the answer/reasoning block and the tool
+                // panel below. Skipped when the stream already ends with a blank
+                // (e.g. a held answer was just flushed, or an empty terminal
+                // `CompletionCall` follows a prior segment's blank), so stacked
+                // segment boundaries collapse to one empty line.
+                if !self.ended_blank() {
+                    let _ = out.write_all(b"\n");
+                    self.note_lines(1);
+                    self.set_blank(true);
+                }
                 self.note_text();
             }
             drop(out);
@@ -1262,6 +1348,10 @@ impl Output for ConsoleOutput {
                     let events = parser.flush();
                     let mut renderer = self.renderer.lock().unwrap();
                     let _ = renderer.feed(&events, &mut *out);
+                    if !events.is_empty() {
+                        // Flushed answer text is content, not a blank separator.
+                        self.set_blank(false);
+                    }
                 }
                 // Finalize thinking (it was rendered inline + dimmed as it streamed).
                 {
@@ -1269,10 +1359,23 @@ impl Output for ConsoleOutput {
                     let events = parser.flush();
                     let mut renderer = self.thinking_renderer.lock().unwrap();
                     let _ = renderer.feed(&events, &mut *out);
+                    if !events.is_empty() {
+                        // Flushed thinking is content, not a blank separator.
+                        self.set_blank(false);
+                    }
                 }
                 self.ensure_dim(false, &mut *out);
-                let _ = writeln!(out);
-                self.note_lines(1);
+                // Trailing blank so the separator that opens the next loop
+                // iteration does not butt against the last line of the response.
+                // Skipped when the turn already ended with a blank (the terminal
+                // `CompletionCall`'s `end_response_segment` — or a held-answer
+                // flush — printed one), which is what collapses the previously
+                // observed double empty line to a single one.
+                if !self.ended_blank() {
+                    let _ = writeln!(out);
+                    self.note_lines(1);
+                    self.set_blank(true);
+                }
                 self.note_text();
             }
             drop(out);
@@ -1300,6 +1403,8 @@ impl Output for ConsoleOutput {
             let _ = writeln!(out);
             drop(out);
             self.note_lines(1);
+            // The divider is a blank line; the panel content below resets it.
+            self.set_blank(true);
         }
         // Dark-grey panel box (no `⏺`, no tree line-art). The command label is
         // the first line and is left flush; its output — the trailing
@@ -1425,6 +1530,8 @@ impl Output for ConsoleOutput {
             let mut out = self.writer.lock().unwrap();
             let _ = write!(out, "{} ", style("❯").bold().blue());
             let _ = out.flush();
+            // The prompt is content, not a blank separator.
+            self.set_blank(false);
         }
         let mut input = String::new();
         let _ = io::stdin().read_line(&mut input);
@@ -1632,6 +1739,8 @@ impl Output for ConsoleOutput {
         );
         self.note_lines(9);
         drop(out);
+        // The header is content, not a blank separator.
+        self.set_blank(false);
     }
 
     fn begin_capture(&self) {
@@ -2242,5 +2351,50 @@ mod tests {
         assert!(colored.contains('\x1b'), "color path must emit ANSI");
         // non-color path returns the line untouched
         assert_eq!(highlight_code_fg("let x = 1;", "rust", false), "let x = 1;");
+    }
+
+    #[test]
+    fn tmp_repro_separator_blanks() {
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_response_inner(true); // live path
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+
+        // Case A: turn ends with a tool result (no trailing answer text).
+        out.stream_text("Let me sleep.\n");
+        out.end_response_segment();
+        out.display_tool_call("bash", &serde_json::json!({"command": "sleep 30"}));
+        out.display_tool_result("\"2. sleep 30 — done\"");
+        out.end_response();
+        out.display_separator();
+        let a = out.end_capture_inner();
+        let a = strip_ansi(&String::from_utf8_lossy(&a));
+        eprintln!("=== Case A (tool-result end) ===\n{:?}", a);
+
+        // Case B: turn ends with plain text answer.
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+        out.stream_text("All done.\n");
+        out.end_response();
+        out.display_separator();
+        let b = out.end_capture_inner();
+        let b = strip_ansi(&String::from_utf8_lossy(&b));
+        eprintln!("=== Case B (text end) ===\n{:?}", b);
+
+        // Case C: turn ends with trailing thinking after a tool result.
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+        out.stream_text("Let me sleep.\n");
+        out.end_response_segment();
+        out.display_tool_call("bash", &serde_json::json!({"command": "sleep 30"}));
+        out.display_tool_result("\"2. sleep 30 — done\"");
+        out.stream_thinking("wrapping up\n");
+        out.end_response();
+        out.display_separator();
+        let c = out.end_capture_inner();
+        let c = strip_ansi(&String::from_utf8_lossy(&c));
+        eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
     }
 }

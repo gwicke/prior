@@ -54,6 +54,10 @@ New entries
 
 cancellation for tool commands
 preservation of context across models / on error
+    add optional debug logging of context sent / raw messages
+    when a turn errors, send full previous model output of that turn for
+    continuity
+    verify that cancelled turns still preserve as much context as possible
 caching improvements esp. for deepseek, openrouter
 session storage
   resume / tree

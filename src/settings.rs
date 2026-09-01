@@ -615,6 +615,7 @@ mod tests {
             sandbox: None,
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
+            message_log_path: None,
         };
         // Mutate every setting, then apply.
         s.set_value(SettingKey::DefaultModel, "openrouter:tencent/hy3:free")

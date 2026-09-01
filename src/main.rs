@@ -44,6 +44,10 @@ struct Args {
     /// Log available providers and debug model catalog extrapolation/filtering
     #[arg(long, global = true)]
     debug_providers: bool,
+
+    /// Log raw messages to a JSONL file for debugging
+    #[arg(long, global = true, value_name = "FILE")]
+    log_messages: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -280,6 +284,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         sandbox,
         show_reasoning_handle,
         reasoning_in_context,
+        message_log_path: args.log_messages.clone(),
     };
     let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {

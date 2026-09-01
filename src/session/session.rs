@@ -18,10 +18,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use rig_core::message::{
-    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall,
+    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolCall, ToolCallId,
     ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
-use rig_core::OneOrMany;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::session::storage::{JsonlSessionStorage, SessionStorage};
@@ -227,7 +226,7 @@ impl Session {
             let mut map = self.tool_name_by_call_id.lock().unwrap();
             for item in content.iter() {
                 if let AssistantContent::ToolCall(tc) = item {
-                    map.insert(tc.id.clone(), tc.function.name.clone());
+                    map.insert(tc.id.clone().into_string(), tc.function.name.clone());
                 }
             }
         }
@@ -558,7 +557,7 @@ fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
         "user" => {
             let content = pi_content_to_user_content(value.get("content")?)?;
             Some(Message::User {
-                content: OneOrMany::many(content).ok()?,
+                content,
             })
         }
         "assistant" => {
@@ -567,7 +566,7 @@ fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
                 id: value
                     .get("responseId")
                     .and_then(|v| v.as_str().map(String::from)),
-                content: OneOrMany::many(content).ok()?,
+                content,
             })
         }
         _ => None,
@@ -586,7 +585,7 @@ fn pi_toolresults_to_rig_message(results: Vec<serde_json::Value>) -> Option<Mess
         return None;
     }
     Some(Message::User {
-        content: OneOrMany::many(tool_results).ok()?,
+        content: tool_results,
     })
 }
 
@@ -596,9 +595,13 @@ fn pi_toolresult_to_rig(value: &serde_json::Value) -> Option<ToolResult> {
     let content = pi_content_to_toolresult_content(value.get("content")?)?;
 
     Some(ToolResult {
-        id,
-        call_id: None,
-        content: OneOrMany::many(content).ok()?,
+        call: ToolCallId::new(id)?,
+        provider: None,
+        name: value
+            .get("toolName")
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "tool".to_string()),
+        content,
     })
 }
 
@@ -646,8 +649,8 @@ fn pi_content_to_assistant_content(
                 let name = item.get("name")?.as_str()?.to_string();
                 let arguments = item.get("arguments")?.clone();
                 let tc = ToolCall {
-                    id,
-                    call_id: None,
+                    id: ToolCallId::new(id)?,
+                    provider: None,
                     function: ToolFunction::new(name, arguments),
                     signature: None,
                     additional_params: None,
@@ -768,7 +771,7 @@ pub(crate) fn rig_message_to_pi_entries(
                             content: SessionEntryContent::Message {
                                 message: serde_json::json!({
                                     "role": "toolResult",
-                                    "toolCallId": tr.id,
+                                    "toolCallId": tr.call.as_str(),
                                     "toolName": "tool",
                                     "content": content_items,
                                     "isError": false,
@@ -820,9 +823,6 @@ pub(crate) fn rig_message_to_pi_entries(
                                         "type": "thinking",
                                         "thinking": s,
                                     }));
-                                }
-                                _ => {
-                                    // Future ReasoningContent variants — skip.
                                 }
                             }
                         }
@@ -993,7 +993,7 @@ mod tests {
         match msg {
             Message::User { content } => {
                 assert_eq!(content.len(), 1);
-                match content.first_ref() {
+                match content.first().unwrap() {
                     UserContent::Text(t) => assert_eq!(t.text, "hello world"),
                     _ => panic!("expected Text"),
                 }
@@ -1017,7 +1017,7 @@ mod tests {
             Message::Assistant { id, content } => {
                 assert_eq!(id, Some("msg_001".into()));
                 assert_eq!(content.len(), 2);
-                match content.first_ref() {
+                match content.first().unwrap() {
                     AssistantContent::Reasoning(r) => {
                         match &r.content[0] {
                             ReasoningContent::Text { text, signature } => {
@@ -1050,7 +1050,7 @@ mod tests {
         match msg {
             Message::Assistant { content, .. } => {
                 assert_eq!(content.len(), 1);
-                match content.first_ref() {
+                match content.first().unwrap() {
                     AssistantContent::ToolCall(tc) => {
                         assert_eq!(tc.id, "tc_001");
                         assert_eq!(tc.function.name, "bash");
@@ -1118,7 +1118,7 @@ mod tests {
         // 1: user "list files"
         assert!(matches!(&messages[0], Message::User { .. }));
         if let Message::User { content } = &messages[0] {
-            if let UserContent::Text(t) = content.first_ref() {
+            if let UserContent::Text(t) = content.first().unwrap() {
                 assert_eq!(t.text, "list files");
             } else {
                 panic!("expected Text");
@@ -1132,12 +1132,12 @@ mod tests {
         assert!(matches!(&messages[2], Message::User { .. }));
         if let Message::User { content } = &messages[2] {
             assert_eq!(content.len(), 2);
-            match content.first_ref() {
-                UserContent::ToolResult(tr) => assert_eq!(tr.id, "tc_1"),
+            match content.first().unwrap() {
+                UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_1"),
                 _ => panic!("expected ToolResult"),
             }
             match content.iter().nth(1).unwrap() {
-                UserContent::ToolResult(tr) => assert_eq!(tr.id, "tc_2"),
+                UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_2"),
                 _ => panic!("expected ToolResult"),
             }
         }
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(converted.len(), 1);
         match &converted[0] {
             Message::User { content } => {
-                if let UserContent::Text(t) = content.first_ref() {
+                if let UserContent::Text(t) = content.first().unwrap() {
                     assert_eq!(t.text, "hello from rig");
                 } else {
                     panic!("expected Text");
@@ -1206,14 +1206,13 @@ mod tests {
     fn test_rig_assistant_with_reasoning_roundtrip() {
         let assistant = Message::Assistant {
             id: Some("resp-1".into()),
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::Reasoning(Reasoning::new_with_signature(
                     "step by step",
                     Some("sig".into()),
                 )),
                 AssistantContent::Text(Text::new("done")),
-            ])
-            .unwrap(),
+            ],
         };
 
         let entries = rig_message_to_pi_entries(&assistant, "a1", &None);
@@ -1225,7 +1224,7 @@ mod tests {
             Message::Assistant { id, content } => {
                 assert_eq!(id.as_deref(), Some("resp-1"));
                 assert_eq!(content.len(), 2);
-                match content.first_ref() {
+                match content.first().unwrap() {
                     AssistantContent::Reasoning(r) => {
                         match &r.content[0] {
                             ReasoningContent::Text { text, signature } => {
@@ -1249,12 +1248,12 @@ mod tests {
     #[test]
     fn test_rig_tool_result_roundtrip() {
         let tool_result = Message::User {
-            content: OneOrMany::many(vec![UserContent::ToolResult(ToolResult {
-                id: "tc_1".into(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::Text(Text::new("output"))),
-            })])
-            .unwrap(),
+            content: vec![UserContent::ToolResult(ToolResult {
+                call: ToolCallId::new("tc_1").unwrap(),
+                provider: None,
+                name: "tool".into(),
+                content: vec![ToolResultContent::Text(Text::new("output"))],
+            })],
         };
 
         let entries = rig_message_to_pi_entries(&tool_result, "tr-id", &None);
@@ -1274,8 +1273,8 @@ mod tests {
         match &converted[0] {
             Message::User { content } => {
                 assert_eq!(content.len(), 1);
-                match content.first_ref() {
-                    UserContent::ToolResult(tr) => assert_eq!(tr.id, "tc_1"),
+                match content.first().unwrap() {
+                    UserContent::ToolResult(tr) => assert_eq!(tr.call.as_str(), "tc_1"),
                     _ => panic!("expected ToolResult"),
                 }
             }
@@ -1504,42 +1503,45 @@ mod tests {
         // Assistant turn with three tool calls.
         let assistant_with_tools = Message::Assistant {
             id: None,
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: "tc_0".into(), call_id: None,
+                    id: ToolCallId::new("tc_0").unwrap(), provider: None,
                     function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: "tc_1".into(), call_id: None,
+                    id: ToolCallId::new("tc_1").unwrap(), provider: None,
                     function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: "tc_2".into(), call_id: None,
+                    id: ToolCallId::new("tc_2").unwrap(), provider: None,
                     function: rig_core::message::ToolFunction::new("ls".into(), serde_json::json!({})),
                     signature: None, additional_params: None,
                 }),
-            ]).unwrap(),
+            ],
         };
         session.append_message(&assistant_with_tools).await.unwrap();
 
         // Three tool results in one User message.
         let tool_results = Message::User {
-            content: OneOrMany::many(vec![
+            content: vec![
                 UserContent::ToolResult(ToolResult {
-                    id: "tc_0".into(), call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 0"))),
+                    call: ToolCallId::new("tc_0").unwrap(), provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("result 0"))],
                 }),
                 UserContent::ToolResult(ToolResult {
-                    id: "tc_1".into(), call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 1"))),
+                    call: ToolCallId::new("tc_1").unwrap(), provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("result 1"))],
                 }),
                 UserContent::ToolResult(ToolResult {
-                    id: "tc_2".into(), call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(Text::new("result 2"))),
+                    call: ToolCallId::new("tc_2").unwrap(), provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("result 2"))],
                 }),
-            ]).unwrap(),
+            ],
         };
         session.append_message(&tool_results).await.unwrap();
 
@@ -1558,7 +1560,7 @@ mod tests {
         assert_eq!(content.len(), 3, "all three tool results must be present after roundtrip");
 
         let ids: Vec<&str> = content.iter().map(|c| match c {
-            UserContent::ToolResult(tr) => tr.id.as_str(),
+            UserContent::ToolResult(tr) => tr.call.as_str(),
             _ => panic!("expected ToolResult"),
         }).collect();
         assert_eq!(ids, ["tc_0", "tc_1", "tc_2"], "tool results must be in original order");
@@ -1592,20 +1594,21 @@ mod tests {
         session.append_message(&Message::user("weather")).await.unwrap();
         session.append_message(&Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "call_abc".into(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: ToolCallId::new("call_abc").unwrap(),
+                provider: None,
                 function: ToolFunction::new("get_weather".to_string(), serde_json::json!({"city": "NYC"})),
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }).await.unwrap();
         session.append_message(&Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
-                id: "call_abc".into(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::Text(Text::new("72F"))),
-            })),
+            content: vec![UserContent::ToolResult(RigToolResult {
+                call: ToolCallId::new("call_abc").unwrap(),
+                provider: None,
+                name: "tool".into(),
+                content: vec![ToolResultContent::Text(Text::new("72F"))],
+            })],
         }).await.unwrap();
         session.append_message(&Message::assistant("It's 72F in NYC")).await.unwrap();
 
@@ -1689,20 +1692,21 @@ mod tests {
         session.append_message(&Message::user("read file")).await.unwrap();
         session.append_message(&Message::Assistant {
             id: None,
-            content: OneOrMany::one(AssistantContent::ToolCall(ToolCall {
-                id: "tc_read".into(),
-                call_id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall {
+                id: ToolCallId::new("tc_read").unwrap(),
+                provider: None,
                 function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
                 signature: None,
                 additional_params: None,
-            })),
+            })],
         }).await.unwrap();
         session.append_message(&Message::User {
-            content: OneOrMany::one(UserContent::ToolResult(RigToolResult {
-                id: "tc_read".into(),
-                call_id: None,
-                content: OneOrMany::one(ToolResultContent::Text(Text::new("file contents"))),
-            })),
+            content: vec![UserContent::ToolResult(RigToolResult {
+                call: ToolCallId::new("tc_read").unwrap(),
+                provider: None,
+                name: "tool".into(),
+                content: vec![ToolResultContent::Text(Text::new("file contents"))],
+            })],
         }).await.unwrap();
         session.append_message(&Message::assistant("done")).await.unwrap();
 
@@ -1747,36 +1751,38 @@ mod tests {
         session.append_message(&Message::user("do things")).await.unwrap();
         session.append_message(&Message::Assistant {
             id: None,
-            content: OneOrMany::many(vec![
+            content: vec![
                 AssistantContent::ToolCall(ToolCall {
-                    id: "tc_bash".into(),
-                    call_id: None,
+                    id: ToolCallId::new("tc_bash").unwrap(),
+                    provider: None,
                     function: ToolFunction::new("bash".into(), serde_json::json!({"command": "ls"})),
                     signature: None,
                     additional_params: None,
                 }),
                 AssistantContent::ToolCall(ToolCall {
-                    id: "tc_read".into(),
-                    call_id: None,
+                    id: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
                     function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
                     signature: None,
                     additional_params: None,
                 }),
-            ]).unwrap(),
+            ],
         }).await.unwrap();
         session.append_message(&Message::User {
-            content: OneOrMany::many(vec![
+            content: vec![
                 UserContent::ToolResult(RigToolResult {
-                    id: "tc_bash".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(Text::new("file1.txt"))),
+                    call: ToolCallId::new("tc_bash").unwrap(),
+                    provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("file1.txt"))],
                 }),
                 UserContent::ToolResult(RigToolResult {
-                    id: "tc_read".into(),
-                    call_id: None,
-                    content: OneOrMany::one(ToolResultContent::Text(Text::new("content"))),
+                    call: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("content"))],
                 }),
-            ]).unwrap(),
+            ],
         }).await.unwrap();
         session.append_message(&Message::assistant("all done")).await.unwrap();
 

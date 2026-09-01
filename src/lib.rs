@@ -21,7 +21,7 @@ pub use config::{Config, Recipe, ToolSettings};
 pub use settings::{SettingKey, SettingsStore, ShowReasoning, ShowReasoningHandle};
 
 // Re-export core rig types for library users
-pub use rig_core::agent::AgentBuilder;
+pub use rig_agent::agent::AgentBuilder;
 pub use rig_core::client::{CompletionClient, ProviderClient};
 pub use rig_core::completion::CompletionModel;
 pub use rig_core::providers;
