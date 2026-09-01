@@ -38,7 +38,7 @@ pub trait Output: Send + Sync {
     }
     // ---- Response event sequence ----
     // Both the live streaming path (`PicoAgent::prompt`) and the session
-    // replay path (`replay_recent_turns`) drive these methods in the same
+    // replay path (`replay_units`) drive these methods in the same
     // order, so `ConsoleOutput` only needs one rendering implementation and
     // replay output is guaranteed to match live output.
     //

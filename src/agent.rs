@@ -1236,7 +1236,7 @@ pub(crate) fn parse_session_name_after(rest: &str) -> (String, String) {
 
 /// One assistant segment: the content streamed between tool executions (or the
 /// whole final answer when there are no more tools to run in this turn).
-struct AssistantSegment {
+pub(crate) struct AssistantSegment {
     /// Reasoning/thinking blocks in message order.
     thinking: Vec<String>,
     /// Answer text blocks in message order.
@@ -1263,114 +1263,279 @@ impl AssistantSegment {
 
 /// One complete conversation turn: the user's text prompt followed by the
 /// full chain of assistant segments (`text/reasoning → tool block → …`).
-struct ConversationTurn {
+pub(crate) struct ConversationTurn {
     user_text: String,
     segments: Vec<AssistantSegment>,
 }
 
-/// Group a flat `Vec<Message>` (from `SessionContext::messages`) into replay
-/// turns.
+/// One replayable item from the raw session branch.
 ///
-/// A `User { Text }` opens a new `ConversationTurn`. A `User { ToolResult }`
-/// populates `tool_results` on the most recent assistant segment — these
-/// always follow the assistant message that issued the calls. An `Assistant`
-/// message appends a new segment to the current turn.
-fn group_into_turns(messages: &[Message]) -> Vec<ConversationTurn> {
-    let mut turns: Vec<ConversationTurn> = Vec::new();
+/// Replay walks the FULL branch (root→leaf) so compaction entries render as
+/// visible markers while the conversation replays all the way to the
+/// beginning; only the agent context is prefix-limited at the compaction
+/// scope (see `Session::build_context` / `apply_compaction_transforms`).
+pub(crate) enum ReplayUnit {
+    Turn(ConversationTurn),
+    /// A compaction boundary marker. Everything on the branch after this
+    /// entry is what the agent sees (it was written with `firstKeptEntryId`).
+    Compaction { tokens_before: u64 },
+}
 
-    for msg in messages {
-        match msg {
-            Message::User { content } => {
-                let mut user_text: Option<String> = None;
-                let mut tool_results: Vec<(String, String)> = Vec::new();
 
-                for item in content.iter() {
-                    match item {
-                        UserContent::Text(t) if user_text.is_none() => {
-                            user_text = Some(t.text.clone());
-                        }
-                        UserContent::ToolResult(tr) => {
-                            let text = tr
-                                .content
-                                .iter()
-                                .filter_map(|rc| match rc {
-                                    ToolResultContent::Text(t) => Some(t.text.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            tool_results.push((tr.call.clone().into_string(), text));
-                        }
-                        _ => {}
+/// Build replay units from the raw session branch (root->leaf).
+///
+/// Replay walks the FULL branch so compaction entries become
+/// `ReplayUnit::Compaction` markers interleaved with turns, giving the user
+/// the whole history while only the agent context is prefix-limited at the
+/// compaction scope. Tool-result entries are batched into the preceding
+/// assistant segment exactly like `extract_messages`/`group_into_turns`, so an
+/// uncompacted branch produces the same turns as the old context-based path.
+fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec<ReplayUnit> {
+    use crate::session::SessionEntryContent;
+
+    let mut units: Vec<ReplayUnit> = Vec::new();
+    let mut open: Option<ConversationTurn> = None;
+    // Pending tool-result pi messages (batched into the next assistant flush).
+    let mut pending_tools: Vec<serde_json::Value> = Vec::new();
+
+    fn flush_pending_tools(
+        pending: &mut Vec<serde_json::Value>,
+        open: &mut Option<ConversationTurn>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(turn) = open.as_mut() {
+            let mut seg_vec = Vec::new();
+            if let Some(seg) = turn.segments.last_mut() {
+                let trs = std::mem::take(pending);
+                for tr in trs {
+                    // Reuse the pi -> rig tool-result conversion (pub(crate)).
+                    if let Some(Message::User { content }) =
+                        crate::session::pi_toolresults_to_rig_message(vec![tr])
+                    {
+                        seg_vec.extend(content);
                     }
                 }
-
-                if let Some(txt) = user_text {
-                    // New conversation turn.
-                    turns.push(ConversationTurn { user_text: txt, segments: Vec::new() });
-                } else if !tool_results.is_empty() {
-                    // Attach to the most recent segment of the current turn.
-                    if let Some(turn) = turns.last_mut() {
-                        if let Some(seg) = turn.segments.last_mut() {
-                            seg.tool_results.extend(tool_results);
-                        }
+                for item in seg_vec {
+                    if let UserContent::ToolResult(tr) = item {
+                        let text = tr
+                            .content
+                            .iter()
+                            .filter_map(|rc| match rc {
+                                ToolResultContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        seg.tool_results.push((tr.call.clone().into_string(), text));
                     }
                 }
             }
-            Message::Assistant { content, .. } => {
-                if let Some(turn) = turns.last_mut() {
-                    let mut seg = AssistantSegment::new();
-                    for item in content.iter() {
-                        match item {
-                            AssistantContent::Reasoning(r) => {
-                                let t: String = r
-                                    .content
-                                    .iter()
-                                    .filter_map(|rc| match rc {
-                                        ReasoningContent::Text { text, .. } => Some(text.as_str()),
-                                        ReasoningContent::Summary(s) => Some(s.as_str()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                if !t.is_empty() {
-                                    seg.thinking.push(t);
+        }
+        pending.clear();
+    }
+
+    for entry in branch {
+        match &entry.content {
+            SessionEntryContent::Message { message } => {
+                let role = message.get("role").and_then(|r| r.as_str());
+                match role {
+                    Some("toolResult") => pending_tools.push(message.clone()),
+                    Some("user") | Some("assistant") => {
+                        // End of a turn boundary? A user text message starts a
+                        // new turn; flush pending tool results first.
+                        if role == Some("user") {
+                            flush_pending_tools(&mut pending_tools, &mut open);
+                            if let Some(txt) = user_text_of(message) {
+                                if let Some(t) = open.take() {
+                                    units.push(ReplayUnit::Turn(t));
                                 }
+                                open = Some(ConversationTurn {
+                                    user_text: txt,
+                                    segments: Vec::new(),
+                                });
                             }
-                            AssistantContent::Text(t) if !t.text.is_empty() => {
-                                seg.text.push(t.text.clone());
+                        } else {
+                            // Assistant: attach to current turn (flush tools first).
+                            flush_pending_tools(&mut pending_tools, &mut open);
+                            if let Some(msg) = crate::session::pi_message_to_rig(message) {
+                                feed_turn_into(&mut open, &msg);
                             }
-                            AssistantContent::ToolCall(tc) => {
-                                seg.tool_calls.push((
-                                    tc.id.clone().into_string(),
-                                    tc.function.name.clone(),
-                                    tc.function.arguments.clone(),
-                                ));
-                            }
-                            _ => {}
                         }
                     }
-                    turn.segments.push(seg);
+                    _ => {}
                 }
+            }
+            SessionEntryContent::Compaction { tokens_before, .. } => {
+                // A compaction boundary comes AFTER the turn it concludes:
+                // flush any open turn first, then emit the marker.
+                flush_pending_tools(&mut pending_tools, &mut open);
+                if let Some(t) = open.take() {
+                    units.push(ReplayUnit::Turn(t));
+                }
+                units.push(ReplayUnit::Compaction { tokens_before: *tokens_before });
             }
             _ => {}
         }
     }
-
-    turns
+    flush_pending_tools(&mut pending_tools, &mut open);
+    if let Some(t) = open.take() {
+        units.push(ReplayUnit::Turn(t));
+    }
+    units
 }
 
-/// Replay stored session turns through the same Output event sequence the live
-/// streaming path uses (`PicoAgent::prompt`). Groups the flat message list
-/// into conversation turns, then drives:
-///
-///   `begin_response` / `set_answer_hold` /
-///   `stream_thinking` / `stream_text` /
-///   `end_response_segment` / `display_tool_call` / `display_tool_result` /
-///   `end_response`
-///
-/// in the identical order the live path produces, so `ConsoleOutput` renders
-/// replayed content exactly as it rendered the original live session.
+/// Extract the first text block of a pi user AgentMessage.
+fn user_text_of(message: &serde_json::Value) -> Option<String> {
+    message
+        .pointer("/content/0/text")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Feed one assistant rig Message into the open turn (assistant segments
+/// always belong to the current turn).
+fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
+    let Some(turn) = open.as_mut() else { return };
+    let Message::Assistant { content, .. } = msg else { return };
+    let mut seg = AssistantSegment::new();
+    for item in content.iter() {
+        match item {
+            AssistantContent::Reasoning(r) => {
+                let t: String = r
+                    .content
+                    .iter()
+                    .filter_map(|rc| match rc {
+                        ReasoningContent::Text { text, .. } => Some(text.as_str()),
+                        ReasoningContent::Summary(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !t.is_empty() {
+                    seg.thinking.push(t);
+                }
+            }
+            AssistantContent::Text(t) if !t.text.is_empty() => {
+                seg.text.push(t.text.clone());
+            }
+            AssistantContent::ToolCall(tc) => {
+                seg.tool_calls.push((
+                    tc.id.clone().into_string(),
+                    tc.function.name.clone(),
+                    tc.function.arguments.clone(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    turn.segments.push(seg);
+}
+
+/// Render a single `ConversationTurn` through the Output event sequence
+/// (identical to the live streaming path). `leading_separator` controls
+/// whether a separator precedes the user prompt (replay skips it for the very
+/// first unit because the loop already emitted one).
+fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: bool) {
+    if leading_separator {
+        output.display_separator();
+    }
+    output.display_plain(&turn.user_text);
+
+    if turn.segments.is_empty() {
+        return;
+    }
+
+    output.display_separator();
+    output.begin_response();
+    output.set_answer_hold(false);
+
+    let seg_count = turn.segments.len();
+    for (seg_idx, segment) in turn.segments.iter().enumerate() {
+        let is_last_segment = seg_idx + 1 == seg_count;
+
+        for thinking in &segment.thinking {
+            output.stream_thinking(thinking);
+        }
+        for text in &segment.text {
+            output.stream_text(text);
+        }
+
+        if !segment.tool_calls.is_empty() {
+            output.end_response_segment();
+            for (call_id, name, args) in &segment.tool_calls {
+                output.display_tool_call(name, args);
+                if let Some((_, result_text)) =
+                    segment.tool_results.iter().find(|(rid, _)| rid == call_id)
+                {
+                    output.display_tool_result(result_text);
+                }
+            }
+        } else if !is_last_segment {
+            output.end_response_segment();
+        }
+    }
+    output.end_response();
+}
+
+/// Replay a slice of units starting at `start`. Compaction markers render as a
+/// dim system notice between turns; `Nt`/`Nl` limits count TURNS (markers are
+/// not turns and are always drawn when inside the selected window).
+fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
+    // Leading separators only space out turns (turns *after* the first one).
+    // Compaction markers are not turns and never force a separator.
+    let mut first_turn_seen = false;
+    for unit in &units[start..] {
+        match unit {
+            ReplayUnit::Turn(turn) => {
+                render_turn(output, turn, first_turn_seen);
+                first_turn_seen = true;
+            }
+            ReplayUnit::Compaction { tokens_before } => {
+                output.display_system(&format!(
+                    "[compaction: {}k tokens]",
+                    tokens_before / 1000,
+                ));
+            }
+        }
+    }
+}
+
+/// Count the conversation turns in a unit list (compaction markers are not
+/// turns).
+pub(crate) fn count_turns(units: &[ReplayUnit]) -> usize {
+    units.iter().filter(|u| matches!(u, ReplayUnit::Turn(_))).count()
+}
+
+/// Return the unit index where the last `n` turns begin (0 when `n` >= the
+/// total). Markers in that window are included in the render — only the
+/// leading turns before the window are dropped, matching `/replay N` semantics
+/// where the limit applies to turns.
+pub(crate) fn last_turns_start(units: &[ReplayUnit], n: usize) -> usize {
+    if n == 0 {
+        return units.len();
+    }
+    let mut seen = 0usize;
+    let mut idx = units.len();
+    while idx > 0 {
+        idx -= 1;
+        if matches!(units[idx], ReplayUnit::Turn(_)) {
+            seen += 1;
+            if seen == n {
+                break;
+            }
+        }
+    }
+    if seen < n { 0 } else { idx }
+}
+
+/// Replay the last `n` turns (plus any markers inside that window) from a
+/// unit list.
+pub(crate) fn replay_last_turns(output: &dyn Output, units: &[ReplayUnit], n: usize) {
+    let start = last_turns_start(units, n);
+    replay_units(output, units, start);
+}
 
 /// Parse a replay-length argument: plain number `N`, `Nt` (turns), or `Nl`
 /// (lines).  Returns `(count, is_lines)`.  An empty/whitespace input returns
@@ -1389,81 +1554,6 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
         (n, false)
     }
 }
-
-fn replay_recent_turns(
-    output: &Arc<dyn Output>,
-    ctx: &crate::session::SessionContext,
-    replay_turns: usize,
-) {
-    let turns = group_into_turns(&ctx.messages);
-    // Take the N most recent complete turns (accurate count, not a raw-message
-    // estimate like the old `len - replay_turns * 2 + 1` heuristic).
-    let start = turns.len().saturating_sub(replay_turns);
-
-    for (turn_idx, turn) in turns[start..].iter().enumerate() {
-        // Separator before each user prompt mirrors the top-of-loop separator
-        // in `run_interactive`. Skip it for the very first replayed turn: the
-        // loop already emitted one before the `/session resume` input was read.
-        if turn_idx > 0 {
-            output.display_separator();
-        }
-        output.display_plain(&turn.user_text);
-
-        if turn.segments.is_empty() {
-            continue;
-        }
-
-        // Pre-response separator: mirrors `run_interactive`'s separator between
-        // the submitted user prompt and the start of the agent response.
-        output.display_separator();
-
-        output.begin_response();
-        // Replay is non-streaming; content is already in the correct order.
-        // Answer-hold exists to reorder live-stream content that arrives out of
-        // sequence (reasoning after answer); it is never needed in replay.
-        output.set_answer_hold(false);
-
-        let seg_count = turn.segments.len();
-        for (seg_idx, segment) in turn.segments.iter().enumerate() {
-            let is_last_segment = seg_idx + 1 == seg_count;
-
-            for thinking in &segment.thinking {
-                output.stream_thinking(thinking);
-            }
-            for text in &segment.text {
-                output.stream_text(text);
-            }
-
-            if !segment.tool_calls.is_empty() {
-                // Flush the current text/reasoning block before the tool panel.
-                // Mirrors the `CompletionCall` stream event that fires in the
-                // live path immediately before `LoggingHook::on_tool_call`.
-                output.end_response_segment();
-                for (call_id, name, args) in &segment.tool_calls {
-                    output.display_tool_call(name, args);
-                    // Emit the matching result immediately after its call, so
-                    // `ConsoleOutput::last_tool` is always set when the result
-                    // renders (drives language guessing and gutter stripping).
-                    // A cancelled turn may have calls with no stored result;
-                    // skip `display_tool_result` rather than showing garbage.
-                    if let Some((_, result_text)) =
-                        segment.tool_results.iter().find(|(rid, _)| rid == call_id)
-                    {
-                        output.display_tool_result(result_text);
-                    }
-                }
-            } else if !is_last_segment {
-                // Defensive: a segment with no tool calls but more segments
-                // follow (shouldn't occur in a well-formed session). Flush to
-                // keep the renderer state clean.
-                output.end_response_segment();
-            }
-        }
-
-        output.end_response();
-    }
-}
-
 /// Parse and dispatch a `/session <name> <action>` command.
 
 /// Parse and dispatch a `/session <name> <action>` command.
@@ -1535,27 +1625,30 @@ async fn handle_session_command(
                         let id = new_session.get_session_id().to_string();
 
                         if count > 0 {
-                            if let Ok(ctx) = new_session.build_context().await {
-                                output.display_separator();
-                                if is_lines {
-                                    // Line-based: capture full replay via writer, tail lines.
-                                    output.begin_capture();
-                                    let total = group_into_turns(&ctx.messages).len();
-                                    replay_recent_turns(output, &ctx, total);
-                                    let bytes = output.end_capture();
-                                    let captured = String::from_utf8_lossy(&bytes);
-                                    let lines: Vec<&str> = captured.lines().collect();
-                                    let start = lines.len().saturating_sub(count);
-                                    use std::io::Write as _;
-                                    let stdout = std::io::stdout();
-                                    let mut handle = stdout.lock();
-                                    for line in &lines[start..] {
-                                        let _ = writeln!(handle, "{}", line);
-                                    }
-                                    let _ = handle.flush();
-                                } else {
-                                    replay_recent_turns(output, &ctx, count);
+                            // Replay from the RAW branch so compaction entries
+                            // render as markers while the whole history is
+                            // available; only the agent context is scoped.
+                            let branch = new_session.get_branch().await;
+                            let units = build_replay_units(&branch);
+                            let total = count_turns(&units);
+                            output.display_separator();
+                            if is_lines {
+                                // Line-based: capture full replay via writer, tail lines.
+                                output.begin_capture();
+                                replay_units(output.as_ref(), &units, 0);
+                                let bytes = output.end_capture();
+                                let captured = String::from_utf8_lossy(&bytes);
+                                let lines: Vec<&str> = captured.lines().collect();
+                                let start = lines.len().saturating_sub(count);
+                                use std::io::Write as _;
+                                let stdout = std::io::stdout();
+                                let mut handle = stdout.lock();
+                                for line in &lines[start..] {
+                                    let _ = writeln!(handle, "{}", line);
                                 }
+                                let _ = handle.flush();
+                            } else {
+                                replay_last_turns(output.as_ref(), &units, count.min(total));
                             }
                         }
 
@@ -2280,61 +2373,46 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     continue;
                 }
                 // Handle `/replay [N[t|l]]`: re-render session history.
+                // Replay walks the RAW branch (via `build_replay_units`) so
+                // compaction entries render as markers while the full history
+                // replays all the way to the beginning; only the agent context
+                // is prefix-limited at the compaction scope.
                 if input == "/replay" || input.starts_with("/replay ") {
                     if let Some(ref s) = session {
                         let arg = input["/replay".len()..].trim();
+                        let branch = s.get_branch().await;
+                        let units = build_replay_units(&branch);
+                        let total = count_turns(&units);
                         if arg.ends_with('l') {
                             // Line-based limit: capture full replay (with full ANSI
                             // rendering) via a Vec<u8> writer, then display only the
                             // last N lines.
                             let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
                             if n > 0 {
-                                match s.build_context().await {
-                                    Ok(ctx) => {
-                                        let turns = group_into_turns(&ctx.messages);
-                                        if turns.is_empty() {
-                                            config.output.display_text("Session is empty");
-                                        } else {
-                                            let total = turns.len();
-                                            // Capture full replay (full ANSI rendering)
-                                            // via writer swap.
-                                            config.output.begin_capture();
-                                            if total > 0 {
-                                                config.output.display_separator();
-                                            }
-                                            replay_recent_turns(&config.output, &ctx, total);
-                                            let bytes = config.output.end_capture();
-                                            let captured = String::from_utf8_lossy(&bytes);
-                                            let lines: Vec<&str> = captured.lines().collect();
-                                            let start = lines.len().saturating_sub(n);
-                                            use std::io::Write as _;
-                                            let stdout = std::io::stdout();
-                                            let mut handle = stdout.lock();
-                                            for line in &lines[start..] {
-                                                let _ = writeln!(handle, "{}", line);
-                                            }
-                                            let _ = handle.flush();
-                                        }
+                                if total == 0 {
+                                    config.output.display_text("Session is empty");
+                                } else {
+                                    config.output.begin_capture();
+                                    config.output.display_separator();
+                                    replay_units(config.output.as_ref(), &units, 0);
+                                    let bytes = config.output.end_capture();
+                                    let captured = String::from_utf8_lossy(&bytes);
+                                    let lines: Vec<&str> = captured.lines().collect();
+                                    let start = lines.len().saturating_sub(n);
+                                    use std::io::Write as _;
+                                    let stdout = std::io::stdout();
+                                    let mut handle = stdout.lock();
+                                    for line in &lines[start..] {
+                                        let _ = writeln!(handle, "{}", line);
                                     }
-                                    Err(e) => {
-                                        config.output.display_text(&format!("Cannot replay session: {}", e));
-                                    }
+                                    let _ = handle.flush();
                                 }
                             } else {
                                 // `0l` — replay all (same as bare `/replay`).
-                                match s.build_context().await {
-                                    Ok(ctx) => {
-                                        let turns = group_into_turns(&ctx.messages);
-                                        let total = turns.len();
-                                        if total > 0 {
-                                            config.output.display_separator();
-                                        }
-                                        replay_recent_turns(&config.output, &ctx, total);
-                                    }
-                                    Err(e) => {
-                                        config.output.display_text(&format!("Cannot replay session: {}", e));
-                                    }
+                                if total > 0 {
+                                    config.output.display_separator();
                                 }
+                                replay_units(config.output.as_ref(), &units, 0);
                             }
                         } else {
                             // Turn-based limit: N or Nt (or no arg).  Empty arg means all.
@@ -2343,20 +2421,12 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                             } else {
                                 parse_replay_len_arg(arg, 0)
                             };
-                            let replay_turns = if count == 0 { None } else { Some(count) };
-                            match s.build_context().await {
-                                Ok(ctx) => {
-                                    let turns = group_into_turns(&ctx.messages);
-                                    let total = turns.len();
-                                    let count = replay_turns.unwrap_or(total).min(total);
-                                    if count > 0 {
-                                        config.output.display_separator();
-                                    }
-                                    replay_recent_turns(&config.output, &ctx, count);
-                                }
-                                Err(e) => {
-                                    config.output.display_text(&format!("Cannot replay session: {}", e));
-                                }
+                            if total == 0 {
+                                config.output.display_text("Session is empty");
+                            } else {
+                                let count = if count == 0 { total } else { count.min(total) };
+                                config.output.display_separator();
+                                replay_last_turns(config.output.as_ref(), &units, count);
                             }
                         }
                     } else {
@@ -2573,9 +2643,11 @@ mod tests {
     use rig_core::message::Reasoning;
 
     use super::{
-        create_private_dir, is_anthropic_family, maybe_strip_reasoning, message_role, persist_turn,
+        build_replay_units, count_turns, create_private_dir, is_anthropic_family,
+        last_turns_start, maybe_strip_reasoning, message_role, persist_turn,
         reasoning_text, MessageLogger,
     };
+    use super::{ReplayUnit};
     use rig_core::message::{AssistantContent, Message, Text};
 
     #[test]
@@ -3069,6 +3141,107 @@ mod tests {
             "expected sandboxed `!` command to print the remapped host file content; output:\n{shown}"
         );
     }
+
+    // ── Phase 2: replay units ─────────────────────────────────────────
+
+    fn pi_user_entry(id: &str, parent: Option<&str>, text: &str) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|p| p.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            content: crate::session::SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}]
+                }),
+            },
+        }
+    }
+
+    fn pi_assistant_entry(id: &str, parent: Option<&str>, text: &str) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|p| p.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            content: crate::session::SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": text}]
+                }),
+            },
+        }
+    }
+
+    fn pi_compaction_entry(id: &str, parent: Option<&str>, tokens: u64) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|p| p.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+            content: crate::session::SessionEntryContent::Compaction {
+                summary: String::new(),
+                first_kept_entry_id: "m0".to_string(),
+                tokens_before: tokens,
+            },
+        }
+    }
+
+    #[test]
+    fn build_replay_units_marks_compaction_and_keeps_all_turns() {
+        let branch = vec![
+            pi_user_entry("m0", None, "hello"),
+            pi_assistant_entry("a0", Some("m0"), "hi there"),
+            pi_compaction_entry("c1", Some("a0"), 42_000),
+            pi_user_entry("m1", Some("c1"), "continue"),
+        ];
+        let units = build_replay_units(&branch);
+        // [Turn(hello,hi), Compaction, Turn(continue)]
+        assert_eq!(units.len(), 3);
+        assert!(matches!(units[0], ReplayUnit::Turn(_)));
+        match &units[1] {
+            ReplayUnit::Compaction { tokens_before } => assert_eq!(*tokens_before, 42_000),
+            _ => panic!("expected compaction marker"),
+        }
+        assert!(matches!(units[2], ReplayUnit::Turn(_)));
+        // Both turns present → full history replays to the beginning.
+        assert_eq!(count_turns(&units), 2);
+    }
+
+    #[test]
+    fn build_replay_units_uncompacted_has_all_turns() {
+        let branch = vec![
+            pi_user_entry("m0", None, "q1"),
+            pi_assistant_entry("a0", Some("m0"), "r1"),
+            pi_user_entry("m1", Some("a0"), "q2"),
+            pi_assistant_entry("a1", Some("m1"), "r2"),
+        ];
+        let units = build_replay_units(&branch);
+        assert_eq!(units.len(), 2);
+        assert!(matches!(units[0], ReplayUnit::Turn(_)));
+        assert!(matches!(units[1], ReplayUnit::Turn(_)));
+        assert_eq!(count_turns(&units), 2);
+        // last_turns_start: the last turn begins at unit index 1.
+        assert_eq!(last_turns_start(&units, 1), 1);
+    }
+
+    #[test]
+    fn last_turns_start_clamps_and_honors_markers() {
+        // [T0] [C] [T1] [T2]
+        let branch = vec![
+            pi_user_entry("m0", None, "q0"),
+            pi_compaction_entry("c1", Some("m0"), 10_000),
+            pi_user_entry("m1", Some("c1"), "q1"),
+            pi_user_entry("m2", Some("m1"), "q2"),
+        ];
+        let units = build_replay_units(&branch);
+        assert_eq!(count_turns(&units), 3);
+        // Last 2 turns: [T1, T2] → they start at unit index 2 (after [T0][C]).
+        assert_eq!(last_turns_start(&units, 2), 2);
+        // More turns than exist → clamp to 0.
+        assert_eq!(last_turns_start(&units, 99), 0);
+        // Zero turns requested → empty range (start == len).
+        assert_eq!(last_turns_start(&units, 0), units.len());
+    }
+
 }
 
 /// Human-readable role label for a rig [`Message`], used in the JSONL log.

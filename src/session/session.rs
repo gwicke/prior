@@ -610,7 +610,7 @@ pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<Ses
 }
 
 /// Convert a single pi AgentMessage (user or assistant) to a rig Message.
-fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
+pub(crate) fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
     let role = value.get("role")?.as_str()?;
     match role {
         "user" => {
@@ -633,7 +633,7 @@ fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
 }
 
 /// Convert a batch of pi toolResult entries into a single rig Message::User.
-fn pi_toolresults_to_rig_message(results: Vec<serde_json::Value>) -> Option<Message> {
+pub(crate) fn pi_toolresults_to_rig_message(results: Vec<serde_json::Value>) -> Option<Message> {
     let mut tool_results: Vec<UserContent> = Vec::new();
     for result in &results {
         if let Some(tr) = pi_toolresult_to_rig(result) {
