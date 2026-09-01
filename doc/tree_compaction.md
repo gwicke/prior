@@ -2,15 +2,31 @@
 
 ## Status
 
-**Design / not implemented.** Extends the existing `/tree` navigator (see
+**Phases 1–5 implemented.** Extends the existing `/tree` navigator (see
 `doc/tree.md`) so that selecting a tree point can append a **compaction entry**
 to the *current* session, prefix-limiting the agent context at that point —
 instead of forking a new session. The session file stays in-place and remains
 bidirectionally compatible with pi's session format.
 
-**Scope:** "no summary" compaction only (empty `summary`). Summarized
-compaction (LLM-generated summary) is designed for later and is sketched in
-Phase 6.
+**Scope:** `truncate` (empty `summary`) and `text-only` (deterministic
+text summary) compaction. LLM-generated summarized compaction remains future
+work (Phase 6).
+
+**Text-only mode** (`/tree <entry-id> compact text-only`) builds a summary
+from the dropped span containing every **user prompt**, the assistant's
+**text responses per turn**, and a trailing **files-touched list**
+(`read`/`write`/`edit` paths, modified files marked) — no reasoning, no tool
+calls, no tool output. Built deterministically by
+`crate::session::build_text_only_summary` (no LLM), written as the
+`Compaction` entry's `summary`, rendered as markdown right after the
+compaction, and replayed at the compaction marker in `/replay`. Per the pi
+contract it reaches the LLM as the FIRST context message via the
+`compactionSummary` wrapper (`apply_compaction_transforms`).
+
+**ID syntax:** a tree point is referenced as `/tree <entry-id>` (angle
+brackets). A bare `/tree someterm` remains a fuzzy **search** over the entry
+list — this preserves the existing content filtering while making id targets
+unambiguous.
 
 ## Goal
 
@@ -21,7 +37,7 @@ session's leaf pointer (via `InputAction::NavigateTree`). We want:
    (today's behavior) and `compact`.
 2. `switch` opens a **sub-menu** offering `just switch` and `summarize`
    (summarize = the existing abandoned-branch summarization, committed as
-   `/tree <id> switch --summarize`). `compact` opens a **sub-menu** for
+   `/tree <entry-id> switch --summarize`). `compact` opens a **sub-menu** for
    summarization choice, offering only `truncate` (drop the prefix, keep no
    summary) for now (more options later).
 3. Choosing `compact` appends a pi-compatible `Compaction` entry at the end of
@@ -41,7 +57,7 @@ session's leaf pointer (via `InputAction::NavigateTree`). We want:
 6. Loading a session with existing compaction entries (e.g. written by pi, or
    resumed later) applies the same scoping on `build_context()`.
 7. **Output documentation follows the slash-menu pattern**: the nested menus are
-   reflected in the prompt itself (`/tree <id> switch`, `/tree <id> compact
+   reflected in the prompt itself (`/tree <entry-id> switch`, `/tree <entry-id> compact
    truncate`), and the completed prompt is preserved in the output via
    `Repl::emit_commit` — exactly like `/model <model>` or
    `/session <id> resume`. This **replaces** the current non-compliant
@@ -173,15 +189,15 @@ That is exactly the requested split: **replay full, context scoped.**
   lands, replay would **stop showing the beginning** unless switched to the raw
   branch. (This is the main replay change.)
 - `/tree` UI: `ActiveOverlay::Tree` Enter emits `NavigateTree(target_id)`
-  (`repl.rs:1341`); main loop `move_leaf` (`agent.rs:2089`) and `/tree <id>
+  (`repl.rs:1341`); main loop `move_leaf` (`agent.rs:2089`) and `/tree <entry-id>
   [--summarize]` Submit path (`agent.rs:2185`) both handle switching.
 - **Branch summarization already exists** (`parse_tree_args`, `agent.rs:1674`
   + the Submit handler `agent.rs:2199-2228`): pi's "Branch Summarization"
   (pi `compaction.md`; `session_before_tree` `userWantsSummary`). It
   summarizes the **abandoned branch** (old leaf → common ancestor), appends a
   `BranchSummary` entry at the old leaf, then `move_leaf(target)` —
-  pi-identical. Its canonical command becomes `/tree <id> switch --summarize`
-  (the bare `/tree <id> --summarize` stays accepted as a backward-compatible
+  pi-identical. Its canonical command becomes `/tree <entry-id> switch --summarize`
+  (the bare `/tree <entry-id> --summarize` stays accepted as a backward-compatible
   alias). It is **orthogonal to `compact`**: branch-summarization preserves
   the branch you're leaving when switching; `compact` truncates the *prefix*
   of the current context. pi has both mechanisms.
@@ -194,15 +210,16 @@ That is exactly the requested split: **replay full, context scoped.**
 ### Command grammar
 
 ```
-/tree <target_id> [switch [--summarize] | compact [truncate|…]]
+/tree <entry-id> [switch [--summarize] | compact [truncate|text-only]]
 ```
 
 - Default action = `switch`; default switch mode = plain (`just switch`).
 - `switch --summarize` = switch **and** summarize the abandoned branch
-  (existing branch-summarization; committed as `/tree <id> switch --summarize`).
-  The bare `/tree <id> --summarize` form remains accepted as an alias.
+  (existing branch-summarization; committed as `/tree <entry-id> switch --summarize`).
+  The bare `/tree <entry-id> --summarize` form remains accepted as an alias.
 - `compact` appends a compaction entry; its sub-menu selects the summary mode
-  (`truncate` = `summary ""`, more modes later). Default mode = `truncate`.
+  (`truncate` = `summary ""`; `text-only` = deterministic text summary).
+  Default mode = `truncate`.
 - `--summarize` applies only to `switch`; for `compact` it is ignored (or
   rejected with a notice — decide in review).
 
@@ -210,8 +227,8 @@ That is exactly the requested split: **replay full, context scoped.**
 
 Every action completed through the overlays is committed via
 `Repl::emit_commit` (same as the `/model`, `/thinking`, `/session` overlays,
-`repl.rs:1095/1280`), so the finished prompt — `/tree <id> switch`,
-`/tree <id> switch --summarize`, or `/tree <id> compact truncate` — is echoed
+`repl.rs:1095/1280`), so the finished prompt — `/tree <entry-id> switch`,
+`/tree <entry-id> switch --summarize`, or `/tree <entry-id> compact truncate` — is echoed
 into the session output and stands as the record of the action. Consequently:
 
 - the main loop **no longer prints** `/tree navigated (<id>)`
@@ -229,20 +246,20 @@ into the session output and stands as the record of the action. Consequently:
 ```
 /tree                       → tree list overlay
   ↓ Enter on a point
-/tree <id>                  → TreeAction overlay: [switch*] [compact]
-  ↓ Enter on "switch"       → buffer "/tree <id> switch"   (sub-menu opens)
-  ↓ Enter on "compact"      → buffer "/tree <id> compact"  (sub-menu opens)
+/tree <entry-id>            → TreeAction overlay: [switch*] [compact]
+  ↓ Enter on "switch"       → buffer "/tree <entry-id> switch"   (sub-menu opens)
+  ↓ Enter on "compact"      → buffer "/tree <entry-id> compact"  (sub-menu opens)
   ↓ Esc                     → back to "/tree " (list)
-/tree <id> switch           → SwitchAction overlay: [just switch*] [summarize]
-  ↓ Enter on "just switch"  → commit & submit "/tree <id> switch"
-  ↓ Enter on "summarize"    → commit & submit "/tree <id> switch --summarize"
-  ↓ Esc                     → back to "/tree <id>" (TreeAction)
-/tree <id> compact          → CompactSummary overlay:
+/tree <entry-id> switch     → SwitchAction overlay: [just switch*] [summarize]
+  ↓ Enter on "just switch"  → commit & submit "/tree <entry-id> switch"
+  ↓ Enter on "summarize"    → commit & submit "/tree <entry-id> switch --summarize"
+  ↓ Esc                     → back to "/tree <entry-id>" (TreeAction)
+/tree <entry-id> compact    → CompactSummary overlay:
                              header: [selected entry] [drops N entries ~Xk tok]
                                      [keeps M entries] [written into this session]
                              options: [truncate*]
-  ↓ Enter on "truncate"     → commit & submit "/tree <id> compact truncate"
-  ↓ Esc                     → back to "/tree <id>" (TreeAction)
+  ↓ Enter on "truncate"     → commit & submit "/tree <entry-id> compact truncate"
+  ↓ Esc                     → back to "/tree <entry-id>" (TreeAction)
 ```
 
 Mirrors the existing `/session <name>` → `SessionAction` → `Confirm` pattern:
@@ -498,9 +515,14 @@ pub(crate) enum CompactSummaryMode {
     Truncate,      // summary = "" — drop the prefix, keep no summary
 }
 
-/// Parse `/tree <target_id> [switch [--summarize] | compact [truncate|…]]`.
-/// The bare `/tree <id> --summarize` form is accepted as an alias for
+/// Parse `/tree <entry-id> [switch [--summarize] | compact [truncate|text-only]]`.
+/// The bare `/tree <entry-id> --summarize` form is accepted as an alias for
 /// `switch --summarize` (backward compat).
+/// IMPORTANT: the angle brackets around the id are STRIPPED here —
+/// move_leaf/get_entry need the raw entry id. Regression-tested
+/// (parse_tree_args_strips_angle_brackets_from_id): with the brackets kept,
+/// the leaf pointer was written to a nonexistent entry → empty context,
+/// no current-position marker, "/replay: session is empty".
 fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode>, bool) {
     let mut summarize = false;
     let mut target = String::new();
@@ -545,7 +567,7 @@ if input.starts_with("/tree") {
             // critique #3).
             //
             // NO confirmation line here — the committed prompt
-            // "/tree <id> switch [--summarize]" (echoed by the overlay's
+            // "/tree <entry-id> switch [--summarize]" (echoed by the overlay's
             // emit_commit) is the documentation. Remove the old
             // display_plain("/tree navigated (…)") at agent.rs:2234.
         }
@@ -576,7 +598,7 @@ if input.starts_with("/tree") {
             match s.append_compaction(&summary, &target_id, tokens_before).await {
                 Ok(_) => {
                     // No "/tree compacted at …" line and no inline token
-                    // count: the committed prompt "/tree <id> compact truncate"
+                    // count: the committed prompt "/tree <entry-id> compact truncate"
                     // documents the action. Informational details (what was
                     // dropped/kept, token estimate) were already shown in the
                     // sub-menu header before committing (Phase 5.2).
@@ -616,7 +638,7 @@ Notes:
 ### 5.1 New overlay variants
 
 ```rust
-/// `/tree <id>` action menu (switch / compact).
+/// `/tree <entry-id>` action menu (switch / compact).
 TreeAction {
     target_id: String,
     header: Vec<String>,        // selected entry label + id
@@ -625,7 +647,7 @@ TreeAction {
     _filter: String,
 },
 
-/// `/tree <id> switch` sub-menu (just switch / summarize branch).
+/// `/tree <entry-id> switch` sub-menu (just switch / summarize branch).
 SwitchAction {
     target_id: String,
     header: Vec<String>,        // selected entry label + id (shared style)
@@ -634,54 +656,69 @@ SwitchAction {
     _filter: String,
 },
 
-/// `/tree <id> compact` summary-mode sub-menu.
+/// `/tree <entry-id> compact` summary-mode sub-menu.
 /// `header` carries the informational rows (selected entry, dropped/kept
 /// counts, token estimate) — the in-menu equivalent of `SessionAction`'s
 /// per-session info header. No such info is ever printed inline.
 CompactSummary {
     target_id: String,
     header: Vec<String>,        // info rows (Phase 5.2)
-    opts: Vec<String>,          // ["truncate"]  (more modes later)
+    opts: Vec<String>,          // ["truncate", "text only"]
     active: Option<usize>,      // Some(0)
     _filter: String,
 },
 ```
 
-### 5.2 `from_buffer` promotion (`repl.rs:612`)
+### 5.2 `from_buffer` promotion (`repl.rs`, `"tree"` arm)
 
 In the `"tree"` arm, before the list path, promote based on the buffer — the
 buffer itself encodes the nesting depth (mirrors how `/session <name> <action>`
-promotes):
+promotes). **Implemented** with the angle-bracket id syntax:
 
-- `filter` is empty → tree list (`ActiveOverlay::Tree`).
-- `filter` is exactly one tree entry id → `ActiveOverlay::TreeAction`
-  (options `switch`, `compact`; `active = Some(0)`).
-- `filter` parses as `<id> switch` (exact id + trailing `switch` token) →
+- `filter` is empty, or a **search term** (no angle brackets) → tree list
+  (`ActiveOverlay::Tree`), fuzzy-filtered as before — `/tree someterm`
+  searches entry contents.
+- `filter` is `<entry-id>` (angle-bracketed; id must exist in the tree) →
+  `ActiveOverlay::TreeAction` (options `switch`, `compact`;
+  `active = Some(0)`).
+- `filter` parses as `<entry-id> switch` (id + trailing `switch` token) →
   `ActiveOverlay::SwitchAction` directly (options `just switch`, `summarize`).
-- `filter` parses as `<id> compact` (exact id + trailing `compact` token) →
+- `filter` parses as `<entry-id> compact` (id + trailing `compact` token) →
   `ActiveOverlay::CompactSummary` directly (options `truncate`;
   `active = Some(0)`).
-- `filter` is `<id> switch --summarize` or `<id> compact truncate` → show the
-  corresponding overlay with the trailing mode **pre-selected** (`summarize`
-  / `truncate`), so Enter re-commits the full line verbatim.
+- `filter` is `<entry-id> switch --summarize` or `<entry-id> compact
+  truncate` → the corresponding overlay with the trailing mode **pre-selected**
+  (`summarize` / `truncate`), so Enter re-commits the full line verbatim.
+- An angle-bracketed id that matches no tree entry falls through to the list
+  (which will show no matches for that filter — same behavior as today's
+  unknown-id list state).
 
-Concretely: parse the filter with the same token rules as `parse_tree_args`;
-when the trailing tokens match a known action/mode, set `active` to that
-option's index instead of the default.
+**Tree list cursor start:** when the list opens, `sel` starts on the **current
+position row** (the leaf, reported as the overlay's `active` index) rather
+than the top — `overlay_window` then scrolls the list so that row is in view.
+No search needed to find where you are. Implemented in the `read_input`
+sel-reset: `ActiveOverlay::Tree { active: Some(a), .. } => sel = *a`.
+
+Implementation notes (`Repl::parse_tree_id`, `Repl::filter_tree_options`):
+`parse_tree_id` returns `Some(id)` only for `<…>` (≥ 1 char, trimmed); any
+other argument is treated as a search term. The text after the id token is
+split into the action token and the sub-menu's fuzzy filter.
 
 #### Pervasive fuzzy search (established slash-menu pattern)
 
 Every option list above is **fuzzy-filterable by the trailing buffer text**,
 rebuilt on each keystroke exactly like the `/persona` and `/model` overlays:
 
-- `TreeAction`: the text after `/tree <id> ` filters `switch`/`compact` via
-  `crate::fuzzy::fuzzy_filter_bonus`; `active` follows the first match. E.g.
-  `/tree <id> co` narrows to `compact`.
-- `SwitchAction`: text after `/tree <id> switch ` filters `just switch` /
-  `summarize`; e.g. `/tree <id> switch su` → `summarize` active,
-  `/tree <id> switch j` → `just switch` active.
-- `CompactSummary`: text after `/tree <id> compact ` filters `truncate`
-  (single option today; future modes join the same list).
+- `TreeAction`: the text after `/tree <entry-id> ` filters `switch`/`compact`
+  via `Repl::filter_tree_options` (fuzzy rank + exact pre-selection); e.g.
+  `/tree <entry-id> co` narrows to `compact`. An unknown single token after
+  the id (`/tree <entry-id> sw`) is treated as this filter — the id is
+  selected, the action menu opens pre-narrowed.
+- `SwitchAction`: text after `/tree <entry-id> switch ` filters `just switch` /
+  `summarize`; e.g. `/tree <entry-id> switch su` → `summarize` active,
+  `/tree <entry-id> switch j` → `just switch` active.
+- `CompactSummary`: text after `/tree <entry-id> compact ` filters
+  `truncate` / `text only` (e.g. `/tree <entry-id> compact te` → `text only`).
 - Exact known tokens (`--summarize`, `truncate`, `just-switch`, `switch`,
   `compact`) additionally **pre-select** their option regardless of fuzzy
   rank — this is the "direct correspondence with the slash prompt": the
@@ -700,11 +737,12 @@ Selection → committed line mapping (canonical, filter text dropped):
 
 | Overlay | Option | Committed line |
 | --- | --- | --- |
-| TreeAction | `switch` | `/tree <id> switch` (then sub-menu) |
-| TreeAction | `compact` | `/tree <id> compact` (then sub-menu) |
-| SwitchAction | `just switch` | `/tree <id> switch` |
-| SwitchAction | `summarize` | `/tree <id> switch --summarize` |
-| CompactSummary | `truncate` | `/tree <id> compact truncate` |
+| TreeAction | `switch` | `/tree <entry-id> switch` (then sub-menu) |
+| TreeAction | `compact` | `/tree <entry-id> compact` (then sub-menu) |
+| SwitchAction | `just switch` | `/tree <entry-id> switch` |
+| SwitchAction | `summarize` | `/tree <entry-id> switch --summarize` |
+| CompactSummary | `truncate` | `/tree <entry-id> compact truncate` |
+| CompactSummary | `text only` | `/tree <entry-id> compact text-only` |
 
 #### Header rows for `CompactSummary` (the "per-session info" equivalent)
 
@@ -750,30 +788,37 @@ headers (selected entry row only).
 - `Tree`: replace `NavigateTree(target_id)` (`repl.rs:1341`) with
   `editor.set(&format!("/tree {}", target_id))` + `Continue` → list Enter opens
   the action menu (mirrors `Session` overlay Enter).
-- `TreeAction` `switch`: `editor.set("/tree <id> switch")` + `Continue`
+- `TreeAction` `switch`: `editor.set("/tree <entry-id> switch")` + `Continue`
   (sub-menu opens on the next `from_buffer` pass).
-- `TreeAction` `compact`: `editor.set("/tree <id> compact")` + `Continue`
+- `TreeAction` `compact`: `editor.set("/tree <entry-id> compact")` + `Continue`
   (sub-menu opens on the next `from_buffer` pass).
 - `SwitchAction` `just switch`: commit + submit via `Repl::emit_commit`
   (`emit_commit(output, editor, redraw, sel, input_row, &line, "", false)`, as
   the `SessionAction` resume arm does at `repl.rs:1280`) with
-  `line = "/tree <id> switch"`, then
+  `line = "/tree <entry-id> switch"`, then
   `return OverlayAction::Action(InputAction::Submit(line))`.
-- `SwitchAction` `summarize`: commit + submit `/tree <id> switch --summarize`
+- `SwitchAction` `summarize`: commit + submit `/tree <entry-id> switch --summarize`
   (same `emit_commit` + `Submit` pattern). The committed line is preserved in
   the output — this is the action's documentation.
 - `CompactSummary` `truncate`: commit + submit
-  `/tree <id> compact truncate` (same `emit_commit` + `Submit` pattern).
+  `/tree <entry-id> compact truncate` (same `emit_commit` + `Submit` pattern).
+- `CompactSummary` `text only`: commit + submit
+  `/tree <entry-id> compact text-only`. After the handler appends the entry,
+  the generated summary is rendered as markdown below the committed line —
+  the one intentional inline output, present only for summary-producing
+  modes.
 
 ### 5.4 `handle_tab` / `handle_esc` / `display_rows` / `overlay_disc`
 
-- `Tree` Tab: fill `/tree <id>` into the buffer (currently a no-op).
-- `TreeAction` Tab: fill `/tree <id> <action>` (e.g. `/tree <id> compact`).
-- `SwitchAction` Tab: fill `/tree <id> switch --summarize` when `summarize`
-  is selected, else leave `/tree <id> switch` (mirrors `SessionAction` Tab).
-- `CompactSummary` Tab: fill `/tree <id> compact truncate`.
+- `Tree` Tab: fill `/tree <entry-id>` into the buffer (**implemented**;
+  previously a no-op).
+- `TreeAction` Tab: fill `/tree <entry-id> <action>` (e.g.
+  `/tree <entry-id> compact`) — **implemented**.
+- `SwitchAction` Tab: fill `/tree <entry-id> switch --summarize` when `summarize`
+  is selected, else leave `/tree <entry-id> switch` — **implemented**.
+- `CompactSummary` Tab: fill `/tree <entry-id> compact truncate` — **implemented**.
 - `TreeAction` Esc → `/tree ` (back to list); `SwitchAction` /
-  `CompactSummary` Esc → `/tree <id>` (back to TreeAction).
+  `CompactSummary` Esc → `/tree <entry-id>` (back to TreeAction) — **implemented**.
 - `display_rows`: "Tree actions  (up/down, Tab/Enter select, Esc back)",
   "Switch actions  (up/down, Tab/Enter select, Esc back)", and
   "Compact summary  (up/down, Tab/Enter select, Esc back)".
@@ -784,13 +829,13 @@ headers (selected entry row only).
   Some(header.as_slice()), sel, active, wrap)`, so the info rows appear as
   non-selectable BG_HEADER lines above the options.
 
-### 5.5 Cleanup
+### 5.5 Cleanup — **done**
 
-`InputAction::NavigateTree` and its handler (`agent.rs:2089`) become dead once
-the `Tree` Enter arm stops emitting it. Remove both — this also removes the
-handler's `display_plain("/tree navigated (…)")` line (`agent.rs:2096`); the
-committed `/tree <id> switch` prompt (Phase 5.3) is its replacement. Grep for
-other emitters after editing (only `repl.rs:1344` today).
+`InputAction::NavigateTree` and its main-loop handler are **removed**: the
+`Tree` Enter arm now completes `/tree <entry-id>` into the buffer, and the
+committed `/tree <entry-id> switch [--summarize]` prompt (Phase 5.3) replaces
+the old `display_plain("/tree navigated (…)")` line. Verified no other
+emitters remain.
 
 ---
 
@@ -817,7 +862,7 @@ When a summary mode beyond `truncate` is added:
 ### Future UI exposure (branch summarization)
 
 Branch summarization is now **exposed in the menu** as the `SwitchAction`
-sub-menu's `summarize` option, committed as `/tree <id> switch --summarize`
+sub-menu's `summarize` option, committed as `/tree <entry-id> switch --summarize`
 (Phase 5) and reusing the existing implementation
 (`collect_entries_for_branch_summary` + `agent.summarize` +
 `append_branch_summary`). No separate future step needed — pi's
@@ -844,7 +889,7 @@ sub-menu's `summarize` option, committed as `/tree <id> switch --summarize`
 
 ## Test plan
 
-1. **`apply_transforms` unit tests** (`session.rs`): empty-summary scoping;
+1. **`apply_transforms` unit tests** (`session.rs`) — **done**: empty-summary scoping;
    non-empty pi-wrapper message; repeated compaction (older summary kept);
    missing `firstKeptEntryId` fallback; compaction entry never in output.
 2. **Serialization cross-compat**: assert picocode writes
@@ -856,23 +901,20 @@ sub-menu's `summarize` option, committed as `/tree <id> switch --summarize`
    the TUI shows the compaction node and the LLM context starts at
    `firstKeptEntryId`; then write a compacted session with pi and resume it in
    picocode, confirming `build_context` scopes identically.
-4. **Replay tests**: uncompacted branch → identical output to today; compacted
+4. **Replay tests** — **done** (`build_replay_units_marks_compaction_and_keeps_all_turns`, `build_replay_units_uncompacted_has_all_turns` + renderer tests): uncompacted branch → identical output to today; compacted
    branch → markers rendered, full history present, `Nt`/`Nl` limits correct.
 5. **`parse_tree_args` tests**: default `switch`; `switch --summarize` and the
    bare `--summarize` alias; `compact`/`compact truncate` (and `no-summary`
    alias); last action token wins.
-6. **REPL tests**: `from_buffer` promotes `/tree <id>` → `TreeAction`,
-   `/tree <id> switch` → `SwitchAction`, `/tree <id> compact` →
-   `CompactSummary`; trailing-mode promotion pre-selects (`switch
-   --summarize` → `summarize`, `compact truncate` → `truncate`); fuzzy
-   filtering narrows the option lists (`/tree <id> switch su` → `summarize`);
-   the `CompactSummary` header contains the selected-entry row, dropped/kept
-   counts, and the `~Xk tokens` estimate (from `ReplCtx::context_tokens`);
-   Enter on `just switch` / `summarize` / `truncate` commits+submits the
-   canonical line with **no** additional inline output; Esc unwinds one level
-   at a time.
+6. **REPL tests** — **partially done**: `parse_tree_id` (angle-bracket vs
+   search-term) and `filter_tree_options` (empty/exact/fuzzy/no-match) are
+   unit-tested. Remaining: `from_buffer` promotion cases
+   (`/tree <entry-id>` → `TreeAction`, `+ switch` → `SwitchAction`,
+   `+ compact` → `CompactSummary`), trailing-mode pre-selection, `CompactSummary`
+   header contents, Enter commit lines, Esc unwinding (TUI-heavy; cover in
+   manual smoke).
 7. **Manual smoke**: `/tree` → pick a point → `switch` sub-menu shows
-   `just switch`/`summarize`; `summarize` commits `/tree <id> switch --summarize`
+   `just switch`/`summarize`; `summarize` commits `/tree <entry-id> switch --summarize`
    and appends a `BranchSummary` entry while moving the leaf; `compact`
    sub-menu shows the info header (`drops N`, `~Xk tokens`, `written into
    this session`) + `truncate`; after `truncate`, the next prompt only sees
@@ -886,9 +928,9 @@ sub-menu's `summarize` option, committed as `/tree <id> switch --summarize`
 
 | File | Change |
 | --- | --- |
-| `src/session/session.rs` | Rewrite `apply_transforms` (pi semantics, empty-summary skip, pi summary wrapper, repeated-compaction handling); add `compaction_summary_message` helper + constants; unit tests. |
-| `src/agent.rs` | `TreeAction`/`CompactSummaryMode` enums + `parse_tree_args` (canonical `switch [--summarize]`, bare `--summarize` alias); `/tree` dispatch (switch + optional branch-summarize, **no `/tree navigated` line** / compact, **no inline token output**); `estimate_context_tokens`; `build_session_ctx` computes `ReplCtx::context_tokens`; replay: `ReplayUnit`, `build_replay_units`, `replay_units`; update `/replay` (4 branches) + resume replay to use the raw branch; remove `NavigateTree` handling + its `display_plain("/tree navigated …")`. |
-| `src/repl.rs` | `ReplCtx::context_tokens` field; `TreeAction` + `SwitchAction` + `CompactSummary` (with `header`) overlay variants; `from_buffer` promotion (incl. trailing-mode pre-selection) + **fuzzy filtering** of option lists; `compact_summary_overlay_entries` header builder (entry row, dropped/kept counts, token estimate); `handle_enter` (commit+submit via `emit_commit`); `handle_tab`/`handle_esc`; `display_rows`; `overlay_disc`; header-aware render arm; Tree Enter → buffer completion; remove `InputAction::NavigateTree`. |
+| `src/session/session.rs` | **Done.** `apply_transforms` rewritten (pi semantics, empty-summary skip, pi summary wrapper, repeated-compaction handling); `compaction_summary_message` helper + `COMPACTION_SUMMARY_PREFIX/SUFFIX` constants; unit tests. |
+| `src/agent.rs` | **Done.** `TreeAction`/`CompactSummaryMode` enums + `parse_tree_args` (canonical `switch [--summarize]`, bare `--summarize` alias); `/tree` dispatch (switch + optional branch-summarize, no `/tree navigated` line / compact, no inline token output); `estimate_context_tokens` (+ `build_session_ctx` computing `ReplCtx::context_tokens`); replay: `ReplayUnit`, `build_replay_units`, `replay_units` (+ `count_turns`/`last_turns_start`/`replay_last_turns`); `/replay` + resume replay on the raw branch; `NavigateTree` handling **removed**. |
+| `src/repl.rs` | **Done.** `ReplCtx::context_tokens` field; `TreeAction` + `SwitchAction` + `CompactSummary` (with `header`) overlay variants; `from_buffer` promotion with the angle-bracket id syntax (`Repl::parse_tree_id`) + fuzzy option filtering (`Repl::filter_tree_options`); `tree_entry_header` / `compact_summary_header` builders; `handle_enter` (commit+submit via `emit_commit` for leaves, buffer promotion otherwise); `handle_tab`/`handle_esc` (one level up); `display_rows` titles; `overlay_disc` (16/17/18); header-aware render arm; Tree Enter/Tab → `/tree <entry-id>` completion; `InputAction::NavigateTree` **removed**. |
 | `src/slash.rs` | (optional) `/tree` help: "Navigate session history — switch, compact, or summarize branches". |
 | `doc/tree_compaction.md` | this doc (update status once implemented). |
 | Future | `SettingKey::TreeSummaryPrompt` in `src/settings.rs` + `settings.toml.example`; `CompactSummaryMode::Summarized` UI + `agent.summarize` wiring. |

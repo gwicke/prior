@@ -242,8 +242,6 @@ pub enum InputAction {
     Quit,
     /// Sandbox operation: (subcommand, path, sandbox_path).
     Sandbox(String, String, String),
-    /// Navigate the session tree to a target entry.
-    NavigateTree(String),
 }
 
 /// Context the REPL needs to render slash overlays and to re-emit recent
@@ -271,6 +269,10 @@ pub struct ReplCtx {
     pub tree: Vec<SessionTreeNode>,
     /// Current leaf entry ID (for highlighting in the tree).
     pub leaf_id: Option<String>,
+    /// Estimated tokens of the current (compaction-scoped) context. Shown in
+    /// the `/tree compact` sub-menu header; the compact handler writes the
+    /// same estimate as `tokensBefore` (same `estimate_context_tokens` call).
+    pub context_tokens: u64,
 }
 
 /// Lightweight session metadata for the `/session` overlay.
@@ -416,6 +418,42 @@ pub(crate) enum ActiveOverlay {
         rows: Vec<String>,
         /// Entry IDs, 1:1 with `rows`, for Enter resolution.
         targets: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
+    },
+
+    /// `/tree <id>` action menu (switch / compact). `target_id` is the
+    /// resolved entry ID; the filter used to find it is dropped on commit.
+    TreeAction {
+        target_id: String,
+        /// Pre-rendered info header rows (selected entry label + id).
+        header: Vec<String>,
+        /// Fuzzy-filtered action labels (switch / compact).
+        opts: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
+    },
+
+    /// `/tree <id> switch` sub-menu (just switch / summarize branch).
+    SwitchAction {
+        target_id: String,
+        /// Pre-rendered info header rows (selected entry label + id).
+        header: Vec<String>,
+        /// Fuzzy-filtered option labels (just switch / summarize).
+        opts: Vec<String>,
+        active: Option<usize>,
+        _filter: String,
+    },
+
+    /// `/tree <id> compact` summary-mode sub-menu. The `header` carries the
+    /// informational rows (selected entry, dropped/kept counts, token
+    /// estimate) — the in-menu equivalent of `SessionAction`'s per-session
+    /// info header. No such info is ever printed inline after the commit.
+    CompactSummary {
+        target_id: String,
+        header: Vec<String>,
+        /// Fuzzy-filtered mode labels (truncate; more modes later).
+        opts: Vec<String>,
         active: Option<usize>,
         _filter: String,
     },
@@ -611,6 +649,93 @@ impl ActiveOverlay {
             }
             "tree" => {
                 let filter = rest.trim().to_string();
+                // Only an id enclosed in angle brackets selects a tree point
+                // (`/tree <deadbeef>`); anything else is a fuzzy search term
+                // for the entry list (`/tree refactor`).
+                if let Some(target_id) = Repl::parse_tree_id(&filter) {
+                    let mut flat = Vec::new();
+                    Repl::flatten_tree_nodes(
+                        &ctx.tree,
+                        0,
+                        ctx.leaf_id.as_deref(),
+                        &std::collections::HashSet::new(),
+                        &mut flat,
+                    );
+                    if let Some((_, label, _, _, _)) =
+                        flat.iter().find(|(_, _, id, _, _)| id == &target_id)
+                    {
+                        let label = label.clone();
+                        // Tokens after the id: `<id>`, `<id> switch`,
+                        // `<id> switch <filter>`, `<id> compact [filter]`, or
+                        // `<id> <partial-action>` (fuzzy filter on the action
+                        // menu, e.g. `<id> sw` → `switch`).
+                        let after = filter
+                            .strip_prefix(&format!("<{}>", target_id))
+                            .unwrap_or("")
+                            .trim();
+                        let (action_tok, sub_filter) =
+                            match after.split_once(' ') {
+                                Some((tok, rest)) => (tok, rest.trim()),
+                                None => (after, ""),
+                            };
+                        // An unknown single token is a fuzzy filter for the
+                        // action menu, not an action.
+                        let (action_tok, sub_filter) = if action_tok.is_empty()
+                            || matches!(action_tok, "switch" | "compact")
+                        {
+                            (action_tok, sub_filter)
+                        } else {
+                            ("", after)
+                        };
+                        let sub_filter = sub_filter.to_string();
+                        match action_tok {
+                            "switch" => {
+                                let mut header = Vec::new();
+                                Repl::tree_entry_header(&target_id, &label, &mut header);
+                                let (opts, active) =
+                                    Repl::filter_tree_options(&["just switch", "summarize"], &sub_filter);
+                                return ActiveOverlay::SwitchAction {
+                                    target_id,
+                                    header,
+                                    opts,
+                                    active,
+                                    _filter: sub_filter,
+                                };
+                            }
+                            "compact" => {
+                                let mut header = Vec::new();
+                                Repl::compact_summary_header(
+                                    &target_id,
+                                    &label,
+                                    ctx,
+                                    &mut header,
+                                );
+                                let (opts, active) =
+                                    Repl::filter_tree_options(&["truncate", "text only"], &sub_filter);
+                                return ActiveOverlay::CompactSummary {
+                                    target_id,
+                                    header,
+                                    opts,
+                                    active,
+                                    _filter: sub_filter,
+                                };
+                            }
+                            _ => {}
+                        }
+                        // No (or unknown) action token → action menu.
+                        let mut header = Vec::new();
+                        Repl::tree_entry_header(&target_id, &label, &mut header);
+                        let (opts, active) =
+                            Repl::filter_tree_options(&["switch", "compact"], &sub_filter);
+                        return ActiveOverlay::TreeAction {
+                            target_id,
+                            header,
+                            opts,
+                            active,
+                            _filter: sub_filter,
+                        };
+                    }
+                }
                 let mut rows = Vec::new();
                 let mut targets = Vec::new();
                 let mut active = None;
@@ -794,6 +919,18 @@ impl ActiveOverlay {
             ActiveOverlay::Tree { rows, active, .. } => {
                 ("Tree  (up/down, Enter navigate, Esc back)",
                  rows.clone(), *active, false)
+            }
+            ActiveOverlay::TreeAction { opts, active, .. } => {
+                ("Tree actions  (up/down, Tab/Enter select, Esc back)",
+                 opts.clone(), *active, false)
+            }
+            ActiveOverlay::SwitchAction { opts, active, .. } => {
+                ("Switch actions  (up/down, Tab/Enter select, Esc back)",
+                 opts.clone(), *active, false)
+            }
+            ActiveOverlay::CompactSummary { opts, active, .. } => {
+                ("Compact summary  (up/down, Tab/Enter select, Esc back)",
+                 opts.clone(), *active, false)
             }
         }
     }
@@ -1037,8 +1174,45 @@ impl ActiveOverlay {
                     }
                 }
             }
-            ActiveOverlay::Tree { .. } => {
-                // Tab on tree: no-op for now (future: copy entry text).
+            ActiveOverlay::Tree { targets, .. } => {
+                // Complete the id into the buffer; the next from_buffer pass
+                // promotes to the action menu (mirrors the Session overlay).
+                if let Some(target_id) = targets.get(sel) {
+                    editor.set(&format!("/tree <{}>", target_id));
+                }
+            }
+            ActiveOverlay::TreeAction { target_id, opts, .. } => {
+                // Tab fills the chosen action; sub-menus open via promotion.
+                if let Some(label) = opts.get(sel) {
+                    let action = match label.as_str() {
+                        "switch" => "switch",
+                        "compact" => "compact",
+                        _ => "",
+                    };
+                    if !action.is_empty() {
+                        editor.set(&format!("/tree <{}> {}", target_id, action));
+                    }
+                }
+            }
+            ActiveOverlay::SwitchAction { target_id, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    let mode = match label.as_str() {
+                        "just switch" => "",
+                        "summarize" => " --summarize",
+                        _ => "",
+                    };
+                    editor.set(&format!("/tree <{}> switch{}", target_id, mode));
+                }
+            }
+            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    let mode = match label.as_str() {
+                        "truncate" => " truncate",
+                        "text only" => " text-only",
+                        _ => "",
+                    };
+                    editor.set(&format!("/tree <{}> compact{}", target_id, mode));
+                }
             }
             _ => {}
         }
@@ -1340,8 +1514,49 @@ impl ActiveOverlay {
             }
             ActiveOverlay::Tree { targets, .. } => {
                 if let Some(target_id) = targets.get(sel) {
-                    editor.set("");
-                    return OverlayAction::Action(InputAction::NavigateTree(target_id.clone()));
+                    editor.set(&format!("/tree <{}>", target_id));
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::TreeAction { target_id, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    match label.as_str() {
+                        "switch" => {
+                            editor.set(&format!("/tree <{}> switch", target_id));
+                        }
+                        "compact" => {
+                            editor.set(&format!("/tree <{}> compact", target_id));
+                        }
+                        _ => {}
+                    }
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::SwitchAction { target_id, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    let line = match label.as_str() {
+                        "just switch" => format!("/tree <{}> switch", target_id),
+                        "summarize" => format!("/tree <{}> switch --summarize", target_id),
+                        _ => String::new(),
+                    };
+                    if !line.is_empty() {
+                        Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                        return OverlayAction::Action(InputAction::Submit(line));
+                    }
+                }
+                OverlayAction::Continue
+            }
+            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
+                if let Some(label) = opts.get(sel) {
+                    let line = match label.as_str() {
+                        "truncate" => format!("/tree <{}> compact truncate", target_id),
+                        "text only" => format!("/tree <{}> compact text-only", target_id),
+                        _ => String::new(),
+                    };
+                    if !line.is_empty() {
+                        Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
+                        return OverlayAction::Action(InputAction::Submit(line));
+                    }
                 }
                 OverlayAction::Continue
             }
@@ -1407,6 +1622,17 @@ impl ActiveOverlay {
             ActiveOverlay::Tree { .. } => {
                 editor.set("");
             }
+            ActiveOverlay::TreeAction { target_id, .. } => {
+                // Back to the tree list (keep nothing: the id may have come
+                // from Enter-complete; the list is the parent level).
+                let _ = target_id;
+                editor.set("/tree ");
+            }
+            ActiveOverlay::SwitchAction { target_id, .. }
+            | ActiveOverlay::CompactSummary { target_id, .. } => {
+                // Back to the action menu for the same entry.
+                editor.set(&format!("/tree <{}>", target_id));
+            }
             _ => {}
         }
     }
@@ -1430,6 +1656,9 @@ impl ActiveOverlay {
             ActiveOverlay::SessionAction { .. } => 12,
             ActiveOverlay::Confirm { .. } => 13,
             ActiveOverlay::Tree { .. } => 14,
+            ActiveOverlay::TreeAction { .. } => 16,
+            ActiveOverlay::SwitchAction { .. } => 17,
+            ActiveOverlay::CompactSummary { .. } => 18,
         }
     }
 
@@ -1661,7 +1890,14 @@ impl Repl {
             // Reset sel when the overlay kind changes (discriminant comparison).
             let cur_disc = overlay.overlay_disc();
             if cur_disc != last_disc {
-                sel = 0;
+                // When the /tree list opens, start the cursor on the current
+                // position (the leaf row, reported as `active`) instead of the
+                // top — otherwise the user has to search for where they are.
+                // The overlay window then scrolls to keep that row in view.
+                sel = match &overlay {
+                    ActiveOverlay::Tree { active: Some(a), .. } => *a,
+                    _ => 0,
+                };
                 last_disc = cur_disc;
             }
             let (title, raw_opts, active, wrap) = overlay.display_rows();
@@ -1679,6 +1915,11 @@ impl Repl {
                 ActiveOverlay::Help => Self::render_help_overlay(),
                 ActiveOverlay::Stat { .. } | ActiveOverlay::ReplayHelp { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
                 ActiveOverlay::SessionAction { header, .. } => {
+                    Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
+                }
+                ActiveOverlay::TreeAction { header, .. }
+                | ActiveOverlay::SwitchAction { header, .. }
+                | ActiveOverlay::CompactSummary { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
                 ActiveOverlay::Confirm { header, .. } => {
@@ -2803,6 +3044,129 @@ impl Repl {
     }
 
     // ── /tree overlay rendering ──────────────────────────────────────────
+
+    /// Parse the `/tree <…>` argument. Returns the entry id when the argument
+    /// **starts** with `<id>` (angle-bracketed id, optionally followed by an
+    /// action token / filter text); `None` for a pure search term. The id is
+    /// required to have a closing `>`; trailing text after it is not part of
+    /// the id.
+    fn parse_tree_id(filter: &str) -> Option<String> {
+        let f = filter.trim();
+        if !f.starts_with('<') {
+            return None;
+        }
+        let end = f.find('>')?;
+        if end < 2 {
+            return None; // `<>` — empty id
+        }
+        Some(f[1..end].to_string())
+    }
+
+    /// Fuzzy-filter option labels for a `/tree` sub-menu. Returns
+    /// `(filtered_opts, active)`. An empty filter returns all options with
+    /// the first active; an exact (case-insensitive) match is pre-selected;
+    /// otherwise fuzzy matching narrows the list with the best match active.
+    /// An unmatched filter keeps the full list with the first option active.
+    fn filter_tree_options(all: &[&str], filter: &str) -> (Vec<String>, Option<usize>) {
+        let labels: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+        if filter.is_empty() {
+            return (labels, Some(0));
+        }
+        // Exact-token pre-selection: the typed prompt *is* the selection.
+        // A leading `--` (e.g. `--summarize`) is stripped before comparing.
+        let fl = filter.to_lowercase();
+        let fl = fl.strip_prefix("--").unwrap_or(&fl);
+        if let Some(i) = labels.iter().position(|l| {
+            l.to_lowercase().replace(' ', "-") == fl
+                || l.to_lowercase() == fl
+        }) {
+            return (labels, Some(i));
+        }
+        let ranked = crate::fuzzy::fuzzy_filter(&labels, filter, |l| l.clone());
+        if ranked.is_empty() {
+            return (labels, Some(0));
+        }
+        let opts: Vec<String> = ranked.iter().map(|r| r.item.clone()).collect();
+        (opts, Some(0))
+    }
+
+    /// Build the small info header for `TreeAction` / `SwitchAction`:
+    /// the selected entry's label and (short) id.
+    fn tree_entry_header(target_id: &str, label: &str, header: &mut Vec<String>) {
+        let avail = term_width().saturating_sub(2);
+        let mut table = Table::new(&["Entry", "ID"])
+            .with_aligns(&[Align::Left, Align::Left])
+            .with_min_widths(&[24, 12])
+            .with_priorities(&[3, 1])
+            .set_gap(2);
+        table.add_row(&[label, &target_id[..target_id.len().min(12)]]);
+        for row in table.render(avail) {
+            header.push(row);
+        }
+    }
+
+    /// Build the info header for the `CompactSummary` sub-menu: what this
+    /// compaction will drop / keep and the token estimate that becomes
+    /// `tokensBefore`. Derived from the flattened tree + active path already
+    /// used by `tree_overlay_entries` — no extra I/O. This is the in-menu
+    /// equivalent of `SessionAction`'s per-session info header.
+    fn compact_summary_header(
+        target_id: &str,
+        label: &str,
+        ctx: &ReplCtx,
+        header: &mut Vec<String>,
+    ) {
+        // Count dropped (before target on the active path) vs kept (target
+        // through leaf) entries from the flattened tree.
+        let mut flat = Vec::new();
+        let active_path: std::collections::HashSet<String> = ctx
+            .leaf_id
+            .as_deref()
+            .map(|lid| {
+                let mut p = std::collections::HashSet::new();
+                collect_active_path(&ctx.tree, lid, &mut p);
+                p
+            })
+            .unwrap_or_default();
+        Self::flatten_tree_nodes(
+            &ctx.tree,
+            0,
+            ctx.leaf_id.as_deref(),
+            &active_path,
+            &mut flat,
+        );
+        let idx = flat.iter().position(|(_, _, id, _, _)| id == target_id);
+        let (dropped, kept) = match idx {
+            Some(i) => (i, flat.len() - i),
+            None => (0, flat.len()),
+        };
+
+        let avail = term_width().saturating_sub(2);
+        let mut table = Table::new(&["Entry", "ID"])
+            .with_aligns(&[Align::Left, Align::Left])
+            .with_min_widths(&[24, 12])
+            .with_priorities(&[3, 1])
+            .set_gap(2);
+        table.add_row(&[label, &target_id[..target_id.len().min(12)]]);
+        for row in table.render(avail) {
+            header.push(row);
+        }
+        // Detail rows (non-selectable, full-width): the SessionAction style.
+        let mut detail = Table::new(&[""])
+            .with_min_widths(&[10])
+            .with_priorities(&[1]);
+        detail.add_row(&[format!(
+            "drops {} entr{} before this point (~{}k tokens)",
+            dropped,
+            if dropped == 1 { "y" } else { "ies" },
+            ctx.context_tokens / 1000,
+        )]);
+        detail.add_row(&[format!("keeps {} entries to the current leaf", kept)]);
+        detail.add_row(&["written into this session (in-place compaction)"]);
+        for row in detail.render(avail) {
+            header.push(row);
+        }
+    }
 
     /// Build `/tree` overlay rows from a pre-built session tree.
     /// Uses the same `Table` infrastructure as `/session` for consistent rendering.
@@ -4266,6 +4630,211 @@ mod tests {
         assert_eq!(Repl::replace_last_token("/model gpt", "gpt-4"), "/model gpt-4");
         // no space -> whole string replaced
         assert_eq!(Repl::replace_last_token("/set", "X"), "X");
+    }
+
+    #[test]
+    fn parse_tree_id_angle_brackets_only() {
+        // Angle-bracketed → entry id.
+        assert_eq!(
+            Repl::parse_tree_id("<0194abc-def>"),
+            Some("0194abc-def".to_string())
+        );
+        assert_eq!(Repl::parse_tree_id(" <x> "), Some("x".to_string()));
+        // Trailing text after the id still selects the id (the trailing text
+        // is the action token / sub-menu filter, not part of the id).
+        assert_eq!(Repl::parse_tree_id("<x> switch"), Some("x".to_string()));
+        assert_eq!(
+            Repl::parse_tree_id("<0194abc> sw"),
+            Some("0194abc".to_string())
+        );
+        assert_eq!(Repl::parse_tree_id("<x> compact truncate"), Some("x".to_string()));
+        // Anything else → fuzzy search term for the entry list.
+        assert_eq!(Repl::parse_tree_id("someterm"), None);
+        assert_eq!(Repl::parse_tree_id(""), None);
+        assert_eq!(Repl::parse_tree_id("<"), None);
+        assert_eq!(Repl::parse_tree_id("<>"), None);
+        assert_eq!(Repl::parse_tree_id("<unbalanced"), None);
+        assert_eq!(Repl::parse_tree_id("unbalanced>"), None);
+    }
+
+    #[test]
+    fn filter_tree_options_empty_and_exact() {
+        let all = ["switch", "compact"];
+        // Empty filter → full list, first active.
+        let (opts, active) = Repl::filter_tree_options(&all, "");
+        assert_eq!(opts, vec!["switch".to_string(), "compact".to_string()]);
+        assert_eq!(active, Some(0));
+        // Exact match pre-selects regardless of position.
+        let (_, active) = Repl::filter_tree_options(&all, "compact");
+        assert_eq!(active, Some(1));
+        // Hyphenated label matches its spaced form.
+        let all2 = ["just switch", "summarize"];
+        let (_, active) = Repl::filter_tree_options(&all2, "just-switch");
+        assert_eq!(active, Some(0));
+    }
+
+    #[test]
+    fn filter_tree_options_fuzzy_narrows_and_orders() {
+        let all2 = ["just switch", "summarize"];
+        // `su` fuzzy-matches `summarize` best → first (active).
+        let (opts, active) = Repl::filter_tree_options(&all2, "su");
+        assert_eq!(opts[0], "summarize");
+        assert_eq!(active, Some(0));
+        // `ju` matches `just switch` first.
+        let (opts, _) = Repl::filter_tree_options(&all2, "ju");
+        assert_eq!(opts[0], "just switch");
+        // No match → full list unchanged, first active.
+        let (opts, active) = Repl::filter_tree_options(&all2, "zzzz");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(active, Some(0));
+    }
+
+    /// End-to-end `from_buffer` promotion for the `/tree` menus, including
+    /// the exact reported cases: `/tree <full-uuid>` (bare), `/tree <uuid>
+    /// sw` (partial action token), and `/tree <uuid> switch` (exact action).
+    fn tree_ctx() -> ReplCtx {
+        use crate::session::{SessionEntry, SessionEntryContent};
+        let mk = |id: &str, role: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": role,
+                    "content": [{"type": "text", "text": format!("{} msg", role)}]
+                }),
+            },
+        };
+        let root = mk("root-entry", "user");
+        let leaf = mk("leaf-entry", "assistant");
+        let tree = vec![crate::session::SessionTreeNode {
+            entry: root,
+            children: vec![crate::session::SessionTreeNode {
+                entry: leaf,
+                children: vec![],
+                label: None,
+            }],
+            label: None,
+        }];
+        ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("leaf-entry".into()),
+            context_tokens: 1234,
+        }
+    }
+
+    fn tree_overlay(buf: &str) -> ActiveOverlay {
+        let ctx = tree_ctx();
+        // `from_buffer` only reads settings for the /set overlays; a default
+        // store is enough here.
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            path: None,
+        };
+        ActiveOverlay::from_buffer(buf, &ctx, &settings, false, &[])
+    }
+
+    #[test]
+    fn from_buffer_tree_id_promotes_to_action_menu() {
+        let ov = tree_overlay("/tree <root-entry>");
+        match ov {
+            ActiveOverlay::TreeAction { target_id, opts, active, .. } => {
+                assert_eq!(target_id, "root-entry");
+                assert_eq!(opts, vec!["switch".to_string(), "compact".to_string()]);
+                assert_eq!(active, Some(0));
+            }
+            other => panic!("expected TreeAction, got {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_id_partial_action_token_fuzzy_filters() {
+        // `/tree <uuid> sw` — reported bug: must show the action menu
+        // narrowed to `switch`, NOT the entry list with "no matches".
+        let ov = tree_overlay("/tree <root-entry> sw");
+        match ov {
+            ActiveOverlay::TreeAction { target_id, opts, .. } => {
+                assert_eq!(target_id, "root-entry");
+                assert_eq!(opts, vec!["switch".to_string()]);
+            }
+            other => panic!("expected TreeAction (fuzzy-filtered), got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_id_exact_action_promotes_to_submenu() {
+        // `/tree <uuid> switch` — reported bug: must open the SwitchAction
+        // sub-menu, NOT show "no matches".
+        let ov = tree_overlay("/tree <root-entry> switch");
+        match ov {
+            ActiveOverlay::SwitchAction { target_id, opts, active, .. } => {
+                assert_eq!(target_id, "root-entry");
+                assert_eq!(opts, vec!["just switch".to_string(), "summarize".to_string()]);
+                assert_eq!(active, Some(0)); // `just switch` pre-selected
+            }
+            other => panic!("expected SwitchAction, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_id_compact_promotes_to_compact_summary() {
+        let ov = tree_overlay("/tree <root-entry> compact");
+        match ov {
+            ActiveOverlay::CompactSummary { target_id, opts, active, header, .. } => {
+                assert_eq!(target_id, "root-entry");
+                assert_eq!(opts, vec!["truncate".to_string(), "text only".to_string()]);
+                assert_eq!(active, Some(0));
+                // Info header present: entry row + dropped/kept/token rows.
+                assert!(!header.is_empty());
+                let joined = header.join("\n");
+                assert!(joined.contains("root-entry"));
+                assert!(joined.contains("tokens"));
+                assert!(joined.contains("drops"));
+            }
+            other => panic!("expected CompactSummary, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_trailing_mode_preselects_option() {
+        let ov = tree_overlay("/tree <root-entry> switch --summarize");
+        match ov {
+            ActiveOverlay::SwitchAction { active, .. } => {
+                assert_eq!(active, Some(1)); // `summarize` pre-selected
+            }
+            other => panic!("expected SwitchAction, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_searchterm_stays_in_list() {
+        // Bare search terms (no angle brackets) must NOT promote — they stay
+        // in the fuzzy entry list (existing `/tree <searchterm>` behavior).
+        let ov = tree_overlay("/tree user");
+        match ov {
+            ActiveOverlay::Tree { targets, .. } => {
+                assert!(targets.contains(&"root-entry".to_string()));
+            }
+            other => panic!("expected Tree list, got disc {:?}", other.overlay_disc()),
+        }
+        // Unknown angle-bracketed id → falls through to the list too.
+        let ov = tree_overlay("/tree <does-not-exist>");
+        assert!(matches!(ov, ActiveOverlay::Tree { .. }));
     }
 
     #[test]

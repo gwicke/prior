@@ -58,6 +58,171 @@ fn compaction_summary_message(summary: &str) -> SessionEntry {
     }
 }
 
+/// A single file touched during the compacted span, for the text-only
+/// summary's file list.
+#[derive(Debug, PartialEq)]
+pub(crate) struct TouchedFile {
+    pub path: String,
+    /// `true` when the file was written/edited (vs only read).
+    pub modified: bool,
+}
+
+/// Serialize one pi user/assistant AgentMessage into the text-only summary.
+/// Returns `None` for messages with no renderable text (tool results,
+/// reasoning-only assistant messages, empty content).
+fn summary_message_text(message: &serde_json::Value) -> Option<String> {
+    let role = message.get("role").and_then(|r| r.as_str())?;
+    let content = message.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|item| {
+            let ty = item.get("type").and_then(|t| t.as_str())?;
+            match (role, ty) {
+                ("user", "text") | ("assistant", "text") => {
+                    item.get("text").and_then(|t| t.as_str())
+                }
+                // Deliberately excluded: toolCall, thinking/reasoning,
+                // toolResult content, images.
+                _ => None,
+            }
+        })
+        .filter(|t| !t.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Extract touched files from one pi assistant message's `toolCall` blocks.
+/// Appends into `files`, promoting existing read-only entries to modified
+/// when a later write/edit touches the same path. Only `read`, `write`, and
+/// `edit` calls are considered; all other tools are ignored.
+fn collect_touched_files(message: &serde_json::Value, files: &mut Vec<TouchedFile>) {
+    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let modified = match name {
+            "write" | "edit" => true,
+            "read" => false,
+            _ => continue, // bash, grep, … do not touch files directly
+        };
+        let Some(path) = item
+            .get("arguments")
+            .and_then(|a| a.get("path"))
+            .and_then(|p| p.as_str())
+        else {
+            continue;
+        };
+        if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+            if modified {
+                existing.modified = true; // read-then-write → modified
+            }
+        } else {
+            files.push(TouchedFile {
+                path: path.to_string(),
+                modified,
+            });
+        }
+    }
+}
+
+/// Build a deterministic, text-only compaction summary from the branch
+/// entries a compaction drops (everything before `firstKeptEntryId`).
+///
+/// Contains, in chronological order:
+/// - every **user prompt** (full text),
+/// - the assistant's **text responses** for that turn (one block per turn;
+///   reasoning and tool-call syntax are skipped),
+/// and ends with a **touched-files list** (`read` / `write` / `edit` paths,
+/// modified files marked) — but no reasoning content, no tool calls, and no
+/// tool output.
+///
+/// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
+/// ("text only" mode). Empty when the dropped span has no renderable text.
+pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
+    let mut out = String::new();
+    let mut files: Vec<TouchedFile> = Vec::new();
+    // Assistant text accumulates until the next user prompt closes the turn.
+    let mut turn_assistant: Vec<String> = Vec::new();
+
+    let flush_turn = |out: &mut String, assistant: &mut Vec<String>| {
+        if assistant.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[assistant]\n");
+        out.push_str(&assistant.join("\n"));
+        assistant.clear();
+    };
+
+    for entry in dropped {
+        match &entry.content {
+            SessionEntryContent::Message { message } => {
+                match message.get("role").and_then(|r| r.as_str()) {
+                    Some("user") => {
+                        // A new user prompt closes the previous turn.
+                        flush_turn(&mut out, &mut turn_assistant);
+                        if let Some(text) = summary_message_text(message) {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str("[user]\n");
+                            out.push_str(&text);
+                        }
+                    }
+                    Some("assistant") => {
+                        collect_touched_files(message, &mut files);
+                        if let Some(text) = summary_message_text(message) {
+                            turn_assistant.push(text);
+                        }
+                    }
+                    // toolResult entries: excluded (no tool output in the
+                    // summary).
+                    _ => {}
+                }
+            }
+            // Meta entries (model/thinking changes, earlier compactions,
+            // labels, …): excluded from the text-only summary.
+            _ => {}
+        }
+    }
+    flush_turn(&mut out, &mut turn_assistant);
+
+    if !files.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("Files touched:\n");
+        // Modified first, then reads; each group alphabetical for stability.
+        let mut modified: Vec<&TouchedFile> =
+            files.iter().filter(|f| f.modified).collect();
+        let mut read: Vec<&TouchedFile> = files.iter().filter(|f| !f.modified).collect();
+        modified.sort_by(|a, b| a.path.cmp(&b.path));
+        read.sort_by(|a, b| a.path.cmp(&b.path));
+        for f in modified {
+            out.push_str(&format!("- modified: {}\n", f.path));
+        }
+        for f in read {
+            out.push_str(&format!("- read: {}\n", f.path));
+        }
+        // Trim the trailing newline of the last list entry.
+        while out.ends_with('\n') {
+            out.pop();
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
@@ -2083,5 +2248,192 @@ mod tests {
         assert!(!json.contains("\"provider\""));
         assert!(!json.contains("\"modelId\""));
         assert!(!json.contains("\"thinkingLevel\""));
+    }
+
+    // ------------------------------------------------------------------
+    // Text-only compaction summary
+    // ------------------------------------------------------------------
+
+    fn sum_user(id: &str, parent: Option<&str>, text: &str) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(|p| p.into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}]
+                }),
+            },
+        }
+    }
+
+    fn sum_assistant(id: &str, parent: Option<&str>, content: serde_json::Value) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(|p| p.into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "assistant",
+                    "content": content
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn text_only_summary_user_prompts_and_assistant_text() {
+        let dropped = vec![
+            sum_user("m0", None, "first prompt"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "reasoning", "text": "deep thoughts"},
+                {"type": "text", "text": "first answer"},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "src/lib.rs"}}
+            ])),
+            // Tool result — must be excluded entirely.
+            SessionEntry {
+                id: "t0".into(),
+                parent_id: Some("a0".into()),
+                timestamp: "2025-01-01T00:00:01.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "toolResult",
+                        "content": [{"type": "text", "text": "file contents here"}]
+                    }),
+                },
+            },
+            sum_user("m1", Some("t0"), "second prompt"),
+            sum_assistant("a1", Some("m1"), serde_json::json!([
+                {"type": "text", "text": "second answer"}
+            ])),
+        ];
+        let s = build_text_only_summary(&dropped);
+        assert!(s.contains("[user]\nfirst prompt"));
+        assert!(s.contains("[assistant]\nfirst answer"));
+        assert!(s.contains("[user]\nsecond prompt"));
+        assert!(s.contains("[assistant]\nsecond answer"));
+        // No reasoning, no tool syntax, no tool output.
+        assert!(!s.contains("deep thoughts"));
+        assert!(!s.contains("toolCall"));
+        assert!(!s.contains("read("));
+        assert!(!s.contains("file contents here"));
+        // Turn order preserved.
+        let first = s.find("first prompt").unwrap();
+        let second = s.find("second prompt").unwrap();
+        assert!(first < second);
+    }
+
+    #[test]
+    fn text_only_summary_lists_touched_files() {
+        let dropped = vec![
+            sum_user("m0", None, "do work"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "text", "text": "working"},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "b.txt", "offset": 0, "limit": 10}},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "a.txt"}},
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "a.txt", "edits": []}},
+                {"type": "toolCall", "name": "bash",
+                 "arguments": {"command": "ls"}},
+            ])),
+        ];
+        let s = build_text_only_summary(&dropped);
+        // Modified files listed as modified (read-then-edit promotes).
+        assert!(s.contains("Files touched:"));
+        assert!(s.contains("- modified: a.txt"));
+        assert!(s.contains("- read: b.txt"));
+        // Non-file tools ignored; a.txt appears once in the read list and
+        // once as modified, but NOT as a plain read (promoted).
+        let read_lines: Vec<&str> = s.lines().filter(|l| l.starts_with("- read: ")).collect();
+        assert_eq!(read_lines, vec!["- read: b.txt"]);
+        // No tool-call syntax or arguments leaked.
+        assert!(!s.contains("toolCall"));
+        assert!(!s.contains("arguments"));
+        // Modified before reads.
+        let m = s.find("- modified:").unwrap();
+        let r = s.find("- read:").unwrap();
+        assert!(m < r);
+    }
+
+    #[test]
+    fn text_only_summary_empty_for_empty_span() {
+        assert_eq!(build_text_only_summary(&[]), "");
+        // Tool results only → still empty.
+        let dropped = vec![SessionEntry {
+            id: "t".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "toolResult",
+                    "content": [{"type": "text", "text": "output"}]
+                }),
+            },
+        }];
+        assert_eq!(build_text_only_summary(&dropped), "");
+    }
+
+    #[test]
+    fn text_only_summary_end_of_compacted_context_check() {
+        // The summary is written into a Compaction entry; applying the
+        // compaction transforms must project it as the FIRST context message,
+        // before the kept messages (pi contract).
+        let dropped = vec![
+            sum_user("m0", None, "early task"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "text", "text": "early answer"},
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "src/lib.rs", "edits": []}}
+            ])),
+        ];
+        let summary = build_text_only_summary(&dropped);
+        assert!(!summary.is_empty());
+        assert!(summary.contains("- modified: src/lib.rs"));
+
+        // Branch: dropped span + compaction entry (with summary) + kept span.
+        let branch = vec![
+            sum_user("m0", None, "early task"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "text", "text": "early answer"}
+            ])),
+            SessionEntry {
+                id: "cmp".into(),
+                parent_id: Some("a0".into()),
+                timestamp: "2025-01-01T00:00:02.000Z".into(),
+                content: SessionEntryContent::Compaction {
+                    summary: summary.clone(),
+                    first_kept_entry_id: "m1".into(),
+                    tokens_before: 12_345,
+                },
+            },
+            sum_user("m1", Some("cmp"), "kept prompt"),
+        ];
+        let transformed = apply_compaction_transforms(branch);
+        // [summary user message, kept user message]
+        assert_eq!(transformed.len(), 2);
+        let first = &transformed[0];
+        let text = match &first.content {
+            SessionEntryContent::Message { message } => {
+                message.pointer("/content/0/text").unwrap().as_str().unwrap()
+            }
+            other => panic!("expected Message, got {:?}", std::mem::discriminant(other)),
+        };
+        // pi wrapper + our summary as the FIRST message of the context.
+        assert!(text.starts_with(COMPACTION_SUMMARY_PREFIX));
+        assert!(text.contains("[user]\nearly task"));
+        assert!(text.contains("[assistant]\nearly answer"));
+        assert!(text.contains("Files touched:"));
+        assert!(text.contains("- modified: src/lib.rs"));
+        let second_text = match &transformed[1].content {
+            SessionEntryContent::Message { message } => {
+                message.pointer("/content/0/text").unwrap().as_str().unwrap()
+            }
+            _ => panic!("expected Message"),
+        };
+        assert_eq!(second_text, "kept prompt");
     }
 }

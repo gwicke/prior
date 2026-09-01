@@ -1160,7 +1160,8 @@ fn guard<T: Tool>(
 
 /// Build session context data for the REPL overlays.
 ///
-/// Returns `(sessions list, branch message previews, session tree, leaf_id)`.
+/// Returns `(sessions list, branch message previews, session tree, leaf_id,
+/// context_tokens)`.
 async fn build_session_ctx(
     session: &Option<Session>,
 ) -> (
@@ -1168,6 +1169,7 @@ async fn build_session_ctx(
     Vec<(String, String)>,
     Vec<crate::session::SessionTreeNode>,
     Option<String>,
+    u64,
 ) {
     let sessions = Vec::new(); // loaded on demand by the `/session` overlay
 
@@ -1193,12 +1195,82 @@ async fn build_session_ctx(
         Vec::new()
     };
 
-    let (tree, leaf_id) = match session {
-        Some(s) => (s.get_tree().await, s.get_leaf_id().await),
-        None => (Vec::new(), None),
+    let (tree, leaf_id, context_tokens) = match session {
+        Some(s) => {
+            let tree = s.get_tree().await;
+            let leaf_id = s.get_leaf_id().await;
+            // Estimated tokens of the current (compaction-scoped) context —
+            // shown in the `/tree compact` sub-menu header and written as
+            // `tokensBefore` when the user compacts. Same call the compact
+            // handler makes, so header and written value always agree.
+            let context_tokens = s
+                .build_context()
+                .await
+                .map(|c| estimate_context_tokens(&c.messages))
+                .unwrap_or(0);
+            (tree, leaf_id, context_tokens)
+        }
+        None => (Vec::new(), None, 0),
     };
 
-    (sessions, branch_messages, tree, leaf_id)
+    (sessions, branch_messages, tree, leaf_id, context_tokens)
+}
+
+/// Approximate token count for a context message list.
+///
+/// Rough deterministic heuristic (chars/4 + per-message framing overhead);
+/// pi uses a real tokenizer. Good enough for the `[compaction: Nk tokens]`
+/// display and the `tokensBefore` field — no correctness dependency.
+pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
+    fn text_tokens(t: &str) -> u64 {
+        t.chars().count() as u64 / 4
+    }
+    let mut n = 0u64;
+    for m in messages {
+        n += 16; // per-message framing overhead (role, separators)
+        match m {
+            Message::User { content } => {
+                for c in content.iter() {
+                    match c {
+                        UserContent::Text(t) => n += text_tokens(&t.text),
+                        UserContent::ToolResult(tr) => {
+                            for rc in tr.content.iter() {
+                                if let ToolResultContent::Text(t) = rc {
+                                    n += text_tokens(&t.text);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::Assistant { content, .. } => {
+                for c in content.iter() {
+                    match c {
+                        AssistantContent::Text(t) => n += text_tokens(&t.text),
+                        AssistantContent::Reasoning(r) => {
+                            for rc in r.content.iter() {
+                                match rc {
+                                    ReasoningContent::Text { text, .. } => {
+                                        n += text_tokens(text)
+                                    }
+                                    ReasoningContent::Summary(s) => n += text_tokens(s),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            n += text_tokens(&tc.function.name)
+                                + text_tokens(&tc.function.arguments.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::System { content } => n += text_tokens(content),
+        }
+    }
+    n.max(1)
 }
 
 /// Result of handling a `/session` command.
@@ -1278,7 +1350,12 @@ pub(crate) enum ReplayUnit {
     Turn(ConversationTurn),
     /// A compaction boundary marker. Everything on the branch after this
     /// entry is what the agent sees (it was written with `firstKeptEntryId`).
-    Compaction { tokens_before: u64 },
+    /// `summary` is the compaction's summary text (empty for `truncate`
+    /// mode); when non-empty it is rendered as part of the marker.
+    Compaction {
+        tokens_before: u64,
+        summary: String,
+    },
 }
 
 
@@ -1367,14 +1444,17 @@ fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec<ReplayUnit
                     _ => {}
                 }
             }
-            SessionEntryContent::Compaction { tokens_before, .. } => {
+            SessionEntryContent::Compaction { tokens_before, summary, .. } => {
                 // A compaction boundary comes AFTER the turn it concludes:
                 // flush any open turn first, then emit the marker.
                 flush_pending_tools(&mut pending_tools, &mut open);
                 if let Some(t) = open.take() {
                     units.push(ReplayUnit::Turn(t));
                 }
-                units.push(ReplayUnit::Compaction { tokens_before: *tokens_before });
+                units.push(ReplayUnit::Compaction {
+                    tokens_before: *tokens_before,
+                    summary: summary.clone(),
+                });
             }
             _ => {}
         }
@@ -1492,11 +1572,18 @@ fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
                 render_turn(output, turn, first_turn_seen);
                 first_turn_seen = true;
             }
-            ReplayUnit::Compaction { tokens_before } => {
+            ReplayUnit::Compaction { tokens_before, summary } => {
                 output.display_system(&format!(
                     "[compaction: {}k tokens]",
                     tokens_before / 1000,
                 ));
+                // A text-only compaction carries its summary — render it as
+                // markdown right below the marker so the compaction point is
+                // self-documenting in the replay, exactly as it was shown
+                // immediately after the compaction was performed.
+                if !summary.is_empty() {
+                    output.display_markdown(summary);
+                }
             }
         }
     }
@@ -1763,17 +1850,56 @@ async fn handle_session_command(
     }
 }
 
-/// Parse `/tree <target_id> [--summarize]` arguments.
-fn parse_tree_args(rest: &str) -> (String, bool) {
+/// Tree action selected from the `/tree` overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeAction {
+    /// Move the session leaf pointer to the target (today's behavior).
+    Switch,
+    /// Append a `Compaction` entry with `firstKeptEntryId = target`, then let
+    /// `build_context()` scope the agent context at that point.
+    Compact,
+}
+
+/// Summary mode for `/tree compact` (future: more modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactSummaryMode {
+    /// `summary = ""` — drop the prefix, keep no summary.
+    Truncate,
+    /// Deterministic text-only summary: user prompts + assistant text
+    /// responses per turn, plus a touched-files list (read/write/edit
+    /// paths). No reasoning, no tool calls, no tool output.
+    TextOnly,
+}
+
+/// Parse `/tree <target_id> [switch [--summarize] | compact [truncate|…]]`.
+/// The bare `/tree <id> --summarize` form is accepted as an alias for
+/// `switch --summarize` (backward compat). Only committed canonical lines (or
+/// hand-typed canonical/alias forms) reach this parser — sub-menu filter
+/// fragments are consumed by the overlay's fuzzy/pre-selection logic.
+fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode>, bool) {
     let mut summarize = false;
     let mut target = String::new();
+    let mut action = TreeAction::Switch;
+    let mut mode: Option<CompactSummaryMode> = None;
     for part in rest.split_whitespace() {
         match part {
             "--summarize" | "-s" => summarize = true,
-            id => target = id.to_string(),
+            "switch" => action = TreeAction::Switch,
+            "compact" => action = TreeAction::Compact,
+            "truncate" | "none" | "no-summary" => mode = Some(CompactSummaryMode::Truncate),
+            "text-only" | "text" => mode = Some(CompactSummaryMode::TextOnly),
+            id => {
+                // The overlay commits the id angle-bracketed (`/tree <id>
+                // switch`); strip the brackets — the raw id is what move_leaf
+                // / get_entry expect.
+                let t = id.trim();
+                let t = t.strip_prefix('<').unwrap_or(t);
+                let t = t.strip_suffix('>').unwrap_or(t);
+                target = t.to_string();
+            }
         }
     }
-    (target, summarize)
+    (target, action, mode, summarize)
 }
 
 /// Build a summarization prompt from a list of session entries.
@@ -2029,9 +2155,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 config.output.display_separator();
 
                 // Build session context data for REPL overlays.
-                let (_sessions, branch_messages, tree, leaf_id) = build_session_ctx(
-                    &session,
-                ).await;
+                let (_sessions, branch_messages, tree, leaf_id, context_tokens) =
+                    build_session_ctx(&session).await;
 
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
@@ -2049,6 +2174,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     branch_messages,
                     tree,
                     leaf_id,
+                    context_tokens,
                 };
                 r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
             }
@@ -2179,19 +2305,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
             }
-            InputAction::NavigateTree(target_id) => {
-                if let Some(ref s) = session {
-                    let old_leaf_id = s.get_leaf_id().await;
-                    if old_leaf_id.as_deref() == Some(target_id.as_str()) {
-                        continue;
-                    }
-                    let _ = s.move_leaf(Some(target_id.clone())).await;
-                    config.output.display_plain(&format!(
-                        "/tree navigated ({})",
-                        &target_id[..target_id.len().min(8)],
-                    ));
-                }
-            }
             InputAction::Submit(input) => {
                 if input.is_empty() {
                     continue;
@@ -2274,61 +2387,156 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                     continue;
                 }
-                // Handle `/tree <target_id>` commands — navigate session tree.
+                // Handle `/tree <target_id>` commands — navigate or compact.
                 if input.starts_with("/tree") {
                     let rest = input["/tree".len()..].trim();
-                    let (target_id, summarize) = parse_tree_args(rest);
+                    let (target_id, action, mode, summarize) = parse_tree_args(rest);
                     if target_id.is_empty() {
                         // No target: the overlay is already open from from_buffer.
                         continue;
                     }
 
-                    if let Some(ref s) = session {
-                        let old_leaf_id = s.get_leaf_id().await;
-                        if old_leaf_id.as_deref() == Some(target_id.as_str()) {
-                            continue; // already at this position
-                        }
-
-                        // Summarize the abandoned branch if requested.
-                        if summarize {
-                            if let Some(old_leaf) = old_leaf_id.as_deref() {
-                                let (abandoned, common_ancestor_id) = {
-                                    let index = s.index().lock().await;
-                                    collect_entries_for_branch_summary(&index, old_leaf, &target_id)
-                                };
-                                if !abandoned.is_empty() {
-                                    config.output.display_thinking("Summarizing abandoned branch...");
-                                    let prompt = build_summary_prompt(&abandoned);
-                                    if let Some(ref agent) = agent {
-                                        match agent.summarize(&prompt).await {
-                                            Ok(summary) => {
-                                                let _ = s.append_branch_summary(
-                                                    &common_ancestor_id,
-                                                    &summary,
+                    match action {
+                        TreeAction::Switch => {
+                            if let Some(ref s) = session {
+                                let old_leaf_id = s.get_leaf_id().await;
+                                if old_leaf_id.as_deref() != Some(target_id.as_str()) {
+                                    // Summarize the abandoned branch if requested.
+                                    if summarize {
+                                        if let Some(old_leaf) = old_leaf_id.as_deref() {
+                                            let (abandoned, common_ancestor_id) = {
+                                                let index = s.index().lock().await;
+                                                collect_entries_for_branch_summary(
+                                                    &index,
+                                                    old_leaf,
+                                                    &target_id,
                                                 )
-                                                .await;
-                                            }
-                                            Err(e) => {
-                                                config.output.display_text(&format!(
-                                                    "Summary failed: {}",
-                                                    e
-                                                ));
+                                            };
+                                            if !abandoned.is_empty() {
+                                                config
+                                                    .output
+                                                    .display_thinking("Summarizing abandoned branch...");
+                                                let prompt = build_summary_prompt(&abandoned);
+                                                if let Some(ref agent) = agent {
+                                                    match agent.summarize(&prompt).await {
+                                                        Ok(summary) => {
+                                                            let _ = s
+                                                                .append_branch_summary(
+                                                                    &common_ancestor_id,
+                                                                    &summary,
+                                                                )
+                                                                .await;
+                                                        }
+                                                        Err(e) => {
+                                                            config.output.display_text(&format!(
+                                                                "Summary failed: {}",
+                                                                e
+                                                            ));
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
+
+                                    // Move the leaf pointer. The next prompt() call
+                                    // reads the new branch via build_context()
+                                    // automatically.
+                                    let _ = s.move_leaf(Some(target_id.clone())).await;
                                 }
+                                // No confirmation line: the committed prompt
+                                // "/tree <id> switch [--summarize]" (echoed by the
+                                // overlay's emit_commit, or typed verbatim by the
+                                // user) documents the action.
                             }
                         }
+                        TreeAction::Compact => {
+                            let Some(ref s) = session else {
+                                config.output.display_text("Cannot compact: no active session");
+                                continue;
+                            };
+                            let old_leaf_id = s.get_leaf_id().await;
 
-                        // Move the leaf pointer. The next prompt() call reads the
-                        // new branch via build_context() automatically.
-                        let _ = s.move_leaf(Some(target_id.clone())).await;
+                            // pi parity: refuse to compact when the leaf IS a
+                            // compaction entry (prepareCompaction early return).
+                            if let Some(id) = &old_leaf_id {
+                                if let Some(entry) = s.get_entry(id).await {
+                                    if matches!(
+                                        entry.content,
+                                        crate::session::SessionEntryContent::Compaction { .. }
+                                    ) {
+                                        config.output.display_text("Cannot compact: the session was already compacted at this point");
+                                        continue;
+                                    }
+                                }
+                            }
 
-                        config.output.display_plain(&format!(
-                            "/tree {} ({})",
-                            if summarize { "navigated + summarized" } else { "navigated" },
-                            &target_id[..target_id.len().min(8)],
-                        ));
+                            // Validate the target is a known entry, so we never
+                            // write a silently no-op compaction
+                            // (firstKeptEntryId that never resolves).
+                            if s.get_entry(&target_id).await.is_none() {
+                                config.output.display_text(&format!(
+                                    "Cannot compact: unknown tree entry {}",
+                                    &target_id[..target_id.len().min(12)],
+                                ));
+                                continue;
+                            }
+
+                            // tokensBefore from the current scoped context
+                            // (pi semantics: tokens of the context being
+                            // replaced).
+                            let tokens_before = match s.build_context().await {
+                                Ok(ctx) => estimate_context_tokens(&ctx.messages),
+                                Err(_) => 0,
+                            };
+
+                            let summary = match mode.unwrap_or(CompactSummaryMode::Truncate) {
+                                CompactSummaryMode::Truncate => String::new(),
+                                CompactSummaryMode::TextOnly => {
+                                    // The dropped span is everything on the
+                                    // branch BEFORE the truncation point.
+                                    let dropped = {
+                                        let leaf = old_leaf_id.clone().unwrap_or_default();
+                                        let index = s.index().lock().await;
+                                        let branch = index.get_path_to_root(&leaf);
+                                        branch
+                                            .into_iter()
+                                            .take_while(|e| e.id != target_id)
+                                            .collect::<Vec<_>>()
+                                    };
+                                    crate::session::build_text_only_summary(&dropped)
+                                }
+                            };
+
+                            match s.append_compaction(&summary, &target_id, tokens_before).await {
+                                Ok(_) => {
+                                    // No confirmation line and no inline token
+                                    // count: the committed prompt
+                                    // "/tree <id> compact <mode>" documents the
+                                    // action. The estimate was shown in the
+                                    // compact sub-menu header before committing.
+                                    // For TextOnly, the summary itself is
+                                    // rendered below (via display_compaction_summary).
+                                }
+                                Err(e) => config.output.display_text(&format!(
+                                    "Cannot compact session: {}",
+                                    e
+                                )),
+                            }
+                            // Show the generated summary right after the
+                            // compaction (markdown, like an agent response) —
+                            // this is the only inline output, and only for
+                            // modes that actually produce a summary.
+                            if !summary.is_empty() {
+                                config.output.display_separator();
+                                config.output.display_markdown(&summary);
+                            }
+                            // The compaction entry is now the leaf; subsequent
+                            // turns are appended after it (append_message
+                            // parents to the new leaf) and the next prompt()
+                            // rebuilds the scoped context via build_context().
+                            // No session switch.
+                        }
                     }
                     continue;
                 }
@@ -2644,11 +2852,45 @@ mod tests {
 
     use super::{
         build_replay_units, count_turns, create_private_dir, is_anthropic_family,
-        last_turns_start, maybe_strip_reasoning, message_role, persist_turn,
-        reasoning_text, MessageLogger,
+        last_turns_start, maybe_strip_reasoning, message_role, parse_tree_args,
+        persist_turn, reasoning_text, MessageLogger,
     };
-    use super::{ReplayUnit};
+    use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use rig_core::message::{AssistantContent, Message, Text};
+
+    #[test]
+    fn parse_tree_args_strips_angle_brackets_from_id() {
+        // The overlay commits `/tree <id> switch`; the target must arrive at
+        // move_leaf/get_entry as the RAW id. Regression test: with brackets
+        // kept, move_leaf pointed at a nonexistent entry → empty context,
+        // no current-position marker, "/replay: session is empty".
+        let (target, action, mode, summarize) =
+            parse_tree_args("<0194abc-123> switch");
+        assert_eq!(target, "0194abc-123");
+        assert_eq!(action, TreeAction::Switch);
+        assert_eq!(mode, None);
+        assert!(!summarize);
+
+        // Bare angle-bracketed id (action menu commit path).
+        let (target, ..) = parse_tree_args("<x>");
+        assert_eq!(target, "x");
+
+        // Plain id still works (hand-typed without brackets).
+        let (target, ..) = parse_tree_args("plain-id switch");
+        assert_eq!(target, "plain-id");
+
+        // Compact with mode + summarize flag orthogonal.
+        let (target, action, mode, _) =
+            parse_tree_args("<id9> compact truncate --summarize");
+        assert_eq!(target, "id9");
+        assert_eq!(action, TreeAction::Compact);
+        assert_eq!(mode, Some(CompactSummaryMode::Truncate));
+
+        // Text-only mode token.
+        let (_, action, mode, _) = parse_tree_args("<id9> compact text-only");
+        assert_eq!(action, TreeAction::Compact);
+        assert_eq!(mode, Some(CompactSummaryMode::TextOnly));
+    }
 
     #[test]
     fn reasoning_text_extracts_text_block() {
@@ -3198,7 +3440,10 @@ mod tests {
         assert_eq!(units.len(), 3);
         assert!(matches!(units[0], ReplayUnit::Turn(_)));
         match &units[1] {
-            ReplayUnit::Compaction { tokens_before } => assert_eq!(*tokens_before, 42_000),
+            ReplayUnit::Compaction { tokens_before, summary } => {
+                assert_eq!(*tokens_before, 42_000);
+                assert_eq!(summary, ""); // truncate-mode compaction
+            }
             _ => panic!("expected compaction marker"),
         }
         assert!(matches!(units[2], ReplayUnit::Turn(_)));
