@@ -3235,8 +3235,17 @@ impl Repl {
     }
 
     /// Recursively flatten tree nodes into entries for table rendering.
-    /// `indent` is the number of leading spaces (0 = root, 2 = branch child, …).
-    /// Indent only increases at branching points (multiple children).
+    ///
+    /// `indent` is the number of leading spaces (increases +2 at branching
+    /// points). Entries are additionally **grouped by turn**: a user prompt
+    /// starts a turn, and everything belonging to that turn until the next
+    /// user prompt (assistant response text) is indented one extra char so
+    /// the response visually belongs to its prompt. Entries without a
+    /// visible label (tool results, tool-call-only assistant segments, meta
+    /// entries) are skipped but still descended and keep the turn state
+    /// flowing through them. Compaction rows read
+    /// `compaction <id> before "…"` with the kept entry's text resolved from
+    /// the subtree.
     fn flatten_tree_nodes(
         nodes: &[SessionTreeNode],
         indent: usize,
@@ -3244,39 +3253,139 @@ impl Repl {
         active_path: &std::collections::HashSet<String>,
         out: &mut Vec<(usize, String, String, bool, bool)>,
     ) {
+        Self::flatten_turns(
+            nodes,
+            indent,
+            leaf_id,
+            active_path,
+            &mut false, // not inside a user turn yet
+            out,
+        );
+    }
+
+    /// Turn-tracking worker for `flatten_tree_nodes`. `in_turn` flips on at
+    /// a user prompt and off at the next user prompt / compaction entry;
+    /// visible non-user rows while `in_turn` are indented one char deeper.
+    #[allow(clippy::too_many_arguments)]
+    fn flatten_turns(
+        nodes: &[SessionTreeNode],
+        indent: usize,
+        leaf_id: Option<&str>,
+        active_path: &std::collections::HashSet<String>,
+        in_turn: &mut bool,
+        out: &mut Vec<(usize, String, String, bool, bool)>,
+    ) {
         for node in nodes {
-            let label = Self::entry_display_label(&node.entry, node.label.as_deref());
+            let kind = turn_kind(&node.entry);
+            let kept_text = Self::compaction_kept_text(node);
+            let label =
+                Self::entry_display_label_ext(&node.entry, node.label.as_deref(), kept_text);
+
+            // Turn-state updates happen even for skipped entries so long
+            // tool-result chains don't break turn grouping. Invisible rows
+            // (tool results, tool-call-only assistant segments) pass the
+            // turn indent through unchanged.
+            let row_indent = match kind {
+                TurnKind::User => {
+                    *in_turn = true;
+                    indent
+                }
+                TurnKind::Assistant => {
+                    if *in_turn {
+                        indent + 1
+                    } else {
+                        indent
+                    }
+                }
+                TurnKind::Boundary => {
+                    *in_turn = false;
+                    indent
+                }
+            };
 
             if label.is_empty() {
-                // Meta entry: skip visual row but still descend.
-                let child_indent = if node.children.len() > 1 {
-                    indent + 2
-                } else {
-                    indent
-                };
-                Self::flatten_tree_nodes(
-                    &node.children, child_indent, leaf_id, active_path, out,
+                // Meta entry: skip visual row but still descend, keeping the
+                // SAME row indent (an invisible tool chain stays inside the
+                // turn, and the next visible response stays at turn depth).
+                Self::flatten_turns(
+                    &node.children, indent, leaf_id, active_path, in_turn, out,
                 );
                 continue;
             }
 
             let is_active = active_path.contains(&node.entry.id);
             let is_current = leaf_id == Some(node.entry.id.as_str());
-            out.push((indent, label.clone(), node.entry.id.clone(), is_active, is_current));
+            out.push((
+                row_indent,
+                label.clone(),
+                node.entry.id.clone(),
+                is_active,
+                is_current,
+            ));
 
-            let child_indent = if node.children.len() > 1 {
-                indent + 2
-            } else {
-                indent
-            };
-            Self::flatten_tree_nodes(
-                &node.children, child_indent, leaf_id, active_path, out,
+            // Children continue the turn flow at the same base indent: the
+            // chain user→assistant→tool→assistant→user is linear, and the
+            // turn depth is derived per node from `in_turn`, never stacked.
+            Self::flatten_turns(
+                &node.children, indent, leaf_id, active_path, in_turn, out,
             );
         }
     }
 
+    /// For a compaction node, find the display label of the entry it keeps
+    /// (`firstKeptEntryId`), searched depth-first through the node's
+    /// subtree. Returns `None` when the kept entry is not under this node.
+    fn compaction_kept_text(node: &SessionTreeNode) -> Option<String> {
+        let SessionEntryContent::Compaction { first_kept_entry_id, .. } = &node.entry.content
+        else {
+            return None;
+        };
+        fn search(nodes: &[SessionTreeNode], want: &str) -> Option<String> {
+            for n in nodes {
+                if n.entry.id == want {
+                    let t = Repl::entry_display_label(&n.entry, n.label.as_deref());
+                    if !t.is_empty() {
+                        return Some(t);
+                    }
+                }
+                if let Some(t) = search(&n.children, want) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        search(&node.children, first_kept_entry_id)
+    }
+
+    /// `entry_display_label` with an optional pre-resolved kept-entry text
+    /// for compaction rows (see `compaction_kept_text`).
+    fn entry_display_label_ext(
+        entry: &SessionEntry,
+        label: Option<&str>,
+        kept_text: Option<String>,
+    ) -> String {
+        if let SessionEntryContent::Compaction { first_kept_entry_id, .. } = &entry.content {
+            let s = kept_text
+                .as_deref()
+                .or(label)
+                .map(|t| Self::sanitise_single_line(t))
+                .unwrap_or_else(|| "(kept entry not on visible path)".into());
+            return format!(
+                "compaction {} before \"{}\"",
+                &first_kept_entry_id[..first_kept_entry_id.len().min(12)],
+                s
+            );
+        }
+        Self::entry_display_label(entry, label)
+    }
+
     /// Build a display label for one tree entry.
-    /// Returns an empty string for meta entries that should be skipped.
+    ///
+    /// The /tree list is turn-oriented: only **user prompts** and **model
+    /// response text** are shown (no tool calls, no tool results, no
+    /// reasoning). Assistant responses whose text is empty (tool-call-only
+    /// segments) are suppressed entirely. Compaction entries are rendered by
+    /// `entry_display_label_ext` (needs subtree lookup for the kept text).
     fn entry_display_label(entry: &SessionEntry, _label: Option<&str>) -> String {
         let body = match &entry.content {
             SessionEntryContent::Message { message } => {
@@ -3288,50 +3397,37 @@ impl Repl {
                         Self::sanitise_single_line(text)
                     }
                     Some("assistant") => {
-                        // Parse content blocks: skip reasoning, show tool calls
-                        // or text. Matches the live render's get_preview format.
-                        let content_arr = message.get("content").and_then(|c| c.as_array());
-                        let mut text = String::new();
-                        let mut tool_call_label: Option<String> = None;
-                        if let Some(arr) = content_arr {
-                            for item in arr {
-                                match item.get("type").and_then(|t| t.as_str()) {
-                                    Some("text") => {
-                                        if text.is_empty() {
-                                            text = item.get("text")
-                                                .and_then(|t| t.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                        }
-                                    }
-                                    Some("toolCall") => {
-                                        if tool_call_label.is_none() {
-                                            let name = item.get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("tool");
-                                            let args = item.get("arguments");
-                                            tool_call_label = Some(
-                                                Self::tool_preview_label(name, args)
-                                            );
-                                        }
-                                    }
-                                    // Skip thinking/reasoning blocks
-                                    _ => {}
-                                }
-                            }
-                        }
-                        // Prefer tool call label; fall back to text.
-                        if let Some(label) = tool_call_label {
-                            label
-                        } else if !text.is_empty() {
-                            Self::sanitise_single_line(&text)
+                        // Text only: reasoning and tool calls are skipped;
+                        // a response with no text (tool-call-only segment)
+                        // is suppressed entirely and its entries fold into
+                        // the previous visible row.
+                        let text = message.get("content")
+                            .and_then(|c| c.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                                        Some("text") => item.get("text").and_then(|t| t.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                            .unwrap_or_default();
+                        if text.is_empty() {
+                            String::new() // no visible row for this entry
                         } else {
-                            "(assistant)".into()
+                            Self::sanitise_single_line(&text)
                         }
                     }
-                    Some("toolResult") => "(tool result)".into(),
-                    _ => "(unknown)".into(),
+                    // Tool results are never shown.
+                    Some("toolResult") => String::new(),
+                    _ => String::new(),
                 }
+            }
+            SessionEntryContent::Compaction { .. } => {
+                // Rendered by entry_display_label_ext (kept text resolved
+                // from the subtree); unreachable here but kept exhaustive.
+                String::new()
             }
             SessionEntryContent::ThinkingLevelChange { thinking_level } => {
                 format!("thinking: {}", thinking_level)
@@ -3343,10 +3439,6 @@ impl Repl {
             SessionEntryContent::BranchSummary { summary, .. } => {
                 let s = Self::sanitise_single_line(summary);
                 if s.is_empty() { "[S] (branch summary)".into() } else { format!("[S] {}", s) }
-            }
-            SessionEntryContent::Compaction { summary, .. } => {
-                let s = Self::sanitise_single_line(summary);
-                if s.is_empty() { "[C] (compacted)".into() } else { format!("[C] {}", s) }
             }
             SessionEntryContent::Label { target_id, label } => {
                 let l = label.as_deref().unwrap_or("(label)");
@@ -3372,95 +3464,6 @@ impl Repl {
             }
         }
         body
-    }
-
-    /// Format a tool call preview for the tree overlay, matching the live
-    /// render's `get_preview` style from `output.rs`.
-    fn tool_preview_label(name: &str, args: Option<&serde_json::Value>) -> String {
-        use serde_json::Value;
-        let get_str = |key: &str| {
-            args.and_then(|a| a.as_object())
-                .and_then(|o| o.get(key))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
-        let get_u64 = |key: &str| {
-            args.and_then(|a| a.as_object())
-                .and_then(|o| o.get(key))
-                .and_then(|v| v.as_u64())
-        };
-        match name {
-            "read" | "read_file" => {
-                let path = get_str("path").unwrap_or_default();
-                let offset = get_u64("offset").unwrap_or(0);
-                let limit = get_u64("limit").unwrap_or(0);
-                let mut s = format!("read {}", path);
-                if limit > 0 {
-                    s.push_str(&format!(" [{}..{}]", offset + 1, offset + limit));
-                } else if offset > 0 {
-                    s.push_str(&format!(" [{}..]", offset + 1));
-                }
-                s
-            }
-            "bash" => {
-                let cmd = get_str("command")
-                    .or_else(|| get_str("cmd"))
-                    .unwrap_or_default();
-                format!("$ {}", cmd.trim())
-            }
-            s if s.starts_with("grep") => {
-                let pat = get_str("pattern")
-                    .or_else(|| get_str("pat"))
-                    .unwrap_or_default();
-                let path = get_str("path").unwrap_or_default();
-                format!("grep {} {}", pat, path)
-            }
-            s if s == "ls" || s.starts_with("list") => {
-                let path = get_str("path").unwrap_or_default();
-                format!("ls {}", path)
-            }
-            "edit" | "edit_file" => {
-                let path = get_str("path").unwrap_or_default();
-                // Try canonical format (edits array) with oldText/newText.
-                if let Some(edits_array) = args
-                    .and_then(|a| a.as_object())
-                    .and_then(|o| o.get("edits"))
-                    .and_then(|v| v.as_array())
-                {
-                    if let Some(first) = edits_array.first() {
-                        let old_text = first.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
-                        format!("edit {} [{}..]", path, Self::count_lines_before(old_text))
-                    } else {
-                        format!("edit {}", path)
-                    }
-                } else {
-                    format!("edit {}", path)
-                }
-            }
-            _ => {
-                let first = args
-                    .and_then(|a| a.as_object())
-                    .and_then(|o| o.values().next())
-                    .map(|v| match v {
-                        Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    })
-                    .unwrap_or_default();
-                if first.len() > 50 {
-                    format!("{} {}...", name, &first[..47])
-                } else if first.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{} {}", name, first.replace('\n', " "))
-                }
-            }
-        }
-    }
-
-    /// Count the number of lines before `text`, returning a 1-based line number.
-    /// This approximates a line count for the old edit text.
-    fn count_lines_before(text: &str) -> usize {
-        text.matches('\n').count() + 1
     }
 
     /// Build the `/sandbox` overlay rows for `filter`.
@@ -4420,6 +4423,30 @@ fn cursor_positioning(layout: &Layout, prompt: &str) -> String {
     s
 }
 
+/// Turn-grouping classification for a session entry in the /tree list.
+enum TurnKind {
+    /// A user prompt starts (or re-opens) a turn.
+    User,
+    /// Assistant content belongs to the open turn (indented +1).
+    Assistant,
+    /// Compaction entries close the turn scope.
+    Boundary,
+}
+
+fn turn_kind(entry: &SessionEntry) -> TurnKind {
+    match &entry.content {
+        SessionEntryContent::Message { message } => {
+            match message.get("role").and_then(|r| r.as_str()) {
+                Some("user") => TurnKind::User,
+                Some("assistant") => TurnKind::Assistant,
+                _ => TurnKind::Assistant, // toolResult: invisible, keeps state
+            }
+        }
+        SessionEntryContent::Compaction { .. } => TurnKind::Boundary,
+        _ => TurnKind::Assistant, // meta entries: invisible, keeps state
+    }
+}
+
 /// Recursively search the tree for `leaf_id` and collect all ancestor IDs
 /// (including the leaf itself) into `out`. Returns `true` if found in this
 /// subtree (short-circuits further searching).
@@ -4835,6 +4862,177 @@ mod tests {
         // Unknown angle-bracketed id → falls through to the list too.
         let ov = tree_overlay("/tree <does-not-exist>");
         assert!(matches!(ov, ActiveOverlay::Tree { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // /tree list rendering: turn grouping, no tools, compaction scope
+    // ------------------------------------------------------------------
+
+    fn tree_entry(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionTreeNode {
+        SessionTreeNode {
+            entry: SessionEntry {
+                id: id.into(),
+                parent_id: parent.map(|p| p.into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": role,
+                        "content": [{"type": "text", "text": text}]
+                    }),
+                },
+            },
+            children: vec![],
+            label: None,
+        }
+    }
+
+    fn assistant_with_tools(
+        id: &str,
+        parent: Option<&str>,
+        text: Option<&str>,
+        tool_name: Option<&str>,
+    ) -> SessionTreeNode {
+        let mut content = vec![];
+        if let Some(t) = text {
+            content.push(serde_json::json!({"type": "text", "text": t}));
+        }
+        if let Some(name) = tool_name {
+            content.push(serde_json::json!({
+                "type": "toolCall", "name": name,
+                "arguments": {"path": "x.rs"}
+            }));
+        }
+        SessionTreeNode {
+            entry: SessionEntry {
+                id: id.into(),
+                parent_id: parent.map(|p| p.into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": content
+                    }),
+                },
+            },
+            children: vec![],
+            label: None,
+        }
+    }
+
+    fn tool_result(id: &str, parent: Option<&str>) -> SessionTreeNode {
+        SessionTreeNode {
+            entry: SessionEntry {
+                id: id.into(),
+                parent_id: parent.map(|p| p.into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "toolResult",
+                        "content": [{"type": "text", "text": "tool output"}]
+                    }),
+                },
+            },
+            children: vec![],
+            label: None,
+        }
+    }
+
+    fn compaction(id: &str, parent: Option<&str>, kept: &str) -> SessionTreeNode {
+        SessionTreeNode {
+            entry: SessionEntry {
+                id: id.into(),
+                parent_id: parent.map(|p| p.into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Compaction {
+                    summary: String::new(),
+                    first_kept_entry_id: kept.into(),
+                    tokens_before: 42_000,
+                },
+            },
+            children: vec![],
+            label: None,
+        }
+    }
+
+    fn attach(mut parent: SessionTreeNode, child: SessionTreeNode) -> SessionTreeNode {
+        parent.children.push(child);
+        parent
+    }
+
+    #[test]
+    fn tree_list_skips_tools_and_groups_turns() {
+        // Chain: user -> assistant(text+toolCall) -> toolResult -> assistant(text) -> user2
+        let assistant_tools = attach(
+            assistant_with_tools("a0", Some("m0"), Some("partial answer"), Some("read")),
+            tool_result("t0", Some("a0")),
+        );
+        let assistant_text = attach(
+            assistant_with_tools("a1", Some("t0"), Some("final answer"), None),
+            tree_entry("m1", Some("a1"), "user", "second prompt"),
+        );
+        let chain = attach(assistant_tools, assistant_text);
+        let tree = vec![attach(tree_entry("m0", None, "user", "first prompt"), chain)];
+
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
+
+        // Visible rows: user prompt, the assistant's text before AND after
+        // the tool call (both are response text), then the second user
+        // prompt. NO tool-call/tool-result rows.
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        assert_eq!(labels.len(), 4, "got: {:?}", labels);
+        assert!(labels[0].contains("first prompt"));
+        assert!(labels[1].contains("partial answer"));
+        assert!(labels[2].contains("final answer"));
+        assert!(labels[3].contains("second prompt"));
+        let all = labels.join("\n");
+        assert!(!all.contains("read"));
+        assert!(!all.contains("tool output"));
+        // Indent: assistant rows are one char deeper than their user prompt;
+        // the indent persists across the invisible tool-call/tool-result
+        // chain between the two text segments.
+        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _)| *i).collect();
+        assert_eq!(indents, vec![0, 1, 1, 0], "got: {:?}", out);
+    }
+
+    #[test]
+    fn tree_list_tool_only_assistant_segment_is_suppressed() {
+        // Assistant message with a tool call but NO text → no visible row.
+        let with_call = attach(
+            assistant_with_tools("a0", Some("m0"), None, Some("read")),
+            tool_result("t0", Some("a0")),
+        );
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "prompt"),
+            attach(with_call, tree_entry("m1", Some("t0"), "assistant", "done")),
+        )];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        assert_eq!(labels.len(), 2, "got: {:?}", labels);
+        assert!(labels[0].contains("prompt"));
+        assert!(labels[1].contains("done"));
+        assert_eq!(out[1].0, 1); // still part of the same turn
+    }
+
+    #[test]
+    fn tree_list_compaction_shows_kept_text() {
+        // Compaction entry whose kept entry (m1) sits in its subtree.
+        let cmp = compaction("c1", Some("a0"), "m1");
+        let cmp = attach(cmp, tree_entry("m1", Some("c1"), "user", "kept prompt"));
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "old prompt"),
+            attach(tree_entry("a0", Some("m0"), "assistant", "old answer"), cmp),
+        )];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let compaction_row = labels
+            .iter()
+            .find(|l| l.starts_with("compaction"))
+            .expect("compaction row must be visible");
+        assert!(compaction_row.contains("m1"));
+        assert!(compaction_row.contains("before \"kept prompt\""));
     }
 
     #[test]
