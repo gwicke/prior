@@ -17,7 +17,7 @@ use console::style;
 use rig_agent::agent::{
     Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
     HookContext, ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, NoToolConfig, ObservationAction,
-    StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
+    RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::{Chat, PromptError};
@@ -130,6 +130,9 @@ impl PicoAgent for CodeAgent {
                 output: self.output.clone(),
                 user_cancel: self.user_cancel.clone(),
                 message_logger: self.message_logger.clone(),
+                reasoning_in_context: self.reasoning_in_context,
+                provider: self.provider.clone(),
+                model: self.model.clone(),
             })
             .max_turns(self.tool_call_limit)
             .history(prior)
@@ -874,6 +877,9 @@ struct LoggingHook {
     output: Arc<dyn Output>,
     user_cancel: Arc<AtomicBool>,
     message_logger: Option<Arc<MessageLogger>>,
+    reasoning_in_context: bool,
+    provider: String,
+    model: String,
 }
 
 impl AgentHook for LoggingHook {
@@ -885,15 +891,39 @@ impl AgentHook for LoggingHook {
         if self.user_cancel.load(Ordering::SeqCst) {
             CompletionCallAction::Stop("cancelled by user".into())
         } else {
-            // `--log-messages`: capture the exact context sent to the model on
-            // this call — the full history plus the current prompt — under one
-            // turn id shared with the matching response.
+            // Build stripped history for sending to the provider and logging.
+            // The prompt is sent separately (not part of history), but we
+            // log it alongside. When `reasoning_in_context` is false,
+            // `maybe_strip_reasoning` removes reasoning blocks from the
+            // history — and the log should reflect exactly what the
+            // model sees.
+            let stripped_history = maybe_strip_reasoning(
+                event.history.iter().cloned().collect(),
+                self.reasoning_in_context,
+                &self.provider,
+                &self.model,
+            );
+
+            // `--log-messages`: capture the exact context sent to the
+            // model on this call — the full history plus the current
+            // prompt — under one turn id shared with the matching
+            // response. Logging the stripped history reflects what
+            // the provider actually receives.
             if let Some(logger) = &self.message_logger {
                 let turn_id = logger.advance_turn();
-                for m in event.history {
+                for m in &stripped_history {
                     logger.log_message("sent", m, turn_id).await;
                 }
                 logger.log_message("sent", event.prompt, turn_id).await;
+            }
+
+            // When `reasoning_in_context` is false, send the stripped
+            // history to the provider via a patch. `maybe_strip_reasoning`
+            // also handles the Anthropic-family thinking+tool_use replay
+            // contract (reasoning is force-kept on turns with tool calls),
+            // so the patch is a no-op there.
+            if !self.reasoning_in_context {
+                return CompletionCallAction::Patch(RequestPatch::new().history(stripped_history));
             }
             CompletionCallAction::Continue
         }
@@ -2678,6 +2708,9 @@ mod tests {
                 output: Arc::new(crate::NoOutput),
                 user_cancel: Arc::new(AtomicBool::new(false)),
                 message_logger: Some(logger.clone()),
+                reasoning_in_context: false,
+                provider: "test".to_string(),
+                model: "test-model".to_string(),
             })
             .max_turns(1)
             .await;
