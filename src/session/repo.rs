@@ -128,6 +128,13 @@ impl JsonlSessionRepo {
         &self.base_dir
     }
 
+    /// Invalidate the metadata cache so the next listing re-reads from disk.
+    pub fn invalidate_cache(&self) {
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = None;
+        }
+    }
+
     /// Resolve the encoded CWD directory path.
     fn session_dir(&self, cwd: &Path) -> PathBuf {
         self.base_dir.join(encode_cwd(cwd))

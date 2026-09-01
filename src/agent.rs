@@ -1588,19 +1588,18 @@ async fn handle_session_command(
                 let cur_id = s.get_session_id().to_string();
                 if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
                     let _ = s.set_session_name(&new_name).await;
+                    // Refresh the repo's metadata cache so that the listing picks up the new name immediately
+                    if let Some(ref repo) = repo {
+                        repo.invalidate_cache();
+                    }
                 } else if let Some(meta) = meta {
-                    match repo.as_ref().unwrap().open(&meta).await {
-                        Ok((storage, _index)) => {
-                            let s = Session::new_persisted(storage, crate::session::SessionIndex {
-                                header: crate::session::SessionHeader::new(
-                                    &std::env::current_dir().unwrap_or_default()
-                                ),
-                                entries: std::collections::HashMap::new(),
-                                leaf_id: None,
-                                children: std::collections::HashMap::new(),
-                                session_name: None,
-                            });
+                    let repo = repo.as_ref().unwrap();
+                    match repo.open(&meta).await {
+                        Ok((storage, index)) => {
+                            let s = Session::new_persisted(storage, index);
                             let _ = s.set_session_name(&new_name).await;
+                            // Refresh the repo's metadata cache so that the listing picks up the new name immediately
+                            repo.invalidate_cache();
                         }
                         Err(e) => {
                             config.output.display_text(&format!("Cannot open session: {}", e));
