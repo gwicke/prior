@@ -3208,6 +3208,10 @@ impl Repl {
         }
 
         // Render via Table for column alignment like /session.
+        // Column 0 is the indicator: `◉` marks the current position (the
+        // leaf); there is no separate `*` column. Column 1 carries the label,
+        // indented so exactly ONE space separates the indicator from the
+        // first character at base indent.
         let avail = term_width().saturating_sub(2);
         let mut table = Table::new(&["", "Entry"])
             .with_aligns(&[Align::Left, Align::Left])
@@ -3216,11 +3220,15 @@ impl Repl {
             .set_gap(1);
 
         for (indent, label, entry_id, is_active, is_curr) in &flat {
-            let marker = if *is_curr { "◉" } else { " " };
+            let marker = if *is_curr { "◉" } else { "" };
+            // Turn indentation (user=1, response=2) plus branch indent (+3
+            // per branching level) — but always at least one space after the
+            // indicator column.
+            let display_indent = indent + 1;
             let display = if *is_active {
-                format!("{:indent$}{}", "", label, indent = indent)
+                format!("{:indent$}{}", "", label, indent = display_indent)
             } else {
-                format!("\x1b[2m{:indent$}{}\x1b[0m", "", label, indent = indent)
+                format!("\x1b[2m{:indent$}{}\x1b[0m", "", label, indent = display_indent)
             };
             table.add_row(&[marker, &display]);
             targets.push(entry_id.clone());
@@ -3253,11 +3261,32 @@ impl Repl {
         active_path: &std::collections::HashSet<String>,
         out: &mut Vec<(usize, String, String, bool, bool)>,
     ) {
+        // Precompute id -> display label over the WHOLE tree so compaction
+        // rows can resolve their kept entry: `firstKeptEntryId` points to an
+        // entry BEFORE the compaction (an ancestor/sibling elsewhere in the
+        // tree), never a descendant, so a subtree search never finds it.
+        let mut labels: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        fn collect_labels(
+            nodes: &[SessionTreeNode],
+            labels: &mut std::collections::HashMap<String, String>,
+        ) {
+            for n in nodes {
+                let t = Repl::entry_display_label(&n.entry, n.label.as_deref());
+                if !t.is_empty() {
+                    labels.insert(n.entry.id.clone(), t);
+                }
+                collect_labels(&n.children, labels);
+            }
+        }
+        collect_labels(nodes, &mut labels);
+
         Self::flatten_turns(
             nodes,
             indent,
             leaf_id,
             active_path,
+            &labels,
             &mut false, // not inside a user turn yet
             out,
         );
@@ -3266,20 +3295,22 @@ impl Repl {
     /// Turn-tracking worker for `flatten_tree_nodes`. `in_turn` flips on at
     /// a user prompt and off at the next user prompt / compaction entry;
     /// visible non-user rows while `in_turn` are indented one char deeper.
+    /// `labels` is the whole-tree id → display-label map used by compaction
+    /// rows to resolve the kept entry.
     #[allow(clippy::too_many_arguments)]
     fn flatten_turns(
         nodes: &[SessionTreeNode],
         indent: usize,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
+        labels: &std::collections::HashMap<String, String>,
         in_turn: &mut bool,
         out: &mut Vec<(usize, String, String, bool, bool)>,
     ) {
         for node in nodes {
             let kind = turn_kind(&node.entry);
-            let kept_text = Self::compaction_kept_text(node);
             let label =
-                Self::entry_display_label_ext(&node.entry, node.label.as_deref(), kept_text);
+                Self::entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
             // Turn-state updates happen even for skipped entries so long
             // tool-result chains don't break turn grouping. Invisible rows
@@ -3308,7 +3339,7 @@ impl Repl {
                 // SAME row indent (an invisible tool chain stays inside the
                 // turn, and the next visible response stays at turn depth).
                 Self::flatten_turns(
-                    &node.children, indent, leaf_id, active_path, in_turn, out,
+                    &node.children, indent, leaf_id, active_path, labels, in_turn, out,
                 );
                 continue;
             }
@@ -3326,54 +3357,37 @@ impl Repl {
             // Children continue the turn flow at the same base indent: the
             // chain user→assistant→tool→assistant→user is linear, and the
             // turn depth is derived per node from `in_turn`, never stacked.
+            // Branching points indent their children +3 so forks read
+            // clearly against the +1 turn indentation.
+            let child_indent = if node.children.len() > 1 {
+                indent + 3
+            } else {
+                indent
+            };
             Self::flatten_turns(
-                &node.children, indent, leaf_id, active_path, in_turn, out,
+                &node.children, child_indent, leaf_id, active_path, labels, in_turn, out,
             );
         }
     }
 
-    /// For a compaction node, find the display label of the entry it keeps
-    /// (`firstKeptEntryId`), searched depth-first through the node's
-    /// subtree. Returns `None` when the kept entry is not under this node.
-    fn compaction_kept_text(node: &SessionTreeNode) -> Option<String> {
-        let SessionEntryContent::Compaction { first_kept_entry_id, .. } = &node.entry.content
-        else {
-            return None;
-        };
-        fn search(nodes: &[SessionTreeNode], want: &str) -> Option<String> {
-            for n in nodes {
-                if n.entry.id == want {
-                    let t = Repl::entry_display_label(&n.entry, n.label.as_deref());
-                    if !t.is_empty() {
-                        return Some(t);
-                    }
-                }
-                if let Some(t) = search(&n.children, want) {
-                    return Some(t);
-                }
-            }
-            None
-        }
-        search(&node.children, first_kept_entry_id)
-    }
-
-    /// `entry_display_label` with an optional pre-resolved kept-entry text
-    /// for compaction rows (see `compaction_kept_text`).
+    /// `entry_display_label` with the whole-tree label map, so compaction
+    /// rows can resolve the kept entry's text (`firstKeptEntryId` lives
+    /// before the compaction, elsewhere in the tree).
     fn entry_display_label_ext(
         entry: &SessionEntry,
         label: Option<&str>,
-        kept_text: Option<String>,
+        labels: &std::collections::HashMap<String, String>,
     ) -> String {
         if let SessionEntryContent::Compaction { first_kept_entry_id, .. } = &entry.content {
-            let s = kept_text
-                .as_deref()
-                .or(label)
+            let kept = labels
+                .get(first_kept_entry_id)
                 .map(|t| Self::sanitise_single_line(t))
-                .unwrap_or_else(|| "(kept entry not on visible path)".into());
+                .or_else(|| label.map(|l| Self::sanitise_single_line(l)))
+                .unwrap_or_else(|| "(kept entry)".into());
             return format!(
                 "compaction {} before \"{}\"",
                 &first_kept_entry_id[..first_kept_entry_id.len().min(12)],
-                s
+                kept
             );
         }
         Self::entry_display_label(entry, label)
@@ -4961,17 +4975,22 @@ mod tests {
 
     #[test]
     fn tree_list_skips_tools_and_groups_turns() {
-        // Chain: user -> assistant(text+toolCall) -> toolResult -> assistant(text) -> user2
-        let assistant_tools = attach(
-            assistant_with_tools("a0", Some("m0"), Some("partial answer"), Some("read")),
-            tool_result("t0", Some("a0")),
+        // Linear chain: m0 -> a0(text+toolCall) -> t0 -> a1(text) -> m1.
+        // (Real sessions are linear parent chains, not nested forks.)
+        let chain = attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            attach(
+                assistant_with_tools("a0", Some("m0"), Some("partial answer"), Some("read")),
+                attach(
+                    tool_result("t0", Some("a0")),
+                    attach(
+                        assistant_with_tools("a1", Some("t0"), Some("final answer"), None),
+                        tree_entry("m1", Some("a1"), "user", "second prompt"),
+                    ),
+                ),
+            ),
         );
-        let assistant_text = attach(
-            assistant_with_tools("a1", Some("t0"), Some("final answer"), None),
-            tree_entry("m1", Some("a1"), "user", "second prompt"),
-        );
-        let chain = attach(assistant_tools, assistant_text);
-        let tree = vec![attach(tree_entry("m0", None, "user", "first prompt"), chain)];
+        let tree = vec![chain];
 
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
@@ -5017,22 +5036,65 @@ mod tests {
 
     #[test]
     fn tree_list_compaction_shows_kept_text() {
-        // Compaction entry whose kept entry (m1) sits in its subtree.
-        let cmp = compaction("c1", Some("a0"), "m1");
-        let cmp = attach(cmp, tree_entry("m1", Some("c1"), "user", "kept prompt"));
+        // Kept entry (m1) is a SIBLING elsewhere in the tree — the real
+        // case: firstKeptEntryId points BEFORE the compaction, so the label
+        // map must resolve it across the whole tree (regression: a subtree-
+        // only search always missed it and showed "(kept entry not on
+        // visible path)").
         let tree = vec![attach(
-            tree_entry("m0", None, "user", "old prompt"),
-            attach(tree_entry("a0", Some("m0"), "assistant", "old answer"), cmp),
+            tree_entry("m0", None, "user", "kept prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "old answer"),
+                compaction("c1", Some("a0"), "m0"), // keeps m0 (the root)
+            ),
         )];
         let mut out = Vec::new();
-        Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
+        Repl::flatten_tree_nodes(&tree, 0, Some("c1"), &std::collections::HashSet::new(), &mut out);
         let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
         let compaction_row = labels
             .iter()
             .find(|l| l.starts_with("compaction"))
             .expect("compaction row must be visible");
-        assert!(compaction_row.contains("m1"));
+        assert!(compaction_row.contains("m0"));
         assert!(compaction_row.contains("before \"kept prompt\""));
+    }
+
+    #[test]
+    fn tree_list_branch_indent_is_three() {
+        // a0 forks: two children -> each child indented +3.
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(tree_entry("m0", None, "user", "prompt"), fork)];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
+        let branch_rows: Vec<usize> = out
+            .iter()
+            .filter(|(_, l, _, _, _)| l.contains("branch"))
+            .map(|(i, _, _, _, _)| *i)
+            .collect();
+        assert_eq!(branch_rows, vec![3, 3]); // base 0 + branch indent 3
+        // The fork point itself stays at turn depth (+1: assistant in turn).
+        let fork_indent = out
+            .iter()
+            .find(|(_, l, _, _, _)| l.contains("fork point"))
+            .map(|(i, _, _, _, _)| *i)
+            .unwrap();
+        assert_eq!(fork_indent, 1);
     }
 
     #[test]

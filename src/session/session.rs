@@ -153,15 +153,22 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
     // Assistant text accumulates until the next user prompt closes the turn.
     let mut turn_assistant: Vec<String> = Vec::new();
 
+    // Each turn is introduced by a horizontal rule + speaker header, so the
+    // markdown rendering gives clear visual separation between turns:
+    //
+    //   ---
+    //   # [user]
+    //   <prompt>
+    //
+    //   ---
+    //   # [assistant]
+    //   <response text>
     let flush_turn = |out: &mut String, assistant: &mut Vec<String>| {
         if assistant.is_empty() {
             return;
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[assistant]\n");
-        out.push_str(&assistant.join("\n"));
+        out.push_str("\n---\n# [assistant]\n");
+        out.push_str(&assistant.join("\n\n"));
         assistant.clear();
     };
 
@@ -173,10 +180,7 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
                         // A new user prompt closes the previous turn.
                         flush_turn(&mut out, &mut turn_assistant);
                         if let Some(text) = summary_message_text(message) {
-                            if !out.is_empty() {
-                                out.push('\n');
-                            }
-                            out.push_str("[user]\n");
+                            out.push_str("\n---\n# [user]\n");
                             out.push_str(&text);
                         }
                     }
@@ -199,28 +203,23 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
     flush_turn(&mut out, &mut turn_assistant);
 
     if !files.is_empty() {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str("Files touched:\n");
+        out.push_str("\n---\n# [files touched]\n");
         // Modified first, then reads; each group alphabetical for stability.
         let mut modified: Vec<&TouchedFile> =
             files.iter().filter(|f| f.modified).collect();
         let mut read: Vec<&TouchedFile> = files.iter().filter(|f| !f.modified).collect();
         modified.sort_by(|a, b| a.path.cmp(&b.path));
         read.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut lines: Vec<String> = Vec::new();
         for f in modified {
-            out.push_str(&format!("- modified: {}\n", f.path));
+            lines.push(format!("- modified: {}", f.path));
         }
         for f in read {
-            out.push_str(&format!("- read: {}\n", f.path));
+            lines.push(format!("- read: {}", f.path));
         }
-        // Trim the trailing newline of the last list entry.
-        while out.ends_with('\n') {
-            out.pop();
-        }
+        out.push_str(&lines.join("\n"));
     }
-    out
+    out.trim_start_matches('\n').to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,10 +2309,10 @@ mod tests {
             ])),
         ];
         let s = build_text_only_summary(&dropped);
-        assert!(s.contains("[user]\nfirst prompt"));
-        assert!(s.contains("[assistant]\nfirst answer"));
-        assert!(s.contains("[user]\nsecond prompt"));
-        assert!(s.contains("[assistant]\nsecond answer"));
+        assert!(s.contains("# [user]\nfirst prompt"));
+        assert!(s.contains("# [assistant]\nfirst answer"));
+        assert!(s.contains("# [user]\nsecond prompt"));
+        assert!(s.contains("# [assistant]\nsecond answer"));
         // No reasoning, no tool syntax, no tool output.
         assert!(!s.contains("deep thoughts"));
         assert!(!s.contains("toolCall"));
@@ -2323,6 +2322,11 @@ mod tests {
         let first = s.find("first prompt").unwrap();
         let second = s.find("second prompt").unwrap();
         assert!(first < second);
+        // HR separators before every section: 2 user turns, 2 assistant
+        // responses, and the files list. (The very first separator has its
+        // leading newline trimmed off.)
+        assert_eq!(s.matches("---\n# [").count(), 5);
+        assert!(s.starts_with("---\n# [user]\nfirst prompt"));
     }
 
     #[test]
@@ -2343,7 +2347,7 @@ mod tests {
         ];
         let s = build_text_only_summary(&dropped);
         // Modified files listed as modified (read-then-edit promotes).
-        assert!(s.contains("Files touched:"));
+        assert!(s.contains("# [files touched]"));
         assert!(s.contains("- modified: a.txt"));
         assert!(s.contains("- read: b.txt"));
         // Non-file tools ignored; a.txt appears once in the read list and
@@ -2424,9 +2428,9 @@ mod tests {
         };
         // pi wrapper + our summary as the FIRST message of the context.
         assert!(text.starts_with(COMPACTION_SUMMARY_PREFIX));
-        assert!(text.contains("[user]\nearly task"));
-        assert!(text.contains("[assistant]\nearly answer"));
-        assert!(text.contains("Files touched:"));
+        assert!(text.contains("# [user]\nearly task"));
+        assert!(text.contains("[assistant]"));
+        assert!(text.contains("# [files touched]"));
         assert!(text.contains("- modified: src/lib.rs"));
         let second_text = match &transformed[1].content {
             SessionEntryContent::Message { message } => {
