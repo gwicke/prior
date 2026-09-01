@@ -27,6 +27,38 @@ use crate::session::storage::{JsonlSessionStorage, SessionStorage};
 use crate::session::types::*;
 
 // ---------------------------------------------------------------------------
+// Compaction summary message (pi-compatible wrapper)
+// ---------------------------------------------------------------------------
+
+/// pi's compaction summary message wrapper (core/messages.ts).
+/// The compaction entry is never sent to the LLM as itself; when its `summary`
+/// is non-empty it is projected into a synthetic user message wrapped as below.
+const COMPACTION_SUMMARY_PREFIX: &str =
+    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+
+/// Build the synthetic user-message entry that stands in for a `Compaction`
+/// entry in the LLM context (pi `compactionSummary` message, converted by
+/// `convertToLlm`). Called with a non-empty summary only — an empty summary
+/// emits nothing in the context ("if available" per the design doc).
+fn compaction_summary_message(summary: &str) -> SessionEntry {
+    SessionEntry {
+        id: uuid::Uuid::now_v7().to_string(),
+        parent_id: None,
+        timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        content: SessionEntryContent::Message {
+            message: serde_json::json!({
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": format!("{}{}{}", COMPACTION_SUMMARY_PREFIX, summary, COMPACTION_SUMMARY_SUFFIX)
+                }]
+            }),
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 
@@ -130,10 +162,14 @@ impl Session {
     /// 4. Derive thinking level and model from the branch
     pub async fn build_context(&self) -> crate::Result<SessionContext> {
         let branch = self.get_branch().await;
+        // derive_thinking_level / derive_model run on the FULL branch (pi's
+        // `getSessionContextSettings` walks the whole path), NOT on the
+        // compaction-scoped set, so a model/thinking change recorded before
+        // the compaction boundary still applies after compaction.
+        let thinking_level = derive_thinking_level(&branch);
+        let model = derive_model(&branch);
         let transformed = self.apply_transforms(branch);
         let messages = extract_messages(&transformed);
-        let thinking_level = derive_thinking_level(&transformed);
-        let model = derive_model(&transformed);
 
         // If deriving from entries yielded nothing, fall back to the session
         // header's provider/model/thinking metadata (pi stores these at the
@@ -150,59 +186,19 @@ impl Session {
 
     /// Apply context-level transforms on the branch.
     ///
-    /// Currently supports compaction: when a `Compaction` entry is on the
-    /// branch, all entries before `first_kept_entry_id` are removed and
-    /// replaced with a synthetic user message carrying the summary text.
+    /// Mirrors pi's `buildContextEntries` (`session-manager.ts`): the latest
+    /// compaction entry on the branch scopes the context. The result is
+    /// `[summary from the latest compaction (if any)] + [entries from
+    /// firstKeptEntryId (inclusive) up to the compaction entry] + [entries
+    /// after the compaction entry]`. The compaction entry itself is NEVER
+    /// included (an empty summary emits no summary message at all); older
+    /// compaction entries that fall inside the kept range are projected to
+    /// their own summary messages (pi's repeated-compaction behavior).
     ///
-    /// For Phase 2, this is an identity transform (no compaction entries
-    /// exist yet).
+    /// An empty summary scopes the context to simply
+    /// `<first message>…<last message>`.
     fn apply_transforms(&self, entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
-        // Find the most recent compaction entry (closest to leaf).
-        let compaction = entries.iter().rev().find_map(|entry| {
-            if let SessionEntryContent::Compaction {
-                summary,
-                first_kept_entry_id,
-                ..
-            } = &entry.content
-            {
-                Some((summary.clone(), first_kept_entry_id.clone()))
-            } else {
-                None
-            }
-        });
-
-        let Some((summary, first_kept_id)) = compaction else {
-            return entries;
-        };
-
-        // Find the index of the first kept entry.
-        let keep_idx = entries.iter().position(|e| e.id == first_kept_id);
-        let keep_idx = match keep_idx {
-            Some(i) => i,
-            None => return entries, // fallback: no transform
-        };
-
-        // Build the result: summary message + kept entries.
-        let mut result: Vec<SessionEntry> = Vec::new();
-
-        // Create a synthetic message entry carrying the summary text.
-        let summary_entry = SessionEntry {
-            id: uuid::Uuid::now_v7().to_string(),
-            parent_id: None,
-            timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            content: SessionEntryContent::Message {
-                message: serde_json::json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": format!("[Compacted: {}]", summary)}]
-                }),
-            },
-        };
-        result.push(summary_entry);
-
-        // Append entries from the keep point onwards.
-        result.extend_from_slice(&entries[keep_idx..]);
-
-        result
+        apply_compaction_transforms(entries)
     }
 
     // ------------------------------------------------------------------
@@ -548,6 +544,69 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
     }
 
     messages
+}
+
+/// Compaction scoping core (pi `buildContextEntries` parity). Exposed as a
+/// free function so tests can exercise it without a `Session` instance.
+///
+/// Latest compaction on the branch (closest to leaf) scopes the context to:
+/// `[summary (if non-empty)] + [firstKeptEntryId .. compaction) +
+/// [post-compaction]`. The compaction entry itself is never included; older
+/// compactions inside the kept range project their (non-empty) summaries.
+pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
+    // Find the most recent compaction entry (closest to leaf) — pi keeps
+    // the latest compaction on the path active.
+    let compaction = entries.iter().rev().find_map(|entry| match &entry.content {
+        SessionEntryContent::Compaction {
+            summary,
+            first_kept_entry_id,
+            ..
+        } => Some((
+            entry.id.clone(),
+            summary.clone(),
+            first_kept_entry_id.clone(),
+        )),
+        _ => None,
+    });
+
+    let Some((compaction_id, summary, first_kept_id)) = compaction else {
+        return entries; // no compaction → full branch
+    };
+
+    // Find the index of the first kept entry.
+    let keep_idx = match entries.iter().position(|e| e.id == first_kept_id) {
+        Some(i) => i,
+        None => return entries, // defensive fallback: full branch
+    };
+
+    let mut result: Vec<SessionEntry> = Vec::new();
+
+    // The latest compaction's summary goes FIRST (pi: contextEntries =
+    // [compaction] + …). Empty summary → emit nothing ("if available").
+    if !summary.is_empty() {
+        result.push(compaction_summary_message(&summary));
+    }
+
+    // Kept range: firstKeptEntryId .. end, with the latest compaction
+    // entry itself excluded (already represented above; never sent as
+    // itself).
+    for entry in &entries[keep_idx..] {
+        if entry.id == compaction_id {
+            continue;
+        }
+        match &entry.content {
+            // Older compaction inside the kept range → its own summary
+            // message (pi behavior for repeated compactions); an empty
+            // summary is dropped entirely.
+            SessionEntryContent::Compaction { summary, .. } if !summary.is_empty() => {
+                result.push(compaction_summary_message(summary));
+            }
+            SessionEntryContent::Compaction { .. } => {}
+            _ => result.push(entry.clone()),
+        }
+    }
+
+    result
 }
 
 /// Convert a single pi AgentMessage (user or assistant) to a rig Message.
@@ -1667,7 +1726,185 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
     }
-}
+
+    // ── Phase 1: compaction scoping (pi `buildContextEntries` parity) ──────
+
+    /// Helper: create a Compaction entry.
+    fn compaction_entry(id: &str, summary: &str, first_kept: &str, tokens: u64, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(String::from),
+            timestamp: "tc".into(),
+            content: SessionEntryContent::Compaction {
+                summary: summary.into(),
+                first_kept_entry_id: first_kept.into(),
+                tokens_before: tokens,
+            },
+        }
+    }
+
+    /// Helper: extract the text of a scoped context's first message.
+    fn first_user_text(messages: &[Message]) -> &str {
+        match &messages[0] {
+            Message::User { content } => match &content[0] {
+                UserContent::Text(t) => t.text.as_str(),
+                _ => "",
+            },
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_empty_summary_truncates_prefix() {
+        // [m0 m1 m2 C{firstKept:m1, summary:""} m3] → [m1 m2 m3]
+        let entries = vec![
+            user_msg("m0", "intro", None),
+            user_msg("m1", "kept-a", Some("m0")),
+            user_msg("m2", "kept-b", Some("m1")),
+            compaction_entry("c1", "", "m1", 128, Some("m2")),
+            user_msg("m3", "after", Some("c1")),
+        ];
+        let out = apply_compaction_transforms(entries);
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        // Empty summary → no summary message; m0 dropped; compaction entry never included.
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_nonempty_summary_wraps_pi_message() {
+        // [m0 m1 m2 C{firstKept:m1, summary:"S"} m3] → [summary("S") m1 m2 m3]
+        let entries = vec![
+            user_msg("m0", "intro", None),
+            user_msg("m1", "kept-a", Some("m0")),
+            user_msg("m2", "kept-b", Some("m1")),
+            compaction_entry("c1", "S", "m1", 128, Some("m2")),
+            user_msg("m3", "after", Some("c1")),
+        ];
+        let out = apply_compaction_transforms(entries);
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 4);
+        // First is the pi-wrapped summary user message (fresh uuid, not m0/m1/m2/m3/c1).
+        assert_eq!(ids[1..], ["m1", "m2", "m3"]);
+        assert_eq!(
+            first_user_text(&extract_messages(&out)),
+            "The conversation history before this point was compacted into the following summary:\n\n<summary>\nS\n</summary>"
+        );
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_no_compaction_is_identity() {
+        let entries = vec![
+            user_msg("m0", "intro", None),
+            user_msg("m1", "kept-a", Some("m0")),
+            user_msg("m2", "kept-b", Some("m1")),
+        ];
+        let out = apply_compaction_transforms(entries.clone());
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].id, "m0");
+        assert_eq!(out[1].id, "m1");
+        assert_eq!(out[2].id, "m2");
+        assert_eq!(
+            extract_messages(&out),
+            extract_messages(&entries),
+            "no compaction → context identical to the full branch"
+        );
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_repeated_compaction_keeps_older_summary() {
+        // Two compactions: the latest (c2) scopes from m3; the older (c1) with
+        // a non-empty summary lives INSIDE the kept range (between m3 and c2)
+        // and projects its own pi-wrapped summary message (pi repeated-
+        // compaction behavior).
+        // [m0 m1 m2 m3 C1{firstKept:m0, summary:"early"} m4 C2{firstKept:m3, summary:""} m5]
+        // → [m3, summary("early"), m4, m5]
+        let entries = vec![
+            user_msg("m0", "a", None),
+            user_msg("m1", "b", Some("m0")),
+            user_msg("m2", "c", Some("m1")),
+            user_msg("m3", "d", Some("m2")),
+            compaction_entry("c1", "early", "m0", 64, Some("m3")),
+            user_msg("m4", "e", Some("c1")),
+            compaction_entry("c2", "", "m3", 96, Some("m4")),
+            user_msg("m5", "f", Some("c2")),
+        ];
+        let out = apply_compaction_transforms(entries);
+        let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
+        // m3 (firstKept of c2), then the older c1 summary message, then m4, m5.
+        assert_eq!(ids.len(), 4);
+        assert_eq!(ids[0], "m3");
+        assert_eq!(ids[3], "m5");
+        // The second context message is the c1 pi-wrapped summary.
+        let msgs = extract_messages(&out);
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(first_user_text(&msgs[1..]), "The conversation history before this point was compacted into the following summary:\n\n<summary>\nearly\n</summary>");
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_missing_first_kept_falls_back() {
+        // firstKeptEntryId not on the branch → defensive fallback (full branch).
+        let entries = vec![
+            user_msg("m0", "intro", None),
+            user_msg("m1", "kept", Some("m0")),
+            compaction_entry("c1", "", "missing-id", 128, Some("m1")),
+            user_msg("m2", "after", Some("c1")),
+        ];
+        let out = apply_compaction_transforms(entries.clone());
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].id, "m0");
+        assert_eq!(out[3].id, "m2");
+        assert_eq!(
+            extract_messages(&out),
+            extract_messages(&entries),
+            "missing firstKeptEntryId → full branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_context_scopes_to_compaction_on_resume() {
+        // End-to-end: append a compaction entry (empty summary, firstKept=m1),
+        // then a follow-up message, and verify build_context() on a RE-OPENED
+        // session (simulating resume) exposes only the scoped prefix.
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-cmp-resume-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        session.append_message(&Message::user("intro")).await.unwrap();
+        session.append_message(&Message::user("kept-a")).await.unwrap();
+        session.append_message(&Message::user("kept-b")).await.unwrap();
+
+        // find the id of "kept-a" (second message) to use as firstKeptEntryId
+        let branch = session.get_branch().await;
+        let kept_id = branch[1].id.clone();
+        session.append_compaction("", &kept_id, 200).await.unwrap();
+        session.append_message(&Message::user("after")).await.unwrap();
+
+        // Re-open (resume) and verify the scoped context: [kept-a, kept-b, after]
+        let ro = JsonlSessionStorage::open_readonly(path.clone()).await.unwrap();
+        let index2 = ro.build_index().await.unwrap();
+        let session2 = Session::new_persisted(ro, index2);
+        let ctx = session2.build_context().await.unwrap();
+
+        let texts: Vec<&str> = ctx.messages.iter().map(|m| match m {
+            Message::User { content } => match &content[0] {
+                UserContent::Text(t) => t.text.as_str(),
+                _ => "",
+            },
+            _ => "",
+        }).collect();
+        assert_eq!(texts, ["kept-a", "kept-b", "after"]);
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
 
     #[tokio::test]
     async fn test_toolname_in_toolresult() {
@@ -1847,3 +2084,4 @@ mod tests {
         assert!(!json.contains("\"modelId\""));
         assert!(!json.contains("\"thinkingLevel\""));
     }
+}
