@@ -65,8 +65,10 @@ pub enum PicocodeError {
     /// Provider returned 429 (rate-limited). When `retry_after_secs` is `Some`
     /// it is taken from the provider's `Retry-After` header (or the OpenRouter
     /// envelope's `metadata.retry_after_seconds`); when `None` the provider
-    /// signalled rate-limit without a hint. The REPL waits `retry_after_secs`
-    /// then re-prompts once.
+    /// signalled rate-limit without a hint. The REPL uses `retry_after_secs`
+    /// as the floor of the first back-off (then doubles per consecutive
+    /// failure) and retries up to the per-turn budget (see [`retry_budget`]).
+    /// [`retry_budget`]: crate::agent::retry_budget
     #[error(
         "Rate-limited by provider (HTTP 429){}. Retrying after the back-off.",
         match .retry_after_secs { Some(s) => format!("; retry-after {s}s"), None => String::new() }

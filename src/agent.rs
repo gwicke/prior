@@ -506,46 +506,51 @@ async fn cancellable_sleep(
 
 /// How many retry attempts the REPL grants for `e`, per logical turn (the
 /// caller's `attempt` counter is scoped to one prompt submission, so a fresh
-/// user prompt resets it). Rate-limited turns get a large budget — an
-/// overloaded service is the *reason* the run failed, and each attempt that
-/// made progress persisted it, so retrying is cheap. All other retryable
-/// classes keep a single retry: a stream of them signals a deeper problem.
-/// Post-MVP: expose the rate-limit budget via `AgentConfig`.
+/// user prompt resets it). All auto-retryable errors — rate-limited, upstream
+/// 5xx, transport, streaming-protocol, and malformed tool calls — share the
+/// same generous budget. They are all transient failures that should clear
+/// with a retry; the budget exists to cap a runaway, not to second-guess the
+/// policy. Post-MVP: expose this via `AgentConfig`.
 fn retry_budget(e: &crate::PicocodeError) -> u8 {
-    let rate_limited = match e {
-        crate::PicocodeError::LlmRateLimited { .. } => true,
-        crate::PicocodeError::LlmInterrupted { cause } => {
-            matches!(&**cause, crate::PicocodeError::LlmRateLimited { .. })
-        }
-        _ => false,
-    };
-    if rate_limited {
-        20
+    if e.is_auto_retryable() {
+        50
     } else {
-        1
+        0
     }
 }
 
-/// Back-off delay before the next retry attempt. The provider's `Retry-After`
-/// hint (or OpenRouter's `metadata.retry_after_seconds`) is authoritative when
-/// present; otherwise an exponential back-off starting at 2 s (malformed tool
-/// call) or 3 s, doubling per attempt up to a 5-minute ceiling.
-fn retry_delay_secs(e: &crate::PicocodeError, attempt: u8) -> u64 {
+/// Back-off delay before the next retry attempt, in seconds.
+///
+/// Policy: `2^(consecutive_failures - 1)`, no upper bound — the per-turn
+/// `retry_budget` (50) caps how many retries we will ever attempt, so the
+/// delay growth is implicitly bounded in practice. We do not cap the value
+/// at 300 s or any other number: the user wanted raw exponential growth
+/// bounded only by the retry count.
+///
+/// The `consecutive_failures` counter is reset to 0 whenever the
+/// underlying prompt made progress (the agent returned more content or
+/// tool calls) before failing — even if the run ultimately errored. That
+/// is, `consecutive_failures` counts *consecutive failures with no
+/// progress between them*. A failure that happened *after* a successful
+/// sub-run inside the same turn restarts the sequence at `2^0 = 1` s, so
+/// the next attempt is not punished for a one-off blip mid-turn.
+///
+/// A provider-supplied `Retry-After` (or OpenRouter's
+/// `metadata.retry_after_seconds`) is the **floor** when present — respect
+/// the provider's hint, then add our exponential growth on top by treating
+/// the hint as the starting base.
+fn retry_delay_secs(e: &crate::PicocodeError, consecutive_failures: u8) -> u64 {
+    // Provider hint floors the delay. If present, we use it as the base of
+    // the exponential schedule: attempt 1 = `hint`, attempt 2 = `hint*2`,
+    // …, attempt N = `hint * 2^(N-1)`. This respects upstream's request
+    // while still growing on a string of consecutive 429s.
     if let Some(hint) = e.retry_after_secs() {
-        return hint;
+        let n = consecutive_failures.saturating_sub(1).min(63) as u32;
+        return (hint as u64).saturating_mul(1u64 << n);
     }
-    let base = match e {
-        crate::PicocodeError::LlmMalformedToolCall { .. } => 2,
-        crate::PicocodeError::LlmInterrupted { cause }
-            if matches!(&**cause, crate::PicocodeError::LlmMalformedToolCall { .. }) =>
-        {
-            2
-        }
-        _ => 3,
-    };
-    // `1 << min(attempt-1, 6)` caps growth at 64× the base.
-    let multiplier = 1u64 << attempt.saturating_sub(1).min(6);
-    (base as u64).saturating_mul(multiplier).min(300)
+    // No provider hint: pure 2^(n-1) seconds, no cap.
+    let n = consecutive_failures.saturating_sub(1).min(63) as u32;
+    1u64 << n
 }
 
 /// Classify a `StreamingError` into a structured `PicocodeError` variant.
@@ -3383,7 +3388,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     None
                 };
                 let response: std::result::Result<String, crate::PicocodeError> = {
-                    let mut attempt = 0u8;
+                    let mut consecutive_failures: u8 = 0;
                     let mut next_input: String = input.clone();
                     // The full steering message (synthetic feedback / "continue
                     // where you left off") is delivered once per logical turn;
@@ -3394,7 +3399,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     // interruptions get a short continuation instead.
                     let mut steer_delivered = false;
                     let outcome: std::result::Result<String, crate::PicocodeError> = loop {
-                        attempt += 1;
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
@@ -3407,9 +3411,20 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     "Aborted.".into(),
                                 ));
                             }
+                            // Mid-turn failure that persisted progress: the
+                            // underlying run produced content/tool calls
+                            // before erroring. This is NOT a "consecutive
+                            // failure" for back-off purposes — there was
+                            // successful work in between — so reset the
+                            // counter and treat the upcoming retry as a
+                            // fresh first attempt (delay = 2^0 = 1 s, or
+                            // the provider's Retry-After floor). The budget
+                            // is still consumed (one retry used), but the
+                            // exponential delay does not compound.
                             Err(crate::PicocodeError::LlmInterrupted { cause, .. })
-                                if attempt <= retry_budget(&cause) =>
+                                if consecutive_failures < retry_budget(&cause) =>
                             {
+                                consecutive_failures = 0;
                                 // `prompt()` persisted the user prompt + the
                                 // finalized partial transcript to the session
                                 // and returned `LlmInterrupted`. Continue from
@@ -3418,7 +3433,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 // so re-sending it would duplicate the user's
                                 // request.
                                 config.output.display_text(&format!("Error: {}", cause));
-                                let secs = retry_delay_secs(&cause, attempt);
+                                let secs = retry_delay_secs(&cause, 1);
                                 config
                                     .output
                                     .display_text(&format!("Retrying in {secs}s..."));
@@ -3465,17 +3480,24 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 }
                                 continue;
                             }
-                            Err(e) if attempt <= retry_budget(&e) && e.is_auto_retryable() => {
-                                // No progress was persisted (`prompt()` returned
-                                // the plain classified error): the turn never
-                                // got past its first model call, so we re-run it
-                                // from `input`. For malformed tool calls the
-                                // model needs the parse error to self-correct —
-                                // and the original `input` is NOT yet in the
-                                // session, so re-establish it first, then
-                                // re-prompt with the synthetic feedback.
+                            // No-progress retryable failure: `prompt()` returned
+                            // the plain classified error without persisting any
+                            // partial transcript. This is a "consecutive
+                            // failure" — increment the counter and grow the
+                            // back-off exponentially. The retry re-runs from
+                            // `input` (the turn never got past its first model
+                            // call). For malformed tool calls the model needs
+                            // the parse error to self-correct — and the original
+                            // `input` is NOT yet in the session, so
+                            // re-establish it first, then re-prompt with the
+                            // synthetic feedback.
+                            Err(e)
+                                if e.is_auto_retryable()
+                                    && consecutive_failures < retry_budget(&e) =>
+                            {
+                                consecutive_failures = consecutive_failures.saturating_add(1);
                                 config.output.display_text(&format!("Error: {}", e));
-                                let secs = retry_delay_secs(&e, attempt);
+                                let secs = retry_delay_secs(&e, consecutive_failures);
                                 config
                                     .output
                                     .display_text(&format!("Retrying in {secs}s..."));
@@ -4649,6 +4671,173 @@ mod tests {
             _l: usize,
             _pn: Option<&str>,
         ) {
+        }
+    }
+
+    #[test]
+    fn retry_budget_is_50_for_every_retryable_variant() {
+        // All transient classes share a single generous budget: rate-limited,
+        // upstream 5xx, transport, streaming-protocol, and malformed tool
+        // calls. The budget exists to cap a runaway, not to second-guess
+        // the policy per class. Non-retryable classes get 0 (no retries).
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmRateLimited { retry_after_secs: None }),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmRateLimited {
+                retry_after_secs: Some(60)
+            }),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmUpstream { status: 502 }),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmTransport("reset".into())),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmStreamProtocol("eof".into())),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmMalformedToolCall {
+                tool_name: "edit".into(),
+                parse_error: "expected `,` or `}`".into(),
+            }),
+            50
+        );
+        // Non-retryable: 0 retries.
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmAuth { status: 401 }),
+            0
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmBilling { status: 402 }),
+            0
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmClient { status: 400 }),
+            0
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmMaxTurns { max_turns: 16 }),
+            0
+        );
+        // LlmInterrupted delegates to its cause.
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmInterrupted {
+                cause: Box::new(PicocodeError::LlmRateLimited { retry_after_secs: None }),
+            }),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmInterrupted {
+                cause: Box::new(PicocodeError::LlmTransport("reset".into())),
+            }),
+            50
+        );
+        assert_eq!(
+            super::retry_budget(&PicocodeError::LlmInterrupted {
+                cause: Box::new(PicocodeError::LlmAuth { status: 403 }),
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn retry_delay_grows_as_pow2_without_cap() {
+        // No provider hint: pure 2^(n-1), no ceiling. The per-turn budget
+        // (50) is the implicit cap on how many attempts we will ever make.
+        // attempt=1 → 1s, 2 → 2s, 3 → 4s, … (delay is `1 << (n-1)` seconds).
+        let e = PicocodeError::LlmTransport("reset".into());
+        assert_eq!(super::retry_delay_secs(&e, 1), 1);
+        assert_eq!(super::retry_delay_secs(&e, 2), 2);
+        assert_eq!(super::retry_delay_secs(&e, 3), 4);
+        assert_eq!(super::retry_delay_secs(&e, 4), 8);
+        assert_eq!(super::retry_delay_secs(&e, 10), 512);
+        // Saturating at u64: still finite, no panic. We never reach 50 in
+        // practice (budget caps it), but saturating_pow keeps the math safe.
+        let big = super::retry_delay_secs(&e, 50);
+        assert!(big > 0);
+    }
+
+    #[test]
+    fn retry_delay_respects_retry_after_as_floor_then_doubles() {
+        // When the provider reports Retry-After, it is the FLOOR of the
+        // first attempt; subsequent attempts double from there. This
+        // respects upstream's request while still growing on a string of
+        // consecutive 429s.
+        let e = PicocodeError::LlmRateLimited {
+            retry_after_secs: Some(5),
+        };
+        assert_eq!(super::retry_delay_secs(&e, 1), 5);
+        assert_eq!(super::retry_delay_secs(&e, 2), 10);
+        assert_eq!(super::retry_delay_secs(&e, 3), 20);
+        assert_eq!(super::retry_delay_secs(&e, 4), 40);
+    }
+
+    #[test]
+    fn retry_delay_for_malformed_tool_call_uses_provider_floor_or_one() {
+        // Malformed tool calls carry no provider hint (the model is the
+        // source of the error), so the first delay is 1s — fast feedback
+        // for self-correction. Subsequent attempts double.
+        let e = PicocodeError::LlmMalformedToolCall {
+            tool_name: "edit".into(),
+            parse_error: "expected `,` or `}`".into(),
+        };
+        assert_eq!(super::retry_delay_secs(&e, 1), 1);
+        assert_eq!(super::retry_delay_secs(&e, 2), 2);
+        assert_eq!(super::retry_delay_secs(&e, 3), 4);
+    }
+
+    #[test]
+    fn classify_deepinfra_502_upstream_error_via_provider_response_is_retryable() {
+        // The first error from the task: OpenRouter surfaces a DeepInfra
+        // 502 as a `ProviderResponseError` with status 502. The classifier
+        // must map it to `LlmUpstream { status: 502 }` and mark it
+        // auto-retryable.
+        use rig_core::ProviderResponseError;
+        use rig_core::http_client::StatusCode;
+        let body = r#"{"id":"gen-1788441206-TngoywArM91X9nINXYNP","object":"chat.completion.chunk","created":1788441206,"model":"z-ai/glm-5.3-flash","provider":"DeepInfra","choices":[],"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError: Timeout on reading data from socket","metadata":{"error_type":"provider_unavailable"}}}"#;
+        let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
+            StatusCode::BAD_GATEWAY,
+            body.to_string(),
+        ));
+        let classified = super::classify_completion_error(&ce);
+        match classified {
+            PicocodeError::LlmUpstream { status } => {
+                assert_eq!(status, 502);
+                assert!(classified.is_auto_retryable());
+                assert_eq!(classified.retry_after_secs(), None);
+            }
+            other => panic!("expected LlmUpstream {{ status: 502 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_http_client_error_sending_request_is_retryable_transport() {
+        // The second error from the task: reqwest surfaces connection
+        // failures as `CompletionError::HttpError(Instance(...))`. It must
+        // classify as `LlmTransport` and be auto-retryable. We can't
+        // construct a real reqwest::Error here, so we wrap a stub std
+        // error via `Error::instance` (the boxed-error path reqwest uses).
+        use rig_core::http_client;
+        let stub: std::io::Error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "error sending request for url (https://openrouter.ai/api/v1/chat/completions)",
+        );
+        let http_err = http_client::Error::instance(stub);
+        let ce = CompletionError::HttpError(http_err);
+        let classified = super::classify_completion_error(&ce);
+        match classified {
+            PicocodeError::LlmTransport(ref msg) => {
+                assert!(msg.contains("openrouter.ai"), "msg: {msg}");
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmTransport, got {other:?}"),
         }
     }
 

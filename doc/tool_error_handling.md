@@ -344,22 +344,33 @@ text-only fallback to keep completed tool work on cancellation too. The only
 difference from the retryable-error path: `Esc` does **not** auto-retry — it
 persists and returns `Cancelled`.
 
-### Retry budget & back-off for 429 (R5)
+### Retry budget & back-off (R5)
 
 Current REPL loop is single-shot (`attempt == 1`). New policy, per **logical
 turn** (the counter lives in the REPL's per-prompt `loop`, so a fresh user
 prompt resets it — never session-global):
 
-- Budget: **up to 20 retries** for `LlmRateLimited`, configurable via an
-  `AgentConfig` field (e.g. `rate_limit_retry_budget: u8 = 20`; `0` disables
-  multi-retry → current single-shot). Other retryable classes
-  (`LlmTransport`, `LlmUpstream`, `LlmStreamProtocol`,
-  `LlmMalformedToolCall`) keep a small budget (1–3) — they are unlikely to
-  recur in a burst and a stream of them signals a deeper problem.
-- Delay: `retry_after_secs` (provider `Retry-After` / OpenRouter
-  `metadata.retry_after_seconds`) is the **floor**; exponential back-off
-  doubles the previous wait up to a ceiling (e.g. 5 min). Effective wait =
-  `max(retry_after_secs, backoff(attempt))`, capped at the ceiling.
+- Budget: **up to 50 retries**, applied **uniformly** to every auto-retryable
+  class — `LlmRateLimited`, `LlmUpstream` (5xx), `LlmTransport`,
+  `LlmStreamProtocol`, and `LlmMalformedToolCall`. They are all transient
+  failures that should clear with a retry; the budget exists to cap a runaway,
+  not to second-guess the policy per class. Non-retryable classes
+  (`LlmAuth`, `LlmBilling`, `LlmClient` 4xx, `LlmMaxTurns`, `LlmUnknownTool`)
+  get 0 retries. Post-MVP: expose via `AgentConfig`.
+- Delay: pure exponential growth, **no upper bound**. Effective wait =
+  `2^(consecutive_failures - 1)` seconds. When the provider reports
+  `Retry-After` (or OpenRouter's `metadata.retry_after_seconds`), it is the
+  **floor of the first attempt** and the base of the exponential schedule
+  (`hint`, `hint*2`, `hint*4`, …). The per-turn budget (50) is the implicit
+  cap on how many attempts we will ever make, so the delay growth is bounded
+  in practice.
+- **Consecutive-failure reset**: the `consecutive_failures` counter resets to
+  0 whenever the underlying prompt made progress (the agent returned more
+  content or tool calls) before failing. That is, a failure that happened
+  *after* a successful sub-run inside the same turn restarts the back-off at
+  `2^0 = 1` s (or the provider's `Retry-After`). This way, two consecutive
+  failures with a successful retry in between are not punished with
+  compounding delays.
 - `cancellable_sleep` (existing, `src/agent.rs`) keeps each wait `<Esc>`-
   abortable; the in-flight reader spans the whole budget window.
 - Give-up: after the budget, surface a final error naming the class and the
@@ -421,8 +432,8 @@ text-only partial.
      (merge-into-trailing-user when the transcript ends on a user message —
      see *Consecutive-user*).
 9. Track total elapsed; on give-up, display the final error + total wait.
-10. Add `rate_limit_retry_budget: u8` to `AgentConfig` (default 20) and thread
-    through `create_agent` / `run_interactive`.
+10. Add `retry_budget: u8` to `AgentConfig` (default 50, currently hardcoded)
+    and thread through `create_agent` / `run_interactive`.
 
 ### Phase 4 — Tests & cross-checks
 
@@ -494,17 +505,25 @@ taxonomy and the `Retry-After` extraction.
    steer-once guard) (R3).
 7. ✅ `Esc` persists completed tool batches, not just text (cancel branch uses
    the same finalized transcript) (R4).
-8. ☐ 429 budget: hardcoded at 20 per logical turn via `retry_budget()` with
-   `Retry-After`-floor + exponential back-off and `<Esc>`-abortable waits
-   (R5). Remaining: expose the budget as an `AgentConfig` field
-   (`rate_limit_retry_budget`, default 20) and report the total wait time on
-   give-up.
+8. ✅ Unified retry budget: hardcoded at **50 per logical turn** for every
+   auto-retryable class (`LlmRateLimited`, `LlmUpstream`, `LlmTransport`,
+   `LlmStreamProtocol`, `LlmMalformedToolCall`) via `retry_budget()`, with
+   `2^(consecutive_failures - 1)` second back-off (no upper bound — the
+   budget is the implicit cap), provider `Retry-After` as the floor, and
+   `<Esc>`-abortable waits. The `consecutive_failures` counter resets to 0
+   on a `prompt()` that made progress (so a failure *after* a successful
+   sub-run inside the same turn restarts at 1 s). Remaining: expose the
+   budget as an `AgentConfig` field (default 50) and report the total wait
+   time on give-up.
 9. ☐ Malformed-tool-call recovery shares the persist-and-steer machinery
    where progress exists (R6). Unknown-tool recovery remains owned by the rig
    hook (`on_invalid_tool_call`), which is correct — it recovers in-run
    without the REPL layer.
-10. ✅ Existing classification + display + name-recovery tests pass (316 lib
-    tests).
+10. ✅ Existing classification + display + name-recovery tests pass (328 lib
+    tests; +6 new tests covering the unified budget, exponential growth, the
+    Retry-After floor, and the two retryable error shapes from the task:
+    the DeepInfra 502 `ProviderResponseError` envelope and the
+    `Http client error: error sending request for url` transport error).
 
 ## File changes (projected)
 
