@@ -1,595 +1,525 @@
-# Tool Error Handling
+# Turn Error Handling & Auto-Retry (Design)
 
-*Cross-checked against the pinned rig checkout (`gwicke/rig` rev `1c2f4405`,
-`rig-agent`/`rig-run` 0.42, `rig-core` 0.42) — see `Cargo.toml`.*
+*Status: design + implementation. Cross-checked against the pinned rig
+checkout (`gwicke/rig` rev `1c2f4405`, `rig-agent`/`rig-run`/`rig-core` 0.42)
+— see `Cargo.toml`. Line numbers below refer to `src/agent.rs` /
+`src/lib.rs` / `src/output.rs` at the time of writing and drift; anchors are
+named functions.*
 
-This document covers two layers of "tool error" handling:
+This document is the design for how picocode handles failures that
+interrupt an agent turn, and how it retries them without losing progress. It
+replaces the earlier "tool error handling" content: the *tool-execution* error
+story is settled and summarized here for reference, while the mid-turn
+provider/transport failure problem is the subject of the design and of the
+implementation in `src/agent.rs` / `src/lib.rs`.
 
-1. **Tool execution errors** — a tool runs, and rig surfaces the result
-   (`Ok` / `failed` / `refused` / `skipped`). Handled by rig's
-   `ToolResult` envelope and our `on_tool_result` hook. See *Tool
-   execution errors* below.
-2. **Provider / transport errors** — the provider's HTTP response (or
-   SSE stream) is broken: 429, 401, network drop, malformed tool-call
-   JSON, etc. Handled by the `Some(Err(e))` arm of the prompt loop and
-   the REPL's auto-retry pipeline. See *Provider error classification
-   and auto-retry* below.
+## The two failure classes
 
-The split is by *where* the error originates: rig's dispatcher
-(layer 1) or rig's HTTP/SSE transport (layer 2). Both go through
-`PicocodeError` so the REPL can render and act on a single taxonomy.
+1. **Tool execution errors** — a registered tool runs and fails. Rig models
+   these richly (`ToolResult` / `ToolErrorKind` / `ToolExecutionError`) and
+   already feeds the failure text back to the model in the same run; the model
+   sees the error and can correct. Picocode's only job here is *display*
+   (render the failure distinctly) and *name recovery* (`on_invalid_tool_call`).
+   This class is **done** — see [Tool execution errors](#tool-execution-errors).
+2. **Turn-level provider / transport errors** — the provider's HTTP response
+   or SSE stream fails mid-turn: 429, 401, 5xx, network drop, malformed
+   streamed tool-call JSON. These kill the whole rig run. Picocode classifies
+   them (`classify_stream_error`) and the REPL auto-retries — but the current
+   retry **re-runs the whole turn from the session**, losing any tool work the
+   turn had already completed. This class is the **open design** — see
+   [Mid-turn failure & resume](#mid-turn-failure--resume).
 
-## Layer 1 — Tool execution errors
+---
 
-### Problem statement
+## Tool execution errors (settled)
 
-Picocode registers its tools on a rig `Agent` (`src/agent.rs`
-`build_rig_agent`) and lets **rig execute them**. The `LoggingHook`
-(`src/agent.rs`, ~lines 885–999) only *observes*: `on_tool_call` renders
-the incoming args for display and `on_tool_result` renders the result.
-Two real, current failure modes:
-
-1. **Tool errors are rendered without their error status.**
-   `on_tool_result` passes only `event.raw_result.output().render()` —
-   a plain string — into `display_tool_result`, which detects errors
-   by sniffing for the legacy `"Toolset error:"` / `"ToolCallError:"`
-   prefixes that the current rig no longer emits. A failed tool
-   therefore renders like a normal result and the user never sees
-   *why* it failed or whether the model will retry.
-2. **The model calling a nonexistent/disallowed tool aborts the
-   whole prompt.** Rig never dispatches such a call (it validates the
-   name before `on_tool_call`). Picocode's `LoggingHook` now
-   implements `on_invalid_tool_call` (layer 1 Task 2, see below) and
-   the streaming request sets
-   `.max_invalid_tool_call_retries(1)`, so the model recovers
-   in-turn via `InvalidToolCallAction::retry(feedback)` and only
-   escapes to a fatal `PicocodeError::LlmUnknownTool { tool_name,
-   available }` when the retry budget is exhausted.
-
-### What is *not* a problem (contrary to earlier drafts)
-
-- **"Malformed JSON arguments are silently treated as a string."** By
-  the time a tool call reaches `on_tool_call`, rig has already parsed
-  the provider payload into `ToolFunction.arguments: serde_json::Value`
-  (`rig_core::message`) and re-serialized it
-  (`json_utils::serialize_json_value`), so `ToolCall.args` is *always
-  syntactically valid JSON*. The
-  `.unwrap_or(serde_json::Value::String(event.args.to_string()))` in
-  `on_tool_call` (~line 982) is effectively dead display code. A
-  provider payload that fails *typed* deserialization (wrong types /
-  missing fields) is caught later by rig's own dispatch
-  (`parse_tool_args` → `ToolExecutionError::invalid_args`), producing
-  a failed `ToolResult` that rig already feeds back to the model in
-  the same run. See also layer 2 — when the *streamed* JSON itself
-  is broken, that is a different failure class
-  (`LlmMalformedToolCall`).
-- **"The provider never learns about failed tool calls."** Rig
-  returns the error's model-visible output as the tool result message
-  and automatically issues the next model call (tool results are
-  committed internally; `MultiTurnStreamItem::ToolExecutionCommitted`
-  + `StreamUserItem(ToolResult)` are what picocode sees on the
-  stream). The model *does* learn and can retry with corrected args.
-
-### How a tool call actually flows (rig ≥ `1c2f4405`)
-
-```
-model turn with tool call
-  │
-  ├─ name NOT in this turn's allowed set ─► InvalidToolCallContext
-  │     AgentHook::on_invalid_tool_call(ctx, event) -> Option<InvalidToolCallAction>
-  │        None (default)      → fail():  run errors with PromptError::UnknownToolCall
-  │        Retry{feedback}     → rollback + re-prompt model (needs max_invalid_tool_call_retries > 0)
-  │        Repair{tool_name}   → rename and dispatch
-  │        Skip{reason}        → synthetic tool result "reason", run continues
-  │        Stop{reason}        → PromptCancelled
-  │
-  └─ name allowed ─► AgentHook::on_tool_call(ToolCall) -> ToolCallAction   ← picocode hook
-        Run | Rewrite(Value) | Skip(String) | Stop(String)
-        │
-        ▼  rig dispatches: tool.execute(args) — deserialize args into T::Args
-        │
-        ├─ args fail typed parse ─► ToolResult::failed(InvalidArgs)
-        ├─ impl missing at dispatch time ─► ToolResult::failed(NotFound)  ("tool `x` not found")
-        ├─ call() returns Err ─► ToolResult::failed(map_error(...))   (kind from Tool::map_error)
-        └─ Ok(output) ─► ToolResult::success(output)
-        │
-        ▼  AgentHook::on_tool_result(ToolResultEvent) -> ToolResultAction   ← picocode hook
-             Keep | Rewrite(ToolOutput) | Stop(String)
-        │
-        ▼  rig commits the result content to history, emits
-           ToolExecutionCommitted / StreamUserItem(ToolResult), calls the model again
-```
-
-### Does rig already provide the right error kinds? — Yes.
-
-Do **not** add a picocode-local `ToolErrorKind` (earlier drafts
-proposed one; it would shadow the identical name already in scope via
-`rig_core::tool`).
-
-| Failure (layer 1)        | Rig equivalent (use this)                              | Notes |
-|--------------------------|--------------------------------------------------------|-------|
-| `InvalidArgs` (typed)    | `ToolErrorKind::InvalidArgs`                           | raised by rig dispatch (`parse_tool_args`); carries parse-error message |
-| Tool not found at dispatch | `ToolErrorKind::NotFound`                           | "tool `x` not found" — the registered impl vanished between advertise and dispatch |
-| `ExecutionFailed`        | `ToolErrorKind::{Timeout, PermissionDenied, Cancelled, Other, …}` | finer-grained; `Tool::map_error` classifies |
-| Refusal vs permission    | `ToolResult::is_refused()` vs `is_error_kind(PermissionDenied)` | distinct dispositions on the same `ToolResult` |
-| Structured output fail   | `ToolErrorKind::Other` + `ToolExecutionError::with_model_output` / tool's own `Output` conversion | structured output conversion happens in rig (`IntoToolOutput`) |
-| Upstream provider fail   | `ToolErrorKind::{Provider, Network, RateLimited}`      | e.g. MCP upstreams |
-
-Rig primitives available to picocode today:
-
-- `rig_core::tool::ToolErrorKind` — `InvalidArgs | Timeout |
-  Cancelled | NotFound | PermissionDenied | RateLimited | Provider |
-  Network | Other`, each with `as_str()`, default `retryable()`,
-  default model feedback.
-- `rig_core::tool::ToolExecutionError` — envelope with operator
-  `message()`, model-visible `model_output()` (redaction-safe),
-  `retryable()`, `code()`, `http_status()`, downcastable `source()`.
-- `rig_core::tool::ToolResult` — success / error / refused / skipped
-  dispositions: `is_success()`, `is_error()`, `is_refused()`,
-  `is_skipped()`, `is_error_kind(kind)`, `error()`, `refusal()`,
-  `output()`.
-- `rig_agent::agent::InvalidToolCallContext` + `InvalidToolCallAction`
-  (`Fail | Retry{feedback} | Repair{tool_name} | Skip{reason} |
-  Stop{reason}`) — rig-run policy, surfaced as
-  `AgentHook::on_invalid_tool_call`.
-- `rig_run::PromptError` — `CompletionError`, `PromptCancelled`,
-  `MaxTurnsError`, `UnknownToolCall{tool_name, available_tools,
-  allowed_tools}`.
-
-### Corrected rig hook surface (what the code compiles against)
+### Rig surface (verified against rev `1c2f4405`)
 
 ```rust
-// rig_agent::agent (rev 1c2f4405) — NOT what earlier drafts claimed
-
+// rig_agent::agent
 pub struct ToolCall<'a> {
     pub tool_name: &'a str,
-    pub tool_call_id: Option<&'a str>,      // provider id or rig-minted handle
-    pub internal_call_id: InternalCallId,   // rig correlation id
-    pub args: &'a str,                      // ALWAYS valid JSON (re-serialized Value)
+    pub tool_call_id: Option<&'a str>,     // provider id or rig-minted handle
+    pub internal_call_id: InternalCallId,
+    pub args: &'a str,                     // ALWAYS valid JSON (re-serialized Value)
 }
-
 pub struct ToolResultEvent<'a> {
     pub tool_name: &'a str,
     pub tool_call_id: Option<&'a str>,
     pub internal_call_id: InternalCallId,
     pub args: &'a str,
-    pub presentation: &'a ToolOutput,       // running presentation rewrite
-    pub raw_result: &'a ToolResult,         // rig_core::tool::ToolResult — structured!
+    pub presentation: &'a ToolOutput,      // running presentation rewrite
+    pub raw_result: &'a ToolResult,        // rig_core::tool::ToolResult — structured
     pub tool_context: &'a ToolContext,
 }
-
 pub enum ToolCallAction { Run, Rewrite(serde_json::Value), Skip(String), Stop(String) }
-//  ^ Skip(reason) = "do not run; return reason to the model; turn continues" —
-//    this is the retry-friendly action the doc previously tried to fake with Stop.
-
 pub enum ToolResultAction { Keep, Rewrite(ToolOutput), Stop(String) }
-//  ^ Rewrite = replace the model-visible presentation (e.g. an error panel) while
-//    the raw result stays available for policy/telemetry.
 ```
 
-### Refined implementation plan (layer 1)
+- `ToolCall.args` is always syntactically valid JSON: rig parses the provider
+  payload into `ToolFunction.arguments: serde_json::Value` and re-serializes
+  it. The `.unwrap_or(Value::String(..))` fallback in picocode's
+  `on_tool_call` is dead display code — **kept** as a future-proofing shim,
+  never changed.
+- Malformed *typed* args (wrong types/missing fields) become
+  `ToolErrorKind::InvalidArgs` inside rig dispatch → failed `ToolResult` →
+  model sees the error text in the same run and can correct. The model always
+  learns about failed tool calls.
+- No picocode-local `ToolErrorKind` exists; rig's
+  `InvalidArgs | Timeout | Cancelled | NotFound | PermissionDenied |
+  RateLimited | Provider | Network | Other` is the taxonomy.
 
-#### Task 1 — Display structured tool errors (primary gap)
+### Implemented in picocode
 
-`src/agent.rs` `on_tool_result` (currently ~line 987):
+- **Display (Task 1).** `Output::display_tool_error(tool_name, kind, message)`
+  added with a default impl → `display_error`; `ConsoleOutput` overrides it to
+  render a panel using the existing `paint_panel`/`tool_panel(is_error=true)`
+  helpers. `LoggingHook::on_tool_result` (`src/agent.rs`) branches on
+  disposition: `is_error()` → error panel; `is_refused()` → "denied" panel;
+  success/skipped → `display_tool_result`. The legacy `"Toolset error:"` /
+  `"ToolCallError:"` sniffing in `display_tool_result` is **kept as a compat
+  shim** for replaying pre-0.40 sessions (no-op for new runs).
+- **Name recovery (Task 2).** `LoggingHook::on_invalid_tool_call`
+  (`src/agent.rs`) returns `InvalidToolCallAction::retry(available-tools
+  feedback)` when a model calls an unknown/disallowed tool; the streaming
+  request sets `.max_invalid_tool_call_retries(1)`. The model recovers
+  in-run. On budget exhaustion, `classify_stream_error` maps the terminal
+  `PromptError::UnknownToolCall` to `PicocodeError::LlmUnknownTool` (escape
+  hatch, `is_auto_retryable() == false`).
+
+---
+
+## Mid-turn failure & resume (implemented)
+
+### The problem with the current retry
+
+The current layer-2 design (previous version of this doc) has a **fatal
+flaw** for mid-turn failures: it treats a retry as "re-run the whole prompt
+from the session." Concretely:
+
+1. `prompt(input)` builds `prior` from `s.build_context()` and runs the full
+   agentic turn (model call → tool calls → tool results → …).
+2. A 429 can hit at **any** model call inside that turn — after several tool
+   executions have already completed and produced results.
+3. When that happens, rig surfaces a `StreamingError` with **no transcript**:
+   only `PromptCancelled`, `MaxTurnsError`, and `UnknownToolCall` carry
+   `chat_history` (`rig-run/src/error.rs`). The partial turn's
+   `new_messages` (assistant tool calls + tool results) die with the run.
+4. The REPL retry re-invokes `prompt(input)`. `prior` now comes from the
+   session, which has **no record of the partial turn** — so the retry
+   restarts from the very first model call and **re-executes every tool call**
+   the failed attempt already completed.
+5. On an overloaded service (which is *why* we got a 429), re-running the
+   whole turn from scratch is the worst possible strategy: it burns the
+   provider budget and the user's time, and is likely to hit the same wall
+   again *after* redoing all the tool work.
+
+Worse, the earlier "fix" for duplication (skip intermediate persistence on
+auto-retryable errors) means the session has **nothing** from the failed turn;
+if the retry budget is then exhausted, the user's entire turn is lost —
+including completed tool results that should have been preserved.
+
+### Requirements
+
+- R1 — **Preserve progress.** Completed model turns (text + reasoning) and
+  completed tool-call→result pairs that happened before the failure must
+  survive into the session, so the model on the retry knows what it already
+  did and does not redo it.
+- R2 — **Resume, don't restart.** The retry must continue from the last safe
+  transcript boundary, not replay the whole turn from the user's original
+  input.
+- R3 — **No duplication.** The user's input, the partial transcript, and the
+  retry's steering message must each appear exactly once in the session.
+- R4 — **All agent output persists.** Cancelled turns and failed turns get the
+  same treatment: whatever completed safely is committed to the session. (This
+  is already the direction of the `Esc` cancel path.)
+- R5 — **Retry budget with back-off for 429.** Raise the budget to ~20
+  attempts per *logical turn* (not per session), exponential back-off honoring
+  `Retry-After`, cancel-safe, and a final give-up error that says how long we
+  waited.
+- R6 — **Generalize.** The same mechanism must cover malformed-tool-call
+  recovery, not just 429s.
+
+### Rejected alternative: transport-level retry
+
+Retrying at the HTTP/SSE transport layer (wrap the client so a 429/5xx is
+retried before rig sees it) would keep rig's `AgentRun` alive and its
+`new_messages` intact — "preserve progress by construction." Rejected because:
+
+- It does not generalize: malformed streamed tool-call JSON is a *parser*
+  error, not a transport error; tool-call errors live at the run layer. A
+  transport retry can't fix or even see them.
+- It fights rig's design: rig deliberately treats a rejected HTTP response as
+  terminal (`http_client/sse.rs`: "A rejected response is terminal: the retry
+  policy governs transport failures, not a server that answered").
+- It hides policy (when to stop retrying, what to tell the user) in a layer
+  that can't render or steer.
+
+### Chosen architecture: picocode-side canonical transcript + resume-by-context
+
+The session is already the context carrier — `build_context()` feeds rig's
+`.history()`, compaction and session-resume already seed context from it, and
+the `on_completion_call` hook can patch the exact history a request sends
+(`RequestPatch::history`, already used for reasoning stripping). So the design
+is:
+
+**Accumulate a canonical transcript of the run in picocode as it streams;
+on a mid-turn failure, persist the transcript up to the last *safe* boundary;
+retry by continuing from that boundary — with a steering message — rather than
+re-sending the original input.**
+
+This mirrors exactly what rig does internally when it resumes a run or
+continues after tool results: the next completion request is
+`history = prior (session + partial transcript)`, `prompt = steering message`.
+
+### What picocode can already observe (the accumulation primitives)
+
+Verified against the stream surface:
+
+- **The user prompt** (`input`) is the run's first message
+  (`new_messages[0]` in rig-run).
+- **Every accepted model turn**, including tool-only and reasoning-only turns,
+  fires `LoggingHook::on_model_turn_finished` with canonical
+  `event.content: &Vec<AssistantContent>` (text, reasoning, tool calls) —
+  `src/agent.rs`. This is the same content rig parks in
+  `Message::Assistant { content }`.
+- **Completed tool-result batches** arrive as stream items after rig has
+  committed them to `new_messages` (`run.tool_results(...)` is called *before*
+  the items are yielded): `MultiTurnStreamItem::ToolExecutionCommitted` then
+  `StreamUserItem(StreamedUserContent::ToolResult { tool_result,
+  internal_call_id })`. Each becomes part of a `Message::User` tool-result
+  message (rig-run `run.rs` pushes the batch as one `Message::User`).
+- **Final success** yields `MultiTurnStreamItem::FinalResponse(resp)` whose
+  `resp.messages()` is the *complete* run transcript (`new_messages`):
+  `[user(input), assistant(turn1), user(tool-results-1), assistant(turn2), …]`.
+  This is the ground truth the accumulator must match on the happy path —
+  an excellent cross-check for tests.
+- **The error path** yields `Err(StreamingError)` with no transcript. The
+  accumulator is what survives.
+
+### The transcript accumulator
+
+Introduce a small run-scoped struct, e.g. `TurnTranscript`:
 
 ```rust
-async fn on_tool_result(
-    &self,
-    _ctx: &HookContext,
-    event: ToolResultEvent<'_>,
-) -> ToolResultAction {
-    if self.user_cancel.load(Ordering::SeqCst) {
-        return ToolResultAction::Stop("cancelled by user".into());
-    }
-    let result = event.raw_result;
-    if result.is_error() {
-        let err = result.error().expect("is_error ⇒ Some");
-        // Structured, redaction-safe display: kind + operator message.
-        self.output
-            .display_tool_error(event.tool_name, err.kind().as_str(), err.message());
-    } else if result.is_refused() {
-        let err = result.refusal().expect("is_refused ⇒ Some");
-        self.output
-            .display_tool_error(event.tool_name, "denied", err.message());
-    } else {
-        self.output
-            .display_tool_result(&result.output().render());
-    }
-    ToolResultAction::Keep   // error text is already the model-visible output
+/// Canonical messages of the in-flight run, mirroring rig's `new_messages`
+/// shape: [user(input), assistant, user(tool-results), assistant, …].
+#[derive(Default)]
+struct TurnTranscript {
+    /// Completed messages in canonical order (safe to persist).
+    committed: Vec<Message>,
+    /// Whether any model turn has fully completed (distinguishes
+    /// "429 before any progress" from "429 mid-turn").
+    has_progress: bool,
+    /// Call ids of the most recent assistant turn's tool calls that are still
+    /// awaiting results (for synthesis at finalize).
+    pending_tool_calls: BTreeSet<String>,
 }
 ```
 
-`src/output.rs`:
+Sources:
+- `input` → seed `committed[0] = Message::user(input)` only when the run
+  actually starts (first model call begins); do not pre-seed.
+- `on_model_turn_finished` → append `Message::Assistant { content }`;
+  record `pending_tool_calls` from any `ToolCall` parts.
+- Tool-result stream items → group consecutive `ToolResult`s into the
+  pending batch; when the batch is complete (all `pending_tool_calls`
+  answered, or a `ToolExecutionCommitted`+`StreamUserItem` group closes),
+  append one `Message::User { content: [ToolResult…] }` and clear
+  `pending_tool_calls`.
 
-- Add `fn display_tool_error(&self, tool_name: &str, kind: &str, message: &str)`
-  to `trait Output` **with a default impl** that forwards to
-  `display_error` with a `format!("{tool_name} failed [{kind}]: {message}")`
-  string. This keeps every existing `Output` impl compiling unchanged —
-  only `ConsoleOutput` overrides the method to use the dedicated panel
-  rendering below. `LiveOutput` (which wraps an inner `Output` in
-  `src/output.rs:~1797`) also forwards via the default; if its inner is
-  a `ConsoleOutput`, the error panel still renders correctly.
-- `ConsoleOutput`: render the error using the same `paint_panel` /
-  `tool_panel` helpers the tool-call and tool-result panels use
-  (`src/output.rs:1388` for the dark-grey call panel and ~1423 for the
-  result panel) so the visual style stays consistent. The label
-  format is `{tool_name} failed [{kind}]` (e.g.
-  `read_file failed [invalid_args]`); the `message` is rendered in
-  the panel body in red.
-- **Keep** the legacy `"Toolset error:"` / `"ToolCallError:"`
-  string-sniffing loop in `display_tool_result` (`src/output.rs:1441-1447`)
-  as a migration shim for *replay* of old sessions. Current rig never
-  produces these prefixes, so the loop is a no-op for new runs; but
-  sessions persisted by older picocode versions (pre rig-agent 0.40)
-  may still contain tool results that begin with one of these
-  prefixes, and replay would render the literal prefix without the
-  shim. The shim is ~5 lines and is documented as compat-only.
+Because hooks run inside rig's `prompt` machinery and the stream loop lives in
+picocode's `prompt()`, the accumulator is shared via `Arc<Mutex<…>>` cloned
+into the `LoggingHook` instance that `prompt()` itself constructs
+(`src/agent.rs`, the `stream_prompt(...).add_hook(LoggingHook { … })` site) —
+no cross-run state, no new agent fields.
 
-> Note: the model sees `result.output()` regardless of what we render
-> — display is purely cosmetic. No `ToolResultAction::Stop` is needed
-> on error; rig already returns the error to the model and continues
-> the run. The `on_tool_result` change below replaces the existing
-> `display_tool_result` call for error/refused results (it does not
-> *add* a call) so each result renders exactly one panel.
+### Safe-boundary finalization on failure (R1, G1/G8) — no truncation
 
-#### Task 2 — Let the model recover from bad tool names ✅ implemented
+When a retryable error interrupts the run, decide what to persist. The rule is
+**never drop or truncate progress** — an interrupted state that is unsafe to
+persist verbatim is *converted into text* instead, so the user and the model
+see everything that happened:
 
-Unknown/disallowed names never reach `on_tool_call`; rig gates them
-behind `on_invalid_tool_call`. The recovery is implemented on
-`LoggingHook` (`src/agent.rs` ~line 1173) and the streaming request
-in `PicoAgent::prompt` is configured with
-`.max_invalid_tool_call_retries(1)`.
+- **No completed model turn** (the 429 hit the *first* model call, or the
+  malformed-tool-call error hit while the first turn was still assembling):
+  there is no partial transcript to preserve. Persist **nothing**; the retry
+  re-sends the original `input` as the prompt. (This is the current behavior
+  and is correct — see R3.)
+- **Safe boundary** (ends on an assistant message with no unanswered tool
+  calls, or on a user tool-result message): persist `committed` as-is.
+- **Trailing assistant turn with tool calls that never got results**: keep
+  the whole assistant message (text + reasoning + tool calls) and **synthesize
+  a text tool result for every unanswered call**, exactly like rig's own
+  `invalid_tool_retry_user_message` (`rig-run/src/transcript.rs`): each
+  unanswered `ToolCall` becomes a `Message::User` containing
+  `tool_result_message(call, provider, name, "…interrupted; not executed…")`.
+  The transcript stays canonical (`validate_canonical` passes: every
+  assistant tool call is answered by a tool result in the very next message),
+  and the model sees precisely what it planned to do and that the calls were
+  interrupted — no loss, no truncation.
+- **In-flight pure-text turn** (text was streaming when the error hit, turn
+  never accepted by rig): persist the partial text as a text-only assistant
+  message. This is safe (no tool calls) and preserves the reasoning/text
+  progress — matching the `Esc` cancel path's existing text preservation.
 
-The hook (`src/agent.rs:1173-1195`):
+This mirrors the `Esc` cancel path's existing text preservation and extends it:
+completed tool batches are kept (they are `Message::User` results answering
+earlier assistant turns), and an *unanswered trailing* tool turn is kept too —
+its calls are answered with synthesized text results instead of being dropped.
 
-```rust
-async fn on_invalid_tool_call(
-    &self,
-    _ctx: &HookContext,
-    event: &InvalidToolCallContext,
-) -> Option<InvalidToolCallAction> {
-    if self.user_cancel.load(Ordering::SeqCst) {
-        return Some(InvalidToolCallAction::stop("cancelled by user"));
-    }
-    // Surface the issue to the user *before* the recovery attempt so
-    // the in-flight panel shows what the model tried. `display_error`
-    // is the existing method; when `display_tool_error` lands (Task 1
-    // follow-up) this call can swap to it for a dedicated panel.
-    self.output.display_error(&format!(
-        "Model called tool `{}` which is not available. \
-         Available tools: {:?}. Asking the model to retry with a valid name.",
-        event.tool_name, event.available_tools
-    ));
-    Some(InvalidToolCallAction::retry(format!(
-        "tool `{}` is not available. Available tools: {:?}. \
-         Please re-emit the call with one of the available tool names.",
-        event.tool_name, event.available_tools
-    )))
-}
-```
+### Where persistence happens and how the retry continues (R2/R3)
 
-Configuration on the streaming request (`src/agent.rs:140`):
+`prompt()` currently has two persistence sites: the `Some(Err)` branch
+(Phase 2a, `src/agent.rs`) and the success tail (`final_history` /
+`cancelled_history`). The new design:
 
-```rust
-.max_turns(self.tool_call_limit)
-.max_invalid_tool_call_retries(1)   // ← layer 1 Task 2
-.history(prior)
-```
+1. **On a retryable mid-turn error with progress**: in the `Some(Err)`
+   branch, run the finalization above and `append_message` each message of the
+   finalized `committed` to the session **once**. Then return the classified
+   error, but tag it so the REPL knows progress was persisted and a
+   *continuation* is required (not a fresh `input` re-send).
+2. **On a retryable error with no progress**: persist nothing; the REPL
+   re-sends `input` (current behavior).
+3. **The REPL retry loop** (`src/agent.rs`, `run_interactive`): for the
+   "progress persisted" case, re-prompt with a *steering/continuation* message
+   instead of `input` — e.g.
+   `"The previous request was interrupted by a transient provider error
+   (429). The work completed so far is in the conversation above. Continue
+   where you left off."` The original `input` is already in the session as
+   `committed[0]`, so it is not duplicated; the steering message is the new
+   prompt and becomes the next turn's user message on success.
+4. **Malformed-tool-call recovery** unifies: the error typically arrives with
+   **no** completed turn (the assembler failed mid-first-turn), so nothing is
+   persisted; the synthetic feedback message (see `synthetic_retry_feedback`)
+   already carries the correction. If the malformed call happened on a *later*
+   turn (some progress existed), that progress is persisted per the rule above
+   and the feedback becomes the continuation prompt.
+5. **Success tail stays as-is**: when a retry finally succeeds,
+   `resp.messages()` is the *retry run's* transcript `[user(steering),
+   assistant(…)]`; it is appended after the persisted partial — yielding the
+   correct full history `[user(input), assistant(partial)…, user(steering),
+   assistant(final)…]` with no duplication.
 
-### Why this is the rig-idiomatic path
+### Steering message vs. re-sending input (why not re-send)
 
-The recovery happens *inside* the same rig run, in the
-`RunState::ResolvingToolCalls` state, by rolling back the rejected
-tool call and prepending the feedback to the next completion
-request. Crucially, the original assistant `tool_call` block is
-*not* committed to history (see rig-run `run.rs:1403-1434` — the
-rollback path strips the rejected call before the next model turn).
-That means the session is clean: one user prompt, one assistant
-turn that recovered mid-flight. The `LlmUnknownTool` escape hatch
-in the classifier (`src/agent.rs:394-403`) is reached only when
-the retry budget is exhausted — and because that budget is 1, a
-second hallucination of the same wrong name *will* surface to the
-user, which is the right behavior.
+Re-sending `input` after partial progress would duplicate `committed[0]` (the
+input is already in the session from step 1) *and* restate a request the model
+already worked on. A steering message ("continue where you left off", or the
+synthetic parse-error feedback) is the correct continuation token: it is a new
+user message that points at the existing context without repeating it. This is
+the same pattern rig uses for `InvalidToolCallAction::Retry { feedback }` — the
+feedback is appended as a user message and the model continues from there.
 
-### `LlmUnknownTool` contract
+### Consecutive-user and alternation constraint (G4 — verify empirically)
 
-`PicocodeError::LlmUnknownTool` is the **escape hatch** reached
-when the rig hook's retry budget runs out:
+Rig's canonical model **permits consecutive user messages**
+(`validate_canonical` only rejects assistant-assistant and unanswered tool
+calls), so `[user(input), user(steering)]` is valid to *rig*. But some provider
+adapters (notably Anthropic's legacy API, which requires strict
+user↔assistant alternation) may reject `user,user` on the wire. The Anthropic
+adapter in the pinned rev is a 1:1 message conversion with no visible
+merge-consecutive-users pass, so this is a **real, unverified risk**.
 
-- `is_auto_retryable() == false` — the REPL does not auto-retry
-  the *whole prompt*; the in-turn recovery already happened, and a
-  fresh prompt would just have the same context.
-- `synthetic_retry_feedback() == None` — the feedback the model
-  needs was already injected by the rig hook; doing it again via
-  `PicocodeError` would duplicate the user message in the session.
-- `Display` shows `available` so the user can see what the model
-  *could* have called.
+Mitigation options to validate during implementation:
+- If `user,user` is rejected: when the partial transcript ends on a `user`
+  tool-result message, *merge* the steering text into that same
+  `Message::User` (append a text item alongside the tool results) instead of
+  sending a separate user prompt. This is what rig itself does when it appends
+  a tool batch to a trailing user message (`run.rs:1532`).
+- If accepted: keep the steering message as its own prompt.
 
-`on_tool_call` (the display hook) needs **no behavioural change**
-for malformed args — rig's dispatch produces the `InvalidArgs`
-`ToolResult` that Task 1 now styles. The existing defensive
-fallback in `on_tool_call` (`agent.rs:~981`,
-`serde_json::from_str(...).unwrap_or(serde_json::Value::String(event.args.to_string()))`)
-should be **left in place**: although `ToolCall.args` is always
-syntactically valid JSON today (rig re-serializes from `Value`),
-the fallback is a future-proofing shim against any rig surface
-change that might surface raw text. The cost of keeping it is one
-allocation on an impossible branch; the cost of removing it is a
-silent user-visible regression if a rig upgrade ever shifts the
-contract. Do not change `on_tool_call` as part of Task 1.
+The safe default is to **merge when the transcript ends on a user message** —
+which is precisely the case after a completed tool batch (the common
+mid-turn-failure shape). A pure `prompt(input)` after no progress ends on an
+assistant boundary, so the normal first-turn retry is unaffected.
 
-## Layer 2 — Provider / transport error classification and auto-retry
+### Cancel (`Esc`) unifies with the same path
 
-The second failure class is the one that originally caused the user to
-hit this doc: provider-side errors that never reach a tool call. They
-land in the `Some(Err(e))` arm of the streaming loop in `src/agent.rs`
-~line 214 and are routed through `classify_stream_error` → typed
-`PicocodeError` → the REPL's auto-retry pipeline.
+The existing `Esc` branch (`src/agent.rs`) persists `user(input)` + text-only
+partial. Under this design it becomes: finalize the accumulator (synthesizing
+answers for any unanswered trailing tool calls) and persist. This satisfies
+R4 ("all agent output should be persisted") and upgrades the current
+text-only fallback to keep completed tool work on cancellation too. The only
+difference from the retryable-error path: `Esc` does **not** auto-retry — it
+persists and returns `Cancelled`.
 
-### The `PicocodeError` taxonomy (provider layer)
+### Retry budget & back-off for 429 (R5)
 
-Defined in `src/lib.rs` (~lines 32–204). Every variant is reachable
-from the streaming or blocking surface and the REPL auto-retry reads
-`is_auto_retryable()` / `retry_after_secs()` /
-`synthetic_retry_feedback()` on the returned value.
+Current REPL loop is single-shot (`attempt == 1`). New policy, per **logical
+turn** (the counter lives in the REPL's per-prompt `loop`, so a fresh user
+prompt resets it — never session-global):
 
-| Variant                   | Source / rig variant                          | Auto-retry? | Notes |
-|---------------------------|-----------------------------------------------|-------------|-------|
-| `LlmAuth { status }`      | `CompletionError::HttpError` 401/403          | no          | user must fix the API key |
-| `LlmBilling { status }`   | `CompletionError::HttpError` 402              | no          | user must add credits |
-| `LlmRateLimited { retry_after_secs }` | `CompletionError::HttpError` / `ProviderResponse` 429 | yes | respects provider `Retry-After` (or OpenRouter's `metadata.retry_after_seconds`) |
-| `LlmUpstream { status }`  | `CompletionError::HttpError` 5xx              | yes         | transient by default |
-| `LlmClient { status }`    | `CompletionError::HttpError` other 4xx        | no          | 4xx other than 401/402/403/429 — request was malformed |
-| `LlmTransport(String)`    | `CompletionError::HttpError`/`ProviderError` without captured status (DNS, TLS, drop) | yes         | transient by default |
-| `LlmStreamProtocol(String)` | `CompletionError::ResponseError` (any shape that is not the assembler-emitted malformed-tool-call prefix) | yes         | e.g. SSE truncation |
-| `LlmMalformedToolCall { tool_name, parse_error }` | `CompletionError::ResponseError("tool call \`X\` arrived with malformed JSON input: …")` (rig-core `parts.rs:697-700`) | yes         | stochastic model emission; on retry, the model gets a synthetic user message describing the parse error so it can self-correct |
-| `LlmUnknownTool { tool_name, available }` | `PromptError::UnknownToolCall` (no `on_invalid_tool_call` recovery) | no | surfaces the available list so the user can steer |
-| `LlmMaxTurns { max_turns }` | `PromptError::MaxTurnsError`               | no          | configured budget exhausted |
-| `Llm(String)`             | catch-all for any other LLM error             | no          |  |
-| `Cancelled(String)`       | `PromptError::PromptCancelled` or user Esc    | n/a         | the REPL converts it to a friendly "Aborted." notice |
+- Budget: **up to 20 retries** for `LlmRateLimited`, configurable via an
+  `AgentConfig` field (e.g. `rate_limit_retry_budget: u8 = 20`; `0` disables
+  multi-retry → current single-shot). Other retryable classes
+  (`LlmTransport`, `LlmUpstream`, `LlmStreamProtocol`,
+  `LlmMalformedToolCall`) keep a small budget (1–3) — they are unlikely to
+  recur in a burst and a stream of them signals a deeper problem.
+- Delay: `retry_after_secs` (provider `Retry-After` / OpenRouter
+  `metadata.retry_after_seconds`) is the **floor**; exponential back-off
+  doubles the previous wait up to a ceiling (e.g. 5 min). Effective wait =
+  `max(retry_after_secs, backoff(attempt))`, capped at the ceiling.
+- `cancellable_sleep` (existing, `src/agent.rs`) keeps each wait `<Esc>`-
+  abortable; the in-flight reader spans the whole budget window.
+- Give-up: after the budget, surface a final error naming the class and the
+  **total time waited** so the user can decide whether to keep going or switch
+  providers. Because progress was persisted (R1), give-up is lossless — the
+  partial turn is in the session and the user's next prompt continues from it.
 
-The malformed-tool-call case is the one that *also* must inject a
-synthetic user message on the retry — see `synthetic_retry_feedback`
-in `src/lib.rs:191`. The reasoning: the model emitted a tool call
-whose arguments failed JSON parsing at the wire's terminal marker, so
-the model never saw the error. Without feedback a blind retry would
-likely reproduce the same broken call. This mirrors the rig-run
-`InvalidToolCallAction::Retry { feedback }` pattern, applied at the
-prompt-loop layer because rig's `on_invalid_tool_call` hook does not
-fire for parse errors — only for *name validation* failures.
+### Malformed-tool-call (R6) — already covered
 
-### The classification flow
+`LlmMalformedToolCall` classification, `synthetic_retry_feedback`, and the
+REPL injection exist today (`src/lib.rs`, `src/agent.rs`). Under the new
+design the only change is that when it occurs after partial progress, the
+partial transcript is persisted first (finalization rule) and the feedback is
+the continuation prompt; when it occurs on the first turn, behavior is
+unchanged.
 
-```
-StreamingError::Completion(ce)
-  │                 ┌── HttpError with status ──► ce.provider_response_status()
-  │                 │     ├── 401/403 → LlmAuth
-  │                 │     ├── 402     → LlmBilling
-  │                 │     ├── 429     → LlmRateLimited { retry_after_secs from Retry-After }
-  │                 │     ├── 5xx     → LlmUpstream
-  │                 │     └── 4xx else → LlmClient
-  │                 │
-  │                 ├── HttpError/ProviderError w/o status → LlmTransport
-  │                 └── ResponseError(msg)
-  │                       ├── "tool call `X` arrived with malformed JSON input: …" → LlmMalformedToolCall
-  │                       └── anything else → LlmStreamProtocol(msg)
-  │
-StreamingError::Prompt(pe)
-  ├── CompletionError(ce)         → recurse above
-  ├── MaxTurnsError { max_turns }  → LlmMaxTurns
-  ├── UnknownToolCall { … }        → LlmUnknownTool
-  ├── PromptCancelled { … }        → caller (REPL) returns Cancelled
-  └── MemoryError(…)               → PicocodeError::Other (opaque; not retryable)
-```
+---
 
-Implementation: `classify_stream_error` (`src/agent.rs:386`) for
-streaming errors, `classify_prompt_error` (`src/agent.rs:343`) for the
-non-streaming `chat()` surface used by `/tree --summarize`. Both
-delegate to `classify_completion_error` (`src/agent.rs:418`,
-`pub(crate)`) for the `CompletionError` half.
+## Implementation plan
 
-### The REPL auto-retry pipeline
+### Phase 1 — Accumulator (`TurnTranscript`) + hook wiring
 
-`src/agent.rs` ~lines 2820–2938. After `prompt()` returns a classified
-`PicocodeError`:
+1. Add `TurnTranscript` (fields as above) + `Arc<Mutex<TurnTranscript>>` into
+   `CodeAgent::prompt` and clone it into the `LoggingHook` instance.
+2. `LoggingHook::on_model_turn_finished`: append
+   `Message::Assistant { content }` and record pending tool-call ids.
+3. `LoggingHook::on_tool_result`: accumulate the result; when the batch
+   closes, append `Message::User { [ToolResult…] }` and clear pending ids.
+   (Batch close detection: `on_tool_result` fires per tool; a batch closes
+   when the next model turn begins or the run ends. The `ToolExecutionCommitted`
+   / `StreamUserItem` items in the stream loop can also drive this — pick one
+   source of truth and unit-test it.)
+4. On `FinalResponse`, optionally assert the accumulator matches
+   `resp.messages()` (debug cross-check; drop in release).
 
-1. The REPL matches on `PicocodeError::Cancelled` (returns
-   `Cancelled("Aborted.")`) and `is_auto_retryable()`. Non-retryable
-   errors are surfaced to the user and the loop breaks.
-2. For retryable errors: the REPL displays
-   `Error: <PicocodeError::Display>`, then `Retrying in <secs>s…`.
-3. Back-off: `e.retry_after_secs()` when present (rate-limited
-   provider hint, or OpenRouter's `metadata.retry_after_seconds`),
-   otherwise 2 s for `LlmMalformedToolCall` and 3 s for everything
-   else. The wait is `cancellable_sleep` (`src/agent.rs:346`): a
-   `tokio::select!` between a `tokio::time::sleep_until(deadline)` and
-   the `cancel_notify` set by `<Esc>`. Returns `false` on cancel →
-   the REPL returns `Cancelled` instead of retrying.
-4. **Context preservation**: the user prompt and any partial assistant
-   text were persisted to the session in `prompt()`'s `Some(Err(e))`
-   arm at lines 249–256 *before* the classifier ran. The retry
-   therefore sees a session whose last message is the user prompt the
-   user actually typed (with no duplication) plus the partial text
-   from the failed attempt.
-5. For `LlmMalformedToolCall`, the synthetic feedback from
-   `PicocodeError::synthetic_retry_feedback()` is appended as a new
-   user message in the session and used as the next prompt's input.
-   This gives the model the parse error it never saw during
-   streaming. For every other retryable error, the original `input`
-   is re-sent verbatim.
-6. The loop races `Esc` again after `cancellable_sleep` returns
-   (cancellation can fire between sleep return and the next
-   `prompt()` clearing the flag), and only then re-invokes
-   `agent.prompt(&next_input, session)`.
-7. **Single-shot**: the `attempt == 1` guard makes this a one-strike
-   retry. If the second attempt fails with the same error class, the
-   REPL surfaces it to the user as fatal. Future work: expose a
-   config flag to allow more retries.
+### Phase 2 — Truncation + persistence on failure
 
-### Why this is one of the smaller changes in the file
+5. Implement `fn finalize(t: &TurnTranscript) -> Vec<Message>`
+   implementing the rules in *Safe-boundary finalization* (pure function,
+   unit-testable; synthesizes text tool results for unanswered trailing calls,
+   never truncates).
+6. In `prompt()`'s `Some(Err)` branch: compute `classified`; if
+   `classified.is_auto_retryable()`:
+   - if `transcript.has_progress` → append finalized `committed` to session;
+     return a variant/code that tells the REPL "progress persisted → steer".
+   - else → persist nothing (current behavior); return the classified error.
+   Non-retryable errors keep the existing Phase 2a persistence
+   (`user(input)` + text partial) so the user's turn is never lost on give-up.
+7. Cancel branch: persist the finalized transcript (now including completed
+tool batches and synthesized answers for any interrupted calls) instead of the
+text-only partial.
 
-The classification, the auto-retry, the cancellable sleep, the
-context preservation, the synthetic feedback — all of it is in
-`src/agent.rs` and `src/lib.rs`. The only production site that was
-not yet on the typed path was `summarize` (`src/agent.rs:342`); the
-classifier now routes that through `classify_prompt_error`, so a
-`/tree --summarize` 429 also surfaces as `LlmRateLimited` and is
-auto-retryable through the same accessors.
+### Phase 3 — REPL retry loop upgrade
 
-## Testing Strategy
+8. In `run_interactive`, replace the `attempt == 1` guard with the
+   per-turn budget policy (R5). Distinguish the two retry shapes via the error:
+   - no progress → re-send `input`;
+   - progress persisted → re-prompt with the steering message
+     (merge-into-trailing-user when the transcript ends on a user message —
+     see *Consecutive-user*).
+9. Track total elapsed; on give-up, display the final error + total wait.
+10. Add `rate_limit_retry_budget: u8` to `AgentConfig` (default 20) and thread
+    through `create_agent` / `run_interactive`.
 
-1. `on_tool_result` with `ToolResult::failed(InvalidArgs)` → error
-   panel rendered; `ToolResultAction::Keep`; normal-success rendering
-   unchanged.
-2. Tool `call()` returning an error (`ToolError::Io` / `Generic`) →
-   rig maps via `Tool::map_error`; hook shows kind + message; model
-   receives error content.
-3. Model calls an unknown tool → `on_invalid_tool_call` returns
-   `retry(...)` with budget 1; stream emits
-   `ModelTurnRetried`/`StreamUserItem`, run completes on the
-   corrected call (integration, scripted model).
-4. Model calls an unknown tool with no hook/budget →
-   `UnknownToolCall` error classified as `LlmUnknownTool`; partial
-   turn persisted (existing behaviour).
-5. **Provider 429 with `Retry-After: 60`** → classified as
-   `LlmRateLimited { retry_after_secs: Some(60) }`,
-   `is_auto_retryable() == true`. The REPL sleeps 60 s then retries.
-   Covered by `retry_after_secs_extracted_from_provider_response_headers`
-   (`src/agent.rs:3831`) — pins the `Retry-After` extraction
-   contract.
-6. **Provider 429 via the non-streaming `chat()` path** (e.g.
-   `/tree --summarize`) → classified as `LlmRateLimited` with
-   `retry_after_secs` preserved. Covered by
-   `classify_prompt_error_429_preserves_retry_after`
-   (`src/agent.rs:3858`).
-7. **Streamed tool call arrives with malformed JSON** →
-   `LlmMalformedToolCall { tool_name, parse_error }`; REPL injects
-   synthetic feedback and retries once. Covered by
-   `classify_429_with_retry_after_is_rate_limited_and_retryable`
-   (`src/agent.rs:3709`) — which despite the name, pins the
-   malformed-tool-call contract (the test name reflects an older
-   intent; the body verifies the malformed-tool-call shape end-to-end:
-   `is_auto_retryable`, `retry_after_secs == None`, and
-   `synthetic_retry_feedback().contains("edit")`).
-8. **Unknown `ResponseError` shape** (e.g. SSE truncation) →
-   `LlmStreamProtocol`, not misclassified as `MalformedToolCall`.
-   Covered by
-   `classify_unparseable_response_other_message_does_not_match_tool_call`
-   (`src/agent.rs:3787`).
-9. **`PromptError::PromptCancelled`** is *not* classified; the
-   caller's existing path returns `Cancelled`. Covered by
-   `classify_prompt_cancelled_is_not_retryable`
-   (`src/agent.rs:3742`).
-10. `MaxTurnsError` and `UnknownToolCall` get their own typed
-    variants with non-retryable semantics. Covered by
-    `max_turns_error_is_not_retryable` (`src/agent.rs:3774`) and
-    `unknown_tool_call_with_available_list_surfaces_usefully`
-    (`src/agent.rs:3756`).
-11. User cancel during error handling still stops via
-    `Stop`/`PromptCancelled`.
-12. Existing golden tests (`tool_call`/`tool_result` rendering,
-    session persistence) pass unchanged.
-13. **Replay compat**: a session entry persisted by an older
-    picocode (pre rig-agent 0.40) whose tool result begins with
-    `Toolset error: ` or `ToolCallError: ` renders without the
-    literal prefix (the compat shim in
-    `display_tool_result` strips it before render). New sessions
-    never produce these prefixes, so the shim is a no-op there.
-14. **`on_tool_result` with `ToolResult::failed`** renders exactly
-    one panel (the error panel via `display_tool_error`) — *not* the
-    error panel followed by a result panel from the old
-    unconditional `display_tool_result` call. The branch in
-    `on_tool_result` must be `is_error` → `is_refused` → success, in
-    that order, with `display_tool_result` only on success/skipped.
+### Phase 4 — Tests & cross-checks
 
-## Risk Assessment
+11. Unit: finalization rules (each boundary case — synthesis of unanswered
+    trailing calls, no data loss), accumulator ordering vs.
+    `resp.messages()` on the happy path (scripted model), steering-message
+    shape.
+12. Integration (scripted model + injected error): mid-turn 429 after a tool
+    batch → assert the partial transcript is in the session, the retry prompt
+    is the steering message (not `input`), and the model's next call sees the
+    tool results in history.
+13. Integration: 429 before any progress → retry re-sends `input`, no
+    duplication in the final session.
+14. Regression: first-turn malformed tool call still recovers via synthetic
+    feedback with no session duplication.
+15. Regression: `Esc` mid-turn persists completed tool batches (upgraded from
+    text-only) and returns `Cancelled`.
+16. Regression: all existing classification + display tests pass unchanged.
+
+### Open questions to resolve during implementation
+
+- **Q1 (alternation):** Does the Anthropic wire reject `user,user`?
+  Empirically test with the real adapter; decide merge-vs-separate steering
+  accordingly. (Default: merge when transcript ends on a user message.)
+- **Q2 (batch-close source):** Drive tool-result batching from
+  `on_tool_result` (hook) or from the `StreamUserItem` items (stream loop)?
+  Pick one source of truth; the other cross-checks in tests.
+- **Q3 (partial mixed turn):** For an in-flight turn with both text and tool
+  calls that never resolved, the whole assistant message is kept and the
+  unanswered calls are answered with synthesized text results (no truncation,
+  no split). Confirmed as the design default; no open question remains.
+- **Q4 (steering text):** Exact wording of the 429 continuation message, and
+  whether it should echo the original request id/context. Default text above.
+
+---
+
+## Testing strategy (summary)
+
+As in *Phase 4* above, plus the settled layer-1 tests (display panels, name
+recovery) which exist and stay. Existing classification tests
+(`classify_*`), `retry_after_secs_extracted_from_provider_response_headers`,
+and `classify_prompt_error_429_preserves_retry_after` continue to pin the
+taxonomy and the `Retry-After` extraction.
+
+## Risk assessment
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| `max_invalid_tool_call_retries` consumes the `max_turns` budget | Medium | Keep at 1; document that retries count toward `tool_call_limit` |
-| Refusals vs permission failures confused in display | Low | Branch on `is_refused()` before `is_error()` (Task 1 order matters) |
-| Changing `display_tool_result` breaks replay path | Low | Replay drives the same `Output` methods; both paths pass through Task 1 |
-| Old session entries with legacy `Toolset error:` / `ToolCallError:` prefixes render literally | Low | Keep the compat-stripping shim in `display_tool_result` (~5 lines, no-op for new sessions) |
-| `display_tool_error` redundant with `display_error` if `ConsoleOutput` skips the override | Low | Default impl formats the string and forwards; only `ConsoleOutput` overrides for the dedicated panel |
-| `on_tool_result` renders both error and result panels if both branches fire | Low | Branch is `is_error` → `is_refused` → success, in that order; `display_tool_result` only on success/skipped. Pinned by test #14. |
-| Model feedback leaks raw args on `InvalidArgs` | Low | rig redacts via `ToolExecutionError`; display uses `message()`/`model_output()`, not raw args |
-| Single-shot auto-retry masks persistent transient errors | Low | `attempt == 1` guard; a second occurrence of the same class surfaces to the user |
-| `Retry-After` HTTP-date form not handled | Low | OpenRouter and most providers use delta-seconds; HTTP-date would fall through to a default back-off. Tracked as a follow-up. |
-| Synthetic-feedback retry persists an extra user message | Low | Acceptable trade-off — the model needs the parse error it never saw. The original user prompt is not duplicated. |
+| `user,user` rejected by a provider adapter (esp. Anthropic) | High if present | Merge steering into trailing `Message::User` when transcript ends on a user message (the common mid-turn shape); verify empirically (Q1) |
+| Accumulator diverges from rig's `new_messages` shape | Medium | Cross-check against `resp.messages()` on the happy path (Phase 1.4); validate with `rig_run`'s `validate_canonical` in tests |
+| Unanswered trailing tool-call turn persisted → invalid history | Medium | Finalization synthesizes a text tool result per unanswered call (G1), so the transcript stays canonical (`validate_canonical` passes); no truncation |
+| Duplicate `user(input)` on retry | Medium | Persist-once rule: no progress → no persist + re-send; progress → persist finalized + steering prompt (never re-send `input`) |
+| 429 budget burns `max_turns` | Medium | Per-turn counter only; each retry is a fresh `prompt()` consuming 1 turn — document that a 20-retry burst may exhaust a small `tool_call_limit`; keep budget configurable |
+| Long back-off with no user feedback | Low | REPL already prints `Retrying in Ns…`; add cumulative total on give-up |
+| Regression: replay of old sessions | Low | Compat shim kept in `display_tool_result`; no session-format change (messages persist via existing `append_message`) |
 
-## Acceptance Criteria
+## Acceptance criteria
 
-1. ✅ Failed/refused/skipped tool results render distinctly from
-   successes, with kind + tool name (no string-sniffing).
-2. ✅ The model already receives every tool error as result content
-   (rig behaviour — verified); picocode no longer obscures it at
-   render time.
-3. ✅ Unknown-tool calls recover via `on_invalid_tool_call` + retry
-   budget (or fail with a classified, user-visible `LlmUnknownTool`
-   when disabled).
-4. ✅ Rate-limit/auth/network/5xx/billing/transport/stream-protocol
-   errors are surfaced as such, not `Other`.
-5. ✅ `Retry-After` (and OpenRouter's `metadata.retry_after_seconds`)
-   drive a cancel-safe back-off, and the REPL re-prompts once on
-   transient errors.
-6. ✅ Streamed malformed-tool-call JSON (`tool call \`X\` arrived with
-   malformed JSON input: …`) is classified as `LlmMalformedToolCall`,
-   auto-retryable, and gets a synthetic user-message feedback so the
-   model can self-correct.
-7. ✅ Esc cancellation still works during error handling — `cancellable_sleep`
-   is wired to the existing `cancel_notify`; the in-flight
-   `tokio::time::sleep_until` is broken on Esc and the REPL returns
-   `Cancelled`.
-8. ✅ Context is preserved across the failure: `prompt()` persists
-   the user prompt and any partial assistant text on the
-   non-cancellation `Some(Err)` path before the classifier runs, and
-   the REPL re-sends the same `input` (or the synthetic feedback for
-   `LlmMalformedToolCall`) to the next `prompt()` call. The session
-   never loses the user's message or the partial turn.
-9. ✅ No picocode-local `ToolErrorKind` — reuse `rig_core::tool::*`
-   kinds for layer 1.
-10. ✅ All existing tests pass (310 lib tests + 4 classification
-    tests + 1 new `classify_prompt_error_429_preserves_retry_after`).
+1. ✅ Failed/refused/skipped tool results render distinctly (settled).
+2. ✅ Unknown-tool calls recover in-run via `on_invalid_tool_call` (settled).
+3. ✅ Rate-limit/auth/network/5xx errors classified, not `Other` (settled).
+4. ✅ Mid-turn failure persists completed model turns and tool-call→result
+   pairs to the session (`TurnTranscript` + `prompt()` error branch) (R1).
+5. ✅ Retry after mid-turn failure continues from the persisted boundary via a
+   steering message — the model sees prior tool results and does not redo them
+   (`LlmInterrupted` + REPL steer) (R2).
+6. ✅ No duplication of the user input, the partial transcript, or the
+   steering/feedback message across retries and final success (persist-once +
+   steer-once guard) (R3).
+7. ✅ `Esc` persists completed tool batches, not just text (cancel branch uses
+   the same finalized transcript) (R4).
+8. ☐ 429 budget: hardcoded at 20 per logical turn via `retry_budget()` with
+   `Retry-After`-floor + exponential back-off and `<Esc>`-abortable waits
+   (R5). Remaining: expose the budget as an `AgentConfig` field
+   (`rate_limit_retry_budget`, default 20) and report the total wait time on
+   give-up.
+9. ☐ Malformed-tool-call recovery shares the persist-and-steer machinery
+   where progress exists (R6). Unknown-tool recovery remains owned by the rig
+   hook (`on_invalid_tool_call`), which is correct — it recovers in-run
+   without the REPL layer.
+10. ✅ Existing classification + display + name-recovery tests pass (316 lib
+    tests).
 
-## File Changes
+## File changes (projected)
 
-- `src/agent.rs` —
-  - `on_tool_result` structured-error rendering (layer 1 Task 1);
-  - new `on_invalid_tool_call` (layer 1 Task 2);
-  - `.max_invalid_tool_call_retries(1)` (layer 1 Task 2);
-  - `Some(Err(e))` branch in `prompt()` calls `classify_stream_error`
-    and persists the user prompt + partial text *before* classifying
-    (layer 2);
-  - `classify_stream_error` + `classify_completion_error` +
-    `detect_response_error` (layer 2);
-  - `classify_prompt_error` for the non-streaming `summarize` path
-    (layer 2);
-  - `cancellable_sleep` wired to `user_cancel` + `cancel_notify`
-    (layer 2);
-  - REPL orchestrator at ~line 2820 drives the single-shot auto-retry
-    loop with `is_auto_retryable()` / `retry_after_secs()` /
-    `synthetic_retry_feedback()` (layer 2);
-  - unit tests for every classification path.
-- `src/lib.rs` —
-  - `PicocodeError` extended with `LlmAuth`, `LlmBilling`,
-    `LlmRateLimited`, `LlmUpstream`, `LlmClient`, `LlmTransport`,
-    `LlmStreamProtocol`, `LlmMalformedToolCall`, `LlmUnknownTool`,
-    `LlmMaxTurns`;
-  - `is_auto_retryable`, `retry_after_secs`, `synthetic_retry_feedback`
-    accessors.
-- `src/output.rs` — `Output::display_tool_error` (default →
-  `display_error`); `ConsoleOutput` error panel; remove legacy
-  `Toolset error`/`ToolCallError` sniffing in `display_tool_result`
-  (layer 1 Task 1).
+- `src/agent.rs` — `TurnTranscript`, `LoggingHook` wiring, finalize fn,
+  `Some(Err)`/cancel persistence changes, REPL retry-loop budget + steering,
+  `AgentConfig::rate_limit_retry_budget` plumbing, tests.
+- `src/lib.rs` — `PicocodeError` steering signal (new variant or flag) if the
+  REPL needs to distinguish "no progress" from "progress persisted";
+  `AgentConfig` re-export unchanged.
+- `src/output.rs` — unchanged (display already done).
 - `doc/tool_error_handling.md` — this document.
 
-*Refined after cross-checking the pinned rig checkout: rig already
-provides the tool-execution error kinds (`ToolErrorKind`), the
-structured result envelope (`ToolResult`), the invalid-tool-call
-recovery surface (`on_invalid_tool_call` + `InvalidToolCallAction`),
-and the top-level provider error metadata (`CompletionError` —
-`provider_response_status()` / `provider_response_headers()` /
-`provider_response_body()`). The remaining work in picocode is layer-1
-display and recovery policy, plus the layer-2 `Some(Err)` classifier
-and REPL auto-retry pipeline — not new error types.*
+---
+
+*Supersedes the earlier "tool error handling" drafts. The tool-execution half
+is settled; the mid-turn failure half is the design above — accumulate a
+canonical transcript, persist at the last safe boundary on failure, and resume
+by steering from that boundary instead of restarting the turn.*
