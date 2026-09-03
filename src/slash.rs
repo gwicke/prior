@@ -16,6 +16,7 @@ pub enum SlashKind {
     Session,
     Tree,
     Clear,
+    New,
     Replay,
 }
 
@@ -84,6 +85,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/clear",
             help: "Delete the current session and start a new one",
             kind: SlashKind::Clear,
+        },
+        SlashCommand {
+            name: "/new",
+            help: "Start a new session (keeps the current one on disk)",
+            kind: SlashKind::New,
         },
         SlashCommand {
             name: "/replay",
@@ -170,8 +176,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_twelve_commands() {
-        assert_eq!(registry().len(), 12);
+    fn registry_has_thirteen_commands() {
+        assert_eq!(registry().len(), 13);
+    }
+
+    #[test]
+    fn lookup_new_command() {
+        let s = registry().iter().find(|c| c.name == "/new").unwrap();
+        assert_eq!(s.kind, SlashKind::New);
     }
 
     #[test]
@@ -198,7 +210,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 12);
+        assert_eq!(r.len(), 13);
     }
 
     #[test]

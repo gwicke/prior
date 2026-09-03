@@ -1270,6 +1270,11 @@ impl ActiveOverlay {
                             output.display_plain("/clear");
                             return OverlayAction::Action(InputAction::Submit("/clear".into()));
                         }
+                        slash::SlashKind::New => {
+                            redraw(&LineEditor::new(), &[], sel, input_row);
+                            output.display_plain("/new");
+                            return OverlayAction::Action(InputAction::Submit("/new".into()));
+                        }
                         slash::SlashKind::Replay => editor.set("/replay "),
                     }
                 }

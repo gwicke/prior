@@ -3261,6 +3261,15 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     current_session_id = String::new();
                     continue;
                 }
+                // Handle `/new`: drop the current in-memory session and let
+                // `ensure_session` create a fresh one on the next prompt.
+                // The old session is preserved on disk and can be resumed
+                // via `/session <name> resume`.
+                if input == "/new" || input.starts_with("/new ") {
+                    session = None;
+                    current_session_id = String::new();
+                    continue;
+                }
                 // Handle `/replay [N[t|l]]`: re-render session history.
                 // Replay walks the RAW branch (via `build_replay_units`) so
                 // compaction entries render as markers while the full history
