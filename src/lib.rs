@@ -107,7 +107,15 @@ pub enum PicocodeError {
     /// Provider stream assembled a tool call whose JSON arguments were
     /// malformed (rig's `tool call \`{name}\` arrived with malformed JSON
     /// input`). The model gets a synthetic user message describing the parse
-    /// error so it can self-correct, and the REPL re-prompts once.
+    /// error so it can self-correct, and the REPL re-prompts. This includes
+    /// both stochastic subclasses (truncation at an argument boundary,
+    /// `expected , or }`, `EOF while parsing`) and the content-echo subclass
+    /// (raw control characters inside a string — the model copied file or
+    /// terminal content verbatim into an argument). All are recoverable by
+    /// feeding the parse error back to the model, which mirrors the manual
+    /// workflow of pasting the error and letting the model retry; the feedback
+    /// text is what [`synthetic_retry_feedback`](Self::synthetic_retry_feedback)
+    /// provides so that workflow happens automatically.
     #[error(
         "Provider returned malformed JSON for tool call `{tool_name}`: {parse_error}. Asking the model to retry."
     )]
@@ -136,6 +144,23 @@ pub enum PicocodeError {
         max_turns: usize,
     },
 
+    /// A transient, auto-retryable error (429, transport, 5xx, malformed
+    /// tool-call JSON, …) interrupted the run *after* some progress had
+    /// already been persisted to the session as a canonical partial
+    /// transcript. The REPL must continue from that transcript with a
+    /// steering message rather than re-sending the original input — the
+    /// input is already in the session as the persisted turn's first
+    /// message, so re-sending it would duplicate the user's request.
+    ///
+    /// The wrapped [`cause`](Self::cause) carries the classification the
+    /// user sees (e.g. `LlmRateLimited`) and the back-off hint
+    /// (`retry_after_secs()`); the accessors on this variant delegate to it.
+    #[error("{}", .cause)]
+    LlmInterrupted {
+        /// The underlying classified error.
+        cause: Box<PicocodeError>,
+    },
+
     #[error("Missing API key for provider {0}. Please set the {1} environment variable.")]
     MissingApiKey(String, String),
 
@@ -156,40 +181,52 @@ impl PicocodeError {
     /// Whether the REPL should automatically re-prompt once for this error.
     ///
     /// True for transient failures (rate-limit, transport, upstream 5xx,
-    /// streaming protocol, malformed streamed tool-call JSON). False for
-    /// permanent configuration issues (auth, billing, client 4xx, max-turns,
-    /// unknown tool). Always check this *before* retrying so a single failure
-    /// does not loop forever if the underlying problem is persistent.
+    /// streaming protocol, malformed streamed tool-call JSON — including the
+    /// raw-control-character content-echo subclass). False for permanent
+    /// configuration issues (auth, billing, client 4xx, max-turns, unknown
+    /// tool). Always check this *before* retrying so a single failure does not
+    /// loop forever if the underlying problem is persistent.
     pub fn is_auto_retryable(&self) -> bool {
-        matches!(
-            self,
-            PicocodeError::LlmRateLimited { .. }
-                | PicocodeError::LlmUpstream { .. }
-                | PicocodeError::LlmTransport(_)
-                | PicocodeError::LlmStreamProtocol(_)
-                | PicocodeError::LlmMalformedToolCall { .. }
-        )
+        match self {
+            PicocodeError::LlmInterrupted { cause } => cause.is_auto_retryable(),
+            _ => matches!(
+                self,
+                PicocodeError::LlmRateLimited { .. }
+                    | PicocodeError::LlmUpstream { .. }
+                    | PicocodeError::LlmTransport(_)
+                    | PicocodeError::LlmStreamProtocol(_)
+                    | PicocodeError::LlmMalformedToolCall { .. }
+            ),
+        }
     }
 
     /// The `Retry-After` hint for a rate-limited response, if the provider
-    /// reported one. `None` for every other error variant.
+    /// reported one. `None` for every other error variant. Delegates through
+    /// [`LlmInterrupted`](Self::LlmInterrupted) to the wrapped cause.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             PicocodeError::LlmRateLimited { retry_after_secs } => *retry_after_secs,
+            PicocodeError::LlmInterrupted { cause } => cause.retry_after_secs(),
             _ => None,
         }
     }
 
     /// Synthetic user feedback to inject into the session for the auto-retry
-    /// on a `LlmMalformedToolCall`. The model emitted a tool call whose
-    /// arguments failed JSON parsing at the wire's terminal marker, so the
-    /// model never saw the error. Without this feedback a blind retry would
-    /// likely reproduce the same broken call. Mirrors the rig-run
-    /// `InvalidToolCallAction::Retry { feedback }` pattern, applied at the
-    /// prompt-loop layer because rig's `on_invalid_tool_call` hook does not
-    /// fire for parse errors — only for *name validation* failures.
+    /// on a [`LlmMalformedToolCall`](Self::LlmMalformedToolCall) — every
+    /// subclass, including raw control characters in a string. The model
+    /// emitted a tool call whose arguments failed JSON parsing at the wire's
+    /// terminal marker, so the model never saw the error. Without this
+    /// feedback a blind retry would likely reproduce the same broken call.
+    /// Mirrors the rig-run `InvalidToolCallAction::Retry { feedback }`
+    /// pattern, applied at the prompt-loop layer because rig's
+    /// `on_invalid_tool_call` hook does not fire for parse errors — only for
+    /// *name validation* failures.
+    ///
+    /// This automates the manual workflow of pasting the parse error into the
+    /// next prompt and letting the model retry.
     pub fn synthetic_retry_feedback(&self) -> Option<String> {
         match self {
+            PicocodeError::LlmInterrupted { cause } => cause.synthetic_retry_feedback(),
             PicocodeError::LlmMalformedToolCall {
                 tool_name,
                 parse_error,

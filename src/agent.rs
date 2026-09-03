@@ -22,7 +22,7 @@ use rig_agent::agent::{
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::{Chat, CompletionError, PromptError};
-use rig_agent::streaming::{StreamedAssistantContent, StreamingPrompt};
+use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig_agent::tool::ToolContext;
 use rig_core::client::CompletionClient;
 use rig_core::message::{AssistantContent, Message, ReasoningContent, Text, ToolResultContent, UserContent};
@@ -124,6 +124,9 @@ impl PicoAgent for CodeAgent {
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
+        // The run-scoped transcript is shared with the hook and the stream
+        // loop so a mid-turn failure can persist exactly what completed.
+        let transcript = Arc::new(Mutex::new(TurnTranscript::default()));
         let mut stream = self
             .agent
             .stream_prompt(input)
@@ -134,6 +137,7 @@ impl PicoAgent for CodeAgent {
                 reasoning_in_context: self.reasoning_in_context,
                 provider: self.provider.clone(),
                 model: self.model.clone(),
+                transcript: transcript.clone(),
             })
             .max_turns(self.tool_call_limit)
             // Allow one in-turn recovery for the model calling a tool that
@@ -190,7 +194,21 @@ impl PicoAgent for CodeAgent {
                             }
                             _ => {}
                         },
-                        Some(Ok(MultiTurnStreamItem::StreamUserItem(_))) => {}
+                        Some(Ok(MultiTurnStreamItem::StreamUserItem(
+                            StreamedUserContent::ToolResult {
+                                tool_result, ..
+                            },
+                        ))) => {
+                            // Tool-result stream items are the canonical
+                            // `Message::User` content rig committed to its own
+                            // `new_messages`. Accumulate them (batched by
+                            // `TurnTranscript` into one user message per
+                            // completed batch) so a mid-turn failure can
+                            // persist the completed tool work.
+                            if let Ok(mut t) = transcript.lock() {
+                                t.push_tool_result(tool_result);
+                            }
+                        }
                         Some(Ok(MultiTurnStreamItem::CompletionCall(call))) => {
                             // Plumb per-request usage out of the stream (compaction's
                             // prerequisite — doc/compaction.md §2.7). The last call's
@@ -241,9 +259,23 @@ impl PicoAgent for CodeAgent {
                             // next turn's context.
                             if let StreamingError::Prompt(prompt_err) = &e {
                                 if let PromptError::PromptCancelled { .. } = prompt_err.as_ref() {
+                                    // Cancelled mid-run (Esc or a hook Stop).
+                                    // Persist the user prompt plus whatever
+                                    // completed: the finalized transcript
+                                    // (accepted turns + completed tool batches
+                                    // + synthesized answers for interrupted
+                                    // calls), or the streamed text when no
+                                    // turn completed yet.
                                     let mut partial = vec![Message::user(input)];
-                                    if !output.is_empty() {
-                                        partial.push(Message::assistant(&output));
+                                    {
+                                        let mut t = transcript
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        if t.has_progress() {
+                                            partial.extend(t.finalize());
+                                        } else if !output.is_empty() {
+                                            partial.push(Message::assistant(&output));
+                                        }
                                     }
                                     cancelled_history = Some(partial);
                                     aborted = true;
@@ -255,22 +287,70 @@ impl PicoAgent for CodeAgent {
                             // steering message sees the user's input and any partial
                             // assistant text, rather than having it silently dropped.
                             // See doc/pi_steering_rig.md §6.5.3.
+                            //
+                            // EXCEPTION (auto-retryable errors): when the classified
+                            // error is one the REPL will auto-retry (429, transport,
+                            // upstream 5xx, stream protocol, malformed tool call),
+                            // the SAME logical turn is re-attempted — the retry calls
+                            // `prompt()` again with the same input, and rig re-sends
+                            // the full context history for the turn (the same way it
+                            // does for a tool-result continuation). Persisting
+                            // `user(input)` here would therefore duplicate the user's
+                            // message in the session on every retry. Skip the
+                            // intermediate persistence for those errors; the partial
+                            // assistant text (in `output`) is dropped too, so the
+                            // retry starts from a clean, single copy of the turn.
+                            // Preserve progress on a non-cancellation error.
+                            //
+                            // When the classified error is auto-retryable AND
+                            // nothing completed (no accepted model turn, no
+                            // streamed text), we persist NOTHING: the REPL
+                            // re-sends the original `input` as a clean single
+                            // copy of the turn. When something did complete,
+                            // we persist `user(input)` + the finalized
+                            // transcript once, and return an
+                            // `LlmInterrupted` error so the REPL continues
+                            // from that transcript with a steering message
+                            // instead of re-sending `input` (which would
+                            // duplicate it). Non-retryable errors keep the
+                            // earlier Phase 2a behavior so the user's turn is
+                            // never lost on give-up. See
+                            // doc/tool_error_handling.md §Mid-turn failure.
+                            let classified = classify_stream_error(&e);
+                            let retryable = classified.is_auto_retryable();
+                            let mut progress_persisted = false;
                             if let Some(s) = session {
-                                let user_msg = Message::user(input);
-                                let _ = s.append_message(&user_msg).await;
-                                if !output.is_empty() {
-                                    let partial = Message::assistant(&output);
-                                    let _ = s.append_message(&partial).await;
+                                // Finalize what completed (accepted turns +
+                                // tool batches; never truncates).
+                                let (transcript_msgs, has_accepted) = {
+                                    let mut t = transcript
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let has_accepted = t.has_progress();
+                                    let msgs = if has_accepted { t.finalize() } else { Vec::new() };
+                                    (msgs, has_accepted)
+                                };
+                                if !retryable || has_accepted || !output.is_empty() {
+                                    let _ = s.append_message(&Message::user(input)).await;
+                                    if has_accepted {
+                                        for m in &transcript_msgs {
+                                            let _ = s.append_message(m).await;
+                                        }
+                                    } else if !output.is_empty() {
+                                        let _ = s
+                                            .append_message(&Message::assistant(&output))
+                                            .await;
+                                    }
+                                    progress_persisted = retryable;
                                 }
                             }
                             self.output.end_response();
-                            // Classify the failure into a typed `PicocodeError` so
-                            // the REPL can render a useful message and decide
-                            // whether to auto-retry. `Other(e.to_string())` here
-                            // would lose the status/headers/retry-after that rig
-                            // already captured on the `CompletionError` — see
-                            // doc/tool_error_handling.md.
-                            return Err(classify_stream_error(&e));
+                            if retryable && progress_persisted {
+                                return Err(crate::PicocodeError::LlmInterrupted {
+                                    cause: Box::new(classified),
+                                });
+                            }
+                            return Err(classified);
                         }
                         None => break,
                     }
@@ -282,10 +362,19 @@ impl PicoAgent for CodeAgent {
                         // closes the HTTP connection; any running tool was already
                         // killed by the watchdog (Phase 1a-d tool-cancel channel).
                         //
-                        // Capture partial turn for persistence.
+                        // Capture partial turn for persistence: user prompt +
+                        // finalized transcript (or streamed text when no
+                        // turn completed).
                         let mut partial = vec![Message::user(input)];
-                        if !output.is_empty() {
-                            partial.push(Message::assistant(&output));
+                        {
+                            let mut t = transcript
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if t.has_progress() {
+                                partial.extend(t.finalize());
+                            } else if !output.is_empty() {
+                                partial.push(Message::assistant(&output));
+                            }
                         }
                         cancelled_history = Some(partial);
                         aborted = true;
@@ -415,6 +504,50 @@ async fn cancellable_sleep(
     }
 }
 
+/// How many retry attempts the REPL grants for `e`, per logical turn (the
+/// caller's `attempt` counter is scoped to one prompt submission, so a fresh
+/// user prompt resets it). Rate-limited turns get a large budget — an
+/// overloaded service is the *reason* the run failed, and each attempt that
+/// made progress persisted it, so retrying is cheap. All other retryable
+/// classes keep a single retry: a stream of them signals a deeper problem.
+/// Post-MVP: expose the rate-limit budget via `AgentConfig`.
+fn retry_budget(e: &crate::PicocodeError) -> u8 {
+    let rate_limited = match e {
+        crate::PicocodeError::LlmRateLimited { .. } => true,
+        crate::PicocodeError::LlmInterrupted { cause } => {
+            matches!(&**cause, crate::PicocodeError::LlmRateLimited { .. })
+        }
+        _ => false,
+    };
+    if rate_limited {
+        20
+    } else {
+        1
+    }
+}
+
+/// Back-off delay before the next retry attempt. The provider's `Retry-After`
+/// hint (or OpenRouter's `metadata.retry_after_seconds`) is authoritative when
+/// present; otherwise an exponential back-off starting at 2 s (malformed tool
+/// call) or 3 s, doubling per attempt up to a 5-minute ceiling.
+fn retry_delay_secs(e: &crate::PicocodeError, attempt: u8) -> u64 {
+    if let Some(hint) = e.retry_after_secs() {
+        return hint;
+    }
+    let base = match e {
+        crate::PicocodeError::LlmMalformedToolCall { .. } => 2,
+        crate::PicocodeError::LlmInterrupted { cause }
+            if matches!(&**cause, crate::PicocodeError::LlmMalformedToolCall { .. }) =>
+        {
+            2
+        }
+        _ => 3,
+    };
+    // `1 << min(attempt-1, 6)` caps growth at 64× the base.
+    let multiplier = 1u64 << attempt.saturating_sub(1).min(6);
+    (base as u64).saturating_mul(multiplier).min(300)
+}
+
 /// Classify a `StreamingError` into a structured `PicocodeError` variant.
 /// `prompt()` invokes this on every non-cancellation stream error. The
 /// return is what the REPL shows the user, what determines whether the
@@ -508,6 +641,134 @@ fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
         }
     }
     None
+}
+
+/// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
+/// shape: `[assistant, user(tool-results), assistant, …]` (the user prompt is
+/// added at persist time by `prompt()`, which owns `input`). picocode
+/// accumulates this from the stream events so a mid-turn failure can persist
+/// exactly what completed — and nothing more — before the REPL retries.
+///
+/// * [`LoggingHook::on_model_turn_finished`] appends each *accepted* assistant
+///   turn (`event.content` is the canonical, provider-normalized
+///   `AssistantContent` rig parked for the turn — the same content a
+///   successful run persists via `FinalResponse.messages()`).
+/// * Tool-result stream items (`StreamUserItem(ToolResult)`) are batched into
+///   one `Message::User` and flushed on the next assistant turn or at
+///   [`finalize`](Self::finalize) — matching rig, which pushes each completed
+///   batch as a single `Message::User`.
+///
+/// [`finalize`](Self::finalize) returns a canonical transcript for
+/// persistence: a trailing assistant turn whose tool calls were never answered
+/// (the run was interrupted mid-batch) is *completed* with synthesized text
+/// tool results — one per unanswered call, marked "did not execute" — so
+/// nothing is dropped or truncated and rig's `validate_canonical` passes.
+/// This mirrors rig's own `invalid_tool_retry_user_message`
+/// (`rig-run/src/transcript.rs`), which answers rejected calls with text
+/// results rather than removing them.
+#[derive(Default)]
+struct TurnTranscript {
+    /// Completed messages in canonical order.
+    committed: Vec<Message>,
+    /// Accepted assistant turns. `> 0` means the run got past the first model
+    /// call — i.e. there is progress worth persisting on a mid-turn failure.
+    assistant_turns: usize,
+    /// Tool results of the in-flight batch (following an assistant tool
+    /// turn); flushed as one `Message::User` on the next assistant turn or at
+    /// finalize.
+    pending_results: Vec<UserContent>,
+}
+
+impl TurnTranscript {
+    /// Append an accepted assistant turn. Any pending tool-result batch is
+    /// flushed first so the transcript stays canonical (assistant → user
+    /// results → …). Turns with no visible content (rig curates empty turns
+    /// out of history) are skipped.
+    fn push_assistant_turn(&mut self, id: Option<String>, content: Vec<AssistantContent>) {
+        self.flush_results();
+        if !assistant_content_is_visible(&content) {
+            return;
+        }
+        self.committed.push(Message::Assistant { id, content });
+        self.assistant_turns += 1;
+    }
+
+    /// Accumulate one tool result of the in-flight batch.
+    fn push_tool_result(&mut self, result: rig_core::message::ToolResult) {
+        self.pending_results.push(UserContent::ToolResult(result));
+    }
+
+    /// Whether any model turn completed (progress worth persisting).
+    fn has_progress(&self) -> bool {
+        self.assistant_turns > 0
+    }
+
+    /// The canonical transcript to persist on interruption. Flushes any
+    /// pending tool-result batch, then — if the transcript still ends on an
+    /// assistant turn with tool calls that never ran — answers each call with
+    /// a synthesized text result. Never truncates or drops progress.
+    fn finalize(&mut self) -> Vec<Message> {
+        self.flush_results();
+        let needs_synthesis = matches!(
+            self.committed.last(),
+            Some(Message::Assistant { content, .. })
+                if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)))
+        );
+        if needs_synthesis {
+            let calls: Vec<&rig_core::message::ToolCall> = match self.committed.last() {
+                Some(Message::Assistant { content, .. }) => content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::ToolCall(tc) => Some(tc),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let synthesized: Vec<UserContent> = calls
+                .iter()
+                .map(|tc| {
+                    UserContent::ToolResult(rig_core::message::ToolResult {
+                        call: tc.id.clone(),
+                        provider: tc.provider.clone(),
+                        name: tc.function.name.clone(),
+                        content: vec![ToolResultContent::text(format!(
+                            "[tool call `{}` was interrupted before execution; \
+                             it did not run. Continue from the conversation above.]",
+                            tc.function.name
+                        ))],
+                    })
+                })
+                .collect();
+            if !synthesized.is_empty() {
+                self.committed.push(Message::User {
+                    content: synthesized,
+                });
+            }
+        }
+        self.committed.clone()
+    }
+
+    /// Flush a pending tool-result batch as one `Message::User`.
+    fn flush_results(&mut self) {
+        if self.pending_results.is_empty() {
+            return;
+        }
+        let results = std::mem::take(&mut self.pending_results);
+        self.committed.push(Message::User { content: results });
+    }
+}
+
+/// Whether an accepted assistant turn carries anything the user/model should
+/// see (non-empty text, reasoning, a tool call, or any other content part).
+/// Mirrors rig's curation of empty turns out of history.
+fn assistant_content_is_visible(content: &[AssistantContent]) -> bool {
+    content.iter().any(|c| match c {
+        AssistantContent::Text(t) => !t.text.trim().is_empty(),
+        AssistantContent::Reasoning(r) => !reasoning_text(r).is_empty(),
+        AssistantContent::ToolCall(_) => true,
+        _ => true,
+    })
 }
 
 /// Flatten a rig `Reasoning` payload into plain text. Provider-specific
@@ -1053,6 +1314,10 @@ struct LoggingHook {
     reasoning_in_context: bool,
     provider: String,
     model: String,
+    /// Run-scoped canonical transcript accumulator; see [`TurnTranscript`].
+    /// Hooks and the prompt loop both append under this mutex in stream
+    /// order, so the transcript mirrors rig's own `new_messages`.
+    transcript: Arc<Mutex<TurnTranscript>>,
 }
 
 impl AgentHook for LoggingHook {
@@ -1138,6 +1403,14 @@ impl AgentHook for LoggingHook {
                 };
                 let turn_id = logger.current_turn_id();
                 logger.log_message("received", &msg, turn_id).await;
+            }
+            // Accumulate the accepted turn into the run transcript so a
+            // mid-turn failure can persist exactly what completed (see
+            // `TurnTranscript` / doc/tool_error_handling.md). This branch
+            // returns `Continue`, i.e. the turn was accepted — matching rig's
+            // own history commit for the same content.
+            if let Ok(mut t) = self.transcript.lock() {
+                t.push_assistant_turn(event.identity.message_id.clone(), event.content.clone());
             }
             ModelTurnAction::Continue
         }
@@ -2919,6 +3192,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 let response: std::result::Result<String, crate::PicocodeError> = {
                     let mut attempt = 0u8;
                     let mut next_input: String = input.clone();
+                    // The full steering message (synthetic feedback / "continue
+                    // where you left off") is delivered once per logical turn;
+                    // `prompt()` persists it with the partial transcript when a
+                    // retry makes progress and then fails again. Re-sending the
+                    // same full steer on that later interruption would repeat it
+                    // in the session once the retry succeeds, so later
+                    // interruptions get a short continuation instead.
+                    let mut steer_delivered = false;
                     let outcome: std::result::Result<String, crate::PicocodeError> = loop {
                         attempt += 1;
                         let prompt_result = agent
@@ -2933,24 +3214,18 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     "Aborted.".into(),
                                 ));
                             }
-                            Err(e) if attempt == 1 && e.is_auto_retryable() => {
-                                // Surface the classified error to the user so
-                                // they see what's happening during the back-off.
-                                config.output.display_text(&format!("Error: {}", e));
-                                // Back-off: provider hint for 429, short
-                                // fixed delay otherwise. The reader stays
-                                // alive across the sleep so `Esc` here aborts
-                                // the retry.
-                                let secs = e
-                                    .retry_after_secs()
-                                    .unwrap_or(if matches!(
-                                        e,
-                                        crate::PicocodeError::LlmMalformedToolCall { .. }
-                                    ) {
-                                        2
-                                    } else {
-                                        3
-                                    });
+                            Err(crate::PicocodeError::LlmInterrupted { cause, .. })
+                                if attempt <= retry_budget(&cause) =>
+                            {
+                                // `prompt()` persisted the user prompt + the
+                                // finalized partial transcript to the session
+                                // and returned `LlmInterrupted`. Continue from
+                                // that transcript with a steering message — the
+                                // original `input` is already in the session,
+                                // so re-sending it would duplicate the user's
+                                // request.
+                                config.output.display_text(&format!("Error: {}", cause));
+                                let secs = retry_delay_secs(&cause, attempt);
                                 config
                                     .output
                                     .display_text(&format!("Retrying in {secs}s..."));
@@ -2965,18 +3240,67 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                         "Aborted.".into(),
                                     ));
                                 }
-                                // Build the next input. For malformed tool
-                                // calls, the model needs to *see* the parse
-                                // error to self-correct — inject a synthetic
-                                // user message describing the failure and
-                                // re-prompt with that (the original `input`
-                                // is already in the session from the failed
-                                // attempt). For all other retryable errors
-                                // we re-prompt with the same input.
+                                // Steering prompt: the synthetic feedback for
+                                // e.g. malformed tool calls, else a generic
+                                // continuation pointing at the persisted work.
+                                // NOT appended to the session — it becomes the
+                                // retry's prompt (input + partial are already
+                                // persisted). Delivered in full only once per
+                                // logical turn; after the model has already been
+                                // steered once and made further (persisted)
+                                // progress, a short continuation suffices and
+                                // avoids repeating the steer text in the session.
+                                next_input = if steer_delivered {
+                                    "Please continue where you left off.".to_string()
+                                } else {
+                                    steer_delivered = true;
+                                    match cause.synthetic_retry_feedback() {
+                                        Some(fb) => fb,
+                                        None => {
+                                            "The previous request was interrupted by a transient \
+                                             provider error. The conversation above contains the \
+                                             work completed before the interruption; continue \
+                                             where you left off."
+                                                .to_string()
+                                        }
+                                    }
+                                };
+                                if cancel.load(Ordering::SeqCst) {
+                                    break Err(crate::PicocodeError::Cancelled(
+                                        "Aborted.".into(),
+                                    ));
+                                }
+                                continue;
+                            }
+                            Err(e) if attempt <= retry_budget(&e) && e.is_auto_retryable() => {
+                                // No progress was persisted (`prompt()` returned
+                                // the plain classified error): the turn never
+                                // got past its first model call, so we re-run it
+                                // from `input`. For malformed tool calls the
+                                // model needs the parse error to self-correct —
+                                // and the original `input` is NOT yet in the
+                                // session, so re-establish it first, then
+                                // re-prompt with the synthetic feedback.
+                                config.output.display_text(&format!("Error: {}", e));
+                                let secs = retry_delay_secs(&e, attempt);
+                                config
+                                    .output
+                                    .display_text(&format!("Retrying in {secs}s..."));
+                                let slept = cancellable_sleep(
+                                    &config.user_cancel,
+                                    &config.cancel_notify,
+                                    secs,
+                                )
+                                .await;
+                                if !slept {
+                                    break Err(crate::PicocodeError::Cancelled(
+                                        "Aborted.".into(),
+                                    ));
+                                }
                                 if let Some(feedback) = e.synthetic_retry_feedback() {
                                     if let Some(ref s) = session {
                                         let _ = s
-                                            .append_message(&Message::user(&feedback))
+                                            .append_message(&Message::user(input.clone()))
                                             .await;
                                     }
                                     next_input = feedback;
@@ -3305,6 +3629,7 @@ mod tests {
                 reasoning_in_context: false,
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
+                transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
             })
             .max_turns(1)
             .await;
@@ -3817,6 +4142,36 @@ mod tests {
     }
 
     #[test]
+    fn classify_control_character_parse_error_is_retryable_with_feedback() {
+        // The content-echo subclass (raw control characters in a string —
+        // the model copied file/terminal bytes into `edit.old_text`) must
+        // stay auto-retryable WITH synthetic feedback: the manual workflow
+        // is to paste the parse error and let the model retry, and that
+        // works (the model re-reads the source and re-emits clean JSON).
+        // Automate it — do not special-case it as non-retryable.
+        let err = CompletionError::ResponseError(
+            "tool call `edit` arrived with malformed JSON input: \
+             control character (\\u0000-\\u001F) found while parsing a string at line 2 column 0"
+                .into(),
+        );
+        let classified = super::classify_completion_error(&err);
+        match classified {
+            PicocodeError::LlmMalformedToolCall {
+                ref tool_name,
+                ref parse_error,
+            } => {
+                assert_eq!(tool_name, "edit");
+                assert!(parse_error.contains("control character"));
+                assert!(classified.is_auto_retryable());
+                let fb = classified.synthetic_retry_feedback().unwrap();
+                assert!(fb.contains("edit"));
+                assert!(fb.contains("control character"));
+            }
+            other => panic!("expected LlmMalformedToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classify_prompt_cancelled_is_not_retryable() {
         let e = StreamingError::Prompt(Box::new(PromptError::prompt_cancelled(
             Vec::<Message>::new(),
@@ -4024,6 +4379,73 @@ mod tests {
             msg.contains("expected `,` or `}` at line 1"),
             "message missing: {msg}"
         );
+    }
+    // ---- TurnTranscript accumulation & finalization ----
+    //
+    // The transcript mirrors rig's `new_messages` shape so a mid-turn failure
+    // can persist exactly what completed (doc/tool_error_handling.md
+    // §Mid-turn failure). These tests pin the accumulation order and the
+    // no-truncation finalization: unanswered trailing tool calls are answered
+    // with synthesized text results, never dropped.
+
+    #[test]
+    fn transcript_batches_tool_results_between_assistant_turns() {
+        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent};
+        use super::TurnTranscript;
+
+        let tc = ToolCall::from_wire("call_1", ToolFunction::new("read".to_string(), serde_json::json!({})));
+        let call_id = tc.id.clone();
+        let mut t = TurnTranscript::default();
+        // Assistant turn with a tool call.
+        t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
+        assert!(t.has_progress());
+        // Tool result streams back (batch accumulates).
+        t.push_tool_result(rig_core::message::ToolResult {
+            call: call_id,
+            provider: None,
+            name: "read".to_string(),
+            content: vec![ToolResultContent::text("ok")],
+        });
+        // Next assistant turn flushes the batch as one Message::User.
+        t.push_assistant_turn(None, vec![AssistantContent::text("done")]);
+        let f = t.finalize();
+        assert_eq!(f.len(), 3, "assistant + user(results) + assistant: {f:?}");
+        assert!(matches!(&f[1], Message::User { .. }), "batch must be one user msg");
+    }
+
+    #[test]
+    fn transcript_finalize_answers_interrupted_calls_with_text_results() {
+        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent, UserContent};
+        use super::TurnTranscript;
+
+        let tc = ToolCall::from_wire("call_1", ToolFunction::new("read".to_string(), serde_json::json!({})));
+        let mut t = TurnTranscript::default();
+        t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
+        // Run interrupted before any tool result: finalize must synthesize a
+        // text result per unanswered call — never truncate.
+        let f = t.finalize();
+        assert_eq!(f.len(), 2, "assistant + synthesized user: {f:?}");
+        let Message::User { content } = &f[1] else {
+            panic!("expected a user message");
+        };
+        let UserContent::ToolResult(tr) = &content[0] else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(tr.name, "read");
+        let ToolResultContent::Text(txt) = &tr.content[0] else {
+            panic!("expected text content");
+        };
+        assert!(txt.text.contains("interrupted"), "got: {}", txt.text);
+    }
+
+    #[test]
+    fn transcript_skips_turns_without_visible_content() {
+        use super::TurnTranscript;
+
+        let mut t = TurnTranscript::default();
+        t.push_assistant_turn(None, vec![AssistantContent::text("   ")]);
+        assert!(!t.has_progress(), "blank-text turn must not count as progress");
+        assert!(t.finalize().is_empty());
     }
 }
 
