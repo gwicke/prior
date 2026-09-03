@@ -876,7 +876,7 @@ editable via `/set`):
 
 > Summarize the conversation so far in less than 2000 words. Preserve the
 > key technical decisions, file paths touched, current task state, and any
-> unresolved questions. Drop reasoning traces and tool-call boilerplate.
+> unresolved questions.
 
 After picking `llm`, the buffer becomes:
 
@@ -1077,30 +1077,31 @@ new label unchanged.
 ```rust
 ActiveOverlay::CompactSummary { target_id, opts, .. } => {
     if let Some(label) = opts.get(sel) {
-        let (mode, trailing) = match label.as_str() {
-            "truncate"   => ("truncate",   None),
-            "text only"  => ("text-only",  None),
-            "llm"        => ("llm",        Some(settings.llm_compact_prompt())),
-            _            => ("",           None),
-        };
-        if mode.is_empty() { return OverlayAction::Continue; }
-        match trailing {
-                None => {
-                    // Commit + submit (unchanged path).
-                    let line = format!("/tree <{}> compact {}", target_id, mode);
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    return OverlayAction::Action(InputAction::Submit(line));
-                }
-                Some(prompt) => {
-                    // Stage the prompt for editing; do NOT commit/submit yet.
-                    let line = format!("/tree <{}> compact llm {}", target_id, prompt);
-                    editor.set(&line);
-                    // The user now edits freely; Enter on the editor line
-                    // goes through the normal InputAction::Submit path.
+        match label.as_str() {
+            "truncate"  => commit_and_submit(format!("/tree <{}> compact truncate", target_id)),
+            "text only" => commit_and_submit(format!("/tree <{}> compact text-only", target_id)),
+            "llm" => {
+                let buf = editor.text().to_string();
+                let prefix = format!("/tree <{}> compact llm", target_id);
+                let already_typed = buf
+                    .strip_prefix(&prefix)
+                    .map(|rest| !rest.trim().is_empty())
+                    .unwrap_or(false);
+                if already_typed {
+                    // Buffer IS the canonical line — commit + submit verbatim.
+                    // Covers the case where the user has typed (or pasted)
+                    // `/tree <id> compact llm <prompt>` directly, and the
+                    // overlay re-opened on Enter; pressing Enter again must
+                    // actually run the compaction, not re-stage the line.
+                    commit_and_submit(buf);
+                } else {
+                    // Stage the default prompt for editing.
+                    editor.set(&format!("{} {}", prefix, settings.llm_compact_prompt()));
                 }
             }
+            _ => {}
+        }
     }
-    OverlayAction::Continue
 }
 ```
 
@@ -1110,7 +1111,33 @@ prompt edit surface, which is what the prompt-editing convention expects.
 The `llm` option is special because the line carries an editable payload;
 this is the same shape as, e.g., the `/model` flow's "type to filter then
 Enter to commit" pattern, except that here the trailing text *is* the
-payload.
+payload. As soon as the buffer ends with non-empty text after `compact
+llm `, the line is treated as canonical and Enter commits it — so the
+second Enter (after staging) runs the compaction rather than re-staging.
+
+The `already_typed` check is what prevents the "Enter just re-stages the
+default" loop: the user picks `llm` from the menu → buffer becomes
+`/tree <id> compact llm <default>` → `from_buffer` re-opens the overlay
+(filtering by `llm <default>`); pressing Enter detects the trailing text
+and submits.
+
+#### `from_buffer` — first-word promotion for `CompactSummary`
+
+When the buffer is `/tree <id> compact llm <payload>`, the existing
+`filter_tree_options` fuzzy pre-selection can return the wrong active row:
+SkimMatcherV2 scores the long payload against the short mode labels
+(`truncate`, `text only`, `llm`) and frequently returns an empty score
+list (none of the labels are a superstring of the payload), so the
+function falls through to `(all_labels, Some(0))` — i.e. `truncate` is
+highlighted even though the user typed `llm`. To keep the highlighted row
+in sync with what the user actually typed, `from_buffer` post-processes
+the active position: if the first whitespace-delimited token of
+`sub_filter` matches a known mode label (with `text only` ↔ `text-only`
+normalisation), that mode becomes the active row regardless of the fuzzy
+result. Empty `sub_filter` (the user just typed `compact`) keeps the
+default `Some(0)` (truncate). This is purely a UI affordance; the handler
+in `handle_enter` also self-checks the buffer via
+`llm_compact_buffer_is_canonical` so the staged line is always honored.
 
 #### `handle_tab`
 

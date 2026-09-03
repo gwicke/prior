@@ -86,8 +86,7 @@ pub fn default_show_reasoning_handle() -> ShowReasoningHandle {
 /// value (or the built-in `DEFAULT_LLM_COMPACT_PROMPT` if empty).
 pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation so far in less than 2000 words. \
      Preserve the key technical decisions, file paths touched, current \
-     task state, and any unresolved questions. Drop reasoning traces \
-     and tool-call boilerplate.";
+     task state, and any unresolved questions.";
 
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

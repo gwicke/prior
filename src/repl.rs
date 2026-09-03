@@ -710,8 +710,29 @@ impl ActiveOverlay {
                                     ctx,
                                     &mut header,
                                 );
-                                let (opts, active) =
+                                let (opts, _fuzzy_active) =
                                     Repl::filter_tree_options(&["truncate", "text only", "llm"], &sub_filter);
+                                // If the filter begins with a known mode
+                                // label followed by whitespace (e.g. `llm
+                                // <payload>`), prefer that mode even when
+                                // the trailing payload makes SkimMatcher's
+                                // subsequence filter return no scores or
+                                // pre-select a different mode. The
+                                // `filter_tree_options` exact-token check
+                                // is full-string only, so we promote here
+                                // for first-word matches.
+                                let first = sub_filter
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or("");
+                                let first_normalized = first.replace(' ', "-");
+                                let active = opts
+                                    .iter()
+                                    .position(|l| {
+                                        l == first
+                                            || l.replace(' ', "-") == first_normalized
+                                    })
+                                    .or(_fuzzy_active);
                                 return ActiveOverlay::CompactSummary {
                                     target_id,
                                     header,
@@ -1566,22 +1587,39 @@ impl ActiveOverlay {
             }
             ActiveOverlay::CompactSummary { target_id, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
+                    // If the buffer already carries a fully-formed `compact
+                    // llm <payload>` line, the user has already committed
+                    // a canonical prompt. Honor it directly — commit and
+                    // submit, regardless of which option is currently
+                    // highlighted (the fuzzy filter treats the long
+                    // payload as a query and may not pre-select `llm`).
+                    // This is the only point where the slash-menu
+                    // convention (Enter commits a canonical line) holds
+                    // across label selection.
+                    if label.as_str() == "llm" {
+                        let buf = editor.text().to_string();
+                        if Repl::llm_compact_buffer_is_canonical(&buf, target_id) {
+                            Repl::emit_commit(
+                                output,
+                                editor,
+                                redraw,
+                                sel,
+                                input_row,
+                                &buf,
+                                "",
+                                false,
+                            );
+                            return OverlayAction::Action(InputAction::Submit(buf));
+                        }
+                        // Otherwise stage the default prompt for editing.
+                        let prefix = format!("/tree <{}> compact llm", target_id);
+                        let staged = format!("{} {}", prefix, settings.llm_compact_prompt());
+                        editor.set(&staged);
+                        return OverlayAction::Continue;
+                    }
                     let line = match label.as_str() {
                         "truncate" => format!("/tree <{}> compact truncate", target_id),
                         "text only" => format!("/tree <{}> compact text-only", target_id),
-                        // LLM mode stages an editable prompt (default from
-                        // settings); the user edits and presses Enter to
-                        // submit. No emit_commit here — the user hasn't
-                        // committed yet (see doc/tree_compaction.md §6.7).
-                        "llm" => {
-                            let staged = format!(
-                                "/tree <{}> compact llm {}",
-                                target_id,
-                                settings.llm_compact_prompt(),
-                            );
-                            editor.set(&staged);
-                            return OverlayAction::Continue;
-                        }
                         _ => String::new(),
                     };
                     if !line.is_empty() {
@@ -3093,6 +3131,18 @@ impl Repl {
             return None; // `<>` — empty id
         }
         Some(f[1..end].to_string())
+    }
+
+    /// True iff the editor buffer is a fully-formed `compact llm <payload>`
+    /// line for the given target id (i.e. the user has already typed a
+    /// canonical LLM-compaction line). Used by `handle_enter` to decide
+    /// between re-staging the default prompt and submitting verbatim.
+    fn llm_compact_buffer_is_canonical(buffer: &str, target_id: &str) -> bool {
+        let prefix = format!("/tree <{}> compact llm", target_id);
+        buffer
+            .strip_prefix(&prefix)
+            .map(|rest| !rest.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// Fuzzy-filter option labels for a `/tree` sub-menu. Returns
@@ -4893,6 +4943,56 @@ mod tests {
             }
             other => panic!("expected CompactSummary, got disc {:?}", other.overlay_disc()),
         }
+    }
+
+    #[test]
+    fn from_buffer_tree_id_compact_llm_with_payload_promotes_to_compact_summary() {
+        // When the buffer already carries a fully-formed `compact llm
+        // <payload>` line, the overlay re-opens as CompactSummary with
+        // `llm` pre-selected (the first-word promotion in `from_buffer`
+        // overrides the empty SkimMatcher score list for the long
+        // payload). The handler then detects trailing text and commits
+        // + submits.
+        let ov = tree_overlay("/tree <root-entry> compact llm Summarize this");
+        match ov {
+            ActiveOverlay::CompactSummary { target_id, opts, active, _filter, .. } => {
+                assert_eq!(target_id, "root-entry");
+                // First-word promotion picks `llm` regardless of the
+                // fuzzy score (which is empty for a long payload).
+                assert_eq!(active, Some(2));
+                assert_eq!(opts[active.unwrap()], "llm");
+            }
+            other => panic!("expected CompactSummary, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn llm_compact_buffer_is_canonical_detects_payload() {
+        // Buffer with trailing payload is canonical.
+        assert!(Repl::llm_compact_buffer_is_canonical(
+            "/tree <e1> compact llm Summarize this",
+            "e1",
+        ));
+        // Whitespace-only payload (single space) is not canonical.
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "/tree <e1> compact llm ",
+            "e1",
+        ));
+        // Just `compact llm` (no trailing text) is not canonical.
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "/tree <e1> compact llm",
+            "e1",
+        ));
+        // Different target id — not canonical for this target.
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "/tree <e2> compact llm Summarize this",
+            "e1",
+        ));
+        // Unrelated buffer.
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "hello world",
+            "e1",
+        ));
     }
 
     #[test]
