@@ -3720,8 +3720,18 @@ impl Repl {
             KeyCode::Up => {
                 let (w, _) = crossterm::terminal::size().unwrap_or((80, 24));
                 if !editor.visual_up(w as usize, prompt) {
-                    if let Some(s) = history.prev(&editor.text(), nav, draft) {
-                        editor.set(&s);
+                    // Only fall through to history when there is no unsubmitted
+                    // draft in the buffer. Otherwise, a stray Up at the top of the
+                    // prompt would silently stash the in-progress text and
+                    // replace it with the previous history entry — a destructive
+                    // action that's easy to trigger when reaching for Home.
+                    // When a draft *does* exist (the user already navigated
+                    // back), keep the existing behavior so they can still step
+                    // through history.
+                    if editor.text().is_empty() || nav.is_some() {
+                        if let Some(s) = history.prev(&editor.text(), nav, draft) {
+                            editor.set(&s);
+                        }
                     }
                 }
                 None
@@ -5419,6 +5429,79 @@ mod tests {
         assert_eq!(h.next(&mut nav, &mut draft), Some("second".to_string()));
         assert_eq!(h.next(&mut nav, &mut draft), Some("draft".to_string()));
         assert!(nav.is_none());
+    }
+
+    #[test]
+    fn up_at_top_preserves_unsubmitted_prompt() {
+        // Regression: hitting Up at the top of an unsubmitted prompt used to
+        // silently stash the in-progress text as the history draft and replace
+        // it with the previous entry — easy to trigger when reaching for Home
+        // and destructive enough to lose the whole prompt. Up should now be a
+        // no-op while the buffer is non-empty and the user hasn't started
+        // navigating history yet.
+        let mut h = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        h.add("first");
+        h.add("second");
+        let mut nav: Option<usize> = None;
+        let mut draft = String::new();
+        let mut editor = LineEditor::from_text("in progress");
+        editor.end();
+        let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
+        assert_eq!(editor.text(), "in progress", "Up must not clobber the unsubmitted prompt");
+        assert!(nav.is_none(), "history navigation must not have started");
+        assert!(draft.is_empty(), "no draft should have been stashed");
+    }
+
+    #[test]
+    fn up_at_top_with_empty_buffer_still_loads_history() {
+        // Counterpart to the regression test: an empty buffer should still
+        // navigate history on Up so the previous-entry recall behavior
+        // (the original reason Up-on-top exists) is preserved.
+        let mut h = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        h.add("first");
+        h.add("second");
+        let mut nav: Option<usize> = None;
+        let mut draft = String::new();
+        let mut editor = LineEditor::new();
+        let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
+        assert_eq!(editor.text(), "second", "empty buffer should load latest history entry");
+        assert!(nav.is_some());
+        assert!(draft.is_empty());
+    }
+
+    #[test]
+    fn up_continues_history_navigation_when_already_inside() {
+        // Once the user has already navigated back (nav is Some), they are
+        // intentionally walking the history; Up must keep advancing even if
+        // the buffer is non-empty (it now holds a history entry, not a fresh
+        // draft), and Down must keep restoring.
+        let mut h = History {
+            entries: Vec::new(),
+            file: None,
+        };
+        h.add("first");
+        h.add("second");
+        let mut nav: Option<usize> = None;
+        let mut draft = String::new();
+        let mut editor = LineEditor::new();
+        let up = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let _ = Repl::edit_key(up, &mut editor, &mut h, &mut nav, &mut draft, "");
+        assert_eq!(editor.text(), "second");
+        // second Up while buffer is non-empty should still navigate (nav != None)
+        let _ = Repl::edit_key(up, &mut editor, &mut h, &mut nav, &mut draft, "");
+        assert_eq!(editor.text(), "first");
+        // Down restores the previous entry
+        let down = event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let _ = Repl::edit_key(down, &mut editor, &mut h, &mut nav, &mut draft, "");
+        assert_eq!(editor.text(), "second");
     }
 
     #[test]
