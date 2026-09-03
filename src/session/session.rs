@@ -546,55 +546,6 @@ impl Session {
         index.leaf_id.clone()
     }
 
-    /// Return the text of the most recent user message on the leaf→root
-    /// branch, walking backwards through `assistant` / `user` /
-    /// `toolResult` / model-change / thinking-level-change entries until a
-    /// user message is found. Used by retry/de-dup logic to check whether
-    /// a candidate user prompt is already at the tail of the session
-    /// (so a fresh persist would duplicate it). `None` if no user
-    /// message is on the branch yet.
-    pub async fn last_user_message_text(&self) -> Option<String> {
-        let index = self.index.lock().await;
-        let leaf_id = index.leaf_id.clone()?;
-        let mut current_id = leaf_id;
-        loop {
-            let entry = match index.entries.get(&current_id) {
-                Some(e) => e,
-                None => return None,
-            };
-            if let crate::session::types::SessionEntryContent::Message { message } = &entry.content {
-                if message.get("role").and_then(|r| r.as_str()) == Some("user") {
-                    // Walk the user message's content array and concatenate
-                    // any text parts. We only match on plain text; tool
-                    // result content is not a user prompt and is not
-                    // returned here.
-                    if let Some(content) = message.get("content") {
-                        if let Some(arr) = content.as_array() {
-                            let mut text = String::new();
-                            for part in arr {
-                                if let Some(s) = part.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        text.push('\n');
-                                    }
-                                    text.push_str(s);
-                                }
-                            }
-                            if !text.is_empty() {
-                                return Some(text);
-                            }
-                        } else if let Some(s) = content.as_str() {
-                            return Some(s.to_string());
-                        }
-                    }
-                }
-            }
-            match &entry.parent_id {
-                Some(pid) => current_id = pid.clone(),
-                None => return None,
-            }
-        }
-    }
-
     /// Build a recursive tree from the in-memory index.
     pub async fn get_tree(&self) -> Vec<SessionTreeNode> {
         let index = self.index.lock().await;
@@ -2296,56 +2247,6 @@ mod tests {
         assert!(!json.contains("\"provider\""));
         assert!(!json.contains("\"modelId\""));
         assert!(!json.contains("\"thinkingLevel\""));
-    }
-
-    #[tokio::test]
-    async fn test_last_user_message_text_walks_back_to_most_recent_user() {
-        // Helper to set up a fresh on-disk session for a unit test.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-last-user-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let filename = session_filename(&chrono::Utc::now());
-        let path = dir.join(&filename);
-        let storage = JsonlSessionStorage::open_or_create(path.clone())
-            .await
-            .unwrap();
-        let header = SessionHeader::new(std::path::Path::new("/test"));
-        storage.write_header(&header).await.unwrap();
-        let index = storage.build_index().await.unwrap();
-        let session = Session::new_persisted(storage, index);
-
-        // Empty session: no user message yet.
-        assert_eq!(session.last_user_message_text().await, None);
-
-        // Single user message: that one.
-        session.append_message(&Message::user("hello")).await.unwrap();
-        assert_eq!(
-            session.last_user_message_text().await,
-            Some("hello".to_string())
-        );
-
-        // Add an assistant turn: the leaf is now assistant, but
-        // last_user_message_text still walks back to the user.
-        session
-            .append_message(&Message::assistant("world"))
-            .await
-            .unwrap();
-        assert_eq!(
-            session.last_user_message_text().await,
-            Some("hello".to_string())
-        );
-
-        // New user message: now THAT is the most recent user.
-        session.append_message(&Message::user("again")).await.unwrap();
-        assert_eq!(
-            session.last_user_message_text().await,
-            Some("again".to_string())
-        );
     }
 
     // ------------------------------------------------------------------
