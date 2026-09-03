@@ -1145,6 +1145,22 @@ fn derive_model(entries: &[SessionEntry]) -> Option<String> {
         })
 }
 
+/// Find the most recent `ModelChange` on the branch (closest to leaf),
+/// returning both the provider and the model id. Used by the resume
+/// prefill, which formats `provider:model_id` so the `/model` overlay's
+/// fuzzy filter matches a single catalog entry directly.
+pub(crate) fn derive_model_change(
+    entries: &[SessionEntry],
+) -> Option<(String, String)> {
+    entries.iter().rev().find_map(|e| {
+        if let SessionEntryContent::ModelChange { provider, model_id } = &e.content {
+            Some((provider.clone(), model_id.clone()))
+        } else {
+            None
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1433,6 +1449,64 @@ mod tests {
         assert_eq!(derive_thinking_level(&entries), Some("high".into()));
         // Latest model change wins (closest to leaf)
         assert_eq!(derive_model(&entries), Some("gpt-4o".into()));
+    }
+
+    #[test]
+    fn test_derive_model_change_returns_provider_and_model_id() {
+        let entries = vec![
+            SessionEntry {
+                id: "e1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            SessionEntry {
+                id: "e2".into(),
+                parent_id: Some("e1".into()),
+                timestamp: "t2".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "openai".into(),
+                    model_id: "gpt-4o".into(),
+                },
+            },
+        ];
+        // Latest ModelChange wins (closest to leaf in rev() iteration).
+        assert_eq!(
+            derive_model_change(&entries),
+            Some(("openai".into(), "gpt-4o".into()))
+        );
+
+        // No ModelChange → None.
+        let empty: Vec<SessionEntry> = vec![];
+        assert_eq!(derive_model_change(&empty), None);
+
+        // Other entry types in between don't break the leaf-first walk.
+        let mixed = vec![
+            SessionEntry {
+                id: "e1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-sonnet-4-5".into(),
+                },
+            },
+            SessionEntry {
+                id: "e2".into(),
+                parent_id: Some("e1".into()),
+                timestamp: "t2".into(),
+                content: SessionEntryContent::ThinkingLevelChange {
+                    thinking_level: "high".into(),
+                },
+            },
+        ];
+        assert_eq!(
+            derive_model_change(&mixed),
+            Some(("anthropic".into(), "claude-sonnet-4-5".into()))
+        );
     }
 
     #[test]

@@ -1352,6 +1352,15 @@ When resuming a session:
 - **Next prompt continues normally.** The resumed session is indistinguishable
   from one that was never interrupted. Persistence via `append_message()` works
   the same way after resume as before.
+- **Model prefill on resume.** After the default replay
+  (`session_resume_replay_turns`, default 3), the next input prompt is
+  pre-filled with `/model <provider>:<model_id>` whenever the resumed
+  session has a `ModelChange` entry on its active leaf→root path, or the
+  session header carries `provider`/`modelId`. Pressing Enter accepts
+  (rebuilds the agent with that model); Esc dismisses; typing narrows the
+  model picker. The session-running agent itself is *not* silently switched
+  on resume — the user gets to choose. The thinking level is not yet
+  surfaced via prefill (single input field; see `doc/todo.md`).
 
 Resume is purely about restoring the LLM's context window. Visual continuity
 is the terminal's responsibility.

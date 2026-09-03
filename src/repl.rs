@@ -1879,6 +1879,7 @@ impl Repl {
     pub fn read_input(
         &mut self,
         prompt: &str,
+        initial_buffer: Option<&str>,
         history: &mut History,
         ctx: &ReplCtx,
         settings: &mut SettingsStore,
@@ -1887,6 +1888,15 @@ impl Repl {
         output: &dyn Output,
     ) -> Option<InputAction> {
         let mut editor = LineEditor::new();
+        // Seed the editor with a prefill string if one was provided. Used by
+        // `/session <id> resume` to surface the resumed session's stored model
+        // (`/model <provider>:<model_id>`) so the user can press Enter to
+        // accept, Esc to dismiss, or type to choose a different model.
+        // Pre-filling a slash command also opens its overlay immediately,
+        // so the model picker is visible without any extra keystroke.
+        if let Some(s) = initial_buffer {
+            editor.set(s);
+        }
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
         let mut sel: usize = 0;

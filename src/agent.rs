@@ -2010,8 +2010,11 @@ enum SessionCommandResult {
     NotSession,
     /// Session command handled, current session unchanged.
     Handled,
-    /// Session command created/resumed a new session with this ID.
-    Switched(String),
+    /// Session command created/resumed a new session with this ID. `prefill`
+    /// is pre-loaded into the next input prompt (use `None` for no prefill,
+    /// e.g. on fork; `Some("/model …")` on resume to surface the restored
+    /// model to the user for explicit confirmation).
+    Switched { id: String, prefill: Option<String> },
     /// Session command deleted a session.
     Deleted,
 }
@@ -2088,7 +2091,6 @@ pub(crate) enum ReplayUnit {
         summary: String,
     },
 }
-
 
 /// Build replay units from the raw session branch (root->leaf).
 ///
@@ -2372,14 +2374,49 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
         (n, false)
     }
 }
-/// Parse and dispatch a `/session <name> <action>` command.
 
+/// Build the `/model <provider>:<model_id>` prefill to surface the model
+/// the resumed session was last using. Looks at the active leaf→root
+/// branch first (a `ModelChange` entry is authoritative for mid-session
+/// `/model` switches); falls back to the session header's
+/// `provider`/`modelId` when no entry exists; returns `None` otherwise so
+/// the prompt stays empty and the user is not nudged to switch.
+///
+/// The full `provider:model_id` form is intentional: the `/model`
+/// overlay's fuzzy filter is keyed off `provider`/`display`/`id`/`qualified`
+/// (see `model_overlay_entries` in repl.rs), and the catalog entry's
+/// `qualified()` form is what the Enter handler emits as
+/// `InputAction::SetModel`. Pre-filling the unqualified `model_id` would
+/// only fuzzy-match on the short name and might surface multiple catalog
+/// entries with the same short name under different providers.
+async fn compute_resume_model_prefill(session: &Session) -> Option<String> {
+    let branch = session.get_branch().await;
+    // Branch-derived first: covers mid-session `/model` switches recorded
+    // as `ModelChange` entries.
+    if let Some((provider, model_id)) = crate::session::session::derive_model_change(&branch) {
+        return Some(format!("/model {}:{}", provider, model_id));
+    }
+    // Header fallback: covers sessions created with `with_model_context`
+    // that never recorded an explicit `ModelChange`. The header is only
+    // written once (at session creation), so this case is mostly relevant
+    // for sessions resumed very soon after their first turn.
+    let index = session.index.lock().await;
+    if let (Some(provider), Some(model_id)) = (&index.header.provider, &index.header.model_id) {
+        return Some(format!("/model {}:{}", provider, model_id));
+    }
+    None
+}
 /// Parse and dispatch a `/session <name> <action>` command.
+///
+/// `config` is *not* mutated on resume anymore: the running agent keeps
+/// whatever model it had before, and the restored session's stored model is
+/// surfaced to the user via a `/model <…>` prefill on the next prompt (see
+/// `compute_resume_model_prefill`). This keeps the accept/abort/choose
+/// decision in the user's hands.
 async fn handle_session_command(
     input: &str,
     session: &mut Option<Session>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
-    agent: &mut Option<Box<dyn PicoAgent>>,
     config: &mut AgentConfig,
     output: &Arc<dyn Output>,
     settings: &SettingsStore,
@@ -2440,27 +2477,17 @@ async fn handle_session_command(
 
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
-                        // Restore the model context the session was last using.
-                        // The header stores the provider/model/thinking at
-                        // creation; later switches are recorded as entries which
-                        // `build_context` derives from the branch, but the
-                        // process-wide agent config must be switched to match so
-                        // the *next* prompt uses the same model. Snapshot the old
-                        // values so we only rebuild when they actually differ.
-                        let prev_provider = config.provider.clone();
-                        let prev_model = config.model.clone();
-                        let prev_thinking = config.thinking_level.clone();
-
-                        if let Some(p) = &index.header.provider {
-                            config.provider = p.clone();
-                        }
-                        if let Some(m) = &index.header.model_id {
-                            config.model = m.clone();
-                        }
-                        if let Some(t) = &index.header.thinking_level {
-                            config.thinking_level = Some(t.clone());
-                        }
-
+                        // No silent restore of provider/model/thinking on
+                        // resume: doing so would mutate `config` and rebuild
+                        // the running agent behind the user's back, removing
+                        // the chance to accept/abort/choose a model. The
+                        // resumed session is loaded and replay is rendered
+                        // below; the model/thinking decision is surfaced to
+                        // the user via `compute_resume_model_prefill`, which
+                        // returns a `/model <provider>:<model_id>` prefill
+                        // when a `ModelChange` is on the active path or the
+                        // header carries provider/model metadata, otherwise
+                        // leaves the prompt empty.
                         let new_session = Session::new_persisted(storage, index);
                         let id = new_session.get_session_id().to_string();
 
@@ -2492,24 +2519,29 @@ async fn handle_session_command(
                             }
                         }
 
+                        // Build the model-restoration prefill: find the latest
+                        // `ModelChange` on the active leaf→root path, fall back
+                        // to the session header's provider/model when no entry
+                        // exists, otherwise leave the next prompt empty so the
+                        // user is not nudged to switch. We only restore the
+                        // model (not thinking level) — they share the single
+                        // input field, and silently setting `config.model` plus
+                        // rebuilding the agent bypasses the user's chance to
+                        // accept/abort/choose. Pending: a slug syntax that
+                        // bundles model + thinking into one prefill (see
+                        // doc/todo.md). The full `provider:model_id` form is
+                        // used so the `/model` overlay's fuzzy filter matches
+                        // the catalog entry directly; Enter then dispatches
+                        // `InputAction::SetModel` and rebuilds the agent.
+                        //
+                        // Computed BEFORE moving `new_session` into
+                        // `*session` because `compute_resume_model_prefill`
+                        // takes `&Session`.
+                        let prefill = compute_resume_model_prefill(&new_session).await;
+
                         *session = Some(new_session);
 
-                        // Rebuild the agent if the restored model config differs
-                        // from what the running agent was built with (e.g. the
-                        // user switched models, then switched back by resuming).
-                        if config.provider != prev_provider
-                            || config.model != prev_model
-                            || config.thinking_level != prev_thinking
-                        {
-                            match create_agent(config.clone()).await {
-                                Ok(new_agent) => *agent = Some(new_agent),
-                                Err(e) => config.output.display_text(&format!(
-                                    "Resumed session but cannot rebuild agent with stored model: {}",
-                                    e
-                                )),
-                            }
-                        }
-                        SessionCommandResult::Switched(id)
+                        SessionCommandResult::Switched { id, prefill }
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Cannot resume session: {}", e));
@@ -2545,7 +2577,7 @@ async fn handle_session_command(
                         let new_session = Session::new_persisted(new_storage, index);
                         let id = new_session.get_session_id().to_string();
                         *session = Some(new_session);
-                        SessionCommandResult::Switched(id)
+                        SessionCommandResult::Switched { id, prefill: None }
                     }
                     Err(e) => {
                         config.output.display_text(&format!("Cannot fork session: {}", e));
@@ -2971,6 +3003,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     let _ = tokio::task::spawn(async {
         let _ = model_catalog::catalog().await;
     });
+    // One-shot input buffer preload. A `/session <id> resume` may compute a
+    // `/model <provider>:<model_id>` prefill to surface the resumed session's
+    // stored model to the user (so they can press Enter to accept, Esc to
+    // dismiss, or type to choose a different model). It is set by the
+    // `Switched` arm of the session-command dispatch and consumed by the next
+    // `read_input` call; cleared afterwards so subsequent prompts start empty.
+    let mut pending_prefill: Option<String> = None;
     loop {
         let action = match repl.as_mut() {
             Some(r) => {
@@ -2998,7 +3037,21 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     leaf_id,
                     context_tokens,
                 };
-                r.read_input(&prompt_str, &mut line_history, &ctx, settings, &mut dirty, config.output.cursor_row(), config.output.as_ref())
+                // Pop the pending prefill (if any); the read_input call below
+                // uses it to seed the LineEditor, after which the next loop
+                // iteration starts with `None`.
+                let prefill = pending_prefill.take();
+                let prefill_ref = prefill.as_deref();
+                r.read_input(
+                    &prompt_str,
+                    prefill_ref,
+                    &mut line_history,
+                    &ctx,
+                    settings,
+                    &mut dirty,
+                    config.output.cursor_row(),
+                    config.output.as_ref(),
+                )
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };
@@ -3509,7 +3562,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         &input,
                         &mut session,
                         &mut repo,
-                        &mut agent,
                         &mut config,
                         &out,
                         settings,
@@ -3517,8 +3569,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         SessionCommandResult::NotSession => {
                             // Not a session command — fall through to normal prompt.
                         }
-                        SessionCommandResult::Switched(new_id) => {
+                        SessionCommandResult::Switched { id: new_id, prefill } => {
                             current_session_id = new_id;
+                            // Resume returned a model-restore prefill (e.g.
+                            // `/model <provider>:<model_id>`). Surface it on the
+                            // next prompt instead of letting the user type it
+                            // themselves; clearing the buffer would force them to
+                            // retype the model they just resumed into. The
+                            // prefill is consumed once — `pending_prefill` is
+                            // reset at the top of the next loop iteration so a
+                            // subsequent prompt starts empty.
+                            if prefill.is_some() {
+                                pending_prefill = prefill;
+                            }
                             continue;
                         }
                         _ => {
@@ -3982,10 +4045,13 @@ impl CodeAgent {
 mod tests {
     use rig_core::message::Reasoning;
 
+    use crate::session::Session;
+    use crate::session::storage::SessionStorage;
     use super::{
-        build_replay_units, count_turns, create_private_dir, find_predecessor_on_active_branch,
-        is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role,
-        parse_tree_args, persist_turn, reasoning_text, MessageLogger,
+        build_replay_units, compute_resume_model_prefill, count_turns, create_private_dir,
+        find_predecessor_on_active_branch, is_anthropic_family, last_turns_start,
+        maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
+        MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
@@ -4031,6 +4097,161 @@ mod tests {
 
         let turn2 = TurnPersistence::new();
         assert_eq!(turn2.sent(), 0);
+    }
+
+    /// Build a `Session` from `entries` for `compute_resume_model_prefill`
+    /// tests. Mirrors `session::session::tests::build_session_for_test` —
+    /// duplicated here because the agent's test module does not import the
+    /// session test helpers (different visibility / layering).
+    async fn build_session_with_entries(
+        entries: Vec<crate::session::SessionEntry>,
+    ) -> (Session, std::path::PathBuf) {
+        use crate::session::storage::JsonlSessionStorage;
+        use crate::session::types::session_filename;
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-resume-prefill-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = crate::session::SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        for entry in &entries {
+            storage.append_entry(entry).await.unwrap();
+        }
+        drop(storage);
+
+        let ro = JsonlSessionStorage::open_readonly(path.clone())
+            .await
+            .unwrap();
+        let index = ro.build_index().await.unwrap();
+        (Session::new_persisted(ro, index), path)
+    }
+
+    #[tokio::test]
+    async fn resume_model_prefill_uses_branch_model_change() {
+        // Branch-derived: a `ModelChange` entry on the active path is the
+        // authoritative source (the header is only written at session
+        // creation and never updated on `/model`).
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "u1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": "hi"}]
+                    }),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: Some("u1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-sonnet-4-5".into(),
+                },
+            },
+        ];
+        let (session, path) = build_session_with_entries(entries).await;
+        let prefill = compute_resume_model_prefill(&session).await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model anthropic:claude-sonnet-4-5")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn resume_model_prefill_picks_latest_model_change() {
+        // When multiple `ModelChange` entries exist, the leaf-closest wins
+        // (matches `derive_model_change`'s rev()-iteration contract).
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3-5-sonnet".into(),
+                },
+            },
+            crate::session::SessionEntry {
+                id: "m2".into(),
+                parent_id: Some("m1".into()),
+                timestamp: "t2".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "openai".into(),
+                    model_id: "gpt-4o".into(),
+                },
+            },
+        ];
+        let (session, path) = build_session_with_entries(entries).await;
+        let prefill = compute_resume_model_prefill(&session).await;
+        assert_eq!(prefill.as_deref(), Some("/model openai:gpt-4o"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn resume_model_prefill_falls_back_to_header_when_no_model_change() {
+        // No `ModelChange` on the branch — fall back to the session header's
+        // provider/model_id (carried forward by `ensure_session` via
+        // `with_model_context`). Both fields are required; a header with
+        // only one returns None.
+        use crate::session::storage::JsonlSessionStorage;
+        use std::path::Path;
+
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-resume-prefill-header-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let filename = crate::session::types::session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = crate::session::SessionHeader::with_model_context(
+            Path::new("/test"),
+            Some("openrouter".into()),
+            Some("anthropic/claude-sonnet-4".into()),
+            None,
+        );
+        storage.write_header(&header).await.unwrap();
+        drop(storage);
+
+        let ro = JsonlSessionStorage::open_readonly(path.clone()).await.unwrap();
+        let index = ro.build_index().await.unwrap();
+        let session = Session::new_persisted(ro, index);
+        let prefill = compute_resume_model_prefill(&session).await;
+        assert_eq!(
+            prefill.as_deref(),
+            Some("/model openrouter:anthropic/claude-sonnet-4")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn resume_model_prefill_returns_none_when_nothing_known() {
+        // No `ModelChange`, no header metadata → empty prompt (no nudge).
+        let (session, path) = build_session_with_entries(vec![]).await;
+        let prefill = compute_resume_model_prefill(&session).await;
+        assert_eq!(prefill, None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
