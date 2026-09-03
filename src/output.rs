@@ -83,6 +83,24 @@ pub trait Output: Send + Sync {
     fn set_answer_hold(&self, _hold: bool) {}
     fn display_tool_call(&self, name: &str, args: &Value);
     fn display_tool_result(&self, result: &str);
+    /// Render a tool execution failure in a dedicated error panel.
+    ///
+    /// `kind` is a stable, machine-readable classification from
+    /// `rig_core::tool::ToolErrorKind::as_str()` (e.g. `"invalid_args"`,
+    /// `"timeout"`, `"not_found"`, `"permission_denied"`, `"rate_limited"`,
+    /// `"provider"`, `"network"`, `"cancelled"`, `"other"`). `message` is
+    /// the operator-facing `ToolExecutionError::message()` — redaction-safe
+    /// because rig strips operator-only content into the kind-level
+    /// `model_feedback()` separately.
+    ///
+    /// Default impl formats `{tool_name} failed [{kind}]: {message}` and
+    /// forwards to `display_error`. `ConsoleOutput` overrides this with
+    /// a styled error panel using the same `paint_panel` /
+    /// `tool_panel` helpers as the tool-call and tool-result panels
+    /// (`src/output.rs:1388` / `~1423`).
+    fn display_tool_error(&self, tool_name: &str, kind: &str, message: &str) {
+        self.display_error(&format!("{tool_name} failed [{kind}]: {message}"));
+    }
     fn get_user_input(&self) -> String;
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
