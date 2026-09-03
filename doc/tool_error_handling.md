@@ -370,7 +370,11 @@ prompt resets it — never session-global):
   *after* a successful sub-run inside the same turn restarts the back-off at
   `2^0 = 1` s (or the provider's `Retry-After`). This way, two consecutive
   failures with a successful retry in between are not punished with
-  compounding delays.
+  compounding delays. The reset is gated on *progress* (not on session
+  persistence), so it applies even when no session is active; without a
+  session the steering message is replaced by a re-send of the original input
+  (the back-off still resets, but the user's turn isn't dropped since there is
+  no persisted transcript to continue from).
 - `cancellable_sleep` (existing, `src/agent.rs`) keeps each wait `<Esc>`-
   abortable; the in-flight reader spans the whole budget window.
 - Give-up: after the budget, surface a final error naming the class and the

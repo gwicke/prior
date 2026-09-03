@@ -318,19 +318,30 @@ impl PicoAgent for CodeAgent {
                             // doc/tool_error_handling.md §Mid-turn failure.
                             let classified = classify_stream_error(&e);
                             let retryable = classified.is_auto_retryable();
-                            let mut progress_persisted = false;
+                            // Finalize what completed (accepted turns + tool
+                            // batches; never truncates). `has_accepted` is
+                            // computed independently of the session: it drives
+                            // the consecutive-failure back-off reset in the
+                            // REPL, so a mid-turn failure *after* progress is
+                            // not treated as a "consecutive failure" even when
+                            // there is no session to persist to.
+                            let (transcript_msgs, has_accepted) = {
+                                let mut t = transcript
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let has_accepted = t.has_progress();
+                                let msgs = if has_accepted { t.finalize() } else { Vec::new() };
+                                (msgs, has_accepted)
+                            };
+                            let made_progress = has_accepted || !output.is_empty();
+                            // Persist completed work into the session when one
+                            // exists. Non-retryable errors always persist (so
+                            // the user's turn is never lost on give-up);
+                            // retryable errors persist only when progress
+                            // exists, to avoid duplicating the user's input on
+                            // a blind retry.
                             if let Some(s) = session {
-                                // Finalize what completed (accepted turns +
-                                // tool batches; never truncates).
-                                let (transcript_msgs, has_accepted) = {
-                                    let mut t = transcript
-                                        .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    let has_accepted = t.has_progress();
-                                    let msgs = if has_accepted { t.finalize() } else { Vec::new() };
-                                    (msgs, has_accepted)
-                                };
-                                if !retryable || has_accepted || !output.is_empty() {
+                                if !retryable || made_progress {
                                     let _ = s.append_message(&Message::user(input)).await;
                                     if has_accepted {
                                         for m in &transcript_msgs {
@@ -341,11 +352,16 @@ impl PicoAgent for CodeAgent {
                                             .append_message(&Message::assistant(&output))
                                             .await;
                                     }
-                                    progress_persisted = retryable;
                                 }
                             }
                             self.output.end_response();
-                            if retryable && progress_persisted {
+                            // A retryable error that interrupted the run AFTER
+                            // progress: signal the REPL (via `LlmInterrupted`)
+                            // so it resets the back-off and continues from the
+                            // partial transcript with a steering message. Gated
+                            // on *progress*, not on persistence, so the
+                            // back-off resets even without a session.
+                            if retryable && made_progress {
                                 return Err(crate::PicocodeError::LlmInterrupted {
                                     cause: Box::new(classified),
                                 });
@@ -3467,7 +3483,18 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 // steered once and made further (persisted)
                                 // progress, a short continuation suffices and
                                 // avoids repeating the steer text in the session.
-                                next_input = if steer_delivered {
+                                //
+                                // When there is no session, nothing was actually
+                                // persisted, so a "continue where you left off"
+                                // steer would point at context that doesn't exist
+                                // and drop the user's original request. In that
+                                // case re-send the original `input` instead (same
+                                // as the no-progress path) — the back-off reset
+                                // above still applies, but the user's turn is not
+                                // lost.
+                                next_input = if session.is_none() {
+                                    input.clone()
+                                } else if steer_delivered {
                                     "Please continue where you left off.".to_string()
                                 } else {
                                     steer_delivered = true;
