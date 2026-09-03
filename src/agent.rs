@@ -807,26 +807,33 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
     use crate::PicocodeError::*;
     if let Some(status) = ce.provider_response_status() {
         let code = status.as_u16();
-        let headers = ce.provider_response_headers();
-        let retry_after_secs = headers
-            .and_then(|h| h.get("retry-after"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                // Retry-After can be either a delta-seconds integer or an
-                // HTTP-date. We only handle the integer form (the form
-                // OpenRouter and most providers use for rate limits).
-                s.parse::<u64>().ok()
-            });
-        return match code {
-            401 | 403 => LlmAuth { status: code },
-            402 => LlmBilling { status: code },
-            429 => LlmRateLimited { retry_after_secs },
-            500..=599 => LlmUpstream { status: code },
-            400..=499 => LlmClient { status: code },
-            // 1xx/3xx are not errors at the transport layer; treat as
-            // generic.
-            _ => Other(ce.to_string()),
-        };
+        // A 2xx "success" status cannot signal failure on its own: some
+        // providers (OpenRouter, GMICloud via SSE) stream an error envelope
+        // *inside* a 200 OK body, so those defer to the body-based envelope
+        // detection below. Every genuine failure status (and the odd 1xx/3xx)
+        // classifies from the status directly.
+        if !status.is_success() {
+            let headers = ce.provider_response_headers();
+            let retry_after_secs = headers
+                .and_then(|h| h.get("retry-after"))
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    // Retry-After can be either a delta-seconds integer or an
+                    // HTTP-date. We only handle the integer form (the form
+                    // OpenRouter and most providers use for rate limits).
+                    s.parse::<u64>().ok()
+                });
+            return match code {
+                401 | 403 => LlmAuth { status: code },
+                402 => LlmBilling { status: code },
+                429 => LlmRateLimited { retry_after_secs },
+                500..=599 => LlmUpstream { status: code },
+                400..=499 => LlmClient { status: code },
+                // 1xx/3xx are not errors at the transport layer; treat as
+                // generic.
+                _ => Other(ce.to_string()),
+            };
+        }
     }
 
     match ce {
@@ -834,21 +841,29 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
         CompletionError::ProviderError(_) => LlmTransport(ce.to_string()),
         CompletionError::ResponseError(msg) => detect_response_error(msg)
             .unwrap_or_else(|| LlmStreamProtocol(msg.clone())),
+        // SSE streamed the provider's error envelope as the terminal event:
+        // rig's `completion_error_from_body` builds this as a
+        // `ProviderResponse` with NO HTTP status (or a 2xx one from
+        // `from_http_response`). The body IS the JSON envelope, so run the
+        // same detector the `ResponseError` path uses instead of falling
+        // through to `Other` (which is not auto-retryable).
+        CompletionError::ProviderResponse(pre) => detect_response_error(&pre.body)
+            .unwrap_or_else(|| Other(ce.to_string())),
         _ => Other(ce.to_string()),
     }
 }
 
-/// Detect a small number of well-known `ResponseError(String)` shapes that
-/// rig emits with no richer classification. Today this covers the
+/// Detect a small number of well-known provider-error shapes that rig emits
+/// with no richer classification. Today this covers the
 /// assembler-emitted malformed-tool-call message and the OpenRouter-style
 /// JSON error envelopes that some providers stream in the body of a 200 OK
-/// response (so rig captures them in `CompletionError::ProviderResponse` /
-/// `ResponseError(String)` without an HTTP status). The latter surfaces as
-/// `error.code: 429` with `error_type: "rate_limit_exceeded"` (or
-/// `provider_unavailable`) inside a JSON envelope; without this detection
-/// it falls through to `LlmStreamProtocol`, which misclassifies a
-/// rate-limit as a streaming protocol error and is not respected by the
-/// `Retry-After` floor.
+/// response (rig captures those as `CompletionError::ProviderResponse` with
+/// no HTTP status — or as `ResponseError(String)` on other transports). The
+/// latter surfaces as `error.code: 429` with
+/// `error_type: "rate_limit_exceeded"` (or `provider_unavailable`) inside a
+/// JSON envelope; without this detection it falls through to
+/// `LlmStreamProtocol` / `Other`, which misclassifies a rate-limit and is
+/// not respected by the `Retry-After` floor.
 fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
     use crate::PicocodeError::*;
     // "tool call `X` arrived with malformed JSON input: <serde error>"
@@ -5232,6 +5247,78 @@ mod tests {
             }
             other => panic!("expected LlmUpstream {{ status: 502 }}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_provider_response_429_envelope_without_status_is_rate_limited() {
+        // The production shape of the reported bug: rig's SSE decoder
+        // (`completion_error_from_body`) turns a terminal error envelope
+        // streamed inside a 200 OK into `CompletionError::ProviderResponse`
+        // with NO HTTP status and the raw JSON as the body — NOT a
+        // `ResponseError` with a prefixed string (which the sibling tests
+        // above emulate). Previously this fell through to `Other` (Display
+        // "Other error: ProviderResponseError: {...}"), which is not
+        // auto-retryable. The classifier must extract the 429 from the body
+        // and map it to `LlmRateLimited` so the REPL's budget applies.
+        use rig_core::ProviderResponseError;
+        let body = r#"{"id":"gen-1788464790-qEKKA0Klq7sLFL2HAM4O","object":"chat.completion.chunk","created":1788464790,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
+        let ce = CompletionError::ProviderResponse(
+            ProviderResponseError::without_status(body.to_string()),
+        );
+        // Sanity-check the fixture matches the production wiring: no HTTP
+        // status is preserved, so only body-based envelope detection can
+        // classify this.
+        assert_eq!(ce.provider_response_status(), None);
+        let classified = super::classify_completion_error(&ce);
+        match classified {
+            PicocodeError::LlmRateLimited { retry_after_secs } => {
+                assert_eq!(retry_after_secs, None);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmRateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_provider_response_502_envelope_with_2xx_status_is_upstream() {
+        // A gateway that funnels a 200 OK response carrying an error
+        // envelope through `from_http_response` preserves the 2xx status on
+        // the `ProviderResponse`. A 2xx status must not be treated as a
+        // failure on its own — the classifier defers to the body envelope,
+        // mapping the 502 to `LlmUpstream`.
+        use rig_core::ProviderResponseError;
+        use rig_core::http_client::StatusCode;
+        let body = r#"{"id":"gen-x","object":"chat.completion.chunk","created":0,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":502,"message":"Upstream error","metadata":{"error_type":"provider_unavailable"}}}"#;
+        let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
+            StatusCode::OK,
+            body.to_string(),
+        ));
+        let classified = super::classify_completion_error(&ce);
+        match classified {
+            PicocodeError::LlmUpstream { status } => {
+                assert_eq!(status, 502);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmUpstream {{ status: 502 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_provider_response_without_envelope_body_falls_through_to_other() {
+        // A status-less `ProviderResponse` whose body is not an
+        // OpenRouter-style envelope (e.g. plain-text or non-envelope JSON)
+        // must keep the pre-fix behavior: fall through to `Other`, NOT get
+        // auto-retried (there is no signal it is transient).
+        use rig_core::ProviderResponseError;
+        let ce = CompletionError::ProviderResponse(
+            ProviderResponseError::without_status("provider exploded".to_string()),
+        );
+        let classified = super::classify_completion_error(&ce);
+        assert!(
+            matches!(classified, PicocodeError::Other(_)),
+            "expected Other, got {classified:?}"
+        );
+        assert!(!classified.is_auto_retryable());
     }
 
     #[test]
