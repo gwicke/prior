@@ -378,6 +378,41 @@ prompt resets it — never session-global):
   providers. Because progress was persisted (R1), give-up is lossless — the
   partial turn is in the session and the user's next prompt continues from it.
 
+### Lost-context guard: always persist `user(input)` on first failure
+
+A pre-fix bug: when `prompt()` failed on a retryable error with **no
+progress** (e.g. a 429 on the first model call of a turn, before any
+assistant turn or streamed text had been produced), nothing was persisted
+to the session. If the REPL exhausted the retry budget (50 attempts) on
+the same transient condition, the user's turn was lost entirely — the
+session had no record of the user prompt, and a follow-up "continue"
+prompt had zero context. The user's actual incident:
+
+> "the *full turn context* was lost, including the user prompt. When
+> asking the model to continue with a simple "continue" prompt, it had
+> zero context from the previous failed turn."
+
+The fix (R7) is symmetric and de-duped:
+
+- **Error branch** (`src/agent.rs`, `CodeAgent::prompt`): persist
+  `user(input)` on the FIRST failure of a turn, regardless of whether
+  progress was made or the error is retryable. Before persisting, check
+  `Session::last_user_message_text()`; only persist if the session's
+  most recent user message is **not** the current `input` (so a second
+  attempt of the same turn doesn't add a duplicate).
+- **Success branch**: when persisting `final_history`, drop the leading
+  `Message::user(input)` if it matches the current turn's input. This
+  catches the "retryable error pre-persisted, then the retry succeeded"
+  case without duplicating the user prompt.
+- **REPL retry loop** (no-progress branch): removed the manual
+  `s.append_message(&Message::user(input))` for synthetic feedback;
+  `prompt()`'s error branch now owns this with proper de-dup.
+
+Net effect: the user prompt is always in the session after the first
+failure of a turn. The 50-attempt retry budget can be exhausted without
+losing the user's input — give-up is lossless in all cases, not just
+when progress was made.
+
 ### Malformed-tool-call (R6) — already covered
 
 `LlmMalformedToolCall` classification, `synthetic_retry_feedback`, and the
@@ -519,17 +554,33 @@ taxonomy and the `Retry-After` extraction.
    where progress exists (R6). Unknown-tool recovery remains owned by the rig
    hook (`on_invalid_tool_call`), which is correct — it recovers in-run
    without the REPL layer.
-10. ✅ Existing classification + display + name-recovery tests pass (328 lib
-    tests; +6 new tests covering the unified budget, exponential growth, the
-    Retry-After floor, and the two retryable error shapes from the task:
-    the DeepInfra 502 `ProviderResponseError` envelope and the
-    `Http client error: error sending request for url` transport error).
+10. ✅ Lost-context guard (R7): `user(input)` is persisted on the FIRST
+    failure of a turn regardless of retryability or progress, de-duped
+    via `Session::last_user_message_text()`. A retryable failure with
+    no progress (e.g. a sustained 429 on the very first model call) no
+    longer loses the turn when the retry budget is exhausted.
+11. ✅ OpenRouter 429 mid-stream JSON envelope (the `ProviderResponseError`
+    shape with `error.code: 429` and `error_type: "rate_limit_exceeded"`)
+    classifies as `LlmRateLimited`, so the `Retry-After`-floor + 50-attempt
+    budget applies. Same for 5xx codes in the envelope (`LlmUpstream`).
+12. ✅ Existing classification + display + name-recovery tests pass (333 lib
+    tests; +5 new tests covering the OpenRouter 429 mid-stream JSON
+    envelope → `LlmRateLimited`, the 502 envelope → `LlmUpstream`, the
+    no-code fall-through to `LlmStreamProtocol`, the pre-existing
+    malformed-tool-call detection still working alongside the new path,
+    and `Session::last_user_message_text` walking back to the most
+    recent user message).
 
 ## File changes (projected)
 
 - `src/agent.rs` — `TurnTranscript`, `LoggingHook` wiring, finalize fn,
-  `Some(Err)`/cancel persistence changes, REPL retry-loop budget + steering,
+  `Some(Err)`/cancel persistence changes (with `user(input)` de-dup via
+  `Session::last_user_message_text`), REPL retry-loop budget + steering,
+  OpenRouter mid-stream JSON envelope detection in `detect_response_error`,
   `AgentConfig::rate_limit_retry_budget` plumbing, tests.
+- `src/session/session.rs` — new `Session::last_user_message_text()`
+  helper that walks the leaf→root branch and returns the most recent
+  user-message text (or `None`).
 - `src/lib.rs` — `PicocodeError` steering signal (new variant or flag) if the
   REPL needs to distinguish "no progress" from "progress persisted";
   `AgentConfig` re-export unchanged.

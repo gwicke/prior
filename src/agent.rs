@@ -294,32 +294,40 @@ impl PicoAgent for CodeAgent {
                             // the SAME logical turn is re-attempted — the retry calls
                             // `prompt()` again with the same input, and rig re-sends
                             // the full context history for the turn (the same way it
-                            // does for a tool-result continuation). Persisting
-                            // `user(input)` here would therefore duplicate the user's
-                            // message in the session on every retry. Skip the
-                            // intermediate persistence for those errors; the partial
-                            // assistant text (in `output`) is dropped too, so the
-                            // retry starts from a clean, single copy of the turn.
-                            // Preserve progress on a non-cancellation error.
+                            // does for a tool-result continuation). Naively
+                            // pre-persisting `user(input)` here would therefore
+                            // duplicate the user's message in the session on every
+                            // retry.
                             //
-                            // When the classified error is auto-retryable AND
-                            // nothing completed (no accepted model turn, no
-                            // streamed text), we persist NOTHING: the REPL
-                            // re-sends the original `input` as a clean single
-                            // copy of the turn. When something did complete,
-                            // we persist `user(input)` + the finalized
-                            // transcript once, and return an
-                            // `LlmInterrupted` error so the REPL continues
-                            // from that transcript with a steering message
-                            // instead of re-sending `input` (which would
-                            // duplicate it). Non-retryable errors keep the
-                            // earlier Phase 2a behavior so the user's turn is
-                            // never lost on give-up. See
-                            // doc/tool_error_handling.md §Mid-turn failure.
+                            // De-dup strategy: persist `user(input)` only when the
+                            // session's most recent user message is NOT this same
+                            // `input`. After a successful retry the success path
+                            // will skip the leading `user(input)` in `final_history`
+                            // if the session already ends on it (see the success
+                            // branch). This way:
+                            //   * retryable-no-progress (the lost-context bug):
+                            //     `user(input)` is persisted on the FIRST failure,
+                            //     so a give-up after 50 retries still leaves the
+                            //     turn visible in the session.
+                            //   * retryable-with-progress: same — `user(input)` is
+                            //     persisted if not already there.
+                            //   * non-retryable: same as the original Phase 2a.
+                            //   * retry-then-success: the success branch drops the
+                            //     duplicate leading `user(input)` from
+                            //     `final_history`.
                             let classified = classify_stream_error(&e);
                             let retryable = classified.is_auto_retryable();
                             let mut progress_persisted = false;
                             if let Some(s) = session {
+                                // De-dup: only persist `user(input)` if it isn't
+                                // already the most recent user message on the
+                                // branch. `last_user_message_text()` returns
+                                // `None` for a fresh session.
+                                let already_persisted = s
+                                    .last_user_message_text()
+                                    .await
+                                    .map(|s| s == input)
+                                    .unwrap_or(false);
                                 // Finalize what completed (accepted turns +
                                 // tool batches; never truncates).
                                 let (transcript_msgs, has_accepted) = {
@@ -330,8 +338,18 @@ impl PicoAgent for CodeAgent {
                                     let msgs = if has_accepted { t.finalize() } else { Vec::new() };
                                     (msgs, has_accepted)
                                 };
-                                if !retryable || has_accepted || !output.is_empty() {
+                                // Always persist `user(input)` on the FIRST
+                                // failure of a turn (when the session doesn't
+                                // already end on it). Persist transcript/text
+                                // only when something completed — same as
+                                // before.
+                                let should_persist_input = !already_persisted;
+                                let should_persist_progress =
+                                    !retryable || has_accepted || !output.is_empty();
+                                if should_persist_input {
                                     let _ = s.append_message(&Message::user(input)).await;
+                                }
+                                if should_persist_progress {
                                     if has_accepted {
                                         for m in &transcript_msgs {
                                             let _ = s.append_message(m).await;
@@ -341,8 +359,8 @@ impl PicoAgent for CodeAgent {
                                             .append_message(&Message::assistant(&output))
                                             .await;
                                     }
-                                    progress_persisted = retryable;
                                 }
+                                progress_persisted = retryable && should_persist_input;
                             }
                             self.output.end_response();
                             if retryable && progress_persisted {
@@ -390,7 +408,17 @@ impl PicoAgent for CodeAgent {
             // Store pre-strip messages (strip is applied to LLM context above,
             // not at storage time — see doc/session_storage.md §4).
             if let Some(fh) = final_history {
-                let to_commit = normalize_call_ids(fh);
+                // De-dup: when the error branch pre-persisted `user(input)`
+                // (e.g. on a mid-turn retryable failure that later succeeded),
+                // `final_history[0]` is the same `user(input)`. Drop the
+                // leading message to avoid a duplicate. This is a precise
+                // comparison against the current turn's input — a different
+                // trailing user message (from a previous turn) would not
+                // match and would not be dropped.
+                let mut to_commit = normalize_call_ids(fh);
+                if to_commit.first() == Some(&Message::user(input.to_string())) {
+                    to_commit.remove(0);
+                }
                 for msg in to_commit {
                     let _ = s.append_message(&msg).await;
                 }
@@ -629,9 +657,16 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
 }
 
 /// Detect a small number of well-known `ResponseError(String)` shapes that
-/// rig emits with no richer classification. Today this is just the
-/// assembler-emitted malformed-tool-call message (parts.rs:697-700); add
-/// more shapes here as they appear.
+/// rig emits with no richer classification. Today this covers the
+/// assembler-emitted malformed-tool-call message and the OpenRouter-style
+/// JSON error envelopes that some providers stream in the body of a 200 OK
+/// response (so rig captures them in `CompletionError::ProviderResponse` /
+/// `ResponseError(String)` without an HTTP status). The latter surfaces as
+/// `error.code: 429` with `error_type: "rate_limit_exceeded"` (or
+/// `provider_unavailable`) inside a JSON envelope; without this detection
+/// it falls through to `LlmStreamProtocol`, which misclassifies a
+/// rate-limit as a streaming protocol error and is not respected by the
+/// `Retry-After` floor.
 fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
     use crate::PicocodeError::*;
     // "tool call `X` arrived with malformed JSON input: <serde error>"
@@ -645,7 +680,33 @@ fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
             }
         }
     }
+    // OpenRouter-style JSON envelope: `{"error":{"code":429,"message":"...",
+    // "metadata":{"error_type":"rate_limit_exceeded"}}, ...}`. The body
+    // is sometimes wrapped by `ProviderResponseError: ` (the `Display`
+    // output of `CompletionError::ProviderResponse(...)` when status is
+    // `None`); strip the prefix if present.
+    let body = msg
+        .strip_prefix("ProviderResponseError: ")
+        .unwrap_or(msg);
+    if let Some(code) = extract_openrouter_error_code(body) {
+        match code {
+            429 => return Some(LlmRateLimited { retry_after_secs: None }),
+            500..=599 => return Some(LlmUpstream { status: code }),
+            401 | 403 => return Some(LlmAuth { status: code }),
+            402 => return Some(LlmBilling { status: code }),
+            400..=499 => return Some(LlmClient { status: code }),
+            _ => return None,
+        }
+    }
     None
+}
+
+/// Extract the `error.code` field from an OpenRouter-style error envelope.
+/// Returns `None` if the body is not JSON or has no numeric `error.code`.
+fn extract_openrouter_error_code(body: &str) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = v.get("error")?.get("code")?.as_u64()?;
+    u16::try_from(code).ok()
 }
 
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
@@ -3481,16 +3542,15 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 continue;
                             }
                             // No-progress retryable failure: `prompt()` returned
-                            // the plain classified error without persisting any
-                            // partial transcript. This is a "consecutive
-                            // failure" — increment the counter and grow the
-                            // back-off exponentially. The retry re-runs from
-                            // `input` (the turn never got past its first model
-                            // call). For malformed tool calls the model needs
-                            // the parse error to self-correct — and the original
-                            // `input` is NOT yet in the session, so
-                            // re-establish it first, then re-prompt with the
-                            // synthetic feedback.
+                            // the plain classified error. `prompt()`'s error
+                            // branch already de-duped and persisted `user(input)`
+                            // (or skipped it because the session already ended
+                            // on it), so we do NOT re-append here. The retry
+                            // re-runs from `input` (the turn never got past its
+                            // first model call). For malformed tool calls the
+                            // model needs the parse error to self-correct; in
+                            // that case the synthetic feedback becomes the
+                            // retry's prompt instead of `input`.
                             Err(e)
                                 if e.is_auto_retryable()
                                     && consecutive_failures < retry_budget(&e) =>
@@ -3513,11 +3573,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     ));
                                 }
                                 if let Some(feedback) = e.synthetic_retry_feedback() {
-                                    if let Some(ref s) = session {
-                                        let _ = s
-                                            .append_message(&Message::user(input.clone()))
-                                            .await;
-                                    }
+                                    // `prompt()` already persisted `user(input)`
+                                    // (de-duped). Re-prompt with the synthetic
+                                    // feedback so the model can self-correct.
                                     next_input = feedback;
                                 }
                                 // Race window: cancel could fire after
@@ -4839,6 +4897,74 @@ mod tests {
             }
             other => panic!("expected LlmTransport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_openrouter_429_mid_stream_envelope_is_rate_limited() {
+        // OpenRouter sometimes streams a 429 in the body of a 200 OK
+        // response (the `error.code` field of a JSON envelope). Rig
+        // surfaces this as `CompletionError::ProviderResponse(...)` with
+        // `status == None` and the JSON body as the `Display` string. The
+        // classifier must extract the 429 and map it to `LlmRateLimited`
+        // so the REPL's Retry-After floor and the 50-attempt budget
+        // apply.
+        let envelope = r#"ProviderResponseError: {"id":"gen-1788453950-hBER7wC6ldCU829zmnAe","object":"chat.completion.chunk","created":1788453950,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        match classified {
+            PicocodeError::LlmRateLimited { retry_after_secs } => {
+                assert_eq!(retry_after_secs, None);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmRateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_openrouter_502_mid_stream_envelope_is_upstream() {
+        // Same envelope shape, but with a 5xx code. Must map to
+        // `LlmUpstream { status: 502 }`.
+        let envelope = r#"ProviderResponseError: {"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError","metadata":{"error_type":"provider_unavailable"}}}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        match classified {
+            PicocodeError::LlmUpstream { status } => {
+                assert_eq!(status, 502);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmUpstream {{ status: 502 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_openrouter_envelope_without_error_code_falls_through_to_stream_protocol() {
+        // JSON that parses but has no `error.code` (e.g. a different
+        // provider's envelope) should not match — falls through to
+        // `LlmStreamProtocol` as before.
+        let envelope = r#"{"id":"x","error":"invalid_argument"}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        assert!(matches!(
+            classified,
+            PicocodeError::LlmStreamProtocol(_)
+        ));
+    }
+
+    #[test]
+    fn classify_unrecognized_text_response_error_still_matches_malformed_tool_call() {
+        // The pre-existing "tool call `X` arrived with malformed JSON"
+        // detection must keep working alongside the new OpenRouter
+        // envelope detection — they share the same `detect_response_error`
+        // entry point.
+        let err = CompletionError::ResponseError(
+            "tool call `edit` arrived with malformed JSON input: expected `,` or `}` at line 1"
+                .into(),
+        );
+        let classified = super::classify_completion_error(&err);
+        assert!(matches!(
+            classified,
+            PicocodeError::LlmMalformedToolCall { .. }
+        ));
     }
 
     #[test]
