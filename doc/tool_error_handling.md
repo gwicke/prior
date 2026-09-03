@@ -393,37 +393,41 @@ prompt had zero context. The user's actual incident:
 The fix (R7) is symmetric and de-duped with an in-memory per-turn guard:
 
 - **`TurnPersistence`** (`src/agent.rs`): the REPL owns one instance per
-  user prompt and reuses it across retries; it records the *text* of the
-  user message already pre-persisted to the session this turn. Keying by
-  text (not a boolean) is what makes both of these safe:
-  1. **Identical inputs across turns** (e.g. the user types "continue"
-     twice in a row): a session-level comparison cannot tell "same turn,
-     retry" from "different turn, same text" and would wrongly suppress
-     the second turn's prompt. The per-turn record is reset on every new
-     user prompt, so it never conflates them.
-  2. **Steering messages** (a retry prompt that differs from the
-     original input, e.g. the synthetic malformed-tool feedback): that
-     is a distinct user message that MUST be persisted. Keying by text
-     means the steering prompt is never skipped or dropped just because
-     the turn's original input was.
-- **Error branch** (`src/agent.rs`, `CodeAgent::prompt`): persist
-  `user(input)` on the FIRST failure of a turn for that prompt text,
-  regardless of whether progress was made or the error is retryable.
-  Skip only when the per-turn record already holds the same text.
-- **Cancel branch**: same — de-dups `user(input)` against the per-turn
-  record before building the cancelled partial.
-- **Success branch**: when persisting `final_history`, drop the leading
-  `Message::user(input)` if the per-turn record holds the same text.
-  This catches the "retryable error pre-persisted, then the retry
-  succeeded" case without duplicating the user prompt.
-- **REPL retry loop** (no-progress branch): removed the manual
-  `s.append_message(&Message::user(input))` for synthetic feedback;
-  `prompt()`'s error branch now owns this with proper de-dup.
+  user prompt and reuses it across retries. It tracks **how many NEW user
+  messages have been dispatched this turn** (`turns_sent`: the user's
+  original prompt plus each steering/continuation directive) and captures a
+  **base frame** (`base_session_count`: the session's user-prompt count at
+  this turn's first `prompt()` entry). This is entirely **text-independent**.
+- **Session is the persistence source of truth**
+  (`Session::count_persisted_user_prompts`): walks the active branch and
+  counts `role: "user"` entries (tool results are `role: "toolResult"` and
+  are never counted). The decision in `prompt()` computes
+  `this_turn_persisted = current_session_count − base` and compares it to
+  `turns_sent`:
+  1. **this_turn_persisted < turns_sent** → this turn's latest dispatch is
+     not yet persisted → persist `user(input)` (first failure, or a steering
+     dispatch whose prompt hasn't landed yet).
+  2. **this_turn_persisted >= turns_sent** → it's already persisted (a
+     resend of a prior attempt) → skip, and on success drop the leading
+     `user(input)` from `final_history`.
+- This is correct across turn boundaries because the *base* is subtracted:
+  two identical inputs in successive turns (e.g. "continue" twice) get
+  distinct base frames, so turn 2's `this_turn_persisted` starts at 0 and
+  its "continue" is persisted as fresh. A steering "continue" within one
+  turn is a distinct dispatch (`turns_sent` incremented), so it is never
+  elided against the original. No text comparison anywhere.
+- **REPL retry loop**: `turn.mark_new_dispatch()` is called for the initial
+  prompt and for each steering/continuation directive; a plain retry that
+  re-sends an identical prompt does NOT bump the count. The removed manual
+  `s.append_message(&Message::user(input))` for synthetic feedback stays
+  owned by `prompt()`'s de-dup logic.
 
 Net effect: the user prompt is always in the session after the first
 failure of a turn. The 50-attempt retry budget can be exhausted without
 losing the user's input — give-up is lossless in all cases, not just
-when progress was made.
+when progress was made. Because the decision reads the session, a REPL
+counter drift is harmless: the outcome always reconciles to what is
+really persisted.
 
 ### Malformed-tool-call (R6) — already covered
 
@@ -568,27 +572,33 @@ taxonomy and the `Retry-After` extraction.
    without the REPL layer.
 10. ✅ Lost-context guard (R7): `user(input)` is persisted on the FIRST
     failure of a turn regardless of retryability or progress, de-duped
-    via the per-turn `TurnPersistence` record (text-keyed; never
-    conflates identical inputs across turns). A retryable failure with
+    via the per-turn `TurnPersistence` record (count-based; never
+    conflates identical inputs across turns — the session is the source
+    of truth). A retryable failure with
     no progress (e.g. a sustained 429 on the very first model call) no
     longer loses the turn when the retry budget is exhausted.
 11. ✅ OpenRouter 429 mid-stream JSON envelope (the `ProviderResponseError`
     shape with `error.code: 429` and `error_type: "rate_limit_exceeded"`)
     classifies as `LlmRateLimited`, so the `Retry-After`-floor + 50-attempt
     budget applies. Same for 5xx codes in the envelope (`LlmUpstream`).
-12. ✅ Existing classification + display + name-recovery tests pass (334 lib
+12. ✅ Existing classification + display + name-recovery tests pass (335 lib
     tests; +3 new tests covering the OpenRouter 429/502 mid-stream JSON
     envelope classification and the no-code fall-through to
-    `LlmStreamProtocol`, plus 2 unit tests pinning the text-keyed
-    per-turn `TurnPersistence` de-dup behavior).
+    `LlmStreamProtocol`, plus 3 tests pinning the count-based
+    `TurnPersistence` dispatch semantics and the session
+    `count_persisted_user_prompts` source of truth).
 
 ## File changes (projected)
 
 - `src/agent.rs` — `TurnTranscript`, `LoggingHook` wiring, finalize fn,
-  `Some(Err)`/cancel persistence changes (de-duped via the per-turn
-  `TurnPersistence` record), REPL retry-loop budget + steering (short
+  `Some(Err)`/cancel persistence changes (de-duped via the count-based
+  `TurnPersistence` record over the session source-of-truth),
+  REPL retry-loop budget + steering (short
   "continue" message), OpenRouter mid-stream JSON envelope detection in
   `detect_response_error`, tests.
+- `src/session/session.rs` — new
+  `Session::count_persisted_user_prompts()` used as the persistence
+  source-of-truth for the retry de-dup guard, tests.
 - `src/lib.rs` — `PicocodeError` steering signal (new variant or flag) if the
   REPL needs to distinguish "no progress" from "progress persisted";
   `AgentConfig` re-export unchanged.

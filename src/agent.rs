@@ -88,66 +88,108 @@ pub trait PicoAgent: Send + Sync {
 }
 
 /// Per-turn persistence state threaded across `prompt()` retries inside one
-/// REPL turn. The REPL owns one instance and resets it (`new()`) at the
-/// start of every user prompt.
+/// REPL turn. The REPL owns one instance per user prompt and reuses it across
+/// retries.
 ///
-/// `persisted_prompt` is the single source of truth for "has `prompt()`'s
-/// error/cancel branch already pre-persisted the user prompt for this turn,
-/// and what text did it persist?". It is set the first time `prompt()`
-/// writes `Message::user(input)` to the session (on an error or cancel) and
-/// consulted on the success path to drop the leading `user(input)` from
-/// `final_history` so the user prompt appears exactly once in the session.
+/// It tracks two quantities:
 ///
-/// The stored value is the *text* of the pre-persisted prompt, NOT just a
-/// boolean. This is essential for two cases:
+/// * `turns_sent` — how many **new user messages** have been dispatched this
+///   turn (the user's original prompt, plus each steering/continuation
+///   directive the REPL introduces). A plain retry that re-sends the same
+///   prompt (unchanged `next_input`) does NOT increment it.
+/// * `base_session_count` — the number of user prompts already in the session
+///   at the moment this turn's FIRST `prompt()` ran. Captured lazily and once
+///   (`initialize_base`), so retries of the same turn keep the original
+///   frame.
 ///
-/// 1. **Steering messages**: after a mid-turn failure, the REPL retries with
-///    a different prompt (e.g. "continue" or the synthetic malformed-tool
-///    feedback). That is a distinct user message that MUST be persisted.
-///    Keying by text means the steering prompt is never skipped or dropped
-///    just because the turn's original input was.
-/// 2. **Identical inputs across turns**: two successive user turns can both
-///    be "continue". A session-level comparison ("is the last user message
-///    the same text?") cannot tell "same turn, retry" from "different turn,
-///    same text" and would over-dedup. The in-memory flag is reset per turn
-///    (`TurnPersistence::new()`), so it never conflates them.
+/// The persistence decision is made IN `prompt()` by reading the **session**
+/// (the persistence source of truth) and answering the question:
+///
+/// `this_turn_persisted = current_session_count − base`
+/// * if `this_turn_persisted < turns_sent` → this turn's latest dispatch is
+///   not yet persisted → persist `user(input)` now (first failure, or a
+///   steering dispatch whose prompt hasn't landed yet).
+/// * if `this_turn_persisted >= turns_sent` → it's already persisted (a
+///   resend of a prior attempt) → skip, and on success drop the leading
+///   `user(input)` from `final_history`.
+///
+/// Comparing the session-derived *delta* (base-subtracted) against the
+/// per-turn `turns_sent` is what makes this correct across turn boundaries:
+///
+/// * **Identical inputs across turns** (e.g. "continue" twice): turn 2's
+///   base is the session count AFTER turn 1 (which committed "continue"), so
+///   turn 2's own dispatch (sent = 1) still has `this_turn_persisted = 0` and
+///   is persisted as a fresh message. No text comparison involved.
+/// * **"continue" → "continue" within a turn**: the steering dispatch
+///   increments `turns_sent`, so it is never elided against the original.
+/// * **REPL/session drift**: the session is authoritative; the decision
+///   reconciles to what is really persisted.
 #[derive(Debug, Default)]
 pub struct TurnPersistence {
-    persisted_prompt: std::sync::Mutex<Option<String>>,
+    turns_sent: std::sync::Mutex<u64>,
+    /// Session user-prompt count at this turn's first `prompt()` entry.
+    /// `None` until [`Self::initialize_base`] runs once.
+    base_session_count: std::sync::Mutex<Option<u64>>,
 }
 
 impl TurnPersistence {
+    /// Start a fresh logical turn. The REPL calls this once per user prompt
+    /// submission, NOT per retry. Subsequent retries reuse it.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Text of the user message already pre-persisted to the session in this
-    /// turn, if any.
-    pub fn persisted_prompt(&self) -> Option<String> {
-        self.persisted_prompt
+    /// How many *new* user messages have been dispatched in this turn so far.
+    pub fn sent(&self) -> u64 {
+        *self
+            .turns_sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
-    /// Record that `text` has been pre-persisted to the session. Subsequent
-    /// persistence of the SAME text within this turn is skipped; a different
-    /// text (e.g. a steering message) is treated as a fresh persist.
-    pub fn mark_user_prompt_persisted(&self, text: impl Into<String>) {
+    /// Record that a NEW user message (the user's prompt, or a steering/
+    /// continuation directive) is being dispatched. The REPL calls this when
+    /// it sends a fresh message — NOT on a plain retry that re-sends an
+    /// identical prompt.
+    pub fn mark_new_dispatch(&self) {
         *self
-            .persisted_prompt
+            .turns_sent
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.into());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
     }
 
-    /// Clear the persisted record (e.g. after the success path has committed
-    /// `final_history`, or when the REPL decides no session persistence
-    /// happened for this turn).
-    pub fn clear_user_prompt_persisted(&self) {
+    /// Capture the turn's base frame: the number of user prompts already in
+    /// the session when the turn's first `prompt()` ran. Only the first call
+    /// sets it; retries keep the original frame. A `None` session means 0.
+    pub async fn initialize_base(&self, session: Option<&Session>) {
+        {
+            let base = self
+                .base_session_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if base.is_some() {
+                return;
+            }
+        } // guard dropped before the await
+        let count: u64 = match session {
+            Some(s) => s.count_persisted_user_prompts().await as u64,
+            None => 0,
+        };
         *self
-            .persisted_prompt
+            .base_session_count
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(count);
+    }
+
+    /// How many of this turn's dispatches are actually persisted in the
+    /// session right now: `current_session_count − base`. Saturates at 0.
+    pub fn this_turn_persisted(&self, current_session_count: usize) -> u64 {
+        let base = self
+            .base_session_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(0);
+        (current_session_count as u64).saturating_sub(base)
     }
 }
 
@@ -167,6 +209,11 @@ impl PicoAgent for CodeAgent {
         // only survive while the reader is still running — which it never is at
         // this point. See doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
+
+        // Capture this turn's base frame (session user-prompt count at entry)
+        // once, so retries of the same turn keep the same reference point for
+        // the persistence de-dup decision. Idempotent.
+        turn.initialize_base(session).await;
 
         // Build prior context from session, or use empty vec as fallback.
         let prior: Vec<Message> = if let Some(s) = session {
@@ -335,18 +382,22 @@ impl PicoAgent for CodeAgent {
                                     // (accepted turns + completed tool batches
                                     // + synthesized answers for interrupted
                                     // calls), or the streamed text when no
-                                    // turn completed yet. De-dup against the
-                                    // per-turn `TurnPersistence`: if this
-                                    // turn's `user(input)` was already
-                                    // pre-persisted (e.g. a prior retryable
-                                    // failure inside the same turn), skip
-                                    // the leading `user(input)` here.
+                                    // turn completed yet. The leading
+                                    // `user(input)` is included only if this
+                                    // turn's fresh dispatch isn't already in
+                                    // the session (count vs. `turn.sent()`); a
+                                    // resend whose prompt is already persisted
+                                    // is skipped so we never duplicate it.
                                     let mut partial: Vec<Message> = Vec::new();
-                                    if turn.persisted_prompt()
-                                        != Some(input.to_string())
-                                    {
+                                    let session_has_prompt = match session {
+                                        Some(s) => {
+                                            let c = s.count_persisted_user_prompts().await;
+                                            turn.this_turn_persisted(c) >= turn.sent()
+                                        }
+                                        None => false,
+                                    };
+                                    if !session_has_prompt {
                                         partial.push(Message::user(input));
-                                        turn.mark_user_prompt_persisted(input);
                                     }
                                     {
                                         let mut t = transcript
@@ -429,19 +480,27 @@ impl PicoAgent for CodeAgent {
                                     let msgs = if has_accepted { t.finalize() } else { Vec::new() };
                                     (msgs, has_accepted)
                                 };
-                                // Always persist `user(input)` on the FIRST
-                                // failure of a turn for THIS prompt text (the
-                                // per-turn record is empty or holds a different
-                                // text, e.g. a steering message). Persist
-                                // transcript/text only when something
-                                // completed — same as before.
-                                let should_persist_input = turn.persisted_prompt()
-                                    != Some(input.to_string());
+                                // Persist-decision (session is the source of
+                                // truth): `this_turn_persisted` is how many of
+                                // this turn's *new* dispatches are recorded in
+                                // the session (current count minus the base
+                                // frame captured at turn start). If it is
+                                // LOWER than `turn.sent()`, the fresh dispatch
+                                // for this turn is not yet persisted (first
+                                // failure, or a steering dispatch whose prompt
+                                // hasn't landed) — persist `user(input)` now.
+                                // If it is already EQUAL, the prompt is
+                                // persisted (this is a resend of a prior
+                                // attempt) — skip.
+                                let session_user_count =
+                                    s.count_persisted_user_prompts().await;
+                                let should_persist_input =
+                                    turn.this_turn_persisted(session_user_count)
+                                        < turn.sent();
                                 let should_persist_progress =
                                     !retryable || has_accepted || !output.is_empty();
                                 if should_persist_input {
                                     let _ = s.append_message(&Message::user(input)).await;
-                                    turn.mark_user_prompt_persisted(input);
                                 }
                                 if should_persist_progress {
                                     if has_accepted {
@@ -503,22 +562,23 @@ impl PicoAgent for CodeAgent {
             // not at storage time — see doc/session_storage.md §4).
             if let Some(fh) = final_history {
                 let mut to_commit = normalize_call_ids(fh);
-                // De-dup: when the error/cancel branch pre-persisted
-                // `user(input)` within this turn (the per-turn record holds
-                // the same text, e.g. a mid-turn retryable failure that
-                // later succeeded), `final_history[0]` is the same
-                // `user(input)`. Drop the leading message so the user prompt
-                // appears exactly once. The record is reset per turn and is
-                // keyed by the persisted text, so this can never collide with
-                // a previous turn that coincidentally had the same text — e.g.
-                // two successive turns both typed "continue" are persisted
-                // separately (turn 1's success does not set turn 2's record).
-                // A steering message (different text) is NOT dropped.
-                if turn.persisted_prompt() == Some(input.to_string()) {
-                    if to_commit.first() == Some(&Message::user(input.to_string())) {
+                // De-dup against the session (persistence source of truth).
+                // When the session already holds this turn's fresh dispatch
+                // prompt (`session_user_count >= turn.sent()`, e.g. a prior
+                // failed attempt pre-persisted it), `final_history[0]` is a
+                // re-sent duplicate of that same prompt — drop it so the user
+                // prompt appears exactly once. When the session count is
+                // LOWER (the fresh dispatch's prompt isn't persisted yet — a
+                // genuinely new user message/stear directive), keep
+                // `final_history[0]` so it is committed.
+                let session_user_count = s.count_persisted_user_prompts().await;
+                if turn.this_turn_persisted(session_user_count) >= turn.sent() {
+                    // Only drop when the leading message is this turn's user
+                    // prompt (a plain text User message), never a tool-result
+                    // batch or an assistant message.
+                    if matches!(to_commit.first(), Some(Message::User { content }) if content.iter().any(|c| matches!(c, UserContent::Text(_)))) {
                         to_commit.remove(0);
                     }
-                    turn.clear_user_prompt_persisted();
                 }
                 for msg in to_commit {
                     let _ = s.append_message(&msg).await;
@@ -550,6 +610,10 @@ impl PicoAgent for CodeAgent {
         // `prompt` now renders the response itself via the streaming Output
         // methods, so there is no separate `display_markdown` here.
         let turn = TurnPersistence::new();
+        // run_once is sessionless but still a NEW user dispatch; mark it so
+        // `turn.sent() == 1` and the success path does not mis-deduplicate
+        // `final_history[0]` against an absent session.
+        turn.mark_new_dispatch();
         let response = self.prompt(&input, None, &turn).await?;
         Ok(response)
     }
@@ -3560,6 +3624,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     // two identical inputs in a row, e.g. "continue" twice,
                     // never collide). See `TurnPersistence`.
                     let turn = TurnPersistence::new();
+                    // The user's original prompt is this turn's first NEW
+                    // dispatch.
+                    turn.mark_new_dispatch();
                     // The full steering message (synthetic feedback / "continue")
                     // is delivered once per logical turn; `prompt()` persists it
                     // with the partial transcript when a retry makes progress and
@@ -3639,6 +3706,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                         None => "continue".to_string(),
                                     }
                                 };
+                                // The steering message is a NEW user dispatch
+                                // for this turn (distinct from the original
+                                // prompt), so it counts toward `turns_sent` and
+                                // will be persisted/deduped as its own message.
+                                turn.mark_new_dispatch();
                                 if cancel.load(Ordering::SeqCst) {
                                     break Err(crate::PicocodeError::Cancelled(
                                         "Aborted.".into(),
@@ -3682,6 +3754,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     // (de-duped). Re-prompt with the synthetic
                                     // feedback so the model can self-correct.
                                     next_input = feedback;
+                                    // The feedback replaces the original prompt
+                                    // as a NEW user dispatch for this turn.
+                                    turn.mark_new_dispatch();
                                 }
                                 // Race window: cancel could fire after
                                 // `cancellable_sleep` returned but before
@@ -3842,44 +3917,45 @@ mod tests {
     use rig_core::message::{AssistantContent, Message, Text};
 
     #[test]
-    fn turn_persistence_dedups_by_text_within_a_turn() {
-        // The per-turn record must dedup repeated persistence of the SAME
-        // prompt text (the retry case) while treating a DIFFERENT prompt
-        // text (a steering message) as a fresh persist.
+    fn turn_persistence_counts_dispatch_not_text() {
+        // The per-turn record counts NEW dispatches (the user's original
+        // prompt plus each steering/continuation directive), never the
+        // prompt TEXT. This is what lets two identical "continue" messages
+        // in one turn be treated as distinct dispatches.
         let turn = TurnPersistence::new();
-        assert_eq!(turn.persisted_prompt(), None);
+        assert_eq!(turn.sent(), 0);
 
-        // First failure of the turn: nothing persisted yet -> persist.
-        turn.mark_user_prompt_persisted("build the project");
-        assert_eq!(turn.persisted_prompt(), Some("build the project".to_string()));
+        // The user's first prompt is dispatch 1.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 1);
 
-        // Retry with the same user prompt: record matches -> skip (
-        // callers check `persisted_prompt() != Some(text)` before
-        // re-persisting; the record being unchanged reflects that skip).
-        turn.mark_user_prompt_persisted("build the project");
-        assert_eq!(turn.persisted_prompt(), Some("build the project".to_string()));
+        // A retry that re-sends the SAME prompt does NOT bump the count:
+        // callers only call mark_new_dispatch when next_input actually
+        // changes to a new message.
+        // (No-op here; the no-resend case is just "don't call it".)
 
-        // Steering message: DIFFERENT text -> treat as fresh; the record
-        // now reflects the steering prompt.
-        turn.mark_user_prompt_persisted("continue");
-        assert_eq!(turn.persisted_prompt(), Some("continue".to_string()));
+        // A steering "continue" (same text as a possible original) is a NEW
+        // dispatch and must bump.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 2);
 
-        // Clearing (e.g. after a successful persistence of final_history)
-        // resets the record for a hypothetical next use.
-        turn.clear_user_prompt_persisted();
-        assert_eq!(turn.persisted_prompt(), None);
+        // A second "continue" steering is yet another dispatch.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 3);
     }
 
     #[test]
-    fn turn_persistence_is_reset_per_new_turn() {
-        // Two successive user turns with an IDENTICAL input ("continue"
-        // twice) must NOT collide: the REPL creates a fresh
-        // TurnPersistence per user prompt, so turn 2 starts empty even
-        // though turn 1 persisted "continue".
+    fn turn_persistence_is_fresh_per_new_turn() {
+        // Two successive user turns must have independent dispatch counts
+        // (e.g. the user types "continue" twice). The REPL mints a fresh
+        // TurnPersistence per user prompt, so turn 2 starts at 0 even
+        // though turn 1 dispatched and persisted a "continue".
         let turn1 = TurnPersistence::new();
-        turn1.mark_user_prompt_persisted("continue");
+        turn1.mark_new_dispatch();
+        assert_eq!(turn1.sent(), 1);
+
         let turn2 = TurnPersistence::new();
-        assert_eq!(turn2.persisted_prompt(), None);
+        assert_eq!(turn2.sent(), 0);
     }
 
     #[test]
