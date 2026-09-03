@@ -15,6 +15,7 @@ pub enum SlashKind {
     Sandbox,
     Session,
     Tree,
+    Compact,
     Clear,
     New,
     Replay,
@@ -80,6 +81,11 @@ pub fn registry() -> &'static [SlashCommand] {
             name: "/tree",
             help: "Navigate session history — select a point to continue from",
             kind: SlashKind::Tree,
+        },
+        SlashCommand {
+            name: "/compact",
+            help: "Compact the session at the current position",
+            kind: SlashKind::Compact,
         },
         SlashCommand {
             name: "/clear",
@@ -176,8 +182,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_thirteen_commands() {
-        assert_eq!(registry().len(), 13);
+    fn registry_has_fourteen_commands() {
+        assert_eq!(registry().len(), 14);
     }
 
     #[test]
@@ -210,7 +216,7 @@ mod tests {
     #[test]
     fn empty_query_returns_all() {
         let r = filter_commands("");
-        assert_eq!(r.len(), 13);
+        assert_eq!(r.len(), 14);
     }
 
     #[test]

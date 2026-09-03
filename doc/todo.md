@@ -1,0 +1,5 @@
+- [x] bash tool error return: report error code
+- [x] restore model on `/session <id> resume`
+- [ ] Compaction unification
+  - [x] /compact command - same as `/tree <id> compact` but at current position
+  - [ ] `/tree <id> switch --summarize` - use same menu / mechanism as others

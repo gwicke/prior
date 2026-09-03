@@ -2136,6 +2136,7 @@ async fn handle_session_command(
     input: &str,
     session: &mut Option<Session>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
+    agent: &mut Option<Box<dyn PicoAgent>>,
     config: &mut AgentConfig,
     output: &Arc<dyn Output>,
     settings: &SettingsStore,
@@ -2196,6 +2197,27 @@ async fn handle_session_command(
 
                 match repo.as_ref().unwrap().open(&meta).await {
                     Ok((storage, index)) => {
+                        // Restore the model context the session was last using.
+                        // The header stores the provider/model/thinking at
+                        // creation; later switches are recorded as entries which
+                        // `build_context` derives from the branch, but the
+                        // process-wide agent config must be switched to match so
+                        // the *next* prompt uses the same model. Snapshot the old
+                        // values so we only rebuild when they actually differ.
+                        let prev_provider = config.provider.clone();
+                        let prev_model = config.model.clone();
+                        let prev_thinking = config.thinking_level.clone();
+
+                        if let Some(p) = &index.header.provider {
+                            config.provider = p.clone();
+                        }
+                        if let Some(m) = &index.header.model_id {
+                            config.model = m.clone();
+                        }
+                        if let Some(t) = &index.header.thinking_level {
+                            config.thinking_level = Some(t.clone());
+                        }
+
                         let new_session = Session::new_persisted(storage, index);
                         let id = new_session.get_session_id().to_string();
 
@@ -2228,6 +2250,22 @@ async fn handle_session_command(
                         }
 
                         *session = Some(new_session);
+
+                        // Rebuild the agent if the restored model config differs
+                        // from what the running agent was built with (e.g. the
+                        // user switched models, then switched back by resuming).
+                        if config.provider != prev_provider
+                            || config.model != prev_model
+                            || config.thinking_level != prev_thinking
+                        {
+                            match create_agent(config.clone()).await {
+                                Ok(new_agent) => *agent = Some(new_agent),
+                                Err(e) => config.output.display_text(&format!(
+                                    "Resumed session but cannot rebuild agent with stored model: {}",
+                                    e
+                                )),
+                            }
+                        }
                         SessionCommandResult::Switched(id)
                     }
                     Err(e) => {
@@ -3228,6 +3266,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         &input,
                         &mut session,
                         &mut repo,
+                        &mut agent,
                         &mut config,
                         &out,
                         settings,

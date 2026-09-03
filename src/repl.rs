@@ -456,7 +456,20 @@ pub(crate) enum ActiveOverlay {
         opts: Vec<String>,
         active: Option<usize>,
         _filter: String,
+        /// Which canonical form the committed line uses:
+        /// `/tree <id> compact <mode>` (`AtEntry`) or `/compact <mode>`
+        /// (`AtCurrent`, resolves to the current leaf in the main loop).
+        prefix: CompactPrefix,
     },
+}
+
+/// How a compact overlay commits its canonical command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactPrefix {
+    /// `/tree <target-id> compact <mode>` — target explicitly resolved.
+    AtEntry,
+    /// `/compact <mode>` — compact at the session's current position.
+    AtCurrent,
 }
 
 impl ActiveOverlay {
@@ -562,6 +575,55 @@ impl ActiveOverlay {
                 } else {
                     // Non-empty arg → no overlay, submit directly.
                     ActiveOverlay::None
+                }
+            }
+            "compact" => {
+                // `/compact` compacts at the CURRENT position — the same
+                // summary-mode menu as `/tree <id> compact`, targeted at the
+                // session's current leaf. Committed lines reuse the existing
+                // `/tree <leafid> compact <mode>` handling in the main loop.
+                let filter = rest.trim().to_string();
+                match ctx.leaf_id.as_deref() {
+                    Some(leaf_id) => {
+                        // Resolve the leaf's display label from the tree so the
+                        // header shows what is being compacted at.
+                        let mut flat = Vec::new();
+                        let active_path: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        Repl::flatten_tree_nodes(
+                            &ctx.tree,
+                            0,
+                            Some(leaf_id),
+                            &active_path,
+                            &mut flat,
+                        );
+                        let label = flat
+                            .iter()
+                            .find(|(_, _, id, _, _)| id == leaf_id)
+                            .map(|(_, l, _, _, _)| l.clone())
+                            .unwrap_or_else(|| leaf_id.to_string());
+                        let mut header = Vec::new();
+                        Repl::compact_summary_header(leaf_id, &label, ctx, &mut header);
+                        let (opts, _fuzzy_active) =
+                            Repl::filter_tree_options(&["truncate", "text only", "llm"], &filter);
+                        let first = filter.split_whitespace().next().unwrap_or("");
+                        let first_normalized = first.replace(' ', "-");
+                        let active = opts
+                            .iter()
+                            .position(|l| {
+                                l == first || l.replace(' ', "-") == first_normalized
+                            })
+                            .or(_fuzzy_active);
+                        ActiveOverlay::CompactSummary {
+                            target_id: leaf_id.to_string(),
+                            header,
+                            opts,
+                            active,
+                            _filter: filter,
+                            prefix: CompactPrefix::AtCurrent,
+                        }
+                    }
+                    None => ActiveOverlay::None,
                 }
             }
             "sandbox" | "sb" => {
@@ -739,6 +801,7 @@ impl ActiveOverlay {
                                     opts,
                                     active,
                                     _filter: sub_filter,
+                                    prefix: CompactPrefix::AtEntry,
                                 };
                             }
                             _ => {}
@@ -1226,7 +1289,7 @@ impl ActiveOverlay {
                     editor.set(&format!("/tree <{}> switch{}", target_id, mode));
                 }
             }
-            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
+            ActiveOverlay::CompactSummary { target_id, opts, prefix, .. } => {
                 if let Some(label) = opts.get(sel) {
                     let mode = match label.as_str() {
                         "truncate" => " truncate",
@@ -1238,7 +1301,14 @@ impl ActiveOverlay {
                         "llm" => " llm ",
                         _ => "",
                     };
-                    let line = format!("/tree <{}> compact{}", target_id, mode);
+                    // `/compact <mode>` compacts at the current position;
+                    // `/tree <id> compact <mode>` at an explicitly selected
+                    // entry.
+                    let head = match prefix {
+                        CompactPrefix::AtCurrent => "/compact".to_string(),
+                        CompactPrefix::AtEntry => format!("/tree <{}> compact", target_id),
+                    };
+                    let line = format!("{}{}", head, mode);
                     if label.as_str() == "llm" {
                         // Stage the prompt: <line><settings.llm_compact_prompt()>
                         let staged = format!("{}{}", line, settings.llm_compact_prompt());
@@ -1286,6 +1356,7 @@ impl ActiveOverlay {
                         slash::SlashKind::Sandbox => editor.set("/sandbox "),
                         slash::SlashKind::Session => editor.set("/session path:. "),
                         slash::SlashKind::Tree => editor.set("/tree "),
+                        slash::SlashKind::Compact => editor.set("/compact "),
                         slash::SlashKind::Clear => {
                             redraw(&LineEditor::new(), &[], sel, input_row);
                             output.display_plain("/clear");
@@ -1585,7 +1656,7 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
+            ActiveOverlay::CompactSummary { target_id, opts, prefix, .. } => {
                 if let Some(label) = opts.get(sel) {
                     // If the buffer already carries a fully-formed `compact
                     // llm <payload>` line, the user has already committed
@@ -1598,7 +1669,13 @@ impl ActiveOverlay {
                     // across label selection.
                     if label.as_str() == "llm" {
                         let buf = editor.text().to_string();
-                        if Repl::llm_compact_buffer_is_canonical(&buf, target_id) {
+                        let head = match prefix {
+                            CompactPrefix::AtCurrent => "/compact llm".to_string(),
+                            CompactPrefix::AtEntry => {
+                                format!("/tree <{}> compact llm", target_id)
+                            }
+                        };
+                        if Repl::llm_compact_buffer_is_canonical(&buf, &head) {
                             Repl::emit_commit(
                                 output,
                                 editor,
@@ -1612,14 +1689,21 @@ impl ActiveOverlay {
                             return OverlayAction::Action(InputAction::Submit(buf));
                         }
                         // Otherwise stage the default prompt for editing.
-                        let prefix = format!("/tree <{}> compact llm", target_id);
-                        let staged = format!("{} {}", prefix, settings.llm_compact_prompt());
+                        let prefix_str = match prefix {
+                            CompactPrefix::AtCurrent => "/compact llm".to_string(),
+                            CompactPrefix::AtEntry => format!("/tree <{}> compact llm", target_id),
+                        };
+                        let staged = format!("{} {}", prefix_str, settings.llm_compact_prompt());
                         editor.set(&staged);
                         return OverlayAction::Continue;
                     }
+                    let head = match prefix {
+                        CompactPrefix::AtCurrent => "/compact".to_string(),
+                        CompactPrefix::AtEntry => format!("/tree <{}> compact", target_id),
+                    };
                     let line = match label.as_str() {
-                        "truncate" => format!("/tree <{}> compact truncate", target_id),
-                        "text only" => format!("/tree <{}> compact text-only", target_id),
+                        "truncate" => format!("{} truncate", head),
+                        "text only" => format!("{} text-only", head),
                         _ => String::new(),
                     };
                     if !line.is_empty() {
@@ -3137,10 +3221,14 @@ impl Repl {
     /// line for the given target id (i.e. the user has already typed a
     /// canonical LLM-compaction line). Used by `handle_enter` to decide
     /// between re-staging the default prompt and submitting verbatim.
-    fn llm_compact_buffer_is_canonical(buffer: &str, target_id: &str) -> bool {
-        let prefix = format!("/tree <{}> compact llm", target_id);
+    /// Detect a fully-formed `compact llm <payload>` line. The `head` must
+    /// be the literal canonical command head (already resolved per prefix):
+    /// `/tree <id> compact llm` or `/compact llm`. A payload is required so a
+    /// bare head or an empty payload re-stages the default prompt instead of
+    /// submitting an empty summary request.
+    fn llm_compact_buffer_is_canonical(buffer: &str, head: &str) -> bool {
         buffer
-            .strip_prefix(&prefix)
+            .strip_prefix(head)
             .map(|rest| !rest.trim().is_empty())
             .unwrap_or(false)
     }
@@ -4971,27 +5059,40 @@ mod tests {
         // Buffer with trailing payload is canonical.
         assert!(Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm Summarize this",
-            "e1",
+            "/tree <e1> compact llm",
+        ));
+        assert!(Repl::llm_compact_buffer_is_canonical(
+            "/compact llm Summarize this",
+            "/compact llm",
         ));
         // Whitespace-only payload (single space) is not canonical.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm ",
-            "e1",
+            "/tree <e1> compact llm",
         ));
         // Just `compact llm` (no trailing text) is not canonical.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm",
-            "e1",
+            "/tree <e1> compact llm",
         ));
         // Different target id — not canonical for this target.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e2> compact llm Summarize this",
-            "e1",
+            "/tree <e1> compact llm",
+        ));
+        // `/compact` head does not match a `/tree` buffer and vice-versa.
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "/compact llm Summarize this",
+            "/tree <e1> compact llm",
+        ));
+        assert!(!Repl::llm_compact_buffer_is_canonical(
+            "/tree <e1> compact llm Summarize this",
+            "/compact llm",
         ));
         // Unrelated buffer.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "hello world",
-            "e1",
+            "/tree <e1> compact llm",
         ));
     }
 
