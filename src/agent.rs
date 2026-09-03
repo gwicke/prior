@@ -72,7 +72,12 @@ pub struct SessionUsage {
 
 #[async_trait]
 pub trait PicoAgent: Send + Sync {
-    async fn prompt(&self, input: &str, session: Option<&Session>) -> Result<String>;
+    async fn prompt(
+        &self,
+        input: &str,
+        session: Option<&Session>,
+        turn: &TurnPersistence,
+    ) -> Result<String>;
     async fn run_once(&self, input: String) -> Result<String>;
     /// Snapshot of the accumulated session token usage (for `/stat`). A zeroed
     /// result means no completion call has reported usage yet.
@@ -82,12 +87,119 @@ pub trait PicoAgent: Send + Sync {
     async fn summarize(&self, prompt: &str) -> Result<String>;
 }
 
+/// Per-turn persistence state threaded across `prompt()` retries inside one
+/// REPL turn. The REPL owns one instance per user prompt and reuses it across
+/// retries.
+///
+/// It tracks two quantities:
+///
+/// * `turns_sent` — how many **new user messages** have been dispatched this
+///   turn (the user's original prompt, plus each steering/continuation
+///   directive the REPL introduces). A plain retry that re-sends the same
+///   prompt (unchanged `next_input`) does NOT increment it.
+/// * `base_session_count` — the number of user prompts already in the session
+///   at the moment this turn's FIRST `prompt()` ran. Captured lazily and once
+///   (`initialize_base`), so retries of the same turn keep the original
+///   frame.
+///
+/// The persistence decision is made IN `prompt()` by reading the **session**
+/// (the persistence source of truth) and answering the question:
+///
+/// `this_turn_persisted = current_session_count − base`
+/// * if `this_turn_persisted < turns_sent` → this turn's latest dispatch is
+///   not yet persisted → persist `user(input)` now (first failure, or a
+///   steering dispatch whose prompt hasn't landed yet).
+/// * if `this_turn_persisted >= turns_sent` → it's already persisted (a
+///   resend of a prior attempt) → skip, and on success drop the leading
+///   `user(input)` from `final_history`.
+///
+/// Comparing the session-derived *delta* (base-subtracted) against the
+/// per-turn `turns_sent` is what makes this correct across turn boundaries:
+///
+/// * **Identical inputs across turns** (e.g. "continue" twice): turn 2's
+///   base is the session count AFTER turn 1 (which committed "continue"), so
+///   turn 2's own dispatch (sent = 1) still has `this_turn_persisted = 0` and
+///   is persisted as a fresh message. No text comparison involved.
+/// * **"continue" → "continue" within a turn**: the steering dispatch
+///   increments `turns_sent`, so it is never elided against the original.
+/// * **REPL/session drift**: the session is authoritative; the decision
+///   reconciles to what is really persisted.
+#[derive(Debug, Default)]
+pub struct TurnPersistence {
+    turns_sent: std::sync::Mutex<u64>,
+    /// Session user-prompt count at this turn's first `prompt()` entry.
+    /// `None` until [`Self::initialize_base`] runs once.
+    base_session_count: std::sync::Mutex<Option<u64>>,
+}
+
+impl TurnPersistence {
+    /// Start a fresh logical turn. The REPL calls this once per user prompt
+    /// submission, NOT per retry. Subsequent retries reuse it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many *new* user messages have been dispatched in this turn so far.
+    pub fn sent(&self) -> u64 {
+        *self
+            .turns_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that a NEW user message (the user's prompt, or a steering/
+    /// continuation directive) is being dispatched. The REPL calls this when
+    /// it sends a fresh message — NOT on a plain retry that re-sends an
+    /// identical prompt.
+    pub fn mark_new_dispatch(&self) {
+        *self
+            .turns_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+    }
+
+    /// Capture the turn's base frame: the number of user prompts already in
+    /// the session when the turn's first `prompt()` ran. Only the first call
+    /// sets it; retries keep the original frame. A `None` session means 0.
+    pub async fn initialize_base(&self, session: Option<&Session>) {
+        {
+            let base = self
+                .base_session_count
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if base.is_some() {
+                return;
+            }
+        } // guard dropped before the await
+        let count: u64 = match session {
+            Some(s) => s.count_persisted_user_prompts().await as u64,
+            None => 0,
+        };
+        *self
+            .base_session_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(count);
+    }
+
+    /// How many of this turn's dispatches are actually persisted in the
+    /// session right now: `current_session_count − base`. Saturates at 0.
+    pub fn this_turn_persisted(&self, current_session_count: usize) -> u64 {
+        let base = self
+            .base_session_count
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(0);
+        (current_session_count as u64).saturating_sub(base)
+    }
+}
+
 #[async_trait]
 impl PicoAgent for CodeAgent {
     async fn prompt(
         &self,
         input: &str,
         session: Option<&Session>,
+        turn: &TurnPersistence,
     ) -> Result<String> {
         self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
@@ -97,6 +209,11 @@ impl PicoAgent for CodeAgent {
         // only survive while the reader is still running — which it never is at
         // this point. See doc/turn_cancellation_persistence_bugs.md §3.
         self.user_cancel.store(false, Ordering::SeqCst);
+
+        // Capture this turn's base frame (session user-prompt count at entry)
+        // once, so retries of the same turn keep the same reference point for
+        // the persistence de-dup decision. Idempotent.
+        turn.initialize_base(session).await;
 
         // Build prior context from session, or use empty vec as fallback.
         let prior: Vec<Message> = if let Some(s) = session {
@@ -265,8 +382,23 @@ impl PicoAgent for CodeAgent {
                                     // (accepted turns + completed tool batches
                                     // + synthesized answers for interrupted
                                     // calls), or the streamed text when no
-                                    // turn completed yet.
-                                    let mut partial = vec![Message::user(input)];
+                                    // turn completed yet. The leading
+                                    // `user(input)` is included only if this
+                                    // turn's fresh dispatch isn't already in
+                                    // the session (count vs. `turn.sent()`); a
+                                    // resend whose prompt is already persisted
+                                    // is skipped so we never duplicate it.
+                                    let mut partial: Vec<Message> = Vec::new();
+                                    let session_has_prompt = match session {
+                                        Some(s) => {
+                                            let c = s.count_persisted_user_prompts().await;
+                                            turn.this_turn_persisted(c) >= turn.sent()
+                                        }
+                                        None => false,
+                                    };
+                                    if !session_has_prompt {
+                                        partial.push(Message::user(input));
+                                    }
                                     {
                                         let mut t = transcript
                                             .lock()
@@ -294,28 +426,46 @@ impl PicoAgent for CodeAgent {
                             // the SAME logical turn is re-attempted — the retry calls
                             // `prompt()` again with the same input, and rig re-sends
                             // the full context history for the turn (the same way it
-                            // does for a tool-result continuation). Persisting
-                            // `user(input)` here would therefore duplicate the user's
-                            // message in the session on every retry. Skip the
-                            // intermediate persistence for those errors; the partial
-                            // assistant text (in `output`) is dropped too, so the
-                            // retry starts from a clean, single copy of the turn.
-                            // Preserve progress on a non-cancellation error.
+                            // does for a tool-result continuation). Naively
+                            // pre-persisting `user(input)` here would therefore
+                            // duplicate the user's message in the session on every
+                            // retry.
                             //
-                            // When the classified error is auto-retryable AND
-                            // nothing completed (no accepted model turn, no
-                            // streamed text), we persist NOTHING: the REPL
-                            // re-sends the original `input` as a clean single
-                            // copy of the turn. When something did complete,
-                            // we persist `user(input)` + the finalized
-                            // transcript once, and return an
-                            // `LlmInterrupted` error so the REPL continues
-                            // from that transcript with a steering message
-                            // instead of re-sending `input` (which would
-                            // duplicate it). Non-retryable errors keep the
-                            // earlier Phase 2a behavior so the user's turn is
-                            // never lost on give-up. See
-                            // doc/tool_error_handling.md §Mid-turn failure.
+                            // De-dup strategy: the per-turn `TurnPersistence`
+                            // record is the single source of truth for "was
+                            // `user(input)` already written to the session
+                            // within THIS turn, and with what text?" The REPL
+                            // resets it (`TurnPersistence::new()`) at the start
+                            // of every user prompt and reuses it across
+                            // retries. The first failure of a turn persists
+                            // `user(input)` and records the text; later
+                            // failures that repeat the SAME text (and the
+                            // cancel branch) skip. A retry that switches to a
+                            // DIFFERENT prompt text (the steering message)
+                            // persists that new text too. On success, `prompt()`
+                            // drops the leading `user(input)` from
+                            // `final_history` when the recorded text matches.
+                            //
+                            // This is strictly SAFER than deduping by comparing
+                            // against the session's last user message: two
+                            // successive turns with an IDENTICAL input (e.g.
+                            // the user types "continue" twice) must NOT
+                            // collide. A session-level comparison cannot tell
+                            // "same turn, retry" from "different turn, same
+                            // text", and would wrongly suppress the second
+                            // turn's user prompt. The in-memory record is
+                            // reset per turn, so it never conflates them.
+                            //
+                            //   * retryable-no-progress (the lost-context bug):
+                            //     `user(input)` is persisted on the FIRST failure,
+                            //     so a give-up after 50 retries still leaves the
+                            //     turn visible in the session.
+                            //   * retryable-with-progress: same — `user(input)` is
+                            //     persisted if not already there.
+                            //   * non-retryable: same as the original Phase 2a.
+                            //   * retry-then-success: the success branch drops the
+                            //     duplicate leading `user(input)` from
+                            //     `final_history`.
                             let classified = classify_stream_error(&e);
                             let retryable = classified.is_auto_retryable();
                             // Finalize what completed (accepted turns + tool
@@ -341,8 +491,29 @@ impl PicoAgent for CodeAgent {
                             // exists, to avoid duplicating the user's input on
                             // a blind retry.
                             if let Some(s) = session {
-                                if !retryable || made_progress {
+                                // Persist-decision (session is the source of
+                                // truth): `this_turn_persisted` is how many of
+                                // this turn's *new* dispatches are recorded in
+                                // the session (current count minus the base
+                                // frame captured at turn start). If it is
+                                // LOWER than `turn.sent()`, the fresh dispatch
+                                // for this turn is not yet persisted (first
+                                // failure, or a steering dispatch whose prompt
+                                // hasn't landed) — persist `user(input)` now.
+                                // If it is already EQUAL, the prompt is
+                                // persisted (this is a resend of a prior
+                                // attempt) — skip.
+                                let session_user_count =
+                                    s.count_persisted_user_prompts().await;
+                                let should_persist_input =
+                                    turn.this_turn_persisted(session_user_count)
+                                        < turn.sent();
+                                let should_persist_progress =
+                                    !retryable || has_accepted || !output.is_empty();
+                                if should_persist_input {
                                     let _ = s.append_message(&Message::user(input)).await;
+                                }
+                                if should_persist_progress {
                                     if has_accepted {
                                         for m in &transcript_msgs {
                                             let _ = s.append_message(m).await;
@@ -406,7 +577,25 @@ impl PicoAgent for CodeAgent {
             // Store pre-strip messages (strip is applied to LLM context above,
             // not at storage time — see doc/session_storage.md §4).
             if let Some(fh) = final_history {
-                let to_commit = normalize_call_ids(fh);
+                let mut to_commit = normalize_call_ids(fh);
+                // De-dup against the session (persistence source of truth).
+                // When the session already holds this turn's fresh dispatch
+                // prompt (`session_user_count >= turn.sent()`, e.g. a prior
+                // failed attempt pre-persisted it), `final_history[0]` is a
+                // re-sent duplicate of that same prompt — drop it so the user
+                // prompt appears exactly once. When the session count is
+                // LOWER (the fresh dispatch's prompt isn't persisted yet — a
+                // genuinely new user message/stear directive), keep
+                // `final_history[0]` so it is committed.
+                let session_user_count = s.count_persisted_user_prompts().await;
+                if turn.this_turn_persisted(session_user_count) >= turn.sent() {
+                    // Only drop when the leading message is this turn's user
+                    // prompt (a plain text User message), never a tool-result
+                    // batch or an assistant message.
+                    if matches!(to_commit.first(), Some(Message::User { content }) if content.iter().any(|c| matches!(c, UserContent::Text(_)))) {
+                        to_commit.remove(0);
+                    }
+                }
                 for msg in to_commit {
                     let _ = s.append_message(&msg).await;
                 }
@@ -436,7 +625,12 @@ impl PicoAgent for CodeAgent {
         self.output.display_separator();
         // `prompt` now renders the response itself via the streaming Output
         // methods, so there is no separate `display_markdown` here.
-        let response = self.prompt(&input, None).await?;
+        let turn = TurnPersistence::new();
+        // run_once is sessionless but still a NEW user dispatch; mark it so
+        // `turn.sent() == 1` and the success path does not mis-deduplicate
+        // `final_history[0]` against an absent session.
+        turn.mark_new_dispatch();
+        let response = self.prompt(&input, None, &turn).await?;
         Ok(response)
     }
 
@@ -645,9 +839,16 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
 }
 
 /// Detect a small number of well-known `ResponseError(String)` shapes that
-/// rig emits with no richer classification. Today this is just the
-/// assembler-emitted malformed-tool-call message (parts.rs:697-700); add
-/// more shapes here as they appear.
+/// rig emits with no richer classification. Today this covers the
+/// assembler-emitted malformed-tool-call message and the OpenRouter-style
+/// JSON error envelopes that some providers stream in the body of a 200 OK
+/// response (so rig captures them in `CompletionError::ProviderResponse` /
+/// `ResponseError(String)` without an HTTP status). The latter surfaces as
+/// `error.code: 429` with `error_type: "rate_limit_exceeded"` (or
+/// `provider_unavailable`) inside a JSON envelope; without this detection
+/// it falls through to `LlmStreamProtocol`, which misclassifies a
+/// rate-limit as a streaming protocol error and is not respected by the
+/// `Retry-After` floor.
 fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
     use crate::PicocodeError::*;
     // "tool call `X` arrived with malformed JSON input: <serde error>"
@@ -661,7 +862,33 @@ fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
             }
         }
     }
+    // OpenRouter-style JSON envelope: `{"error":{"code":429,"message":"...",
+    // "metadata":{"error_type":"rate_limit_exceeded"}}, ...}`. The body
+    // is sometimes wrapped by `ProviderResponseError: ` (the `Display`
+    // output of `CompletionError::ProviderResponse(...)` when status is
+    // `None`); strip the prefix if present.
+    let body = msg
+        .strip_prefix("ProviderResponseError: ")
+        .unwrap_or(msg);
+    if let Some(code) = extract_openrouter_error_code(body) {
+        match code {
+            429 => return Some(LlmRateLimited { retry_after_secs: None }),
+            500..=599 => return Some(LlmUpstream { status: code }),
+            401 | 403 => return Some(LlmAuth { status: code }),
+            402 => return Some(LlmBilling { status: code }),
+            400..=499 => return Some(LlmClient { status: code }),
+            _ => return None,
+        }
+    }
     None
+}
+
+/// Extract the `error.code` field from an OpenRouter-style error envelope.
+/// Returns `None` if the body is not JSON or has no numeric `error.code`.
+fn extract_openrouter_error_code(body: &str) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let code = v.get("error")?.get("code")?.as_u64()?;
+    u16::try_from(code).ok()
 }
 
 /// Canonical transcript of the in-flight run, mirroring rig's `new_messages`
@@ -3454,19 +3681,29 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 let response: std::result::Result<String, crate::PicocodeError> = {
                     let mut consecutive_failures: u8 = 0;
                     let mut next_input: String = input.clone();
-                    // The full steering message (synthetic feedback / "continue
-                    // where you left off") is delivered once per logical turn;
-                    // `prompt()` persists it with the partial transcript when a
-                    // retry makes progress and then fails again. Re-sending the
-                    // same full steer on that later interruption would repeat it
-                    // in the session once the retry succeeds, so later
-                    // interruptions get a short continuation instead.
+                    // Per-turn persistence flag. Reset once per user prompt
+                    // (NOT per retry): the retry loop below reuses it across
+                    // `prompt()` attempts so a pre-persisted `user(input)` is
+                    // not duplicated, while the NEXT turn starts fresh (so
+                    // two identical inputs in a row, e.g. "continue" twice,
+                    // never collide). See `TurnPersistence`.
+                    let turn = TurnPersistence::new();
+                    // The user's original prompt is this turn's first NEW
+                    // dispatch.
+                    turn.mark_new_dispatch();
+                    // The full steering message (synthetic feedback / "continue")
+                    // is delivered once per logical turn; `prompt()` persists it
+                    // with the partial transcript when a retry makes progress and
+                    // then fails again. Re-sending the same full steer on that
+                    // later interruption would repeat it in the session once the
+                    // retry succeeds, so later interruptions get a short
+                    // continuation instead.
                     let mut steer_delivered = false;
                     let outcome: std::result::Result<String, crate::PicocodeError> = loop {
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&next_input, session.as_ref())
+                            .prompt(&next_input, session.as_ref(), &turn)
                             .await;
                         match prompt_result {
                             Ok(text) => break Ok(text),
@@ -3513,15 +3750,17 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     ));
                                 }
                                 // Steering prompt: the synthetic feedback for
-                                // e.g. malformed tool calls, else a generic
-                                // continuation pointing at the persisted work.
-                                // NOT appended to the session — it becomes the
-                                // retry's prompt (input + partial are already
-                                // persisted). Delivered in full only once per
-                                // logical turn; after the model has already been
-                                // steered once and made further (persisted)
-                                // progress, a short continuation suffices and
-                                // avoids repeating the steer text in the session.
+                                // e.g. malformed tool calls (carries the parse
+                                // error the model needs to self-correct), else a
+                                // short "continue" pointing at the persisted
+                                // work. NOT appended to the session — it becomes
+                                // the retry's prompt (input + partial are already
+                                // persisted). Delivered in full (the synthetic
+                                // feedback) only once per logical turn; after the
+                                // model has already been steered once and made
+                                // further (persisted) progress, a plain "continue"
+                                // suffices and avoids repeating the steer text in
+                                // the session.
                                 //
                                 // When there is no session, nothing was actually
                                 // persisted, so a "continue where you left off"
@@ -3534,20 +3773,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 next_input = if session.is_none() {
                                     input.clone()
                                 } else if steer_delivered {
-                                    "Please continue where you left off.".to_string()
+                                    "continue".to_string()
                                 } else {
                                     steer_delivered = true;
                                     match cause.synthetic_retry_feedback() {
                                         Some(fb) => fb,
-                                        None => {
-                                            "The previous request was interrupted by a transient \
-                                             provider error. The conversation above contains the \
-                                             work completed before the interruption; continue \
-                                             where you left off."
-                                                .to_string()
-                                        }
+                                        None => "continue".to_string(),
                                     }
                                 };
+                                // The steering message is a NEW user dispatch
+                                // for this turn (distinct from the original
+                                // prompt), so it counts toward `turns_sent` and
+                                // will be persisted/deduped as its own message.
+                                turn.mark_new_dispatch();
                                 if cancel.load(Ordering::SeqCst) {
                                     break Err(crate::PicocodeError::Cancelled(
                                         "Aborted.".into(),
@@ -3556,16 +3794,15 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                 continue;
                             }
                             // No-progress retryable failure: `prompt()` returned
-                            // the plain classified error without persisting any
-                            // partial transcript. This is a "consecutive
-                            // failure" — increment the counter and grow the
-                            // back-off exponentially. The retry re-runs from
-                            // `input` (the turn never got past its first model
-                            // call). For malformed tool calls the model needs
-                            // the parse error to self-correct — and the original
-                            // `input` is NOT yet in the session, so
-                            // re-establish it first, then re-prompt with the
-                            // synthetic feedback.
+                            // the plain classified error. `prompt()`'s error
+                            // branch already de-duped and persisted `user(input)`
+                            // (or skipped it because the session already ended
+                            // on it), so we do NOT re-append here. The retry
+                            // re-runs from `input` (the turn never got past its
+                            // first model call). For malformed tool calls the
+                            // model needs the parse error to self-correct; in
+                            // that case the synthetic feedback becomes the
+                            // retry's prompt instead of `input`.
                             Err(e)
                                 if e.is_auto_retryable()
                                     && consecutive_failures < retry_budget(&e) =>
@@ -3588,12 +3825,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                     ));
                                 }
                                 if let Some(feedback) = e.synthetic_retry_feedback() {
-                                    if let Some(ref s) = session {
-                                        let _ = s
-                                            .append_message(&Message::user(input.clone()))
-                                            .await;
-                                    }
+                                    // `prompt()` already persisted `user(input)`
+                                    // (de-duped). Re-prompt with the synthetic
+                                    // feedback so the model can self-correct.
                                     next_input = feedback;
+                                    // The feedback replaces the original prompt
+                                    // as a NEW user dispatch for this turn.
+                                    turn.mark_new_dispatch();
                                 }
                                 // Race window: cancel could fire after
                                 // `cancellable_sleep` returned but before
@@ -3750,7 +3988,50 @@ mod tests {
         parse_tree_args, persist_turn, reasoning_text, MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
+    use super::TurnPersistence;
     use rig_core::message::{AssistantContent, Message, Text};
+
+    #[test]
+    fn turn_persistence_counts_dispatch_not_text() {
+        // The per-turn record counts NEW dispatches (the user's original
+        // prompt plus each steering/continuation directive), never the
+        // prompt TEXT. This is what lets two identical "continue" messages
+        // in one turn be treated as distinct dispatches.
+        let turn = TurnPersistence::new();
+        assert_eq!(turn.sent(), 0);
+
+        // The user's first prompt is dispatch 1.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 1);
+
+        // A retry that re-sends the SAME prompt does NOT bump the count:
+        // callers only call mark_new_dispatch when next_input actually
+        // changes to a new message.
+        // (No-op here; the no-resend case is just "don't call it".)
+
+        // A steering "continue" (same text as a possible original) is a NEW
+        // dispatch and must bump.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 2);
+
+        // A second "continue" steering is yet another dispatch.
+        turn.mark_new_dispatch();
+        assert_eq!(turn.sent(), 3);
+    }
+
+    #[test]
+    fn turn_persistence_is_fresh_per_new_turn() {
+        // Two successive user turns must have independent dispatch counts
+        // (e.g. the user types "continue" twice). The REPL mints a fresh
+        // TurnPersistence per user prompt, so turn 2 starts at 0 even
+        // though turn 1 dispatched and persisted a "continue".
+        let turn1 = TurnPersistence::new();
+        turn1.mark_new_dispatch();
+        assert_eq!(turn1.sent(), 1);
+
+        let turn2 = TurnPersistence::new();
+        assert_eq!(turn2.sent(), 0);
+    }
 
     #[test]
     fn parse_tree_args_strips_angle_brackets_from_id() {
@@ -4914,6 +5195,74 @@ mod tests {
             }
             other => panic!("expected LlmTransport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_openrouter_429_mid_stream_envelope_is_rate_limited() {
+        // OpenRouter sometimes streams a 429 in the body of a 200 OK
+        // response (the `error.code` field of a JSON envelope). Rig
+        // surfaces this as `CompletionError::ProviderResponse(...)` with
+        // `status == None` and the JSON body as the `Display` string. The
+        // classifier must extract the 429 and map it to `LlmRateLimited`
+        // so the REPL's Retry-After floor and the 50-attempt budget
+        // apply.
+        let envelope = r#"ProviderResponseError: {"id":"gen-1788453950-hBER7wC6ldCU829zmnAe","object":"chat.completion.chunk","created":1788453950,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        match classified {
+            PicocodeError::LlmRateLimited { retry_after_secs } => {
+                assert_eq!(retry_after_secs, None);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmRateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_openrouter_502_mid_stream_envelope_is_upstream() {
+        // Same envelope shape, but with a 5xx code. Must map to
+        // `LlmUpstream { status: 502 }`.
+        let envelope = r#"ProviderResponseError: {"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError","metadata":{"error_type":"provider_unavailable"}}}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        match classified {
+            PicocodeError::LlmUpstream { status } => {
+                assert_eq!(status, 502);
+                assert!(classified.is_auto_retryable());
+            }
+            other => panic!("expected LlmUpstream {{ status: 502 }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_openrouter_envelope_without_error_code_falls_through_to_stream_protocol() {
+        // JSON that parses but has no `error.code` (e.g. a different
+        // provider's envelope) should not match — falls through to
+        // `LlmStreamProtocol` as before.
+        let envelope = r#"{"id":"x","error":"invalid_argument"}"#;
+        let err = CompletionError::ResponseError(envelope.to_string());
+        let classified = super::classify_completion_error(&err);
+        assert!(matches!(
+            classified,
+            PicocodeError::LlmStreamProtocol(_)
+        ));
+    }
+
+    #[test]
+    fn classify_unrecognized_text_response_error_still_matches_malformed_tool_call() {
+        // The pre-existing "tool call `X` arrived with malformed JSON"
+        // detection must keep working alongside the new OpenRouter
+        // envelope detection — they share the same `detect_response_error`
+        // entry point.
+        let err = CompletionError::ResponseError(
+            "tool call `edit` arrived with malformed JSON input: expected `,` or `}` at line 1"
+                .into(),
+        );
+        let classified = super::classify_completion_error(&err);
+        assert!(matches!(
+            classified,
+            PicocodeError::LlmMalformedToolCall { .. }
+        ));
     }
 
     #[test]

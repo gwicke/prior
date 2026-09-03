@@ -546,6 +546,36 @@ impl Session {
         index.leaf_id.clone()
     }
 
+    /// Count how many genuine *user prompt* messages are currently persisted
+    /// on the active leaf→root branch.
+    ///
+    /// This is the persistence source-of-truth for the retry de-dup guard
+    /// (`TurnPersistence`): it counts pi `role: "user"` entries, which are
+    /// only ever written for a plain, non-empty user prompt (see
+    /// [`rig_message_to_pi_entries`] — tool results are stored as
+    /// `role: "toolResult"`, never `"user"`). So it measures how many
+    /// user turns have really been committed to the session, independently of
+    /// any REPL-side counter. Compaction/`model_change`/`thinking_level`
+    /// entries are ignored.
+    pub async fn count_persisted_user_prompts(&self) -> usize {
+        let index = self.index.lock().await;
+        let leaf_id = match &index.leaf_id {
+            Some(id) => id.clone(),
+            None => return 0,
+        };
+        let path = index.get_path_to_root(&leaf_id);
+        path.iter().fold(0usize, |count, entry| {
+            if let crate::session::types::SessionEntryContent::Message { message } =
+                &entry.content
+            {
+                if message.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    return count + 1;
+                }
+            }
+            count
+        })
+    }
+
     /// Build a recursive tree from the in-memory index.
     pub async fn get_tree(&self) -> Vec<SessionTreeNode> {
         let index = self.index.lock().await;
@@ -2204,6 +2234,82 @@ mod tests {
         }
         assert!(bash_ok, "should have a bash tool result with toolName 'bash'");
         assert!(read_ok, "should have a read tool result with toolName 'read'");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_count_persisted_user_prompts_counts_only_user_prompts() {
+        // `count_persisted_user_prompts` is the session-side source of truth
+        // for the retry de-dup guard: it must count genuine user prompts
+        // (role "user") and EXCLUDE tool-result batches (role
+        // "toolResult"), assistant messages, and non-message entries.
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-count-user-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        use rig_core::message::{
+            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
+        };
+
+        // Empty session: 0 user prompts.
+        assert_eq!(session.count_persisted_user_prompts().await, 0);
+
+        // One genuine user prompt.
+        session.append_message(&Message::user("hello")).await.unwrap();
+        assert_eq!(session.count_persisted_user_prompts().await, 1);
+
+        // An assistant turn does not add a user prompt.
+        session
+            .append_message(&Message::assistant("world"))
+            .await
+            .unwrap();
+        assert_eq!(session.count_persisted_user_prompts().await, 1);
+
+        // A tool-result batch (role "toolResult") must NOT be counted.
+        session
+            .append_message(&Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
+                    function: ToolFunction::new("read".into(), serde_json::json!({})),
+                    signature: None,
+                    additional_params: None,
+                })],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::User {
+                content: vec![UserContent::ToolResult(RigToolResult {
+                    call: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("file contents"))],
+                })],
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.count_persisted_user_prompts().await, 1);
+
+        // A second user prompt now makes 2.
+        session.append_message(&Message::user("again")).await.unwrap();
+        assert_eq!(session.count_persisted_user_prompts().await, 2);
 
         let _ = tokio::fs::remove_file(&path).await;
     }

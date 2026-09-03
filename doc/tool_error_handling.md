@@ -283,12 +283,10 @@ its calls are answered with synthesized text results instead of being dropped.
    re-sends `input` (current behavior).
 3. **The REPL retry loop** (`src/agent.rs`, `run_interactive`): for the
    "progress persisted" case, re-prompt with a *steering/continuation* message
-   instead of `input` — e.g.
-   `"The previous request was interrupted by a transient provider error
-   (429). The work completed so far is in the conversation above. Continue
-   where you left off."` The original `input` is already in the session as
-   `committed[0]`, so it is not duplicated; the steering message is the new
-   prompt and becomes the next turn's user message on success.
+   instead of `input` — the short steer `"continue"` (or the synthetic
+   malformed-tool-call feedback). The original `input` is already in the
+   session as `committed[0]`, so it is not duplicated; the steering message is
+   the new prompt and becomes the next turn's user message on success.
 4. **Malformed-tool-call recovery** unifies: the error typically arrives with
    **no** completed turn (the assembler failed mid-first-turn), so nothing is
    persisted; the synthetic feedback message (see `synthetic_retry_feedback`)
@@ -305,7 +303,7 @@ its calls are answered with synthesized text results instead of being dropped.
 
 Re-sending `input` after partial progress would duplicate `committed[0]` (the
 input is already in the session from step 1) *and* restate a request the model
-already worked on. A steering message ("continue where you left off", or the
+already worked on. A steering message (the short "continue", or the
 synthetic parse-error feedback) is the correct continuation token: it is a new
 user message that points at the existing context without repeating it. This is
 the same pattern rig uses for `InvalidToolCallAction::Retry { feedback }` — the
@@ -381,6 +379,59 @@ prompt resets it — never session-global):
   **total time waited** so the user can decide whether to keep going or switch
   providers. Because progress was persisted (R1), give-up is lossless — the
   partial turn is in the session and the user's next prompt continues from it.
+
+### Lost-context guard: always persist `user(input)` on first failure
+
+A pre-fix bug: when `prompt()` failed on a retryable error with **no
+progress** (e.g. a 429 on the first model call of a turn, before any
+assistant turn or streamed text had been produced), nothing was persisted
+to the session. If the REPL exhausted the retry budget (50 attempts) on
+the same transient condition, the user's turn was lost entirely — the
+session had no record of the user prompt, and a follow-up "continue"
+prompt had zero context. The user's actual incident:
+
+> "the *full turn context* was lost, including the user prompt. When
+> asking the model to continue with a simple "continue" prompt, it had
+> zero context from the previous failed turn."
+
+The fix (R7) is symmetric and de-duped with an in-memory per-turn guard:
+
+- **`TurnPersistence`** (`src/agent.rs`): the REPL owns one instance per
+  user prompt and reuses it across retries. It tracks **how many NEW user
+  messages have been dispatched this turn** (`turns_sent`: the user's
+  original prompt plus each steering/continuation directive) and captures a
+  **base frame** (`base_session_count`: the session's user-prompt count at
+  this turn's first `prompt()` entry). This is entirely **text-independent**.
+- **Session is the persistence source of truth**
+  (`Session::count_persisted_user_prompts`): walks the active branch and
+  counts `role: "user"` entries (tool results are `role: "toolResult"` and
+  are never counted). The decision in `prompt()` computes
+  `this_turn_persisted = current_session_count − base` and compares it to
+  `turns_sent`:
+  1. **this_turn_persisted < turns_sent** → this turn's latest dispatch is
+     not yet persisted → persist `user(input)` (first failure, or a steering
+     dispatch whose prompt hasn't landed yet).
+  2. **this_turn_persisted >= turns_sent** → it's already persisted (a
+     resend of a prior attempt) → skip, and on success drop the leading
+     `user(input)` from `final_history`.
+- This is correct across turn boundaries because the *base* is subtracted:
+  two identical inputs in successive turns (e.g. "continue" twice) get
+  distinct base frames, so turn 2's `this_turn_persisted` starts at 0 and
+  its "continue" is persisted as fresh. A steering "continue" within one
+  turn is a distinct dispatch (`turns_sent` incremented), so it is never
+  elided against the original. No text comparison anywhere.
+- **REPL retry loop**: `turn.mark_new_dispatch()` is called for the initial
+  prompt and for each steering/continuation directive; a plain retry that
+  re-sends an identical prompt does NOT bump the count. The removed manual
+  `s.append_message(&Message::user(input))` for synthetic feedback stays
+  owned by `prompt()`'s de-dup logic.
+
+Net effect: the user prompt is always in the session after the first
+failure of a turn. The 50-attempt retry budget can be exhausted without
+losing the user's input — give-up is lossless in all cases, not just
+when progress was made. Because the decision reads the session, a REPL
+counter drift is harmless: the outcome always reconciles to what is
+really persisted.
 
 ### Malformed-tool-call (R6) — already covered
 
@@ -523,17 +574,35 @@ taxonomy and the `Retry-After` extraction.
    where progress exists (R6). Unknown-tool recovery remains owned by the rig
    hook (`on_invalid_tool_call`), which is correct — it recovers in-run
    without the REPL layer.
-10. ✅ Existing classification + display + name-recovery tests pass (328 lib
-    tests; +6 new tests covering the unified budget, exponential growth, the
-    Retry-After floor, and the two retryable error shapes from the task:
-    the DeepInfra 502 `ProviderResponseError` envelope and the
-    `Http client error: error sending request for url` transport error).
+10. ✅ Lost-context guard (R7): `user(input)` is persisted on the FIRST
+    failure of a turn regardless of retryability or progress, de-duped
+    via the per-turn `TurnPersistence` record (count-based; never
+    conflates identical inputs across turns — the session is the source
+    of truth). A retryable failure with
+    no progress (e.g. a sustained 429 on the very first model call) no
+    longer loses the turn when the retry budget is exhausted.
+11. ✅ OpenRouter 429 mid-stream JSON envelope (the `ProviderResponseError`
+    shape with `error.code: 429` and `error_type: "rate_limit_exceeded"`)
+    classifies as `LlmRateLimited`, so the `Retry-After`-floor + 50-attempt
+    budget applies. Same for 5xx codes in the envelope (`LlmUpstream`).
+12. ✅ Existing classification + display + name-recovery tests pass (335 lib
+    tests; +3 new tests covering the OpenRouter 429/502 mid-stream JSON
+    envelope classification and the no-code fall-through to
+    `LlmStreamProtocol`, plus 3 tests pinning the count-based
+    `TurnPersistence` dispatch semantics and the session
+    `count_persisted_user_prompts` source of truth).
 
 ## File changes (projected)
 
 - `src/agent.rs` — `TurnTranscript`, `LoggingHook` wiring, finalize fn,
-  `Some(Err)`/cancel persistence changes, REPL retry-loop budget + steering,
-  `AgentConfig::rate_limit_retry_budget` plumbing, tests.
+  `Some(Err)`/cancel persistence changes (de-duped via the count-based
+  `TurnPersistence` record over the session source-of-truth),
+  REPL retry-loop budget + steering (short
+  "continue" message), OpenRouter mid-stream JSON envelope detection in
+  `detect_response_error`, tests.
+- `src/session/session.rs` — new
+  `Session::count_persisted_user_prompts()` used as the persistence
+  source-of-truth for the retry de-dup guard, tests.
 - `src/lib.rs` — `PicocodeError` steering signal (new variant or flag) if the
   REPL needs to distinguish "no progress" from "progress persisted";
   `AgentConfig` re-export unchanged.
