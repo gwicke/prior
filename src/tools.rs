@@ -277,7 +277,25 @@ impl rig_core::tool::Tool for Bash {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
-        run_sandboxed(&args.command, args.timeout).await
+        let (out, exit_code) = run_sandboxed_with_status(&args.command, args.timeout).await?;
+        // The bash tool result is shown verbatim to the user (via
+        // `LoggingHook::on_tool_result` → `display_tool_result`) AND handed
+        // straight back to the LLM as the tool message. An empty stdout
+        // is therefore ambiguous to both audiences: the model can't tell
+        // success (e.g. `mkdir -p foo`) from failure (e.g. `false` or
+        // command-not-found) and the user sees the same opaque "no
+        // output". Surface the exit code so both can act on it.
+        // `run_sandboxed` itself returns `"(empty)"` for an empty stream;
+        // override that here with the more informative message.
+        if out == "(empty)" {
+            let code = match exit_code {
+                Some(n) => n.to_string(),
+                None => "unknown (terminated by signal)".to_string(),
+            };
+            Ok(format!("[bash] no output, exit code {code}"))
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -427,12 +445,62 @@ pub(crate) async fn run_sandboxed(
         // `capture_bounded`).
         let cap = cfg.max_output_bytes();
         let expr = build_bwrap_expr(&cmd, cfg, false)?;
-        capture_bounded(expr, timeout, cap)
+        // Discard the exit code here — `run_sandboxed` is the shared helper
+        // for paths (the `!`/`!!` user shell, `agent_browser`) that don't
+        // surface it. The bash tool uses `Bash::call` directly, which goes
+        // through `run_sandboxed_with_status` to get the exit code.
+        capture_bounded(expr, timeout, cap).map(|(out, _exit)| out)
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
 
     Ok(trim_output(output))
+}
+
+/// Same as [`run_sandboxed`] but also returns the child's exit code, so the
+/// bash tool can report a meaningful "[bash] no output, exit code N" when the
+/// command produced no output. `None` means the child was killed by a signal
+/// or otherwise terminated without an observable exit code (e.g. watchdog
+/// kill, IO error mid-run).
+pub(crate) async fn run_sandboxed_with_status(
+    cmd: &str,
+    override_timeout: Option<u64>,
+) -> Result<(String, Option<i32>), ToolError> {
+    let cfg = sandbox_config();
+
+    // The LLM may override the configured default timeout per command. The
+    // timeout is enforced whenever the command actually runs; an unset sandbox
+    // config is refused before the timeout is relevant (see the closure below).
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs);
+    let timeout = resolve_timeout(override_timeout, configured)?;
+
+    // Move owned copies into the blocking task (`cmd` cloned to a String, the
+    // `Arc` config cheaply cloned) so the closure is `'static`. Everything runs
+    // in one task so the non-`Clone` `Handle` stays owned where it can be killed.
+    let cmd = cmd.to_string();
+    let cfg = cfg.clone();
+    let (output, exit_code) = tokio::task::spawn_blocking(move || {
+        // Same sandbox-required contract as `run_sandboxed` — see that fn's
+        // comment for the rationale. The body is intentionally duplicated
+        // rather than shared via a free helper because the only divergent
+        // piece is which return shape we hand back; folding them together
+        // would require every other caller to destructure a tuple.
+        let cfg = match cfg.as_ref().as_ref() {
+            Some(c) => c,
+            None => {
+                return Err(ToolError::Generic(
+                    "sandbox not configured; refusing to run command".into(),
+                ))
+            }
+        };
+        let cap = cfg.max_output_bytes();
+        let expr = build_bwrap_expr(&cmd, cfg, false)?;
+        capture_bounded(expr, timeout, cap)
+    })
+    .await
+    .map_err(|e| ToolError::Generic(e.to_string()))??;
+
+    Ok((trim_output(output), exit_code))
 }
 
 /// Run a program (given as an argv list) inside a **read-only** Bubblewrap
@@ -449,7 +517,7 @@ pub(crate) async fn run_sandboxed_ro(
     let argv = argv.to_vec();
     let cfg = cfg.clone();
     let cap = cfg.max_output_bytes();
-    let output = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ToolError> {
+    let output = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
         let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
         // Stream merged stdout+stderr in bounded chunks (matches the shell
         // path: bwrap forwards stdio to inherited fds; stderr is merged in,
@@ -459,6 +527,9 @@ pub(crate) async fn run_sandboxed_ro(
     })
     .await
     .map_err(|e| ToolError::Generic(e.to_string()))??;
+    // Exit code is discarded — read-only tools don't surface it to the model
+    // (grep/list_dir etc. treat a non-zero status as a non-error "no match").
+    let (output, _exit) = output;
     Ok(String::from_utf8_lossy(&output).to_string())
 }
 
@@ -498,7 +569,7 @@ fn capture_bounded(
     expr: duct::Expression,
     timeout: Option<u64>,
     max_bytes: usize,
-) -> Result<Vec<u8>, ToolError> {
+) -> Result<(Vec<u8>, Option<i32>), ToolError> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -633,7 +704,24 @@ fn capture_bounded(
         );
         out.extend_from_slice(note.as_bytes());
     }
-    Ok(out)
+
+    // The child has either exited (EOF observed) or been killed by the
+    // watchdog (in which case `try_wait` still resolves to the dead process's
+    // status — typically the signal code, which `ExitStatus::code` reports as
+    // `None`). Either way the call is non-blocking now: the IO thread has
+    // already finished by the time the read loop returned `Ok(0)`, and a
+    // watchdog kill closes the pipe so the read also unblocks. We surface
+    // the exit code (or `None` for signal-terminated / unobservable
+    // terminations) so callers like the bash tool can render a meaningful
+    // "[bash] no output, exit code N" message when the command produced no
+    // stdout/stderr.
+    let exit_code = handle
+        .try_wait()
+        .ok()
+        .flatten()
+        .and_then(|out| out.status.code());
+
+    Ok((out, exit_code))
 }
 
 /// Read-only system directories bound into every sandbox so the shell and
@@ -1159,6 +1247,77 @@ mod sandbox_tests {
         set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
         let out = run_sandboxed("echo hello-world", None).await.unwrap();
         assert_eq!(out, "hello-world");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sandboxed_with_status_reports_exit_code_on_success() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        let (out, code) = run_sandboxed_with_status("true", None).await.unwrap();
+        assert_eq!(out, "(empty)");
+        assert_eq!(code, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_sandboxed_with_status_reports_nonzero_exit_code() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        // `sh -c 'exit 7'` produces no output but a known non-zero exit.
+        let (out, code) = run_sandboxed_with_status("exit 7", None).await.unwrap();
+        assert_eq!(out, "(empty)");
+        assert_eq!(code, Some(7));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_tool_empty_output_includes_exit_code() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        // Drive the tool the same way rig does: build a ToolContext and call
+        // `call` with a deserialised BashArgs. The empty-output case is
+        // re-shaped into the "[bash] no output, exit code N" message so
+        // both the user (via `display_tool_result`) and the model (via
+        // rig's tool message) see a useful signal instead of `"(empty)"`.
+        use rig_core::tool::Tool;
+        let mut ctx = rig_core::tool::ToolContext::default();
+        let args = serde_json::from_value::<BashArgs>(serde_json::json!({
+            "command": "exit 0",
+        }))
+        .unwrap();
+        let out = Bash.call(&mut ctx, args).await.unwrap();
+        assert_eq!(out, "[bash] no output, exit code 0");
+
+        let args = serde_json::from_value::<BashArgs>(serde_json::json!({
+            "command": "exit 42",
+        }))
+        .unwrap();
+        let out = Bash.call(&mut ctx, args).await.unwrap();
+        assert_eq!(out, "[bash] no output, exit code 42");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_tool_passes_through_nonempty_output_unchanged() {
+        if !bwrap_on_path() {
+            return;
+        }
+        set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
+        use rig_core::tool::Tool;
+        let mut ctx = rig_core::tool::ToolContext::default();
+        let args = serde_json::from_value::<BashArgs>(serde_json::json!({
+            "command": "echo hi",
+        }))
+        .unwrap();
+        let out = Bash.call(&mut ctx, args).await.unwrap();
+        assert_eq!(out, "hi");
     }
 
     #[tokio::test]
