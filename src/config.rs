@@ -41,6 +41,11 @@ pub struct Config {
     /// contract). See `doc/compaction.md`.
     #[serde(default)]
     pub reasoning_in_context: Option<bool>,
+    /// Free-text instruction prepended to the dropped-span transcript when
+    /// `/tree <id> compact llm` is run with no trailing text. When unset,
+    /// the built-in `DEFAULT_LLM_COMPACT_PROMPT` is used.
+    #[serde(default)]
+    pub llm_compact_prompt: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

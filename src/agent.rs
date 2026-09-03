@@ -2343,7 +2343,7 @@ pub(crate) enum TreeAction {
     Compact,
 }
 
-/// Summary mode for `/tree compact` (future: more modes).
+/// Summary mode for `/tree compact`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactSummaryMode {
     /// `summary = ""` — drop the prefix, keep no summary.
@@ -2352,26 +2352,50 @@ pub(crate) enum CompactSummaryMode {
     /// responses per turn, plus a touched-files list (read/write/edit
     /// paths). No reasoning, no tool calls, no tool output.
     TextOnly,
+    /// LLM-generated summary: the dropped span is serialized into a prompt,
+    /// sent through `agent.summarize()` (after temporarily moving the leaf
+    /// to the entry *before* the compaction point and remembering the
+    /// original leaf), and the response is written as `summary`.
+    /// Accepts an optional trailing free-text payload (the user-editable
+    /// instruction); when empty, `settings.llm_compact_prompt()` is used.
+    Llm,
 }
 
-/// Parse `/tree <target_id> [switch [--summarize] | compact [truncate|…]]`.
+/// Parse `/tree <target_id> [switch [--summarize] | compact [truncate|text-only|llm [<payload>]]]`.
 /// The bare `/tree <id> --summarize` form is accepted as an alias for
 /// `switch --summarize` (backward compat). Only committed canonical lines (or
 /// hand-typed canonical/alias forms) reach this parser — sub-menu filter
 /// fragments are consumed by the overlay's fuzzy/pre-selection logic.
-fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode>, bool) {
+/// For `compact llm`, the trailing free-text payload (whitespace-joined,
+/// no quote parsing — matches `rename`/`set`) is returned in the last
+/// tuple slot; empty for the other modes.
+fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode>, bool, String) {
     let mut summarize = false;
     let mut target = String::new();
     let mut action = TreeAction::Switch;
     let mut mode: Option<CompactSummaryMode> = None;
+    let mut llm_payload = String::new();
+    let mut seen_compact = false;
+    let mut after_mode = false;
     for part in rest.split_whitespace() {
         match part {
             "--summarize" | "-s" => summarize = true,
             "switch" => action = TreeAction::Switch,
-            "compact" => action = TreeAction::Compact,
-            "truncate" | "none" | "no-summary" => mode = Some(CompactSummaryMode::Truncate),
-            "text-only" | "text" => mode = Some(CompactSummaryMode::TextOnly),
-            id => {
+            "compact" => {
+                action = TreeAction::Compact;
+                seen_compact = true;
+            }
+            "truncate" | "none" | "no-summary" if seen_compact && !after_mode => {
+                mode = Some(CompactSummaryMode::Truncate)
+            }
+            "text-only" | "text" if seen_compact && !after_mode => {
+                mode = Some(CompactSummaryMode::TextOnly)
+            }
+            "llm" | "summary" if seen_compact => {
+                mode = Some(CompactSummaryMode::Llm);
+                after_mode = true;
+            }
+            id if !seen_compact => {
                 // The overlay commits the id angle-bracketed (`/tree <id>
                 // switch`); strip the brackets — the raw id is what move_leaf
                 // / get_entry expect.
@@ -2380,9 +2404,19 @@ fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode
                 let t = t.strip_suffix('>').unwrap_or(t);
                 target = t.to_string();
             }
+            // Anything after the `llm` token is part of the payload;
+            // re-join with single spaces so multi-word prompts survive
+            // split_whitespace's collapse.
+            _ if after_mode && mode == Some(CompactSummaryMode::Llm) => {
+                if !llm_payload.is_empty() {
+                    llm_payload.push(' ');
+                }
+                llm_payload.push_str(part);
+            }
+            _ => {}
         }
     }
-    (target, action, mode, summarize)
+    (target, action, mode, summarize, llm_payload)
 }
 
 /// Build a summarization prompt from a list of session entries.
@@ -2436,6 +2470,25 @@ fn collect_entries_for_branch_summary(
 
     let abandoned = old_path.into_iter().skip(common_len).collect();
     (abandoned, common_ancestor_id)
+}
+
+/// Walk the active branch (root → leaf) and return the entry id that
+/// immediately precedes `target_id`. Returns `None` if `target_id` is not
+/// on the active branch or is the root. Used by the `compact llm` handler
+/// to pick the position from which to run the LLM (so the LLM's prior
+/// context equals the span the compaction entry is dropping).
+fn find_predecessor_on_active_branch(
+    index: &crate::session::SessionIndex,
+    target_id: &str,
+) -> Option<String> {
+    let leaf = index.leaf_id.as_deref()?;
+    let branch = index.get_path_to_root(leaf); // root → leaf
+    let pos = branch.iter().position(|e| e.id == target_id)?;
+    if pos == 0 {
+        None
+    } else {
+        Some(branch[pos - 1].id.clone())
+    }
 }
 
 /// Ensure a session exists, creating one lazily if needed.
@@ -2873,7 +2926,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 // Handle `/tree <target_id>` commands — navigate or compact.
                 if input.starts_with("/tree") {
                     let rest = input["/tree".len()..].trim();
-                    let (target_id, action, mode, summarize) = parse_tree_args(rest);
+                    let (target_id, action, mode, summarize, llm_payload) = parse_tree_args(rest);
                     if target_id.is_empty() {
                         // No target: the overlay is already open from from_buffer.
                         continue;
@@ -2967,14 +3020,25 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
 
                             // tokensBefore from the current scoped context
                             // (pi semantics: tokens of the context being
-                            // replaced).
+                            // replaced). Computed once up-front so all three
+                            // modes agree on the value (the header shows the
+                            // same number).
                             let tokens_before = match s.build_context().await {
                                 Ok(ctx) => estimate_context_tokens(&ctx.messages),
                                 Err(_) => 0,
                             };
 
-                            let summary = match mode.unwrap_or(CompactSummaryMode::Truncate) {
-                                CompactSummaryMode::Truncate => String::new(),
+                            let resolved_mode = mode.unwrap_or(CompactSummaryMode::Truncate);
+                            match resolved_mode {
+                                CompactSummaryMode::Truncate => {
+                                    match s.append_compaction("", &target_id, tokens_before).await {
+                                        Ok(_) => {}
+                                        Err(e) => config.output.display_text(&format!(
+                                            "Cannot compact session: {}",
+                                            e
+                                        )),
+                                    }
+                                }
                                 CompactSummaryMode::TextOnly => {
                                     // The dropped span is everything on the
                                     // branch BEFORE the truncation point.
@@ -2987,34 +3051,163 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                                             .take_while(|e| e.id != target_id)
                                             .collect::<Vec<_>>()
                                     };
-                                    crate::session::build_text_only_summary(&dropped)
+                                    let summary = crate::session::build_text_only_summary(&dropped);
+                                    match s.append_compaction(&summary, &target_id, tokens_before).await {
+                                        Ok(_) => {
+                                            // Show the generated summary right
+                                            // after the compaction — the single
+                                            // intentional inline output for
+                                            // summary-producing modes.
+                                            if !summary.is_empty() {
+                                                config.output.display_separator();
+                                                config.output.display_markdown(&summary);
+                                            }
+                                        }
+                                        Err(e) => config.output.display_text(&format!(
+                                            "Cannot compact session: {}",
+                                            e
+                                        )),
+                                    }
                                 }
-                            };
+                                CompactSummaryMode::Llm => {
+                                    // 1. Find the entry just before target_id
+                                    //    on the active branch. The LLM call
+                                    //    will run from this position so its
+                                    //    prior context = the dropped span.
+                                    let predecessor_id = {
+                                        let index = s.index().lock().await;
+                                        find_predecessor_on_active_branch(&index, &target_id)
+                                    };
+                                    let Some(predecessor_id) = predecessor_id else {
+                                        config.output.display_text(
+                                            "Cannot compact: nothing before this point",
+                                        );
+                                        continue;
+                                    };
+                                    if Some(&predecessor_id) == old_leaf_id.as_ref() {
+                                        config.output.display_text(
+                                            "Cannot compact: nothing before the current position",
+                                        );
+                                        continue;
+                                    }
 
-                            match s.append_compaction(&summary, &target_id, tokens_before).await {
-                                Ok(_) => {
-                                    // No confirmation line and no inline token
-                                    // count: the committed prompt
-                                    // "/tree <id> compact <mode>" documents the
-                                    // action. The estimate was shown in the
-                                    // compact sub-menu header before committing.
-                                    // For TextOnly, the summary itself is
-                                    // rendered below (via display_compaction_summary).
+                                    // 2. Build the dropped span = branch
+                                    //    entries strictly BEFORE target_id.
+                                    let dropped = {
+                                        let leaf = old_leaf_id.clone().unwrap_or_default();
+                                        let index = s.index().lock().await;
+                                        let branch = index.get_path_to_root(&leaf);
+                                        branch
+                                            .into_iter()
+                                            .take_while(|e| e.id != target_id)
+                                            .collect::<Vec<_>>()
+                                    };
+                                    let span = build_summary_prompt(&dropped);
+
+                                    // 3. Compose the user-tweakable payload:
+                                    //    trailing text on the committed line
+                                    //    wins; otherwise the setting (with
+                                    //    built-in fallback).
+                                    let user_prompt = if llm_payload.trim().is_empty() {
+                                        settings.llm_compact_prompt()
+                                    } else {
+                                        llm_payload.clone()
+                                    };
+                                    let composed = format!(
+                                        "{}\n\n--- BEGIN DROPPED SPAN ---\n{}\n--- END DROPPED SPAN ---",
+                                        user_prompt, span,
+                                    );
+
+                                    // 4. Switch the leaf to the predecessor.
+                                    //    Remember old_leaf_id for step 7.
+                                    let _ = s.move_leaf(Some(predecessor_id.clone())).await;
+
+                                    // 5. Run the LLM. Use the non-streaming
+                                    //    summarize() surface — `prompt()`
+                                    //    would emit Thinking…/stream/tool
+                                    //    noise inappropriate for a summary
+                                    //    destined to be wrapped in <summary>.
+                                    let summary_text = match agent.as_ref() {
+                                        Some(a) => match a.summarize(&composed).await {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                // 5a. Failure: switch the
+                                                // leaf BACK to old_leaf_id,
+                                                // surface the error, do not
+                                                // append.
+                                                let _ = s
+                                                    .move_leaf(old_leaf_id.clone())
+                                                    .await;
+                                                config.output.display_text(&format!(
+                                                    "Summary failed: {}",
+                                                    e
+                                                ));
+                                                continue;
+                                            }
+                                        },
+                                        None => {
+                                            let _ = s
+                                                .move_leaf(old_leaf_id.clone())
+                                                .await;
+                                            config.output.display_text(
+                                                "Cannot compact: no agent",
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    // 6. Empty response: soft-fail.
+                                    let summary_text = summary_text.trim().to_string();
+                                    if summary_text.is_empty() {
+                                        let _ = s
+                                            .move_leaf(old_leaf_id.clone())
+                                            .await;
+                                        config.output.display_text(
+                                            "Summary was empty; nothing written.",
+                                        );
+                                        continue;
+                                    }
+
+                                    // 7. Switch the leaf back to
+                                    //    old_leaf_id. The user-visible
+                                    //    session position is restored.
+                                    let _ = s.move_leaf(old_leaf_id.clone()).await;
+
+                                    // 8. Append the compaction entry —
+                                    //    same shape as the other modes. The
+                                    //    session file is byte-identical to a
+                                    //    non-LLM compaction with the same
+                                    //    `summary` content.
+                                    match s
+                                        .append_compaction(
+                                            &summary_text,
+                                            &target_id,
+                                            tokens_before,
+                                        )
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            // 9. Render the summary as
+                                            //    markdown (same intentional
+                                            //    inline output as text-only).
+                                            config.output.display_separator();
+                                            config.output.display_markdown(
+                                                &summary_text,
+                                            );
+                                        }
+                                        Err(e) => config.output.display_text(
+                                            &format!(
+                                                "Cannot compact session: {}",
+                                                e
+                                            ),
+                                        ),
+                                    }
                                 }
-                                Err(e) => config.output.display_text(&format!(
-                                    "Cannot compact session: {}",
-                                    e
-                                )),
                             }
-                            // Show the generated summary right after the
-                            // compaction (markdown, like an agent response) —
-                            // this is the only inline output, and only for
-                            // modes that actually produce a summary.
-                            if !summary.is_empty() {
-                                config.output.display_separator();
-                                config.output.display_markdown(&summary);
-                            }
-                            // The compaction entry is now the leaf; subsequent
+                            // The compaction entry is now the leaf (for the
+                            // two sync modes); for the LLM mode it's the same
+                            // because step 7 restored the original leaf and
+                            // append_compaction parents to it. Subsequent
                             // turns are appended after it (append_message
                             // parents to the new leaf) and the next prompt()
                             // rebuilds the scoped context via build_context().
@@ -3455,9 +3648,9 @@ mod tests {
     use rig_core::message::Reasoning;
 
     use super::{
-        build_replay_units, count_turns, create_private_dir, is_anthropic_family,
-        last_turns_start, maybe_strip_reasoning, message_role, parse_tree_args,
-        persist_turn, reasoning_text, MessageLogger,
+        build_replay_units, count_turns, create_private_dir, find_predecessor_on_active_branch,
+        is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role,
+        parse_tree_args, persist_turn, reasoning_text, MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use rig_core::message::{AssistantContent, Message, Text};
@@ -3468,7 +3661,7 @@ mod tests {
         // move_leaf/get_entry as the RAW id. Regression test: with brackets
         // kept, move_leaf pointed at a nonexistent entry → empty context,
         // no current-position marker, "/replay: session is empty".
-        let (target, action, mode, summarize) =
+        let (target, action, mode, summarize, _) =
             parse_tree_args("<0194abc-123> switch");
         assert_eq!(target, "0194abc-123");
         assert_eq!(action, TreeAction::Switch);
@@ -3484,16 +3677,119 @@ mod tests {
         assert_eq!(target, "plain-id");
 
         // Compact with mode + summarize flag orthogonal.
-        let (target, action, mode, _) =
+        let (target, action, mode, _, _) =
             parse_tree_args("<id9> compact truncate --summarize");
         assert_eq!(target, "id9");
         assert_eq!(action, TreeAction::Compact);
         assert_eq!(mode, Some(CompactSummaryMode::Truncate));
 
         // Text-only mode token.
-        let (_, action, mode, _) = parse_tree_args("<id9> compact text-only");
+        let (_, action, mode, _, _) = parse_tree_args("<id9> compact text-only");
         assert_eq!(action, TreeAction::Compact);
         assert_eq!(mode, Some(CompactSummaryMode::TextOnly));
+    }
+
+    #[test]
+    fn parse_tree_args_llm_mode() {
+        // Bare `llm` token after `compact` selects Llm mode with empty payload.
+        let (target, action, mode, summarize, payload) =
+            parse_tree_args("<id9> compact llm");
+        assert_eq!(target, "id9");
+        assert_eq!(action, TreeAction::Compact);
+        assert_eq!(mode, Some(CompactSummaryMode::Llm));
+        assert!(!summarize);
+        assert_eq!(payload, "");
+
+        // `summary` is accepted as an alias for `llm`.
+        let (_, action, mode, _, _) = parse_tree_args("<id9> compact summary");
+        assert_eq!(action, TreeAction::Compact);
+        assert_eq!(mode, Some(CompactSummaryMode::Llm));
+
+        // Trailing text after `llm` is preserved verbatim, whitespace-joined.
+        let (_, _, mode, _, payload) =
+            parse_tree_args("<id9> compact llm Summarize the conversation");
+        assert_eq!(mode, Some(CompactSummaryMode::Llm));
+        assert_eq!(payload, "Summarize the conversation");
+
+        // Multi-word payload collapses internal whitespace runs to single
+        // spaces (matches split_whitespace behavior).
+        let (_, _, _, _, payload) =
+            parse_tree_args("<id9> compact llm hello   world  foo");
+        assert_eq!(payload, "hello world foo");
+
+        // `text-only` after `llm` is part of the payload, not a mode token.
+        let (_, _, mode, _, payload) =
+            parse_tree_args("<id9> compact llm text-only is just text");
+        assert_eq!(mode, Some(CompactSummaryMode::Llm));
+        assert_eq!(payload, "text-only is just text");
+    }
+
+    fn build_chain_index(leaf_id: &str, ids: &[&str]) -> crate::session::SessionIndex {
+        // Build a linear chain root -> ... -> leaf, with leaf_id pointing
+        // at the last id.
+        let mut index = crate::session::SessionIndex {
+            header: crate::session::SessionHeader::new(std::path::Path::new("/test")),
+            entries: Default::default(),
+            leaf_id: Some(leaf_id.to_string()),
+            children: Default::default(),
+            session_name: None,
+        };
+        for (i, id) in ids.iter().enumerate() {
+            let entry = crate::session::SessionEntry {
+                id: id.to_string(),
+                parent_id: if i == 0 { None } else { Some(ids[i - 1].to_string()) },
+                timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+                content: crate::session::SessionEntryContent::SessionInfo {
+                    name: None,
+                },
+            };
+            index.entries.insert(id.to_string(), entry);
+            if i > 0 {
+                index
+                    .children
+                    .entry(ids[i - 1].to_string())
+                    .or_default()
+                    .push(id.to_string());
+            }
+        }
+        index
+    }
+
+    #[test]
+    fn find_predecessor_on_active_branch_returns_prev_on_chain() {
+        let index = build_chain_index("m3", &["m0", "m1", "m2", "m3"]);
+        // m2 is immediately before m3 on the active branch.
+        assert_eq!(
+            find_predecessor_on_active_branch(&index, "m3"),
+            Some("m2".to_string())
+        );
+        // m1 is immediately before m2.
+        assert_eq!(
+            find_predecessor_on_active_branch(&index, "m2"),
+            Some("m1".to_string())
+        );
+        // m0 has no predecessor on the chain.
+        assert_eq!(
+            find_predecessor_on_active_branch(&index, "m0"),
+            None
+        );
+        // An id not on the active branch: get_path_to_root walks the leaf
+        // chain and returns empty for the missing id, so position returns
+        // None and we report no predecessor.
+        assert_eq!(
+            find_predecessor_on_active_branch(&index, "nope"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_predecessor_on_active_branch_no_leaf() {
+        let mut index = build_chain_index("m1", &["m0", "m1"]);
+        index.leaf_id = None;
+        assert_eq!(
+            find_predecessor_on_active_branch(&index, "m1"),
+            None
+        );
     }
 
     #[test]

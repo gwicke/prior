@@ -711,7 +711,7 @@ impl ActiveOverlay {
                                     &mut header,
                                 );
                                 let (opts, active) =
-                                    Repl::filter_tree_options(&["truncate", "text only"], &sub_filter);
+                                    Repl::filter_tree_options(&["truncate", "text only", "llm"], &sub_filter);
                                 return ActiveOverlay::CompactSummary {
                                     target_id,
                                     header,
@@ -956,6 +956,7 @@ impl ActiveOverlay {
         editor: &mut LineEditor,
         path_completions: &mut Vec<String>,
         completion_pos: &mut Option<(usize, usize)>,
+        settings: &SettingsStore,
     ) {
         match self {
             ActiveOverlay::CommandList { cmds } => {
@@ -1209,9 +1210,21 @@ impl ActiveOverlay {
                     let mode = match label.as_str() {
                         "truncate" => " truncate",
                         "text only" => " text-only",
+                        // LLM mode stages an editable prompt for the user
+                        // to tweak before submitting; no emit_commit here
+                        // (the user hasn't committed yet — see
+                        // doc/tree_compaction.md §6.7).
+                        "llm" => " llm ",
                         _ => "",
                     };
-                    editor.set(&format!("/tree <{}> compact{}", target_id, mode));
+                    let line = format!("/tree <{}> compact{}", target_id, mode);
+                    if label.as_str() == "llm" {
+                        // Stage the prompt: <line><settings.llm_compact_prompt()>
+                        let staged = format!("{}{}", line, settings.llm_compact_prompt());
+                        editor.set(&staged);
+                    } else {
+                        editor.set(&line);
+                    }
                 }
             }
             _ => {}
@@ -1551,6 +1564,19 @@ impl ActiveOverlay {
                     let line = match label.as_str() {
                         "truncate" => format!("/tree <{}> compact truncate", target_id),
                         "text only" => format!("/tree <{}> compact text-only", target_id),
+                        // LLM mode stages an editable prompt (default from
+                        // settings); the user edits and presses Enter to
+                        // submit. No emit_commit here — the user hasn't
+                        // committed yet (see doc/tree_compaction.md §6.7).
+                        "llm" => {
+                            let staged = format!(
+                                "/tree <{}> compact llm {}",
+                                target_id,
+                                settings.llm_compact_prompt(),
+                            );
+                            editor.set(&staged);
+                            return OverlayAction::Continue;
+                        }
                         _ => String::new(),
                     };
                     if !line.is_empty() {
@@ -2041,7 +2067,8 @@ impl Repl {
                             }
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
-                                    &mut path_completions, &mut completion_pos);
+                                    &mut path_completions, &mut completion_pos,
+                                    settings);
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2421,6 +2448,7 @@ impl Repl {
                 ValueCandidate { display: "false".into(), value: "false".into(), desc: "drop reasoning from context to save tokens (default)".into() },
             ],
             SettingKey::SessionResumeReplayTurns => Vec::new(),
+            SettingKey::LlmCompactPrompt => Vec::new(),
         }
     }
 
@@ -4795,6 +4823,7 @@ mod tests {
             show_reasoning: "indicator".into(),
             reasoning_in_context: false,
             session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
             path: None,
         };
         ActiveOverlay::from_buffer(buf, &ctx, &settings, false, &[])
@@ -4848,7 +4877,7 @@ mod tests {
         match ov {
             ActiveOverlay::CompactSummary { target_id, opts, active, header, .. } => {
                 assert_eq!(target_id, "root-entry");
-                assert_eq!(opts, vec!["truncate".to_string(), "text only".to_string()]);
+                assert_eq!(opts, vec!["truncate".to_string(), "text only".to_string(), "llm".to_string()]);
                 assert_eq!(active, Some(0));
                 // Info header present: entry row + dropped/kept/token rows.
                 assert!(!header.is_empty());

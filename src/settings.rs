@@ -80,6 +80,15 @@ pub fn default_show_reasoning_handle() -> ShowReasoningHandle {
     Arc::new(Mutex::new(ShowReasoning::default()))
 }
 
+/// User-tweakable prompt prepended to the dropped-span transcript when
+/// `/tree <id> compact llm` is run. When the committed `/tree` line has no
+/// trailing text after `llm`, the LLM-compaction handler substitutes this
+/// value (or the built-in `DEFAULT_LLM_COMPACT_PROMPT` if empty).
+pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation so far in less than 2000 words. \
+     Preserve the key technical decisions, file paths touched, current \
+     task state, and any unresolved questions. Drop reasoning traces \
+     and tool-call boilerplate.";
+
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKey {
@@ -99,6 +108,9 @@ pub enum SettingKey {
     ReasoningInContext,
     /// positive integer — number of turns to replay on session resume.
     SessionResumeReplayTurns,
+    /// Free text — instruction prepended to the dropped-span transcript
+    /// when `/tree <id> compact llm` is run with no trailing prompt.
+    LlmCompactPrompt,
 }
 
 /// How a setting's *value* may be completed. Drive a value-autocomplete
@@ -171,6 +183,12 @@ pub static SETTINGS: &[SettingMeta] = &[
         description: "Turns to replay on session resume (0 = none)",
         kind: ValueKind::Int,
     },
+    SettingMeta {
+        key: SettingKey::LlmCompactPrompt,
+        name: "llm_compact_prompt",
+        description: "Prompt prepended to /tree <id> compact llm when no trailing text is given",
+        kind: ValueKind::FreeText,
+    },
 ];
 
 /// In-memory mirror of the five managed settings, plus the optional file to
@@ -190,6 +208,10 @@ pub struct SettingsStore {
     /// Number of most recent turns to replay on session resume.
     /// 0 = no replay. Default: 3.
     pub session_resume_replay_turns: usize,
+    /// Free-text instruction used by `/tree <id> compact llm` when the
+    /// committed line has no trailing prompt after `llm`. Empty falls back
+    /// to [`DEFAULT_LLM_COMPACT_PROMPT`] at the call site.
+    pub llm_compact_prompt: String,
     pub path: Option<PathBuf>,
 }
 
@@ -219,6 +241,7 @@ impl SettingsStore {
                 .to_string(),
             reasoning_in_context: cfg.reasoning_in_context,
             session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -246,6 +269,7 @@ impl SettingsStore {
                 .unwrap_or_else(|| "content".to_string()),
             reasoning_in_context: cfg.reasoning_in_context.unwrap_or(false),
             session_resume_replay_turns: 3,
+            llm_compact_prompt: cfg.llm_compact_prompt.clone().unwrap_or_default(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -303,6 +327,18 @@ impl SettingsStore {
             SettingKey::ShowReasoning => self.show_reasoning.clone(),
             SettingKey::ReasoningInContext => self.reasoning_in_context.to_string(),
             SettingKey::SessionResumeReplayTurns => self.session_resume_replay_turns.to_string(),
+            SettingKey::LlmCompactPrompt => self.llm_compact_prompt.clone(),
+        }
+    }
+
+    /// Resolve the prompt used by `/tree <id> compact llm` when the
+    /// committed line has no trailing text. Falls back to
+    /// [`DEFAULT_LLM_COMPACT_PROMPT`] when the setting is empty.
+    pub fn llm_compact_prompt(&self) -> String {
+        if self.llm_compact_prompt.trim().is_empty() {
+            DEFAULT_LLM_COMPACT_PROMPT.to_string()
+        } else {
+            self.llm_compact_prompt.clone()
         }
     }
 
@@ -373,6 +409,10 @@ impl SettingsStore {
                     .map_err(|_| format!("session_resume_replay_turns must be a non-negative integer (got '{}')", value.trim()))?;
                 Ok(())
             }
+            // FreeText: any value is acceptable. Empty is allowed and falls
+            // back to DEFAULT_LLM_COMPACT_PROMPT at the call site, so the
+            // user can clear it to restore the default.
+            SettingKey::LlmCompactPrompt => Ok(()),
         }
     }
 
@@ -449,6 +489,13 @@ impl SettingsStore {
             "reasoning_in_context",
             toml_edit::value(self.reasoning_in_context),
         );
+        // llm_compact_prompt: only written when set (non-empty); an absent
+        // key falls back to DEFAULT_LLM_COMPACT_PROMPT on load.
+        if !self.llm_compact_prompt.trim().is_empty() {
+            table.insert("llm_compact_prompt", toml_edit::value(self.llm_compact_prompt.clone()));
+        } else {
+            table.remove("llm_compact_prompt");
+        }
         // Ensure the parent directory (e.g. ~/.config/picocode) exists before
         // writing, mirroring how the history file is created.
         if let Some(parent) = path.parent() {
@@ -484,6 +531,9 @@ impl SettingsStore {
             }
             SettingKey::SessionResumeReplayTurns => {
                 self.session_resume_replay_turns = value.trim().parse().unwrap_or(self.session_resume_replay_turns)
+            }
+            SettingKey::LlmCompactPrompt => {
+                self.llm_compact_prompt = value.trim().to_string();
             }
         }
     }
@@ -525,6 +575,7 @@ mod tests {
             show_reasoning: "content".into(),
             reasoning_in_context: false,
             session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
             path: Some(path.to_path_buf()),
         }
     }
@@ -658,7 +709,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().join("picocode.toml").as_path());
         let all = s.overlay_rows("");
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         let filtered = s.overlay_rows("model");
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.key, SettingKey::DefaultModel);
@@ -737,8 +788,8 @@ mod tests {
         let opts: Vec<String> = table.render(200);
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
-        // title + 8 single-line options (pre-formatted rows are NOT wrapped).
-        assert_eq!(lines.len(), 9, "pre-formatted rows must not be word-wrapped");
+        // title + 9 single-line options (pre-formatted rows are NOT wrapped).
+        assert_eq!(lines.len(), 10, "pre-formatted rows must not be word-wrapped");
         // Strip ANSI so visible column positions compare cleanly (the selected
         // row carries an extra color escape that must not affect alignment).
         fn strip_ansi(s: &str) -> String {
