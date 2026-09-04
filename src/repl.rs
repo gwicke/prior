@@ -426,7 +426,9 @@ pub(crate) enum ActiveOverlay {
     /// resolved entry ID; the filter used to find it is dropped on commit.
     TreeAction {
         target_id: String,
-        /// Pre-rendered info header rows (selected entry label + id).
+        /// Pre-rendered info header rows (selected entry body — multi-line
+        /// for messages, single-line otherwise; the entry ID is intentionally
+        /// omitted since it is already visible in the prompt buffer).
         header: Vec<String>,
         /// Fuzzy-filtered action labels (switch / compact).
         opts: Vec<String>,
@@ -437,7 +439,9 @@ pub(crate) enum ActiveOverlay {
     /// `/tree <id> switch` sub-menu (just switch / summarize branch).
     SwitchAction {
         target_id: String,
-        /// Pre-rendered info header rows (selected entry label + id).
+        /// Pre-rendered info header rows (selected entry body — multi-line
+        /// for messages, single-line otherwise; the entry ID is intentionally
+        /// omitted since it is already visible in the prompt buffer).
         header: Vec<String>,
         /// Fuzzy-filtered option labels (just switch / summarize).
         opts: Vec<String>,
@@ -757,7 +761,8 @@ impl ActiveOverlay {
                         match action_tok {
                             "switch" => {
                                 let mut header = Vec::new();
-                                Repl::tree_entry_header(&target_id, &label, &mut header);
+                                let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                                Repl::tree_entry_header(entry, &label, &mut header);
                                 let (opts, active) =
                                     Repl::filter_tree_options(&["just switch", "summarize"], &sub_filter);
                                 return ActiveOverlay::SwitchAction {
@@ -811,7 +816,8 @@ impl ActiveOverlay {
                         }
                         // No (or unknown) action token → action menu.
                         let mut header = Vec::new();
-                        Repl::tree_entry_header(&target_id, &label, &mut header);
+                        let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                        Repl::tree_entry_header(entry, &label, &mut header);
                         let (opts, active) =
                             Repl::filter_tree_options(&["switch", "compact"], &sub_filter);
                         return ActiveOverlay::TreeAction {
@@ -3287,18 +3293,109 @@ impl Repl {
         (opts, Some(0))
     }
 
-    /// Build the small info header for `TreeAction` / `SwitchAction`:
-    /// the selected entry's label and (short) id.
-    fn tree_entry_header(target_id: &str, label: &str, header: &mut Vec<String>) {
+    /// Find the entry with `id` in the tree (depth-first). Returns `None`
+    /// if the id is not present (corrupt index or out-of-tree id).
+    fn find_entry_by_id<'a>(
+        nodes: &'a [SessionTreeNode],
+        id: &str,
+    ) -> Option<&'a SessionEntry> {
+        fn walk<'a>(
+            nodes: &'a [SessionTreeNode],
+            id: &str,
+        ) -> Option<&'a SessionEntry> {
+            for n in nodes {
+                if n.entry.id == id {
+                    return Some(&n.entry);
+                }
+                if let Some(e) = walk(&n.children, id) {
+                    return Some(e);
+                }
+            }
+            None
+        }
+        walk(nodes, id)
+    }
+
+    /// Extract the full message body of a `Message` entry (user or
+    /// assistant), preserving newlines and surrounding whitespace.
+    /// Returns `None` for any other entry variant.
+    fn entry_message_body(entry: &SessionEntry) -> Option<String> {
+        let message = match &entry.content {
+            SessionEntryContent::Message { message } => message,
+            _ => return None,
+        };
+        match message.get("role").and_then(|r| r.as_str()) {
+            Some("user") => message
+                .pointer("/content/0/text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            Some("assistant") => message
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    // Same multi-text concatenation as `entry_display_label`,
+                    // but joined with newlines (not spaces) so the wrap-aware
+                    // header can show paragraphs.
+                    arr.iter()
+                        .filter_map(|item| {
+                            match item.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => item.get("text").and_then(|t| t.as_str()),
+                                _ => None,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
+            _ => None,
+        }
+    }
+
+    /// Build the info header for `TreeAction` / `SwitchAction`: the selected
+    /// entry's body (multi-line, wrapped to the terminal width) when it's a
+    /// message, otherwise the precomputed single-line label. The ID is
+    /// intentionally NOT shown — it is already visible in the prompt buffer
+    /// (`/tree <id>`).
+    ///
+    /// For messages, the body is wrapped to the terminal width with newlines
+    /// preserved, capped at [`Self::TREE_PREVIEW_LINE_CAP`] lines as a
+    /// safety net so runaway prompts don't blow up the menu. The pop-up
+    /// itself is bounded at `2/3` of the terminal height by `redraw`, so a
+    /// tall terminal sees the full message; a short one clips via the
+    /// existing windowed-selection mechanism.
+    fn tree_entry_header(
+        entry: Option<&SessionEntry>,
+        label: &str,
+        header: &mut Vec<String>,
+    ) {
+        const TREE_PREVIEW_LINE_CAP: usize = 10;
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["Entry", "ID"])
-            .with_aligns(&[Align::Left, Align::Left])
-            .with_min_widths(&[24, 12])
-            .with_priorities(&[3, 1])
-            .set_gap(2);
-        table.add_row(&[label, &target_id[..target_id.len().min(12)]]);
-        for row in table.render(avail) {
-            header.push(row);
+        // Try the multi-line message body first; fall back to the
+        // single-line label for non-message entries (compaction, model
+        // change, branch summary, ...).
+        let body_lines: Vec<String> = if let Some(text) =
+            entry.and_then(Self::entry_message_body)
+        {
+            let mut lines = wrap(&text, avail);
+            if lines.len() > TREE_PREVIEW_LINE_CAP {
+                let skipped = lines.len() - TREE_PREVIEW_LINE_CAP + 1;
+                lines.truncate(TREE_PREVIEW_LINE_CAP - 1);
+                lines.push(format!(
+                    "[… {} more line{}]",
+                    skipped,
+                    if skipped == 1 { "" } else { "s" }
+                ));
+            }
+            lines
+        } else {
+            let single = Self::sanitise_single_line(label);
+            if single.is_empty() {
+                Vec::new()
+            } else {
+                vec![single]
+            }
+        };
+        for line in body_lines {
+            header.push(line);
         }
     }
 
@@ -5081,6 +5178,273 @@ mod tests {
                 assert_eq!(opts, vec!["switch".to_string()]);
             }
             other => panic!("expected TreeAction (fuzzy-filtered), got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn tree_entry_header_user_message_preserves_newlines_and_drops_id() {
+        // The header for a user-message entry shows the FULL body (with
+        // newlines preserved), wrapped to the terminal width. The entry
+        // id is intentionally absent — it is already in the prompt.
+        let body = "line one\nline two\nline three";
+        let entry = SessionEntry {
+            id: "u1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": body}]
+                }),
+            },
+        };
+        let mut header = Vec::new();
+        Repl::tree_entry_header(Some(&entry), "stale label (ignored for messages)", &mut header);
+        // Newlines preserved → one header row per line.
+        assert_eq!(header.len(), 3, "got: {:?}", header);
+        assert_eq!(header[0], "line one");
+        assert_eq!(header[1], "line two");
+        assert_eq!(header[2], "line three");
+        // Id never appears in the header.
+        assert!(!header.iter().any(|l| l.contains("u1")), "got: {:?}", header);
+    }
+
+    #[test]
+    fn tree_entry_header_long_message_caps_at_ten_lines() {
+        // 25 single-token lines wrap to many lines (well over the cap);
+        // header must include a trailing "[… N more lines]" indicator and
+        // never blow up the menu.
+        let body: String = (1..=25)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = SessionEntry {
+            id: "u1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": body}]
+                }),
+            },
+        };
+        let mut header = Vec::new();
+        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        // Cap is 10: 9 visible + 1 "[… N more lines]" marker.
+        assert_eq!(header.len(), 10, "got: {:?}", header);
+        assert!(header[0].contains("line1"));
+        assert!(header[8].contains("line9"));
+        assert!(
+            header[9].contains("more line"),
+            "expected truncation marker, got: {:?}",
+            header[9]
+        );
+        // 25 lines total, 9 visible → 16 skipped (24 - 9 + 1 = 16, since
+        // we kept 9 lines and skipped the rest). The marker says how many
+        // were dropped — verify it accounts for the difference.
+        let marker = &header[9];
+        assert!(marker.contains("16"), "expected 16 skipped, got: {marker}");
+    }
+
+    #[test]
+    fn tree_entry_header_short_message_under_cap_unchanged() {
+        // 3-line message under the cap: no truncation marker.
+        let body = "a\nb\nc";
+        let entry = SessionEntry {
+            id: "u1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": body}]
+                }),
+            },
+        };
+        let mut header = Vec::new();
+        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        assert_eq!(header, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn tree_entry_header_assistant_message_concatenates_text_segments() {
+        // Multi-segment assistant content (common with tool-call-only
+        // turns split into multiple text blocks) joins with newlines so
+        // paragraphs stay separated in the preview.
+        let entry = SessionEntry {
+            id: "a1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "first paragraph"},
+                        {"type": "text", "text": "second paragraph"}
+                    ]
+                }),
+            },
+        };
+        let mut header = Vec::new();
+        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        assert_eq!(
+            header,
+            vec!["first paragraph".to_string(), "second paragraph".to_string()]
+        );
+    }
+
+    #[test]
+    fn tree_entry_header_non_message_falls_back_to_single_line_label() {
+        // Non-message entries (compaction, branch summary, ...) keep the
+        // existing single-line label behaviour.
+        let entry = SessionEntry {
+            id: "c1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Compaction {
+                summary: String::new(),
+                first_kept_entry_id: "m0".into(),
+                tokens_before: 42_000,
+            },
+        };
+        let mut header = Vec::new();
+        Repl::tree_entry_header(Some(&entry), "compaction ... before \"...\"", &mut header);
+        assert_eq!(header.len(), 1, "got: {:?}", header);
+        assert!(header[0].contains("compaction"));
+        assert!(!header[0].contains("c1"), "id should not appear: {:?}", header[0]);
+    }
+
+    #[test]
+    fn tree_entry_header_unknown_id_renders_only_label() {
+        // Defensive: if the caller can't locate the entry, fall back to
+        // the precomputed single-line label.
+        let mut header = Vec::new();
+        Repl::tree_entry_header(None, "compaction ...", &mut header);
+        assert_eq!(header, vec!["compaction ...".to_string()]);
+    }
+
+    #[test]
+    fn from_buffer_tree_id_action_menu_shows_full_message_body() {
+        // The TreeAction overlay for a user message: the header now
+        // contains the multi-line body, not the previous single-line
+        // summary.
+        let body = "first line\nsecond line";
+        let entry = SessionEntry {
+            id: "root-entry".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": body}]
+                }),
+            },
+        };
+        // Build a fresh ctx whose root entry carries the multi-line body.
+        let tree = vec![crate::session::SessionTreeNode {
+            entry,
+            children: vec![],
+            label: None,
+        }];
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("root-entry".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/tree <root-entry>", &ctx, &settings, false, &[]);
+        match ov {
+            ActiveOverlay::TreeAction { header, opts, .. } => {
+                // Body preserved: two header lines, one per source line.
+                assert_eq!(header.len(), 2, "got: {:?}", header);
+                assert_eq!(header[0], "first line");
+                assert_eq!(header[1], "second line");
+                // No id, no stale single-line summary.
+                assert!(!header.iter().any(|l| l.contains("root-entry")));
+                // Menu still wired up.
+                assert_eq!(opts, vec!["switch".to_string(), "compact".to_string()]);
+            }
+            other => panic!("expected TreeAction, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_id_switch_menu_shows_full_message_body() {
+        // Same expectation for the SwitchAction sub-menu: it shares the
+        // header builder.
+        let body = "alpha\nbeta\ngamma";
+        let entry = SessionEntry {
+            id: "root-entry".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": body}]
+                }),
+            },
+        };
+        let tree = vec![crate::session::SessionTreeNode {
+            entry,
+            children: vec![],
+            label: None,
+        }];
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("root-entry".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/tree <root-entry> switch", &ctx, &settings, false, &[]);
+        match ov {
+            ActiveOverlay::SwitchAction { header, opts, .. } => {
+                assert_eq!(header.len(), 3, "got: {:?}", header);
+                assert_eq!(header, vec!["alpha", "beta", "gamma"]);
+                assert_eq!(
+                    opts,
+                    vec!["just switch".to_string(), "summarize".to_string()]
+                );
+            }
+            other => panic!("expected SwitchAction, got disc {:?}", other.overlay_disc()),
         }
     }
 
