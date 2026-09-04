@@ -581,10 +581,16 @@ taxonomy and the `Retry-After` extraction.
     of truth). A retryable failure with
     no progress (e.g. a sustained 429 on the very first model call) no
     longer loses the turn when the retry budget is exhausted.
-11. ✅ OpenRouter 429 mid-stream JSON envelope (the `ProviderResponseError`
+11. ✅ OpenRouter mid-stream JSON envelope (the `ProviderResponseError`
     shape with `error.code: 429` and `error_type: "rate_limit_exceeded"`)
     classifies as `LlmRateLimited`, so the `Retry-After`-floor + 50-attempt
-    budget applies. Same for 5xx codes in the envelope (`LlmUpstream`).
+    budget applies. Same for 5xx codes in the envelope (`LlmUpstream`). This
+    covers both rig surfaces for the envelope: the status-less
+    `CompletionError::ProviderResponse` that the SSE decoder builds via
+    `completion_error_from_body` (the real GMICloud/OpenRouter production
+    path — previously misclassified as `Other` and not auto-retried) and the
+    `ResponseError(String)` display-text path, plus 2xx-status
+    `ProviderResponse`s from `from_http_response`.
 12. ✅ Existing classification + display + name-recovery tests pass (335 lib
     tests; +3 new tests covering the OpenRouter 429/502 mid-stream JSON
     envelope classification and the no-code fall-through to
