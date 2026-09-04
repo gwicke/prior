@@ -2068,7 +2068,16 @@ impl Repl {
             let mut overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::Help => Self::render_help_overlay(),
-                ActiveOverlay::Stat { .. } | ActiveOverlay::ReplayHelp { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
+                ActiveOverlay::Stat { .. } => {
+                    // Pre-formatted (each line is already its own row), so
+                    // split-on-newline is used instead of `wrap` — this
+                    // preserves the leading whitespace that distinguishes
+                    // section headers (e.g. "session:") from keys
+                    // (e.g. "  created:"), which `split_whitespace` would
+                    // otherwise strip during word-wrap.
+                    Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, false)
+                }
+                ActiveOverlay::ReplayHelp { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
                 ActiveOverlay::SessionAction { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
