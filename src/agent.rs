@@ -4125,23 +4125,73 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     Ok(())
 }
 
-/// Compute the `/stat` panel lines: context-window limit + current usage, an
-/// approximate session cost, and the cache hit rate (when the provider reports
-/// cache metrics). Reads the live model catalog for the window size and the
-/// per-token pricing, and the agent's accumulated [`SessionUsage`] for the
-/// per-turn / session totals. Returns plain lines so the REPL can render them
-/// in the `/stat` overlay (`render_plain` display).
-pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> Vec<String> {
+/// Session-level metadata shown in the `/stat` overlay header.
+///
+/// Captures the same fields that the `/session <id>` action-menu header
+/// displays (name, message_count, age/created/last update). Built from
+/// [`crate::session::repo::SessionMetadata`] at the call site so this
+/// function stays pure / easily testable.
+#[derive(Debug, Clone)]
+pub struct SessionStatsInfo {
+    /// User-assigned display name, if any. Falls back to the session id.
+    pub display_name: String,
+    /// ISO 8601 creation timestamp (from the session header).
+    pub created: String,
+    /// ISO 8601 timestamp of the most recent user message, if any.
+    /// When `None`, falls back to `created` for display.
+    pub last_updated: Option<String>,
+    /// Number of message entries in the session (mirrors `/session <id>`).
+    pub message_count: usize,
+}
+
+/// Compute the `/stat` panel lines. Renders two sections:
+///
+/// 1. **session** — display name, created/last-updated times, total session size
+///    (mirrors `/session <id>`).
+/// 2. **model**   — provider/model identifier, context-window limit, current
+///    usage, approximate session cost, cache hit rate.
+///
+/// Reads the live model catalog for the window size and the per-token pricing,
+/// and the agent's accumulated [`SessionUsage`] for the per-turn / session
+/// totals. Returns plain lines so the REPL can render them in the `/stat`
+/// overlay (`render_plain` display).
+pub fn session_stats_lines(
+    provider: &str,
+    model: &str,
+    usage: SessionUsage,
+    session: Option<SessionStatsInfo>,
+) -> Vec<String> {
     let entry = model_catalog::lookup(provider, model);
     let ctx_len = entry.as_ref().and_then(|e| e.context_length);
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("Session stats — {}:{}", provider, model));
+
+    // ── session section ─────────────────────────────────────────────────
+    match session {
+        Some(s) => {
+            lines.push(format!("session: {}", s.display_name));
+            let created = format_stat_ts(&s.created);
+            let last = s
+                .last_updated
+                .as_deref()
+                .map(format_stat_ts)
+                .unwrap_or_else(|| created.clone());
+            lines.push(format!("  created: {}, last update {}", created, last));
+            lines.push(format!("  size: {} turns", s.message_count));
+        }
+        None => {
+            // No repo / no metadata available (e.g. in tests without a session).
+            lines.push("session: (unavailable)".to_string());
+        }
+    }
+
+    // ── model section ───────────────────────────────────────────────────
+    lines.push(format!("model: {}:{}", provider, model));
 
     // Context window limit.
     match ctx_len {
-        Some(max) => lines.push(format!("  context window limit : {} tokens", max)),
-        None => lines.push("  context window limit : unknown (model not in catalog)".to_string()),
+        Some(max) => lines.push(format!("  context window limit: {} tokens", max)),
+        None => lines.push("  context window limit: unknown (model not in catalog)".to_string()),
     }
 
     // Current context usage (absolute + % of max).
@@ -4150,14 +4200,14 @@ pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> 
         if let Some(max) = ctx_len {
             let pct = (cur as f64 / max as f64) * 100.0;
             lines.push(format!(
-                "  current usage        : {} tokens ({:.1}% of limit)",
+                "  current usage: {} tokens ({:.1}% of limit)",
                 cur, pct
             ));
         } else {
-            lines.push(format!("  current usage        : {} tokens", cur));
+            lines.push(format!("  current usage: {} tokens", cur));
         }
     } else {
-        lines.push("  current usage        : n/a (no completion call recorded yet)".to_string());
+        lines.push("  current usage: n/a (no completion call recorded yet)".to_string());
     }
 
     // Approximate session cost.
@@ -4170,11 +4220,11 @@ pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> 
             let cost = (usage.session_input_tokens as f64 / 1_000_000.0) * p
                 + (usage.session_output_tokens as f64 / 1_000_000.0) * c;
             lines.push(format!(
-                "  approx session cost : ${:.4} (in {} / out {} tokens)",
+                "  approx session cost: ${:.4} (in {} / out {} tokens)",
                 cost, usage.session_input_tokens, usage.session_output_tokens
             ));
         }
-        _ => lines.push("  approx session cost : n/a (no pricing in catalog)".to_string()),
+        _ => lines.push("  approx session cost: n/a (no pricing in catalog)".to_string()),
     }
 
     // Cache hit rate (session-level: reads as a fraction of all input tokens).
@@ -4184,7 +4234,7 @@ pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> 
     if total_in > 0 && (cached > 0 || creation > 0) {
         let hit = (cached as f64 / total_in as f64) * 100.0;
         lines.push(format!(
-            "  cache hit rate       : {:.1}% (read {} / written {} / fresh {} tokens)",
+            "  cache hit rate: {:.1}% (read {} / written {} / fresh {} tokens)",
             hit,
             cached,
             creation,
@@ -4192,11 +4242,28 @@ pub fn session_stats_lines(provider: &str, model: &str, usage: SessionUsage) -> 
         ));
     } else {
         lines.push(
-            "  cache hit rate       : n/a (provider reported no cache metrics)".to_string(),
+            "  cache hit rate: n/a (provider reported no cache metrics)".to_string(),
         );
     }
 
     lines
+}
+
+/// Format an ISO-8601 timestamp (RFC3339 or "YYYY-MM-DDTHH:MM:SS.sssZ") as
+/// "YYYY-MM-DD HH:MM" for the `/stat` header. Falls back to the raw string
+/// when parsing fails so a malformed timestamp never blanks the panel.
+fn format_stat_ts(ts: &str) -> String {
+    // Try RFC3339 first ("2025-01-01T14:32:00.123456789+00:00").
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return dt.format("%Y-%m-%d %H:%M").to_string();
+    }
+    // Fall back to the truncated UTC format used by session headers
+    // ("2025-01-01T14:32:00.000Z") via chrono::DateTime::parse_from_str.
+    let normalized = format!("{}Z", ts.trim_end_matches('Z'));
+    if let Ok(dt) = chrono::DateTime::parse_from_str(&normalized, "%+") {
+        return dt.format("%Y-%m-%d %H:%M").to_string();
+    }
+    ts.to_string()
 }
 
 impl CodeAgent {
@@ -6351,6 +6418,69 @@ mod tests {
 
             let _ = tokio::fs::remove_dir_all(&base).await;
         }
+    }
+
+    #[test]
+    fn session_stats_lines_renders_session_and_model_sections() {
+        use super::{SessionStatsInfo, session_stats_lines, SessionUsage};
+
+        let info = SessionStatsInfo {
+            display_name: "my-session".into(),
+            created: "2025-01-02T03:04:05.000Z".into(),
+            last_updated: Some("2025-01-02T10:11:12.000Z".into()),
+            message_count: 7,
+        };
+        let usage = SessionUsage::default();
+        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info));
+
+        // The first three lines are the new "session:" section.
+        assert!(
+            lines[0].starts_with("session:"),
+            "expected session header, got {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("my-session"));
+        assert!(
+            lines[1].starts_with("  created:") && lines[1].contains("last update"),
+            "expected created/last update line, got {:?}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "  size: 7 turns");
+
+        // Then the "model:" section starts on the next line, with the rest
+        // of the existing context-window / usage / cost / cache rows.
+        let model_idx = lines
+            .iter()
+            .position(|l| l.starts_with("model:"))
+            .expect("model section must be present");
+        assert!(model_idx >= 3, "model section must follow session section");
+        assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
+        assert!(lines.iter().any(|l| l.contains("context window limit")));
+    }
+
+    #[test]
+    fn session_stats_lines_falls_back_when_no_session_info() {
+        use super::{session_stats_lines, SessionUsage};
+
+        let lines = session_stats_lines(
+            "openrouter",
+            "minimax/minimax-m3:free",
+            SessionUsage::default(),
+            None,
+        );
+
+        // Without a repo / session metadata the panel still renders both
+        // sections — session just shows "(unavailable)" instead of details.
+        assert!(
+            lines[0].starts_with("session:") && lines[0].contains("unavailable"),
+            "expected unavailable session header, got {:?}",
+            lines[0]
+        );
+        let model_idx = lines
+            .iter()
+            .position(|l| l.starts_with("model:"))
+            .expect("model section must be present");
+        assert!(model_idx >= 1);
     }
 }
 

@@ -542,8 +542,14 @@ impl ActiveOverlay {
                 }
             }
             "stat" | "stats" => {
+                // Load the current session's metadata (name, created, last
+                // update, message_count) so the panel can render a session:
+                // section alongside the model/context stats. Falls back to
+                // `None` when the repo is unavailable (e.g. tests) so the
+                // model section still renders cleanly.
+                let session_info = Repl::current_session_stats_info(ctx);
                 let lines = crate::agent::session_stats_lines(
-                    &ctx.provider, &ctx.model, ctx.session_usage,
+                    &ctx.provider, &ctx.model, ctx.session_usage, session_info,
                 );
                 ActiveOverlay::Stat { lines }
             }
@@ -3192,6 +3198,30 @@ impl Repl {
         .into_iter()
         .map(|r| r.item.clone())
         .collect()
+    }
+
+    /// Build a [`crate::agent::SessionStatsInfo`] for the session currently
+    /// active in the REPL. Returns `None` when the repo is unavailable, the
+    /// session id is empty (no session), or the id can't be located on disk
+    /// (e.g. an unsaved / in-memory session that hasn't been flushed yet).
+    ///
+    /// Looks up by `ctx.current_session_id` across all CWDs to avoid relying
+    /// on the CWD filter; `/stat` should always reflect the actual current
+    /// session regardless of where it lives.
+    fn current_session_stats_info(ctx: &ReplCtx) -> Option<crate::agent::SessionStatsInfo> {
+        if ctx.current_session_id.is_empty() {
+            return None;
+        }
+        let repo = ctx.repo.as_ref()?;
+        let all = repo.list_sessions_sync(None);
+        let meta = all.into_iter().find(|m| m.id == ctx.current_session_id)?;
+        let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
+        Some(crate::agent::SessionStatsInfo {
+            display_name,
+            created: meta.timestamp,
+            last_updated: meta.last_prompt_timestamp,
+            message_count: meta.message_count,
+        })
     }
 
     // ── /tree overlay rendering ──────────────────────────────────────────
