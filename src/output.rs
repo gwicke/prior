@@ -400,17 +400,23 @@ pub(crate) fn render_markdown(src: &str, width: usize, color: bool) -> String {
     markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
 
-/// Wrap `text` to `width` columns.
+/// Wrap `text` to fit `width` characters per line.
 ///
-/// Tokenizes into maximal non-whitespace "words", collapsing any run of
-/// whitespace between them to a single space. A word longer than `width` is
-/// hard-split into `width`-sized character chunks (CJK-safe). Logical lines
-/// (split on `\n`) are wrapped independently, and blank lines are preserved.
+/// Each logical line (split on `\n`) is wrapped independently; blank lines are
+/// preserved. The leading whitespace of each logical line is captured and
+/// re-emitted at the start of the first wrapped line *and* every continuation
+/// line, so indentation survives a reflow.
+///
+/// Tokenization inside the body uses `split_whitespace`, collapsing any run of
+/// whitespace between words to a single space. A word longer than the available
+/// width (after subtracting the indent) is hard-split into `width`-sized
+/// character chunks (CJK-safe). The first chunk keeps the indent; subsequent
+/// chunks are emitted plain so the overlay renderer can prepend its own marker.
 ///
 /// Unlike a grapheme-boundary splitter, this keeps trailing punctuation
 /// attached to its word (e.g. `"Commands:"` stays `"Commands:"`, not
 /// `"Commands :"`) and never inserts a space adjacent to existing whitespace
-/// (so `"a  b"` reflows to `"a b"`).
+/// between words.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return text.lines().map(|l| l.to_string()).collect();
@@ -418,34 +424,51 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
     for logical in text.split('\n') {
-        if logical.trim().is_empty() {
+        if logical.is_empty() {
             out.push(String::new());
             continue;
         }
-        let words: Vec<&str> = logical.split_whitespace().collect();
-        let mut line = String::new();
+        // Capture leading whitespace so the indent survives wrap.
+        let indent: String = logical.chars().take_while(|c| c.is_whitespace()).collect();
+        let body = &logical[indent.len()..];
+        if body.is_empty() {
+            // All-whitespace line: preserve the indent itself.
+            out.push(indent);
+            continue;
+        }
+        let indent_chars = indent.chars().count();
+        let content_width = width.saturating_sub(indent_chars).max(1);
+        let words: Vec<&str> = body.split_whitespace().collect();
+        let mut line = String::from(&indent);
         for word in words {
-            if word.chars().count() > width {
+            if word.chars().count() > content_width {
                 // Flush any pending line, then hard-split the long word.
-                if !line.is_empty() {
+                if line.chars().count() > indent_chars {
                     out.push(std::mem::take(&mut line));
                 }
                 let chunks: Vec<String> = word
                     .chars()
                     .collect::<Vec<_>>()
-                    .chunks(width)
+                    .chunks(content_width)
                     .map(|c| c.iter().collect())
                     .collect();
-                for c in &chunks[..chunks.len().saturating_sub(1)] {
-                    out.push(c.clone());
+                let last_idx = chunks.len().saturating_sub(1);
+                for (i, c) in chunks.iter().enumerate() {
+                    if i == 0 {
+                        out.push(format!("{}{}", indent, c));
+                    } else if i < last_idx {
+                        out.push(c.clone());
+                    }
                 }
                 line = chunks.last().cloned().unwrap_or_default();
                 continue;
             }
-            if line.is_empty() {
+            let content_len = line.chars().count() - indent_chars;
+            if content_len == 0 {
                 line.push_str(word);
-            } else if line.chars().count() + 1 + word.chars().count() > width {
+            } else if content_len + 1 + word.chars().count() > content_width {
                 out.push(std::mem::take(&mut line));
+                line.push_str(&indent);
                 line.push_str(word);
             } else {
                 line.push(' ');
@@ -1894,7 +1917,9 @@ mod tests {
     #[test]
     fn wrap_empty_input() {
         assert_eq!(wrap("", 10), vec![""]);
-        assert_eq!(wrap("   ", 10), vec![""]);
+        // A pure-whitespace logical line keeps its whitespace (it has
+        // visible width, unlike a truly empty line).
+        assert_eq!(wrap("   ", 10), vec!["   "]);
     }
 
     #[test]
@@ -1919,12 +1944,66 @@ mod tests {
     }
 
     #[test]
-    fn wrap_preserves_alignment_free_help() {
-        // `wrap` reflows: leading/padding whitespace is collapsed to single
-        // spaces, punctuation stays attached, em-dash gets one space.
+    fn wrap_preserves_indent_while_collapsing_inter_word_runs() {
+        // Leading whitespace is preserved so indentation survives a reflow,
+        // but inter-word whitespace runs are still collapsed to a single
+        // space (the same behavior as before for the body of the line).
         let help = "  /help      — Show available commands\n  /model      — Select a model";
         let r = wrap(help, 100);
-        assert_eq!(r, vec!["/help — Show available commands", "/model — Select a model"]);
+        assert_eq!(
+            r,
+            vec![
+                "  /help — Show available commands".to_string(),
+                "  /model — Select a model".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_preserves_indent_on_continuation_lines() {
+        // When a logical line is wrapped to multiple physical lines, every
+        // continuation line keeps the original indent so the wrapped block
+        // reads as one indented paragraph.
+        let text = "    one two three four five six seven eight nine ten";
+        // Width 15 - 4 (indent) = 11 chars for content per line.
+        let r = wrap(text, 15);
+        for line in &r {
+            assert!(
+                line.starts_with("    "),
+                "every wrapped line should keep the 4-space indent, got {:?}",
+                line
+            );
+        }
+        assert_eq!(
+            r,
+            vec![
+                "    one two".to_string(),
+                "    three four".to_string(),
+                "    five six".to_string(),
+                "    seven eight".to_string(),
+                "    nine ten".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_long_word_first_chunk_keeps_indent_subsequent_chunks_plain() {
+        // A word longer than the available content width is hard-split. The
+        // FIRST chunk keeps the indent (it's the first visual line of that
+        // word); the renderer will prepend its own marker to subsequent
+        // chunks, so emitting them plain keeps continuation lines aligned.
+        let text = "  abcdefghij";
+        // Width 5 - 2 (indent) = 3 chars content per chunk.
+        let r = wrap(text, 5);
+        assert_eq!(
+            r,
+            vec![
+                "  abc".to_string(),
+                "def".to_string(),
+                "ghi".to_string(),
+                "j".to_string(),
+            ]
+        );
     }
 
     #[test]
