@@ -3150,6 +3150,24 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 if input == "/q" || input == "exit" {
                     break;
                 }
+                // Safety net: any code path that drops the in-memory session
+                // (notably `/new` and `/clear`) must leave us with a fresh one
+                // before the first post-drop prompt — otherwise
+                // `prompt(input, None, ...)` would build an empty prior context
+                // and skip every `append_message` (gated on `session.is_some()`),
+                // losing turn-to-turn memory and never writing the new session
+                // to disk. Cheap when the session is already populated.
+                ensure_session(
+                    &mut session,
+                    &repo,
+                    Some(config.provider.clone()),
+                    Some(config.model.clone()),
+                    config.thinking_level.clone(),
+                ).await;
+                current_session_id = session
+                    .as_ref()
+                    .map(|s| s.get_session_id().to_string())
+                    .unwrap_or_default();
                 // User-initiated shell command. `!cmd` runs `cmd` in the
                 // sandbox and captures its output into the session context (so
                 // the LLM sees it on the next turn); `!!cmd` runs and displays
@@ -3555,7 +3573,22 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         }
                     }
                     session = None;
-                    current_session_id = String::new();
+                    // Create a fresh session for the next prompt so context
+                    // carries across turns AND the new turns get persisted.
+                    // `repo.create()` defers the header write to the first
+                    // `append_message`, so a user that quits immediately
+                    // still produces no empty `.jsonl` file.
+                    ensure_session(
+                        &mut session,
+                        &repo,
+                        Some(config.provider.clone()),
+                        Some(config.model.clone()),
+                        config.thinking_level.clone(),
+                    ).await;
+                    current_session_id = session
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
                     continue;
                 }
                 // Handle `/new`: drop the current in-memory session and let
@@ -3564,7 +3597,22 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                 // via `/session <name> resume`.
                 if input == "/new" || input.starts_with("/new ") {
                     session = None;
-                    current_session_id = String::new();
+                    // See `/clear` above: without this call, the next prompt
+                    // would run with `session = None` — losing prior context
+                    // and skipping every `append_message` (since they're gated
+                    // on `session.is_some()`), so the new "session" wouldn't
+                    // be saved.
+                    ensure_session(
+                        &mut session,
+                        &repo,
+                        Some(config.provider.clone()),
+                        Some(config.model.clone()),
+                        config.thinking_level.clone(),
+                    ).await;
+                    current_session_id = session
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
                     continue;
                 }
                 // Handle `/replay [N[t|l]]`: re-render session history.
@@ -5442,6 +5490,122 @@ mod tests {
         t.push_assistant_turn(None, vec![AssistantContent::text("   ")]);
         assert!(!t.has_progress(), "blank-text turn must not count as progress");
         assert!(t.finalize().is_empty());
+    }
+
+    // Regression test for the `/new` (and `/clear`) bug: those commands set
+    // the in-memory `session = None`, but the prior implementation never
+    // recreated a session before the next Submit. As a result
+    //   - `prompt(input, None, ...)` built an empty prior context, so
+    //     turn-to-turn context was lost across prompts inside the new
+    //     "session";
+    //   - every `s.append_message(...)` is gated on `session.is_some()`,
+    //     so the new turns were never persisted to disk — `/session` showed
+    //     only the old (kept) session, and a quit produced no `.jsonl`.
+    //
+    // The fix calls `ensure_session()` after `/new` and `/clear` (and again
+    // at the top of the Submit arm as a safety net). This test verifies
+    // that the `ensure_session` mechanism the fix relies on correctly
+    // produces a fresh, writable session after the in-memory session is
+    // dropped, and that the new session's prior-context view contains
+    // only its OWN history (not the dropped one's) — so the model would
+    // see turn 2's prior = [turn 2-1].
+    //
+    // We invoke `repo.create()` directly (which is the same call
+    // `ensure_session` makes once it has captured the cwd) so the test is
+    // hermetic — independent of `std::env::current_dir()` at test-run time.
+    #[tokio::test]
+    async fn ensure_session_after_drop_creates_fresh_persistent_session() {
+        use rig_core::message::Message;
+        use std::path::PathBuf;
+        use crate::session::repo::SessionRepo;
+        use crate::session::storage::SessionStorage;
+
+        let base: PathBuf = std::env::temp_dir().join(format!(
+            "picocode-new-fix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+        let cwd = std::path::Path::new("/home/test/regression");
+
+        // First session (the "before /new" one). Persist a message so the
+        // session file is written and is distinct from a bare header.
+        let storage1 = repo.create(cwd).await.unwrap();
+        let header1 = crate::session::SessionHeader::new(cwd);
+        let index1 = storage1.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+            header: header1,
+            entries: std::collections::HashMap::new(),
+            leaf_id: None,
+            children: std::collections::HashMap::new(),
+            session_name: None,
+        });
+        let first = crate::session::Session::new(storage1, index1);
+        let first_id = first.get_session_id().to_string();
+        first
+            .append_message(&Message::user("hello old session"))
+            .await
+            .unwrap();
+
+        // Simulate `/new`: drop the in-memory session (the on-disk file is
+        // preserved, matching `/new`'s contract).
+        drop(first);
+
+        // With the fix, the new handler now calls `ensure_session()` again,
+        // producing a SECOND session with a fresh UUID and a writable storage.
+        // We replicate that by calling `repo.create()` again with the same cwd.
+        let storage2 = repo.create(cwd).await.unwrap();
+        let header2 = crate::session::SessionHeader::new(cwd);
+        let index2 = storage2.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+            header: header2,
+            entries: std::collections::HashMap::new(),
+            leaf_id: None,
+            children: std::collections::HashMap::new(),
+            session_name: None,
+        });
+        let second = crate::session::Session::new(storage2, index2);
+        let second_id = second.get_session_id().to_string();
+
+        assert_ne!(
+            first_id, second_id,
+            "/new must yield a fresh session UUID; otherwise the new prompts would land in the kept session"
+        );
+
+        // The new session must be writable: appending the first turn should
+        // succeed (pre-fix, session was still None here and append_message
+        // was unreachable).
+        second
+            .append_message(&Message::user("hello new session t1"))
+            .await
+            .unwrap();
+        second
+            .append_message(&Message::assistant("t1 reply"))
+            .await
+            .unwrap();
+
+        // And its prior-context view must reflect its OWN history only —
+        // i.e. the model would see "t1, t1 reply" on the next turn, not the
+        // old session's "hello old session".
+        let ctx = second.build_context().await.unwrap();
+        assert_eq!(
+            ctx.messages.len(),
+            2,
+            "second session's context must hold its own two turns, not the first session's"
+        );
+
+        // Listing must surface both sessions (the kept old one and the new
+        // persisted one) — pre-fix, only the old one was on disk.
+        let metas = repo.list(Some(cwd)).await.unwrap_or_default();
+        let ids: std::collections::HashSet<_> = metas.iter().map(|m| m.id.clone()).collect();
+        assert!(
+            ids.contains(&first_id) && ids.contains(&second_id),
+            "both sessions must be on disk after /new; got {:?}",
+            ids
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 }
 
