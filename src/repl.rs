@@ -13,7 +13,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crate::output::{term_width, wrap, Output};
+use crate::output::{term_height, term_width, wrap, Output};
 use crate::model_catalog;
 use crate::slash;
 use crate::thinking;
@@ -760,11 +760,21 @@ impl ActiveOverlay {
                         let sub_filter = sub_filter.to_string();
                         match action_tok {
                             "switch" => {
-                                let mut header = Vec::new();
-                                let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
-                                Repl::tree_entry_header(entry, &label, &mut header);
+                                // Compute opts first so the message-preview
+                                // cap can reserve room for the menu rows
+                                // (see `tree_entry_header`).
                                 let (opts, active) =
                                     Repl::filter_tree_options(&["just switch", "summarize"], &sub_filter);
+                                let max_body_lines =
+                                    Repl::tree_preview_line_budget(opts.len());
+                                let mut header = Vec::new();
+                                let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                                Repl::tree_entry_header(
+                                    entry,
+                                    &label,
+                                    max_body_lines,
+                                    &mut header,
+                                );
                                 return ActiveOverlay::SwitchAction {
                                     target_id,
                                     header,
@@ -815,11 +825,17 @@ impl ActiveOverlay {
                             _ => {}
                         }
                         // No (or unknown) action token → action menu.
-                        let mut header = Vec::new();
-                        let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
-                        Repl::tree_entry_header(entry, &label, &mut header);
                         let (opts, active) =
                             Repl::filter_tree_options(&["switch", "compact"], &sub_filter);
+                        let max_body_lines = Repl::tree_preview_line_budget(opts.len());
+                        let mut header = Vec::new();
+                        let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                        Repl::tree_entry_header(
+                            entry,
+                            &label,
+                            max_body_lines,
+                            &mut header,
+                        );
                         return ActiveOverlay::TreeAction {
                             target_id,
                             header,
@@ -1014,16 +1030,13 @@ impl ActiveOverlay {
                  rows.clone(), *active, false)
             }
             ActiveOverlay::TreeAction { opts, active, .. } => {
-                ("Tree actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
             ActiveOverlay::SwitchAction { opts, active, .. } => {
-                ("Switch actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
             ActiveOverlay::CompactSummary { opts, active, .. } => {
-                ("Compact summary  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
         }
     }
@@ -2430,12 +2443,16 @@ impl Repl {
             format!("{}{:<width$}{}", bg, s, C_RESET, width = tw)
         };
         let mut out = String::new();
-        out.push_str(&bg_line(title, BG));
+        if !title.is_empty() {
+            out.push_str(&bg_line(title, BG));
+        }
         // Render header rows (non-selectable info) if present.
         if let Some(hdr) = header {
             for hline in hdr {
                 for subline in hline.split('\n') {
-                    out.push('\n');
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
                     out.push_str(&format!("{}{:<width$}{}", BG_HEADER, subline, C_RESET, width = tw));
                 }
             }
@@ -2465,7 +2482,9 @@ impl Repl {
             } else {
                 format!("{}{}", fg, body)
             };
-            out.push('\n');
+            if !out.is_empty() {
+                out.push('\n');
+            }
             out.push_str(&bg_line(&content, bg));
         }
         out
@@ -3350,40 +3369,63 @@ impl Repl {
         }
     }
 
+    /// Compute the line budget for the `/tree <id>` message-preview
+    /// header. Subtracts the title row and the menu rows from the overlay
+    /// budget (`2/3` of the terminal height, matching `redraw`'s
+    /// `max_pop`). Anything leftover is the maximum number of header rows
+    /// the message preview is allowed to consume. Returns at least 1 so
+    /// even a tiny terminal still gets a single truncated preview line.
+    fn tree_preview_line_budget(opts_count: usize) -> usize {
+        let term_h = term_height().max(1);
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        // Title (1) + opts rows + header rows ≤ max_pop. The header can
+        // also legitimately be empty (a one-line label still fits), so the
+        // budget has a floor of 1.
+        max_pop.saturating_sub(1).saturating_sub(opts_count).max(1)
+    }
+
     /// Build the info header for `TreeAction` / `SwitchAction`: the selected
     /// entry's body (multi-line, wrapped to the terminal width) when it's a
     /// message, otherwise the precomputed single-line label. The ID is
     /// intentionally NOT shown — it is already visible in the prompt buffer
     /// (`/tree <id>`).
     ///
-    /// For messages, the body is wrapped to the terminal width with newlines
-    /// preserved, capped at [`Self::TREE_PREVIEW_LINE_CAP`] lines as a
-    /// safety net so runaway prompts don't blow up the menu. The pop-up
-    /// itself is bounded at `2/3` of the terminal height by `redraw`, so a
-    /// tall terminal sees the full message; a short one clips via the
-    /// existing windowed-selection mechanism.
+    /// `max_body_lines` caps the number of header rows consumed by the
+    /// message preview. The caller computes it from the terminal height
+    /// and the count of menu items so the menu is never pushed off-screen
+    /// by a long message: the overlay budget (`2/3` of `term_h`) minus the
+    /// title row and the menu rows must cover the header. When the body
+    /// exceeds the cap, the last visible line gets a trailing `…` so the
+    /// user knows the preview is incomplete — same convention as the
+    /// single-line rendering in `Table::render`.
     fn tree_entry_header(
         entry: Option<&SessionEntry>,
         label: &str,
+        max_body_lines: usize,
         header: &mut Vec<String>,
     ) {
-        const TREE_PREVIEW_LINE_CAP: usize = 10;
         let avail = term_width().saturating_sub(2);
         // Try the multi-line message body first; fall back to the
         // single-line label for non-message entries (compaction, model
-        // change, branch summary, ...).
+        // change, branch summary, ...). The label branch never exceeds
+        // one row, so it is unaffected by `max_body_lines`.
         let body_lines: Vec<String> = if let Some(text) =
             entry.and_then(Self::entry_message_body)
         {
             let mut lines = wrap(&text, avail);
-            if lines.len() > TREE_PREVIEW_LINE_CAP {
-                let skipped = lines.len() - TREE_PREVIEW_LINE_CAP + 1;
-                lines.truncate(TREE_PREVIEW_LINE_CAP - 1);
-                lines.push(format!(
-                    "[… {} more line{}]",
-                    skipped,
-                    if skipped == 1 { "" } else { "s" }
-                ));
+            // Sanity floor: a caller that hands us `max_body_lines == 0`
+            // (terminal too short to fit anything) still gets a single
+            // truncated row so the menu remains self-describing.
+            let cap = max_body_lines.max(1);
+            if lines.len() > cap {
+                lines.truncate(cap);
+                // Marker sits at the end of the last visible row — same
+                // ellipsis convention as the single-line path. Never
+                // appends a dedicated truncation row (that would steal
+                // one of the menu's reserved lines).
+                if let Some(last) = lines.last_mut() {
+                    *last = format!("{last}…");
+                }
             }
             lines
         } else {
@@ -5199,7 +5241,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "stale label (ignored for messages)", &mut header);
+        Repl::tree_entry_header(Some(&entry), "stale label (ignored for messages)", usize::MAX, &mut header);
         // Newlines preserved → one header row per line.
         assert_eq!(header.len(), 3, "got: {:?}", header);
         assert_eq!(header[0], "line one");
@@ -5210,10 +5252,11 @@ mod tests {
     }
 
     #[test]
-    fn tree_entry_header_long_message_caps_at_ten_lines() {
-        // 25 single-token lines wrap to many lines (well over the cap);
-        // header must include a trailing "[… N more lines]" indicator and
-        // never blow up the menu.
+    fn tree_entry_header_long_message_truncates_with_inline_ellipsis() {
+        // 25 lines, capped at 10: header has exactly 10 rows, the last
+        // ends with `…` so the user knows the preview is incomplete. No
+        // separate truncation row (that would steal one of the menu's
+        // reserved lines).
         let body: String = (1..=25)
             .map(|i| format!("line{}", i))
             .collect::<Vec<_>>()
@@ -5230,26 +5273,28 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
-        // Cap is 10: 9 visible + 1 "[… N more lines]" marker.
+        Repl::tree_entry_header(Some(&entry), "label", 10, &mut header);
         assert_eq!(header.len(), 10, "got: {:?}", header);
-        assert!(header[0].contains("line1"));
-        assert!(header[8].contains("line9"));
+        // First 9 rows are unmodified message lines (line1..line9).
+        for (i, row) in header.iter().take(9).enumerate() {
+            assert_eq!(*row, format!("line{}", i + 1), "row {i}");
+        }
+        // Last row ends with the ellipsis marker.
         assert!(
-            header[9].contains("more line"),
-            "expected truncation marker, got: {:?}",
+            header[9].ends_with('…'),
+            "expected trailing ellipsis, got: {:?}",
             header[9]
         );
-        // 25 lines total, 9 visible → 16 skipped (24 - 9 + 1 = 16, since
-        // we kept 9 lines and skipped the rest). The marker says how many
-        // were dropped — verify it accounts for the difference.
-        let marker = &header[9];
-        assert!(marker.contains("16"), "expected 16 skipped, got: {marker}");
+        assert!(
+            header[9].starts_with("line10"),
+            "expected last visible line to start with the truncated content, got: {:?}",
+            header[9]
+        );
     }
 
     #[test]
-    fn tree_entry_header_short_message_under_cap_unchanged() {
-        // 3-line message under the cap: no truncation marker.
+    fn tree_entry_header_under_cap_no_ellipsis() {
+        // 3-line message under the cap: no ellipsis, all rows intact.
         let body = "a\nb\nc";
         let entry = SessionEntry {
             id: "u1".into(),
@@ -5263,8 +5308,26 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        Repl::tree_entry_header(Some(&entry), "label", 10, &mut header);
         assert_eq!(header, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // No ellipsis anywhere — message fit under the cap.
+        assert!(header.iter().all(|l| !l.ends_with('…')));
+    }
+
+    #[test]
+    fn tree_preview_line_budget_reserves_room_for_menu_items() {
+        // The budget is `2/3 * term_h` minus the title (1) and the menu
+        // rows. On a 24-row terminal that's 16 - 1 - opts_count. With
+        // 2 opts (the bare /tree <id> menu) that's 13 header rows — enough
+        // for typical prompts.
+        let budget = Repl::tree_preview_line_budget(2);
+        let term_h = term_height();
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        assert_eq!(budget, max_pop.saturating_sub(1).saturating_sub(2).max(1));
+        // Floor: at least 1 even on a tiny / bizarre terminal.
+        assert!(budget >= 1);
+        // More menu rows ⇒ smaller preview budget.
+        assert!(Repl::tree_preview_line_budget(2) >= Repl::tree_preview_line_budget(5));
     }
 
     #[test]
@@ -5287,7 +5350,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        Repl::tree_entry_header(Some(&entry), "label", usize::MAX, &mut header);
         assert_eq!(
             header,
             vec!["first paragraph".to_string(), "second paragraph".to_string()]
@@ -5309,7 +5372,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "compaction ... before \"...\"", &mut header);
+        Repl::tree_entry_header(Some(&entry), "compaction ... before \"...\"", usize::MAX, &mut header);
         assert_eq!(header.len(), 1, "got: {:?}", header);
         assert!(header[0].contains("compaction"));
         assert!(!header[0].contains("c1"), "id should not appear: {:?}", header[0]);
@@ -5320,7 +5383,7 @@ mod tests {
         // Defensive: if the caller can't locate the entry, fall back to
         // the precomputed single-line label.
         let mut header = Vec::new();
-        Repl::tree_entry_header(None, "compaction ...", &mut header);
+        Repl::tree_entry_header(None, "compaction ...", usize::MAX, &mut header);
         assert_eq!(header, vec!["compaction ...".to_string()]);
     }
 
