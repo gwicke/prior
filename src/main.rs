@@ -48,6 +48,14 @@ struct Args {
     /// Log raw messages to a JSONL file for debugging
     #[arg(long, global = true, value_name = "FILE")]
     log_messages: Option<String>,
+
+    /// Auto-resume the most recent session for the current directory at
+    /// startup. Equivalent to opening the interactive chat, typing `/session`,
+    /// pressing Tab to pick the top entry, and Enter to confirm `resume`.
+    /// If no session exists yet for this CWD, a fresh one is started and
+    /// a one-line note is printed (so first-launch flows don't hard-error).
+    #[arg(short = 'r', long, global = true)]
+    resume: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -163,6 +171,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Config::load(args.config.as_deref())?;
+
+    // `--resume` only makes sense in interactive chat mode: it's a session
+    // pickup for the REPL. Combining it with `input`/`recipe`/positional
+    // prompt would mix two execution semantics (resume implies entering the
+    // REPL after the replay; the others run a single turn and exit).
+    if args.resume
+        && (matches!(
+            &args.command,
+            Some(Commands::Input { .. } | Commands::Recipe { .. })
+        ) || args.prompt.is_some())
+    {
+        eprintln!("Error: --resume can only be used with the interactive chat (no `input`/`recipe` subcommand and no positional prompt).");
+        std::process::exit(2);
+    }
 
     let (command, prompt, recipe_name) = match (&args.command, &args.prompt) {
         (Some(Commands::Recipe { name }), _) => (
@@ -322,7 +344,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                picocode::agent::run_interactive(agent_config, &mut settings).await?;
+                picocode::agent::run_interactive(agent_config, &mut settings, args.resume).await?;
             }
         }
     }

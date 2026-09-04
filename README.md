@@ -106,6 +106,7 @@ Picocode is designed to be flexible, whether you're using it for a quick questio
 - `-q, --quiet`: Minimal output, useful for piping into other tools.
 - `--persona <NAME>`: Launch with a specific expert persona.
 - `--tool-call-limit <N>`: Maximum number of tool calls allowed per turn (Default: 50).
+- `-r, --resume`: Auto-resume the most recent session for the current directory at startup — equivalent to opening the interactive chat, typing `/session`, pressing Tab to pick the top entry, and Enter to confirm `resume`. If no session exists yet, a new one is started with a note. Implies the interactive chat (cannot be combined with `input`/`recipe`/positional prompt).
 
 ## 🛠 Available Tools
 

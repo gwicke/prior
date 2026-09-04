@@ -3146,7 +3146,7 @@ fn save_recent_models(models: &[String]) {
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
-pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) -> Result<()> {
+pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, auto_resume: bool) -> Result<()> {
     let mut config = config;
     // Store the original (non-merged) sandbox config so the remove overlay
     // can list config-provided bindings and allow temporary exclusion.
@@ -3257,7 +3257,62 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
     // dismiss, or type to choose a different model). It is set by the
     // `Switched` arm of the session-command dispatch and consumed by the next
     // `read_input` call; cleared afterwards so subsequent prompts start empty.
+    //
+    // The CLI `--resume` flag populates this BEFORE the loop so the very
+    // first prompt already has the slash command queued — the user presses
+    // Enter once and goes through the exact same code path as a manual
+    // `/session`, Tab, Enter: the REPL parses `/session <id> resume`, the
+    // `handle_session_command` dispatch opens + replays the session, and the
+    // usual `/model …` prefill flows back into `pending_prefill` for the
+    // second prompt. This keeps the history and UX identical to a typed
+    // resume (including the model-overlay catalog fetch that needs the
+    // inter-keystroke time to land).
     let mut pending_prefill: Option<String> = None;
+    if auto_resume {
+        // Resolve the most-recent session for the CWD up-front so the first
+        // REPL iteration can submit a complete `/session <id> resume` line.
+        // `repo.list(Some(cwd))` returns the same newest-first listing the
+        // `/session` overlay would render; its top entry is exactly what
+        // Tab would have highlighted.
+        match repo
+            .as_ref()
+            .and_then(|r| std::env::current_dir().ok().map(|c| (r, c)))
+        {
+            Some((r, cwd)) => match r.list(Some(&cwd)).await {
+                Ok(metas) if !metas.is_empty() => {
+                    let meta = &metas[0];
+                    // Prefer the user-assigned name (more readable than a
+                    // raw UUID when present), matching what `/session`
+                    // shows in the listing.
+                    let ident = meta
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| meta.id.clone());
+                    pending_prefill = Some(format!("/session {} resume", ident));
+                }
+                Ok(_) => {
+                    // No prior session for this CWD. Print a one-liner so
+                    // the user knows `--resume` had nothing to act on
+                    // (they may have expected an existing session) without
+                    // making this a hard error: a fresh checkout that the
+                    // user happens to launch with `--resume` by muscle
+                    // memory should not abort.
+                    config.output.display_text(
+                        "--resume: no prior session for this directory; starting a new one.",
+                    );
+                }
+                Err(e) => {
+                    config
+                        .output
+                        .display_text(&format!("Cannot list sessions: {}", e));
+                }
+            },
+            None => {
+                // No session storage available (no `app_config_dir`). Same
+                // reasoning as the empty-list branch: silently fall through.
+            }
+        }
+    }
     loop {
         let action = match repl.as_mut() {
             Some(r) => {
@@ -5390,7 +5445,7 @@ mod tests {
         // No normal prompt is ever submitted, so the agent is never created and
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
         // pre-fix condition where `!` would otherwise run unsandboxed.
-        super::run_interactive(config, &mut settings)
+        super::run_interactive(config, &mut settings, false)
             .await
             .unwrap();
 
@@ -6418,6 +6473,99 @@ mod tests {
 
             let _ = tokio::fs::remove_dir_all(&base).await;
         }
+    }
+
+    #[tokio::test]
+    async fn resume_flag_resolves_top_session_for_cwd_to_slash_command() {
+        // The `--resume` CLI flag resolves the most-recent session for the
+        // CWD at startup and pre-loads the buffer with
+        // `/session <name|id> resume` so the very first Enter submits the
+        // exact same slash command a user would have typed after picking
+        // the top entry in the `/session` overlay. This test seeds two
+        // sessions in the same CWD and verifies the resolved identifier
+        // (matching `repo.list`'s top entry) — which is the only logic the
+        // startup path adds on top of a manual resume.
+        use std::path::PathBuf;
+        use crate::session::repo::SessionRepo;
+        use crate::session::storage::SessionStorage;
+
+        let base: PathBuf = std::env::temp_dir().join(format!(
+            "picocode-resume-flag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+        let cwd = std::path::Path::new("/home/test/resume-flag");
+
+        // Seed an older session first. Append a message so the file is
+        // real (not a bare header).
+        let s_old = repo.create(cwd).await.unwrap();
+        let h_old = crate::session::SessionHeader::new(cwd);
+        let i_old = s_old.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+            header: h_old.clone(),
+            entries: std::collections::HashMap::new(),
+            leaf_id: None,
+            children: std::collections::HashMap::new(),
+            session_name: None,
+        });
+        let old_session = crate::session::Session::new(s_old, i_old);
+        old_session
+            .append_message(&rig_core::message::Message::user("old turn"))
+            .await
+            .unwrap();
+        drop(old_session);
+
+        // Tiny gap so the next session's timestamp is strictly greater;
+        // UUIDv7 IDs encode a millisecond timestamp so a 2 ms sleep is
+        // more than enough on any platform.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        // Seed the newer session — also the one `--resume` should pick.
+        let s_new = repo.create(cwd).await.unwrap();
+        let h_new = crate::session::SessionHeader::new(cwd);
+        let i_new = s_new.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+            header: h_new.clone(),
+            entries: std::collections::HashMap::new(),
+            leaf_id: None,
+            children: std::collections::HashMap::new(),
+            session_name: None,
+        });
+        let new_session = crate::session::Session::new(s_new, i_new);
+        new_session
+            .append_message(&rig_core::message::Message::user("new turn"))
+            .await
+            .unwrap();
+        let new_id = new_session.get_session_id().to_string();
+        drop(new_session);
+
+        // Mirror the startup resolve: take `repo.list(Some(cwd))[0]` and
+        // build the `/session <ident> resume` prefill string the same way
+        // `run_interactive` does when `--resume` is set.
+        let metas = repo.list(Some(cwd)).await.unwrap();
+        assert!(metas.len() >= 2, "both sessions must be listed; got {:?}", metas);
+        let top = &metas[0];
+        assert_eq!(
+            top.id, new_id,
+            "listing must be newest-first; expected {} on top, got {}",
+            new_id, top.id
+        );
+
+        let ident = top.name.clone().unwrap_or_else(|| top.id.clone());
+        let prefill = format!("/session {} resume", ident);
+        // Ident must be either the session's UUID id (no name assigned)
+        // or its user-assigned name — either way, the resulting line is a
+        // complete, dispatchable slash command that `handle_session_command`
+        // would accept.
+        assert!(
+            prefill == format!("/session {} resume", new_id),
+            "without an explicit name, --resume should fall back to the UUID id; got {:?}",
+            prefill
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[test]
