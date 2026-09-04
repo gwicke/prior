@@ -456,20 +456,7 @@ pub(crate) enum ActiveOverlay {
         opts: Vec<String>,
         active: Option<usize>,
         _filter: String,
-        /// Which canonical form the committed line uses:
-        /// `/tree <id> compact <mode>` (`AtEntry`) or `/compact <mode>`
-        /// (`AtCurrent`, resolves to the current leaf in the main loop).
-        prefix: CompactPrefix,
     },
-}
-
-/// How a compact overlay commits its canonical command line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompactPrefix {
-    /// `/tree <target-id> compact <mode>` — target explicitly resolved.
-    AtEntry,
-    /// `/compact <mode>` — compact at the session's current position.
-    AtCurrent,
 }
 
 impl ActiveOverlay {
@@ -503,6 +490,7 @@ impl ActiveOverlay {
             "" | "model" | "thinking" | "set"
                 | "persona" | "stat" | "replay"
                 | "sandbox" | "session" | "tree"
+                | "compact"
         ) {
             (after, "")
         } else {
@@ -578,52 +566,62 @@ impl ActiveOverlay {
                 }
             }
             "compact" => {
-                // `/compact` compacts at the CURRENT position — the same
-                // summary-mode menu as `/tree <id> compact`, targeted at the
-                // session's current leaf. Committed lines reuse the existing
-                // `/tree <leafid> compact <mode>` handling in the main loop.
+                // `/compact` auto-resolves `target_id` to the last
+                // user message on the active branch, so the committed
+                // line is `/tree <last_user_id> compact <mode>` and
+                // the dropped span = everything before the user's last
+                // prompt. The kept range starts with the user's prompt
+                // and continues to the current leaf, so the next LLM
+                // turn sees [summary] + [last user prompt] + [last
+                // assistant response (if any)] + [new user prompt].
                 let filter = rest.trim().to_string();
-                match ctx.leaf_id.as_deref() {
-                    Some(leaf_id) => {
-                        // Resolve the leaf's display label from the tree so the
-                        // header shows what is being compacted at.
-                        let mut flat = Vec::new();
-                        let active_path: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        Repl::flatten_tree_nodes(
-                            &ctx.tree,
-                            0,
-                            Some(leaf_id),
-                            &active_path,
-                            &mut flat,
-                        );
-                        let label = flat
-                            .iter()
-                            .find(|(_, _, id, _, _)| id == leaf_id)
-                            .map(|(_, l, _, _, _)| l.clone())
-                            .unwrap_or_else(|| leaf_id.to_string());
-                        let mut header = Vec::new();
-                        Repl::compact_summary_header(leaf_id, &label, ctx, &mut header);
-                        let (opts, _fuzzy_active) =
-                            Repl::filter_tree_options(&["truncate", "text only", "llm"], &filter);
-                        let first = filter.split_whitespace().next().unwrap_or("");
-                        let first_normalized = first.replace(' ', "-");
-                        let active = opts
-                            .iter()
-                            .position(|l| {
-                                l == first || l.replace(' ', "-") == first_normalized
-                            })
-                            .or(_fuzzy_active);
-                        ActiveOverlay::CompactSummary {
-                            target_id: leaf_id.to_string(),
-                            header,
-                            opts,
-                            active,
-                            _filter: filter,
-                            prefix: CompactPrefix::AtCurrent,
-                        }
-                    }
-                    None => ActiveOverlay::None,
+                let Some(leaf_id) = ctx.leaf_id.as_deref() else {
+                    return ActiveOverlay::None;
+                };
+                let Some(target_id) =
+                    Repl::last_user_message_id_on_active_branch(&ctx.tree, leaf_id)
+                else {
+                    // No user message on the branch (empty session or
+                    // non-message-only branch). Match the no-leaf case:
+                    // silent `None` so the user just sees no overlay.
+                    return ActiveOverlay::None;
+                };
+                // Resolve the target's display label from the tree so
+                // the header shows what is being compacted at.
+                let label = {
+                    let mut flat = Vec::new();
+                    let active_path: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    Repl::flatten_tree_nodes(
+                        &ctx.tree,
+                        0,
+                        Some(leaf_id),
+                        &active_path,
+                        &mut flat,
+                    );
+                    flat.iter()
+                        .find(|(_, _, id, _, _)| id == &target_id)
+                        .map(|(_, l, _, _, _)| l.clone())
+                        .unwrap_or_else(|| target_id.clone())
+                };
+                let mut header = Vec::new();
+                Repl::compact_summary_header(&target_id, &label, ctx, &mut header);
+                let (opts, _fuzzy_active) =
+                    Repl::filter_tree_options(&["truncate", "text only", "llm"], &filter);
+                let first = filter.split_whitespace().next().unwrap_or("");
+                let first_normalized = first.replace(' ', "-");
+                let active = opts
+                    .iter()
+                    .position(|l| {
+                        l == first || l.replace(' ', "-") == first_normalized
+                    })
+                    .or(_fuzzy_active);
+                ActiveOverlay::CompactSummary {
+                    target_id,
+                    header,
+                    opts,
+                    active,
+                    _filter: filter,
                 }
             }
             "sandbox" | "sb" => {
@@ -801,7 +799,6 @@ impl ActiveOverlay {
                                     opts,
                                     active,
                                     _filter: sub_filter,
-                                    prefix: CompactPrefix::AtEntry,
                                 };
                             }
                             _ => {}
@@ -1289,7 +1286,7 @@ impl ActiveOverlay {
                     editor.set(&format!("/tree <{}> switch{}", target_id, mode));
                 }
             }
-            ActiveOverlay::CompactSummary { target_id, opts, prefix, .. } => {
+            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
                     let mode = match label.as_str() {
                         "truncate" => " truncate",
@@ -1301,14 +1298,10 @@ impl ActiveOverlay {
                         "llm" => " llm ",
                         _ => "",
                     };
-                    // `/compact <mode>` compacts at the current position;
-                    // `/tree <id> compact <mode>` at an explicitly selected
-                    // entry.
-                    let head = match prefix {
-                        CompactPrefix::AtCurrent => "/compact".to_string(),
-                        CompactPrefix::AtEntry => format!("/tree <{}> compact", target_id),
-                    };
-                    let line = format!("{}{}", head, mode);
+                    // Both `/tree <id> compact` and `/compact` resolve
+                    // to the same canonical line:
+                    // `/tree <{target_id}> compact <mode>`.
+                    let line = format!("/tree <{}> compact{}", target_id, mode);
                     if label.as_str() == "llm" {
                         // Stage the prompt: <line><settings.llm_compact_prompt()>
                         let staged = format!("{}{}", line, settings.llm_compact_prompt());
@@ -1656,26 +1649,24 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::CompactSummary { target_id, opts, prefix, .. } => {
+            ActiveOverlay::CompactSummary { target_id, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
-                    // If the buffer already carries a fully-formed `compact
-                    // llm <payload>` line, the user has already committed
-                    // a canonical prompt. Honor it directly — commit and
-                    // submit, regardless of which option is currently
-                    // highlighted (the fuzzy filter treats the long
-                    // payload as a query and may not pre-select `llm`).
-                    // This is the only point where the slash-menu
-                    // convention (Enter commits a canonical line) holds
-                    // across label selection.
+                    // If the buffer already carries a fully-formed
+                    // `compact llm <payload>` line, the user has
+                    // already committed a canonical prompt. Honor it
+                    // directly — commit and submit, regardless of
+                    // which option is currently highlighted (the fuzzy
+                    // filter treats the long payload as a query and
+                    // may not pre-select `llm`). This is the only
+                    // point where the slash-menu convention (Enter
+                    // commits a canonical line) holds across label
+                    // selection.
                     if label.as_str() == "llm" {
                         let buf = editor.text().to_string();
-                        let head = match prefix {
-                            CompactPrefix::AtCurrent => "/compact llm".to_string(),
-                            CompactPrefix::AtEntry => {
-                                format!("/tree <{}> compact llm", target_id)
-                            }
-                        };
-                        if Repl::llm_compact_buffer_is_canonical(&buf, &head) {
+                        if Repl::llm_compact_buffer_is_canonical(
+                            &buf,
+                            target_id,
+                        ) {
                             Repl::emit_commit(
                                 output,
                                 editor,
@@ -1689,18 +1680,13 @@ impl ActiveOverlay {
                             return OverlayAction::Action(InputAction::Submit(buf));
                         }
                         // Otherwise stage the default prompt for editing.
-                        let prefix_str = match prefix {
-                            CompactPrefix::AtCurrent => "/compact llm".to_string(),
-                            CompactPrefix::AtEntry => format!("/tree <{}> compact llm", target_id),
-                        };
+                        let prefix_str =
+                            format!("/tree <{}> compact llm", target_id);
                         let staged = format!("{} {}", prefix_str, settings.llm_compact_prompt());
                         editor.set(&staged);
                         return OverlayAction::Continue;
                     }
-                    let head = match prefix {
-                        CompactPrefix::AtCurrent => "/compact".to_string(),
-                        CompactPrefix::AtEntry => format!("/tree <{}> compact", target_id),
-                    };
+                    let head = format!("/tree <{}> compact", target_id);
                     let line = match label.as_str() {
                         "truncate" => format!("{} truncate", head),
                         "text only" => format!("{} text-only", head),
@@ -3228,17 +3214,17 @@ impl Repl {
     }
 
     /// True iff the editor buffer is a fully-formed `compact llm <payload>`
-    /// line for the given target id (i.e. the user has already typed a
-    /// canonical LLM-compaction line). Used by `handle_enter` to decide
-    /// between re-staging the default prompt and submitting verbatim.
-    /// Detect a fully-formed `compact llm <payload>` line. The `head` must
-    /// be the literal canonical command head (already resolved per prefix):
-    /// `/tree <id> compact llm` or `/compact llm`. A payload is required so a
-    /// bare head or an empty payload re-stages the default prompt instead of
+    /// True iff `buffer` is a fully-formed `/tree <id> compact llm
+    /// <payload>` line (i.e. the user has already typed a canonical
+    /// LLM-compaction line for the given target id). Used by
+    /// `handle_enter` to decide between re-staging the default prompt
+    /// and submitting verbatim. A payload is required so a bare head or
+    /// an empty payload re-stages the default prompt instead of
     /// submitting an empty summary request.
-    fn llm_compact_buffer_is_canonical(buffer: &str, head: &str) -> bool {
+    fn llm_compact_buffer_is_canonical(buffer: &str, target_id: &str) -> bool {
+        let head = format!("/tree <{}> compact llm", target_id);
         buffer
-            .strip_prefix(head)
+            .strip_prefix(&head)
             .map(|rest| !rest.trim().is_empty())
             .unwrap_or(false)
     }
@@ -3473,6 +3459,65 @@ impl Repl {
         );
     }
 
+    /// Find the id of the most recent user-role message on the active
+    /// branch (the branch ending at `leaf_id`). Returns `None` if the
+    /// active branch has no user message (e.g. an empty session, or a
+    /// branch containing only model / thinking / compaction entries).
+    ///
+    /// Used by the `/compact` overlay to auto-resolve `target_id` to
+    /// "the start of the current turn": the dropped span becomes
+    /// everything before the user's last prompt, the kept range starts
+    /// with that prompt, and the next LLM turn sees
+    /// `[summary] + [last user prompt] + [last assistant response] +
+    /// [new user prompt]`. This matches the natural "compact the
+    /// conversation so far" intent.
+    ///
+    /// The tree contains only the active branch (replay flattens
+    /// descendants of the leaf); a leaf-root walk is enough.
+    pub(crate) fn last_user_message_id_on_active_branch(
+        tree: &[SessionTreeNode],
+        leaf_id: &str,
+    ) -> Option<String> {
+        fn walk(
+            nodes: &[SessionTreeNode],
+            leaf_id: &str,
+            out: &mut Option<String>,
+        ) -> bool {
+            for node in nodes {
+                // Found the leaf: emit the nearest user-role ancestor
+                // up the chain (the just-before-leaf user prompt) and
+                // stop the walk. We track `out` so a user message
+                // sitting ON the leaf is still picked up — the leaf
+                // itself is the most recent user message in that case.
+                if node.entry.id == leaf_id {
+                    if Repl::is_user_message(&node.entry) {
+                        *out = Some(node.entry.id.clone());
+                    }
+                    return true;
+                }
+                if walk(&node.children, leaf_id, out) {
+                    if out.is_none() && Repl::is_user_message(&node.entry) {
+                        *out = Some(node.entry.id.clone());
+                    }
+                    return true;
+                }
+            }
+            false
+        }
+        let mut found = None;
+        walk(tree, leaf_id, &mut found);
+        found
+    }
+
+    /// True iff `entry` is a `Message` with `role == "user"`. Mirrors
+    /// the `entry_display_label` role check.
+    pub(crate) fn is_user_message(entry: &SessionEntry) -> bool {
+        matches!(
+            &entry.content,
+            SessionEntryContent::Message { message }
+                if message.get("role").and_then(|r| r.as_str()) == Some("user")
+        )
+    }
     /// Turn-tracking worker for `flatten_tree_nodes`. `in_turn` flips on at
     /// a user prompt and off at the next user prompt / compaction entry;
     /// visible non-user rows while `in_turn` are indented one char deeper.
@@ -5069,40 +5114,35 @@ mod tests {
         // Buffer with trailing payload is canonical.
         assert!(Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm Summarize this",
-            "/tree <e1> compact llm",
-        ));
-        assert!(Repl::llm_compact_buffer_is_canonical(
-            "/compact llm Summarize this",
-            "/compact llm",
+            "e1",
         ));
         // Whitespace-only payload (single space) is not canonical.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm ",
-            "/tree <e1> compact llm",
+            "e1",
         ));
         // Just `compact llm` (no trailing text) is not canonical.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e1> compact llm",
-            "/tree <e1> compact llm",
+            "e1",
         ));
         // Different target id — not canonical for this target.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/tree <e2> compact llm Summarize this",
-            "/tree <e1> compact llm",
+            "e1",
         ));
-        // `/compact` head does not match a `/tree` buffer and vice-versa.
+        // `/compact` head does not match a `/tree` buffer.
+        // (After Phase 7, `/compact` is rewritten to
+        // `/tree <last_user_id> compact <mode>` at the overlay layer,
+        // so a bare `/compact` line never reaches this check.)
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "/compact llm Summarize this",
-            "/tree <e1> compact llm",
-        ));
-        assert!(!Repl::llm_compact_buffer_is_canonical(
-            "/tree <e1> compact llm Summarize this",
-            "/compact llm",
+            "e1",
         ));
         // Unrelated buffer.
         assert!(!Repl::llm_compact_buffer_is_canonical(
             "hello world",
-            "/tree <e1> compact llm",
+            "e1",
         ));
     }
 
@@ -5115,6 +5155,259 @@ mod tests {
             }
             other => panic!("expected SwitchAction, got disc {:?}", other.overlay_disc()),
         }
+    }
+
+    // ---- last_user_message_id_on_active_branch ----
+
+    use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
+
+    fn mk_message(id: &str, role: &str, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|s| s.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": role,
+                    "content": [{"type": "text", "text": format!("{} msg", id)}]
+                }),
+            },
+        }
+    }
+
+    fn mk_compaction(id: &str, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|s| s.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Compaction {
+                summary: String::new(),
+                first_kept_entry_id: String::new(),
+                tokens_before: 0,
+            },
+        }
+    }
+
+    fn node(entry: SessionEntry, children: Vec<SessionTreeNode>) -> SessionTreeNode {
+        SessionTreeNode { entry, children, label: None }
+    }
+
+    #[test]
+    fn last_user_message_id_picks_just_before_leaf_assistant() {
+        // Tree: user(u1) -> assistant(a1) -> user(u2) -> assistant(a2) = leaf
+        // last_user_message_id should be u2 (the just-before-leaf user).
+        let a2 = mk_message("a2", "assistant", Some("u2"));
+        let u2 = mk_message("u2", "user", Some("a1"));
+        let a1 = mk_message("a1", "assistant", Some("u1"));
+        let u1 = mk_message("u1", "user", None);
+        let tree = vec![node(
+            u1,
+            vec![node(a1, vec![node(u2, vec![node(a2, vec![])])])],
+        )];
+        assert_eq!(
+            Repl::last_user_message_id_on_active_branch(&tree, "a2"),
+            Some("u2".to_string())
+        );
+    }
+
+    #[test]
+    fn last_user_message_id_returns_leaf_when_leaf_is_user() {
+        // Mid-turn: leaf is a user prompt (no response yet). The leaf
+        // itself is the most recent user message.
+        let u2 = mk_message("u2", "user", Some("a1"));
+        let a1 = mk_message("a1", "assistant", Some("u1"));
+        let u1 = mk_message("u1", "user", None);
+        let tree = vec![node(
+            u1,
+            vec![node(a1, vec![node(u2, vec![])])],
+        )];
+        assert_eq!(
+            Repl::last_user_message_id_on_active_branch(&tree, "u2"),
+            Some("u2".to_string())
+        );
+    }
+
+    #[test]
+    fn last_user_message_id_returns_root_when_only_user() {
+        // Single user message, no assistant response yet.
+        let u1 = mk_message("u1", "user", None);
+        let tree = vec![node(u1, vec![])];
+        assert_eq!(
+            Repl::last_user_message_id_on_active_branch(&tree, "u1"),
+            Some("u1".to_string())
+        );
+    }
+
+    #[test]
+    fn last_user_message_id_none_when_no_user_message() {
+        // Empty / non-message-only branch: thinking-level change or
+        // compaction entry as the only nodes.
+        let t = SessionEntry {
+            id: "t1".to_string(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::ThinkingLevelChange {
+                thinking_level: "low".to_string(),
+            },
+        };
+        let tree = vec![node(t, vec![])];
+        assert_eq!(
+            Repl::last_user_message_id_on_active_branch(&tree, "t1"),
+            None
+        );
+    }
+
+    #[test]
+    fn last_user_message_id_walks_past_compaction_entries() {
+        // Compaction entries are not user messages; walk past them.
+        // Tree: user(u1) -> compaction(c1) -> user(u2) = leaf.
+        let u2 = mk_message("u2", "user", Some("c1"));
+        let c1 = mk_compaction("c1", Some("u1"));
+        let u1 = mk_message("u1", "user", None);
+        let tree = vec![node(
+            u1,
+            vec![node(c1, vec![node(u2, vec![])])],
+        )];
+        assert_eq!(
+            Repl::last_user_message_id_on_active_branch(&tree, "u2"),
+            Some("u2".to_string())
+        );
+    }
+
+    // ---- `/compact` overlay resolution ----
+
+    #[test]
+    fn from_buffer_compact_resolves_target_to_last_user_message() {
+        // The /compact overlay must auto-resolve target_id to the
+        // last user-role message, NOT the current leaf. The header
+        // also re-anchors to the resolved target's label.
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree: vec![node(
+                mk_message("u1", "user", None),
+                vec![node(
+                    mk_message("a1", "assistant", Some("u1")),
+                    vec![node(mk_message("u2", "user", Some("a1")), vec![])],
+                )],
+            )],
+            leaf_id: Some("u2".into()), // mid-turn: leaf IS a user message
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/compact", &ctx, &settings, false, &[]);
+        match ov {
+            ActiveOverlay::CompactSummary { target_id, .. } => {
+                assert_eq!(
+                    target_id, "u2",
+                    "/compact should resolve to the most recent user message (the leaf when leaf is user)"
+                );
+            }
+            other => panic!("expected CompactSummary, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_compact_resolves_to_user_before_assistant_leaf() {
+        // Most common case: leaf is the assistant's last response.
+        // /compact should resolve to the user prompt that came
+        // immediately before it.
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree: vec![node(
+                mk_message("u1", "user", None),
+                vec![node(
+                    mk_message("a1", "assistant", Some("u1")),
+                    vec![node(mk_message("u2", "user", Some("a1")), vec![
+                        node(mk_message("a2", "assistant", Some("u2")), vec![]),
+                    ])],
+                )],
+            )],
+            leaf_id: Some("a2".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/compact", &ctx, &settings, false, &[]);
+        match ov {
+            ActiveOverlay::CompactSummary { target_id, .. } => {
+                assert_eq!(
+                    target_id, "u2",
+                    "/compact should resolve to the user message just before the assistant leaf"
+                );
+            }
+            other => panic!("expected CompactSummary, got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_compact_no_overlay_when_no_user_message() {
+        // Empty session (no user message): the overlay does not open.
+        // Mirrors the existing no-leaf behavior.
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree: vec![],
+            leaf_id: None,
+            context_tokens: 0,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/compact", &ctx, &settings, false, &[]);
+        assert!(
+            matches!(ov, ActiveOverlay::None),
+            "expected no overlay when there is no user message"
+        );
     }
 
     #[test]
