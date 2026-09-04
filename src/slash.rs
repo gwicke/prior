@@ -89,12 +89,12 @@ pub fn registry() -> &'static [SlashCommand] {
         },
         SlashCommand {
             name: "/clear",
-            help: "Delete the current session and start a new one",
+            help: "Delete the current session and start a new one. Optional: <name> names the new session",
             kind: SlashKind::Clear,
         },
         SlashCommand {
             name: "/new",
-            help: "Start a new session (keeps the current one on disk)",
+            help: "Start a new session (keeps the current one on disk). Optional: <name> names the new session",
             kind: SlashKind::New,
         },
         SlashCommand {

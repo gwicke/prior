@@ -3717,7 +3717,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                     }
                 }
                 // Handle `/clear`: delete current session and start fresh.
+                // Optional: `/clear <name>` names the new session so it shows
+                // up in `/session` listings by user-friendly name from the
+                // first turn onward (instead of needing a follow-up rename).
                 if input == "/clear" || input.starts_with("/clear ") {
+                    let new_name = input["/clear".len()..].trim().to_string();
                     if let Some(ref s) = session {
                         let id = s.get_session_id().to_string();
                         if let Some(ref r) = repo {
@@ -3746,13 +3750,29 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .as_ref()
                         .map(|s| s.get_session_id().to_string())
                         .unwrap_or_default();
+                    if !new_name.is_empty() {
+                        if let Some(ref s) = session {
+                            if let Err(e) = s.set_session_name(&new_name).await {
+                                config
+                                    .output
+                                    .display_text(&format!("Could not name session: {}", e));
+                            } else if let Some(ref r) = repo {
+                                // Mirror `/session <name> rename`: refresh the
+                                // cached listing so the new name is visible
+                                // immediately.
+                                r.invalidate_cache();
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Handle `/new`: drop the current in-memory session and let
                 // `ensure_session` create a fresh one on the next prompt.
                 // The old session is preserved on disk and can be resumed
-                // via `/session <name> resume`.
+                // via `/session <name> resume`. Optional: `/new <name>`
+                // names the new session (same rationale as `/clear <name>`).
                 if input == "/new" || input.starts_with("/new ") {
+                    let new_name = input["/new".len()..].trim().to_string();
                     session = None;
                     // See `/clear` above: without this call, the next prompt
                     // would run with `session = None` — losing prior context
@@ -3770,6 +3790,20 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore) 
                         .as_ref()
                         .map(|s| s.get_session_id().to_string())
                         .unwrap_or_default();
+                    if !new_name.is_empty() {
+                        if let Some(ref s) = session {
+                            if let Err(e) = s.set_session_name(&new_name).await {
+                                config
+                                    .output
+                                    .display_text(&format!("Could not name session: {}", e));
+                            } else if let Some(ref r) = repo {
+                                // Mirror `/session <name> rename`: refresh the
+                                // cached listing so the new name is visible
+                                // immediately.
+                                r.invalidate_cache();
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Handle `/replay [N[t|l]]`: re-render session history.
@@ -6186,6 +6220,137 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    // Regression test for `/new <name>` and `/clear <name>`: the optional
+    // `<name>` argument must be applied to the freshly-created session via
+    // `set_session_name`, so the user sees the chosen name in `/session`
+    // listings and `set_session_name` round-trips through `build_index`
+    // (i.e. the name is durable, not just an in-memory field).
+    //
+    // We exercise the same primitives the handler uses (drop -> repo.create
+    // -> set_session_name) without spinning up the full REPL, so the test
+    // stays hermetic and fast. The handler-side guarantee is that
+    // `input["/new".len()..].trim()` (or `"/clear"`) flows into the
+    // `set_session_name` call below; a one-line parser smoke test in
+    // `slash.rs` covers that end.
+    #[tokio::test]
+    async fn new_and_clear_with_name_set_session_name_on_fresh_session() {
+        use rig_core::message::Message;
+        use std::path::PathBuf;
+        use crate::session::repo::SessionRepo;
+        use crate::session::storage::SessionStorage;
+
+        for cmd in ["/new", "/clear"] {
+            let base: PathBuf = std::env::temp_dir().join(format!(
+                "picocode-new-name-{}-{}-{}",
+                cmd.replace('/', "_"),
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+            let cwd = std::path::Path::new("/home/test/regression");
+
+            // Seed a previous session so the post-{cmd} state is a *new* one.
+            let s0 = repo.create(cwd).await.unwrap();
+            let h0 = crate::session::SessionHeader::new(cwd);
+            let i0 = s0.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+                header: h0,
+                entries: std::collections::HashMap::new(),
+                leaf_id: None,
+                children: std::collections::HashMap::new(),
+                session_name: None,
+            });
+            let prev = crate::session::Session::new(s0, i0);
+            prev.append_message(&Message::user("seed")).await.unwrap();
+            let prev_id = prev.get_session_id().to_string();
+            drop(prev);
+            // `/clear` deletes; `/new` keeps. Mirror that here so the listing
+            // assertions below match each command's actual contract.
+            if cmd == "/clear" {
+                let metas = repo.list(Some(cwd)).await.unwrap_or_default();
+                if let Some(m) = metas.iter().find(|m| m.id == prev_id) {
+                    let _ = repo.delete(m).await;
+                }
+            }
+
+            // Simulate the new dispatch path: drop in-memory session, create
+            // fresh, then call set_session_name with the parsed `<name>`.
+            // (For `/new` the previous session is still on disk; for `/clear`
+            // it isn't — the new session is created identically either way.)
+            let s1 = repo.create(cwd).await.unwrap();
+            let h1 = crate::session::SessionHeader::new(cwd);
+            let i1 = s1.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+                header: h1,
+                entries: std::collections::HashMap::new(),
+                leaf_id: None,
+                children: std::collections::HashMap::new(),
+                session_name: None,
+            });
+            let fresh = crate::session::Session::new(s1, i1);
+            let fresh_id = fresh.get_session_id().to_string();
+            assert_ne!(fresh_id, prev_id, "{} must mint a new session id", cmd);
+
+            let requested = "some project";
+            fresh
+                .set_session_name(requested)
+                .await
+                .expect("set_session_name should succeed on a fresh session");
+
+            // The in-memory index must reflect the new name immediately:
+            // `set_session_name` updates `index.session_name` so a UI that
+            // reads the name off the live index (without forcing a
+            // `build_index` rebuild) sees the user's choice without lag.
+            let idx = fresh.index().lock().await;
+            assert_eq!(
+                idx.session_name.as_deref(),
+                Some(requested),
+                "{} <name> must populate the in-memory session_name",
+                cmd
+            );
+            drop(idx);
+
+            // And it must round-trip through the on-disk JSONL: re-opening
+            // the same storage and rebuilding the index must surface the
+            // same name (so a later process — or `/session` listing — sees
+            // the user-chosen label, not a UUID).
+            let metas = repo.list(Some(cwd)).await.unwrap_or_default();
+            let meta = metas
+                .iter()
+                .find(|m| m.id == fresh_id)
+                .expect("fresh session must be listed");
+            let (storage_ro, index_ro) = repo.open(meta).await.unwrap();
+            let _ = storage_ro; // currently unused; opened for parity with the real path
+            assert_eq!(
+                index_ro.session_name.as_deref(),
+                Some(requested),
+                "{} <name> must persist to the on-disk index",
+                cmd
+            );
+
+            // `/clear` must have removed the old session; `/new` must have
+            // kept it. Both must list the new one.
+            let ids: std::collections::HashSet<_> =
+                metas.iter().map(|m| m.id.clone()).collect();
+            if cmd == "/clear" {
+                assert!(
+                    !ids.contains(&prev_id) && ids.contains(&fresh_id),
+                    "/clear: old session must be gone, new session must be listed; got {:?}",
+                    ids
+                );
+            } else {
+                assert!(
+                    ids.contains(&prev_id) && ids.contains(&fresh_id),
+                    "/new: both sessions must be listed; got {:?}",
+                    ids
+                );
+            }
+
+            let _ = tokio::fs::remove_dir_all(&base).await;
+        }
     }
 }
 

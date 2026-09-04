@@ -521,6 +521,15 @@ impl Session {
 
         {
             let mut index = self.index.lock().await;
+            // Mirror the new name into the in-memory index so a caller that
+            // reads `s.index().session_name` immediately after
+            // `set_session_name` sees the updated value. The JSONL entry is
+            // the source of truth on disk (re-read by `build_index`), but
+            // until that rebuild runs, the in-memory view would otherwise
+            // lag — which is a footgun for any UI path that reads the name
+            // straight off the live index (e.g. the `/new <name>` and
+            // `/clear <name>` handlers in `agent.rs`).
+            index.session_name = Some(name.to_string());
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
                 index.children.entry(pid.clone()).or_default().push(id.clone());
