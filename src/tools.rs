@@ -183,9 +183,34 @@ pub async fn edit_file(
         }
         let count = text.matches(&edit.old_text).count();
         if count > 1 {
+            // List the line numbers of every occurrence so the model can
+            // re-anchor and pick one (or include more surrounding context
+            // in oldText). Cap at 10 to keep the message bounded.
+            let mut line_numbers: Vec<String> = Vec::with_capacity(count.min(10));
+            let mut listed = 0usize;
+            for (byte_off, _) in text.match_indices(&edit.old_text) {
+                if listed >= 10 {
+                    break;
+                }
+                line_numbers.push(
+                    (crate::edit_match::count_lines(&text[..byte_off]) + 1)
+                        .to_string(),
+                );
+                listed += 1;
+            }
+            let line_list = if count > 10 {
+                format!(
+                    "{}, (...and {} more)",
+                    line_numbers.join(", "),
+                    count - 10,
+                )
+            } else {
+                line_numbers.join(", ")
+            };
             return Ok(format!(
-                "error: old_string '{}' (edit #{}) appears {count} times, must be unique",
-                edit.old_text, i + 1
+                "error: old_string '{}' (edit #{}) appears {count} times, \
+                 must be unique. Occurrences at lines: {line_list}",
+                edit.old_text, i + 1,
             ));
         }
     }
@@ -1898,9 +1923,13 @@ mod edit_file_tests {
 
     #[tokio::test]
     #[serial]
-    async fn duplicate_match_returns_non_unique_error() {
+    async fn duplicate_match_returns_non_unique_error_with_line_numbers() {
         let _cwd = CwdGuard::new();
-        tokio::fs::write("d.txt", "foo foo foo\n").await.unwrap();
+        // 'foo' on lines 1, 3, 5 (1-indexed). The file has a trailing
+        // newline, so line N contains all chars before the Nth newline.
+        tokio::fs::write("d.txt", "foo\nbar\nfoo\nbaz\nfoo\n")
+            .await
+            .unwrap();
         let res = edit_file(
             "d.txt".into(),
             vec![EditOp {
@@ -1911,5 +1940,35 @@ mod edit_file_tests {
         .await
         .unwrap();
         assert!(res.contains("appears 3 times"));
+        assert!(
+            res.contains("lines: 1, 3, 5"),
+            "expected per-occurrence line numbers, got: {res}",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_match_caps_listing_when_very_many() {
+        let _cwd = CwdGuard::new();
+        // 15 occurrences on lines 1..=15; we should list 10 and indicate
+        // the remainder.
+        let content: String = (1..=15)
+            .map(|i| format!("x {i}\n"))
+            .collect();
+        tokio::fs::write("many.txt", &content).await.unwrap();
+        let res = edit_file(
+            "many.txt".into(),
+            vec![EditOp {
+                old_text: "x ".into(),
+                new_text: "y ".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(res.contains("appears 15 times"));
+        assert!(
+            res.contains("(...and 5 more)"),
+            "expected truncation notice, got: {res}",
+        );
     }
 }

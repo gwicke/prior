@@ -174,7 +174,7 @@ fn find_anchor(file_text: &str, query: &str, min_len: usize) -> Option<(usize, u
     }
 }
 
-fn count_lines(s: &str) -> usize {
+pub(crate) fn count_lines(s: &str) -> usize {
     if s.is_empty() {
         0
     } else {
