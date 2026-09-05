@@ -13,7 +13,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crate::output::{term_width, wrap, Output};
+use crate::output::{term_height, term_width, wrap, Output};
 use crate::model_catalog;
 use crate::slash;
 use crate::thinking;
@@ -416,6 +416,11 @@ pub(crate) enum ActiveOverlay {
     /// `/tree` overlay: visual session entry tree.
     Tree {
         rows: Vec<String>,
+        /// Per-row background override. `Some(esc)` paints the row with
+        /// that ANSI background (used by `/tree` to tint by indent
+        /// depth); `None` falls back to the default panel BG. Length must
+        /// be the same as `rows`.
+        row_bgs: Vec<Option<&'static str>>,
         /// Entry IDs, 1:1 with `rows`, for Enter resolution.
         targets: Vec<String>,
         active: Option<usize>,
@@ -610,8 +615,8 @@ impl ActiveOverlay {
                         &mut flat,
                     );
                     flat.iter()
-                        .find(|(_, _, id, _, _)| id == &target_id)
-                        .map(|(_, l, _, _, _)| l.clone())
+                        .find(|(_, _, id, _, _, _)| id == &target_id)
+                        .map(|(_, l, _, _, _, _)| l.clone())
                         .unwrap_or_else(|| target_id.clone())
                 };
                 let mut header = Vec::new();
@@ -731,8 +736,8 @@ impl ActiveOverlay {
                         &std::collections::HashSet::new(),
                         &mut flat,
                     );
-                    if let Some((_, label, _, _, _)) =
-                        flat.iter().find(|(_, _, id, _, _)| id == &target_id)
+                    if let Some((_, label, _, _, _, _)) =
+                        flat.iter().find(|(_, _, id, _, _, _)| id == &target_id)
                     {
                         let label = label.clone();
                         // Tokens after the id: `<id>`, `<id> switch`,
@@ -760,11 +765,21 @@ impl ActiveOverlay {
                         let sub_filter = sub_filter.to_string();
                         match action_tok {
                             "switch" => {
-                                let mut header = Vec::new();
-                                let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
-                                Repl::tree_entry_header(entry, &label, &mut header);
+                                // Compute opts first so the message-preview
+                                // cap can reserve room for the menu rows
+                                // (see `tree_entry_header`).
                                 let (opts, active) =
                                     Repl::filter_tree_options(&["just switch", "summarize"], &sub_filter);
+                                let max_body_lines =
+                                    Repl::tree_preview_line_budget(opts.len());
+                                let mut header = Vec::new();
+                                let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                                Repl::tree_entry_header(
+                                    entry,
+                                    &label,
+                                    max_body_lines,
+                                    &mut header,
+                                );
                                 return ActiveOverlay::SwitchAction {
                                     target_id,
                                     header,
@@ -815,11 +830,17 @@ impl ActiveOverlay {
                             _ => {}
                         }
                         // No (or unknown) action token → action menu.
-                        let mut header = Vec::new();
-                        let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
-                        Repl::tree_entry_header(entry, &label, &mut header);
                         let (opts, active) =
                             Repl::filter_tree_options(&["switch", "compact"], &sub_filter);
+                        let max_body_lines = Repl::tree_preview_line_budget(opts.len());
+                        let mut header = Vec::new();
+                        let entry = Repl::find_entry_by_id(&ctx.tree, &target_id);
+                        Repl::tree_entry_header(
+                            entry,
+                            &label,
+                            max_body_lines,
+                            &mut header,
+                        );
                         return ActiveOverlay::TreeAction {
                             target_id,
                             header,
@@ -830,6 +851,7 @@ impl ActiveOverlay {
                     }
                 }
                 let mut rows = Vec::new();
+                let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
                 let mut targets = Vec::new();
                 let mut active = None;
                 Repl::tree_overlay_entries(
@@ -837,11 +859,13 @@ impl ActiveOverlay {
                     ctx.leaf_id.as_deref(),
                     &filter,
                     &mut rows,
+                    &mut row_bgs,
                     &mut targets,
                     &mut active,
                 );
                 ActiveOverlay::Tree {
                     rows,
+                    row_bgs,
                     targets,
                     active,
                     _filter: filter,
@@ -1014,16 +1038,13 @@ impl ActiveOverlay {
                  rows.clone(), *active, false)
             }
             ActiveOverlay::TreeAction { opts, active, .. } => {
-                ("Tree actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
             ActiveOverlay::SwitchAction { opts, active, .. } => {
-                ("Switch actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
             ActiveOverlay::CompactSummary { opts, active, .. } => {
-                ("Compact summary  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
+                ("", opts.clone(), *active, false)
             }
         }
     }
@@ -2086,6 +2107,24 @@ impl Repl {
                 ActiveOverlay::Confirm { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
+                ActiveOverlay::Tree { row_bgs, .. } => {
+                    // Tree carries per-row background tints (see
+                    // `tree_overlay_entries`); build a parallel vec of
+                    // Option<&str> for `overlay_lines_with_bgs`.
+                    let row_bg_view: Vec<Option<&str>> = row_bgs
+                        .iter()
+                        .map(|b| b.map(|s| -> &str { s }))
+                        .collect();
+                    Self::overlay_lines_with_bgs(
+                        effective_title,
+                        &opts,
+                        None,
+                        sel,
+                        active,
+                        wrap,
+                        Some(&row_bg_view),
+                    )
+                }
                 _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
             // Value-mode settings error: red header line.
@@ -2401,10 +2440,26 @@ impl Repl {
         active: Option<usize>,
         wrap_opts: bool,
     ) -> String {
+        Self::overlay_lines_with_bgs(title, options, header, sel, active, wrap_opts, None)
+    }
+
+    /// Like [`overlay_lines`], but accepts a `row_bgs` array that overrides
+    /// the default panel BG on a per-option basis. Length must match
+    /// `options` (entries past the end fall back to the default BG; a
+    /// `None` entry also falls back). The cursor-selected row always uses
+    /// BG_SEL regardless of `row_bgs` so the selection stays distinct.
+    pub fn overlay_lines_with_bgs(
+        title: &str,
+        options: &[String],
+        header: Option<&[String]>,
+        sel: usize,
+        active: Option<usize>,
+        wrap_opts: bool,
+        row_bgs: Option<&[Option<&str>]>,
+    ) -> String {
         const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
         const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
         const C_SEL: &str = "\x1b[1;36m"; // bold cyan: cursor selection
-        const C_ACT: &str = "\x1b[32m"; // green: currently-active model
         const C_RESET: &str = "\x1b[0m";
         const BG_HEADER: &str = "\x1b[48;5;237m"; // slightly lighter for header
         let tw = term_width().max(1);
@@ -2430,12 +2485,16 @@ impl Repl {
             format!("{}{:<width$}{}", bg, s, C_RESET, width = tw)
         };
         let mut out = String::new();
-        out.push_str(&bg_line(title, BG));
+        if !title.is_empty() {
+            out.push_str(&bg_line(title, BG));
+        }
         // Render header rows (non-selectable info) if present.
         if let Some(hdr) = header {
             for hline in hdr {
                 for subline in hline.split('\n') {
-                    out.push('\n');
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
                     out.push_str(&format!("{}{:<width$}{}", BG_HEADER, subline, C_RESET, width = tw));
                 }
             }
@@ -2443,29 +2502,52 @@ impl Repl {
         for (i, line, first) in &rows {
             // The 2-char marker area prefixes every line (including wrapped
             // continuation lines) so all visual lines of one option stay
-            // column-aligned; only the first line of the selected/active
-            // option shows `> `/`* `.
-            let marker = if *first && *i == sel {
+            // column-aligned; only the first line shows a marker. The
+            // marker carries two pieces of information, both piggy-backing
+            // on the same 2-char slot:
+            //   - cursor selection (`>`)
+            //   - current-state row (active model, current session, leaf
+            //     in `/tree`, ...) (`*`)
+            // If the cursor is on the current-state row, `*` wins so the
+            // user sees "this is where you already are" instead of a
+            // generic selection arrow.
+            let is_selected = *first && *i == sel;
+            let is_active = *first && active == Some(*i);
+            let marker = if is_selected && is_active {
+                "* "
+            } else if is_selected {
                 "> "
-            } else if *first && active == Some(*i) {
+            } else if is_active {
                 "* "
             } else {
                 "  "
             };
             let body = format!("{}{}", marker, line);
-            let (bg, fg) = if *i == sel {
-                (BG_SEL, C_SEL)
-            } else if active == Some(*i) {
-                (BG, C_ACT)
+            // BG selection:
+            //   - cursor row → BG_SEL (always wins so the cursor is
+            //     distinct from any per-row tint).
+            //   - row has an explicit `row_bgs[i]` → use that.
+            //   - otherwise → default BG.
+            // Active rows no longer get their own foreground colour — the
+            // `*` marker is the indicator — so the table stays consistent
+            // (overlays that need an inline active marker can prefix it
+            // into the row string themselves).
+            let bg = if *i == sel {
+                BG_SEL
             } else {
-                (BG, "")
+                row_bgs
+                    .and_then(|bgs| bgs.get(*i).and_then(|b| *b))
+                    .unwrap_or(BG)
             };
+            let fg = if *i == sel { C_SEL } else { "" };
             let content = if fg.is_empty() {
                 body
             } else {
                 format!("{}{}", fg, body)
             };
-            out.push('\n');
+            if !out.is_empty() {
+                out.push('\n');
+            }
             out.push_str(&bg_line(&content, bg));
         }
         out
@@ -2842,8 +2924,9 @@ impl Repl {
     /// Build the `/session` overlay rows.
     ///
     /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
-    /// Current session is marked with ◉ and sorted first.
-    /// Each row shows: marker · session name (with first-prompt preview) · dir · turns + relative age.
+    /// Current session is marked via the `*` marker in the 2-char prefix
+    /// area (see `overlay_lines`), so no separate ◉ column is needed.
+    /// Each row shows: session name (with first-prompt preview) · dir · turns + relative age.
     fn session_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
@@ -2853,10 +2936,10 @@ impl Repl {
         let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
 
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Session", "Dir", ""])
-            .with_aligns(&[Align::Left, Align::Left, Align::Left, Align::Right])
-            .with_min_widths(&[2, 20, 10, 10])
-            .with_priorities(&[0, 2, 2, 1])
+        let mut table = Table::new(&["Session", "Dir", ""])
+            .with_aligns(&[Align::Left, Align::Left, Align::Right])
+            .with_min_widths(&[20, 10, 10])
+            .with_priorities(&[2, 2, 1])
             .set_gap(2);
 
         // Load sessions synchronously from disk.
@@ -2916,7 +2999,6 @@ impl Repl {
         }
 
         for meta in &filtered {
-            let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
             let name_part = meta.name.clone().unwrap_or_default();
             let raw_preview = meta.first_prompt_preview.as_deref().unwrap_or("");
             let preview = Self::sanitise_single_line(raw_preview);
@@ -2939,7 +3021,7 @@ impl Repl {
             let rel_ts = meta.last_prompt_timestamp.as_ref().unwrap_or(&meta.timestamp);
             let rel = Self::relative_time(rel_ts);
             let info = format!("{}  {}", meta.message_count, rel);
-            table.add_row(&[marker, &display_name, &dir_display, &info]);
+            table.add_row(&[&display_name, &dir_display, &info]);
         }
 
         for row in table.render(avail) {
@@ -3350,40 +3432,63 @@ impl Repl {
         }
     }
 
+    /// Compute the line budget for the `/tree <id>` message-preview
+    /// header. Subtracts the title row and the menu rows from the overlay
+    /// budget (`2/3` of the terminal height, matching `redraw`'s
+    /// `max_pop`). Anything leftover is the maximum number of header rows
+    /// the message preview is allowed to consume. Returns at least 1 so
+    /// even a tiny terminal still gets a single truncated preview line.
+    fn tree_preview_line_budget(opts_count: usize) -> usize {
+        let term_h = term_height().max(1);
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        // Title (1) + opts rows + header rows ≤ max_pop. The header can
+        // also legitimately be empty (a one-line label still fits), so the
+        // budget has a floor of 1.
+        max_pop.saturating_sub(1).saturating_sub(opts_count).max(1)
+    }
+
     /// Build the info header for `TreeAction` / `SwitchAction`: the selected
     /// entry's body (multi-line, wrapped to the terminal width) when it's a
     /// message, otherwise the precomputed single-line label. The ID is
     /// intentionally NOT shown — it is already visible in the prompt buffer
     /// (`/tree <id>`).
     ///
-    /// For messages, the body is wrapped to the terminal width with newlines
-    /// preserved, capped at [`Self::TREE_PREVIEW_LINE_CAP`] lines as a
-    /// safety net so runaway prompts don't blow up the menu. The pop-up
-    /// itself is bounded at `2/3` of the terminal height by `redraw`, so a
-    /// tall terminal sees the full message; a short one clips via the
-    /// existing windowed-selection mechanism.
+    /// `max_body_lines` caps the number of header rows consumed by the
+    /// message preview. The caller computes it from the terminal height
+    /// and the count of menu items so the menu is never pushed off-screen
+    /// by a long message: the overlay budget (`2/3` of `term_h`) minus the
+    /// title row and the menu rows must cover the header. When the body
+    /// exceeds the cap, the last visible line gets a trailing `…` so the
+    /// user knows the preview is incomplete — same convention as the
+    /// single-line rendering in `Table::render`.
     fn tree_entry_header(
         entry: Option<&SessionEntry>,
         label: &str,
+        max_body_lines: usize,
         header: &mut Vec<String>,
     ) {
-        const TREE_PREVIEW_LINE_CAP: usize = 10;
         let avail = term_width().saturating_sub(2);
         // Try the multi-line message body first; fall back to the
         // single-line label for non-message entries (compaction, model
-        // change, branch summary, ...).
+        // change, branch summary, ...). The label branch never exceeds
+        // one row, so it is unaffected by `max_body_lines`.
         let body_lines: Vec<String> = if let Some(text) =
             entry.and_then(Self::entry_message_body)
         {
             let mut lines = wrap(&text, avail);
-            if lines.len() > TREE_PREVIEW_LINE_CAP {
-                let skipped = lines.len() - TREE_PREVIEW_LINE_CAP + 1;
-                lines.truncate(TREE_PREVIEW_LINE_CAP - 1);
-                lines.push(format!(
-                    "[… {} more line{}]",
-                    skipped,
-                    if skipped == 1 { "" } else { "s" }
-                ));
+            // Sanity floor: a caller that hands us `max_body_lines == 0`
+            // (terminal too short to fit anything) still gets a single
+            // truncated row so the menu remains self-describing.
+            let cap = max_body_lines.max(1);
+            if lines.len() > cap {
+                lines.truncate(cap);
+                // Marker sits at the end of the last visible row — same
+                // ellipsis convention as the single-line path. Never
+                // appends a dedicated truncation row (that would steal
+                // one of the menu's reserved lines).
+                if let Some(last) = lines.last_mut() {
+                    *last = format!("{last}…");
+                }
             }
             lines
         } else {
@@ -3429,7 +3534,7 @@ impl Repl {
             &active_path,
             &mut flat,
         );
-        let idx = flat.iter().position(|(_, _, id, _, _)| id == target_id);
+        let idx = flat.iter().position(|(_, _, id, _, _, _)| id == target_id);
         let (dropped, kept) = match idx {
             Some(i) => (i, flat.len() - i),
             None => (0, flat.len()),
@@ -3462,13 +3567,54 @@ impl Repl {
         }
     }
 
+    /// Per-branch-depth background colours for the `/tree` overlay.
+    /// Unlike turn indent (which advances for every model response),
+    /// `branch_depth` only increments when descending from a node with
+    /// multiple children — so un-branched conversations stay on the
+    /// default panel background (`None`) and only forks get tinted.
+    ///
+    /// The palette alternates dark / light variants so two consecutive
+    /// forks are easy to tell apart, and the warm / cool tints alternate
+    /// in lockstep. All values are intentionally **darker than or equal
+    /// to** the default panel background (`48;5;235` ≈ RGB(38,38,38)):
+    /// the panel stays as the lightest surface in the overlay, and the
+    /// tints sit just below it so the eye reads them as “deeper, not
+    /// louder” rather than as a brighter accent.
+    ///
+    /// Indexing: `(branch_depth - 1) % 4`, so depth 1 picks the first
+    /// entry, depth 2 the second, depth 3 the third, depth 4 the
+    /// fourth, depth 5 cycles back to the first, and so on.
+    const TREE_BG_BY_LEVEL: &[&str] = &[
+        // Depth 1 — dark warm (subtle ochre, darker than default).
+        "\x1b[48;2;28;26;22m",
+        // Depth 2 — same brightness as default, subtle blue tint.
+        "\x1b[48;2;28;30;38m",
+        // Depth 3 — dark cool (subtle blue, darker than default).
+        "\x1b[48;2;22;24;30m",
+        // Depth 4 — same brightness as default, subtle warm tint.
+        "\x1b[48;2;38;36;30m",
+    ];
+    fn tree_row_bg(branch_depth: usize) -> Option<&'static str> {
+        if branch_depth == 0 {
+            None
+        } else {
+            let idx = (branch_depth - 1) % Self::TREE_BG_BY_LEVEL.len();
+            Some(Self::TREE_BG_BY_LEVEL[idx])
+        }
+    }
+
     /// Build `/tree` overlay rows from a pre-built session tree.
-    /// Uses the same `Table` infrastructure as `/session` for consistent rendering.
+    /// Uses the same `Table` infrastructure as `/session` for consistent
+    /// rendering. Each row carries its own per-branch-depth background
+    /// tint so a forked tree is readable at a glance — un-branched
+    /// conversations stay on the default panel background, and only
+    /// branches are tinted.
     fn tree_overlay_entries(
         tree: &[SessionTreeNode],
         leaf_id: Option<&str>,
         filter: &str,
         rows: &mut Vec<String>,
+        row_bgs: &mut Vec<Option<&'static str>>,
         targets: &mut Vec<String>,
         active: &mut Option<usize>,
     ) {
@@ -3486,14 +3632,15 @@ impl Repl {
             })
             .unwrap_or_default();
 
-        // Precompute flat entries: (indent, label, entry_id, is_on_active_path, is_current)
-        let mut flat: Vec<(usize, String, String, bool, bool)> = Vec::new();
+        // Precompute flat entries: (indent, label, entry_id, is_on_active_path,
+        // is_current, branch_depth)
+        let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
         Self::flatten_tree_nodes(tree, 0, leaf_id, &active_path, &mut flat);
 
         // Apply text filter (fuzzy match on display labels).
         if !filter.is_empty() {
             let f = filter.to_lowercase();
-            flat.retain(|(_, label, _, _, _)| label.to_lowercase().contains(&f));
+            flat.retain(|(_, label, _, _, _, _)| label.to_lowercase().contains(&f));
         }
 
         if flat.is_empty() {
@@ -3501,38 +3648,44 @@ impl Repl {
             return;
         }
 
-        // Render via Table for column alignment like /session.
-        // Column 0 is the indicator: `◉` marks the current position (the
-        // leaf); there is no separate `*` column. Column 1 carries the label,
-        // indented so exactly ONE space separates the indicator from the
-        // first character at base indent.
+        // Render via Table for column alignment like /session. There is
+        // no separate indicator column — the 2-char marker area in
+        // `overlay_lines` carries the `>` / `*` cursor and active-state
+        // symbols, so the row string itself just needs the label, prefixed
+        // by the indent space run.
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Entry"])
-            .with_aligns(&[Align::Left, Align::Left])
-            .with_min_widths(&[2, 20])
-            .with_priorities(&[0, 1])
-            .set_gap(1);
+        let mut table = Table::new(&["Entry"])
+            .with_aligns(&[Align::Left])
+            .with_min_widths(&[20])
+            .with_priorities(&[1])
+            .set_gap(0);
 
-        for (indent, label, entry_id, is_active, is_curr) in &flat {
-            let marker = if *is_curr { "◉" } else { "" };
-            // Turn indentation (user=1, response=2) plus branch indent (+3
-            // per branching level) — but always at least one space after the
-            // indicator column.
-            let display_indent = indent + 1;
-            let display = if *is_active {
-                format!("{:indent$}{}", "", label, indent = display_indent)
-            } else {
-                format!("\x1b[2m{:indent$}{}\x1b[0m", "", label, indent = display_indent)
-            };
-            table.add_row(&[marker, &display]);
+        for (indent, label, entry_id, is_active, _is_curr, branch_depth) in &flat {
+            // Active-path rows get a brighter foreground (`\x1b[22m`
+            // — normal intensity) versus `\x1b[2m` (dim) for abandoned
+            // branches. The branch-depth background tint is applied
+            // separately by `overlay_lines` so the cursor-selected row
+            // (which uses BG_SEL) can override it without clashing with
+            // an inner `\x1b[48;2;R;G;Bm` escape. The marker `*` then
+            // conveys the leaf / current position, so we don't need a
+            // dedicated indicator column.
+            let fg = if *is_active { "\x1b[22m" } else { "\x1b[2m" };
+            let display = format!(
+                "{fg}{:indent$}{label}",
+                "",
+                indent = indent,
+                fg = fg,
+            );
+            table.add_row(&[&display]);
             targets.push(entry_id.clone());
+            row_bgs.push(Self::tree_row_bg(*branch_depth));
         }
 
         *rows = table.render(avail);
 
         // Highlight current leaf.
         if let Some(lid) = leaf_id {
-            *active = flat.iter().position(|(_, _, id, _, _)| id == lid);
+            *active = flat.iter().position(|(_, _, id, _, _, _)| id == lid);
         }
     }
 
@@ -3553,7 +3706,7 @@ impl Repl {
         indent: usize,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
-        out: &mut Vec<(usize, String, String, bool, bool)>,
+        out: &mut Vec<(usize, String, String, bool, bool, usize)>,
     ) {
         // Precompute id -> display label over the WHOLE tree so compaction
         // rows can resolve their kept entry: `firstKeptEntryId` points to an
@@ -3575,9 +3728,13 @@ impl Repl {
         }
         collect_labels(nodes, &mut labels);
 
+        // branch_depth starts at 0 — the root conversation lives on the
+        // default panel background. The depth only increments when we
+        // descend from a node with multiple children.
         Self::flatten_turns(
             nodes,
             indent,
+            0,
             leaf_id,
             active_path,
             &labels,
@@ -3647,18 +3804,26 @@ impl Repl {
     }
     /// Turn-tracking worker for `flatten_tree_nodes`. `in_turn` flips on at
     /// a user prompt and off at the next user prompt / compaction entry;
-    /// visible non-user rows while `in_turn` are indented one char deeper.
-    /// `labels` is the whole-tree id → display-label map used by compaction
-    /// rows to resolve the kept entry.
+    /// visible non-user rows while `in_turn` are indented two chars deeper
+    /// (the model response sits visibly under its prompt, not flush with
+    /// it). `branch_depth` tracks how many branching ancestors sit above
+    /// the current node — it stays the same through a linear chain and
+    /// increments by one when descending from a node with multiple
+    /// children. Used by `tree_overlay_entries` to colour alternating
+    /// branches differently so a forked tree is readable at a glance;
+    /// un-branched conversations stay on the default panel background.
+    /// `labels` is the whole-tree id → display-label map used by
+    /// compaction rows to resolve the kept entry.
     #[allow(clippy::too_many_arguments)]
     fn flatten_turns(
         nodes: &[SessionTreeNode],
         indent: usize,
+        branch_depth: usize,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
         labels: &std::collections::HashMap<String, String>,
         in_turn: &mut bool,
-        out: &mut Vec<(usize, String, String, bool, bool)>,
+        out: &mut Vec<(usize, String, String, bool, bool, usize)>,
     ) {
         for node in nodes {
             let kind = turn_kind(&node.entry);
@@ -3676,7 +3841,7 @@ impl Repl {
                 }
                 TurnKind::Assistant => {
                     if *in_turn {
-                        indent + 1
+                        indent + 2
                     } else {
                         indent
                     }
@@ -3691,8 +3856,22 @@ impl Repl {
                 // Meta entry: skip visual row but still descend, keeping the
                 // SAME row indent (an invisible tool chain stays inside the
                 // turn, and the next visible response stays at turn depth).
+                // Branching status is preserved: descendants of an invisible
+                // branching point are still on a branch.
+                let child_branch_depth = if node.children.len() > 1 {
+                    branch_depth + 1
+                } else {
+                    branch_depth
+                };
                 Self::flatten_turns(
-                    &node.children, indent, leaf_id, active_path, labels, in_turn, out,
+                    &node.children,
+                    indent,
+                    child_branch_depth,
+                    leaf_id,
+                    active_path,
+                    labels,
+                    in_turn,
+                    out,
                 );
                 continue;
             }
@@ -3705,20 +3884,42 @@ impl Repl {
                 node.entry.id.clone(),
                 is_active,
                 is_current,
+                branch_depth,
             ));
 
             // Children continue the turn flow at the same base indent: the
             // chain user→assistant→tool→assistant→user is linear, and the
             // turn depth is derived per node from `in_turn`, never stacked.
-            // Branching points indent their children +3 so forks read
-            // clearly against the +1 turn indentation.
+            // Branching points indent their children +4. Mathematically:
+            //   - parent is a user prompt at parameter indent N → branch
+            //     row at N+4 ("four over user prompts one level up")
+            //   - parent is a model response at row_indent N+2 →
+            //     branch row at (N+2)+2 = N+4 ("two over model
+            //     responses one level up")
+            // Both rules land on +4, so a single constant covers both.
+            //
+            // A node with multiple children also increments branch_depth:
+            // its descendants belong to a sub-branch and should take on
+            // the next colour in the alternation.
             let child_indent = if node.children.len() > 1 {
-                indent + 3
+                indent + 4
             } else {
                 indent
             };
+            let child_branch_depth = if node.children.len() > 1 {
+                branch_depth + 1
+            } else {
+                branch_depth
+            };
             Self::flatten_turns(
-                &node.children, child_indent, leaf_id, active_path, labels, in_turn, out,
+                &node.children,
+                child_indent,
+                child_branch_depth,
+                leaf_id,
+                active_path,
+                labels,
+                in_turn,
+                out,
             );
         }
     }
@@ -3737,8 +3938,10 @@ impl Repl {
                 .map(|t| Self::sanitise_single_line(t))
                 .or_else(|| label.map(|l| Self::sanitise_single_line(l)))
                 .unwrap_or_else(|| "(kept entry)".into());
+            // Yellow FG marks compactions as a "special action" — they
+            // summarise / restructure history rather than carry content.
             return format!(
-                "compaction {} before \"{}\"",
+                "\x1b[33mcompaction {} before \"{}\"\x1b[0m",
                 &first_kept_entry_id[..first_kept_entry_id.len().min(12)],
                 kept
             );
@@ -3800,7 +4003,9 @@ impl Repl {
                 format!("thinking: {}", thinking_level)
             }
             SessionEntryContent::ModelChange { provider, model_id } => {
-                format!("model: {}/{}", provider, model_id)
+                // Yellow FG for model switches — another "special action"
+                // marker, mirroring the compaction colour.
+                format!("\x1b[33mmodel: {}/{}\x1b[0m", provider, model_id)
             }
             SessionEntryContent::ActiveToolsChange { .. } => String::new(),
             SessionEntryContent::BranchSummary { summary, .. } => {
@@ -5199,7 +5404,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "stale label (ignored for messages)", &mut header);
+        Repl::tree_entry_header(Some(&entry), "stale label (ignored for messages)", usize::MAX, &mut header);
         // Newlines preserved → one header row per line.
         assert_eq!(header.len(), 3, "got: {:?}", header);
         assert_eq!(header[0], "line one");
@@ -5210,10 +5415,11 @@ mod tests {
     }
 
     #[test]
-    fn tree_entry_header_long_message_caps_at_ten_lines() {
-        // 25 single-token lines wrap to many lines (well over the cap);
-        // header must include a trailing "[… N more lines]" indicator and
-        // never blow up the menu.
+    fn tree_entry_header_long_message_truncates_with_inline_ellipsis() {
+        // 25 lines, capped at 10: header has exactly 10 rows, the last
+        // ends with `…` so the user knows the preview is incomplete. No
+        // separate truncation row (that would steal one of the menu's
+        // reserved lines).
         let body: String = (1..=25)
             .map(|i| format!("line{}", i))
             .collect::<Vec<_>>()
@@ -5230,26 +5436,28 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
-        // Cap is 10: 9 visible + 1 "[… N more lines]" marker.
+        Repl::tree_entry_header(Some(&entry), "label", 10, &mut header);
         assert_eq!(header.len(), 10, "got: {:?}", header);
-        assert!(header[0].contains("line1"));
-        assert!(header[8].contains("line9"));
+        // First 9 rows are unmodified message lines (line1..line9).
+        for (i, row) in header.iter().take(9).enumerate() {
+            assert_eq!(*row, format!("line{}", i + 1), "row {i}");
+        }
+        // Last row ends with the ellipsis marker.
         assert!(
-            header[9].contains("more line"),
-            "expected truncation marker, got: {:?}",
+            header[9].ends_with('…'),
+            "expected trailing ellipsis, got: {:?}",
             header[9]
         );
-        // 25 lines total, 9 visible → 16 skipped (24 - 9 + 1 = 16, since
-        // we kept 9 lines and skipped the rest). The marker says how many
-        // were dropped — verify it accounts for the difference.
-        let marker = &header[9];
-        assert!(marker.contains("16"), "expected 16 skipped, got: {marker}");
+        assert!(
+            header[9].starts_with("line10"),
+            "expected last visible line to start with the truncated content, got: {:?}",
+            header[9]
+        );
     }
 
     #[test]
-    fn tree_entry_header_short_message_under_cap_unchanged() {
-        // 3-line message under the cap: no truncation marker.
+    fn tree_entry_header_under_cap_no_ellipsis() {
+        // 3-line message under the cap: no ellipsis, all rows intact.
         let body = "a\nb\nc";
         let entry = SessionEntry {
             id: "u1".into(),
@@ -5263,8 +5471,26 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        Repl::tree_entry_header(Some(&entry), "label", 10, &mut header);
         assert_eq!(header, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        // No ellipsis anywhere — message fit under the cap.
+        assert!(header.iter().all(|l| !l.ends_with('…')));
+    }
+
+    #[test]
+    fn tree_preview_line_budget_reserves_room_for_menu_items() {
+        // The budget is `2/3 * term_h` minus the title (1) and the menu
+        // rows. On a 24-row terminal that's 16 - 1 - opts_count. With
+        // 2 opts (the bare /tree <id> menu) that's 13 header rows — enough
+        // for typical prompts.
+        let budget = Repl::tree_preview_line_budget(2);
+        let term_h = term_height();
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        assert_eq!(budget, max_pop.saturating_sub(1).saturating_sub(2).max(1));
+        // Floor: at least 1 even on a tiny / bizarre terminal.
+        assert!(budget >= 1);
+        // More menu rows ⇒ smaller preview budget.
+        assert!(Repl::tree_preview_line_budget(2) >= Repl::tree_preview_line_budget(5));
     }
 
     #[test]
@@ -5287,7 +5513,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "label", &mut header);
+        Repl::tree_entry_header(Some(&entry), "label", usize::MAX, &mut header);
         assert_eq!(
             header,
             vec!["first paragraph".to_string(), "second paragraph".to_string()]
@@ -5309,7 +5535,7 @@ mod tests {
             },
         };
         let mut header = Vec::new();
-        Repl::tree_entry_header(Some(&entry), "compaction ... before \"...\"", &mut header);
+        Repl::tree_entry_header(Some(&entry), "compaction ... before \"...\"", usize::MAX, &mut header);
         assert_eq!(header.len(), 1, "got: {:?}", header);
         assert!(header[0].contains("compaction"));
         assert!(!header[0].contains("c1"), "id should not appear: {:?}", header[0]);
@@ -5320,7 +5546,7 @@ mod tests {
         // Defensive: if the caller can't locate the entry, fall back to
         // the precomputed single-line label.
         let mut header = Vec::new();
-        Repl::tree_entry_header(None, "compaction ...", &mut header);
+        Repl::tree_entry_header(None, "compaction ...", usize::MAX, &mut header);
         assert_eq!(header, vec!["compaction ...".to_string()]);
     }
 
@@ -5940,7 +6166,7 @@ mod tests {
         // Visible rows: user prompt, the assistant's text before AND after
         // the tool call (both are response text), then the second user
         // prompt. NO tool-call/tool-result rows.
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         assert_eq!(labels.len(), 4, "got: {:?}", labels);
         assert!(labels[0].contains("first prompt"));
         assert!(labels[1].contains("partial answer"));
@@ -5949,11 +6175,12 @@ mod tests {
         let all = labels.join("\n");
         assert!(!all.contains("read"));
         assert!(!all.contains("tool output"));
-        // Indent: assistant rows are one char deeper than their user prompt;
-        // the indent persists across the invisible tool-call/tool-result
-        // chain between the two text segments.
-        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _)| *i).collect();
-        assert_eq!(indents, vec![0, 1, 1, 0], "got: {:?}", out);
+        // Indent: assistant rows are TWO chars deeper than their user
+        // prompt (the model response sits visibly under its prompt, not
+        // flush with it); the indent persists across the invisible
+        // tool-call/tool-result chain between the two text segments.
+        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _, _)| *i).collect();
+        assert_eq!(indents, vec![0, 2, 2, 0], "got: {:?}", out);
     }
 
     #[test]
@@ -5969,11 +6196,11 @@ mod tests {
         )];
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         assert_eq!(labels.len(), 2, "got: {:?}", labels);
         assert!(labels[0].contains("prompt"));
         assert!(labels[1].contains("done"));
-        assert_eq!(out[1].0, 1); // still part of the same turn
+        assert_eq!(out[1].0, 2); // still part of the same turn (indent+2)
     }
 
     #[test]
@@ -5992,18 +6219,21 @@ mod tests {
         )];
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("c1"), &std::collections::HashSet::new(), &mut out);
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         let compaction_row = labels
             .iter()
-            .find(|l| l.starts_with("compaction"))
-            .expect("compaction row must be visible");
+            .find(|l| l.contains("\x1b[33m") && l.contains("compaction"))
+            .expect("compaction row must be visible (yellow-coloured)");
         assert!(compaction_row.contains("m0"));
         assert!(compaction_row.contains("before \"kept prompt\""));
     }
 
     #[test]
-    fn tree_list_branch_indent_is_three() {
-        // a0 forks: two children -> each child indented +3.
+    fn tree_list_branch_indent_is_four() {
+        // a0 forks: two children -> each child indented +4 (over the
+        // assistant response at indent+2, that's two more; over a user
+        // prompt at the same indent, that's four — the two rules land
+        // on the same value because the response now sits 2 chars in).
         let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
         let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
         let fork = SessionTreeNode {
@@ -6026,17 +6256,249 @@ mod tests {
         Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
         let branch_rows: Vec<usize> = out
             .iter()
-            .filter(|(_, l, _, _, _)| l.contains("branch"))
-            .map(|(i, _, _, _, _)| *i)
+            .filter(|(_, l, _, _, _, _)| l.contains("branch"))
+            .map(|(i, _, _, _, _, _)| *i)
             .collect();
-        assert_eq!(branch_rows, vec![3, 3]); // base 0 + branch indent 3
-        // The fork point itself stays at turn depth (+1: assistant in turn).
+        assert_eq!(branch_rows, vec![4, 4]); // base 2 (assistant in turn) + branch indent 4
+        // The fork point itself stays at turn depth (+2: assistant in turn).
         let fork_indent = out
             .iter()
-            .find(|(_, l, _, _, _)| l.contains("fork point"))
-            .map(|(i, _, _, _, _)| *i)
+            .find(|(_, l, _, _, _, _)| l.contains("fork point"))
+            .map(|(i, _, _, _, _, _)| *i)
             .unwrap();
-        assert_eq!(fork_indent, 1);
+        assert_eq!(fork_indent, 2);
+    }
+
+    #[test]
+    fn tree_list_compaction_and_model_change_are_yellow() {
+        // Special-action entries (compactions, model switches) use a
+        // yellow FG (`\x1b[33m`) so they stand out from the regular
+        // user / assistant rows in the tree list.
+        let comp = SessionEntry {
+            id: "c1".into(),
+            parent_id: Some("a0".into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Compaction {
+                summary: String::new(),
+                first_kept_entry_id: "m0".into(),
+                tokens_before: 42_000,
+            },
+        };
+        let comp_label = Repl::entry_display_label_ext(
+            &comp,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        assert!(comp_label.starts_with("\x1b[33m"), "got: {comp_label:?}");
+        assert!(comp_label.ends_with("\x1b[0m"), "got: {comp_label:?}");
+        assert!(comp_label.contains("compaction"));
+
+        let model_change = SessionEntry {
+            id: "mc1".into(),
+            parent_id: Some("a0".into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::ModelChange {
+                provider: "openrouter".into(),
+                model_id: "anthropic/claude-3.7".into(),
+            },
+        };
+        let mc_label = Repl::entry_display_label(&model_change, None);
+        assert!(mc_label.starts_with("\x1b[33m"), "got: {mc_label:?}");
+        assert!(mc_label.ends_with("\x1b[0m"), "got: {mc_label:?}");
+        assert!(mc_label.contains("model: openrouter/anthropic/claude-3.7"));
+    }
+
+    #[test]
+    fn tree_row_bg_alternates_by_indent_level() {
+        // branch_depth == 0 (the root conversation) gets None — the
+        // row stays on the default panel background, no tint.
+        assert_eq!(Repl::tree_row_bg(0), None);
+        // Depth 1: dark warm.
+        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;2;28;26;22m"));
+        // Depth 2: same brightness as default, subtle blue tint.
+        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;2;28;30;38m"));
+        // Depth 3: dark cool.
+        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;2;22;24;30m"));
+        // Depth 4: same brightness as default, subtle warm tint.
+        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;2;38;36;30m"));
+        // Depth 5 wraps back to dark warm (depth 1).
+        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;2;28;26;22m"));
+    }
+
+    #[test]
+    fn tree_overlay_entries_renders_row_bgs_per_indent() {
+        // Two-level tree: root user prompt → assistant response → fork.
+        // Row BGs should mirror the indents: root None, response ochre,
+        // branch children bluish-grey.
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "prompt"),
+            fork,
+        )];
+        let mut rows = Vec::new();
+        let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
+        let mut targets = Vec::new();
+        let mut active = None;
+        Repl::tree_overlay_entries(
+            &tree,
+            Some("m2"),
+            "",
+            &mut rows,
+            &mut row_bgs,
+            &mut targets,
+            &mut active,
+        );
+        assert_eq!(rows.len(), row_bgs.len());
+        // Root user prompt (depth 0) — default panel background.
+        assert_eq!(row_bgs[0], None);
+        // Assistant response is still in the SAME conversation as the
+        // root user prompt (no branching happened yet), so it stays on
+        // the default background even though it's indented.
+        assert_eq!(row_bgs[1], None);
+        // Two branch children of the fork point — depth 1.
+        assert_eq!(row_bgs[2], Some("\x1b[48;2;28;26;22m"));
+        assert_eq!(row_bgs[3], Some("\x1b[48;2;28;26;22m"));
+        // No more leading whitespace in the rendered top-level label:
+        // previously `display_indent = indent + 1` prepended an extra
+        // space at the top level.
+        assert!(rows[0].starts_with("\x1b[22mprompt") || rows[0].starts_with("\x1b[2mprompt"));
+    }
+
+    #[test]
+    fn tree_list_branch_depth_tracks_fork_only() {
+        // branch_depth only increments at branching nodes (a node with
+        // multiple children). Within an un-branched turn — even with a
+        // nested model response — every row sits at the same depth, so
+        // a linear conversation gets NO background tint (all rows on
+        // the default panel background).
+        let chain = attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "first answer"),
+                attach(
+                    tree_entry("m1", Some("a0"), "user", "second prompt"),
+                    tree_entry("a1", Some("m1"), "assistant", "second answer"),
+                ),
+            ),
+        );
+        let tree = vec![chain];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, None, &std::collections::HashSet::new(), &mut out);
+        let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
+        assert_eq!(depths, vec![0, 0, 0, 0], "got: {out:?}");
+
+        // Forks, by contrast, push their children one depth deeper:
+        // m0 → a0 (depth0) → [m1 (depth1) | m2 (depth1)]
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "prompt"),
+            fork,
+        )];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
+        let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
+        // m0, a0 stay at depth 0 (the conversation so far).
+        // m1 and m2 (the branches) sit at depth 1.
+        assert_eq!(depths, vec![0, 0, 1, 1], "got: {out:?}");
+    }
+
+    #[test]
+    fn overlay_lines_selected_active_uses_star_marker() {
+        // Selected AND active row shows `* `, not `> ` (so the user
+        // sees "you're already here" rather than a generic cursor).
+        let opts = vec!["one".to_string(), "two".to_string()];
+        let out = Repl::overlay_lines("title", &opts, None, 1, Some(1), true);
+        // The selected row's BG escape precedes the marker, so look for
+        // `* ` anywhere in the BG-active line.
+        let line_with_two = out
+            .lines()
+            .find(|l| l.contains("two"))
+            .unwrap_or("");
+        assert!(
+            line_with_two.contains("* two"),
+            "selected active row must use `* ` not `> `: {line_with_two:?}"
+        );
+        assert!(!line_with_two.contains("> two"));
+    }
+
+    #[test]
+    fn overlay_lines_active_only_uses_star_marker() {
+        // Active row that's NOT selected still gets `* ` (consistent
+        // with the previous behaviour: active state lives in the
+        // 2-char prefix, no separate indicator column).
+        let opts = vec!["one".to_string(), "two".to_string()];
+        let out = Repl::overlay_lines("title", &opts, None, 0, Some(1), true);
+        let line_with_two = out
+            .lines()
+            .find(|l| l.contains("two"))
+            .unwrap_or("");
+        assert!(line_with_two.contains("* two"), "got: {line_with_two:?}");
+    }
+
+    #[test]
+    fn overlay_lines_with_bgs_applies_per_row_background() {
+        // Per-row BG override: row 0 default, row 1 ochre, row 2
+        // bluish-grey. Selected row keeps BG_SEL regardless of the
+        // override.
+        let opts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let bgs: Vec<Option<&str>> = vec![
+            None,
+            Some("\x1b[48;5;180m"),
+            Some("\x1b[48;5;240m"),
+        ];
+        // sel = 0 → row 0 uses BG_SEL, others use their override.
+        let out = Repl::overlay_lines_with_bgs(
+            "title",
+            &opts,
+            None,
+            0,
+            None,
+            true,
+            Some(&bgs),
+        );
+        // Selected row uses BG_SEL (\x1b[48;5;239m) and *not* the row's
+        // BG override (which is None here, so BG_SEL is also the
+        // fallback).
+        let line0 = out.lines().nth(1).unwrap_or("");
+        assert!(line0.contains("\x1b[48;5;239m"), "got: {line0:?}");
+        // Row 1 (non-selected) uses its ochre override.
+        let line1 = out.lines().nth(2).unwrap_or("");
+        assert!(line1.contains("\x1b[48;5;180m"), "got: {line1:?}");
+        // Row 2 uses bluish-grey.
+        let line2 = out.lines().nth(3).unwrap_or("");
+        assert!(line2.contains("\x1b[48;5;240m"), "got: {line2:?}");
     }
 
     #[test]

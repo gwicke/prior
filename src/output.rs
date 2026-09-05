@@ -387,6 +387,15 @@ pub fn term_width() -> usize {
         .unwrap_or(80)
 }
 
+/// Terminal height in rows, or 24 if it cannot be determined. Symmetric to
+/// [`term_width`] — callers use it to budget vertical space for pop-up
+/// overlays (e.g. reserving room for menu items below a multi-line header).
+pub fn term_height() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, h)| h as usize)
+        .unwrap_or(24)
+}
+
 /// Render `src` as a styled terminal string via `codewandler-markdown-terminal`.
 ///
 /// Uses GFM (`parse_gfm`) so tables / task-lists / strikethrough render as users
