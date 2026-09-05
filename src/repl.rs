@@ -416,6 +416,11 @@ pub(crate) enum ActiveOverlay {
     /// `/tree` overlay: visual session entry tree.
     Tree {
         rows: Vec<String>,
+        /// Per-row background override. `Some(esc)` paints the row with
+        /// that ANSI background (used by `/tree` to tint by indent
+        /// depth); `None` falls back to the default panel BG. Length must
+        /// be the same as `rows`.
+        row_bgs: Vec<Option<&'static str>>,
         /// Entry IDs, 1:1 with `rows`, for Enter resolution.
         targets: Vec<String>,
         active: Option<usize>,
@@ -846,6 +851,7 @@ impl ActiveOverlay {
                     }
                 }
                 let mut rows = Vec::new();
+                let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
                 let mut targets = Vec::new();
                 let mut active = None;
                 Repl::tree_overlay_entries(
@@ -853,11 +859,13 @@ impl ActiveOverlay {
                     ctx.leaf_id.as_deref(),
                     &filter,
                     &mut rows,
+                    &mut row_bgs,
                     &mut targets,
                     &mut active,
                 );
                 ActiveOverlay::Tree {
                     rows,
+                    row_bgs,
                     targets,
                     active,
                     _filter: filter,
@@ -2099,6 +2107,24 @@ impl Repl {
                 ActiveOverlay::Confirm { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
+                ActiveOverlay::Tree { row_bgs, .. } => {
+                    // Tree carries per-row background tints (see
+                    // `tree_overlay_entries`); build a parallel vec of
+                    // Option<&str> for `overlay_lines_with_bgs`.
+                    let row_bg_view: Vec<Option<&str>> = row_bgs
+                        .iter()
+                        .map(|b| b.map(|s| -> &str { s }))
+                        .collect();
+                    Self::overlay_lines_with_bgs(
+                        effective_title,
+                        &opts,
+                        None,
+                        sel,
+                        active,
+                        wrap,
+                        Some(&row_bg_view),
+                    )
+                }
                 _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
             // Value-mode settings error: red header line.
@@ -2414,10 +2440,26 @@ impl Repl {
         active: Option<usize>,
         wrap_opts: bool,
     ) -> String {
+        Self::overlay_lines_with_bgs(title, options, header, sel, active, wrap_opts, None)
+    }
+
+    /// Like [`overlay_lines`], but accepts a `row_bgs` array that overrides
+    /// the default panel BG on a per-option basis. Length must match
+    /// `options` (entries past the end fall back to the default BG; a
+    /// `None` entry also falls back). The cursor-selected row always uses
+    /// BG_SEL regardless of `row_bgs` so the selection stays distinct.
+    pub fn overlay_lines_with_bgs(
+        title: &str,
+        options: &[String],
+        header: Option<&[String]>,
+        sel: usize,
+        active: Option<usize>,
+        wrap_opts: bool,
+        row_bgs: Option<&[Option<&str>]>,
+    ) -> String {
         const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
         const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
         const C_SEL: &str = "\x1b[1;36m"; // bold cyan: cursor selection
-        const C_ACT: &str = "\x1b[32m"; // green: currently-active model
         const C_RESET: &str = "\x1b[0m";
         const BG_HEADER: &str = "\x1b[48;5;237m"; // slightly lighter for header
         let tw = term_width().max(1);
@@ -2460,23 +2502,44 @@ impl Repl {
         for (i, line, first) in &rows {
             // The 2-char marker area prefixes every line (including wrapped
             // continuation lines) so all visual lines of one option stay
-            // column-aligned; only the first line of the selected/active
-            // option shows `> `/`* `.
-            let marker = if *first && *i == sel {
+            // column-aligned; only the first line shows a marker. The
+            // marker carries two pieces of information, both piggy-backing
+            // on the same 2-char slot:
+            //   - cursor selection (`>`)
+            //   - current-state row (active model, current session, leaf
+            //     in `/tree`, ...) (`*`)
+            // If the cursor is on the current-state row, `*` wins so the
+            // user sees "this is where you already are" instead of a
+            // generic selection arrow.
+            let is_selected = *first && *i == sel;
+            let is_active = *first && active == Some(*i);
+            let marker = if is_selected && is_active {
+                "* "
+            } else if is_selected {
                 "> "
-            } else if *first && active == Some(*i) {
+            } else if is_active {
                 "* "
             } else {
                 "  "
             };
             let body = format!("{}{}", marker, line);
-            let (bg, fg) = if *i == sel {
-                (BG_SEL, C_SEL)
-            } else if active == Some(*i) {
-                (BG, C_ACT)
+            // BG selection:
+            //   - cursor row → BG_SEL (always wins so the cursor is
+            //     distinct from any per-row tint).
+            //   - row has an explicit `row_bgs[i]` → use that.
+            //   - otherwise → default BG.
+            // Active rows no longer get their own foreground colour — the
+            // `*` marker is the indicator — so the table stays consistent
+            // (overlays that need an inline active marker can prefix it
+            // into the row string themselves).
+            let bg = if *i == sel {
+                BG_SEL
             } else {
-                (BG, "")
+                row_bgs
+                    .and_then(|bgs| bgs.get(*i).and_then(|b| *b))
+                    .unwrap_or(BG)
             };
+            let fg = if *i == sel { C_SEL } else { "" };
             let content = if fg.is_empty() {
                 body
             } else {
@@ -2861,8 +2924,9 @@ impl Repl {
     /// Build the `/session` overlay rows.
     ///
     /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
-    /// Current session is marked with ◉ and sorted first.
-    /// Each row shows: marker · session name (with first-prompt preview) · dir · turns + relative age.
+    /// Current session is marked via the `*` marker in the 2-char prefix
+    /// area (see `overlay_lines`), so no separate ◉ column is needed.
+    /// Each row shows: session name (with first-prompt preview) · dir · turns + relative age.
     fn session_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
@@ -2872,10 +2936,10 @@ impl Repl {
         let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
 
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Session", "Dir", ""])
-            .with_aligns(&[Align::Left, Align::Left, Align::Left, Align::Right])
-            .with_min_widths(&[2, 20, 10, 10])
-            .with_priorities(&[0, 2, 2, 1])
+        let mut table = Table::new(&["Session", "Dir", ""])
+            .with_aligns(&[Align::Left, Align::Left, Align::Right])
+            .with_min_widths(&[20, 10, 10])
+            .with_priorities(&[2, 2, 1])
             .set_gap(2);
 
         // Load sessions synchronously from disk.
@@ -2935,7 +2999,6 @@ impl Repl {
         }
 
         for meta in &filtered {
-            let marker = if meta.id == ctx.current_session_id { "◉" } else { " " };
             let name_part = meta.name.clone().unwrap_or_default();
             let raw_preview = meta.first_prompt_preview.as_deref().unwrap_or("");
             let preview = Self::sanitise_single_line(raw_preview);
@@ -2958,7 +3021,7 @@ impl Repl {
             let rel_ts = meta.last_prompt_timestamp.as_ref().unwrap_or(&meta.timestamp);
             let rel = Self::relative_time(rel_ts);
             let info = format!("{}  {}", meta.message_count, rel);
-            table.add_row(&[marker, &display_name, &dir_display, &info]);
+            table.add_row(&[&display_name, &dir_display, &info]);
         }
 
         for row in table.render(avail) {
@@ -3504,13 +3567,38 @@ impl Repl {
         }
     }
 
+    /// Per-indent-level background colors for the `/tree` overlay. Indents
+    /// advance by 2 spaces (model response = 2 over a user prompt,
+    /// branching = 4 over a user prompt, 2 over a model response), so
+    /// the level is `indent / 2`. Odd levels get an ochre tint (warm,
+    /// distinct from the default dark-grey panel) and even levels get a
+    /// bluish-grey tint, so deeply-nested branches alternate and never
+    /// blend with the bare panel rows above them. The level-0 row
+    /// (top-level user prompt) stays on the default panel background.
+    const TREE_BG_BY_LEVEL: &[&str] = &[
+        // level 0: defaults to the panel BG via None; not used here.
+        "\x1b[48;5;180m", // level 1 — ochre (DarkGoldenrod3)
+        "\x1b[48;5;240m", // level 2 — bluish-grey (Grey3)
+    ];
+    fn tree_row_bg(indent: usize) -> Option<&'static str> {
+        if indent == 0 {
+            None
+        } else {
+            let level = (indent / 2) - 1;
+            Some(Self::TREE_BG_BY_LEVEL[level % Self::TREE_BG_BY_LEVEL.len()])
+        }
+    }
+
     /// Build `/tree` overlay rows from a pre-built session tree.
-    /// Uses the same `Table` infrastructure as `/session` for consistent rendering.
+    /// Uses the same `Table` infrastructure as `/session` for consistent
+    /// rendering. Each row carries its own per-level background tint so
+    /// the visual depth of a branch is readable at a glance.
     fn tree_overlay_entries(
         tree: &[SessionTreeNode],
         leaf_id: Option<&str>,
         filter: &str,
         rows: &mut Vec<String>,
+        row_bgs: &mut Vec<Option<&'static str>>,
         targets: &mut Vec<String>,
         active: &mut Option<usize>,
     ) {
@@ -3543,31 +3631,37 @@ impl Repl {
             return;
         }
 
-        // Render via Table for column alignment like /session.
-        // Column 0 is the indicator: `◉` marks the current position (the
-        // leaf); there is no separate `*` column. Column 1 carries the label,
-        // indented so exactly ONE space separates the indicator from the
-        // first character at base indent.
+        // Render via Table for column alignment like /session. There is
+        // no separate indicator column — the 2-char marker area in
+        // `overlay_lines` carries the `>` / `*` cursor and active-state
+        // symbols, so the row string itself just needs the label, prefixed
+        // by the indent space run.
         let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["", "Entry"])
-            .with_aligns(&[Align::Left, Align::Left])
-            .with_min_widths(&[2, 20])
-            .with_priorities(&[0, 1])
-            .set_gap(1);
+        let mut table = Table::new(&["Entry"])
+            .with_aligns(&[Align::Left])
+            .with_min_widths(&[20])
+            .with_priorities(&[1])
+            .set_gap(0);
 
-        for (indent, label, entry_id, is_active, is_curr) in &flat {
-            let marker = if *is_curr { "◉" } else { "" };
-            // Turn indentation (user=1, response=2) plus branch indent (+3
-            // per branching level) — but always at least one space after the
-            // indicator column.
-            let display_indent = indent + 1;
-            let display = if *is_active {
-                format!("{:indent$}{}", "", label, indent = display_indent)
-            } else {
-                format!("\x1b[2m{:indent$}{}\x1b[0m", "", label, indent = display_indent)
-            };
-            table.add_row(&[marker, &display]);
+        for (indent, label, entry_id, is_active, _is_curr) in &flat {
+            // Active-path rows get a brighter foreground (`\x1b[22m`
+            // — normal intensity) versus `\x1b[2m` (dim) for abandoned
+            // branches. The per-level background tint is applied
+            // separately by `overlay_lines` so the cursor-selected row
+            // (which uses BG_SEL) can override it without clashing with
+            // an inner `\x1b[48;5;...m` escape. The marker `*` then
+            // conveys the leaf / current position, so we don't need a
+            // dedicated indicator column.
+            let fg = if *is_active { "\x1b[22m" } else { "\x1b[2m" };
+            let display = format!(
+                "{fg}{:indent$}{label}",
+                "",
+                indent = indent,
+                fg = fg,
+            );
+            table.add_row(&[&display]);
             targets.push(entry_id.clone());
+            row_bgs.push(Self::tree_row_bg(*indent));
         }
 
         *rows = table.render(avail);
@@ -3689,9 +3783,10 @@ impl Repl {
     }
     /// Turn-tracking worker for `flatten_tree_nodes`. `in_turn` flips on at
     /// a user prompt and off at the next user prompt / compaction entry;
-    /// visible non-user rows while `in_turn` are indented one char deeper.
-    /// `labels` is the whole-tree id → display-label map used by compaction
-    /// rows to resolve the kept entry.
+    /// visible non-user rows while `in_turn` are indented two chars deeper
+    /// (the model response sits visibly under its prompt, not flush with
+    /// it). `labels` is the whole-tree id → display-label map used by
+    /// compaction rows to resolve the kept entry.
     #[allow(clippy::too_many_arguments)]
     fn flatten_turns(
         nodes: &[SessionTreeNode],
@@ -3718,7 +3813,7 @@ impl Repl {
                 }
                 TurnKind::Assistant => {
                     if *in_turn {
-                        indent + 1
+                        indent + 2
                     } else {
                         indent
                     }
@@ -3752,10 +3847,29 @@ impl Repl {
             // Children continue the turn flow at the same base indent: the
             // chain user→assistant→tool→assistant→user is linear, and the
             // turn depth is derived per node from `in_turn`, never stacked.
-            // Branching points indent their children +3 so forks read
-            // clearly against the +1 turn indentation.
+            // Branching points indent their children relative to the
+            // parent's kind:
+            //   - parent is a user prompt: +4
+            //     ("four spaces over user prompts one level up")
+            //   - parent is a model response: +2
+            //     ("two over model responses one level up")
+            //   - parent is a Boundary / meta entry: +4
+            //     (rare — falls through to the user-prompt case)
+            // So a branch from a user prompt at indent 0 and a branch
+            // from a model response at indent 2 land on the same indent
+            // (4) — both consistent with the "user-prompt" rule.
+            // Children continue the turn flow at the same base indent: the
+            // chain user→assistant→tool→assistant→user is linear, and the
+            // turn depth is derived per node from `in_turn`, never stacked.
+            // Branching points indent their children +4. Mathematically:
+            //   - parent is a user prompt at parameter indent N → branch
+            //     row at N+4 ("four over user prompts one level up")
+            //   - parent is a model response at row_indent N+2 →
+            //     branch row at (N+2)+2 = N+4 ("two over model
+            //     responses one level up")
+            // Both rules land on +4, so a single constant covers both.
             let child_indent = if node.children.len() > 1 {
-                indent + 3
+                indent + 4
             } else {
                 indent
             };
@@ -3779,8 +3893,10 @@ impl Repl {
                 .map(|t| Self::sanitise_single_line(t))
                 .or_else(|| label.map(|l| Self::sanitise_single_line(l)))
                 .unwrap_or_else(|| "(kept entry)".into());
+            // Yellow FG marks compactions as a "special action" — they
+            // summarise / restructure history rather than carry content.
             return format!(
-                "compaction {} before \"{}\"",
+                "\x1b[33mcompaction {} before \"{}\"\x1b[0m",
                 &first_kept_entry_id[..first_kept_entry_id.len().min(12)],
                 kept
             );
@@ -3842,7 +3958,9 @@ impl Repl {
                 format!("thinking: {}", thinking_level)
             }
             SessionEntryContent::ModelChange { provider, model_id } => {
-                format!("model: {}/{}", provider, model_id)
+                // Yellow FG for model switches — another "special action"
+                // marker, mirroring the compaction colour.
+                format!("\x1b[33mmodel: {}/{}\x1b[0m", provider, model_id)
             }
             SessionEntryContent::ActiveToolsChange { .. } => String::new(),
             SessionEntryContent::BranchSummary { summary, .. } => {
@@ -6012,11 +6130,12 @@ mod tests {
         let all = labels.join("\n");
         assert!(!all.contains("read"));
         assert!(!all.contains("tool output"));
-        // Indent: assistant rows are one char deeper than their user prompt;
-        // the indent persists across the invisible tool-call/tool-result
-        // chain between the two text segments.
+        // Indent: assistant rows are TWO chars deeper than their user
+        // prompt (the model response sits visibly under its prompt, not
+        // flush with it); the indent persists across the invisible
+        // tool-call/tool-result chain between the two text segments.
         let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _)| *i).collect();
-        assert_eq!(indents, vec![0, 1, 1, 0], "got: {:?}", out);
+        assert_eq!(indents, vec![0, 2, 2, 0], "got: {:?}", out);
     }
 
     #[test]
@@ -6036,7 +6155,7 @@ mod tests {
         assert_eq!(labels.len(), 2, "got: {:?}", labels);
         assert!(labels[0].contains("prompt"));
         assert!(labels[1].contains("done"));
-        assert_eq!(out[1].0, 1); // still part of the same turn
+        assert_eq!(out[1].0, 2); // still part of the same turn (indent+2)
     }
 
     #[test]
@@ -6058,15 +6177,18 @@ mod tests {
         let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
         let compaction_row = labels
             .iter()
-            .find(|l| l.starts_with("compaction"))
-            .expect("compaction row must be visible");
+            .find(|l| l.contains("\x1b[33m") && l.contains("compaction"))
+            .expect("compaction row must be visible (yellow-coloured)");
         assert!(compaction_row.contains("m0"));
         assert!(compaction_row.contains("before \"kept prompt\""));
     }
 
     #[test]
-    fn tree_list_branch_indent_is_three() {
-        // a0 forks: two children -> each child indented +3.
+    fn tree_list_branch_indent_is_four() {
+        // a0 forks: two children -> each child indented +4 (over the
+        // assistant response at indent+2, that's two more; over a user
+        // prompt at the same indent, that's four — the two rules land
+        // on the same value because the response now sits 2 chars in).
         let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
         let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
         let fork = SessionTreeNode {
@@ -6092,14 +6214,186 @@ mod tests {
             .filter(|(_, l, _, _, _)| l.contains("branch"))
             .map(|(i, _, _, _, _)| *i)
             .collect();
-        assert_eq!(branch_rows, vec![3, 3]); // base 0 + branch indent 3
-        // The fork point itself stays at turn depth (+1: assistant in turn).
+        assert_eq!(branch_rows, vec![4, 4]); // base 2 (assistant in turn) + branch indent 4
+        // The fork point itself stays at turn depth (+2: assistant in turn).
         let fork_indent = out
             .iter()
             .find(|(_, l, _, _, _)| l.contains("fork point"))
             .map(|(i, _, _, _, _)| *i)
             .unwrap();
-        assert_eq!(fork_indent, 1);
+        assert_eq!(fork_indent, 2);
+    }
+
+    #[test]
+    fn tree_list_compaction_and_model_change_are_yellow() {
+        // Special-action entries (compactions, model switches) use a
+        // yellow FG (`\x1b[33m`) so they stand out from the regular
+        // user / assistant rows in the tree list.
+        let comp = SessionEntry {
+            id: "c1".into(),
+            parent_id: Some("a0".into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Compaction {
+                summary: String::new(),
+                first_kept_entry_id: "m0".into(),
+                tokens_before: 42_000,
+            },
+        };
+        let comp_label = Repl::entry_display_label_ext(
+            &comp,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        assert!(comp_label.starts_with("\x1b[33m"), "got: {comp_label:?}");
+        assert!(comp_label.ends_with("\x1b[0m"), "got: {comp_label:?}");
+        assert!(comp_label.contains("compaction"));
+
+        let model_change = SessionEntry {
+            id: "mc1".into(),
+            parent_id: Some("a0".into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::ModelChange {
+                provider: "openrouter".into(),
+                model_id: "anthropic/claude-3.7".into(),
+            },
+        };
+        let mc_label = Repl::entry_display_label(&model_change, None);
+        assert!(mc_label.starts_with("\x1b[33m"), "got: {mc_label:?}");
+        assert!(mc_label.ends_with("\x1b[0m"), "got: {mc_label:?}");
+        assert!(mc_label.contains("model: openrouter/anthropic/claude-3.7"));
+    }
+
+    #[test]
+    fn tree_row_bg_alternates_by_indent_level() {
+        // Top-level (indent=0) gets None (default panel BG).
+        assert_eq!(Repl::tree_row_bg(0), None);
+        // Level 1 (model response at indent=2, or branch from indent=0):
+        // ochre.
+        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;5;180m"));
+        // Level 2 (indent=4): bluish-grey.
+        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;5;240m"));
+        // Level 3 (indent=6): ochre again — alternation continues.
+        assert_eq!(Repl::tree_row_bg(6), Some("\x1b[48;5;180m"));
+    }
+
+    #[test]
+    fn tree_overlay_entries_renders_row_bgs_per_indent() {
+        // Two-level tree: root user prompt → assistant response → fork.
+        // Row BGs should mirror the indents: root None, response ochre,
+        // branch children bluish-grey.
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "prompt"),
+            fork,
+        )];
+        let mut rows = Vec::new();
+        let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
+        let mut targets = Vec::new();
+        let mut active = None;
+        Repl::tree_overlay_entries(
+            &tree,
+            Some("m2"),
+            "",
+            &mut rows,
+            &mut row_bgs,
+            &mut targets,
+            &mut active,
+        );
+        assert_eq!(rows.len(), row_bgs.len());
+        // root (indent 0): no BG
+        assert_eq!(row_bgs[0], None);
+        // assistant response (indent 2): ochre
+        assert_eq!(row_bgs[1], Some("\x1b[48;5;180m"));
+        // two branch children (indent 4): bluish-grey
+        assert_eq!(row_bgs[2], Some("\x1b[48;5;240m"));
+        assert_eq!(row_bgs[3], Some("\x1b[48;5;240m"));
+        // No more leading whitespace in the rendered top-level label:
+        // previously `display_indent = indent + 1` prepended an extra
+        // space at the top level.
+        assert!(rows[0].starts_with("\x1b[22mprompt") || rows[0].starts_with("\x1b[2mprompt"));
+    }
+
+    #[test]
+    fn overlay_lines_selected_active_uses_star_marker() {
+        // Selected AND active row shows `* `, not `> ` (so the user
+        // sees "you're already here" rather than a generic cursor).
+        let opts = vec!["one".to_string(), "two".to_string()];
+        let out = Repl::overlay_lines("title", &opts, None, 1, Some(1), true);
+        // The selected row's BG escape precedes the marker, so look for
+        // `* ` anywhere in the BG-active line.
+        let line_with_two = out
+            .lines()
+            .find(|l| l.contains("two"))
+            .unwrap_or("");
+        assert!(
+            line_with_two.contains("* two"),
+            "selected active row must use `* ` not `> `: {line_with_two:?}"
+        );
+        assert!(!line_with_two.contains("> two"));
+    }
+
+    #[test]
+    fn overlay_lines_active_only_uses_star_marker() {
+        // Active row that's NOT selected still gets `* ` (consistent
+        // with the previous behaviour: active state lives in the
+        // 2-char prefix, no separate indicator column).
+        let opts = vec!["one".to_string(), "two".to_string()];
+        let out = Repl::overlay_lines("title", &opts, None, 0, Some(1), true);
+        let line_with_two = out
+            .lines()
+            .find(|l| l.contains("two"))
+            .unwrap_or("");
+        assert!(line_with_two.contains("* two"), "got: {line_with_two:?}");
+    }
+
+    #[test]
+    fn overlay_lines_with_bgs_applies_per_row_background() {
+        // Per-row BG override: row 0 default, row 1 ochre, row 2
+        // bluish-grey. Selected row keeps BG_SEL regardless of the
+        // override.
+        let opts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let bgs: Vec<Option<&str>> = vec![
+            None,
+            Some("\x1b[48;5;180m"),
+            Some("\x1b[48;5;240m"),
+        ];
+        // sel = 0 → row 0 uses BG_SEL, others use their override.
+        let out = Repl::overlay_lines_with_bgs(
+            "title",
+            &opts,
+            None,
+            0,
+            None,
+            true,
+            Some(&bgs),
+        );
+        // Selected row uses BG_SEL (\x1b[48;5;239m) and *not* the row's
+        // BG override (which is None here, so BG_SEL is also the
+        // fallback).
+        let line0 = out.lines().nth(1).unwrap_or("");
+        assert!(line0.contains("\x1b[48;5;239m"), "got: {line0:?}");
+        // Row 1 (non-selected) uses its ochre override.
+        let line1 = out.lines().nth(2).unwrap_or("");
+        assert!(line1.contains("\x1b[48;5;180m"), "got: {line1:?}");
+        // Row 2 uses bluish-grey.
+        let line2 = out.lines().nth(3).unwrap_or("");
+        assert!(line2.contains("\x1b[48;5;240m"), "got: {line2:?}");
     }
 
     #[test]
