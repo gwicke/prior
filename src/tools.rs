@@ -234,7 +234,7 @@ pub async fn edit_file(
     let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
     let shown = relativize_path(&p, &cwd);
     Ok(format!(
-        "Successfully replaced {} block(s) in {}",
+        "Replaced {} block(s) in {}",
         edits.len(),
         shown
     ))
