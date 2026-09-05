@@ -491,6 +491,57 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Like [`wrap`], but recognizes a leading `- ` / `+ ` as a diff marker: the
+/// marker is stripped, the body is wrapped (which preserves the body's
+/// leading indent), and the marker is re-prepended to the first wrapped
+/// line. Continuation lines are prefixed with two spaces so they visually
+/// align under the marker column.
+///
+/// `wrap()` alone would collapse the run of whitespace between the `-` and
+/// the original line's first non-whitespace character — for an indented
+/// source line such as `    if foo {`, `format!("- {l}")` produces
+/// `-     if foo {`, which `split_whitespace` then reduces to `- if foo {`,
+/// losing the indentation. Routing diff lines through this helper instead
+/// keeps the original indentation visible.
+fn wrap_with_diff_markers(text: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for logical in text.split('\n') {
+        if logical.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        // A diff line is exactly `<marker><space><original line>` with the
+        // marker being `-` or `+`. Anything else (e.g. `---` from a header
+        // divider or `--foo`) is treated as plain text.
+        let is_diff = matches!(logical.as_bytes(), [b'-' | b'+', b' ', ..]);
+        if is_diff {
+            let marker = &logical[..2];
+            let rest = &logical[2..];
+            // Reserve two columns for the marker + the space that follows it
+            // on the first line. Continuation lines also need two leading
+            // spaces to keep their content aligned under the marker column.
+            let content_width = width.saturating_sub(2).max(1);
+            if rest.is_empty() {
+                // Marker with no body (degenerate but possible): emit the
+                // marker on its own.
+                out.push(marker.to_string());
+                continue;
+            }
+            let wrapped = wrap(rest, content_width);
+            for (i, line) in wrapped.into_iter().enumerate() {
+                if i == 0 {
+                    out.push(format!("{}{}", marker, line));
+                } else {
+                    out.push(format!("  {}", line));
+                }
+            }
+        } else {
+            out.extend(wrap(logical, width));
+        }
+    }
+    out
+}
+
 /// Highlight a single physical line of `text` as `lang` using the *same*
 /// markdown code-block formatter the answer/result path uses
 /// (`markdown_terminal` driven by `markdown_stream` via `render_markdown`).
@@ -1131,7 +1182,7 @@ impl ConsoleOutput {
         let lines = if text.is_empty() {
             vec![String::new()]
         } else {
-            wrap(text, inner)
+            wrap_with_diff_markers(text, inner)
         };
         for line in lines {
             // Foreground-only styling here; `paint_panel` adds the grey
@@ -2016,6 +2067,82 @@ mod tests {
     }
 
     #[test]
+    fn wrap_with_diff_markers_preserves_indent_on_minus_line() {
+        // Regression: a `- ` diff line wrapping an indented source line
+        // used to collapse the indent (e.g. `-     if foo {` → `- if foo {`),
+        // because plain `wrap()` saw the `-` as a normal word and
+        // `split_whitespace` collapsed the run of whitespace between the
+        // marker and the first token. The diff-marker helper now routes
+        // diff lines through a marker-aware path that preserves the body's
+        // leading indent.
+        let r = wrap_with_diff_markers("-     if foo {", 80);
+        assert_eq!(r, vec!["-     if foo {".to_string()]);
+    }
+
+    #[test]
+    fn wrap_with_diff_markers_preserves_indent_on_plus_line() {
+        let r = wrap_with_diff_markers("+         let x = 1;", 80);
+        assert_eq!(r, vec!["+         let x = 1;".to_string()]);
+    }
+
+    #[test]
+    fn wrap_with_diff_markers_continuation_aligns_under_marker() {
+        // Long diff line: the body wraps, the marker stays on the first
+        // line, and subsequent lines indent by two columns to align under
+        // the marker column.
+        let text = "- foo bar baz qux quux quuz corge grault garply waldo fred";
+        // Width 20 - 2 (marker column) = 18 chars for the body per line.
+        let r = wrap_with_diff_markers(text, 20);
+        // The first line must keep the marker; continuation lines must be
+        // prefixed with two spaces to align under `- `.
+        assert!(r[0].starts_with("- "), "first line must keep the marker, got {:?}", r);
+        for line in &r[1..] {
+            assert!(
+                line.starts_with("  "),
+                "continuation lines must indent by two columns, got {:?}",
+                line
+            );
+        }
+        // And the body content must survive intact (no collapsing).
+        let joined: String = r
+            .iter()
+            .flat_map(|l| l.chars())
+            .collect();
+        // Every original character must appear in the wrapped output.
+        assert!(joined.contains("foo"));
+        assert!(joined.contains("garply"));
+    }
+
+    #[test]
+    fn wrap_with_diff_markers_passes_plain_lines_through_unchanged() {
+        // Lines that aren't `- ` / `+ ` markers (e.g. a context line that
+        // happens to start with `-`) are wrapped via the regular `wrap`,
+        // which keeps the indent-preservation behavior for normal text.
+        let r = wrap_with_diff_markers("    hello world", 80);
+        assert_eq!(r, vec!["    hello world".to_string()]);
+    }
+
+    #[test]
+    fn wrap_with_diff_markers_empty_input() {
+        assert_eq!(wrap_with_diff_markers("", 80), vec!["".to_string()]);
+    }
+
+    #[test]
+    fn wrap_with_diff_markers_multiple_lines_mixed() {
+        // A multi-line input that mixes diff markers and a blank logical line.
+        let text = "-     if foo {\n+     if bar {\n";
+        let r = wrap_with_diff_markers(text, 80);
+        assert_eq!(
+            r,
+            vec![
+                "-     if foo {".to_string(),
+                "+     if bar {".to_string(),
+                "".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn truncate_multibyte_no_panic() {
         assert_eq!(truncate("hello", 3), "hel...");
         assert_eq!(truncate("hi", 5), "hi");
@@ -2065,6 +2192,59 @@ mod tests {
         let (label, diff) = get_preview("edit_file", &args);
         assert_eq!(label, "edit /no/such/file.rs");
         assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn edit_preview_preserves_indent_on_diff_lines() {
+        // Regression: edit_preview builds `- ` and `+ ` diff lines from the
+        // raw source, preserving any leading indentation. Each line is then
+        // routed through `wrap_with_diff_markers` (via `tool_panel`), which
+        // must not collapse that indentation when reflowing.
+        let dir = std::env::temp_dir().join("picocode_edit_indent_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sample.rs");
+        // Use a unique content so a leftover file from a previous run
+        // can't change the diff shape. Clean up before and after.
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "fn main() {\n    let x = 1;\n    println!(\"{}\", x);\n}\n",
+        )
+        .unwrap();
+        let old_text = "    let x = 1;\n    println!(\"{}\", x);".to_string();
+        let new_text = "    let x = 2;\n    println!(\"{}!\", x);".to_string();
+        let edits = vec![crate::tools::EditOp {
+            old_text: old_text.clone(),
+            new_text: new_text.clone(),
+        }];
+        let (_range, diff) = edit_preview(path.to_str().unwrap(), &edits);
+
+        // First, the raw edit_preview output must keep the indent: each
+        // diff line carries the source line verbatim, with the original
+        // leading spaces intact.
+        assert!(
+            diff.iter().any(|l| l == "-     let x = 1;"),
+            "old first line should keep its indent in the raw diff, got {:?}",
+            diff
+        );
+        assert!(
+            diff.iter().any(|l| l == "+     let x = 2;"),
+            "new first line should keep its indent in the raw diff, got {:?}",
+            diff
+        );
+
+        // Second, when each diff line is routed through the same wrap path
+        // that tool_panel uses, the indent must still survive. This is the
+        // visible regression: previously, the indent collapsed to a single
+        // space because plain `wrap()` treated `-` as a normal word and
+        // `split_whitespace` collapsed the run between `-` and the first
+        // source-line token.
+        for line in &diff {
+            let wrapped = wrap_with_diff_markers(line, 80);
+            assert_eq!(wrapped, vec![line.clone()], "indent should survive wrap_with_diff_markers for {:?}", line);
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
