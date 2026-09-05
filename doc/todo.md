@@ -9,6 +9,7 @@
         same `llm_compact_prompt` setting; same prompt-customization path.
   - [ ] `/tree <id> switch --summarize` - use same menu / mechanism as others
         (backend ready: `CompactionTarget::Abandoned`; UI TBD)
+        `/tree <id> switch`, `/tree <id> switch llm <prompt>`, `/tree <id> switch simple`
 - [ ] Thinking-level restore on `/session <id> resume` (single input field
       currently can only carry one prefill — model or thinking. Bundle both
       into a slug syntax like `/thinking <level> & /model <slug>` or a new
