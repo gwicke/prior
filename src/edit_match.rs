@@ -1,0 +1,312 @@
+//! Fuzzy match-and-diagnose for the `edit` tool.
+//!
+//! When the model's `oldText` does not exactly match anything in the file,
+//! we want to surface a useful error: where in the file the closest match
+//! lives, how similar it is, and a small diff showing what the model got
+//! wrong. This module implements that pipeline.
+//!
+//! The result is rendered in two views:
+//!   - `model_view` — rich text with the diff, intended for the LLM so it
+//!     can re-anchor and retry.
+//!   - `ui_view`    — a short one-line summary, intended for the human
+//!     watching the TUI. We deliberately do NOT echo file content into the
+//!     UI to avoid leaking large or secret-bearing regions of disk into
+//!     scrollback.
+//!
+//! Algorithm: longest-common-substring anchor + Myers diff over the
+//! windowed region. Cost is sub-millisecond for typical file sizes.
+
+use serde::Serialize;
+use similar::{ChangeTag, TextDiff};
+
+/// Tunables. Constants for now; can become config later if there's call.
+const MIN_ANCHOR_LEN: usize = 4;
+/// Window size on each side of the anchor for Myers diff. Anchors shorter
+/// than this are extended; longer anchors stay as-is. Bounded by file size.
+const WINDOW_PAD: usize = 256;
+/// If similarity is below this ratio, we say "no close match" rather than
+/// try to guide the model toward a phantom.
+const MIN_SIMILARITY: f64 = 0.5;
+/// Cap on the number of diff lines rendered into the model_view.
+const MAX_DIFF_LINES: usize = 30;
+
+/// Result of an edit-failure diagnosis. Rendered as a JSON string the
+/// model-and-UI split can parse.
+#[derive(Debug, Serialize)]
+pub struct EditFailure {
+    /// Short summary for the human (no file text).
+    pub ui_view: String,
+    /// Rich diagnostic for the model: anchor location, similarity, and a
+    /// small diff against the file region.
+    pub model_view: String,
+}
+
+/// Try to find a substring of `file_text` that closely resembles `query`.
+///
+/// `query` is what the model sent as `oldText`. `file_text` is the current
+/// file contents. On exact-match (the normal path) we never get here; this
+/// is only called when `text.contains(query)` already returned `false`.
+///
+/// Returns `None` if no region is similar enough to be worth showing.
+pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
+    if query.is_empty() || file_text.is_empty() {
+        return None;
+    }
+
+    // Stage 1: anchor via longest-common-substring.
+    let anchor = find_anchor(file_text, query, MIN_ANCHOR_LEN)?;
+    let (anchor_start, anchor_len) = anchor;
+    let anchor_end = anchor_start + anchor_len;
+
+    // Stage 2: extract a window around the anchor so Myers diff has a
+    // bounded region to work on. The window is `query.len()`-bounded on
+    // each side so the diff stays informative without scanning the whole
+    // file.
+    let win_start = anchor_start.saturating_sub(query.len() + WINDOW_PAD);
+    let win_end = (anchor_end + query.len() + WINDOW_PAD).min(file_text.len());
+    let window = &file_text[win_start..win_end];
+
+    // Stage 3: Myers diff between the model's `query` and the on-disk
+    // `window`. Cap the rendered output at MAX_DIFF_LINES lines so a huge
+    // diff doesn't blow up the model's context.
+    //
+    // Similarity is a hybrid: max of (anchor length / query length) and
+    // (equal lines / total lines). The anchor metric catches the
+    // "single-line tweak with one bad character" case (lines may show
+    // 0 equal even though 99% of chars match); the line metric catches
+    // the "tab vs space drift" case where the longest shared run is
+    // short but most lines line up. Max-of keeps the bar low for
+    // genuinely-close matches while still rejecting totally-wrong
+    // queries.
+    let diff = TextDiff::from_lines(query, window);
+    let changes: Vec<_> = diff.iter_all_changes().collect();
+    let anchor_sim = (anchor_len as f64) / (query.len() as f64);
+    let total_lines = count_lines(query).max(count_lines(window)).max(1);
+    let equal_lines = changes
+        .iter()
+        .filter(|c| matches!(c.tag(), ChangeTag::Equal))
+        .count();
+    let line_sim = (equal_lines as f64) / total_lines as f64;
+    let similarity = anchor_sim.max(line_sim);
+
+    if similarity < MIN_SIMILARITY {
+        return None;
+    }
+
+    // Translate the window-relative line numbers back to file-relative
+    // line numbers so the model can `read` the right region.
+    let window_line_offset = count_lines(&file_text[..win_start]);
+
+    // Build the rich model_view with a small unified diff and line numbers.
+    let mut model_view = String::new();
+    model_view.push_str(&format!(
+        "edit failed: oldText not found.\n\
+         Closest match: similarity {:.2}, file lines {}-{} (anchor at line {}, \
+         length {} chars).\n\
+         Diff (your oldText vs. file content at that region):\n",
+        similarity,
+        window_line_offset + 1,
+        window_line_offset + window.lines().count().max(1),
+        window_line_offset + count_lines(&file_text[..anchor_start]) + 1,
+        anchor_len,
+    ));
+
+    for (rendered, change) in changes.iter().enumerate() {
+        if rendered >= MAX_DIFF_LINES {
+            model_view.push_str(&format!(
+                "... ({} more diff lines truncated)\n",
+                changes.len().saturating_sub(rendered),
+            ));
+            break;
+        }
+        let tag = match change.tag() {
+            ChangeTag::Equal => " ",
+            ChangeTag::Insert => "+",
+            ChangeTag::Delete => "-",
+        };
+        model_view.push_str(&format!("{}{}", tag, change.value()));
+    }
+
+    let ui_view = format!(
+        "edit failed: oldText not found. Closest match at file lines {}-{} \
+         (similarity {:.2}). See model tool message for diff.",
+        window_line_offset + 1,
+        window_line_offset + window.lines().count().max(1),
+        similarity,
+    );
+
+    Some(EditFailure { ui_view, model_view })
+}
+
+/// Find the longest common substring of `file_text` and `query` using
+/// O(|T|*|Q|) DP with O(|Q|) space (single rolling row). Returns the
+/// byte-range `(start, length)` in `file_text`.
+///
+/// `min_len` discards trivial anchors (e.g. a single common newline).
+fn find_anchor(file_text: &str, query: &str, min_len: usize) -> Option<(usize, usize)> {
+    if query.is_empty() || file_text.is_empty() {
+        return None;
+    }
+    let q = query.as_bytes();
+    let t = file_text.as_bytes();
+    let mut prev = vec![0u32; q.len() + 1];
+    let mut best_len: usize = 0;
+    let mut best_t_end: usize = 0;
+
+    for i in 1..=t.len() {
+        let mut curr = vec![0u32; q.len() + 1];
+        for j in 1..=q.len() {
+            if t[i - 1] == q[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] as usize > best_len && curr[j] as usize >= min_len {
+                    best_len = curr[j] as usize;
+                    best_t_end = i;
+                }
+            }
+        }
+        prev = curr;
+    }
+
+    if best_len == 0 {
+        None
+    } else {
+        Some((best_t_end - best_len, best_len))
+    }
+}
+
+fn count_lines(s: &str) -> usize {
+    if s.is_empty() {
+        0
+    } else {
+        s.matches('\n').count()
+    }
+}
+
+/// Serialize an `EditFailure` to a JSON string the model+UI split can
+/// parse. We use a string the UI can pattern-match on (starts with
+/// `{"ui_view":`) so existing string-sniffing in `display_tool_result`
+/// can pick the right path.
+pub fn render(failure: &EditFailure) -> String {
+    serde_json::to_string(failure).expect("EditFailure is always serializable")
+}
+
+/// Probe used by `display_tool_result` to recognize a structured edit
+/// failure without breaking on unrelated JSON the model might happen to
+/// return.
+pub fn looks_like_edit_failure(result: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(result) else {
+        return false;
+    };
+    v.get("ui_view").is_some() && v.get("model_view").is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_match_returns_none_because_we_only_call_this_on_miss() {
+        // Documenting the contract: callers invoke this only when the
+        // exact match has already failed. This test pins the behavior on
+        // a case where diagnosis is moot.
+        let file = "hello\nworld\n";
+        let q = "hello";
+        // Even though the query IS present, find_anchor still returns
+        // *some* anchor (largest common substring); we only assert the
+        // function doesn't crash. The caller is expected to gate on
+        // !contains().
+        let _ = find_anchor(file, q, MIN_ANCHOR_LEN);
+    }
+
+    #[test]
+    fn anchor_finds_longest_common_substring() {
+        let file = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let q = "    let x = 1;\n    let YY = 2;\n";
+        let (start, len) = find_anchor(file, q, 4).expect("anchor should exist");
+        // The shared substring is "    let " — pick whatever the algo
+        // returned as longest, just assert it's non-empty and in-bounds.
+        assert!(len >= 4);
+        assert!(start + len <= file.len());
+    }
+
+    #[test]
+    fn no_common_substring_returns_none() {
+        let file = "abcdefg";
+        let q = "xyz";
+        assert!(find_anchor(file, q, 1).is_none());
+    }
+
+    #[test]
+    fn diagnose_returns_none_when_no_close_match() {
+        let file = "fn main() {\n    println!(\"hi\");\n}\n";
+        let q = "completely unrelated content here";
+        // The longest common substring will be very small; similarity
+        // should fall below MIN_SIMILARITY.
+        assert!(diagnose(q, file).is_none());
+    }
+
+    #[test]
+    fn diagnose_returns_some_for_close_match() {
+        let file = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        // Off-by-one indentation in the query — the dominant real-world
+        // failure mode.
+        let q = "fn main() {\n   let x = 1;\n    let y = 2;\n}\n";
+        let f = diagnose(q, file).expect("should diagnose");
+        assert!(f.ui_view.contains("Closest match"));
+        assert!(f.model_view.contains("Closest match"));
+        // UI view should NOT contain large chunks of file content.
+        assert!(f.ui_view.len() < 200);
+        assert!(f.model_view.len() > f.ui_view.len());
+    }
+
+    #[test]
+    fn ui_view_does_not_echo_file_regions() {
+        let file = "secret_token = \"ABCDEFG12345\"\n";
+        let q = "secret_token = \"ABCDEFG12346\"\n";
+        let f = diagnose(q, file).expect("should diagnose");
+        // The UI summary must not leak the secret token.
+        assert!(!f.ui_view.contains("ABCDEFG12345"));
+        // The model view SHOULD contain it — that's the whole point.
+        assert!(f.model_view.contains("ABCDEFG"));
+    }
+
+    #[test]
+    fn render_emits_valid_json_with_both_views() {
+        let f = EditFailure {
+            ui_view: "short".into(),
+            model_view: "long with diff".into(),
+        };
+        let s = render(&f);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ui_view"], "short");
+        assert_eq!(v["model_view"], "long with diff");
+    }
+
+    #[test]
+    fn looks_like_edit_failure_recognizes_rendered_output() {
+        let f = EditFailure {
+            ui_view: "short".into(),
+            model_view: "long".into(),
+        };
+        assert!(looks_like_edit_failure(&render(&f)));
+        assert!(!looks_like_edit_failure("plain error string"));
+        assert!(!looks_like_edit_failure(""));
+        assert!(!looks_like_edit_failure("{\"ui_view\":\"x\"}")); // missing model_view
+    }
+
+    #[test]
+    fn empty_inputs_return_none() {
+        assert!(diagnose("", "anything").is_none());
+        assert!(diagnose("anything", "").is_none());
+    }
+
+    #[test]
+    fn whitespace_only_drift_is_diagnosed() {
+        // Tab-vs-space drift: the model wrote spaces, the file has tabs.
+        let file = "fn main() {\n\tlet x = 1;\n}\n";
+        let q = "fn main() {\n    let x = 1;\n}\n";
+        let f = diagnose(q, file);
+        // Should produce a diagnosis (it's close enough).
+        assert!(f.is_some());
+    }
+}

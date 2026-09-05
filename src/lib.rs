@@ -7,6 +7,7 @@ pub mod tools;
 pub mod persona;
 pub mod config;
 pub mod fuzzy;
+pub mod edit_match;
 pub mod slash;
 pub mod repl;
 pub mod model_catalog;

@@ -7,6 +7,7 @@ use tokio::fs;
 use rig_core::tool::ToolContext;
 
 use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig};
+use crate::edit_match;
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 pub enum ToolError {
@@ -150,10 +151,35 @@ pub async fn edit_file(
     let text = fs::read_to_string(&p).await?;
     for (i, edit) in edits.iter().enumerate() {
         if !text.contains(&edit.old_text) {
-            return Ok(format!(
-                "error: old_string '{}' (edit #{}) not found",
-                edit.old_text, i + 1
-            ));
+            // Exact match failed. Try to give the model a useful
+            // diagnostic: anchor location, similarity, and a small diff
+            // against the closest region. The harness emits two views:
+            // the model gets the rich one (re-anchor + diff), the UI gets
+            // a short summary (no file content echoed).
+            let result = match edit_match::diagnose(&edit.old_text, &text) {
+                Some(failure) => {
+                    let edit_idx = i + 1;
+                    let ui_view = format!(
+                        "edit failed: edit #{edit_idx} oldText not found.\n{}",
+                        failure.ui_view,
+                    );
+                    let model_view = format!(
+                        "edit failed: edit #{edit_idx} oldText not found.\n{}",
+                        failure.model_view,
+                    );
+                    serde_json::json!({
+                        "ui_view": ui_view,
+                        "model_view": model_view,
+                    })
+                    .to_string()
+                }
+                None => format!(
+                    "error: old_string '{}' (edit #{}) not found (no similar region in file)",
+                    edit.old_text,
+                    i + 1,
+                ),
+            };
+            return Ok(result);
         }
         let count = text.matches(&edit.old_text).count();
         if count > 1 {
@@ -1754,5 +1780,136 @@ mod sandbox_tests {
             out.contains("fn main"),
             "expected match in output, got: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_file_tests {
+    //! End-to-end tests for `edit_file`'s fuzzy-diagnosis path. We don't
+    //! set up a sandbox (so the test stays fast and runs anywhere); the
+    //! relevant code path bypasses the sandbox when none is configured.
+
+    use super::*;
+    use crate::edit_match::looks_like_edit_failure;
+    use serde_json::Value;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    /// RAII guard that chdirs into a fresh tempdir and restores the
+    /// original cwd on drop. Required because `get_path_with` requires
+    /// the file to be inside CWD, and parallel tests stepping on the
+    /// same global cwd would otherwise race.
+    struct CwdGuard {
+        _dir: tempfile::TempDir,
+        prev: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new() -> Self {
+            crate::tools::set_sandbox(None);
+            let dir = tempdir().unwrap();
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            CwdGuard { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn exact_match_succeeds_and_does_not_emit_diagnostic() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("a.txt", "hello\nworld\n").await.unwrap();
+        let res = edit_file(
+            "a.txt".into(),
+            vec![EditOp {
+                old_text: "hello".into(),
+                new_text: "goodbye".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(res.starts_with("Successfully replaced"));
+        let after = tokio::fs::read_to_string("a.txt").await.unwrap();
+        assert_eq!(after, "goodbye\nworld\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unmatched_old_text_emits_structured_diagnostic_with_both_views() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write(
+            "b.txt",
+            "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
+        )
+        .await
+        .unwrap();
+        // Off-by-one indentation in the query — close enough to diagnose.
+        let res = edit_file(
+            "b.txt".into(),
+            vec![EditOp {
+                old_text: "fn main() {\n   let x = 1;\n    let y = 2;\n}\n".into(),
+                new_text: "noop".into(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            looks_like_edit_failure(&res),
+            "expected structured failure, got: {res}",
+        );
+        let v: Value = serde_json::from_str(&res).unwrap();
+        let ui = v.get("ui_view").and_then(|x| x.as_str()).unwrap();
+        let model = v.get("model_view").and_then(|x| x.as_str()).unwrap();
+        assert!(ui.contains("Closest match"));
+        assert!(model.contains("Closest match"));
+        // UI view must be short and not echo file content.
+        assert!(ui.len() < 200, "ui_view too long: {ui}");
+        assert!(model.len() > ui.len());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn totally_unrelated_old_text_falls_back_to_plain_error() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("c.txt", "fn main() {}\n").await.unwrap();
+        let res = edit_file(
+            "c.txt".into(),
+            vec![EditOp {
+                old_text: "completely different unrelated content here that shares no characters with the file".into(),
+                new_text: "noop".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        // Below the similarity threshold → not a structured failure.
+        assert!(
+            !looks_like_edit_failure(&res),
+            "should fall back to plain error, got: {res}",
+        );
+        assert!(res.contains("not found"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_match_returns_non_unique_error() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("d.txt", "foo foo foo\n").await.unwrap();
+        let res = edit_file(
+            "d.txt".into(),
+            vec![EditOp {
+                old_text: "foo".into(),
+                new_text: "bar".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(res.contains("appears 3 times"));
     }
 }

@@ -1524,6 +1524,21 @@ impl Output for ConsoleOutput {
     fn display_tool_result(&self, result: &str) {
         self.stop_thinking();
 
+        // Edit-tool failures are emitted as a structured JSON object with
+        // separate `ui_view` (short, no file text) and `model_view` (rich,
+        // with diff). The UI must render only the short view so we don't
+        // leak file content into scrollback; the full result string is
+        // still passed back to the model via the tool-result message.
+        if let Ok(v) = serde_json::from_str::<Value>(result) {
+            if let (Some(ui), Some(_model)) = (
+                v.get("ui_view").and_then(|x| x.as_str()),
+                v.get("model_view").and_then(|x| x.as_str()),
+            ) {
+                self.tool_panel(ui, true, true);
+                return;
+            }
+        }
+
         let unquoted = serde_json::from_str::<Value>(result)
             .ok()
             .and_then(|v| match v {
