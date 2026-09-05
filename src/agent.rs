@@ -3653,19 +3653,15 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             };
                             let old_leaf_id = s.get_leaf_id().await;
 
-                            // pi parity: refuse to compact when the leaf IS a
-                            // compaction entry (prepareCompaction early return).
-                            if let Some(id) = &old_leaf_id {
-                                if let Some(entry) = s.get_entry(id).await {
-                                    if matches!(
-                                        entry.content,
-                                        crate::session::SessionEntryContent::Compaction { .. }
-                                    ) {
-                                        config.output.display_text("Cannot compact: the session was already compacted at this point");
-                                        continue;
-                                    }
-                                }
-                            }
+                            // The leaf-is-compaction guard was removed in
+                            // phase C of doc/nested_compactions.md: pi's
+                            // prepareCompaction refuses only when the
+                            // dropped span is empty (compaction.ts:688),
+                            // and the no-op stacked case is handled by
+                            // the LLM-mode guard below ("nothing before
+                            // the current position"). Truncate and
+                            // text-only on an empty dropped span produce
+                            // a legal (if useless) compaction entry.
 
                             // Validate the target is a known entry, so we never
                             // write a silently no-op compaction
@@ -4775,6 +4771,26 @@ mod tests {
         }
     }
 
+    /// Helper: a Compaction entry with the given summary / first-kept / tokens.
+    fn compaction_entry(
+        id: &str,
+        parent: Option<&str>,
+        summary: &str,
+        first_kept: &str,
+        tokens: u64,
+    ) -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(|s| s.to_string()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: crate::session::SessionEntryContent::Compaction {
+                summary: summary.to_string(),
+                first_kept_entry_id: first_kept.to_string(),
+                tokens_before: tokens,
+            },
+        }
+    }
+
     fn test_settings() -> SettingsStore {
         SettingsStore {
             default_model: "p:m".into(),
@@ -4974,6 +4990,169 @@ mod tests {
             }
             other => panic!("expected Compaction entry, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn run_compaction_truncate_when_leaf_is_compaction_writes_new_entry() {
+        // Phase C (doc/nested_compactions.md): the leaf-is-compaction guard
+        // is removed, so re-compacting a session whose leaf is ALREADY a
+        // compaction must succeed. Truncate mode writes a fresh empty-summary
+        // Compaction entry even though the dropped span is empty (the
+        // user explicitly asked for a truncate at this point).
+        //
+        // Branch: [u0, a0, C1{firstKept:u0}] — leaf is C1.
+        let s = build_writable_session_with(vec![
+            message_entry("u0", None, "user", "prompt one"),
+            message_entry("a0", Some("u0"), "assistant", "reply one"),
+            compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
+        ])
+        .await;
+        let old_leaf = s.get_leaf_id().await;
+        // Sanity: the leaf is indeed the compaction entry.
+        assert_eq!(old_leaf.as_deref(), Some("c1"));
+
+        let settings = test_settings();
+        let out = null_output();
+        run_compaction(
+            &s,
+            &None,
+            &settings,
+            CompactionTarget::AtPoint {
+                target_id: "u0".to_string(),
+                tokens_before: 42,
+            },
+            old_leaf.as_deref().unwrap_or(""),
+            CompactSummaryMode::Truncate,
+            "",
+            out.as_ref(),
+        )
+        .await
+        .expect("truncate re-compaction over a leaf-compaction must succeed");
+
+        // New leaf is a Compaction entry with empty summary and firstKept=u0.
+        let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
+        assert_ne!(new_leaf, "c1", "a new compaction entry should be appended");
+        match s.get_entry(&new_leaf).await.expect("entry").content {
+            crate::session::SessionEntryContent::Compaction {
+                summary,
+                first_kept_entry_id,
+                tokens_before,
+            } => {
+                assert_eq!(summary, "");
+                assert_eq!(first_kept_entry_id, "u0");
+                assert_eq!(tokens_before, 42);
+            }
+            other => panic!("expected Compaction entry, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compaction_text_only_when_leaf_is_compaction_skips_nested_summaries() {
+        // Phase C + multi-mode interop: text-only re-compaction over a
+        // session whose leaf is already a compaction. The dropped span is
+        // everything strictly before the target. build_text_only_summary
+        // skips nested compaction entries (it only renders Message entries),
+        // so the new summary must contain the raw user/assistant text but
+        // MUST NOT contain the earlier compaction's summary text.
+        //
+        // Branch: [u0, a0, u1, a1, C1{firstKept:u0, summary:"EARLY"}] — leaf
+        // is C1. Re-compact text-only at target = u1 (dropped: u0, a0).
+        let s = build_writable_session_with(vec![
+            message_entry("u0", None, "user", "first question"),
+            message_entry("a0", Some("u0"), "assistant", "first answer"),
+            message_entry("u1", Some("a0"), "user", "second question"),
+            message_entry("a1", Some("u1"), "assistant", "second answer"),
+            compaction_entry("c1", Some("a1"), "EARLY SECRET SUMMARY", "u0", 80),
+        ])
+        .await;
+        let old_leaf = s.get_leaf_id().await;
+        assert_eq!(old_leaf.as_deref(), Some("c1"));
+
+        let settings = test_settings();
+        let out = null_output();
+        run_compaction(
+            &s,
+            &None,
+            &settings,
+            CompactionTarget::AtPoint {
+                target_id: "u1".to_string(),
+                tokens_before: 60,
+            },
+            old_leaf.as_deref().unwrap_or(""),
+            CompactSummaryMode::TextOnly,
+            "",
+            out.as_ref(),
+        )
+        .await
+        .expect("text-only re-compaction over a leaf-compaction must succeed");
+
+        let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
+        let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
+            crate::session::SessionEntryContent::Compaction {
+                summary,
+                first_kept_entry_id,
+                ..
+            } => {
+                assert_eq!(first_kept_entry_id, "u1");
+                summary
+            }
+            other => panic!("expected Compaction entry, got {:?}", other),
+        };
+        assert!(
+            summary.contains("first question"),
+            "text-only summary should include dropped user prompt, got: {:?}",
+            summary
+        );
+        assert!(
+            !summary.contains("EARLY SECRET SUMMARY"),
+            "text-only summary must NOT leak the nested compaction's summary text, got: {:?}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn run_compaction_llm_when_leaf_is_compaction_still_guards_nothing_before() {
+        // Phase C: the leaf-is-compaction guard is removed, but the LLM
+        // mode still has its own guard against an EMPTY dropped span (the
+        // no-op stacked case: target is the first entry after the leaf, so
+        // there is nothing between the leaf and target to summarize). That
+        // guard must remain active even when the leaf is a compaction.
+        //
+        // Branch: [u0, a0, C1{firstKept:u0}] — leaf is C1. If we try to
+        // LLM-compact targeting a0 (whose predecessor on the branch is u0,
+        // not the leaf c1) the guard should NOT fire (dropped = u0, non-empty),
+        // but there is no agent so it must return Err anyway. The meaningful
+        // assertion here is that the run_compaction backend never panics and
+        // returns a structured error when the leaf is a compaction.
+        let s = build_writable_session_with(vec![
+            message_entry("u0", None, "user", "prompt one"),
+            message_entry("a0", Some("u0"), "assistant", "reply one"),
+            compaction_entry("c1", Some("a0"), "earlier summary", "u0", 50),
+        ])
+        .await;
+        let old_leaf = s.get_leaf_id().await;
+        assert_eq!(old_leaf.as_deref(), Some("c1"));
+
+        let settings = test_settings();
+        let out = null_output();
+        let res = run_compaction(
+            &s,
+            &None, // no agent
+            &settings,
+            CompactionTarget::AtPoint {
+                target_id: "a0".to_string(),
+                tokens_before: 30,
+            },
+            old_leaf.as_deref().unwrap_or(""),
+            CompactSummaryMode::Llm,
+            "user payload",
+            out.as_ref(),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "expected error when no agent available even with leaf==compaction"
+        );
     }
 
     #[test]

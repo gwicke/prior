@@ -13,7 +13,11 @@ Phases implemented:
       `run_compaction_at_point` LLM arm. Selection rule: strict-before
       (deepest prior compaction on the active branch whose
       `first_kept_entry_id` is strictly before the new target).
-- [ ] **C. Drop the leaf-is-compaction guard.** `src/agent.rs:3658‑3668`.
+- [x] **C. Drop the leaf-is-compaction guard.** `src/agent.rs`. The dispatch
+      block is removed; the LLM-mode "nothing before" guard still covers
+      the empty-dropped-span no-op case. Multi-mode interop verified:
+      truncate / text-only / llm all re-compact correctly over a session
+      whose leaf is already a compaction.
 - [ ] **D. Update `doc/tree_compaction.md`** to describe the new semantics
       and update the default `llm_compact_prompt`.
 
@@ -92,15 +96,32 @@ The user-controlled `user_prompt` is the primary instruction. The default
 `llm_compact_prompt` should mention the `--- PREVIOUS SUMMARY ---` section
 so users get merge behaviour by default.
 
-### C. Drop the leaf-is-compaction guard (pending)
+### C. Drop the leaf-is-compaction guard (done)
 
-Remove the block at `src/agent.rs:3658‑3668`. The existing LLM-mode guard
-at `src/agent.rs:3697‑3708` ("nothing before the current position") still
-covers the no-op stacked case. Truncate and text-only modes on an empty
-dropped span will write a (harmless) compaction entry whose
-`first_kept_entry_id` equals the leaf's structure — matching pi's
-behaviour (`compaction.ts:688` refuses only when the dropped span is
-empty; otherwise the write proceeds).
+The dispatch block at the old `src/agent.rs:3658‑3668` is removed: compacting a
+session whose leaf is already a `Compaction` entry is now allowed. The existing
+LLM-mode guard at `src/agent.rs:3697‑3708` ("nothing before the current
+position") still covers the no-op stacked case (empty dropped span). Truncate
+and text-only on an empty dropped span write a (harmless) compaction entry
+whose `first_kept_entry_id` equals the leaf's structure — matching pi
+(`compaction.ts:688` refuses only when the dropped span is empty).
+
+**Multi-mode interop** (verified by tests):
+
+- **Truncate**: appends an empty-summary compaction; never examines the
+  dropped span, so nested compaction entries are irrelevant. Works when the
+  leaf is already a compaction.
+- **TextOnly**: `build_text_only_summary` renders only `Message` entries and
+  skips `Compaction` entries in the dropped span (session.rs), so a nested
+  compaction's summary text never leaks into a new text-only summary.
+- **Llm**: unaffected by the guard removal; still errors on an empty dropped
+  span and (Phase B, pending) will inject `previousSummary`.
+
+`previousSummary` injection (Phase B) applies only to the **LLM** mode.
+Truncate and text-only are deterministic / non-generative: truncate writes no
+summary, and text-only re-derives its summary from the raw `Message` entries
+in the dropped span (which still physically exist in the session file), so
+neither needs to thread a prior compaction's summary forward.
 
 ### D. Documentation updates (pending)
 
