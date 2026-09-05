@@ -5091,6 +5091,7 @@ fn turn_kind(entry: &SessionEntry) -> TurnKind {
             }
         }
         SessionEntryContent::Compaction { .. } => TurnKind::Boundary,
+        SessionEntryContent::ModelChange { .. } => TurnKind::Boundary,
         _ => TurnKind::Assistant, // meta entries: invisible, keeps state
     }
 }
@@ -6374,6 +6375,43 @@ mod tests {
         assert!(mc_label.starts_with("\x1b[33m"), "got: {mc_label:?}");
         assert!(mc_label.ends_with("\x1b[39m"), "got: {mc_label:?}");
         assert!(mc_label.contains("model: openrouter/anthropic/claude-3.7"));
+    }
+
+    #[test]
+    fn tree_list_model_change_is_unindented() {
+        // Model changes are user-initiated (the user picked a
+        // different model for the next turn) so they should sit at
+        // the same indent as the user prompt that just closed — the
+        // same way compactions do, and the same way any other turn
+        // boundary sits. Previously a ModelChange was classified as
+        // TurnKind::Assistant, so the row inherited the model-
+        // response +2 indent and looked like a continuation of the
+        // just-finished turn.
+        let mc = SessionTreeNode {
+            entry: SessionEntry {
+                id: "mc".into(),
+                parent_id: Some("a0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "openrouter".into(),
+                    model_id: "anthropic/claude-3.7".into(),
+                },
+            },
+            children: vec![tree_entry("m1", Some("mc"), "user", "after switch")],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "first answer"),
+                mc,
+            ),
+        )];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
+        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _, _)| *i).collect();
+        // m0=0, a0=2, mc=0 (Boundary, un-indented), m1=0 (User, un-indented).
+        assert_eq!(indents, vec![0, 2, 0, 0], "got: {out:?}");
     }
 
     #[test]
