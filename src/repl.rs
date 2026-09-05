@@ -5845,9 +5845,7 @@ mod tests {
 
     // ---- last_user_message_id_on_active_branch ----
 
-        use crate::session::{
-        SessionEntry, SessionEntryContent, SessionHeader, SessionIndex, SessionTreeNode,
-    };
+            use crate::session::{SessionEntryContent, SessionHeader, SessionIndex, SessionTreeNode};
 
     fn mk_message(id: &str, role: &str, parent: Option<&str>) -> SessionEntry {
         SessionEntry {
@@ -6396,184 +6394,192 @@ mod tests {
     }
 
     #[test]
-    fn tree_overlay_loads_real_session_with_compaction() {
-        // Regression test for the user-reported bug: "tree is missing
-        // all content past the compaction entry". Load the actual
-        // session file from the user's home directory, build the
-        // tree, run tree_overlay_entries, and verify that:
-        //  - the compaction entry is present
-        //  - entries after the compaction (including the active
-        //    message at the end) are present
-        //  - the active row is set to the leaf
-        let session_path = std::path::Path::new(
-            "/home/gabriel/.config/picocode/sessions/--home-gabriel-src-picocode2--/2026-09-04T18-19-51-823Z_01a06da6-048f-7812-9dd5-9bba9236eac3.jsonl",
-        );
-        if !session_path.exists() {
-            // The session file may not be available in CI / on other
-            // machines; skip the test rather than failing.
-            eprintln!("skipping: session file not present at {session_path:?}");
-            return;
+    fn tree_overlay_keeps_descendants_past_session_info() {
+        // Regression test for the user-reported bug: a `SessionInfo`
+        // entry in the middle of the active path used to strand every
+        // descendant below it, because `build_subtree` returned
+        // `None` for `SessionInfo` (a meta entry) and dropped its
+        // children along with it. The user saw a /tree list that
+        // stopped at the SessionInfo, with the rest of the session
+        // (compaction entries, post-compaction content) gone.
+        //
+        // This test builds a synthetic SessionIndex shaped like the
+        // failing one: a linear chain m0 -> a0 -> SI (SessionInfo)
+        // -> MC (model_change) -> CMP (compaction) -> m1 (user) -> a1
+        // (assistant) -> tr (toolResult, the leaf). The leaf points
+        // at a toolResult, so the visible active row is the previous
+        // user prompt.
+        //
+        // After the fix, build_tree produces a tree where the
+        // SessionInfo is present but its children are spliced
+        // directly into the parent, so the full chain — including
+        // the compaction and the post-compaction content — reaches
+        // `tree_overlay_entries` and the active row is set to a
+        // visible ancestor of the leaf.
+        use std::collections::HashMap;
+
+        // Build a SessionIndex with the entries.
+        let mut entries: HashMap<String, SessionEntry> = HashMap::new();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+
+        let chain: Vec<(&str, &str, SessionEntryContent)> = vec![
+            (
+                "m0",
+                "",
+                SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": "first prompt"}]
+                    }),
+                },
+            ),
+            (
+                "a0",
+                "m0",
+                SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "first answer"}]
+                    }),
+                },
+            ),
+            (
+                "si",
+                "a0",
+                SessionEntryContent::SessionInfo {
+                    name: Some("synthetic".into()),
+                },
+            ),
+            (
+                "mc",
+                "si",
+                SessionEntryContent::ModelChange {
+                    provider: "test".into(),
+                    model_id: "m".into(),
+                },
+            ),
+            (
+                "cmp",
+                "mc",
+                SessionEntryContent::Compaction {
+                    summary: String::new(),
+                    first_kept_entry_id: "m0".into(),
+                    tokens_before: 42_000,
+                },
+            ),
+            (
+                "m1",
+                "cmp",
+                SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "user",
+                        "content": [{"type": "text", "text": "after compaction"}]
+                    }),
+                },
+            ),
+            (
+                "a1",
+                "m1",
+                SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "after compaction answer"}]
+                    }),
+                },
+            ),
+            (
+                "tr",
+                "a1",
+                SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "toolResult",
+                        "content": [{"type": "text", "text": "ok"}]
+                    }),
+                },
+            ),
+        ];
+        for (id, parent, content) in &chain {
+            let entry = SessionEntry {
+                id: (*id).into(),
+                parent_id: if parent.is_empty() {
+                    None
+                } else {
+                    Some((*parent).into())
+                },
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: content.clone(),
+            };
+            entries.insert((*id).into(), entry);
+            if !parent.is_empty() {
+                children
+                    .entry((*parent).into())
+                    .or_default()
+                    .push((*id).into());
+            }
         }
-                let content = std::fs::read_to_string(session_path).expect("read session");
-        let mut index = SessionIndex {
-            header: SessionHeader::new(session_path),
-            entries: Default::default(),
-            leaf_id: None,
-            children: Default::default(),
+        let index = SessionIndex {
+            header: SessionHeader::new(std::path::Path::new("/test")),
+            entries,
+            leaf_id: Some("tr".into()),
+            children,
             session_name: None,
         };
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let id = match v.get("id").and_then(|x| x.as_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            let parent_id = v.get("parentId").and_then(|x| x.as_str()).map(String::from);
-            let timestamp = v
-                .get("timestamp")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let type_str = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let entry_content = match type_str {
-                "message" => match v.get("message").cloned() {
-                    Some(msg) => SessionEntryContent::Message { message: msg },
-                    None => continue,
-                },
-                "compaction" => SessionEntryContent::Compaction {
-                    summary: v
-                        .get("summary")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    first_kept_entry_id: v
-                        .get("firstKeptEntryId")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    tokens_before: v
-                        .get("tokensBefore")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
-                },
-                "model_change" => SessionEntryContent::ModelChange {
-                    provider: v
-                        .get("provider")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    model_id: v
-                        .get("modelId")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                },
-                "leaf" => {
-                    index.leaf_id = v
-                        .get("targetId")
-                        .and_then(|x| x.as_str())
-                        .map(String::from);
-                    continue;
-                }
-                _ => continue, // SessionInfo and other meta entries
-            };
-            let entry = SessionEntry {
-                id: id.clone(),
-                parent_id: parent_id.clone(),
-                timestamp,
-                content: entry_content,
-            };
-            index.entries.insert(id.clone(), entry);
-            if let Some(pid) = parent_id {
-                index.children.entry(pid).or_default().push(id);
+        let tree = index.build_tree(Some("tr"));
+
+        // Walk the tree and confirm every entry is reachable from
+        // the root. Before the fix, descendants of `si` were missing
+        // because build_subtree returned None for the SessionInfo
+        // and dropped its children along with it.
+        fn collect_ids<'a>(
+            nodes: &'a [SessionTreeNode],
+            out: &mut std::collections::HashSet<&'a str>,
+        ) {
+            for n in nodes {
+                out.insert(&n.entry.id);
+                collect_ids(&n.children, out);
             }
         }
-        eprintln!("loaded {} entries, leaf = {:?}", index.entries.len(), index.leaf_id);
-        assert!(index.entries.len() > 100, "expected a real session to load");
-        let leaf = index.leaf_id.clone().expect("leaf must be set");
-        let tree = index.build_tree(Some(&leaf));
-        eprintln!("tree has {} root(s)", tree.len());
+        let mut tree_ids = std::collections::HashSet::new();
+        collect_ids(&tree, &mut tree_ids);
+        for expected in &["m0", "a0", "si", "mc", "cmp", "m1", "a1", "tr"] {
+            assert!(
+                tree_ids.contains(*expected),
+                "{expected} missing from tree after SessionInfo; got: {:?}",
+                tree_ids
+            );
+        }
+
+        // Run tree_overlay_entries. The compaction must be present
+        // (yellow label) and the active row must be set.
         let mut rows = Vec::new();
         let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
         let mut targets = Vec::new();
         let mut active = None;
         Repl::tree_overlay_entries(
             &tree,
-            Some(&leaf),
+            Some("tr"),
             "",
             &mut rows,
             &mut row_bgs,
             &mut targets,
             &mut active,
         );
-        eprintln!("tree_overlay_entries produced {} rows; active={active:?}", rows.len());
-        // The compaction entry must be present.
-        let has_compaction = rows.iter().any(|r| r.starts_with("\x1b[22m\x1b[33mcompaction") || r.starts_with("\x1b[2m\x1b[33mcompaction"));
-        assert!(has_compaction, "compaction row missing in real session");
-        // The active row must be set to the leaf (or the nearest
-        // visible ancestor when the leaf is invisible, e.g. a
-        // toolResult). The cursor needs to auto-scroll to the active
-        // row when the user opens /tree, otherwise they see a small
-        // top-of-list window and assume the rest is missing.
-        assert!(active.is_some(), "active row not set for real session (leaf = {leaf})");
-        let active_idx = active.expect("active");
-        // The active row should NOT be the very top of the list
-        // (we walked up the active path to find a visible ancestor,
-        // so even with a toolResult leaf the active must point at
-        // SOMETHING that came after the conversation start).
+        let has_compaction = rows.iter().any(|r| r.contains("\x1b[33mcompaction"));
         assert!(
-            active_idx > 0,
-            "active row stuck at top of list ({active_idx} / {}); the leaf walk didn't find a visible ancestor",
-            rows.len()
+            has_compaction,
+            "compaction row missing from /tree; rows: {rows:?}"
         );
-        // The last 5 rows (likely the tail of the active path / leaf
-        // and its nearby siblings) must all reach the rendered output.
-        for r in rows.iter().rev().take(5) {
-            assert!(
-                !r.trim().is_empty(),
-                "row near the active leaf is empty: {r:?}"
-            );
-        }
-        // Render the overlay end-to-end and confirm the compaction +
-        // active row both reach the final string.
-        let (_title, opts, _active, _wrap) = (
-            "",
-            rows.clone(),
-            active,
-            false,
-        );
-        let row_bg_view: Vec<Option<&str>> =
-            row_bgs.iter().map(|b| b.map(|s| -> &str { s })).collect();
-        let rendered = Repl::overlay_lines_with_bgs(
-            "",
-            &opts,
-            None,
-            active_idx,
-            Some(active_idx),
-            false,
-            Some(&row_bg_view),
-        );
-        assert!(rendered.contains("\x1b[33mcompaction"), "compaction missing from rendered overlay");
-        // The active row's label must be in the rendered output too.
-        let active_label = &rows[active_idx];
-        let trimmed_label: String = active_label
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
-            .trim()
-            .to_string();
-        // The label is wrapped; the first 30 chars of the label is
-        // good enough as a fingerprint.
-        let fp: String = trimmed_label.chars().take(30).collect();
+        let has_post_compaction = rows.iter().any(|r| r.contains("after compaction"));
         assert!(
-            rendered.contains(&fp) || rendered.contains(&trimmed_label),
-            "active row ({fp:?}) missing from rendered overlay"
+            has_post_compaction,
+            "post-compaction content missing from /tree; rows: {rows:?}"
+        );
+        // The active row must be set even though the leaf itself is
+        // a toolResult (invisible). The cursor needs to land on a
+        // visible row so the user can find where they are.
+        assert!(
+            active.is_some(),
+            "active row not set when leaf is invisible; rows: {rows:?}"
         );
     }
 
