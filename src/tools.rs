@@ -149,71 +149,77 @@ pub async fn edit_file(
 ) -> Result<String, ToolError> {
     let p = get_path_with(&path, true)?;
     let text = fs::read_to_string(&p).await?;
+    let total = edits.len();
+    let mut failures: Vec<edit_match::BatchItem> = Vec::new();
+
     for (i, edit) in edits.iter().enumerate() {
         if !text.contains(&edit.old_text) {
             // Exact match failed. Try to give the model a useful
-            // diagnostic: anchor location, similarity, and a small diff
-            // against the closest region. The harness emits two views:
-            // the model gets the rich one (re-anchor + diff), the UI gets
-            // a short summary (no file content echoed).
-            let result = match edit_match::diagnose(&edit.old_text, &text) {
-                Some(failure) => {
-                    let edit_idx = i + 1;
-                    let ui_view = format!(
-                        "edit failed: edit #{edit_idx} oldText not found.\n{}",
-                        failure.ui_view,
+            // diagnostic for this edit; if no close match exists, fall
+            // back to a plain error. We DO NOT return early — collect
+            // every edit's failure so the model can fix them all in one
+            // retry.
+            let edit_idx_1 = i + 1;
+            let failure = match edit_match::diagnose(&edit.old_text, &text) {
+                Some(mut f) => {
+                    // Re-header with the edit index so the batch view
+                    // can carry one summary line per failure.
+                    f.ui_view = format!(
+                        "edit #{edit_idx_1} oldText not found.\n{}",
+                        f.ui_view,
                     );
-                    let model_view = format!(
-                        "edit failed: edit #{edit_idx} oldText not found.\n{}",
-                        failure.model_view,
+                    f.model_view = format!(
+                        "edit #{edit_idx_1} oldText not found.\n{}",
+                        f.model_view,
                     );
-                    serde_json::json!({
-                        "ui_view": ui_view,
-                        "model_view": model_view,
-                    })
-                    .to_string()
+                    f
                 }
-                None => format!(
-                    "error: old_string '{}' (edit #{}) not found (no similar region in file)",
-                    edit.old_text,
-                    i + 1,
+                None => edit_match::EditFailure::not_found_no_match(
+                    edit_idx_1, &edit.old_text,
                 ),
             };
-            return Ok(result);
+            failures.push(edit_match::BatchItem {
+                edit_index: i,
+                failure,
+            });
+            continue;
         }
         let count = text.matches(&edit.old_text).count();
         if count > 1 {
             // List the line numbers of every occurrence so the model can
             // re-anchor and pick one (or include more surrounding context
             // in oldText). Cap at 10 to keep the message bounded.
-            let mut line_numbers: Vec<String> = Vec::with_capacity(count.min(10));
+            let mut line_numbers: Vec<usize> = Vec::with_capacity(count.min(10));
             let mut listed = 0usize;
             for (byte_off, _) in text.match_indices(&edit.old_text) {
                 if listed >= 10 {
                     break;
                 }
                 line_numbers.push(
-                    (crate::edit_match::count_lines(&text[..byte_off]) + 1)
-                        .to_string(),
+                    crate::edit_match::count_lines(&text[..byte_off]) + 1,
                 );
                 listed += 1;
             }
-            let line_list = if count > 10 {
-                format!(
-                    "{}, (...and {} more)",
-                    line_numbers.join(", "),
-                    count - 10,
-                )
-            } else {
-                line_numbers.join(", ")
-            };
-            return Ok(format!(
-                "error: old_string '{}' (edit #{}) appears {count} times, \
-                 must be unique. Occurrences at lines: {line_list}",
-                edit.old_text, i + 1,
-            ));
+            failures.push(edit_match::BatchItem {
+                edit_index: i,
+                failure: edit_match::EditFailure::non_unique(
+                    i + 1,
+                    &edit.old_text,
+                    count,
+                    &line_numbers,
+                ),
+            });
         }
     }
+
+    if !failures.is_empty() {
+        // All-or-nothing: do NOT apply any edits when the validation
+        // pass produced failures. Surfacing the full list lets the model
+        // fix all problems in one retry instead of ping-ponging.
+        let batch = edit_match::BatchEditFailure::build(total, failures);
+        return Ok(edit_match::render_batch(&batch));
+    }
+
     let mut result = text;
     for edit in &edits {
         result = result.replacen(&edit.old_text, &edit.new_text, 1);
@@ -1901,7 +1907,7 @@ mod edit_file_tests {
 
     #[tokio::test]
     #[serial]
-    async fn totally_unrelated_old_text_falls_back_to_plain_error() {
+    async fn totally_unrelated_old_text_emits_no_match_fallback() {
         let _cwd = CwdGuard::new();
         tokio::fs::write("c.txt", "fn main() {}\n").await.unwrap();
         let res = edit_file(
@@ -1913,12 +1919,20 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        // Below the similarity threshold → not a structured failure.
+        // Below the similarity threshold → falls back to the
+        // "no similar region" failure, still wrapped in the structured
+        // batch envelope so the UI can render it differently.
         assert!(
-            !looks_like_edit_failure(&res),
-            "should fall back to plain error, got: {res}",
+            looks_like_edit_failure(&res),
+            "should be a structured failure, got: {res}",
         );
-        assert!(res.contains("not found"));
+        let v: Value = serde_json::from_str(&res).unwrap();
+        let model = v.get("model_view").and_then(|x| x.as_str()).unwrap();
+        assert!(
+            model.contains("no similar region")
+                || model.contains("No close-enough region"),
+            "expected no-match fallback message, got model_view: {model}",
+        );
     }
 
     #[tokio::test]
@@ -1969,6 +1983,101 @@ mod edit_file_tests {
         assert!(
             res.contains("(...and 5 more)"),
             "expected truncation notice, got: {res}",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn batch_reports_all_failures_in_one_shot() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write(
+            "batch.txt",
+            "fn alpha() {\n    let a = 1;\n}\n\
+             fn beta() {\n    let b = 2;\n}\n\
+             fn gamma() {\n    let c = 3;\n}\n",
+        )
+        .await
+        .unwrap();
+        // Three edits:
+        //   #1: exact match succeeds.
+        //   #2: oldText not in file (fuzzy candidate nearby).
+        //   #3: oldText is non-unique (appears twice).
+        let res = edit_file(
+            "batch.txt".into(),
+            vec![
+                EditOp {
+                    old_text: "    let a = 1;".into(),
+                    new_text: "    let a = 42;".into(),
+                },
+                EditOp {
+                    old_text: "    let nonexistent = 99;".into(),
+                    new_text: "    let z = 99;".into(),
+                },
+                EditOp {
+                    old_text: "fn".into(),
+                    new_text: "function".into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let v: Value = serde_json::from_str(&res).expect("structured failure");
+        let model = v.get("model_view").and_then(|x| x.as_str()).unwrap();
+        let ui = v.get("ui_view").and_then(|x| x.as_str()).unwrap();
+        assert_eq!(v.get("total"), Some(&Value::from(3)));
+        assert_eq!(v.get("failed"), Some(&Value::from(2)));
+
+        // The model_view must mention BOTH failed edits, not just one.
+        assert!(
+            model.contains("--- edit #2 ---"),
+            "expected edit #2 in batch summary, got: {model}",
+        );
+        assert!(
+            model.contains("--- edit #3 ---"),
+            "expected edit #3 in batch summary, got: {model}",
+        );
+        assert!(
+            model.contains("No edits were applied"),
+            "must declare no edits applied: {model}",
+        );
+
+        // The UI view should be a count summary, not contain file
+        // content (only one line range per failure, no diff excerpts).
+        assert!(ui.contains("2 of 3 edit(s) had problems"));
+        assert!(!ui.contains("--- edit #"));
+
+        // The file must be unchanged.
+        let after = tokio::fs::read_to_string("batch.txt").await.unwrap();
+        assert!(after.contains("let a = 1;"), "edit #1 should NOT have applied");
+        assert!(!after.contains("let a = 42;"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn batch_with_single_failure_passes_through_per_edit_ui_summary() {
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("single.txt", "fn main() {\n    let x = 1;\n}\n")
+            .await
+            .unwrap();
+        // Single edit, fuzzy candidate nearby.
+        let res = edit_file(
+            "single.txt".into(),
+            vec![EditOp {
+                old_text: "fn main() {\n   let x = 1;\n}\n".into(),
+                new_text: "noop".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let v: Value = serde_json::from_str(&res).unwrap();
+        let ui = v.get("ui_view").and_then(|x| x.as_str()).unwrap();
+        // Single-failure batch: the per-edit ui_view (which carries
+        // the line-range summary) should pass through so the human
+        // sees something useful.
+        assert!(
+            ui.contains("Closest match"),
+            "expected per-edit ui summary in single-failure batch, got: {ui}",
         );
     }
 }

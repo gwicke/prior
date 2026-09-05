@@ -41,6 +41,96 @@ pub struct EditFailure {
     pub model_view: String,
 }
 
+/// A failure for one edit in a batch, paired with the edit's index in
+/// the caller's `Vec<EditOp>` (0-based). Used to build a
+/// [`BatchEditFailure`] that surfaces every problem in a multi-edit
+/// call at once, instead of forcing the model to retry ping-pong.
+#[derive(Debug, Serialize)]
+pub struct BatchItem {
+    /// 0-based index of the edit that failed.
+    pub edit_index: usize,
+    /// Per-edit failure (or a plain-error fallback when no close match
+    /// was found).
+    pub failure: EditFailure,
+}
+
+/// Result of a multi-edit call where one or more edits failed. The
+/// `model_view` aggregates every failure so the model can fix them all
+/// in a single retry. The `ui_view` is a short summary (counts only,
+/// no file content).
+///
+/// Same wire shape as [`EditFailure`] — `{ui_view, model_view}` — so
+/// downstream rendering code doesn't need a separate code path.
+#[derive(Debug, Serialize)]
+pub struct BatchEditFailure {
+    pub ui_view: String,
+    pub model_view: String,
+    /// Total edits in the original call.
+    pub total: usize,
+    /// How many failed.
+    pub failed: usize,
+}
+
+impl BatchEditFailure {
+    /// Build a batch failure from collected per-edit failures. Caller
+    /// is responsible for having validated each failed edit; this just
+    /// formats.
+    ///
+    /// When exactly one edit failed, the `ui_view` carries that
+    /// failure's own short summary (location / line numbers) so the
+    /// human watching the TUI sees something useful. For multi-failure
+    /// batches the `ui_view` falls back to a count-only summary to keep
+    /// the panel bounded.
+    pub fn build(total: usize, items: Vec<BatchItem>) -> Self {
+        let failed = items.len();
+        let mut model_view = String::new();
+        model_view.push_str(&format!(
+            "edit failed: {failed} of {total} edit(s) had problems. \
+             No edits were applied. Fix and retry the batch:\n",
+        ));
+        for item in &items {
+            // Strip the leading "edit failed: ... " line from each
+            // per-edit failure so we don't double-print it; the batch
+            // header already names the failing edit by index.
+            let trimmed = item
+                .failure
+                .model_view
+                .trim_start_matches("edit failed:")
+                .trim_start();
+            model_view.push_str(&format!(
+                "\n--- edit #{} ---\n{}",
+                item.edit_index + 1,
+                trimmed,
+            ));
+        }
+        let ui_view = if items.len() == 1 {
+            // Single failure: pass the per-edit summary through so the
+            // UI shows the line range / count, not just "1 of 1".
+            format!("edit failed: 1 of {total} edit(s) had problems.\n{}",
+                items[0].failure.ui_view)
+        } else {
+            format!(
+                "edit failed: {failed} of {total} edit(s) had problems. \
+                 No edits applied. See model tool message for details.",
+            )
+        };
+        BatchEditFailure {
+            ui_view,
+            model_view,
+            total,
+            failed,
+        }
+    }
+}
+
+/// Serialize a [`BatchEditFailure`] to JSON. The `ui_view` and
+/// `model_view` keys match [`EditFailure`]'s render shape so the same
+/// `looks_like_edit_failure` predicate and the same
+/// `display_tool_result` branch handle both.
+pub fn render_batch(failure: &BatchEditFailure) -> String {
+    serde_json::to_string(failure).expect("BatchEditFailure is always serializable")
+}
+
 /// Try to find a substring of `file_text` that closely resembles `query`.
 ///
 /// `query` is what the model sent as `oldText`. `file_text` is the current
@@ -136,6 +226,64 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     );
 
     Some(EditFailure { ui_view, model_view })
+}
+
+impl EditFailure {
+    /// Construct a fallback for "oldText not found and no close match".
+    /// Used both directly (single-edit call) and inside batch items.
+    pub fn not_found_no_match(edit_index_1based: usize, old_text: &str) -> Self {
+        let ui_view = format!(
+            "edit #{edit_index_1based} failed: oldText not found (no similar region in file).",
+        );
+        let model_view = format!(
+            "edit #{edit_index_1based} failed: oldText not found. \
+             No close-enough region in the file; please re-read the file \
+             and re-anchor your edit. Original oldText: '{}'.",
+            old_text,
+        );
+        EditFailure { ui_view, model_view }
+    }
+
+    /// Construct a failure for "oldText appears N times" with line
+    /// numbers so the model can disambiguate.
+    pub fn non_unique(
+        edit_index_1based: usize,
+        old_text: &str,
+        count: usize,
+        line_numbers: &[usize],
+    ) -> Self {
+        let shown = line_numbers.len();
+        let line_list = if count > shown {
+            format!(
+                "{}, (...and {} more)",
+                line_numbers
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                count - shown,
+            )
+        } else {
+            line_numbers
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ui_view = format!(
+            "edit #{edit_index_1based} failed: oldText appears {count} times \
+             (lines: {line_list}).",
+        );
+        let model_view = format!(
+            "edit #{edit_index_1based} failed: oldText appears {count} times, \
+             must be unique. Occurrences at lines: {line_list}. \
+             To make it unique, include more surrounding context in oldText \
+             (the line(s) immediately before/after) so only one occurrence \
+             matches. Original oldText: '{}'.",
+            old_text,
+        );
+        EditFailure { ui_view, model_view }
+    }
 }
 
 /// Find the longest common substring of `file_text` and `query` using
@@ -308,5 +456,88 @@ mod tests {
         let f = diagnose(q, file);
         // Should produce a diagnosis (it's close enough).
         assert!(f.is_some());
+    }
+
+    #[test]
+    fn not_found_no_match_carries_message_in_both_views() {
+        let f = EditFailure::not_found_no_match(2, "missing");
+        assert!(f.ui_view.contains("edit #2"));
+        assert!(f.model_view.contains("edit #2"));
+        assert!(f.model_view.contains("missing"));
+        // UI view should not contain the raw oldText (it's not a secret,
+        // but the contract is "UI view is short, no file content").
+        assert!(!f.ui_view.contains("missing"));
+    }
+
+    #[test]
+    fn non_unique_lists_line_numbers() {
+        let f = EditFailure::non_unique(1, "foo", 3, &[1, 3, 5]);
+        assert!(f.ui_view.contains("lines: 1, 3, 5"));
+        assert!(f.model_view.contains("lines: 1, 3, 5"));
+        assert!(f.model_view.contains("foo"));
+    }
+
+    #[test]
+    fn non_unique_caps_listing_with_truncation_notice() {
+        let f = EditFailure::non_unique(
+            1,
+            "foo",
+            15,
+            &(1..=10).collect::<Vec<_>>(),
+        );
+        assert!(f.ui_view.contains("(...and 5 more)"));
+        assert!(f.ui_view.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10"));
+    }
+
+    #[test]
+    fn batch_build_aggregates_all_failures() {
+        let items = vec![
+            BatchItem {
+                edit_index: 0,
+                failure: EditFailure::not_found_no_match(1, "x"),
+            },
+            BatchItem {
+                edit_index: 2,
+                failure: EditFailure::non_unique(3, "y", 2, &[4, 8]),
+            },
+        ];
+        let b = BatchEditFailure::build(3, items);
+        assert_eq!(b.total, 3);
+        assert_eq!(b.failed, 2);
+        assert!(b.model_view.contains("--- edit #1 ---"));
+        assert!(b.model_view.contains("--- edit #3 ---"));
+        assert!(b.model_view.contains("No edits were applied"));
+        // Multi-failure: ui_view is the count-only summary.
+        assert!(b.ui_view.contains("2 of 3 edit(s) had problems"));
+        assert!(!b.ui_view.contains("--- edit #"));
+    }
+
+    #[test]
+    fn batch_with_single_failure_passes_through_per_edit_ui() {
+        let items = vec![BatchItem {
+            edit_index: 0,
+            failure: EditFailure {
+                ui_view: "edit #1 closest match at line 42".into(),
+                model_view: "edit #1 closest match at line 42\n<diff>".into(),
+            },
+        }];
+        let b = BatchEditFailure::build(1, items);
+        // Single-failure: ui_view falls through to the per-edit summary.
+        assert!(b.ui_view.contains("closest match at line 42"));
+        assert!(b.ui_view.contains("1 of 1 edit(s)"));
+    }
+
+    #[test]
+    fn render_batch_emits_recognizable_json() {
+        let items = vec![BatchItem {
+            edit_index: 0,
+            failure: EditFailure::not_found_no_match(1, "x"),
+        }];
+        let b = BatchEditFailure::build(2, items);
+        let s = render_batch(&b);
+        assert!(looks_like_edit_failure(&s));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["total"], 2);
+        assert_eq!(v["failed"], 1);
     }
 }
