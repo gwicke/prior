@@ -615,8 +615,8 @@ impl ActiveOverlay {
                         &mut flat,
                     );
                     flat.iter()
-                        .find(|(_, _, id, _, _)| id == &target_id)
-                        .map(|(_, l, _, _, _)| l.clone())
+                        .find(|(_, _, id, _, _, _)| id == &target_id)
+                        .map(|(_, l, _, _, _, _)| l.clone())
                         .unwrap_or_else(|| target_id.clone())
                 };
                 let mut header = Vec::new();
@@ -736,8 +736,8 @@ impl ActiveOverlay {
                         &std::collections::HashSet::new(),
                         &mut flat,
                     );
-                    if let Some((_, label, _, _, _)) =
-                        flat.iter().find(|(_, _, id, _, _)| id == &target_id)
+                    if let Some((_, label, _, _, _, _)) =
+                        flat.iter().find(|(_, _, id, _, _, _)| id == &target_id)
                     {
                         let label = label.clone();
                         // Tokens after the id: `<id>`, `<id> switch`,
@@ -3534,7 +3534,7 @@ impl Repl {
             &active_path,
             &mut flat,
         );
-        let idx = flat.iter().position(|(_, _, id, _, _)| id == target_id);
+        let idx = flat.iter().position(|(_, _, id, _, _, _)| id == target_id);
         let (dropped, kept) = match idx {
             Some(i) => (i, flat.len() - i),
             None => (0, flat.len()),
@@ -3567,32 +3567,48 @@ impl Repl {
         }
     }
 
-    /// Per-indent-level background colors for the `/tree` overlay. Indents
-    /// advance by 2 spaces (model response = 2 over a user prompt,
-    /// branching = 4 over a user prompt, 2 over a model response), so
-    /// the level is `indent / 2`. Odd levels get an ochre tint (warm,
-    /// distinct from the default dark-grey panel) and even levels get a
-    /// bluish-grey tint, so deeply-nested branches alternate and never
-    /// blend with the bare panel rows above them. The level-0 row
-    /// (top-level user prompt) stays on the default panel background.
+    /// Per-branch-depth background colours for the `/tree` overlay.
+    /// Unlike turn indent (which advances for every model response),
+    /// `branch_depth` only increments when descending from a node with
+    /// multiple children — so un-branched conversations stay on the
+    /// default panel background (`None`) and only forks get tinted.
+    ///
+    /// The palette alternates dark / light variants so two consecutive
+    /// forks are easy to tell apart, and the warm / cool tints alternate
+    /// in lockstep. All values are intentionally **darker than or equal
+    /// to** the default panel background (`48;5;235` ≈ RGB(38,38,38)):
+    /// the panel stays as the lightest surface in the overlay, and the
+    /// tints sit just below it so the eye reads them as “deeper, not
+    /// louder” rather than as a brighter accent.
+    ///
+    /// Indexing: `(branch_depth - 1) % 4`, so depth 1 picks the first
+    /// entry, depth 2 the second, depth 3 the third, depth 4 the
+    /// fourth, depth 5 cycles back to the first, and so on.
     const TREE_BG_BY_LEVEL: &[&str] = &[
-        // level 0: defaults to the panel BG via None; not used here.
-        "\x1b[48;5;180m", // level 1 — ochre (DarkGoldenrod3)
-        "\x1b[48;5;240m", // level 2 — bluish-grey (Grey3)
+        // Depth 1 — dark warm (subtle ochre, darker than default).
+        "\x1b[48;2;28;26;22m",
+        // Depth 2 — same brightness as default, subtle blue tint.
+        "\x1b[48;2;28;30;38m",
+        // Depth 3 — dark cool (subtle blue, darker than default).
+        "\x1b[48;2;22;24;30m",
+        // Depth 4 — same brightness as default, subtle warm tint.
+        "\x1b[48;2;38;36;30m",
     ];
-    fn tree_row_bg(indent: usize) -> Option<&'static str> {
-        if indent == 0 {
+    fn tree_row_bg(branch_depth: usize) -> Option<&'static str> {
+        if branch_depth == 0 {
             None
         } else {
-            let level = (indent / 2) - 1;
-            Some(Self::TREE_BG_BY_LEVEL[level % Self::TREE_BG_BY_LEVEL.len()])
+            let idx = (branch_depth - 1) % Self::TREE_BG_BY_LEVEL.len();
+            Some(Self::TREE_BG_BY_LEVEL[idx])
         }
     }
 
     /// Build `/tree` overlay rows from a pre-built session tree.
     /// Uses the same `Table` infrastructure as `/session` for consistent
-    /// rendering. Each row carries its own per-level background tint so
-    /// the visual depth of a branch is readable at a glance.
+    /// rendering. Each row carries its own per-branch-depth background
+    /// tint so a forked tree is readable at a glance — un-branched
+    /// conversations stay on the default panel background, and only
+    /// branches are tinted.
     fn tree_overlay_entries(
         tree: &[SessionTreeNode],
         leaf_id: Option<&str>,
@@ -3616,14 +3632,15 @@ impl Repl {
             })
             .unwrap_or_default();
 
-        // Precompute flat entries: (indent, label, entry_id, is_on_active_path, is_current)
-        let mut flat: Vec<(usize, String, String, bool, bool)> = Vec::new();
+        // Precompute flat entries: (indent, label, entry_id, is_on_active_path,
+        // is_current, branch_depth)
+        let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
         Self::flatten_tree_nodes(tree, 0, leaf_id, &active_path, &mut flat);
 
         // Apply text filter (fuzzy match on display labels).
         if !filter.is_empty() {
             let f = filter.to_lowercase();
-            flat.retain(|(_, label, _, _, _)| label.to_lowercase().contains(&f));
+            flat.retain(|(_, label, _, _, _, _)| label.to_lowercase().contains(&f));
         }
 
         if flat.is_empty() {
@@ -3643,13 +3660,13 @@ impl Repl {
             .with_priorities(&[1])
             .set_gap(0);
 
-        for (indent, label, entry_id, is_active, _is_curr) in &flat {
+        for (indent, label, entry_id, is_active, _is_curr, branch_depth) in &flat {
             // Active-path rows get a brighter foreground (`\x1b[22m`
             // — normal intensity) versus `\x1b[2m` (dim) for abandoned
-            // branches. The per-level background tint is applied
+            // branches. The branch-depth background tint is applied
             // separately by `overlay_lines` so the cursor-selected row
             // (which uses BG_SEL) can override it without clashing with
-            // an inner `\x1b[48;5;...m` escape. The marker `*` then
+            // an inner `\x1b[48;2;R;G;Bm` escape. The marker `*` then
             // conveys the leaf / current position, so we don't need a
             // dedicated indicator column.
             let fg = if *is_active { "\x1b[22m" } else { "\x1b[2m" };
@@ -3661,14 +3678,14 @@ impl Repl {
             );
             table.add_row(&[&display]);
             targets.push(entry_id.clone());
-            row_bgs.push(Self::tree_row_bg(*indent));
+            row_bgs.push(Self::tree_row_bg(*branch_depth));
         }
 
         *rows = table.render(avail);
 
         // Highlight current leaf.
         if let Some(lid) = leaf_id {
-            *active = flat.iter().position(|(_, _, id, _, _)| id == lid);
+            *active = flat.iter().position(|(_, _, id, _, _, _)| id == lid);
         }
     }
 
@@ -3689,7 +3706,7 @@ impl Repl {
         indent: usize,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
-        out: &mut Vec<(usize, String, String, bool, bool)>,
+        out: &mut Vec<(usize, String, String, bool, bool, usize)>,
     ) {
         // Precompute id -> display label over the WHOLE tree so compaction
         // rows can resolve their kept entry: `firstKeptEntryId` points to an
@@ -3711,9 +3728,13 @@ impl Repl {
         }
         collect_labels(nodes, &mut labels);
 
+        // branch_depth starts at 0 — the root conversation lives on the
+        // default panel background. The depth only increments when we
+        // descend from a node with multiple children.
         Self::flatten_turns(
             nodes,
             indent,
+            0,
             leaf_id,
             active_path,
             &labels,
@@ -3785,17 +3806,24 @@ impl Repl {
     /// a user prompt and off at the next user prompt / compaction entry;
     /// visible non-user rows while `in_turn` are indented two chars deeper
     /// (the model response sits visibly under its prompt, not flush with
-    /// it). `labels` is the whole-tree id → display-label map used by
+    /// it). `branch_depth` tracks how many branching ancestors sit above
+    /// the current node — it stays the same through a linear chain and
+    /// increments by one when descending from a node with multiple
+    /// children. Used by `tree_overlay_entries` to colour alternating
+    /// branches differently so a forked tree is readable at a glance;
+    /// un-branched conversations stay on the default panel background.
+    /// `labels` is the whole-tree id → display-label map used by
     /// compaction rows to resolve the kept entry.
     #[allow(clippy::too_many_arguments)]
     fn flatten_turns(
         nodes: &[SessionTreeNode],
         indent: usize,
+        branch_depth: usize,
         leaf_id: Option<&str>,
         active_path: &std::collections::HashSet<String>,
         labels: &std::collections::HashMap<String, String>,
         in_turn: &mut bool,
-        out: &mut Vec<(usize, String, String, bool, bool)>,
+        out: &mut Vec<(usize, String, String, bool, bool, usize)>,
     ) {
         for node in nodes {
             let kind = turn_kind(&node.entry);
@@ -3828,8 +3856,22 @@ impl Repl {
                 // Meta entry: skip visual row but still descend, keeping the
                 // SAME row indent (an invisible tool chain stays inside the
                 // turn, and the next visible response stays at turn depth).
+                // Branching status is preserved: descendants of an invisible
+                // branching point are still on a branch.
+                let child_branch_depth = if node.children.len() > 1 {
+                    branch_depth + 1
+                } else {
+                    branch_depth
+                };
                 Self::flatten_turns(
-                    &node.children, indent, leaf_id, active_path, labels, in_turn, out,
+                    &node.children,
+                    indent,
+                    child_branch_depth,
+                    leaf_id,
+                    active_path,
+                    labels,
+                    in_turn,
+                    out,
                 );
                 continue;
             }
@@ -3842,22 +3884,9 @@ impl Repl {
                 node.entry.id.clone(),
                 is_active,
                 is_current,
+                branch_depth,
             ));
 
-            // Children continue the turn flow at the same base indent: the
-            // chain user→assistant→tool→assistant→user is linear, and the
-            // turn depth is derived per node from `in_turn`, never stacked.
-            // Branching points indent their children relative to the
-            // parent's kind:
-            //   - parent is a user prompt: +4
-            //     ("four spaces over user prompts one level up")
-            //   - parent is a model response: +2
-            //     ("two over model responses one level up")
-            //   - parent is a Boundary / meta entry: +4
-            //     (rare — falls through to the user-prompt case)
-            // So a branch from a user prompt at indent 0 and a branch
-            // from a model response at indent 2 land on the same indent
-            // (4) — both consistent with the "user-prompt" rule.
             // Children continue the turn flow at the same base indent: the
             // chain user→assistant→tool→assistant→user is linear, and the
             // turn depth is derived per node from `in_turn`, never stacked.
@@ -3868,13 +3897,29 @@ impl Repl {
             //     branch row at (N+2)+2 = N+4 ("two over model
             //     responses one level up")
             // Both rules land on +4, so a single constant covers both.
+            //
+            // A node with multiple children also increments branch_depth:
+            // its descendants belong to a sub-branch and should take on
+            // the next colour in the alternation.
             let child_indent = if node.children.len() > 1 {
                 indent + 4
             } else {
                 indent
             };
+            let child_branch_depth = if node.children.len() > 1 {
+                branch_depth + 1
+            } else {
+                branch_depth
+            };
             Self::flatten_turns(
-                &node.children, child_indent, leaf_id, active_path, labels, in_turn, out,
+                &node.children,
+                child_indent,
+                child_branch_depth,
+                leaf_id,
+                active_path,
+                labels,
+                in_turn,
+                out,
             );
         }
     }
@@ -6121,7 +6166,7 @@ mod tests {
         // Visible rows: user prompt, the assistant's text before AND after
         // the tool call (both are response text), then the second user
         // prompt. NO tool-call/tool-result rows.
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         assert_eq!(labels.len(), 4, "got: {:?}", labels);
         assert!(labels[0].contains("first prompt"));
         assert!(labels[1].contains("partial answer"));
@@ -6134,7 +6179,7 @@ mod tests {
         // prompt (the model response sits visibly under its prompt, not
         // flush with it); the indent persists across the invisible
         // tool-call/tool-result chain between the two text segments.
-        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _)| *i).collect();
+        let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _, _)| *i).collect();
         assert_eq!(indents, vec![0, 2, 2, 0], "got: {:?}", out);
     }
 
@@ -6151,7 +6196,7 @@ mod tests {
         )];
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         assert_eq!(labels.len(), 2, "got: {:?}", labels);
         assert!(labels[0].contains("prompt"));
         assert!(labels[1].contains("done"));
@@ -6174,7 +6219,7 @@ mod tests {
         )];
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("c1"), &std::collections::HashSet::new(), &mut out);
-        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _)| l.clone()).collect();
+        let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
         let compaction_row = labels
             .iter()
             .find(|l| l.contains("\x1b[33m") && l.contains("compaction"))
@@ -6211,15 +6256,15 @@ mod tests {
         Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
         let branch_rows: Vec<usize> = out
             .iter()
-            .filter(|(_, l, _, _, _)| l.contains("branch"))
-            .map(|(i, _, _, _, _)| *i)
+            .filter(|(_, l, _, _, _, _)| l.contains("branch"))
+            .map(|(i, _, _, _, _, _)| *i)
             .collect();
         assert_eq!(branch_rows, vec![4, 4]); // base 2 (assistant in turn) + branch indent 4
         // The fork point itself stays at turn depth (+2: assistant in turn).
         let fork_indent = out
             .iter()
-            .find(|(_, l, _, _, _)| l.contains("fork point"))
-            .map(|(i, _, _, _, _)| *i)
+            .find(|(_, l, _, _, _, _)| l.contains("fork point"))
+            .map(|(i, _, _, _, _, _)| *i)
             .unwrap();
         assert_eq!(fork_indent, 2);
     }
@@ -6265,15 +6310,19 @@ mod tests {
 
     #[test]
     fn tree_row_bg_alternates_by_indent_level() {
-        // Top-level (indent=0) gets None (default panel BG).
+        // branch_depth == 0 (the root conversation) gets None — the
+        // row stays on the default panel background, no tint.
         assert_eq!(Repl::tree_row_bg(0), None);
-        // Level 1 (model response at indent=2, or branch from indent=0):
-        // ochre.
-        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;5;180m"));
-        // Level 2 (indent=4): bluish-grey.
-        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;5;240m"));
-        // Level 3 (indent=6): ochre again — alternation continues.
-        assert_eq!(Repl::tree_row_bg(6), Some("\x1b[48;5;180m"));
+        // Depth 1: dark warm.
+        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;2;28;26;22m"));
+        // Depth 2: same brightness as default, subtle blue tint.
+        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;2;28;30;38m"));
+        // Depth 3: dark cool.
+        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;2;22;24;30m"));
+        // Depth 4: same brightness as default, subtle warm tint.
+        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;2;38;36;30m"));
+        // Depth 5 wraps back to dark warm (depth 1).
+        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;2;28;26;22m"));
     }
 
     #[test]
@@ -6316,17 +6365,73 @@ mod tests {
             &mut active,
         );
         assert_eq!(rows.len(), row_bgs.len());
-        // root (indent 0): no BG
+        // Root user prompt (depth 0) — default panel background.
         assert_eq!(row_bgs[0], None);
-        // assistant response (indent 2): ochre
-        assert_eq!(row_bgs[1], Some("\x1b[48;5;180m"));
-        // two branch children (indent 4): bluish-grey
-        assert_eq!(row_bgs[2], Some("\x1b[48;5;240m"));
-        assert_eq!(row_bgs[3], Some("\x1b[48;5;240m"));
+        // Assistant response is still in the SAME conversation as the
+        // root user prompt (no branching happened yet), so it stays on
+        // the default background even though it's indented.
+        assert_eq!(row_bgs[1], None);
+        // Two branch children of the fork point — depth 1.
+        assert_eq!(row_bgs[2], Some("\x1b[48;2;28;26;22m"));
+        assert_eq!(row_bgs[3], Some("\x1b[48;2;28;26;22m"));
         // No more leading whitespace in the rendered top-level label:
         // previously `display_indent = indent + 1` prepended an extra
         // space at the top level.
         assert!(rows[0].starts_with("\x1b[22mprompt") || rows[0].starts_with("\x1b[2mprompt"));
+    }
+
+    #[test]
+    fn tree_list_branch_depth_tracks_fork_only() {
+        // branch_depth only increments at branching nodes (a node with
+        // multiple children). Within an un-branched turn — even with a
+        // nested model response — every row sits at the same depth, so
+        // a linear conversation gets NO background tint (all rows on
+        // the default panel background).
+        let chain = attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "first answer"),
+                attach(
+                    tree_entry("m1", Some("a0"), "user", "second prompt"),
+                    tree_entry("a1", Some("m1"), "assistant", "second answer"),
+                ),
+            ),
+        );
+        let tree = vec![chain];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, None, &std::collections::HashSet::new(), &mut out);
+        let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
+        assert_eq!(depths, vec![0, 0, 0, 0], "got: {out:?}");
+
+        // Forks, by contrast, push their children one depth deeper:
+        // m0 → a0 (depth0) → [m1 (depth1) | m2 (depth1)]
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "prompt"),
+            fork,
+        )];
+        let mut out = Vec::new();
+        Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
+        let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
+        // m0, a0 stay at depth 0 (the conversation so far).
+        // m1 and m2 (the branches) sit at depth 1.
+        assert_eq!(depths, vec![0, 0, 1, 1], "got: {out:?}");
     }
 
     #[test]
