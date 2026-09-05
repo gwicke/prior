@@ -754,8 +754,13 @@ pub(crate) fn extract_messages(entries: &[SessionEntry]) -> Vec<Message> {
 ///
 /// Latest compaction on the branch (closest to leaf) scopes the context to:
 /// `[summary (if non-empty)] + [firstKeptEntryId .. compaction) +
-/// [post-compaction]`. The compaction entry itself is never included; older
-/// compactions inside the kept range project their (non-empty) summaries.
+/// [post-compaction]`. The compaction entry itself is never included;
+/// **all** other `Compaction` entries in the kept range are stepped over
+/// silently (no summary message emitted for them either). This deliberately
+/// diverges from pi (which emits each older compaction's summary as its own
+/// `compactionSummary` user message) to avoid confusing redundant
+/// compaction content mid-turn. See `doc/nested_compactions.md` for the
+/// rationale.
 pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
     // Find the most recent compaction entry (closest to leaf) — pi keeps
     // the latest compaction on the path active.
@@ -772,7 +777,7 @@ pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<Ses
         _ => None,
     });
 
-    let Some((compaction_id, summary, first_kept_id)) = compaction else {
+    let Some((_compaction_id, summary, first_kept_id)) = compaction else {
         return entries; // no compaction → full branch
     };
 
@@ -790,21 +795,20 @@ pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<Ses
         result.push(compaction_summary_message(&summary));
     }
 
-    // Kept range: firstKeptEntryId .. end, with the latest compaction
-    // entry itself excluded (already represented above; never sent as
-    // itself).
+    // Kept range: firstKeptEntryId .. end, with **every** compaction
+    // entry dropped silently — the latest (already represented by the
+    // summary message at the front), and any nested ones in the kept
+    // range. Nested compactions represent superseded boundaries; their
+    // summary text is intentionally invisible to the runtime LLM context
+    // to avoid mid-turn redundancy. Information from them is preserved
+    // via the new compaction's own `previousSummary`-injected
+    // summarization step (see `run_compaction_at_point`).
     for entry in &entries[keep_idx..] {
-        if entry.id == compaction_id {
-            continue;
-        }
         match &entry.content {
-            // Older compaction inside the kept range → its own summary
-            // message (pi behavior for repeated compactions); an empty
-            // summary is dropped entirely.
-            SessionEntryContent::Compaction { summary, .. } if !summary.is_empty() => {
-                result.push(compaction_summary_message(summary));
+            SessionEntryContent::Compaction { .. } => {
+                // Skip the latest compaction (already represented above)
+                // and any older nested compactions (step over silently).
             }
-            SessionEntryContent::Compaction { .. } => {}
             _ => result.push(entry.clone()),
         }
     }
@@ -2088,13 +2092,18 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_compaction_transforms_repeated_compaction_keeps_older_summary() {
-        // Two compactions: the latest (c2) scopes from m3; the older (c1) with
-        // a non-empty summary lives INSIDE the kept range (between m3 and c2)
-        // and projects its own pi-wrapped summary message (pi repeated-
-        // compaction behavior).
-        // [m0 m1 m2 m3 C1{firstKept:m0, summary:"early"} m4 C2{firstKept:m3, summary:""} m5]
-        // → [m3, summary("early"), m4, m5]
+    fn test_apply_compaction_transforms_nested_compaction_steps_over_older_summary() {
+        // Two compactions: the latest (c2) scopes from m3; the older (c1)
+        // with a non-empty summary lives INSIDE the kept range (between m3
+        // and c2). Under the new design (doc/nested_compactions.md), c1 is
+        // stepped over silently — its summary text is NOT re-emitted as a
+        // mid-turn user message. c2's summary is empty so no front
+        // summary message either. Result: just [m3, m4, m5].
+        //
+        // Branch:
+        //   [m0 m1 m2 m3 C1{firstKept:m0, summary:"early"} m4 C2{firstKept:m3, summary:""} m5]
+        // Result:
+        //   [m3, m4, m5]
         let entries = vec![
             user_msg("m0", "a", None),
             user_msg("m1", "b", Some("m0")),
@@ -2107,14 +2116,59 @@ mod tests {
         ];
         let out = apply_compaction_transforms(entries);
         let ids: Vec<&str> = out.iter().map(|e| e.id.as_str()).collect();
-        // m3 (firstKept of c2), then the older c1 summary message, then m4, m5.
-        assert_eq!(ids.len(), 4);
-        assert_eq!(ids[0], "m3");
-        assert_eq!(ids[3], "m5");
-        // The second context message is the c1 pi-wrapped summary.
+        // Only the kept-range messages; both compaction entries (c1, c2)
+        // are absent.
+        assert_eq!(ids, ["m3", "m4", "m5"]);
+        // Defensive: ensure c1's "early" text did NOT leak into the result
+        // as a summary message.
         let msgs = extract_messages(&out);
-        assert_eq!(msgs.len(), 4);
-        assert_eq!(first_user_text(&msgs[1..]), "The conversation history before this point was compacted into the following summary:\n\n<summary>\nearly\n</summary>");
+        assert_eq!(msgs.len(), 3);
+        for m in &msgs {
+            if let Message::User { content } = m {
+                for c in content {
+                    if let UserContent::Text(t) = c {
+                        assert!(
+                            !t.text.contains("early"),
+                            "older compaction summary text leaked into runtime context: {}",
+                            t.text
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_compaction_transforms_triple_nested_only_latest_summary_emitted() {
+        // Three nested compactions. The latest (c3) scopes from m5; c1 and
+        // c2 live inside the kept range with non-empty summaries. Under the
+        // new design, only c3's summary is emitted at the front; c1 and c2
+        // are stepped over silently.
+        //
+        // Branch:
+        //   [m0 m1 m2 m3 C1{firstKept:m0, summary:"s1"} m4 C2{firstKept:m2, summary:"s2"} m5 C3{firstKept:m5, summary:"s3"} m6]
+        // Result:
+        //   [summary("s3"), m5, m6]   — c1 and c2 stepped over
+        let entries = vec![
+            user_msg("m0", "a", None),
+            user_msg("m1", "b", Some("m0")),
+            user_msg("m2", "c", Some("m1")),
+            user_msg("m3", "d", Some("m2")),
+            compaction_entry("c1", "s1", "m0", 64, Some("m3")),
+            user_msg("m4", "e", Some("c1")),
+            compaction_entry("c2", "s2", "m2", 64, Some("m4")),
+            user_msg("m5", "f", Some("c2")),
+            compaction_entry("c3", "s3", "m5", 96, Some("m5")),
+            user_msg("m6", "g", Some("c3")),
+        ];
+        let out = apply_compaction_transforms(entries);
+        let msgs = extract_messages(&out);
+        assert_eq!(msgs.len(), 3, "summary(s3) + m5 + m6");
+        // First message is the c3 summary wrapper.
+        assert!(first_user_text(&msgs).contains("s3"));
+        // Defensive: c1 and c2 summary text must not leak.
+        assert!(!first_user_text(&msgs).contains("s1"));
+        assert!(!first_user_text(&msgs).contains("s2"));
     }
 
     #[test]
