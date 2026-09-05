@@ -22,7 +22,7 @@ Phases implemented:
       the empty-dropped-span no-op case. Multi-mode interop verified:
       truncate / text-only / llm all re-compact correctly over a session
       whose leaf is already a compaction.
-- [ ] **D. Update `doc/tree_compaction.md`** to describe the new semantics
+- [x] **D. Update `doc/tree_compaction.md`** to describe the new semantics
       and update the default `llm_compact_prompt`.
 
 No schema change: `SessionEntryContent::Compaction` keeps its
@@ -107,8 +107,8 @@ Composed prompt (in LLM mode only):
 ```
 
 The user-controlled `user_prompt` is the primary instruction. The default
-`llm_compact_prompt` should mention the `--- PREVIOUS SUMMARY ---` section
-so users get merge behaviour by default.
+`llm_compact_prompt` now mentions the `--- PREVIOUS SUMMARY ---` section so
+users get merge behaviour by default.
 
 ### C. Drop the leaf-is-compaction guard (done)
 
@@ -129,7 +129,7 @@ whose `first_kept_entry_id` equals the leaf's structure — matching pi
   skips `Compaction` entries in the dropped span (session.rs), so a nested
   compaction's summary text never leaks into a new text-only summary.
 - **Llm**: unaffected by the guard removal; still errors on an empty dropped
-  span and (Phase B, pending) will inject `previousSummary`.
+  span and (Phase B) injects `previousSummary` into the summarizer prompt.
 
 `previousSummary` injection (Phase B) applies only to the **LLM** mode.
 Truncate and text-only are deterministic / non-generative: truncate writes no
@@ -137,15 +137,14 @@ summary, and text-only re-derives its summary from the raw `Message` entries
 in the dropped span (which still physically exist in the session file), so
 neither needs to thread a prior compaction's summary forward.
 
-### D. Documentation updates (pending)
+### D. Documentation updates (done)
 
-- **`doc/tree_compaction.md`** §3 (Context scoping) and §4 (Repeated
-  compactions): rewrite to describe the new semantics — step over nested
-  compactions; `previousSummary` injection rule.
-- **`doc/tree_compaction.md`** §4.2 (Leaf guard): replace the guard
-  paragraph with a note explaining its removal.
-- **`settings.toml.example`** / default `llm_compact_prompt`: update to
-  mention the `--- PREVIOUS SUMMARY ---` section.
+- **`doc/tree_compaction.md`** §4 (Repeated compactions) rewritten to describe
+  the new semantics (step over nested compactions; `previousSummary`
+  injection; guard removal). The Phase 1 code sketch and edge-case tables
+  carry `NOTE (superseded)` markers pointing here.
+- **`settings.toml.example`** and the built-in default `llm_compact_prompt`
+  now mention the `--- PREVIOUS SUMMARY ---` section.
 
 ## Cross-tool fidelity
 

@@ -173,7 +173,23 @@ pi (`prepareCompaction`, `compaction.ts:633`):
   summary messages (in path order), so context can contain several
   `compactionSummary` messages.
 
-picocode's `apply_transforms` must match this (see Phase 1).
+**picocode's divergence (documented in `doc/nested_compactions.md`):**
+
+- **Runtime context steps over nested compactions.** `apply_compaction_transforms`
+  drops **every** `Compaction` entry inside the kept range silently — both the
+  latest (represented by the front summary message) and any older nested
+  compactions. Only the latest compaction's `summary` appears as a
+  `compactionSummary` user message at the front of the context. Older
+  summaries are not re-emitted mid-turn.
+- **LLM compaction mode merges `previousSummary`.** When re-compacting, the
+  summarizer receives the deepest prior compaction's `summary` whose
+  `first_kept_entry_id` is *strictly before* the new target (strict-before
+  rule — see `doc/nested_compactions.md` phase B), as a `--- PREVIOUS SUMMARY ---`
+  section. This makes iterative re-compaction lossless.
+- **The leaf-is-compaction guard is removed.** Compacting a session whose
+  leaf is already a `Compaction` entry is allowed; the LLM-mode
+  "nothing before the current position" guard still covers the empty-dropped-
+  span no-op case.
 
 ### 5. Replay
 
@@ -339,6 +355,10 @@ fn apply_transforms(&self, entries: Vec<SessionEntry>) -> Vec<SessionEntry> {
 
     // Kept range: firstKeptEntryId .. end, with the latest compaction entry
     // itself excluded (already represented above; never sent as itself).
+    // NOTE (superseded): the sketch below emits older nested compactions as
+    // their own summary messages (pi behavior). The implemented
+    // `apply_compaction_transforms` now steps over ALL nested compactions
+    // silently — see doc/nested_compactions.md phase A.
     for entry in &entries[keep_idx..] {
         if entry.id == compaction_id {
             continue;
@@ -589,6 +609,11 @@ if input.starts_with("/tree") {
             let Some(ref s) = session else { continue };
             let old_leaf_id = s.get_leaf_id().await;
 
+            // NOTE (superseded): the leaf-is-compaction guard below was part
+            // of the original design but has been REMOVED — see
+            // doc/nested_compactions.md phase C. Compacting a session whose
+            // leaf is already a Compaction entry is now allowed (the
+            // LLM-mode empty-dropped-span guard covers the no-op case).
             // pi: refuse to compact when the leaf IS a compaction entry.
             if let Some(id) = &old_leaf_id {
                 if let Some(entry) = s.get_entry(id).await {
@@ -631,8 +656,10 @@ if input.starts_with("/tree") {
 
 Notes:
 
-- The leaf-is-compaction guard mirrors pi's `prepareCompaction` early return
-  (`compaction.ts:637`): don't stack a compaction directly on a compaction.
+- The leaf-is-compaction guard in the code sketch above is **superseded**:
+  it was removed in doc/nested_compactions.md phase C (pi's
+  `prepareCompaction` at `compaction.ts:637` refuses only when the dropped
+  span is empty; the picocode LLM-mode guard covers that no-op case).
 - `append_compaction` advances the leaf; the very next turn's
   `append_message` uses `index.leaf_id` as parent, so **subsequent turns are
   appended in the session after the compaction entry** (requirement ✓).
@@ -1245,6 +1272,9 @@ TreeAction::Compact => {
     let Some(ref s) = session else { /* error: no session */ continue };
     let old_leaf_id = s.get_leaf_id().await;
 
+    // NOTE (superseded): the pi-parity leaf-is-compaction refusal was
+    // removed in doc/nested_compactions.md phase C. The LLM-mode
+    // empty-dropped-span guard below covers the no-op case.
     // pi parity: refuse if the leaf IS a compaction entry.
     if let Some(id) = &old_leaf_id {
         if let Some(entry) = s.get_entry(id).await {
@@ -1482,9 +1512,9 @@ to use (`/set <key> <free-text-value>` is the closest precedent).
 | --- | --- |
 | `target_id` not on the current branch | Validate with `get_entry` before writing; error message, session unchanged (avoids a silently no-op compaction). |
 | `target_id` == current leaf | Appending a compaction with `firstKeptEntryId` = leaf scopes to the last entry only; allowed but pointless. Consider warning "nothing before this point" — decide in review. |
-| Leaf is already a compaction entry | Refuse (pi parity: `prepareCompaction` early return). |
+| Leaf is already a compaction entry | Allowed (guard removed — see doc/nested_compactions.md phase C). `Truncate`/`TextOnly` write a fresh compaction; `Llm` on an empty dropped span is still refused by the "nothing before the current position" guard. |
 | Empty `summary` in context | No summary message emitted (documented divergence from pi's empty wrapper). |
-| Repeated compactions | Latest compaction scopes; older ones inside kept range become their own summary messages (pi parity). |
+| Repeated compactions | Latest compaction scopes the context; older nested compactions inside the kept range are **stepped over** (not re-emitted — see doc/nested_compactions.md phase A). LLM compaction mode injects the prior summary as `--- PREVIOUS SUMMARY ---` (phase B). |
 | Session written by pi, read by picocode (and vice versa) | Schema identical; `build_index`/`get_path_to_root` treat compaction as a normal node; `build_context` scopes. Verify with round-trip test (below). |
 | `firstKeptEntryId` missing on branch | `apply_transforms` falls back to the full branch (defensive, matches pi's graceful handling). |
 | `tokensBefore` accuracy | Heuristic only; used for the sub-menu header display and future prompts — no correctness dependency. Header and written value come from the same `estimate_context_tokens(build_context())` call. |
@@ -1492,14 +1522,14 @@ to use (`/set <key> <free-text-value>` is the closest precedent).
 | `NavigateTree` removal | Only emitter is `repl.rs:1344`; grep after editing. |
 | Phase 6 — LLM compaction: `<entry-id>` has no predecessor | **Done.** Refuse: `Cannot compact: nothing before this point`. |
 | Phase 6 — LLM compaction: `<entry-id>` == current leaf | **Done.** Refuse: `Cannot compact: nothing before the current position`. |
-| Phase 6 — LLM compaction: leaf is already a compaction | **Done.** Refuse (Phase 5 parity, plus it would scope the LLM's context to the already-scoped summary span). |
+| Phase 6 — LLM compaction: leaf is already a compaction | **Superseded.** The refusal was removed (doc/nested_compactions.md phase C); the empty-dropped-span guard still protects the no-op case. |
 | Phase 6 — LLM compaction: `agent.summarize` fails | **Done.** Restore `old_leaf_id` before surfacing the error; session unchanged (no compaction entry appended). |
 | Phase 6 — LLM compaction: empty/whitespace response | **Done.** Soft-fail: `Summary was empty; nothing written.`; restore leaf; do not append. |
 | Phase 6 — LLM compaction: panic/unwind during `summarize` | Documented failure path is the only safety net; no Drop guard implemented. |
 | Phase 7 — `/compact` with no user message on the active branch | `from_buffer` returns `ActiveOverlay::None` (silent). Mirrors the no-leaf behavior; user can `!cmd` or `/new` to bootstrap. |
 | Phase 7 — `/compact` mid-turn (leaf is a user prompt, no response yet) | `last_user_message_id_on_active_branch` returns the leaf id; dropped span = everything before the leaf; kept range starts with the prompt. |
 | Phase 7 — `/compact` at the root (single user message, no response) | `Truncate` / `TextOnly` are legal no-ops on an empty dropped span; `Llm` refuses (`Err("nothing before this point")`). |
-| Phase 7 — last user message is itself a compaction | The existing compaction-refuse check in the main loop fires (`Cannot compact: the session was already compacted at this point`). |
+| Phase 7 — last user message is itself a compaction | **Superseded.** The compaction-refuse check was removed (doc/nested_compactions.md phase C); `/compact` now resolves normally and may write a new compaction over a compaction leaf. |
 
 ## Phase 7 — Compaction unification: shared `run_compaction` + `/compact`
 
@@ -1665,7 +1695,7 @@ follow-up.
 | Active branch has no user message (empty session) | `from_buffer` returns `ActiveOverlay::None` (silent; same as the no-leaf path). |
 | Current leaf is a user message (mid-turn, no response yet) | `last_user_message_id_on_active_branch` returns the leaf id. The dropped span = everything before the leaf (the prior turns). The kept range starts with the user's prompt. |
 | Current leaf is the assistant's last response | Resolves to the user prompt immediately before it. The dropped span = everything before that prompt; the kept range = [user prompt, assistant response, ..., leaf]. |
-| Last user message is itself a compaction entry | The compaction-refuse check in the main loop still fires (`Cannot compact: the session was already compacted at this point`). |
+| Last user message is itself a compaction entry | **Superseded.** The refusal was removed (doc/nested_compactions.md phase C); compaction over a compaction leaf resolves normally. |
 | `/compact llm` at the start of the conversation | Empty dropped span → `Err("nothing before this point")` (same as `/tree <root> compact llm`). The other two modes are no-ops on an empty dropped span but still legal. |
 
 ---
@@ -1673,8 +1703,9 @@ follow-up.
 ## Test plan
 
 1. **`apply_transforms` unit tests** (`session.rs`) — **done**: empty-summary scoping;
-   non-empty pi-wrapper message; repeated compaction (older summary kept);
-   missing `firstKeptEntryId` fallback; compaction entry never in output.
+   non-empty pi-wrapper message; nested compaction stepped over; triple-nested
+   only-latest-summary; missing `firstKeptEntryId` fallback; compaction entry
+   never in output.
 2. **Serialization cross-compat**: assert picocode writes
    `{"type":"compaction",…,"firstKeptEntryId":…,"tokensBefore":…}` byte-compatible
    with the pi sample in `session-format.md`; parse pi's sample line into
