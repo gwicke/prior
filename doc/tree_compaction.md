@@ -1177,6 +1177,18 @@ default `Some(0)` (truncate). This is purely a UI affordance; the handler
 in `handle_enter` also self-checks the buffer via
 `llm_compact_buffer_is_canonical` so the staged line is always honored.
 
+`from_buffer`'s first-word promotion sets the overlay's `active` row. The
+`read_input` loop then **moves the actual cursor to `active`** for the tree
+action sub-menus (`TreeAction`/`SwitchAction`/`CompactSummary`) whenever the
+menu opens or the buffer re-derives a different `active`
+(`Repl::cursor_sel_policy`). This closes the gap where restoring
+`/tree <id> compact llm <payload>` from history (or typing it) left the
+cursor on row 0 (`truncate`) even though `llm` was marked `*` — Enter would
+have committed `truncate`. Now the cursor follows the prompt's spelled-out
+mode, so Enter on a restored `/tree <id> compact llm <payload>` runs the
+LLM compaction. Arrow keys still win: they change only `sel`, not `active`,
+so a stable `active` leaves the cursor where the user moved it.
+
 #### `handle_tab`
 
 Tab on the `llm` row fills `/tree <{}> compact llm <default prompt>` —

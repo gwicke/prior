@@ -1927,6 +1927,7 @@ impl Repl {
         let mut path_completions: Vec<String> = Vec::new();
         let mut completion_pos: Option<(usize, usize)> = None;
         let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
+        let mut last_active: Option<usize> = None; // last frame's `active` row (see `cursor_sel_policy`)
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -2072,20 +2073,44 @@ impl Repl {
             let overlay = ActiveOverlay::from_buffer(
                 &editor.text(), ctx, settings, help_view, &path_completions,
             );
-            // Reset sel when the overlay kind changes (discriminant comparison).
+            // Hoisted before the sel-reset so `active` (the menu's
+            // default/current-state row) can drive the cursor policy below.
+            let (title, raw_opts, active, wrap) = overlay.display_rows();
             let cur_disc = overlay.overlay_disc();
+            // Buffer-derived option sub-menus expose `active` as the row the
+            // typed prompt spells out (e.g. `/tree <id> compact llm <payload>`
+            // pre-selects `llm`; `/tree <id> switch --summarize` pre-selects
+            // `summarize`). When such a menu opens, or the buffer re-derives a
+            // different `active`, the cursor follows it so Enter acts on the
+            // canonical line the prompt names — otherwise restoring such a
+            // prompt from history and pressing Enter would commit the default
+            // first row (e.g. `truncate`) instead. Arrow navigation is
+            // preserved: arrows change only `sel`, never `active`, so a stable
+            // `active` leaves the cursor where the user put it.
+            let follows_active = matches!(
+                overlay,
+                ActiveOverlay::TreeAction { .. }
+                    | ActiveOverlay::SwitchAction { .. }
+                    | ActiveOverlay::CompactSummary { .. }
+            );
+            // The /tree list seeds its cursor on the current position (the
+            // leaf row) when it opens, but does NOT follow later filter
+            // re-derivations (that would yank the cursor as the user types a
+            // search term). The action sub-menus seed AND follow `active`.
+            let is_tree_list = matches!(overlay, ActiveOverlay::Tree { .. });
+            let (new_sel, new_last_active) = Self::cursor_sel_policy(
+                active,
+                cur_disc != last_disc,
+                is_tree_list || follows_active,
+                follows_active,
+                last_active,
+                sel,
+            );
+            sel = new_sel;
+            last_active = new_last_active;
             if cur_disc != last_disc {
-                // When the /tree list opens, start the cursor on the current
-                // position (the leaf row, reported as `active`) instead of the
-                // top — otherwise the user has to search for where they are.
-                // The overlay window then scrolls to keep that row in view.
-                sel = match &overlay {
-                    ActiveOverlay::Tree { active: Some(a), .. } => *a,
-                    _ => 0,
-                };
                 last_disc = cur_disc;
             }
-            let (title, raw_opts, active, wrap) = overlay.display_rows();
             let title = title.to_string();
             let opts = raw_opts;
             let max_sel = opts.len().saturating_sub(1);
@@ -2386,6 +2411,57 @@ impl Repl {
         } else {
             sel.saturating_sub(avail / 2).min(overlay_len - avail)
         }
+    }
+
+    /// Cursor policy for buffer-derived option menus (`read_input`).
+    ///
+    /// `active` is the overlay's current-state / default row as re-derived
+    /// from the typed buffer on every keystroke. Two cases seed the cursor
+    /// from `active`:
+    ///
+    /// - **On open** (`disc_changed`): a freshly-opened menu whose default
+    ///   is meaningful (the /tree list seeding on the current leaf row, or a
+    ///   tree action sub-menu whose `active` names the mode the prompt
+    ///   already spells out, e.g. `/tree <id> compact llm <payload>` →
+    ///   `llm`) starts the cursor on that row. Without this, restoring such a
+    ///   prompt from history leaves the cursor on row 0 and Enter commits
+    ///   the wrong option.
+    /// - **On re-derivation** (`follow_changes`): when the buffer changes
+    ///   within the same menu and `active` moves to a different row (the
+    ///   user typed `switch --summarize` or `compact llm …`), the cursor
+    ///   follows it.
+    ///
+    /// Arrow navigation stays intact: arrows modify only `sel`, never the
+    /// buffer, so `active` is unchanged on the next frame and the cursor is
+    /// left where the user put it.
+    ///
+    /// `seed_on_open` and `follow_changes` are separate because the /tree
+    /// *list* seeds on the leaf row when it opens but must not yank the
+    /// cursor as the user types a fuzzy search term, whereas the tree action
+    /// sub-menus seed and follow.
+    fn cursor_sel_policy(
+        active: Option<usize>,
+        disc_changed: bool,
+        seed_on_open: bool,
+        follow_changes: bool,
+        last_active: Option<usize>,
+        sel: usize,
+    ) -> (usize, Option<usize>) {
+        let new_sel = if disc_changed {
+            if seed_on_open {
+                active.unwrap_or(0)
+            } else {
+                0
+            }
+        } else if follow_changes && active != last_active {
+            // The typed buffer re-derived a different default row; follow it.
+            active.unwrap_or(sel)
+        } else {
+            sel
+        };
+        // Track the frame's `active` regardless (only consulted when
+        // `follow_changes` is true on a later frame).
+        (new_sel, active)
     }
 
     /// Echo a committed-invocation `line` to the transcript (a record of the
@@ -7088,6 +7164,171 @@ mod tests {
         // Row 2 uses bluish-grey.
         let line2 = out.lines().nth(3).unwrap_or("");
         assert!(line2.contains("\x1b[48;5;240m"), "got: {line2:?}");
+    }
+
+    #[test]
+    fn cursor_sel_policy_seeds_on_open_when_seed_enabled() {
+        // Menu opens (disc change) with a buffer-derived default row (the
+        // `/tree <id> compact llm <payload>` case → `active` = llm index 2).
+        // The cursor must land there, not on row 0.
+        let (sel, _last) = Repl::cursor_sel_policy(
+            Some(2), true, true, true, None, 0,
+        );
+        assert_eq!(sel, 2);
+    }
+
+    #[test]
+    fn cursor_sel_policy_open_without_seed_keeps_zero() {
+        // Value pickers (model etc.) don't seed from `active` on open.
+        let (sel, _last) = Repl::cursor_sel_policy(
+            Some(5), true, false, false, None, 0,
+        );
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn cursor_sel_policy_follows_active_change_within_menu() {
+        // Same menu, but the user typed a mode token so `active` moved from
+        // 0 (truncate default) to 2 (llm). The cursor follows.
+        let (sel, last) = Repl::cursor_sel_policy(
+            Some(2), false, true, true, Some(0), 0,
+        );
+        assert_eq!(sel, 2);
+        assert_eq!(last, Some(2));
+    }
+
+    #[test]
+    fn cursor_sel_policy_arrow_navigation_is_preserved() {
+        // `active` unchanged (the buffer did not change) → the cursor stays
+        // where the user arrowed it (e.g. sel=0 while active is still 2).
+        let (sel, last) = Repl::cursor_sel_policy(
+            Some(2), false, true, true, Some(2), 0,
+        );
+        assert_eq!(sel, 0);
+        assert_eq!(last, Some(2));
+    }
+
+    #[test]
+    fn cursor_sel_policy_tree_list_seeds_on_open_but_does_not_follow_filters() {
+        // /tree list: seed the cursor on the current leaf when the list
+        // opens (seed_on_open = true)…
+        let (sel, last) = Repl::cursor_sel_policy(
+            Some(4), true, true, false, None, 0,
+        );
+        assert_eq!(sel, 4);
+        assert_eq!(last, Some(4));
+        // …but typing a filter that moves `active` must NOT yank the cursor
+        // (follow_changes = false).
+        let (sel, _last) = Repl::cursor_sel_policy(
+            Some(1), false, true, false, Some(4), 4,
+        );
+        assert_eq!(sel, 4);
+    }
+
+    #[test]
+    fn compact_llm_enter_submits_canonical_buffer_when_llm_selected() {
+        // Simulates restoring `/tree <id> compact llm <payload>` from history
+        // and pressing Enter. from_buffer pre-selects llm (active index 2);
+        // cursor_sel_policy seeds the cursor onto it; handle_enter must then
+        // commit + submit the canonical buffer verbatim (NOT truncate).
+        let buf = "/tree <root-entry> compact llm Summarize this";
+        let ov = tree_overlay(buf);
+        let (_title, opts, active, _) = ov.display_rows();
+        let sel = Repl::cursor_sel_policy(active, true, true, true, None, 0).0;
+        assert_eq!(active, Some(2));
+        assert_eq!(sel, 2);
+        let label = opts.get(sel).expect("opts row").as_str();
+        assert_eq!(label, "llm");
+
+        let mut editor = LineEditor::from_text(buf);
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let mut settings = settings;
+        let output = crate::output::NoOutput;
+        let redraw = |_: &LineEditor, _: &[&str], _: usize, _: &mut usize| {};
+        let mut input_row = 0usize;
+        let mut dirty = false;
+        let mut value_error: Option<String> = None;
+        let mut help_view = false;
+        let action = ov.handle_enter(
+            sel,
+            &mut editor,
+            &output,
+            &redraw,
+            &mut input_row,
+            &mut settings,
+            &mut dirty,
+            &mut value_error,
+            &mut help_view,
+        );
+        match action {
+            OverlayAction::Action(InputAction::Submit(line)) => {
+                assert_eq!(line, buf);
+            }
+            _ => panic!("expected Submit(buf)"),
+        }
+    }
+
+    #[test]
+    fn compact_llm_tab_from_active_row_stages_default_prompt() {
+        // Typing `/tree <id> compact llm ` (no payload): the mode is
+        // pre-selected (active=llm) but the buffer is not yet canonical, so
+        // handle_enter stages the default prompt for editing (per
+        // doc/tree_compaction.md §6.7) instead of submitting.
+        let buf = "/tree <root-entry> compact llm";
+        let ov = tree_overlay(buf);
+        let (_title, opts, active, _) = ov.display_rows();
+        let sel = Repl::cursor_sel_policy(active, true, true, true, None, 0).0;
+        assert_eq!(active, Some(2));
+        assert_eq!(opts[sel], "llm");
+
+        let mut editor = LineEditor::from_text(buf);
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: "default summarize".into(),
+            path: None,
+        };
+        let mut settings = settings;
+        let output = crate::output::NoOutput;
+        let redraw = |_: &LineEditor, _: &[&str], _: usize, _: &mut usize| {};
+        let mut input_row = 0usize;
+        let mut dirty = false;
+        let mut value_error: Option<String> = None;
+        let mut help_view = false;
+        let action = ov.handle_enter(
+            sel,
+            &mut editor,
+            &output,
+            &redraw,
+            &mut input_row,
+            &mut settings,
+            &mut dirty,
+            &mut value_error,
+            &mut help_view,
+        );
+        match action {
+            OverlayAction::Continue => {
+                assert_eq!(editor.text(), "/tree <root-entry> compact llm default summarize");
+            }
+            _ => panic!("expected Continue (stage default prompt)"),
+        }
     }
 
     #[test]
