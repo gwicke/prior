@@ -3398,6 +3398,36 @@ impl Repl {
         walk(nodes, id)
     }
 
+    /// Walk the tree looking for a node whose `id` matches, and return
+    /// that node's `parent_id`. Returns `None` if `id` is not in the
+    /// tree or if the matching node has no parent (a root).
+    ///
+    /// Used by `tree_overlay_entries` to walk the parent_id chain when
+    /// the leaf itself is invisible in the list (a tool-result or a
+    /// tool-call-only assistant segment that doesn't produce a row) —
+    /// we walk up until we find an ancestor that IS visible and mark
+    /// that as the active row.
+    fn find_parent_id_in_tree<'a>(
+        nodes: &'a [SessionTreeNode],
+        id: &str,
+    ) -> Option<&'a str> {
+        fn walk<'a>(
+            nodes: &'a [SessionTreeNode],
+            id: &str,
+        ) -> Option<&'a str> {
+            for n in nodes {
+                if n.entry.id == id {
+                    return n.entry.parent_id.as_deref();
+                }
+                if let Some(p) = walk(&n.children, id) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        walk(nodes, id)
+    }
+
     /// Extract the full message body of a `Message` entry (user or
     /// assistant), preserving newlines and surrounding whitespace.
     /// Returns `None` for any other entry variant.
@@ -3695,9 +3725,24 @@ impl Repl {
 
         *rows = table.render(avail);
 
-        // Highlight current leaf.
+        // Highlight current leaf. The leaf may be invisible in the list
+        // (a tool-result or a tool-call-only assistant segment), so
+        // walk up the parent_id chain to the nearest visible ancestor
+        // and mark THAT as the active row — otherwise the user
+        // opens /tree and the cursor lands at the top of a long
+        // list, with no `*` indicator anywhere.
         if let Some(lid) = leaf_id {
-            *active = flat.iter().position(|(_, _, id, _, _, _)| id == lid);
+            let mut cur: Option<&str> = Some(lid);
+            while let Some(id) = cur {
+                if let Some(pos) = flat.iter().position(|(_, _, eid, _, _, _)| eid == id) {
+                    *active = Some(pos);
+                    break;
+                }
+                // Walk up the parent_id chain. We need the SessionEntry
+                // map for that, which lives in `labels` only by id;
+                // look it up via a tree walk.
+                cur = Self::find_parent_id_in_tree(tree, id);
+            }
         }
     }
 
@@ -5800,7 +5845,9 @@ mod tests {
 
     // ---- last_user_message_id_on_active_branch ----
 
-    use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
+        use crate::session::{
+        SessionEntry, SessionEntryContent, SessionHeader, SessionIndex, SessionTreeNode,
+    };
 
     fn mk_message(id: &str, role: &str, parent: Option<&str>) -> SessionEntry {
         SessionEntry {
@@ -6346,6 +6393,188 @@ mod tests {
         assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;5;233m"));
         // Depth 5 wraps back to depth 1.
         assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;5;234m"));
+    }
+
+    #[test]
+    fn tree_overlay_loads_real_session_with_compaction() {
+        // Regression test for the user-reported bug: "tree is missing
+        // all content past the compaction entry". Load the actual
+        // session file from the user's home directory, build the
+        // tree, run tree_overlay_entries, and verify that:
+        //  - the compaction entry is present
+        //  - entries after the compaction (including the active
+        //    message at the end) are present
+        //  - the active row is set to the leaf
+        let session_path = std::path::Path::new(
+            "/home/gabriel/.config/picocode/sessions/--home-gabriel-src-picocode2--/2026-09-04T18-19-51-823Z_01a06da6-048f-7812-9dd5-9bba9236eac3.jsonl",
+        );
+        if !session_path.exists() {
+            // The session file may not be available in CI / on other
+            // machines; skip the test rather than failing.
+            eprintln!("skipping: session file not present at {session_path:?}");
+            return;
+        }
+                let content = std::fs::read_to_string(session_path).expect("read session");
+        let mut index = SessionIndex {
+            header: SessionHeader::new(session_path),
+            entries: Default::default(),
+            leaf_id: None,
+            children: Default::default(),
+            session_name: None,
+        };
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let id = match v.get("id").and_then(|x| x.as_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let parent_id = v.get("parentId").and_then(|x| x.as_str()).map(String::from);
+            let timestamp = v
+                .get("timestamp")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let type_str = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            let entry_content = match type_str {
+                "message" => match v.get("message").cloned() {
+                    Some(msg) => SessionEntryContent::Message { message: msg },
+                    None => continue,
+                },
+                "compaction" => SessionEntryContent::Compaction {
+                    summary: v
+                        .get("summary")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    first_kept_entry_id: v
+                        .get("firstKeptEntryId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    tokens_before: v
+                        .get("tokensBefore")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0),
+                },
+                "model_change" => SessionEntryContent::ModelChange {
+                    provider: v
+                        .get("provider")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    model_id: v
+                        .get("modelId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                },
+                "leaf" => {
+                    index.leaf_id = v
+                        .get("targetId")
+                        .and_then(|x| x.as_str())
+                        .map(String::from);
+                    continue;
+                }
+                _ => continue, // SessionInfo and other meta entries
+            };
+            let entry = SessionEntry {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                timestamp,
+                content: entry_content,
+            };
+            index.entries.insert(id.clone(), entry);
+            if let Some(pid) = parent_id {
+                index.children.entry(pid).or_default().push(id);
+            }
+        }
+        eprintln!("loaded {} entries, leaf = {:?}", index.entries.len(), index.leaf_id);
+        assert!(index.entries.len() > 100, "expected a real session to load");
+        let leaf = index.leaf_id.clone().expect("leaf must be set");
+        let tree = index.build_tree(Some(&leaf));
+        eprintln!("tree has {} root(s)", tree.len());
+        let mut rows = Vec::new();
+        let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
+        let mut targets = Vec::new();
+        let mut active = None;
+        Repl::tree_overlay_entries(
+            &tree,
+            Some(&leaf),
+            "",
+            &mut rows,
+            &mut row_bgs,
+            &mut targets,
+            &mut active,
+        );
+        eprintln!("tree_overlay_entries produced {} rows; active={active:?}", rows.len());
+        // The compaction entry must be present.
+        let has_compaction = rows.iter().any(|r| r.starts_with("\x1b[22m\x1b[33mcompaction") || r.starts_with("\x1b[2m\x1b[33mcompaction"));
+        assert!(has_compaction, "compaction row missing in real session");
+        // The active row must be set to the leaf (or the nearest
+        // visible ancestor when the leaf is invisible, e.g. a
+        // toolResult). The cursor needs to auto-scroll to the active
+        // row when the user opens /tree, otherwise they see a small
+        // top-of-list window and assume the rest is missing.
+        assert!(active.is_some(), "active row not set for real session (leaf = {leaf})");
+        let active_idx = active.expect("active");
+        // The active row should NOT be the very top of the list
+        // (we walked up the active path to find a visible ancestor,
+        // so even with a toolResult leaf the active must point at
+        // SOMETHING that came after the conversation start).
+        assert!(
+            active_idx > 0,
+            "active row stuck at top of list ({active_idx} / {}); the leaf walk didn't find a visible ancestor",
+            rows.len()
+        );
+        // The last 5 rows (likely the tail of the active path / leaf
+        // and its nearby siblings) must all reach the rendered output.
+        for r in rows.iter().rev().take(5) {
+            assert!(
+                !r.trim().is_empty(),
+                "row near the active leaf is empty: {r:?}"
+            );
+        }
+        // Render the overlay end-to-end and confirm the compaction +
+        // active row both reach the final string.
+        let (_title, opts, _active, _wrap) = (
+            "",
+            rows.clone(),
+            active,
+            false,
+        );
+        let row_bg_view: Vec<Option<&str>> =
+            row_bgs.iter().map(|b| b.map(|s| -> &str { s })).collect();
+        let rendered = Repl::overlay_lines_with_bgs(
+            "",
+            &opts,
+            None,
+            active_idx,
+            Some(active_idx),
+            false,
+            Some(&row_bg_view),
+        );
+        assert!(rendered.contains("\x1b[33mcompaction"), "compaction missing from rendered overlay");
+        // The active row's label must be in the rendered output too.
+        let active_label = &rows[active_idx];
+        let trimmed_label: String = active_label
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .to_string();
+        // The label is wrapped; the first 30 chars of the label is
+        // good enough as a fingerprint.
+        let fp: String = trimmed_label.chars().take(30).collect();
+        assert!(
+            rendered.contains(&fp) || rendered.contains(&trimmed_label),
+            "active row ({fp:?}) missing from rendered overlay"
+        );
     }
 
     #[test]
