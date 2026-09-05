@@ -284,6 +284,9 @@ pub struct SessionMeta {
     pub cwd: String,
     pub parent_session: Option<String>,
     pub message_count: usize,
+    /// Number of user-role messages (the canonical "turn count"; excludes
+    /// assistant and `toolResult` entries).
+    pub user_message_count: usize,
     /// A short preview of the first user message in the session.
     pub first_prompt_preview: Option<String>,
     /// Full text of the last user message (for detail display).
@@ -2960,6 +2963,7 @@ impl Repl {
                 cwd: m.cwd,
                 parent_session: m.parent_session.map(|p| p.display().to_string()),
                 message_count: m.message_count,
+                user_message_count: m.user_message_count,
                 first_prompt_preview: m.first_prompt_preview,
                 last_prompt_text: m.last_prompt_text,
                 last_prompt_timestamp: m.last_prompt_timestamp,
@@ -3129,14 +3133,14 @@ impl Repl {
 
         // Build a header table with session identity and metadata.
         let avail = crate::output::term_width().saturating_sub(2);
-        let mut table = crate::table::Table::new(&["Session", "Turns", "Age", "Parent/Dir"])
+        let mut table = crate::table::Table::new(&["Session", "Turns/Msgs", "Age", "Parent/Dir"])
             .with_aligns(&[
                 crate::table::Align::Left,
                 crate::table::Align::Right,
                 crate::table::Align::Right,
                 crate::table::Align::Left,
             ])
-            .with_min_widths(&[20, 5, 11, 12])
+            .with_min_widths(&[20, 10, 11, 12])
             .with_priorities(&[3, 1, 1, 2])
             .set_gap(2);
 
@@ -3149,7 +3153,7 @@ impl Repl {
 
         table.add_row(&[
             &format!("{}{}", marker, name),
-            &meta.message_count.to_string(),
+            &format!("{} / {}", meta.user_message_count, meta.message_count),
             &ts,
             &parent_display,
         ]);
@@ -3253,6 +3257,7 @@ impl Repl {
                 cwd: m.cwd,
                 parent_session: m.parent_session.map(|p| p.display().to_string()),
                 message_count: m.message_count,
+                user_message_count: m.user_message_count,
                 first_prompt_preview: m.first_prompt_preview,
                 last_prompt_text: m.last_prompt_text,
                 last_prompt_timestamp: m.last_prompt_timestamp,
@@ -3309,6 +3314,7 @@ impl Repl {
             created: meta.timestamp,
             last_updated: meta.last_prompt_timestamp,
             message_count: meta.message_count,
+            user_message_count: meta.user_message_count,
         })
     }
 

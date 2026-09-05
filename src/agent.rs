@@ -4195,8 +4195,12 @@ pub struct SessionStatsInfo {
     /// ISO 8601 timestamp of the most recent user message, if any.
     /// When `None`, falls back to `created` for display.
     pub last_updated: Option<String>,
-    /// Number of message entries in the session (mirrors `/session <id>`).
+    /// Total number of message entries (user + assistant + toolResult).
+    /// Mirrors the "messages" count shown in `/session <id>`.
     pub message_count: usize,
+    /// Number of user-role message entries (= turn count).
+    /// Mirrors the "turns" count shown in `/session <id>`.
+    pub user_message_count: usize,
 }
 
 /// Compute the `/stat` panel lines. Renders two sections:
@@ -4232,7 +4236,10 @@ pub fn session_stats_lines(
                 .map(format_stat_ts)
                 .unwrap_or_else(|| created.clone());
             lines.push(format!("  created: {}, last update {}", created, last));
-            lines.push(format!("  size: {} turns", s.message_count));
+            lines.push(format!(
+                "  size: {} turns ({} messages)",
+                s.user_message_count, s.message_count
+            ));
         }
         None => {
             // No repo / no metadata available (e.g. in tests without a session).
@@ -6576,7 +6583,8 @@ mod tests {
             display_name: "my-session".into(),
             created: "2025-01-02T03:04:05.000Z".into(),
             last_updated: Some("2025-01-02T10:11:12.000Z".into()),
-            message_count: 7,
+            message_count: 14,
+            user_message_count: 7,
         };
         let usage = SessionUsage::default();
         let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info));
@@ -6593,7 +6601,10 @@ mod tests {
             "expected created/last update line, got {:?}",
             lines[1]
         );
-        assert_eq!(lines[2], "  size: 7 turns");
+        // Both turn and message counts must be shown — the former is the
+        // number of user prompts (= turns), the latter the total entries
+        // (user + assistant + toolResult).
+        assert_eq!(lines[2], "  size: 7 turns (14 messages)");
 
         // Then the "model:" section starts on the next line, with the rest
         // of the existing context-window / usage / cost / cache rows.
