@@ -3568,34 +3568,43 @@ impl Repl {
     }
 
     /// Per-branch-depth background colours for the `/tree` overlay.
-    /// Unlike turn indent (which advances for every model response),
-    /// `branch_depth` only increments when descending from a node with
-    /// multiple children — so un-branched conversations stay on the
-    /// default panel background (`None`) and only forks get tinted.
-    ///
-    /// The palette alternates dark / light variants so two consecutive
-    /// forks are easy to tell apart, and the warm / cool tints alternate
-    /// in lockstep. All tints are intentionally **darker than the
-    /// default panel background** (`48;5;235` ≈ RGB(38,38,38)): the
-    /// panel stays as the lightest surface in the overlay, and the
-    /// tints sit noticeably below it so the eye reads them as “deeper,
-    /// separate from the conversation above” rather than as a brighter
-    /// accent. The differences are large enough to be obvious at a
-    /// glance (~12 R/G/B units below the panel), not so subtle that
-    /// they vanish against the panel.
-    ///
-    /// Indexing: `(branch_depth - 1) % 4`, so depth 1 picks the first
-    /// entry, depth 2 the second, depth 3 the third, depth 4 the
-    /// fourth, depth 5 cycles back to the first, and so on.
+/// Unlike turn indent (which advances for every model response),
+/// `branch_depth` only increments when descending from a node with
+/// multiple children — so un-branched conversations stay on the
+/// default panel background (`None`) and only forks get tinted.
+///
+/// The palette uses 256-colour codes (`\x1b[48;5;Nm`) rather than
+/// true-colour (`\x1b[48;2;R;G;Bm`) so the tints render correctly
+/// on every terminal that supports 256-colour SGR — a much wider
+/// compatibility surface than true-colour, and every value here is
+/// also valid in 24-bit-capable terminals.
+///
+/// All tints sit a clear step below the default panel background
+/// (`48;5;235` ≈ RGB(38,38,38)) so the eye reads them as "deeper,
+/// separate from the conversation above" rather than as a brighter
+/// accent. The differences are large enough to be obvious at a
+/// glance — not so subtle that they vanish against the panel. The
+/// 256-colour greyscale is coarse, so the warm/cool tints are
+/// encoded by alternating the *brightness* step (one row sits one
+/// step below the panel, the next sits two steps below, alternating)
+/// rather than by hue — the alternation reads as a depth alternation
+/// even without chromatic variation.
+///
+/// Indexing: `(branch_depth - 1) % 4`, so depth 1 picks the first
+/// entry, depth 2 the second, depth 3 the third, depth 4 the
+/// fourth, depth 5 cycles back to the first, and so on.
     const TREE_BG_BY_LEVEL: &[&str] = &[
-        // Depth 1 — dark warm (clear ochre tint, visibly darker than panel).
-        "\x1b[48;2;24;22;18m",
-        // Depth 2 — dark cool (clear blue tint, visibly darker than panel).
-        "\x1b[48;2;18;20;26m",
-        // Depth 3 — dark warm, slightly more saturated.
-        "\x1b[48;2;26;20;16m",
-        // Depth 4 — dark cool, slightly more saturated.
-        "\x1b[48;2;16;18;26m",
+        // Depth 1 — one step below the panel, 235 -> 234.
+        "\x1b[48;5;234m",
+        // Depth 2 — two steps below, 235 -> 233.
+        "\x1b[48;5;233m",
+        // Depth 3 — back to one step below (235 -> 234) for the
+        // depth alternation: depth 1 / 3 share a tint, depth 2 / 4
+        // share a deeper tint, making two consecutive forks easy
+        // to tell apart.
+        "\x1b[48;5;234m",
+        // Depth 4 — two steps below.
+        "\x1b[48;5;233m",
     ];
     fn tree_row_bg(branch_depth: usize) -> Option<&'static str> {
         if branch_depth == 0 {
@@ -6327,16 +6336,88 @@ mod tests {
         // branch_depth == 0 (the root conversation) gets None — the
         // row stays on the default panel background, no tint.
         assert_eq!(Repl::tree_row_bg(0), None);
-        // Depth 1: dark warm.
-        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;2;24;22;18m"));
-        // Depth 2: dark cool.
-        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;2;18;20;26m"));
-        // Depth 3: dark warm, more saturated.
-        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;2;26;20;16m"));
-        // Depth 4: dark cool, more saturated.
-        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;2;16;18;26m"));
-        // Depth 5 wraps back to dark warm (depth 1).
-        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;2;24;22;18m"));
+        // Depth 1: one step below the panel (235 -> 234).
+        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;5;234m"));
+        // Depth 2: two steps below the panel (235 -> 233).
+        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;5;233m"));
+        // Depth 3: back to one step below for the depth alternation.
+        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;5;234m"));
+        // Depth 4: two steps below again.
+        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;5;233m"));
+        // Depth 5 wraps back to depth 1.
+        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;5;234m"));
+    }
+
+    #[test]
+    fn tree_overlay_branches_render_with_visible_indent_and_tint() {
+        // End-to-end visual smoke test: build a tree with a branching
+        // assistant, push it through tree_overlay_entries AND the
+        // overlay_lines rendering, and confirm:
+        //  - the depth-1 warm tint escape appears for branch rows;
+        //  - the row content does not contain \x1b[0m (which would
+        //    break the BG and make the row's padding render against
+        //    the terminal's default background);
+        //  - the rendered output includes the indented branch labels.
+        let b1 = tree_entry("m1", Some("a0"), "user", "branch one");
+        let b2 = tree_entry("m2", Some("a0"), "user", "branch two");
+        let fork = SessionTreeNode {
+            entry: SessionEntry {
+                id: "a0".into(),
+                parent_id: Some("m0".into()),
+                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                content: SessionEntryContent::Message {
+                    message: serde_json::json!({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "fork point"}]
+                    }),
+                },
+            },
+            children: vec![b1, b2],
+            label: None,
+        };
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            fork,
+        )];
+        let mut rows = Vec::new();
+        let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
+        let mut targets = Vec::new();
+        let mut active = None;
+        Repl::tree_overlay_entries(
+            &tree,
+            Some("m2"),
+            "",
+            &mut rows,
+            &mut row_bgs,
+            &mut targets,
+            &mut active,
+        );
+        let row_bg_view: Vec<Option<&str>> =
+            row_bgs.iter().map(|b| b.map(|s| -> &str { s })).collect();
+        let rendered = Repl::overlay_lines_with_bgs(
+            "Tree",
+            &rows,
+            None,
+            active.unwrap_or(0),
+            active,
+            false,
+            Some(&row_bg_view),
+        );
+        eprintln!("--- rendered ---\n{rendered}\n--- end ---");
+        // The depth-1 warm tint escape must appear for the branch rows.
+        assert!(
+            rendered.contains("\x1b[48;5;234m"),
+            "branch tint missing from rendered output: {rendered:?}"
+        );
+        // Both branch labels must reach the rendered output.
+        assert!(
+            rendered.contains("branch one"),
+            "branch one row missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("branch two"),
+            "branch two row missing: {rendered:?}"
+        );
     }
 
     #[test]
@@ -6386,8 +6467,8 @@ mod tests {
         // the default background even though it's indented.
         assert_eq!(row_bgs[1], None);
         // Two branch children of the fork point — depth 1.
-        assert_eq!(row_bgs[2], Some("\x1b[48;2;24;22;18m"));
-        assert_eq!(row_bgs[3], Some("\x1b[48;2;24;22;18m"));
+        assert_eq!(row_bgs[2], Some("\x1b[48;5;234m"));
+        assert_eq!(row_bgs[3], Some("\x1b[48;5;234m"));
         // No more leading whitespace in the rendered top-level label:
         // previously `display_indent = indent + 1` prepended an extra
         // space at the top level.
