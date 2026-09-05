@@ -3575,24 +3575,27 @@ impl Repl {
     ///
     /// The palette alternates dark / light variants so two consecutive
     /// forks are easy to tell apart, and the warm / cool tints alternate
-    /// in lockstep. All values are intentionally **darker than or equal
-    /// to** the default panel background (`48;5;235` ≈ RGB(38,38,38)):
-    /// the panel stays as the lightest surface in the overlay, and the
-    /// tints sit just below it so the eye reads them as “deeper, not
-    /// louder” rather than as a brighter accent.
+    /// in lockstep. All tints are intentionally **darker than the
+    /// default panel background** (`48;5;235` ≈ RGB(38,38,38)): the
+    /// panel stays as the lightest surface in the overlay, and the
+    /// tints sit noticeably below it so the eye reads them as “deeper,
+    /// separate from the conversation above” rather than as a brighter
+    /// accent. The differences are large enough to be obvious at a
+    /// glance (~12 R/G/B units below the panel), not so subtle that
+    /// they vanish against the panel.
     ///
     /// Indexing: `(branch_depth - 1) % 4`, so depth 1 picks the first
     /// entry, depth 2 the second, depth 3 the third, depth 4 the
     /// fourth, depth 5 cycles back to the first, and so on.
     const TREE_BG_BY_LEVEL: &[&str] = &[
-        // Depth 1 — dark warm (subtle ochre, darker than default).
-        "\x1b[48;2;28;26;22m",
-        // Depth 2 — same brightness as default, subtle blue tint.
-        "\x1b[48;2;28;30;38m",
-        // Depth 3 — dark cool (subtle blue, darker than default).
-        "\x1b[48;2;22;24;30m",
-        // Depth 4 — same brightness as default, subtle warm tint.
-        "\x1b[48;2;38;36;30m",
+        // Depth 1 — dark warm (clear ochre tint, visibly darker than panel).
+        "\x1b[48;2;24;22;18m",
+        // Depth 2 — dark cool (clear blue tint, visibly darker than panel).
+        "\x1b[48;2;18;20;26m",
+        // Depth 3 — dark warm, slightly more saturated.
+        "\x1b[48;2;26;20;16m",
+        // Depth 4 — dark cool, slightly more saturated.
+        "\x1b[48;2;16;18;26m",
     ];
     fn tree_row_bg(branch_depth: usize) -> Option<&'static str> {
         if branch_depth == 0 {
@@ -3940,8 +3943,15 @@ impl Repl {
                 .unwrap_or_else(|| "(kept entry)".into());
             // Yellow FG marks compactions as a "special action" — they
             // summarise / restructure history rather than carry content.
+            //
+            // `\x1b[39m` (default foreground) closes the yellow span
+            // WITHOUT touching the background, so the row's BG (set by
+            // `bg_line` in the overlay pipeline) carries through the
+            // trailing padding. Using `\x1b[0m` here would reset the BG
+            // mid-row, leaving the padding against the terminal's
+            // default background and visually breaking the row.
             return format!(
-                "\x1b[33mcompaction {} before \"{}\"\x1b[0m",
+                "\x1b[33mcompaction {} before \"{}\"\x1b[39m",
                 &first_kept_entry_id[..first_kept_entry_id.len().min(12)],
                 kept
             );
@@ -4004,8 +4014,10 @@ impl Repl {
             }
             SessionEntryContent::ModelChange { provider, model_id } => {
                 // Yellow FG for model switches — another "special action"
-                // marker, mirroring the compaction colour.
-                format!("\x1b[33mmodel: {}/{}\x1b[0m", provider, model_id)
+                // marker, mirroring the compaction colour. `\x1b[39m` (not
+                // `\x1b[0m`) so the row's BG carries through the trailing
+                // padding — see `entry_display_label_ext` for rationale.
+                format!("\x1b[33mmodel: {}/{}\x1b[39m", provider, model_id)
             }
             SessionEntryContent::ActiveToolsChange { .. } => String::new(),
             SessionEntryContent::BranchSummary { summary, .. } => {
@@ -6290,7 +6302,9 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         assert!(comp_label.starts_with("\x1b[33m"), "got: {comp_label:?}");
-        assert!(comp_label.ends_with("\x1b[0m"), "got: {comp_label:?}");
+        // Ends with `\x1b[39m` (default FG) so the row's BG carries
+        // through the trailing padding, not `\x1b[0m` (full reset).
+        assert!(comp_label.ends_with("\x1b[39m"), "got: {comp_label:?}");
         assert!(comp_label.contains("compaction"));
 
         let model_change = SessionEntry {
@@ -6304,7 +6318,7 @@ mod tests {
         };
         let mc_label = Repl::entry_display_label(&model_change, None);
         assert!(mc_label.starts_with("\x1b[33m"), "got: {mc_label:?}");
-        assert!(mc_label.ends_with("\x1b[0m"), "got: {mc_label:?}");
+        assert!(mc_label.ends_with("\x1b[39m"), "got: {mc_label:?}");
         assert!(mc_label.contains("model: openrouter/anthropic/claude-3.7"));
     }
 
@@ -6314,15 +6328,15 @@ mod tests {
         // row stays on the default panel background, no tint.
         assert_eq!(Repl::tree_row_bg(0), None);
         // Depth 1: dark warm.
-        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;2;28;26;22m"));
-        // Depth 2: same brightness as default, subtle blue tint.
-        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;2;28;30;38m"));
-        // Depth 3: dark cool.
-        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;2;22;24;30m"));
-        // Depth 4: same brightness as default, subtle warm tint.
-        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;2;38;36;30m"));
+        assert_eq!(Repl::tree_row_bg(1), Some("\x1b[48;2;24;22;18m"));
+        // Depth 2: dark cool.
+        assert_eq!(Repl::tree_row_bg(2), Some("\x1b[48;2;18;20;26m"));
+        // Depth 3: dark warm, more saturated.
+        assert_eq!(Repl::tree_row_bg(3), Some("\x1b[48;2;26;20;16m"));
+        // Depth 4: dark cool, more saturated.
+        assert_eq!(Repl::tree_row_bg(4), Some("\x1b[48;2;16;18;26m"));
         // Depth 5 wraps back to dark warm (depth 1).
-        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;2;28;26;22m"));
+        assert_eq!(Repl::tree_row_bg(5), Some("\x1b[48;2;24;22;18m"));
     }
 
     #[test]
@@ -6372,12 +6386,27 @@ mod tests {
         // the default background even though it's indented.
         assert_eq!(row_bgs[1], None);
         // Two branch children of the fork point — depth 1.
-        assert_eq!(row_bgs[2], Some("\x1b[48;2;28;26;22m"));
-        assert_eq!(row_bgs[3], Some("\x1b[48;2;28;26;22m"));
+        assert_eq!(row_bgs[2], Some("\x1b[48;2;24;22;18m"));
+        assert_eq!(row_bgs[3], Some("\x1b[48;2;24;22;18m"));
         // No more leading whitespace in the rendered top-level label:
         // previously `display_indent = indent + 1` prepended an extra
         // space at the top level.
         assert!(rows[0].starts_with("\x1b[22mprompt") || rows[0].starts_with("\x1b[2mprompt"));
+        // Indented sub-tree is actually indented in the rendered output:
+        // branch children sit 4 spaces in, the assistant response sits
+        // 2 spaces in, and the top-level label has no leading space.
+        assert!(
+            rows[1].starts_with("\x1b[22m  ") || rows[1].starts_with("\x1b[2m  "),
+            "assistant row must be 2-space indented; got: {rows:?}"
+        );
+        assert!(
+            rows[2].starts_with("\x1b[22m    ") || rows[2].starts_with("\x1b[2m    "),
+            "branch child must be 4-space indented; got: {rows:?}"
+        );
+        assert!(
+            rows[3].starts_with("\x1b[22m    ") || rows[3].starts_with("\x1b[2m    "),
+            "branch child must be 4-space indented; got: {rows:?}"
+        );
     }
 
     #[test]
@@ -6513,6 +6542,125 @@ mod tests {
             rendered.contains("\x1b[33m"),
             "compaction row not styled yellow in the rendered output: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn from_buffer_tree_list_compaction_as_leaf_keeps_active_marker() {
+        // Variant: the LEAF itself is the compaction entry. The user
+        // just ran /compact and the leaf is the resulting Compaction
+        // node, with no post-compaction children. The compaction must
+        // still show up and be marked as the active row.
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "kept prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "old answer"),
+                compaction("c1", Some("a0"), "m0"),
+            ),
+        )];
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("c1".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let (_title, opts, active, _) = ov.display_rows();
+        // m0, a0, c1 all reachable; c1 is the active row.
+        assert!(opts.iter().any(|r| r.contains("kept prompt")), "got: {opts:#?}");
+        assert!(opts.iter().any(|r| r.contains("old answer")), "got: {opts:#?}");
+        assert!(opts.iter().any(|r| r.contains("compaction")), "got: {opts:#?}");
+        // c1 must be the active index (the leaf).
+        if let ActiveOverlay::Tree { ref targets, .. } = ov {
+            let pos = targets.iter().position(|t| t == "c1").expect("c1 missing");
+            assert_eq!(active, Some(pos));
+        } else {
+            panic!("expected Tree overlay");
+        }
+    }
+
+    #[test]
+    fn from_buffer_tree_list_post_compaction_chain_visible() {
+        // Variant: chain with multiple post-compaction entries (the
+        // real-life shape after a /compact + a few follow-up turns).
+        // The user reports this shape drops the compaction AND the
+        // post-compaction content; verify all of it shows.
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "first prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "first answer"),
+                attach(
+                    compaction("c1", Some("a0"), "m0"),
+                    attach(
+                        tree_entry("m1", Some("c1"), "user", "after compact 1"),
+                        attach(
+                            tree_entry("a1", Some("m1"), "assistant", "after compact answer"),
+                            tree_entry("m2", Some("a1"), "user", "after compact 2"),
+                        ),
+                    ),
+                ),
+            ),
+        )];
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("m2".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let (_title, opts, active, _) = ov.display_rows();
+        // Every visible label must show.
+        for needle in &["first prompt", "first answer", "compaction", "after compact 1", "after compact answer", "after compact 2"] {
+            assert!(
+                opts.iter().any(|r| r.contains(needle)),
+                "row missing for {:?}; got: {opts:#?}",
+                needle
+            );
+        }
+        // m2 is the leaf, so it must be the active index.
+        if let ActiveOverlay::Tree { ref targets, .. } = ov {
+            let pos = targets.iter().position(|t| t == "m2").expect("m2 missing");
+            assert_eq!(active, Some(pos));
+        } else {
+            panic!("expected Tree overlay");
+        }
     }
 
     #[test]
