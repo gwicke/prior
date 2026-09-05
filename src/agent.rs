@@ -2928,6 +2928,13 @@ pub(crate) enum CompactionTarget {
     },
 }
 
+/// Review hook for a generated compaction summary before it is written. Given
+/// the draft summary text, returns the final text to store (`Some`) or
+/// cancels the compaction (`None`). The interactive caller wires this to the
+/// external-editor + accept/cancel dialog; `None` here means "accept the
+/// draft as-is" (quiet / test paths).
+pub(crate) type CompactionSummaryReview = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// Run a compaction of `mode` at the resolved target. Shared by the
 /// `/tree <id> compact` and `/compact` (→ `/tree <last_user_id> compact`)
 /// paths. The caller is responsible for the up-front validation
@@ -2942,12 +2949,16 @@ pub(crate) enum CompactionTarget {
 /// - `llm_payload`: user-editable prompt override (only consulted when
 ///   `mode == Llm`); when empty, `settings.llm_compact_prompt()` is
 ///   used instead.
+/// - `review`: optional review hook consulted for the summary-producing
+///   modes (`TextOnly`, `Llm`) right before the compaction entry is
+///   written; it can edit the draft and/or cancel.
 ///
 /// On success, appends the compaction entry, optionally renders the
 /// summary inline, and returns `Ok(())`. On failure (no agent,
 /// `summarize` error, empty response, `append_compaction` error) the
 /// leaf is restored if it was moved, the error is rendered to `output`,
-/// and `Err(msg)` is returned for the caller to log if desired.
+/// and `Err(msg)` is returned for the caller to log if desired. A
+/// user-cancelled review returns `Ok(())` without writing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     session: &Session,
@@ -2958,6 +2969,7 @@ pub(crate) async fn run_compaction(
     mode: CompactSummaryMode,
     llm_payload: &str,
     output: &dyn Output,
+    review: Option<CompactionSummaryReview>,
 ) -> std::result::Result<(), String> {
     match target {
         CompactionTarget::AtPoint {
@@ -2974,6 +2986,7 @@ pub(crate) async fn run_compaction(
                 mode,
                 llm_payload,
                 output,
+                review,
             )
             .await
         }
@@ -3002,6 +3015,7 @@ async fn run_compaction_at_point(
     mode: CompactSummaryMode,
     llm_payload: &str,
     output: &dyn Output,
+    review: Option<CompactionSummaryReview>,
 ) -> std::result::Result<(), String> {
     match mode {
         CompactSummaryMode::Truncate => session
@@ -3020,7 +3034,17 @@ async fn run_compaction_at_point(
                     .take_while(|e| e.id != target_id)
                     .collect::<Vec<_>>()
             };
-            let summary = crate::session::build_text_only_summary(&dropped);
+            let draft = crate::session::build_text_only_summary(&dropped);
+            // Summary review / edit gate: let the user review the generated
+            // (deterministic) text before it becomes the compaction's
+            // `summary`. A `None` return cancels without appending.
+            let summary = match &review {
+                Some(r) => match r(&draft) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                },
+                None => draft,
+            };
             session
                 .append_compaction(&summary, target_id, tokens_before)
                 .await
@@ -3127,6 +3151,18 @@ async fn run_compaction_at_point(
             let _ = session
                 .move_leaf(Some(old_leaf_id.to_string()))
                 .await;
+
+            // 7b. Summary review / edit gate: let the user review and edit
+            //     the LLM-generated draft before it is stored. A `None`
+            //     return cancels without appending (the leaf is already
+            //     restored).
+            let summary_text = match &review {
+                Some(r) => match r(&summary_text) {
+                    Some(s) => s,
+                    None => return Ok(()),
+                },
+                None => summary_text,
+            };
 
             // 8. Append the compaction entry — same shape as the
             //    other modes. The session file is byte-identical to a
@@ -3793,6 +3829,29 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 }
                             }
 
+                            // Summary review / edit gate (TextOnly & Llm
+                            // only). When the interactive REPL is active, the
+                            // generated draft is opened in $EDITOR and the
+                            // user accepts (default) or cancels before the
+                            // entry is written (repl.rs
+                            // review_compaction_summary). Outside the REPL
+                            // (quiet / pipe / tests) there is no dialog and
+                            // the draft is accepted as-is.
+                            let review: Option<CompactionSummaryReview> =
+                                if resolved_mode == CompactSummaryMode::Truncate {
+                                    None
+                                } else if let Some(g) = &guard {
+                                    let g = g.clone();
+                                    let out = config.output.clone();
+                                    Some(Box::new(move |draft: &str| {
+                                        crate::repl::review_compaction_summary(
+                                            &g, out.as_ref(), draft,
+                                        )
+                                    }))
+                                } else {
+                                    None
+                                };
+
                             if let Err(msg) = run_compaction(
                                 s,
                                 &agent,
@@ -3805,6 +3864,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 resolved_mode,
                                 &llm_payload,
                                 config.output.as_ref(),
+                                review,
                             )
                             .await
                             {
@@ -4458,7 +4518,7 @@ mod tests {
         find_predecessor_on_active_branch, find_previous_summary_on_active_branch,
         is_anthropic_family, last_turns_start,
         maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
-        run_compaction, CompactionTarget, MessageLogger,
+        run_compaction, CompactionSummaryReview, CompactionTarget, MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
@@ -5087,6 +5147,7 @@ mod tests {
             CompactSummaryMode::Truncate,
             "",
             out.as_ref(),
+            None,
         )
         .await
         .expect("truncate compaction should succeed");
@@ -5132,6 +5193,7 @@ mod tests {
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
+            None,
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5178,6 +5240,7 @@ mod tests {
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
+            None,
         )
         .await;
         assert!(res.is_err(), "expected error when no agent available");
@@ -5217,6 +5280,7 @@ mod tests {
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
+            None,
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5273,6 +5337,7 @@ mod tests {
             CompactSummaryMode::Truncate,
             "",
             out.as_ref(),
+            None,
         )
         .await
         .expect("truncate re-compaction over a leaf-compaction must succeed");
@@ -5330,6 +5395,7 @@ mod tests {
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
+            None,
         )
         .await
         .expect("text-only re-compaction over a leaf-compaction must succeed");
@@ -5355,6 +5421,110 @@ mod tests {
             !summary.contains("EARLY SECRET SUMMARY"),
             "text-only summary must NOT leak the nested compaction's summary text, got: {:?}",
             summary
+        );
+    }
+
+    #[tokio::test]
+    async fn run_compaction_text_only_review_edits_summary_before_write() {
+        // The review hook (editor + accept dialog) is invoked with the
+        // generated draft BEFORE the entry is written. Accepting with edits
+        // must store the edited text, not the generated draft.
+        let s = build_writable_session_with(vec![
+            message_entry("u1", None, "user", "the question"),
+            message_entry("a1", Some("u1"), "assistant", "the answer"),
+        ])
+        .await;
+        let old_leaf = s.get_leaf_id().await;
+        let settings = test_settings();
+        let out = null_output();
+        let review: Option<CompactionSummaryReview> = Some(Box::new(|draft: &str| {
+            // Simulates the user editing the draft in $EDITOR and accepting.
+            assert!(
+                draft.contains("the question"),
+                "review must receive the generated draft, got: {:?}",
+                draft
+            );
+            Some(format!("{}\n\nEDITED BY USER", draft))
+        }));
+        run_compaction(
+            &s,
+            &None,
+            &settings,
+            CompactionTarget::AtPoint {
+                target_id: "a1".to_string(),
+                tokens_before: 10,
+            },
+            old_leaf.as_deref().unwrap_or(""),
+            CompactSummaryMode::TextOnly,
+            "",
+            out.as_ref(),
+            review,
+        )
+        .await
+        .expect("text-only compaction with review should succeed");
+
+        let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
+        let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
+            crate::session::SessionEntryContent::Compaction {
+                summary,
+                first_kept_entry_id,
+                ..
+            } => {
+                assert_eq!(first_kept_entry_id, "a1");
+                summary
+            }
+            other => panic!("expected Compaction entry, got {:?}", other),
+        };
+        assert!(
+            summary.contains("EDITED BY USER"),
+            "compaction summary must store the user-edited text, got: {:?}",
+            summary
+        );
+    }
+
+    #[tokio::test]
+    async fn run_compaction_text_only_review_cancel_writes_nothing() {
+        // Review hook returning None = user cancelled. No compaction entry
+        // may be appended and the leaf must stay where it was.
+        let s = build_writable_session_with(vec![
+            message_entry("u1", None, "user", "the question"),
+            message_entry("a1", Some("u1"), "assistant", "the answer"),
+        ])
+        .await;
+        let old_leaf = s.get_leaf_id().await;
+        let settings = test_settings();
+        let out = null_output();
+        let review: Option<CompactionSummaryReview> = Some(Box::new(|_draft: &str| None));
+        let res = run_compaction(
+            &s,
+            &None,
+            &settings,
+            CompactionTarget::AtPoint {
+                target_id: "a1".to_string(),
+                tokens_before: 10,
+            },
+            old_leaf.as_deref().unwrap_or(""),
+            CompactSummaryMode::TextOnly,
+            "",
+            out.as_ref(),
+            review,
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "cancelled review should return Ok (no error), got {:?}",
+            res
+        );
+        // Leaf unchanged (still the assistant message), and no compaction
+        // entry anywhere after the original messages.
+        assert_eq!(s.get_leaf_id().await.as_deref(), Some("a1"));
+        let entry = s.get_entry("a1").await.expect("a1 entry");
+        assert!(
+            !matches!(
+                entry.content,
+                crate::session::SessionEntryContent::Compaction { .. }
+            ),
+            "no compaction entry may be written when the review cancels"
         );
     }
 
@@ -5395,6 +5565,7 @@ mod tests {
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
+            None,
         )
         .await;
         assert!(

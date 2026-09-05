@@ -105,6 +105,14 @@ pub trait Output: Send + Sync {
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
     fn confirm(&self, message: &str) -> Confirmation;
+    /// Ask the user to accept or cancel a pending compaction summary after
+    /// they have reviewed/edited it in an external editor. `true` = accept
+    /// (write the entry with the possibly-edited summary); `false` = cancel
+    /// (write nothing). Default implementations accept immediately — there is
+    /// no dialog outside the interactive `ConsoleOutput`.
+    fn confirm_compaction_summary(&self, _message: &str) -> bool {
+        true
+    }
     fn display_separator(&self);
     fn display_thinking(&self, message: &str);
     fn stop_thinking(&self);
@@ -1770,6 +1778,86 @@ impl Output for ConsoleOutput {
             2 => Confirmation::Always,
             _ => Confirmation::No,
         }
+    }
+
+    fn confirm_compaction_summary(&self, message: &str) -> bool {
+        self.stop_thinking();
+        // The reader (if any) must not swallow the dialog keystrokes; the
+        // accept/cancel dialog is owned by the main task, mirroring the
+        // tool-confirmation gate.
+        self.reader_paused.store(true, Ordering::SeqCst);
+
+        let (_w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+        let h = h.max(1) as usize;
+        let start_row = self.cursor_row().min(h);
+        let n = 3usize; // title + 2 options
+        let top = start_row.min(h.saturating_sub(n));
+
+        // Default selection = Accept (safe for an explicit review step the
+        // user reached by editing the summary and pressing a key).
+        let options = vec![
+            "Accept".to_string(),
+            "Cancel".to_string(),
+        ];
+        let mut sel: usize = 0;
+
+        let draw = |sel: usize| {
+            let panel = Repl::overlay_lines(message, &options, None, sel, None, true);
+            let mut s = String::new();
+            s.push_str(&format!("\x1b[{};1H", top));
+            s.push_str("\x1b[0J");
+            for line in panel.lines() {
+                s.push_str(line);
+                s.push('\n');
+            }
+            let _ = io::stdout().write_all(s.as_bytes());
+            let _ = io::stdout().flush();
+        };
+        draw(sel);
+
+        let choice = loop {
+            match event::read() {
+                Ok(Event::Key(key)) => match key.code {
+                    KeyCode::Up => {
+                        if sel > 0 {
+                            sel -= 1;
+                            draw(sel);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if sel + 1 < options.len() {
+                            sel += 1;
+                            draw(sel);
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        break match c.to_ascii_lowercase() {
+                            'a' => 0,
+                            'c' => 1,
+                            _ => 0, // anything else -> Accept (default)
+                        };
+                    }
+                    KeyCode::Enter => break sel,
+                    KeyCode::Esc => break 1, // Cancel
+                    _ => {}
+                },
+                _ => {}
+            }
+        };
+
+        // Clear the overlay region.
+        let mut s = String::new();
+        s.push_str(&format!("\x1b[{};1H", top));
+        s.push_str("\x1b[0J");
+        let _ = io::stdout().write_all(s.as_bytes());
+        let _ = io::stdout().flush();
+        self.reader_paused.store(false, Ordering::SeqCst);
+
+        // Echo the resolved choice (raw mode has no terminal echo).
+        println!("  {}", options[choice]);
+        self.note_lines(1);
+
+        choice == 0
     }
 
     fn display_separator(&self) {

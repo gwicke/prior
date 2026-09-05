@@ -1273,6 +1273,28 @@ in-menu equivalent of the existing inline summary markdowns for `text only`
 — keeps the user oriented about what is about to happen without any inline
 output after the commit.
 
+### 6.7b Summary review & edit (before the entry is written)
+
+For the summary-producing modes (`text only`, `llm`), the generated draft
+is **reviewed by the user before** the `Compaction` entry is appended:
+
+1. `run_compaction` builds the draft (deterministic text-only summary, or
+   the LLM summary after the leaf dance), then calls the caller-supplied
+   review hook (`CompactionSummaryReview` in `src/agent.rs`).
+2. In the interactive REPL, the hook drops raw mode and opens the draft in
+   `$EDITOR` (reuses `edit_in_editor` — the Ctrl-E prompt editor), re-enters
+   raw mode, then shows an **Accept / Cancel** overlay via
+   `Output::confirm_compaction_summary` with **Accept as the Enter default**
+   (Esc / `c` cancels).
+3. On **Accept**, the (possibly edited) text is stored as the entry's
+   `summary`. On **Cancel** (or editor failure), `run_compaction` returns
+   `Ok(())` without appending — no compaction entry is written and the
+   session is untouched (for `llm` mode the leaf was already restored).
+
+Outside the interactive REPL (quiet / pipe / tests) the hook is absent and
+the draft is stored as-is — behavior is unchanged from before this step.
+`truncate` (empty summary) never opens the editor.
+
 ### 6.8 Handler implementation sketch (`src/agent.rs`)
 
 The `TreeAction::Compact` arm of the main-loop `/tree` block gains an `Llm`

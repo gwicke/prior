@@ -4477,7 +4477,7 @@ fn resolve_editor() -> (String, Vec<String>) {
 /// A single trailing `\n` is stripped on read‑back because most editors add
 /// one.  Internal newlines and intentional trailing blank lines are preserved.
 /// The tempfile is cleaned up on every return path.
-fn edit_in_editor(current: &str) -> io::Result<String> {
+pub(crate) fn edit_in_editor(current: &str) -> io::Result<String> {
     use std::os::unix::fs::PermissionsExt;
 
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
@@ -4530,6 +4530,51 @@ fn edit_in_editor(current: &str) -> io::Result<String> {
     let _ = std::fs::remove_file(&path);
     Ok(result)
 }
+
+/// Let the user review — and edit — a generated compaction summary before it
+/// is written to the session (doc/nested_compactions.md §review UX).
+///
+/// 1. Drop raw mode, open `draft` in the external `$EDITOR` (reuses the
+///    Ctrl-E prompt-editing machinery), re-enter raw mode.
+/// 2. Ask the user to accept (default) or cancel via `Output`'s
+///    accept/cancel dialog.
+///
+/// Returns `Some(final_text)` to store (the possibly-edited summary) on
+/// accept, or `None` on cancel / editor failure. The caller must not append a
+/// compaction entry when this returns `None`.
+///
+/// `guard` must be the REPL's term guard (only present on an interactive
+/// TTY); the editor cannot be launched without it. Callers running outside
+/// the interactive REPL (quiet / pipe / tests) should pass a review closure
+/// that simply accepts the draft — see `run_compaction`'s callers.
+pub(crate) fn review_compaction_summary(
+    guard: &TermGuard,
+    output: &dyn Output,
+    draft: &str,
+) -> Option<String> {
+    // Drop raw mode for the foreground editor; re-enter on return (mirrors
+    // the Ctrl-E path in read_input).
+    let _ = guard.stop();
+    let edited = edit_in_editor(draft);
+    let _ = guard.start();
+
+    let text = match edited {
+        Ok(t) => t,
+        Err(e) => {
+            output.display_error(&format!("editor error: {}", e));
+            return None;
+        }
+    };
+    if output.confirm_compaction_summary(
+        "Write this compaction summary into the session? (edited text is stored)",
+    ) {
+        Some(text)
+    } else {
+        output.display_text("Compaction cancelled.");
+        None
+    }
+}
+
 
 /// Expand `~` and `~/` prefix to the home directory.  Leaves other paths
 /// unchanged.  Used by path completion to resolve `~` before calling `ls`
