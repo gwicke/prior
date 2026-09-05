@@ -8,6 +8,7 @@ use rig_core::tool::ToolContext;
 
 use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig};
 use crate::edit_match;
+use crate::path_util::relativize_path;
 
 #[derive(Debug, thiserror::Error, Serialize, Deserialize, JsonSchema)]
 pub enum ToolError {
@@ -225,7 +226,18 @@ pub async fn edit_file(
         result = result.replacen(&edit.old_text, &edit.new_text, 1);
     }
     fs::write(&p, result).await?;
-    Ok(format!("Successfully replaced {} block(s) in {}", edits.len(), path))
+    // Render the path the model will see as relative to cwd when possible,
+    // so the success string stays portable across checkouts (the model
+    // already has cwd in its system prompt) and tokens aren't wasted on
+    // the absolute prefix. We deliberately don't try to relativize paths
+    // outside cwd — see `path_util::relativize_path`.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
+    let shown = relativize_path(&p, &cwd);
+    Ok(format!(
+        "Successfully replaced {} block(s) in {}",
+        edits.len(),
+        shown
+    ))
 }
 
 #[rig_tool(
@@ -252,9 +264,15 @@ pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolErr
         files.push((e, mtime));
     }
     files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+    // Format matches as paths relative to cwd (when under cwd). This keeps
+    // the model-facing output portable across checkouts of the same repo
+    // and avoids burning tokens on the absolute cwd prefix. We resolve cwd
+    // here (after the walker has returned and `base` is no longer in use)
+    // and reuse it for every entry.
+    let cwd = std::env::current_dir().unwrap_or_default();
     let res = files
         .iter()
-        .map(|(f, _)| f.to_string_lossy())
+        .map(|(f, _)| relativize_path(f, &cwd))
         .collect::<Vec<_>>()
         .join("\n");
     Ok(if res.is_empty() { "none".into() } else { res })
@@ -264,7 +282,17 @@ pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolErr
 pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolError> {
     // Validate the search root against the active path policy (or cwd bounds);
     // ripgrep itself runs confined inside a read-only sandbox.
-    let _ = get_path(&path)?;
+    let resolved = get_path(&path)?;
+
+    // Pre-relativize the search root so ripgrep's `--with-filename` output
+    // comes back in the portable, token-friendly form. We deliberately do
+    // NOT post-process ripgrep's output (which contains matched file
+    // *content*) — that would risk rewriting paths inside the lines the
+    // user actually searched for. ripgrep echoes the exact path it was
+    // given, so as long as we feed it a relative form, the filename
+    // column stays relative.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| resolved.clone());
+    let rg_path = relativize_path(&resolved, &cwd);
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
@@ -289,7 +317,7 @@ pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolErro
         "500".into(),
         "-e".into(),
         pattern,
-        path,
+        rg_path,
     ];
     let raw = run_sandboxed_ro(&argv, &cfg, timeout).await?;
     let trimmed = raw.trim();
@@ -1173,6 +1201,7 @@ pub async fn agent_browser(args: String) -> Result<String, ToolError> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use serial_test::serial;
 
     #[test]
     fn test_validate_path_normal() {
@@ -1256,6 +1285,63 @@ mod tests {
 
         // Root path
         assert!(validate_path(base, "/").is_err());
+    }
+
+    /// RAII helper that chdirs into a fresh tempdir and restores the
+    /// original cwd on drop. Required by `glob_files` tests because
+    /// `get_path` enforces the result is inside cwd (and the global cwd
+    /// races across parallel tests if mutated inline).
+    struct TempCwd {
+        _dir: tempfile::TempDir,
+        prev: std::path::PathBuf,
+    }
+
+    impl TempCwd {
+        fn new() -> Self {
+            crate::tools::set_sandbox(None);
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir.path()).unwrap();
+            TempCwd { _dir: dir, prev }
+        }
+    }
+
+    impl Drop for TempCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn glob_files_results_are_relative_to_cwd() {
+        // The model passes an absolute path to glob_files; the matched
+        // file paths in the tool result must come back as `./x` (or
+        // `./sub/x`), not `<tempdir>/x`. Otherwise the absolute cwd prefix
+        // burns tokens on every result and breaks session portability
+        // across checkouts of the same repo.
+        let guard = TempCwd::new();
+        tokio::fs::create_dir_all("sub").await.unwrap();
+        tokio::fs::write("a.txt", "x").await.unwrap();
+        tokio::fs::write("sub/b.txt", "y").await.unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        let search_root = cwd.to_string_lossy().into_owned();
+        let res = glob_files("*.txt".to_string(), search_root)
+            .await
+            .unwrap();
+
+        // The matched path must appear in relative form.
+        assert!(
+            res.contains("./a.txt"),
+            "expected `./a.txt` in glob output, got: {res}",
+        );
+        // And the absolute tempdir path must NOT leak.
+        let tempdir_str = guard._dir.path().to_string_lossy().into_owned();
+        assert!(
+            !res.contains(&tempdir_str),
+            "absolute tempdir leaked into glob output: {res}",
+        );
     }
 }
 
@@ -1812,6 +1898,32 @@ mod sandbox_tests {
             "expected match in output, got: {out}"
         );
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn grep_text_uses_relative_search_root() {
+        if !bwrap_on_path() {
+            return;
+        }
+        // Even when the model passes an ABSOLUTE path to grep_text, the
+        // `--with-filename` line prefix must come back relative to cwd —
+        // otherwise every grep result burns tokens on the cwd prefix and a
+        // captured session breaks when replayed at a different checkout.
+        set_sandbox(None);
+        let cwd = std::env::current_dir().unwrap();
+        let absolute = cwd.join("src/main.rs");
+        let out = grep_text("fn main".to_string(), absolute.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert!(
+            out.contains("src/main.rs:"),
+            "expected `src/main.rs:` prefix (relative form), got: {out}",
+        );
+        assert!(
+            !out.contains(&cwd.to_string_lossy().into_owned()),
+            "absolute cwd leaked into grep output: {out}",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1868,6 +1980,39 @@ mod edit_file_tests {
         assert!(res.starts_with("Successfully replaced"));
         let after = tokio::fs::read_to_string("a.txt").await.unwrap();
         assert_eq!(after, "goodbye\nworld\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn success_string_uses_relative_path() {
+        // Inside `CwdGuard::new()` the tool resolves cwd to the tempdir it
+        // chdir'd into. The file is `a.txt` *in that tempdir*, so the
+        // success string must render the path as `./a.txt` — not the
+        // absolute tempdir prefix. This keeps the model-facing output
+        // portable (no cwd leakage) and token-efficient (no wasted cwd
+        // prefix on every tool result).
+        let guard = CwdGuard::new();
+        tokio::fs::write("a.txt", "hello\n").await.unwrap();
+        let res = edit_file(
+            "a.txt".into(),
+            vec![EditOp {
+                old_text: "hello".into(),
+                new_text: "goodbye".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(
+            res.starts_with("Successfully replaced 1 block(s) in ./a.txt"),
+            "expected relative path in success string, got: {res}",
+        );
+        // Defensive: the absolute tempdir path must not appear in the
+        // user-facing string.
+        let tempdir_str = guard._dir.path().to_string_lossy().into_owned();
+        assert!(
+            !res.contains(&tempdir_str),
+            "absolute tempdir leaked into success string: {res}",
+        );
     }
 
     #[tokio::test]

@@ -366,6 +366,13 @@ impl PathPolicy {
                 }
             }
         }
+        // NOTE: error messages here intentionally keep the absolute path
+        // (`host_path.display()`). Sandbox-policy violations are rare and
+        // usually point at user-config mistakes — the absolute form is the
+        // useful one to see when reading scrollback. The model/tool
+        // response-relativization pass deliberately does NOT rewrite
+        // messages produced by `PathPolicy::check` to keep this code path
+        // untouched (it's a security boundary).
         let bind = best.ok_or_else(|| {
             format!(
                 "path is not within a permitted binding: {}",
