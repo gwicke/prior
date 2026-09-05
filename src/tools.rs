@@ -163,15 +163,15 @@ pub async fn edit_file(
             let edit_idx_1 = i + 1;
             let failure = match edit_match::diagnose(&edit.old_text, &text) {
                 Some(mut f) => {
-                    // Re-header with the edit index so the batch view
-                    // can carry one summary line per failure.
+                    // Combine the per-edit ui_view into a single line
+                    // so the human sees:
+                    //   "edit #1 oldText not found. Closest match at..."
+                    // The model_view body remains header-free; the
+                    // batch envelope adds the `--- edit #N ---` separator
+                    // and the "N of M failed" header.
                     f.ui_view = format!(
-                        "edit #{edit_idx_1} oldText not found.\n{}",
+                        "edit #{edit_idx_1} oldText not found. {}",
                         f.ui_view,
-                    );
-                    f.model_view = format!(
-                        "edit #{edit_idx_1} oldText not found.\n{}",
-                        f.model_view,
                     );
                     f
                 }
@@ -2183,7 +2183,7 @@ mod edit_file_tests {
             "expected edit #3 in batch summary, got: {model}",
         );
         assert!(
-            model.contains("No edits were applied"),
+            model.contains("No edits applied"),
             "must declare no edits applied: {model}",
         );
 
