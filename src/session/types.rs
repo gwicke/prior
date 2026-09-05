@@ -510,7 +510,15 @@ impl SessionIndex {
     }
 
     /// Recursively build a subtree rooted at `entry_id`.
-    /// Skips entries whose content is a Leaf or SessionInfo (meta entries).
+    ///
+    /// Skips the entry itself if it is a meta entry (Leaf, SessionInfo)
+    /// — they don't show as rows in the tree list — but **still walks
+    /// into their children**. A `SessionInfo` entry that sits in the
+    /// middle of the active path must not strand its descendants: the
+    /// tree must keep the chain from the root to the leaf intact, even
+    /// if one of the hops is a meta entry the user doesn't need to
+    /// see. (The flat list filters by visibility separately, so even
+    /// if the meta node is in the tree, no row is produced for it.)
     fn build_subtree<'a>(
         &'a self,
         entry_id: &str,
@@ -519,33 +527,46 @@ impl SessionIndex {
     ) -> Option<SessionTreeNode> {
         let entry = self.entries.get(entry_id)?.clone();
 
-        // Skip meta entries that should not appear as tree nodes.
-        if matches!(
-            entry.content,
-            SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
-        ) {
-            return None;
-        }
-
         let children: Vec<SessionTreeNode> = self
             .children
             .get(entry_id)
             .map(|child_ids| {
-                let mut v: Vec<SessionTreeNode> = child_ids
-                    .iter()
-                    .filter_map(|cid| self.build_subtree(cid, active_path, labels))
-                    .collect();
-                // Sort: branch containing preferred_id first
-                v.sort_by_key(|c| {
-                    if active_path.contains(c.entry.id.as_str()) {
-                        0
-                    } else {
-                        1
+                let mut v: Vec<SessionTreeNode> = Vec::new();
+                for cid in child_ids {
+                    // Recurse into the child. If the child is a
+                    // meta entry, the recursive call returns
+                    // something with the meta's own children
+                    // spliced in, so the chain stays gap-free.
+                    if let Some(node) =
+                        self.build_subtree(cid, active_path, labels)
+                    {
+                        v.push(node);
                     }
-                });
+                }
                 v
             })
             .unwrap_or_default();
+
+        // Meta entries (Leaf, SessionInfo) — the entry itself is
+        // invisible in the list, but its children must still be
+        // reachable. If the meta node has visible descendants,
+        // return them wrapped under the meta entry so the tree
+        // shape mirrors the JSONL exactly. The flat list filters
+        // these out via `entry_display_label`, so the user never
+        // sees the SessionInfo row.
+        if matches!(
+            entry.content,
+            SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
+        ) {
+            if children.is_empty() {
+                return None;
+            }
+            return Some(SessionTreeNode {
+                entry,
+                children,
+                label: None,
+            });
+        }
 
         let label = labels.get(entry_id).copied().flatten().map(String::from);
 
