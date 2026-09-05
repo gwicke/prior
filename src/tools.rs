@@ -1977,7 +1977,7 @@ mod edit_file_tests {
         )
         .await
         .unwrap();
-        assert!(res.starts_with("Successfully replaced"));
+        assert!(res.starts_with("Replaced"));
         let after = tokio::fs::read_to_string("a.txt").await.unwrap();
         assert_eq!(after, "goodbye\nworld\n");
     }
@@ -2003,7 +2003,7 @@ mod edit_file_tests {
         .await
         .unwrap();
         assert!(
-            res.starts_with("Successfully replaced 1 block(s) in ./a.txt"),
+            res.starts_with("Replaced 1 block(s) in ./a.txt"),
             "expected relative path in success string, got: {res}",
         );
         // Defensive: the absolute tempdir path must not appear in the
