@@ -85,28 +85,23 @@ impl BatchEditFailure {
         let failed = items.len();
         let mut model_view = String::new();
         model_view.push_str(&format!(
-            "edit failed: {failed} of {total} edit(s) had problems. \
-             No edits were applied. Fix and retry the batch:\n",
+            "{failed} of {total} edit(s) failed. No edits applied.\n",
         ));
         for item in &items {
-            // Strip the leading "edit failed: ... " line from each
-            // per-edit failure so we don't double-print it; the batch
-            // header already names the failing edit by index.
-            let trimmed = item
-                .failure
-                .model_view
-                .trim_start_matches("edit failed:")
-                .trim_start();
+            // Per-edit body has no header of its own; we add the
+            // `--- edit #N ---` separator here.
             model_view.push_str(&format!(
                 "\n--- edit #{} ---\n{}",
                 item.edit_index + 1,
-                trimmed,
+                item.failure.model_view,
             ));
         }
         let ui_view = if items.len() == 1 {
-            // Single failure: pass the per-edit summary through so the
-            // UI shows the line range / count, not just "1 of 1".
-            format!("edit failed: 1 of {total} edit(s) had problems.\n{}",
+            // Single failure: the per-edit summary IS the message. The
+            // model_view in the same JSON envelope carries the diff /
+            // line numbers for the model; no need to point the human at
+            // it.
+            format!("edit failed:\n  {}",
                 items[0].failure.ui_view)
         } else {
             format!(
@@ -187,12 +182,12 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     // line numbers so the model can `read` the right region.
     let window_line_offset = count_lines(&file_text[..win_start]);
 
-    // Build the rich model_view with a small unified diff and line numbers.
+    // Build the rich model_view body (no header; the caller adds a
+    // batch envelope around it).
     let mut model_view = String::new();
     model_view.push_str(&format!(
-        "edit failed: oldText not found.\n\
-         Closest match: similarity {:.2}, file lines {}-{} (anchor at line {}, \
-         length {} chars).\n\
+        "oldText not found. Closest match: similarity {:.2}, file lines {}-{} \
+         (anchor at line {}, length {} chars).\n\
          Diff (your oldText vs. file content at that region):\n",
         similarity,
         window_line_offset + 1,
@@ -218,8 +213,7 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     }
 
     let ui_view = format!(
-        "edit failed: oldText not found. Closest match at file lines {}-{} \
-         (similarity {:.2}). See model tool message for diff.",
+        "Closest match at file lines {}-{} (similarity {:.2}).",
         window_line_offset + 1,
         window_line_offset + window.lines().count().max(1),
         similarity,
@@ -233,12 +227,13 @@ impl EditFailure {
     /// Used both directly (single-edit call) and inside batch items.
     pub fn not_found_no_match(edit_index_1based: usize, old_text: &str) -> Self {
         let ui_view = format!(
-            "edit #{edit_index_1based} failed: oldText not found (no similar region in file).",
+            "edit #{edit_index_1based} oldText not found. \
+             No similar region in file.",
         );
         let model_view = format!(
-            "edit #{edit_index_1based} failed: oldText not found. \
-             No close-enough region in the file; please re-read the file \
-             and re-anchor your edit. Original oldText: '{}'.",
+            "oldText not found. No close-enough region in the file; \
+             please re-read the file and re-anchor your edit. \
+             Original oldText: '{}'.",
             old_text,
         );
         EditFailure { ui_view, model_view }
@@ -271,15 +266,14 @@ impl EditFailure {
                 .join(", ")
         };
         let ui_view = format!(
-            "edit #{edit_index_1based} failed: oldText appears {count} times \
+            "edit #{edit_index_1based} oldText appears {count} times \
              (lines: {line_list}).",
         );
         let model_view = format!(
-            "edit #{edit_index_1based} failed: oldText appears {count} times, \
-             must be unique. Occurrences at lines: {line_list}. \
-             To make it unique, include more surrounding context in oldText \
-             (the line(s) immediately before/after) so only one occurrence \
-             matches. Original oldText: '{}'.",
+            "oldText appears {count} times, must be unique. \
+             Occurrences at lines: {line_list}. Include more surrounding \
+             context in oldText (the line(s) immediately before/after) so \
+             only one occurrence matches. Original oldText: '{}'.",
             old_text,
         );
         EditFailure { ui_view, model_view }
@@ -461,8 +455,11 @@ mod tests {
     #[test]
     fn not_found_no_match_carries_message_in_both_views() {
         let f = EditFailure::not_found_no_match(2, "missing");
+        // ui_view carries the edit index for the human.
         assert!(f.ui_view.contains("edit #2"));
-        assert!(f.model_view.contains("edit #2"));
+        // model_view is body-only (the envelope adds the edit index
+        // header); verify the body content is there.
+        assert!(f.model_view.contains("No close-enough region"));
         assert!(f.model_view.contains("missing"));
         // UI view should not contain the raw oldText (it's not a secret,
         // but the contract is "UI view is short, no file content").
@@ -506,7 +503,8 @@ mod tests {
         assert_eq!(b.failed, 2);
         assert!(b.model_view.contains("--- edit #1 ---"));
         assert!(b.model_view.contains("--- edit #3 ---"));
-        assert!(b.model_view.contains("No edits were applied"));
+        assert!(b.model_view.contains("No edits applied"));
+        assert!(b.model_view.contains("2 of 3 edit(s) failed"));
         // Multi-failure: ui_view is the count-only summary.
         assert!(b.ui_view.contains("2 of 3 edit(s) had problems"));
         assert!(!b.ui_view.contains("--- edit #"));
@@ -522,9 +520,34 @@ mod tests {
             },
         }];
         let b = BatchEditFailure::build(1, items);
-        // Single-failure: ui_view falls through to the per-edit summary.
+        // Single-failure: ui_view is just the per-edit summary line,
+        // prefixed with a one-line "edit failed:" header.
+        assert!(b.ui_view.starts_with("edit failed:"));
         assert!(b.ui_view.contains("closest match at line 42"));
-        assert!(b.ui_view.contains("1 of 1 edit(s)"));
+        assert!(b.ui_view.contains("edit #1"));
+    }
+
+    #[test]
+    fn batch_with_single_failure_does_not_double_header() {
+        // Regression: the previous format produced
+        //   "edit failed: 1 of 1 edit(s) had problems.
+        //    edit #1 oldText not found.
+        //    edit failed: oldText not found. Closest match at file lines..."
+        // The compact form should be a single per-edit line under a
+        // "edit failed:" header.
+        let items = vec![BatchItem {
+            edit_index: 0,
+            failure: EditFailure {
+                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
+                model_view: "<diff>".into(),
+            },
+        }];
+        let b = BatchEditFailure::build(1, items);
+        let ui_lines: Vec<&str> = b.ui_view.lines().collect();
+        assert_eq!(ui_lines.len(), 2, "expected 2 lines, got: {:?}", ui_lines);
+        assert_eq!(ui_lines[0], "edit failed:");
+        assert!(ui_lines[1].contains("edit #1"));
+        assert!(ui_lines[1].contains("Closest match at file lines 60-91"));
     }
 
     #[test]
@@ -539,5 +562,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["total"], 2);
         assert_eq!(v["failed"], 1);
+    }
+
+    #[test]
+    fn batch_model_view_avoids_redundant_headers() {
+        // The model_view should not contain redundant 'edit failed:'
+        // / 'edit #N oldText not found.' prefixes; the envelope owns
+        // those.
+        let items = vec![BatchItem {
+            edit_index: 0,
+            failure: EditFailure {
+                ui_view: "edit #1 oldText not found. Closest match at file lines 60-91 (similarity 0.92).".into(),
+                model_view: "oldText not found. Closest match: similarity 0.92, file lines 60-91.\nDiff:\n a\n-b".into(),
+            },
+        }];
+        let b = BatchEditFailure::build(1, items);
+        // Envelope: "1 of 1 edit(s) failed. No edits applied."
+        assert!(b.model_view.starts_with("1 of 1 edit(s) failed"));
+        assert!(b.model_view.contains("--- edit #1 ---"));
+        // Body preserved.
+        assert!(b.model_view.contains("Closest match: similarity 0.92"));
+        // No redundant "edit failed:" within the body.
+        assert!(!b.model_view.contains("edit failed:"));
+        // No redundant "edit #1 oldText not found." line in the body
+        // (that's the ui_view's job).
+        assert!(!b.model_view.contains("edit #1 oldText not found."));
     }
 }
