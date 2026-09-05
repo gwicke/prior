@@ -157,6 +157,7 @@ impl JsonlSessionRepo {
 
         // Count message entries, extract the first user prompt, and track name.
         let mut message_count = 0usize;
+        let mut user_message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
@@ -165,6 +166,7 @@ impl JsonlSessionRepo {
             if line.contains("\"type\":\"message\"") {
                 message_count += 1;
                 if line.contains("\"role\":\"user\"") {
+                    user_message_count += 1;
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         let text = val
                             .pointer("/message/content/0/text")
@@ -202,6 +204,7 @@ impl JsonlSessionRepo {
             name,
             parent_session: header.parent_session,
             message_count,
+            user_message_count,
             token_count: None,
             first_prompt_preview,
             last_prompt_text: None,
@@ -217,6 +220,7 @@ impl JsonlSessionRepo {
         let header: SessionHeader = serde_json::from_str(first_line).ok()?;
 
         let mut message_count = 0usize;
+        let mut user_message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
@@ -225,6 +229,7 @@ impl JsonlSessionRepo {
             if line.contains("\"type\":\"message\"") {
                 message_count += 1;
                 if line.contains("\"role\":\"user\"") {
+                    user_message_count += 1;
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         let text = val
                             .pointer("/message/content/0/text")
@@ -262,6 +267,7 @@ impl JsonlSessionRepo {
             name,
             parent_session: header.parent_session,
             message_count,
+            user_message_count,
             token_count: None,
             first_prompt_preview,
             last_prompt_text: None,
@@ -280,6 +286,7 @@ impl JsonlSessionRepo {
         let header: SessionHeader = serde_json::from_str(first_line).ok()?;
 
         let mut message_count = 0usize;
+        let mut user_message_count = 0usize;
         let mut first_prompt_preview = None::<String>;
         let mut last_prompt_text: Option<String> = None;
         let mut last_prompt_timestamp: Option<String> = None;
@@ -289,6 +296,7 @@ impl JsonlSessionRepo {
             if line.contains("\"type\":\"message\"") {
                 message_count += 1;
                 if line.contains("\"role\":\"user\"") {
+                    user_message_count += 1;
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
                         let text = val
                             .pointer("/message/content/0/text")
@@ -326,6 +334,7 @@ impl JsonlSessionRepo {
             name,
             parent_session: header.parent_session,
             message_count,
+            user_message_count,
             token_count: None,
             first_prompt_preview,
             last_prompt_text,
@@ -744,6 +753,8 @@ mod tests {
         let sessions = repo.list(Some(cwd)).await.unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].message_count, 2);
+        // 1 user message + 1 assistant message → 1 turn.
+        assert_eq!(sessions[0].user_message_count, 1);
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
     }

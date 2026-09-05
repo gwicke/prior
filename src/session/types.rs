@@ -270,8 +270,12 @@ pub struct SessionMetadata {
     pub name: Option<String>,
     /// Absolute path to the parent session file (if forked).
     pub parent_session: Option<PathBuf>,
-    /// Number of message entries in the session.
+    /// Number of message entries in the session (user + assistant + toolResult).
     pub message_count: usize,
+    /// Number of user-role message entries (i.e. user prompts, one per
+    /// logical turn). Excludes assistant and `toolResult` entries. This is the
+    /// canonical "turn count" used by the `/stat` and `/session <id>` panels.
+    pub user_message_count: usize,
     /// Total token count (from usage on the leaf branch, if tracked).
     pub token_count: Option<u64>,
     /// A short preview of the first user message in the session.

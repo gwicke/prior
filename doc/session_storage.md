@@ -304,6 +304,7 @@ pub(crate) struct SessionMetadata {
     pub(crate) name: Option<String>,      // from the most recent session_info entry
     pub(crate) parent_session: Option<PathBuf>,
     pub(crate) message_count: usize,
+    pub(crate) user_message_count: usize,    // user-role messages (= turn count)
     pub(crate) token_count: Option<u64>,  // from usage on the leaf branch
 }
 
@@ -662,6 +663,10 @@ impl JsonlSessionRepo {
         let message_count = content.lines()
             .filter(|l| l.contains("\"type\":\"message\""))
             .count();
+        // Count user-role messages (turns).
+        let user_message_count = content.lines()
+            .filter(|l| l.contains("\"type\":\"message\"") && l.contains("\"role\":\"user\""))
+            .count();
 
         Some(SessionMetadata {
             id: header.id,
@@ -671,6 +676,7 @@ impl JsonlSessionRepo {
             name: None,  // populated on full index build
             parent_session: header.parent_session,
             message_count,
+            user_message_count,
             token_count: None,
         })
     }
