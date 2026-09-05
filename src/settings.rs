@@ -84,9 +84,18 @@ pub fn default_show_reasoning_handle() -> ShowReasoningHandle {
 /// `/tree <id> compact llm` is run. When the committed `/tree` line has no
 /// trailing text after `llm`, the LLM-compaction handler substitutes this
 /// value (or the built-in `DEFAULT_LLM_COMPACT_PROMPT` if empty).
+///
+/// The `--- PREVIOUS SUMMARY ---` section is injected by LLM compaction
+/// mode when a prior compaction's summary strictly precedes the new
+/// boundary (see doc/nested_compactions.md phase B). The default prompt
+/// tells the model to merge that section rather than treat it as
+/// unrelated, so iterative re-compaction is lossless.
 pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation so far in less than 2000 words. \
      Preserve the key technical decisions, file paths touched, current \
-     task state, and any unresolved questions.";
+     task state, and any unresolved questions. When a \
+     `--- PREVIOUS SUMMARY ---` section is present, treat it as the \
+     existing context checkpoint and merge new information into it \
+     rather than replacing it.";
 
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

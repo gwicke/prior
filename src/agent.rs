@@ -2824,6 +2824,84 @@ fn find_predecessor_on_active_branch(
     }
 }
 
+/// Select the `previousSummary` for a new compaction at `target_id` on the
+/// active branch (doc/nested_compactions.md, phase B, strict-before rule).
+///
+/// Walks the active branch root→leaf. A prior `Compaction` qualifies iff its
+/// own `first_kept_entry_id` is **strictly before** `target_id` on the branch
+/// (compares path positions). Among qualifying compactions, the deepest —
+/// closest to the leaf — wins (last assignment while scanning root→leaf).
+///
+/// A prior compaction whose `first_kept_entry_id` equals or follows
+/// `target_id` is being superseded by the new compaction (the new summary
+/// re-derives that content from the dropped span) and is therefore NOT
+/// merged in. This makes re-compacting at an exact prior boundary behave
+/// like the original compaction at that point: the summarizer sees the
+/// strictly-earlier context, not the about-to-be-superseded summary.
+///
+/// Returns `None` when no prior compaction strictly precedes the target —
+/// i.e. the new compaction is at or before the earliest compaction boundary
+/// on the branch, matching the context the *first* compaction at that point
+/// would have seen.
+fn find_previous_summary_on_active_branch(
+    index: &crate::session::SessionIndex,
+    target_id: &str,
+) -> Option<String> {
+    let leaf = index.leaf_id.as_deref()?;
+    let branch = index.get_path_to_root(leaf); // root → leaf
+    let target_pos = branch.iter().position(|e| e.id == target_id)?;
+
+    let mut previous_summary: Option<String> = None;
+    for entry in &branch {
+        if let crate::session::SessionEntryContent::Compaction {
+            summary,
+            first_kept_entry_id,
+            ..
+        } = &entry.content
+        {
+            // The compaction's first_kept_entry_id must be on the branch for
+            // the positional comparison to be meaningful; if not (defensive
+            // fallback), skip it.
+            if let Some(fk_pos) = branch
+                .iter()
+                .position(|e| e.id == first_kept_entry_id.as_str())
+            {
+                if fk_pos < target_pos {
+                    // Strictly before the new target → qualifies. Last
+                    // assignment wins while scanning root→leaf, so the
+                    // deepest (closest-to-target) qualifying compaction
+                    // is kept.
+                    previous_summary = Some(summary.clone());
+                }
+            }
+        }
+    }
+    previous_summary
+}
+
+/// Compose the summarizer prompt for LLM compaction mode: the user's
+/// summarization instruction, the dropped span (raw `Message` entries), and
+/// optionally the `previousSummary` selected by strict-before
+/// (doc/nested_compactions.md phase B). An empty previous summary is not
+/// injected (no `--- PREVIOUS SUMMARY ---` section).
+fn compose_compaction_llm_prompt(
+    user_prompt: &str,
+    dropped_span: &str,
+    previous_summary: Option<&str>,
+) -> String {
+    let mut composed = format!(
+        "{}\n\n--- BEGIN DROPPED SPAN ---\n{}\n--- END DROPPED SPAN ---",
+        user_prompt, dropped_span,
+    );
+    if let Some(prev) = previous_summary.filter(|s| !s.is_empty()) {
+        composed = format!(
+            "{}\n\n--- PREVIOUS SUMMARY ---\n{}\n--- END PREVIOUS SUMMARY ---",
+            composed, prev,
+        );
+    }
+    composed
+}
+
 /// Where the compaction result gets written. Lets `run_compaction` serve
 /// both the `/tree <id> compact` / `/compact` path (a `Compaction` entry
 /// parented at the resolved target) and a future `/tree <id> switch
@@ -2983,6 +3061,15 @@ async fn run_compaction_at_point(
             };
             let span = build_summary_prompt(&dropped);
 
+            // 2b. Select the previousSummary to merge into the new summary:
+            //     the deepest prior compaction on the active branch whose
+            //     first_kept_entry_id is strictly before target_id
+            //     (doc/nested_compactions.md phase B, strict-before rule).
+            let previous_summary = {
+                let index = session.index().lock().await;
+                find_previous_summary_on_active_branch(&index, target_id)
+            };
+
             // 3. Compose the user-tweakable payload: trailing text on
             //    the committed line wins; otherwise the setting (with
             //    built-in fallback).
@@ -2991,9 +3078,10 @@ async fn run_compaction_at_point(
             } else {
                 llm_payload.to_string()
             };
-            let composed = format!(
-                "{}\n\n--- BEGIN DROPPED SPAN ---\n{}\n--- END DROPPED SPAN ---",
-                user_prompt, span,
+            let composed = compose_compaction_llm_prompt(
+                &user_prompt,
+                &span,
+                previous_summary.as_deref(),
             );
 
             // 4. Switch the leaf to the predecessor. Remember
@@ -4365,8 +4453,10 @@ mod tests {
     use crate::session::storage::SessionStorage;
     use crate::SettingsStore;
     use super::{
-        build_replay_units, compute_resume_model_prefill, count_turns, create_private_dir,
-        find_predecessor_on_active_branch, is_anthropic_family, last_turns_start,
+        build_replay_units, compose_compaction_llm_prompt, compute_resume_model_prefill,
+        count_turns, create_private_dir,
+        find_predecessor_on_active_branch, find_previous_summary_on_active_branch,
+        is_anthropic_family, last_turns_start,
         maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
         run_compaction, CompactionTarget, MessageLogger,
     };
@@ -4706,6 +4796,164 @@ mod tests {
             find_predecessor_on_active_branch(&index, "m1"),
             None
         );
+    }
+
+    /// Build a SessionIndex whose entries are all `Message` entries except
+    /// for the listed compaction descriptors. Each descriptor is
+    /// `(entry_id, first_kept_id, summary)`. The chain is linear
+    /// root→leaf; the leaf is the last `ids` entry.
+    ///
+    /// Compaction entries themselves occupy a position in the chain (they
+    /// are tree nodes), so a chain like `["m0", "c1", "m1"]` means c1
+    /// is parented at m0 and m1 is parented at c1. `first_kept` refers to
+    /// a message id earlier in the chain.
+    fn build_index_with_compactions(
+        ids: &[&str],
+        compactions: &[(&str, &str, &str)],
+    ) -> crate::session::SessionIndex {
+        let leaf = ids.last().expect("non-empty ids");
+        let mut index = build_chain_index(leaf, ids);
+        for (cid, first_kept, summary) in compactions {
+            let parent = ids
+                .iter()
+                .position(|id| *id == *cid)
+                .and_then(|i| if i == 0 { None } else { Some(ids[i - 1].to_string()) });
+            let entry = crate::session::SessionEntry {
+                id: cid.to_string(),
+                parent_id: parent,
+                timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+                content: crate::session::SessionEntryContent::Compaction {
+                    summary: summary.to_string(),
+                    first_kept_entry_id: first_kept.to_string(),
+                    tokens_before: 100,
+                },
+            };
+            index.entries.insert(cid.to_string(), entry);
+        }
+        index
+    }
+
+    #[test]
+    fn find_previous_summary_selects_deepest_strictly_before_target() {
+        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 -> m2 ->
+        //         c2{firstKept:m1, summary:"s2"} -> m3  (leaf=m3)
+        // Compacting at target=m3 (after both): c2 qualifies (its
+        // first_kept m1 is strictly before m3), and it's deeper than c1.
+        let index = build_index_with_compactions(
+            &["m0", "c1", "m1", "m2", "c2", "m3"],
+            &[("c1", "m0", "s1"), ("c2", "m1", "s2")],
+        );
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m3"),
+            Some("s2".to_string())
+        );
+    }
+
+    #[test]
+    fn find_previous_summary_at_exact_boundary_steps_over_superseded() {
+        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 (leaf=m1).
+        // Re-compacting at target=m0 (c1's own first_kept) means c1 is
+        // being superseded at exactly its own boundary; strict-before
+        // skips it and falls back to None (there is no earlier compaction
+        // to merge). This is the "same as the first compaction at that
+        // point saw" behaviour — the original compaction at m0 had no
+        // prior summary to merge either.
+        let index = build_index_with_compactions(
+            &["m0", "c1", "m1"],
+            &[("c1", "m0", "s1")],
+        );
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m0"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_previous_summary_falls_back_to_shallower_when_deeper_superseded() {
+        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 ->
+        //         c2{firstKept:m1, summary:"s2"} -> m2 -> m3 (leaf=m3).
+        // Re-compacting at target=m1: c2's first_kept (m1) EQUALS the target
+        // (c2 is superseded → skipped); c1's first_kept (m0) is strictly
+        // before m1 → qualifies. Result: s1.
+        let index = build_index_with_compactions(
+            &["m0", "c1", "m1", "c2", "m2", "m3"],
+            &[("c1", "m0", "s1"), ("c2", "m1", "s2")],
+        );
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m1"),
+            Some("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn find_previous_summary_no_compaction_before_target_is_none() {
+        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 -> m2
+        // (leaf=m2). Compacting at target=m0: no compaction precedes m0
+        // on the branch → None.
+        let index = build_index_with_compactions(
+            &["m0", "c1", "m1", "m2"],
+            &[("c1", "m0", "s1")],
+        );
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m0"),
+            None
+        );
+        // Same session, target = m2: c1's first_kept m0 precedes m2 → s1.
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m2"),
+            Some("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn find_previous_summary_returns_empty_string_for_empty_qualifying_summary() {
+        // Selection is purely positional: an empty qualifying summary is
+        // still returned as Some(""). The caller (run_compaction_at_point)
+        // filters empties out before injecting a PREVIOUS SUMMARY section.
+        // This test pins down the helper's contract.
+        let index = build_index_with_compactions(
+            &["m0", "c1", "m1"],
+            &[("c1", "m0", "")],
+        );
+        // c1.first_kept (m0) is strictly before target (m1) → qualifies,
+        // even though its summary is empty.
+        assert_eq!(
+            find_previous_summary_on_active_branch(&index, "m1"),
+            Some("".to_string())
+        );
+    }
+
+    #[test]
+    fn compose_llm_prompt_includes_previous_summary_section_when_present() {
+        let prompt = compose_compaction_llm_prompt(
+            "Summarize this.",
+            "user: hello\nassistant: hi",
+            Some("EARLIER SUMMARY"),
+        );
+        assert!(prompt.contains("--- BEGIN DROPPED SPAN ---"));
+        assert!(prompt.contains("--- END DROPPED SPAN ---"));
+        assert!(prompt.contains("user: hello\nassistant: hi"));
+        assert!(prompt.contains("--- PREVIOUS SUMMARY ---"));
+        assert!(prompt.contains("EARLIER SUMMARY"));
+        // PREVIOUS SUMMARY must come after the dropped span.
+        assert!(
+            prompt.find("--- END DROPPED SPAN ---").unwrap()
+                < prompt.find("--- PREVIOUS SUMMARY ---").unwrap()
+        );
+    }
+
+    #[test]
+    fn compose_llm_prompt_omits_previous_summary_when_none_or_empty() {
+        let p1 = compose_compaction_llm_prompt("Prompt", "span", None);
+        assert!(!p1.contains("--- PREVIOUS SUMMARY ---"));
+        let p2 = compose_compaction_llm_prompt("Prompt", "span", Some(""));
+        assert!(!p2.contains("--- PREVIOUS SUMMARY ---"));
+        // Both still contain the dropped span markers and user prompt.
+        for p in [&p1, &p2] {
+            assert!(p.starts_with("Prompt"));
+            assert!(p.contains("--- BEGIN DROPPED SPAN ---"));
+            assert!(p.contains("--- END DROPPED SPAN ---"));
+        }
     }
 
     // ---- run_compaction ----

@@ -9,10 +9,14 @@ Phases implemented:
       every `SessionEntryContent::Compaction` entry encountered in the kept
       range. Only the *latest* compaction's `summary` is emitted at the
       front. Older nested compactions are invisible to the runtime LLM.
-- [ ] **B. Inject `previousSummary` into the LLM compaction summarizer.**
+- [x] **B. Inject `previousSummary` into the LLM compaction summarizer.**
       `run_compaction_at_point` LLM arm. Selection rule: strict-before
       (deepest prior compaction on the active branch whose
-      `first_kept_entry_id` is strictly before the new target).
+      `first_kept_entry_id` is strictly before the new target). Done via
+      `find_previous_summary_on_active_branch`;
+      `compose_compaction_llm_prompt` appends the `--- PREVIOUS SUMMARY ---`
+      section (omitted when none/empty). Default `llm_compact_prompt` now
+      instructs the model to merge it.
 - [x] **C. Drop the leaf-is-compaction guard.** `src/agent.rs`. The dispatch
       block is removed; the LLM-mode "nothing before" guard still covers
       the empty-dropped-span no-op case. Multi-mode interop verified:
@@ -63,12 +67,22 @@ picocode-iterated session will see the older compaction summaries re-emit
 at their path positions — the same noise pi itself produces for its own
 nested-compaction sessions.
 
-### B. `previousSummary` injection in LLM compaction mode (pending)
+### B. `previousSummary` injection in LLM compaction mode (done)
 
-Selection rule: walk the active branch root→leaf; pick the deepest
-`SessionEntryContent::Compaction` whose `first_kept_entry_id` position
-on the branch is **strictly before** the new target's position. Last
-assignment wins.
+Implemented as two functions in `src/agent.rs`:
+
+- `find_previous_summary_on_active_branch(index, target_id) -> Option<String>`:
+  walks the active branch root→leaf and returns the deepest
+  `SessionEntryContent::Compaction`'s `summary` whose `first_kept_entry_id`
+  position is **strictly before** the new target's position. Last
+  assignment wins while scanning root→leaf, so the deepest (closest to
+  target) qualifying compaction is kept. Returns the empty string when a
+  qualifying compaction has an empty summary (the caller filters it out).
+- `compose_compaction_llm_prompt(user_prompt, dropped_span, previous_summary)`:
+  appends the `--- PREVIOUS SUMMARY ---` section after the dropped span
+  when `previous_summary` is non-empty; omits it otherwise.
+
+Selection semantics (strict-before):
 
 - A prior compaction whose `first_kept_entry_id` equals the new target is
   being superseded by the new compaction; it is not merged in. The new
@@ -78,7 +92,7 @@ assignment wins.
   target represents older context the new compaction is not covering
   itself; injecting it preserves that context across the new compaction.
 
-Composed prompt:
+Composed prompt (in LLM mode only):
 
 ```
 {user_prompt}
