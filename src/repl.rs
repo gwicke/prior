@@ -6435,6 +6435,87 @@ mod tests {
     }
 
     #[test]
+    fn from_buffer_tree_list_with_compaction_keeps_row_visible() {
+        // Regression: a real session with a compaction entry must
+        // surface the compaction as a visible row in the `/tree` LIST
+        // overlay (not just the per-id action menu).
+        let tree = vec![attach(
+            tree_entry("m0", None, "user", "kept prompt"),
+            attach(
+                tree_entry("a0", Some("m0"), "assistant", "old answer"),
+                attach(
+                    compaction("c1", Some("a0"), "m0"),
+                    tree_entry("m1", Some("c1"), "user", "after compaction"),
+                ),
+            ),
+        )];
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree,
+            leaf_id: Some("m1".into()),
+            context_tokens: 1234,
+        };
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let (title, opts, active, _) = ov.display_rows();
+        assert!(
+            opts.iter().any(|r| r.contains("compaction")),
+            "compaction row missing from /tree list; got: {opts:#?}"
+        );
+        // The compaction id is what users will type to target it via
+        // /tree <c1>, so it must be wired up as a target.
+        if let ActiveOverlay::Tree { ref targets, .. } = ov {
+            assert!(targets.iter().any(|t| t == "c1"), "targets: {targets:?}");
+        } else {
+            panic!("expected Tree overlay");
+        }
+        // Render the overlay (sel = active = leaf row) and confirm the
+        // compaction row reaches the rendered output with its yellow
+        // FG escape.
+        let sel = active.expect("leaf must be set as active");
+        let row_bg_view: Vec<Option<&str>> = if let ActiveOverlay::Tree { ref row_bgs, .. } = ov {
+            row_bgs.iter().map(|b| b.map(|s| -> &str { s })).collect()
+        } else {
+            vec![]
+        };
+        let rendered = Repl::overlay_lines_with_bgs(
+            title,
+            &opts,
+            None,
+            sel,
+            active,
+            false,
+            Some(&row_bg_view),
+        );
+        assert!(
+            rendered.contains("compaction"),
+            "rendered output missing the compaction row: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\x1b[33m"),
+            "compaction row not styled yellow in the rendered output: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn overlay_lines_selected_active_uses_star_marker() {
         // Selected AND active row shows `* `, not `> ` (so the user
         // sees "you're already here" rather than a generic cursor).
