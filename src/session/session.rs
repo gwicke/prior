@@ -654,12 +654,7 @@ fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
         if let SessionEntryContent::Message { message } = &entry.content {
             if message.get("role").and_then(|r| r.as_str()) == Some("user") {
                 if let Some(text) = summary_message_text(message) {
-                    // Truncate to a reasonable seed length (≈1k chars).
-                    let text = text.trim();
-                    if text.len() > 1024 {
-                        return Some(format!("{}…", &text[..1024]));
-                    }
-                    return Some(text.to_string());
+                    return Some(text.trim().to_string());
                 }
             }
         }
@@ -1124,11 +1119,7 @@ impl Session {
                     // skips tool/results — safe to use here.
                     if let Some(text) = summary_message_text(message) {
                         let text = text.trim();
-                        return Some(if text.len() > 1024 {
-                            format!("{}…", &text[..1024])
-                        } else {
-                            text.to_string()
-                        });
+                        return Some(text.trim().to_string());
                     }
                 }
             }
