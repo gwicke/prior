@@ -3514,47 +3514,38 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     if auto_resume {
         // Resolve the most-recent session for the CWD up-front so the first
         // REPL iteration can submit a complete `/session <id> resume` line.
-        // `repo.list(Some(cwd))` returns the same newest-first listing the
-        // `/session` overlay would render; its top entry is exactly what
-        // Tab would have highlighted.
-        match repo
-            .as_ref()
-            .and_then(|r| std::env::current_dir().ok().map(|c| (r, c)))
+        // Use the synchronous `list_sessions_sync` to avoid a race condition
+        // in the async `list` method where concurrent filesystem operations
+        // (e.g., directory creation from `ensure_session`) could yield an
+        // inconsistent snapshot. The sync version does a blocking read and
+        // returns a consistent view, which is acceptable at startup.
+        if let Some(cwd) = repo.as_ref()
+            .and_then(|_| std::env::current_dir().ok())
         {
-            Some((r, cwd)) => match r.list(Some(&cwd)).await {
-                Ok(metas) if !metas.is_empty() => {
-                    let meta = &metas[0];
-                    // Prefer the user-assigned name (more readable than a
-                    // raw UUID when present), matching what `/session`
-                    // shows in the listing.
-                    let ident = meta
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| meta.id.clone());
-                    pending_prefill = Some(format!("/session {} resume", ident));
-                }
-                Ok(_) => {
-                    // No prior session for this CWD. Print a one-liner so
-                    // the user knows `--resume` had nothing to act on
-                    // (they may have expected an existing session) without
-                    // making this a hard error: a fresh checkout that the
-                    // user happens to launch with `--resume` by muscle
-                    // memory should not abort.
-                    config.output.display_text(
-                        "--resume: no prior session for this directory; starting a new one.",
-                    );
-                }
-                Err(e) => {
-                    config
-                        .output
-                        .display_text(&format!("Cannot list sessions: {}", e));
-                }
-            },
-            None => {
-                // No session storage available (no `app_config_dir`). Same
-                // reasoning as the empty-list branch: silently fall through.
+            let metas = repo.as_ref().unwrap().list_sessions_sync(Some(&cwd));
+            if !metas.is_empty() {
+                let meta = &metas[0];
+                // Prefer the user-assigned name (more readable than a
+                // raw UUID when present), matching what `/session`
+                // shows in the listing.
+                let ident = meta
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| meta.id.clone());
+                pending_prefill = Some(format!("/session {} resume", ident));
+            } else {
+                // No prior session for this CWD. Print a one-liner so
+                // the user knows `--resume` had nothing to act on
+                // (they may have expected an existing session) without
+                // making this a hard error: a fresh checkout that the
+                // user happens to launch with `--resume` by muscle
+                // memory should not abort.
+                config.output.display_text(
+                    "--resume: no prior session for this directory; starting a new one.",
+                );
             }
         }
+        // If no repo or no cwd, silently fall through (same as before).
     }
     loop {
         let action = match repl.as_mut() {
