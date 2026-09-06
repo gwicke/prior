@@ -45,7 +45,11 @@ impl<'de> serde::Deserialize<'de> for ReadOffset {
             where
                 E: serde::de::Error,
             {
-                Err(E::custom(format!("invalid read offset: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(parsed)
+                } else {
+                    Err(E::custom(format!("invalid read offset: '{}' - must be number", value)))
+                }
             }
         }
 
@@ -103,7 +107,11 @@ impl<'de> serde::Deserialize<'de> for ReadLimit {
             where
                 E: serde::de::Error,
             {
-                Err(E::custom(format!("invalid read limit: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(parsed)
+                } else {
+                    Err(E::custom(format!("invalid read limit: '{}' - must be number", value)))
+                }
             }
         }
 
@@ -164,7 +172,11 @@ impl<'de> serde::Deserialize<'de> for BashTimeout {
                 if value.is_empty() {
                     return Ok(None);
                 }
-                Err(E::custom(format!("invalid bash timeout: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(Some(parsed))
+                } else {
+                    Err(E::custom(format!("invalid bash timeout: '{}' - must be number", value)))
+                }
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -251,7 +263,11 @@ impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
                 if value.is_empty() {
                     return Ok(None);
                 }
-                Err(E::custom(format!("invalid timeout_secs: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(Some(parsed))
+                } else {
+                    Err(E::custom(format!("invalid timeout_secs: '{}' - must be number", value)))
+                }
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -338,7 +354,11 @@ impl<'de> serde::Deserialize<'de> for SandboxMemoryMb {
                 if value.is_empty() {
                     return Ok(None);
                 }
-                Err(E::custom(format!("invalid memory_mb: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(Some(parsed))
+                } else {
+                    Err(E::custom(format!("invalid memory_mb: '{}' - must be number", value)))
+                }
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -425,7 +445,11 @@ impl<'de> serde::Deserialize<'de> for SandboxTmpSizeMb {
                 if value.is_empty() {
                     return Ok(None);
                 }
-                Err(E::custom(format!("invalid tmp_size_mb: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<u64>() {
+                    Ok(Some(parsed))
+                } else {
+                    Err(E::custom(format!("invalid tmp_size_mb: '{}' - must be number", value)))
+                }
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -512,7 +536,11 @@ impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
                 if value.is_empty() {
                     return Ok(None);
                 }
-                Err(E::custom(format!("invalid max_output_bytes: '{}' - must be number, is string", value)))
+                if let Ok(parsed) = value.parse::<usize>() {
+                    Ok(Some(parsed))
+                } else {
+                    Err(E::custom(format!("invalid max_output_bytes: '{}' - must be number", value)))
+                }
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
