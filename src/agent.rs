@@ -2903,18 +2903,26 @@ fn collect_entries_for_branch_summary(
 /// on the active branch or is the root. Used by the `compact llm` handler
 /// to pick the position from which to run the LLM (so the LLM's prior
 /// context equals the span the compaction entry is dropping).
-fn find_predecessor_on_active_branch(
-    index: &crate::session::SessionIndex,
-    target_id: &str,
-) -> Option<String> {
-    let leaf = index.leaf_id.as_deref()?;
-    let branch = index.get_path_to_root(leaf); // root → leaf
+/// Find the predecessor of `target_id` on an arbitrary branch (root→leaf order).
+/// Returns the ID of the entry immediately before `target_id`, or `None` if
+/// `target_id` is not on the branch or is the first entry.
+fn find_predecessor(branch: &[crate::session::SessionEntry], target_id: &str) -> Option<String> {
     let pos = branch.iter().position(|e| e.id == target_id)?;
     if pos == 0 {
         None
     } else {
         Some(branch[pos - 1].id.clone())
     }
+}
+
+/// Find the predecessor of `target_id` on the session's active branch.
+fn find_predecessor_on_active_branch(
+    index: &crate::session::SessionIndex,
+    target_id: &str,
+) -> Option<String> {
+    let leaf = index.leaf_id.as_deref()?;
+    let branch = index.get_path_to_root(leaf); // root → leaf
+    find_predecessor(&branch, target_id)
 }
 
 
@@ -2985,7 +2993,6 @@ pub(crate) async fn run_compaction(
     agent: &Option<Box<dyn PicoAgent>>,
     settings: &SettingsStore,
     target: CompactionTarget,
-    old_leaf_id: &str,
     mode: CompactSummaryMode,
     llm_payload: &str,
     output: &dyn Output,
@@ -3004,7 +3011,6 @@ pub(crate) async fn run_compaction(
                 settings,
                 &target_id,
                 tokens_before,
-                old_leaf_id,
                 mode,
                 llm_payload,
                 output,
@@ -3035,7 +3041,6 @@ async fn run_compaction_at_point(
     settings: &SettingsStore,
     target_id: &str,
     tokens_before: u64,
-    old_leaf_id: &str,
     mode: CompactSummaryMode,
     llm_payload: &str,
     output: &dyn Output,
@@ -3043,29 +3048,63 @@ async fn run_compaction_at_point(
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> std::result::Result<(), String> {
+    // -------------------------------------------------------------------------
+    // Shared preamble: tree pivot and dropped span (all modes)
+    // -------------------------------------------------------------------------
+
+    // 1. Get the full raw branch at the original leaf so we can compute the
+    //    dropped span and look up the first user prompt.
+    let original_branch = session.get_branch().await;
+
+    // 2. Find the entry just before target_id on the active branch.
+    //    Required for LLM mode (pivot needs a valid leaf). Optional for
+    //    manual/text-only (seed_text is only used when present).
+    let predecessor_id = find_predecessor(&original_branch, target_id);
+
+    // 3. Pivot the tree so `build_context()` re-scopes to the prefix
+    //    [root .. predecessor_id]. This activates any compaction entry at
+    //    or before that point. `get_pivot_context` handles save/move/restore.
+    //    We only pivot when there is a predecessor — for root-level compactions
+    //    (no predecessor) manual/text-only modes skip the pivot and use no
+    //    seed text; LLM mode still requires a predecessor and returns early.
+    let seed_text = if let Some(ref pred) = predecessor_id {
+        match session.get_pivot_context(pred).await {
+            Some((ctx, _)) => crate::session::Session::extract_seed_from_context(&ctx),
+            None => None,
+        }
+    } else {
+        // No predecessor: root-level compaction. Manual/text-only proceed with
+        // no seed; LLM mode returns an error below.
+        None
+    };
+
+    // 4. LLM mode requires a valid predecessor to scope the summarization
+    //    context. Manual and text-only modes tolerate root-level compactions.
+    if predecessor_id.is_none() && matches!(mode, CompactSummaryMode::Llm) {
+        return Err("nothing before this point".to_string());
+    }
+
+    // 5. The dropped span is everything on the original branch strictly
+    //    before target_id (i.e. the span this compaction will discard).
+    let dropped: Vec<_> = original_branch
+        .into_iter()
+        .take_while(|e| e.id != target_id)
+        .collect();
+
+    // -------------------------------------------------------------------------
+    // Mode-specific processing
+    // -------------------------------------------------------------------------
+
     match mode {
         CompactSummaryMode::Manual => {
-            // Manual mode pre-fills a small template of touched files
-            // (split into `Documents` (`.md`) and `Files` (everything
-            // else)) and lets the user edit it in the review gate (same
-            // path the `text only` and `llm` modes use). A span that
-            // touched no files has nothing to point at, so the template
-            // is empty and we fall through to writing the empty summary
-            // (i.e. the original `truncate`-mode no-op behavior is
-            // preserved for the no-files case).
-            let dropped = {
-                let index = session.index().lock().await;
-                let branch = index.get_path_to_root(old_leaf_id);
-                branch
-                    .into_iter()
-                    .take_while(|e| e.id != target_id)
-                    .collect::<Vec<_>>()
-            };
-            let draft = crate::session::build_manual_template(&dropped);
+            // Manual mode pre-fills a template of touched files (split into
+            // `Documents` (`.md`) and `Files`) seeded with the active compaction's
+            // summary (incremental compaction) or the first user prompt (first
+            // compaction). The user edits it in the review gate before it is
+            // stored. A span with no files and no seed text has nothing to
+            // point at, so we fall through to the empty-summary no-op.
+            let draft = crate::session::build_manual_template(&dropped, seed_text.as_deref());
             let summary = if draft.is_empty() {
-                // Nothing to point at — keep the original behavior (empty
-                // summary, no review). Avoids forcing the user through an
-                // editor for a no-op compaction.
                 String::new()
             } else {
                 match &review {
@@ -3081,9 +3120,6 @@ async fn run_compaction_at_point(
                 .await
                 .map(|_| ())
                 .map_err(|e| format!("Cannot compact session: {}", e))?;
-            // Mirror the text-only / llm behavior: when the user actually
-            // confirmed (or accepted-as-is) a non-empty summary, render
-            // it so they can see what the next turn will see.
             if !summary.is_empty() {
                 output.display_separator();
                 output.display_markdown(&summary);
@@ -3091,20 +3127,11 @@ async fn run_compaction_at_point(
             Ok(())
         }
         CompactSummaryMode::TextOnly => {
-            // The dropped span is everything on the branch BEFORE the
-            // truncation point.
-            let dropped = {
-                let index = session.index().lock().await;
-                let branch = index.get_path_to_root(old_leaf_id);
-                branch
-                    .into_iter()
-                    .take_while(|e| e.id != target_id)
-                    .collect::<Vec<_>>()
-            };
+            // Deterministic text-only summary: user prompts + assistant text
+            // responses per turn, plus touched-files list. Seed text from the
+            // pivot context is available (via `seed_text`) but intentionally
+            // not included — text-only summarises the dropped span directly.
             let draft = crate::session::build_text_only_summary(&dropped);
-            // Summary review / edit gate: let the user review the generated
-            // (deterministic) text before it becomes the compaction's
-            // `summary`. A `None` return cancels without appending.
             let summary = match &review {
                 Some(r) => match r(&draft) {
                     Some(s) => s,
@@ -3116,9 +3143,6 @@ async fn run_compaction_at_point(
                 .append_compaction(&summary, target_id, tokens_before)
                 .await
                 .map_err(|e| format!("Cannot compact session: {}", e))?;
-            // The single intentional inline output for summary-producing
-            // modes: render the generated summary so the user can see
-            // what the next turn will see.
             if !summary.is_empty() {
                 output.display_separator();
                 output.display_markdown(&summary);
@@ -3126,55 +3150,21 @@ async fn run_compaction_at_point(
             Ok(())
         }
         CompactSummaryMode::Llm => {
-            // 1. Find the entry just before target_id on the active branch.
-            //    The summarization request runs with the live conversation
-            //    prefix up to this position, so its context = the span the
-            //    compaction entry will drop.
-            let predecessor_id = {
-                let index = session.index().lock().await;
-                find_predecessor_on_active_branch(&index, target_id)
-            };
-            let Some(predecessor_id) = predecessor_id else {
-                return Err("nothing before this point".to_string());
-            };
-            // The caller is responsible for the
-            // "predecessor == current leaf" check; `run_compaction`
-            // assumes the inputs are already validated.
-
-            // 2. Compose the user-tweakable instruction: trailing text on
+            // 6. Compose the user-tweakable instruction: trailing text on
             //    the committed line wins; otherwise the setting (with
-            //    built-in fallback). This is the ONLY new content in the
-            //    summarization request — the conversation prefix rides as
-            //    real messages (cache-preserving; see
-            //    `summarize_with_session_context`).
+            //    built-in fallback).
             let instruction = if llm_payload.trim().is_empty() {
                 settings.llm_compact_prompt()
             } else {
                 llm_payload.to_string()
             };
 
-            // 3. The leaf dance (restored to its original purpose): move the
-            //    leaf to the predecessor so `build_context()` scopes to
-            //    everything strictly before target_id. A prior compaction on
-            //    that prefix re-activates implicitly: `apply_compaction_
-            //    transforms` emits its summary as the leading `<summary>`
-            //    wrapper. A compaction AT the exact target boundary is a
-            //    descendant of the predecessor, not an ancestor, so it is
-            //    NOT in the prefix — the new summary re-derives its content
-            //    from the raw span (the strict-before supersede rule of
-            //    doc/nested_compactions.md, now emergent from the tree
-            //    rather than injected textually). The compaction entries
-            //    themselves never reach the wire (stepped over by the
-            //    transform).
-            let _ = session.move_leaf(Some(predecessor_id.clone())).await;
-
-            // 4. Run the LLM with the real conversation prefix as history and
-            //    the instruction as the final user message. Retry behavior
-            //    mirrors a normal prompt (same back-off / Esc-cancel loop).
-            //    Note `build` reads the (already-moved) session leaf each
-            //    attempt, so the retry re-sends the identical prefix — there
-            //    is no synthetic steer feedback for a one-shot summary.
-            //    On every outcome the leaf is restored to its original value.
+            // 7. The leaf is already moved to predecessor_id by step 3.
+            //    `summarize_with_session_context` calls `build_context()` internally,
+            //    which re-scopes to the moved leaf and includes any active
+            //    compaction's summary as the leading message. Retries re-send
+            //    the identical scoped prefix. The leaf is restored automatically
+            //    by `get_pivot_context`'s cleanup on each loop iteration.
             let summary_text = match agent.as_ref() {
                 Some(a) => {
                     let instruction = instruction.clone();
@@ -3187,41 +3177,19 @@ async fn run_compaction_at_point(
                     .await;
                     match r {
                         Ok(t) => t,
-                        Err(e) => {
-                            let _ = session
-                                .move_leaf(Some(old_leaf_id.to_string()))
-                                .await;
-                            return Err(format!("Summary failed: {}", e));
-                        }
+                        Err(e) => return Err(format!("Summary failed: {}", e)),
                     }
                 }
-                None => {
-                    let _ = session
-                        .move_leaf(Some(old_leaf_id.to_string()))
-                        .await;
-                    return Err("no agent".to_string());
-                }
+                None => return Err("no agent".to_string()),
             };
 
-            // 5. Empty response: soft-fail.
+            // 8. Empty response: soft-fail.
             let summary_text = summary_text.trim().to_string();
             if summary_text.is_empty() {
-                let _ = session
-                    .move_leaf(Some(old_leaf_id.to_string()))
-                    .await;
                 return Err("Summary was empty; nothing written.".to_string());
             }
 
-            // 6. Switch the leaf back to old_leaf_id. The
-            //    user-visible session position is restored.
-            let _ = session
-                .move_leaf(Some(old_leaf_id.to_string()))
-                .await;
-
-            // 7b. Summary review / edit gate: let the user review and edit
-            //     the LLM-generated draft before it is stored. A `None`
-            //     return cancels without appending (the leaf is already
-            //     restored).
+            // 9. Summary review / edit gate.
             let summary_text = match &review {
                 Some(r) => match r(&summary_text) {
                     Some(s) => s,
@@ -3230,16 +3198,13 @@ async fn run_compaction_at_point(
                 None => summary_text,
             };
 
-            // 8. Append the compaction entry — same shape as the
-            //    other modes. The session file is byte-identical to a
-            //    non-LLM compaction with the same `summary` content.
+            // 10. Append the compaction entry.
             session
                 .append_compaction(&summary_text, target_id, tokens_before)
                 .await
                 .map_err(|e| format!("Cannot compact session: {}", e))?;
 
-            // 9. Render the summary as markdown (same intentional
-            //    inline output as text-only).
+            // 11. Render the summary.
             output.display_separator();
             output.display_markdown(&summary_text);
             Ok(())
@@ -4032,7 +3997,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                     target_id: target_id.clone(),
                                     tokens_before,
                                 },
-                                old_leaf_id.as_deref().unwrap_or(""),
                                 resolved_mode,
                                 &llm_payload,
                                 config.output.as_ref(),
@@ -5222,6 +5186,11 @@ mod tests {
         for entry in &entries {
             storage.append_entry(entry).await.expect("append");
         }
+        // Set the leaf to the last entry so `get_branch()` returns the full path.
+        if let Some(last) = entries.last() {
+            let leaf = crate::session::SessionEntry::new_leaf(Some(last.id.clone()), None);
+            storage.append_entry(&leaf).await.expect("append leaf");
+        }
         let index = storage.build_index().await.expect("build index");
         Session::new_persisted(storage, index)
     }
@@ -5311,13 +5280,12 @@ mod tests {
                 target_id: "u1".to_string(),
                 tokens_before: 100,
             },
-            old_leaf.as_deref().unwrap_or(""),
             CompactSummaryMode::Manual,
             "",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("manual compaction should succeed");
@@ -5359,13 +5327,13 @@ mod tests {
                 target_id: "u1".to_string(),
                 tokens_before: 50,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5408,13 +5376,13 @@ mod tests {
                 target_id: "u1".to_string(),
                 tokens_before: 0,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(res.is_err(), "expected error when no agent available");
@@ -5450,13 +5418,13 @@ mod tests {
                 target_id: "a1".to_string(),
                 tokens_before: 10,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5509,13 +5477,13 @@ mod tests {
                 target_id: "u0".to_string(),
                 tokens_before: 42,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::Manual,
             "",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("manual re-compaction over a leaf-compaction must succeed");
@@ -5569,13 +5537,13 @@ mod tests {
                 target_id: "u1".to_string(),
                 tokens_before: 60,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only re-compaction over a leaf-compaction must succeed");
@@ -5634,13 +5602,13 @@ mod tests {
                 target_id: "a1".to_string(),
                 tokens_before: 10,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
             review,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction with review should succeed");
@@ -5685,13 +5653,13 @@ mod tests {
                 target_id: "a1".to_string(),
                 tokens_before: 10,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
             review,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(
@@ -5745,13 +5713,13 @@ mod tests {
                 target_id: "a0".to_string(),
                 tokens_before: 30,
             },
-            old_leaf.as_deref().unwrap_or(""),
+
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
             None,
-                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(

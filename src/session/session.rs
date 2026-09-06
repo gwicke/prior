@@ -238,21 +238,36 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
 /// hand-edited set of pointers the user can populate or wipe before
 /// confirming the compaction.
 ///
+/// The template is seeded with:
+/// - The **first user prompt** of the session (if no previous compaction
+///   summary exists), which usually establishes significant context; or
+/// - The **previous compaction summary's text** (if one exists), which the
+///   user has been iteratively refining over incremental compactions.
+///
+/// The seed text is placed above the file sections so it survives the
+/// parse → render round-trip. File sections from the previous summary are
+/// also carried forward and merged with freshly-touched files.
+///
 /// Shape (when the dropped span touches at least one file):
 ///
 ///   # Compaction notes
 ///
-///   ## Documents
-///   - <path>  # markdown (*.md) files touched
+///   <seed text or previous summary notes paragraph>
 ///
-///   ## Files
-///   - <path>  # all other files touched
+///   ---
+///   # [Documents]
+///   - modified: path.md   # *.md files touched
+///   - read: path.md
+///
+///   # [Files]
+///   - modified: path.rs
+///   - read: path.rs
 ///
 /// Within each group: modified first, then reads; each group alphabetical.
 /// Empty groups (no `.md` files or no other files) are omitted. A span
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
-pub(crate) fn build_manual_template(dropped: &[SessionEntry]) -> String {
+pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>) -> String {
     let mut files: Vec<TouchedFile> = Vec::new();
     for entry in dropped {
         if let SessionEntryContent::Message { message } = &entry.content {
@@ -261,15 +276,39 @@ pub(crate) fn build_manual_template(dropped: &[SessionEntry]) -> String {
             }
         }
     }
-    if files.is_empty() {
+
+    // Collect seed text (notes paragraph) and carry-forward files.
+    let mut seed_text: Vec<String> = Vec::new();
+    if let Some(summary) = previous_summary {
+        let (parsed_files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
+        for pf in parsed_files {
+            files.push(pf);
+        }
+        seed_text = notes;
+    }
+    // No previous summary: seed with the first user prompt.
+    if seed_text.is_empty() {
+        if let Some(prompt) = first_user_prompt(dropped) {
+            seed_text.push(prompt);
+        }
+    }
+
+    // Nothing to show: no touched files, no seed text. Return empty so
+    // the caller skips the review gate (preserves original no-op behavior).
+    if files.is_empty() && seed_text.is_empty() {
         return String::new();
     }
+
     let mut out = String::new();
     out.push_str("# Compaction notes\n\n");
+    for (i, para) in seed_text.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n");
+        }
+        out.push_str(para);
+    }
     render_files_section(&mut out, &files, "Documents");
     render_files_section(&mut out, &files, "Files");
-    // Trim a single trailing newline; the reviewer opens this in $EDITOR
-    // and a clean ending makes for cleaner edits.
     out.trim_end_matches('\n').to_string()
 }
 
@@ -283,6 +322,271 @@ pub(crate) fn build_manual_template(dropped: &[SessionEntry]) -> String {
 /// decide whether to omit the section header entirely. This keeps the
 /// output compact: if no `.md` was touched, the Documents section simply
 /// doesn't appear, and the summary stays single-section.
+/// Parse a compaction summary into its constituent sections for re-use and
+/// merging across incremental compactions. Designed to be fault-tolerant:
+/// non-conforming input is preserved as-is so the user can manually fix it.
+///
+/// Recognised shapes (case-insensitive, any heading level):
+///
+///   # [Documents]    # Documents    ## documents
+///   - path.md
+///   - modified: path.md
+///   - read: path.md
+///   - Some descriptor: path.md
+///   - /absolute/path.md
+///   * read: /path.rs
+///   * Some sentence: path.md
+///
+/// Rules:
+/// - `-` and `*` list prefixes accepted; non-list lines are preserved.
+/// - `Descriptor: path` (colon-space split on the right-most `:`) is parsed
+///   when the part after the last `:` is a valid file path (has a `.` extension).
+/// - `read` / `modified` descriptors are tracked for upgrade logic; any other
+///   descriptor is preserved verbatim.
+/// - Horizontal rules (`---`, `***`, `---`) are skipped.
+/// - Entries not ending in a valid file path are left in `unparsed`.
+///
+/// Returns `(files, documents, unparsed)` where:
+/// - `files`: non-`.md` paths extracted from the original sections
+/// - `documents`: `.md`/`.markdown` paths extracted from the original sections
+/// - `unparsed`: lines that couldn't be parsed, emitted verbatim below the
+///   file sections so the user can fix them manually
+#[derive(Debug, Default)]
+struct Extractor<'a> {
+    files: Vec<(&'a str, bool)>,
+    documents: Vec<(&'a str, bool)>,
+    unparsed: Vec<&'a str>,
+}
+
+impl<'a> Extractor<'a> {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one non-empty, non-horizontal-rule line into the extractor.
+    fn ingest(&mut self, line: &'a str) {
+        let line = line.trim();
+        if line.is_empty() || line == "--- " || line == "---" || line == "***" {
+            return;
+        }
+
+        // Only list lines are parsed; everything else is preserved as-is.
+        let Some(stripped) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) else {
+            self.unparsed.push(line);
+            return;
+        };
+
+        // Split on the right-most `: ` separator. If the part after it looks
+        // like a file path (contains a `.` before any `/` from the end), treat
+        // the part before as the optional descriptor.
+        let (descriptor, path_candidate) = match stripped.rsplit_once(": ") {
+            Some((desc, rest)) => {
+                // Accept when the "rest" portion contains a file extension.
+                // Path may be bare or absolute.
+                let path = rest.trim();
+                if path.contains('.') && !path.starts_with('.') {
+                    (Some(desc.trim()), path)
+                } else {
+                    (None, stripped.trim())
+                }
+            }
+            None => (None, stripped.trim()),
+        };
+
+        // Normalize: strip trailing `#` comments and whitespace.
+        let path = path_candidate.trim_end().trim_end_matches('`');
+
+        // Accept if it looks like a file (contains a dot, isn't a URL, isn't
+        // just whitespace). Skip URLs, email addresses, dotted words without
+        // separators.
+        if path.is_empty()
+            || path.starts_with("http")
+            || path.starts_with('<')  // email / markup
+            || !path.contains('.')     // no extension → not a file
+            || path.ends_with('.')     // trailing dot
+            || path.contains("://")    // URL
+        {
+            self.unparsed.push(line);
+            return;
+        }
+
+        // Classify by extension.
+        let is_doc = is_document_path(path);
+
+        // Descriptor logic: "read" → modified=false, "modified" → modified=true,
+        // anything else (including absent) → preserve as-is (emit with no
+        // read/modified hint).
+        let modified = descriptor == Some("modified");
+        let preserve_unmodified = descriptor.is_none()
+            || (descriptor != Some("read") && descriptor != Some("modified"));
+
+        let target = if is_doc { &mut self.documents } else { &mut self.files };
+
+        if preserve_unmodified {
+            // Descriptor is absent or non-standard → add verbatim (no hint).
+            target.push((path, modified));
+        } else {
+            // Descriptor is "read" or "modified" → add with status hint.
+            target.push((path, modified));
+        }
+    }
+
+    fn take_unparsed(&mut self) -> Vec<&'a str> {
+        std::mem::take(&mut self.unparsed)
+    }
+}
+
+/// Split a multi-line string into heading-delimited sections. Returns a tuple of
+/// `(preamble, sections)` where:
+/// - `preamble`: text appearing before the first heading (may be empty)
+/// - `sections`: map from normalized label → body text (everything up to the next
+///   heading or horizontal rule, or end-of-input)
+///
+/// Label normalization: lowercased, stripped of `[`/`]`. Any heading level
+/// (1–6 `#`) is accepted. Horizontal rules (`---`, `***`) end a section body.
+fn split_sections(input: &str) -> (String, HashMap<String, String>) {
+    let mut sections = HashMap::new();
+    let mut preamble = String::new();
+    let mut current_label: Option<String> = None;
+    let mut current_body = String::new();
+
+    for line in input.lines() {
+        // Heading detection: any line starting with 1–6 `#` chars followed by
+        // whitespace or `[`.
+        if let Some(rest) = line.strip_prefix('#') {
+            let rest_stripped = rest.trim_start_matches('#').trim_start();
+            if !rest_stripped.is_empty()
+                && (rest_stripped.starts_with('[')
+                    || rest_stripped
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_alphabetic()))
+            {
+                // Flush previous section.
+                if let Some(label) = current_label.take() {
+                    sections.insert(label, current_body.trim().to_string());
+                    current_body.clear();
+                } else if current_body.trim().is_empty() {
+                    // No active section — this is the first heading we hit.
+                    // Save what we've accumulated as the preamble.
+                    preamble = current_body.trim().to_string();
+                    current_body.clear();
+                } else {
+                    // Preamble text was accumulated before any heading.
+                    preamble = current_body.trim().to_string();
+                    current_body.clear();
+                }
+                // Normalise label.
+                let label_raw =
+                    rest_stripped.trim_start_matches('[').trim_end_matches(']');
+                current_label = Some(label_raw.to_lowercase());
+                continue;
+            }
+        }
+        if current_label.is_some() {
+            let trimmed = line.trim();
+            // Horizontal rules end the section body.
+            if trimmed == "---" || trimmed == "***" {
+                continue;
+            }
+            current_body.push_str(line);
+            current_body.push('\n');
+        } else {
+            // Before any heading: accumulate into preamble.
+            let trimmed = line.trim();
+            // Horizontal rules are section separators in the preamble too — skip them.
+            if trimmed == "---" || trimmed == "***" {
+                continue;
+            }
+            current_body.push_str(line);
+            current_body.push('\n');
+        }
+    }
+    // Flush last section.
+    if let Some(label) = current_label {
+        sections.insert(label, current_body.trim().to_string());
+    } else if current_body.trim().is_empty() && preamble.is_empty() {
+        // No heading ever seen, and the body has preamble text.
+        preamble = current_body.trim().to_string();
+    } else if !current_body.trim().is_empty() {
+        // No heading seen at all — all content is preamble.
+        preamble = current_body.trim().to_string();
+    }
+    (preamble, sections)
+}
+
+/// Parse a previously-stored compaction summary and extract the file sections
+/// into a `(TouchedFileVec, preserved_non_file_lines)` pair. The returned
+/// `Vec<TouchedFile>` can be merged with freshly-collected files from the
+/// current span.
+///
+/// Non-file list lines (e.g. free-text notes) are returned verbatim so they
+/// can be re-appended below the unified file section. Horizontal rules are
+/// dropped. This function never errors — malformed input is preserved as-is.
+///
+/// For the `manual` mode, only the first section-level paragraph (before any
+/// heading) is kept as the "previous notes" context. For `text-only`, the
+/// whole body (minus headings) is treated as the notes to keep.
+fn parse_summary_into_sections(
+    summary: &str,
+    file_section_labels: &[&str],
+) -> (Vec<TouchedFile>, Vec<String>) {
+    let (preamble, sections) = split_sections(summary);
+    let mut all_files: Vec<TouchedFile> = Vec::new();
+    let mut non_file_lines: Vec<String> = Vec::new();
+
+    // The preamble (text before the first heading) is always preserved as notes.
+    if !preamble.is_empty() {
+        non_file_lines.push(preamble);
+    }
+
+    for (label, body) in &sections {
+        let is_file_section = file_section_labels.iter().any(|l| *l == label);
+        if is_file_section {
+            let mut extractor = Extractor::new();
+            for line in body.lines() {
+                extractor.ingest(line);
+            }
+            for (path, modified) in extractor.files.drain(..).chain(extractor.documents.drain(..)) {
+                all_files.push(TouchedFile {
+                    path: path.to_string(),
+                    modified,
+                });
+            }
+            non_file_lines.extend(extractor.take_unparsed().iter().map(|s| s.to_string()));
+        } else if !body.is_empty() {
+            // Non-file-section body (e.g. extra notes below the file sections)
+            // is preserved verbatim so the user can fix malformed input.
+            non_file_lines.push(body.clone());
+        }
+    }
+
+    (all_files, non_file_lines)
+}
+
+/// Extract the first user prompt text from a sequence of session entries.
+/// Returns `None` if the span has no user message (e.g. tool-result-only
+/// entries). This is used to seed the manual template when there is no
+/// previous compaction summary — the first prompt usually establishes a
+/// significant amount of context.
+fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
+    for entry in entries.iter().rev() {
+        if let SessionEntryContent::Message { message } = &entry.content {
+            if message.get("role").and_then(|r| r.as_str()) == Some("user") {
+                if let Some(text) = summary_message_text(message) {
+                    // Truncate to a reasonable seed length (≈1k chars).
+                    let text = text.trim();
+                    if text.len() > 1024 {
+                        return Some(format!("{}…", &text[..1024]));
+                    }
+                    return Some(text.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
     // Group + sort: modified first, then read; alphabetical within each.
     let mut modified: Vec<&TouchedFile> = files
@@ -670,6 +974,86 @@ impl Session {
             }
             count
         })
+    }
+
+    /// Pivot the session to `predecessor_id` and return the scoped context.
+    ///
+    /// Moves the leaf to `predecessor_id`, calls `build_context()` (which
+    /// applies `apply_compaction_transforms`), and returns the resulting
+    /// `SessionContext` along with the original leaf ID so the caller can
+    /// restore it. This is the same tree-pivot used by LLM compaction:
+    /// `build_context()` re-scopes to the prefix `root..predecessor_id`,
+    /// activating any compaction entry at or before that point.
+    ///
+    /// Returns `None` if the leaf cannot be saved or moved.
+    pub async fn get_pivot_context(
+        &self, predecessor_id: &str,
+    ) -> Option<(SessionContext, String)> {
+        let old_leaf = self.get_leaf_id().await?;
+        self.move_leaf(Some(predecessor_id.to_string())).await.ok()?;
+        let ctx = self.build_context().await.ok()?;
+        self.move_leaf(Some(old_leaf.clone())).await.ok()?;
+        Some((ctx, old_leaf))
+    }
+
+    /// Extract the text of the active compaction's summary from a pivot
+    /// context, if present.
+    ///
+    /// After a tree pivot to `predecessor_id`, `build_context()` prepends
+    /// the active compaction's summary as a synthetic user message (the
+    /// `<summary>` wrapper from `compaction_summary_message`). This function
+    /// extracts that leading message's text and strips the XML wrapper so
+    /// callers get just the summary content. Returns `None` when there is
+    /// no active compaction or its summary is empty.
+    pub(crate) fn extract_seed_from_context(ctx: &SessionContext) -> Option<String> {
+        let first = ctx.messages.first()?;
+        let Message::User { content } = first else {
+            return None;
+        };
+        let Some(UserContent::Text(t)) = content.first() else {
+            return None;
+        };
+        let raw = t.text.trim();
+        // Strip the COMPACTION_SUMMARY_PREFIX / SUFFIX wrapper.
+        let inner = raw
+            .strip_prefix(COMPACTION_SUMMARY_PREFIX)?
+            .strip_suffix(COMPACTION_SUMMARY_SUFFIX)
+            .unwrap_or(raw)
+            .trim()
+            .to_string();
+        if inner.is_empty() {
+            None
+        } else {
+            Some(inner)
+        }
+    }
+
+    /// Find the first user prompt on the active branch.
+    ///
+    /// Walks root→leaf and returns the text of the first `role: "user"`
+    /// message found — skipping any preceding compaction summary messages that
+    /// were projected from earlier compactions. This correctly handles
+    /// resumed sessions: the first real prompt is always an actual user
+    /// message, never a synthetic summary message.
+    pub async fn get_first_user_prompt(&self) -> Option<String> {
+        let branch = self.get_branch().await;
+        for entry in &branch {
+            if let SessionEntryContent::Message { message } = &entry.content {
+                if message.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    // `summary_message_text` filters to text-only content and
+                    // skips tool/results — safe to use here.
+                    if let Some(text) = summary_message_text(message) {
+                        let text = text.trim();
+                        return Some(if text.len() > 1024 {
+                            format!("{}…", &text[..1024])
+                        } else {
+                            text.to_string()
+                        });
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Build a recursive tree from the in-memory index.
@@ -3011,9 +3395,8 @@ mod tests {
 
     #[test]
     fn build_manual_template_is_empty_when_no_files_touched() {
-        // No file-touching tool calls in the dropped span → no template
-        // (the user has nothing to point at). `run_compaction` falls back
-        // to writing an empty summary in this case.
+        // No file-touching tool calls in the dropped span → no file section,
+        // but the seed text (first user prompt) is always included.
         let dropped = vec![
             sum_user("m0", None, "no files"),
             sum_assistant("a0", Some("m0"), serde_json::json!([
@@ -3022,13 +3405,18 @@ mod tests {
                  "arguments": {"command": "ls"}},
             ])),
         ];
-        assert_eq!(build_manual_template(&dropped), "");
+        let t = build_manual_template(&dropped, None);
+        // Seed text is always present; no file sections since bash doesn't touch files.
+        assert_eq!(
+            t,
+            "# Compaction notes\n\nno files"
+        );
     }
 
     #[test]
     fn build_manual_template_splits_documents_and_files() {
-        // The manual template is a user-editable scaffold: no
-        // conversation content, only the two labeled file lists.
+        // The manual template is a user-editable scaffold: file lists
+        // preceded by the first user prompt as seed text.
         let dropped = vec![
             sum_user("m0", None, "do work"),
             sum_assistant("a0", Some("m0"), serde_json::json!([
@@ -3040,9 +3428,12 @@ mod tests {
                  "arguments": {"path": "docs/plan.md", "edits": []}},
             ])),
         ];
-        let t = build_manual_template(&dropped);
-        // Title.
-        assert!(t.starts_with("# Compaction notes\n\n"));
+        let t = build_manual_template(&dropped, None);
+        // Title section ends with the first file section heading.
+        assert!(t.contains("# Compaction notes\n\n"));
+        assert!(t.contains("\n---\n# [Documents]"));
+        // Seed text (first user prompt) appears after the title.
+        assert!(t.contains("do work"));
         // Both sections present, Documents before Files.
         let docs_i = t.find("# [Documents]").unwrap();
         let files_i = t.find("# [Files]").unwrap();
@@ -3056,10 +3447,6 @@ mod tests {
         let files_block = &t[files_i..];
         assert!(files_block.contains("- modified: src/lib.rs"));
         assert!(!files_block.contains("README.md"));
-        // No user prompts / assistant text leaked into the template.
-        assert!(!t.contains("do work"));
-        assert!(!t.contains("# [user]"));
-        assert!(!t.contains("# [assistant]"));
         // No tool-call syntax / arguments leaked.
         assert!(!t.contains("toolCall"));
         assert!(!t.contains("arguments"));
@@ -3075,10 +3462,12 @@ mod tests {
                  "arguments": {"path": "src/lib.rs", "edits": []}},
             ])),
         ];
-        let t = build_manual_template(&dropped);
+        let t = build_manual_template(&dropped, None);
         assert!(!t.contains("# [Documents]"));
         assert!(t.contains("# [Files]"));
         assert!(t.contains("- modified: src/lib.rs"));
+        // Seed text from first prompt is included.
+        assert!(t.contains("code work"));
 
         // Only .md touched: no Files section, only Documents.
         let dropped = vec![
@@ -3088,9 +3477,173 @@ mod tests {
                  "arguments": {"path": "README.md"}},
             ])),
         ];
-        let t = build_manual_template(&dropped);
+        let t = build_manual_template(&dropped, None);
         assert!(t.contains("# [Documents]"));
         assert!(!t.contains("# [Files]"));
         assert!(t.contains("- read: README.md"));
+        assert!(t.contains("doc work"));
+    }
+
+    // ------------------------------------------------------------------
+    // Summary parsing and section extraction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn split_sections_parses_standard_sections() {
+        let input = "preamble text\n\n---\n# [Documents]\n- path.md\n\n---\n# [Files]\n- path.rs";
+        let (preamble, sections) = split_sections(input);
+        assert_eq!(preamble, "preamble text");
+        assert_eq!(sections.get("documents").unwrap(), "- path.md");
+        assert_eq!(sections.get("files").unwrap(), "- path.rs");
+    }
+
+    #[test]
+    fn split_sections_ignores_heading_levels_and_brackets() {
+        let input = "## documents\n- a.md\n### [Files]\n- b.rs\n# FILES\n- c.txt\n## Documents\n- d.md";
+        let (preamble, sections) = split_sections(input);
+        // Preamble is empty (no text before first heading).
+        assert!(preamble.is_empty());
+        // Last occurrence wins per label.
+        assert_eq!(sections.get("documents").unwrap(), "- d.md");
+        assert_eq!(sections.get("files").unwrap(), "- c.txt");
+    }
+
+    #[test]
+    fn extractor_parses_standard_bullets() {
+        let input = "- modified: path.rs\n- read: path.md\n- /absolute/path.js\n* read: other.rs";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        assert_eq!(ex.documents.len(), 1);
+        assert_eq!(ex.documents[0].0, "path.md");
+        assert!(!ex.documents[0].1); // read
+        assert_eq!(ex.files.len(), 3);
+        assert_eq!(ex.files[0].0, "path.rs");
+        assert!(ex.files[0].1); // modified
+        assert_eq!(ex.files[1].0, "/absolute/path.js");
+        assert_eq!(ex.files[2].0, "other.rs");
+        assert!(!ex.files[2].1); // read (from "* read:")
+    }
+
+    #[test]
+    fn extractor_parses_descriptor_variations() {
+        let input = "- Design doc: path.md\n- Progress doc; update after each turn: another.md\n- Some sentence: /path/file.rs\n- text with `some` [markup](https://example.com): path.js";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        // .md files go to documents; everything else to files.
+        assert_eq!(ex.documents.len(), 2);
+        assert_eq!(ex.documents[0].0, "path.md");
+        assert!(!ex.documents[0].1); // read/modified hint absent → false
+        assert_eq!(ex.documents[1].0, "another.md");
+        assert_eq!(ex.files.len(), 2);
+        assert_eq!(ex.files[0].0, "/path/file.rs");
+        assert!(!ex.files[0].1);
+        assert_eq!(ex.files[1].0, "path.js");
+        assert!(!ex.files[1].1);
+    }
+
+    #[test]
+    fn extractor_ignores_non_file_lines() {
+        let input = "Some prose that is not a list\n- modified: path.rs\n\n---\n  regular text after a list";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        assert_eq!(ex.files.len(), 1);
+        assert_eq!(ex.unparsed.len(), 2);
+        assert!(ex.unparsed.contains(&"Some prose that is not a list"));
+    }
+
+    #[test]
+    fn extractor_skips_urls_and_incomplete_paths() {
+        let input = "- https://example.com\n- user@host\n- no-extension\n- modified: path.rs";
+        let mut ex = Extractor::new();
+        for line in input.lines() {
+            ex.ingest(line);
+        }
+        assert_eq!(ex.files.len(), 1); // only path.rs
+        assert_eq!(ex.unparsed.len(), 3); // url, email, no-ext
+    }
+
+    #[test]
+    fn parse_summary_carries_forward_files_and_notes() {
+        // Files from both Documents and Files sections are merged (both contribute
+        // to the returned list; `build_manual_template` re-splits by extension
+        // when rendering). Non-file-section content before the first file section
+        // heading is returned as notes.
+        let summary = "Context about the project.\n\n---\n# [Documents]\n- read: old.md\n\n---\n# [Files]\n- modified: old.rs";
+        let (all_files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
+        // old.md (document) + old.rs (file) = 2 total.
+        assert_eq!(all_files.len(), 2);
+        assert!(all_files.iter().any(|f| f.path == "old.md" && !f.modified));
+        assert!(all_files.iter().any(|f| f.path == "old.rs" && f.modified));
+        // Notes = pre-file-section text.
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("Context about the project"));
+    }
+
+    #[test]
+    fn parse_summary_handles_malformed_input_gracefully() {
+        // Non-list content gets preserved as unparsed.
+        let summary = "Some notes.\n\n---\n# [Files]\nThis is not a list item\n- good: path.rs";
+        let (files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
+        assert_eq!(files.len(), 1);
+        // Non-file line preserved in notes.
+        assert!(notes.iter().any(|n| n.contains("not a list")));
+    }
+
+    // ------------------------------------------------------------------
+    // Pivot context and seed extraction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn extract_seed_from_context_returns_none_for_empty_context() {
+        use crate::session::types::SessionContext;
+        let ctx = SessionContext {
+            messages: vec![],
+            thinking_level: None,
+            model: None,
+        };
+        assert!(crate::session::Session::extract_seed_from_context(&ctx).is_none());
+    }
+
+    #[test]
+    fn extract_seed_from_context_strips_prefix_and_suffix() {
+        use crate::session::types::SessionContext;
+        use rig_core::message::{Message, UserContent, Text};
+        let summary_text = "Summary body content";
+        // Reconstruct the exact wrapper used by compaction_summary_message.
+        let prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+        let suffix = "\n</summary>";
+        let wrapped = format!("{}{}{}", prefix, summary_text, suffix);
+        let ctx = SessionContext {
+            messages: vec![Message::User {
+                content: vec![UserContent::Text(Text::new(wrapped))],
+            }],
+            thinking_level: None,
+            model: None,
+        };
+        assert_eq!(
+            crate::session::Session::extract_seed_from_context(&ctx).as_deref(),
+            Some("Summary body content")
+        );
+    }
+
+    #[test]
+    fn extract_seed_from_context_returns_none_for_non_user_message() {
+        use crate::session::types::SessionContext;
+        use rig_core::message::Message;
+        let ctx = SessionContext {
+            messages: vec![Message::Assistant {
+                id: None,
+                content: vec![],
+            }],
+            thinking_level: None,
+            model: None,
+        };
+        assert!(crate::session::Session::extract_seed_from_context(&ctx).is_none());
     }
 }
