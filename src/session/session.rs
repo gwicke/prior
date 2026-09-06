@@ -60,11 +60,16 @@ fn compaction_summary_message(summary: &str) -> SessionEntry {
 
 /// A single file touched during the compacted span, for the text-only
 /// summary's file list.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TouchedFile {
     pub path: String,
     /// `true` when the file was written/edited (vs only read).
     pub modified: bool,
+    /// Custom descriptor text from the summary line, if any.
+    /// When `None`, the renderer emits `read:` or `modified:`.
+    /// When `Some("")`, the path is emitted bare.
+    /// When `Some("something")`, emits `something: <path>`.
+    pub descriptor: Option<String>,
 }
 
 /// Markdown / documentation file. Compaction summaries separate these from
@@ -120,14 +125,29 @@ fn summary_message_text(message: &serde_json::Value) -> Option<String> {
 /// comparison to handle path portability. Returns `None` if `path` is not
 /// a sub-path of `session_dir`, or if canonicalization fails.
 pub(crate) fn relativize_path(session_dir: &std::path::Path, path: &str) -> Option<String> {
-    let session_dir = session_dir.canonicalize().ok()?;
-    let abs_path = std::path::Path::new(path).canonicalize().ok()?;
-    let rel = abs_path.strip_prefix(&session_dir).ok()?.to_str()?;
-    // strip_prefix succeeds for equal paths, returning "". Treat as outside.
-    if rel.is_empty() {
+    let session_dir = session_dir.to_string_lossy();
+    let dir = session_dir.trim_end_matches('/');
+    let path_str = path.trim();
+
+    // Normalise: strip leading `./` from relative paths.
+    let path_str = path_str.strip_prefix("./").unwrap_or(path_str);
+
+    // Absolute path: strip the session_dir prefix if present.
+    if let Some(rel) = path_str.strip_prefix(dir) {
+        let rel = rel.trim_start_matches('/');
+        if rel.is_empty() {
+            return None;
+        }
+        return Some(rel.to_string());
+    }
+    // Relative path (doesn't match session_dir): keep as-is.
+    // Paths with `..` or other unusual forms are accepted — they're not
+    // normally accessible in the sandbox and will de-dup normally when they
+    // appear consistently.
+    if path_str.starts_with('/') {
         return None;
     }
-    Some(rel.to_string())
+    Some(path_str.to_string())
 }
 
 /// Extract touched files from one pi assistant message's `toolCall` blocks.
@@ -171,6 +191,7 @@ fn collect_touched_files(
             files.push(TouchedFile {
                 path: normalized,
                 modified,
+                descriptor: None,
             });
         }
     }
@@ -210,19 +231,28 @@ fn collect_touched_files_filtered(
         let normalized = relativize_path(session_dir, path).unwrap_or_else(|| path.to_string());
 
         // Skip already-seen paths (preserve earlier entry's order).
+        // Upgrade descriptor if the new entry is "modified" and the existing is "read".
         if seen_paths.contains(&normalized) {
-            // If the new entry is "modified" and the existing is "read", upgrade it.
             if modified {
                 if let Some(existing) = files.iter_mut().find(|f| f.path == normalized) {
+                    if existing.descriptor.as_deref() == Some("read") {
+                        existing.descriptor = Some("modified".to_string());
+                    }
                     existing.modified = true;
                 }
             }
             continue;
         }
         seen_paths.insert(normalized.clone());
+        let descriptor = if modified {
+            Some("modified".to_string())
+        } else {
+            Some("read".to_string())
+        };
         files.push(TouchedFile {
             path: normalized,
             modified,
+            descriptor,
         });
     }
 }
@@ -433,8 +463,8 @@ pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: 
 ///   file sections so the user can fix them manually
 #[derive(Debug, Default)]
 struct Extractor<'a> {
-    files: Vec<(&'a str, bool)>,
-    documents: Vec<(&'a str, bool)>,
+    files: Vec<(&'a str, Option<String>)>,
+    documents: Vec<(&'a str, Option<String>)>,
     unparsed: Vec<&'a str>,
 }
 
@@ -493,22 +523,19 @@ impl<'a> Extractor<'a> {
         // Classify by extension.
         let is_doc = is_document_path(path);
 
-        // Descriptor logic: "read" → modified=false, "modified" → modified=true,
-        // anything else (including absent) → preserve as-is (emit with no
-        // read/modified hint).
-        let modified = descriptor == Some("modified");
-        let preserve_unmodified = descriptor.is_none()
-            || (descriptor != Some("read") && descriptor != Some("modified"));
+        // Descriptor logic:
+        // - absent or "read" → descriptor=Some("read"), modified=false
+        // - "modified" → descriptor=Some("modified"), modified=true
+        // - anything else → descriptor=Some(custom), modified=false (custom is preserved verbatim)
+        let descriptor = match descriptor.as_deref() {
+            Some("read") => Some("read".to_string()),
+            Some("modified") => Some("modified".to_string()),
+            Some(d) => Some(d.to_string()),
+            None => Some("read".to_string()),
+        };
 
         let target = if is_doc { &mut self.documents } else { &mut self.files };
-
-        if preserve_unmodified {
-            // Descriptor is absent or non-standard → add verbatim (no hint).
-            target.push((path, modified));
-        } else {
-            // Descriptor is "read" or "modified" → add with status hint.
-            target.push((path, modified));
-        }
+        target.push((path, descriptor));
     }
 
     fn take_unparsed(&mut self) -> Vec<&'a str> {
@@ -627,10 +654,12 @@ fn parse_summary_into_sections(
             for line in body.lines() {
                 extractor.ingest(line);
             }
-            for (path, modified) in extractor.files.drain(..).chain(extractor.documents.drain(..)) {
+            for (path, descriptor) in extractor.files.drain(..).chain(extractor.documents.drain(..)) {
+                let modified = descriptor.as_deref() == Some("modified");
                 all_files.push(TouchedFile {
                     path: path.to_string(),
                     modified,
+                    descriptor,
                 });
             }
             non_file_lines.extend(extractor.take_unparsed().iter().map(|s| s.to_string()));
@@ -685,12 +714,28 @@ fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
     out.push_str(&format!("\n---\n# [{}]\n", label));
     let mut lines: Vec<String> = Vec::new();
     for f in modified {
-        lines.push(format!("- modified: {}", f.path));
+        lines.push(file_line(f));
     }
     for f in read {
-        lines.push(format!("- read: {}", f.path));
+        lines.push(file_line(f));
     }
     out.push_str(&lines.join("\n"));
+}
+
+/// Format a single file list line. Uses the custom descriptor if present and
+/// non-empty; falls back to `modified:` or `read:` based on `f.modified`.
+fn file_line(f: &TouchedFile) -> String {
+    match f.descriptor.as_deref() {
+        Some("") | None => {
+            // No custom descriptor: use read/modified hint.
+            if f.modified {
+                format!("- modified: {}", f.path)
+            } else {
+                format!("- read: {}", f.path)
+            }
+        }
+        Some(desc) => format!("- {}: {}", desc, f.path),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3606,13 +3651,13 @@ mod tests {
         }
         assert_eq!(ex.documents.len(), 1);
         assert_eq!(ex.documents[0].0, "path.md");
-        assert!(!ex.documents[0].1); // read
+        assert_eq!(ex.documents[0].1.as_deref(), Some("read"));
         assert_eq!(ex.files.len(), 3);
         assert_eq!(ex.files[0].0, "path.rs");
-        assert!(ex.files[0].1); // modified
+        assert_eq!(ex.files[0].1.as_deref(), Some("modified"));
         assert_eq!(ex.files[1].0, "/absolute/path.js");
         assert_eq!(ex.files[2].0, "other.rs");
-        assert!(!ex.files[2].1); // read (from "* read:")
+        assert_eq!(ex.files[2].1.as_deref(), Some("read")); // "* read:" → read
     }
 
     #[test]
@@ -3625,13 +3670,16 @@ mod tests {
         // .md files go to documents; everything else to files.
         assert_eq!(ex.documents.len(), 2);
         assert_eq!(ex.documents[0].0, "path.md");
-        assert!(!ex.documents[0].1); // read/modified hint absent → false
+        assert_eq!(ex.documents[0].1.as_deref(), Some("Design doc")); // custom preserved
         assert_eq!(ex.documents[1].0, "another.md");
+        assert_eq!(ex.documents[1].1.as_deref(), Some("Progress doc; update after each turn"));
         assert_eq!(ex.files.len(), 2);
         assert_eq!(ex.files[0].0, "/path/file.rs");
-        assert!(!ex.files[0].1);
+        assert_eq!(ex.files[0].1.as_deref(), Some("Some sentence"));
         assert_eq!(ex.files[1].0, "path.js");
-        assert!(!ex.files[1].1);
+        // ": " part before the path is the descriptor; ".js" is the extension → file
+        assert!(ex.files[1].1.as_deref() != Some("read"));
+        assert!(ex.files[1].1.as_deref() != Some("modified"));
     }
 
     #[test]
@@ -3791,13 +3839,14 @@ mod tests {
         let tmp = std::path::PathBuf::from(std::env::temp_dir())
             .join("picocode_relpath_test4");
         std::fs::create_dir_all(&tmp).unwrap();
-        // A nonexistent file inside the session_dir -> canonicalize fails -> None.
+        // A nonexistent file inside the session_dir -> relativizes successfully.
         std::fs::write(tmp.join("marker"), b"").unwrap();
         let result = crate::session::session::relativize_path(
             &tmp,
             tmp.join("nonexistent.rs").to_str().unwrap(),
         );
-        assert_eq!(result, None);
+        // No canonicalization: prefix stripping succeeds regardless of existence.
+        assert_eq!(result, Some("nonexistent.rs".to_string()));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }
