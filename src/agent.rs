@@ -3011,6 +3011,7 @@ impl std::error::Error for CompactionResult {}
 
 impl CompactionResult {
     /// True if the compaction succeeded (entry written).
+    #[cfg(test)]
     pub fn is_done(&self) -> bool {
         matches!(self, CompactionResult::Done)
     }
@@ -5337,7 +5338,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "first reply"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         assert!(run_compaction(
@@ -5382,7 +5383,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "first reply"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         assert!(run_compaction(
@@ -5429,7 +5430,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "first reply"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         let res = run_compaction(
@@ -5474,7 +5475,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "the answer"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         assert!(run_compaction(
@@ -5643,7 +5644,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "the answer"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         let review: Option<CompactionSummaryReview> = Some(Box::new(|draft: &str| {
@@ -5700,7 +5701,7 @@ mod tests {
             message_entry("a1", Some("u1"), "assistant", "the answer"),
         ])
         .await;
-        let old_leaf = s.get_leaf_id().await;
+        let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
         let review: Option<CompactionSummaryReview> = Some(Box::new(|_draft: &str| None));

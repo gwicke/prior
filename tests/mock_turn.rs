@@ -25,7 +25,6 @@ const COLS: u16 = 120;
 struct MockLlm {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
-    scenario: u32,
 }
 
 impl MockLlm {
@@ -47,7 +46,6 @@ impl MockLlm {
         MockLlm {
             port,
             requests,
-            scenario,
         }
     }
 
