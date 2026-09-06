@@ -22,3 +22,4 @@ pub use repo::{SessionRepo, JsonlSessionRepo};
 pub use session::Session;
 pub(crate) use session::{pi_message_to_rig, pi_toolresults_to_rig_message};
 pub(crate) use session::build_text_only_summary;
+pub(crate) use session::build_manual_template;

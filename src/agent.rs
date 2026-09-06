@@ -2148,8 +2148,9 @@ pub(crate) enum ReplayUnit {
     Turn(ConversationTurn),
     /// A compaction boundary marker. Everything on the branch after this
     /// entry is what the agent sees (it was written with `firstKeptEntryId`).
-    /// `summary` is the compaction's summary text (empty for `truncate`
-    /// mode); when non-empty it is rendered as part of the marker.
+    /// `summary` is the compaction's summary text (empty for `manual`
+    /// mode on a no-file span); when non-empty it is rendered as part
+    /// of the marker.
     Compaction {
         tokens_before: u64,
         summary: String,
@@ -2728,11 +2729,19 @@ pub(crate) enum TreeAction {
 /// Summary mode for `/tree compact`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactSummaryMode {
-    /// `summary = ""` — drop the prefix, keep no summary.
-    Truncate,
+    /// User-editable summary: the dropped span is scanned for touched files
+    /// (split into `Documents` = `*.md` and `Files` = everything else) and
+    /// that list is opened in the user's `$EDITOR` for them to edit before
+    /// being stored. The leaf-dance / pre-fill machinery that used to be
+    /// called "truncate" (because it just wrote `summary = ""`) now produces
+    /// a meaningful pre-filled summary. When the dropped span touches no
+    /// files the template is empty and we fall back to `summary = ""` for
+    /// back-compat with the no-op compaction.
+    Manual,
     /// Deterministic text-only summary: user prompts + assistant text
     /// responses per turn, plus a touched-files list (read/write/edit
-    /// paths). No reasoning, no tool calls, no tool output.
+    /// paths, also split into Documents / Files). No reasoning, no tool
+    /// calls, no tool output.
     TextOnly,
     /// LLM-generated summary: the dropped span is serialized into a prompt,
     /// sent through `agent.summarize()` (after temporarily moving the leaf
@@ -2743,7 +2752,7 @@ pub(crate) enum CompactSummaryMode {
     Llm,
 }
 
-/// Parse `/tree <target_id> [switch [--summarize] | compact [truncate|text-only|llm [<payload>]]]`.
+/// Parse `/tree <target_id> [switch [--summarize] | compact [manual|text-only|llm [<payload>]]]`.
 /// The bare `/tree <id> --summarize` form is accepted as an alias for
 /// `switch --summarize` (backward compat). Only committed canonical lines (or
 /// hand-typed canonical/alias forms) reach this parser — sub-menu filter
@@ -2767,8 +2776,14 @@ fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode
                 action = TreeAction::Compact;
                 seen_compact = true;
             }
-            "truncate" | "none" | "no-summary" if seen_compact && !after_mode => {
-                mode = Some(CompactSummaryMode::Truncate)
+            // Primary mode token is now `manual` (the user-editable
+            // pre-fill of the touched-files list). `truncate` / `none` /
+            // `no-summary` remain recognized as deprecated aliases for
+            // muscle-memory / session-log back-compat; the empty-summary
+            // behavior is preserved when the dropped span touches no
+            // files.
+            "manual" | "truncate" | "none" | "no-summary" if seen_compact && !after_mode => {
+                mode = Some(CompactSummaryMode::Manual)
             }
             "text-only" | "text" if seen_compact && !after_mode => {
                 mode = Some(CompactSummaryMode::TextOnly)
@@ -3029,11 +3044,52 @@ async fn run_compaction_at_point(
     cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> std::result::Result<(), String> {
     match mode {
-        CompactSummaryMode::Truncate => session
-            .append_compaction("", target_id, tokens_before)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("Cannot compact session: {}", e)),
+        CompactSummaryMode::Manual => {
+            // Manual mode pre-fills a small template of touched files
+            // (split into `Documents` (`.md`) and `Files` (everything
+            // else)) and lets the user edit it in the review gate (same
+            // path the `text only` and `llm` modes use). A span that
+            // touched no files has nothing to point at, so the template
+            // is empty and we fall through to writing the empty summary
+            // (i.e. the original `truncate`-mode no-op behavior is
+            // preserved for the no-files case).
+            let dropped = {
+                let index = session.index().lock().await;
+                let branch = index.get_path_to_root(old_leaf_id);
+                branch
+                    .into_iter()
+                    .take_while(|e| e.id != target_id)
+                    .collect::<Vec<_>>()
+            };
+            let draft = crate::session::build_manual_template(&dropped);
+            let summary = if draft.is_empty() {
+                // Nothing to point at — keep the original behavior (empty
+                // summary, no review). Avoids forcing the user through an
+                // editor for a no-op compaction.
+                String::new()
+            } else {
+                match &review {
+                    Some(r) => match r(&draft) {
+                        Some(s) => s,
+                        None => return Ok(()), // user cancelled
+                    },
+                    None => draft, // non-interactive (tests, pipe): accept as-is
+                }
+            };
+            session
+                .append_compaction(&summary, target_id, tokens_before)
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("Cannot compact session: {}", e))?;
+            // Mirror the text-only / llm behavior: when the user actually
+            // confirmed (or accepted-as-is) a non-empty summary, render
+            // it so they can see what the next turn will see.
+            if !summary.is_empty() {
+                output.display_separator();
+                output.display_markdown(&summary);
+            }
+            Ok(())
+        }
         CompactSummaryMode::TextOnly => {
             // The dropped span is everything on the branch BEFORE the
             // truncation point.
@@ -3882,7 +3938,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             // dropped span is empty (compaction.ts:688),
                             // and the no-op stacked case is handled by
                             // the LLM-mode guard below ("nothing before
-                            // the current position"). Truncate and
+                            // the current position"). Manual and
                             // text-only on an empty dropped span produce
                             // a legal (if useless) compaction entry.
 
@@ -3907,7 +3963,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 Err(_) => 0,
                             };
 
-                            let resolved_mode = mode.unwrap_or(CompactSummaryMode::Truncate);
+                            let resolved_mode = mode.unwrap_or(CompactSummaryMode::Manual);
 
                             // LLM mode needs a live agent. Startup is lazy:
                             // `agent` is only built on the first normal prompt
@@ -3915,7 +3971,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             // `/session resume` (before any prompt) would
                             // otherwise hit `run_compaction`'s `None` arm and
                             // fail with "no agent". Build it here, mirroring
-                            // the lazy first-prompt creation below. Truncate /
+                            // the lazy first-prompt creation below. Manual /
                             // TextOnly never touch the agent, so they stay
                             // network-free regardless.
                             if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
@@ -3931,7 +3987,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             }
 
                             // LLM mode-specific early-out: refuse if the
-                            // dropped span is empty. (Truncate / TextOnly
+                            // dropped span is empty. (Manual / TextOnly
                             // are no-ops on an empty dropped span but
                             // still legal; the user explicitly asked.)
                             if resolved_mode == CompactSummaryMode::Llm {
@@ -3949,18 +4005,23 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 }
                             }
 
-                            // Summary review / edit gate (TextOnly & Llm
-                            // only). When the interactive REPL is active, the
-                            // generated draft is opened in $EDITOR and the
-                            // user accepts (default) or cancels before the
+                            // Summary review / edit gate (all three modes can
+                            // now produce a user-editable draft: manual
+                            // pre-fills a Documents/Files list, text-only
+                            // and llm fill their existing drafts). When the
+                            // interactive REPL is active, the generated
+                            // draft is opened in $EDITOR and the user
+                            // accepts (default) or cancels before the
                             // entry is written (repl.rs
                             // review_compaction_summary). Outside the REPL
                             // (quiet / pipe / tests) there is no dialog and
-                            // the draft is accepted as-is.
+                            // the draft is accepted as-is. An empty draft
+                            // (manual mode on a no-file span) still
+                            // takes this branch — `review` is only
+                            // consulted inside `run_compaction`, which
+                            // short-circuits to the empty summary path.
                             let review: Option<CompactionSummaryReview> =
-                                if resolved_mode == CompactSummaryMode::Truncate {
-                                    None
-                                } else if let Some(g) = &guard {
+                                if let Some(g) = &guard {
                                     let g = g.clone();
                                     let out = config.output.clone();
                                     Some(Box::new(move |draft: &str| {
@@ -4865,12 +4926,19 @@ mod tests {
         let (target, ..) = parse_tree_args("plain-id switch");
         assert_eq!(target, "plain-id");
 
-        // Compact with mode + summarize flag orthogonal.
+        // Compact with mode + summarize flag orthogonal. `truncate`
+        // remains recognized as a deprecated alias for the new primary
+        // `manual` token.
         let (target, action, mode, _, _) =
             parse_tree_args("<id9> compact truncate --summarize");
         assert_eq!(target, "id9");
         assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::Truncate));
+        assert_eq!(mode, Some(CompactSummaryMode::Manual));
+
+        // Primary mode token is `manual`.
+        let (_, action, mode, _, _) = parse_tree_args("<id9> compact manual");
+        assert_eq!(action, TreeAction::Compact);
+        assert_eq!(mode, Some(CompactSummaryMode::Manual));
 
         // Text-only mode token.
         let (_, action, mode, _, _) = parse_tree_args("<id9> compact text-only");
@@ -5022,11 +5090,12 @@ mod tests {
     // The /compact command (now rewriting to /tree <last_user_id>
     // compact) and the existing /tree <id> compact both route through
     // `run_compaction`. These tests verify the per-mode mechanics in
-    // isolation: Truncate writes a `Compaction` entry with empty
-    // summary; TextOnly writes a deterministic summary; Llm runs the
-    // predecessor / move-back / append dance. The mode plumbing is
-    // already covered by the `parse_tree_args` tests, so we focus
-    // here on the side effects of `run_compaction`.
+    // isolation: Manual writes a `Compaction` entry with empty
+    // summary when the dropped span touched no files; TextOnly writes
+    // a deterministic summary; Llm runs the predecessor / move-back /
+    // append dance. The mode plumbing is already covered by the
+    // `parse_tree_args` tests, so we focus here on the side effects of
+    // `run_compaction`.
 
     #[tokio::test]
     async fn retry_summarization_succeeds_on_first_attempt() {
@@ -5229,10 +5298,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_compaction_truncate_writes_empty_summary() {
-        // After run_compaction(Truncate, target=u1), a Compaction
-        // entry should appear on the branch with empty summary and
-        // first_kept_entry_id = u1.
+    async fn run_compaction_manual_writes_empty_summary() {
+        // After run_compaction(Manual, target=u1) on a span that touched
+        // no files, a Compaction entry should appear on the branch with
+        // empty summary and first_kept_entry_id = u1. (The empty-summary
+        // no-files path preserves the original `truncate`-mode
+        // behavior.)
         let s = build_writable_session_with(vec![
             message_entry("u1", None, "user", "first prompt"),
             message_entry("a1", Some("u1"), "assistant", "first reply"),
@@ -5250,7 +5321,7 @@ mod tests {
                 tokens_before: 100,
             },
             old_leaf.as_deref().unwrap_or(""),
-            CompactSummaryMode::Truncate,
+            CompactSummaryMode::Manual,
             "",
             out.as_ref(),
             None,
@@ -5258,7 +5329,7 @@ mod tests {
                 &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
-        .expect("truncate compaction should succeed");
+        .expect("manual compaction should succeed");
 
         // The new leaf should be a Compaction entry.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -5419,12 +5490,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_compaction_truncate_when_leaf_is_compaction_writes_new_entry() {
+    async fn run_compaction_manual_when_leaf_is_compaction_writes_new_entry() {
         // Phase C (doc/nested_compactions.md): the leaf-is-compaction guard
         // is removed, so re-compacting a session whose leaf is ALREADY a
-        // compaction must succeed. Truncate mode writes a fresh empty-summary
+        // compaction must succeed. Manual mode writes a fresh empty-summary
         // Compaction entry even though the dropped span is empty (the
-        // user explicitly asked for a truncate at this point).
+        // user explicitly asked for a manual compaction at this point).
         //
         // Branch: [u0, a0, C1{firstKept:u0}] — leaf is C1.
         let s = build_writable_session_with(vec![
@@ -5448,7 +5519,7 @@ mod tests {
                 tokens_before: 42,
             },
             old_leaf.as_deref().unwrap_or(""),
-            CompactSummaryMode::Truncate,
+            CompactSummaryMode::Manual,
             "",
             out.as_ref(),
             None,
@@ -5456,7 +5527,7 @@ mod tests {
                 &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
-        .expect("truncate re-compaction over a leaf-compaction must succeed");
+        .expect("manual re-compaction over a leaf-compaction must succeed");
 
         // New leaf is a Compaction entry with empty summary and firstKept=u0.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -6249,7 +6320,7 @@ mod tests {
         match &units[1] {
             ReplayUnit::Compaction { tokens_before, summary } => {
                 assert_eq!(*tokens_before, 42_000);
-                assert_eq!(summary, ""); // truncate-mode compaction
+                assert_eq!(summary, ""); // manual-mode compaction (no files touched)
             }
             _ => panic!("expected compaction marker"),
         }

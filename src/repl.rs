@@ -625,7 +625,7 @@ impl ActiveOverlay {
                 let mut header = Vec::new();
                 Repl::compact_summary_header(&target_id, &label, ctx, &mut header);
                 let (opts, _fuzzy_active) =
-                    Repl::filter_tree_options(&["truncate", "text only", "llm"], &filter);
+                    Repl::filter_tree_options(&["manual", "text only", "llm"], &filter);
                 let first = filter.split_whitespace().next().unwrap_or("");
                 let first_normalized = first.replace(' ', "-");
                 let active = opts
@@ -800,7 +800,7 @@ impl ActiveOverlay {
                                     &mut header,
                                 );
                                 let (opts, _fuzzy_active) =
-                                    Repl::filter_tree_options(&["truncate", "text only", "llm"], &sub_filter);
+                                    Repl::filter_tree_options(&["manual", "text only", "llm"], &sub_filter);
                                 // If the filter begins with a known mode
                                 // label followed by whitespace (e.g. `llm
                                 // <payload>`), prefer that mode even when
@@ -1325,7 +1325,7 @@ impl ActiveOverlay {
             ActiveOverlay::CompactSummary { target_id, opts, .. } => {
                 if let Some(label) = opts.get(sel) {
                     let mode = match label.as_str() {
-                        "truncate" => " truncate",
+                        "manual" => " manual",
                         "text only" => " text-only",
                         // LLM mode stages an editable prompt for the user
                         // to tweak before submitting; no emit_commit here
@@ -1724,7 +1724,7 @@ impl ActiveOverlay {
                     }
                     let head = format!("/tree <{}> compact", target_id);
                     let line = match label.as_str() {
-                        "truncate" => format!("{} truncate", head),
+                        "manual" => format!("{} manual", head),
                         "text only" => format!("{} text-only", head),
                         _ => String::new(),
                     };
@@ -5889,7 +5889,7 @@ mod tests {
         match ov {
             ActiveOverlay::CompactSummary { target_id, opts, active, header, .. } => {
                 assert_eq!(target_id, "root-entry");
-                assert_eq!(opts, vec!["truncate".to_string(), "text only".to_string(), "llm".to_string()]);
+                assert_eq!(opts, vec!["manual".to_string(), "text only".to_string(), "llm".to_string()]);
                 assert_eq!(active, Some(0));
                 // Info header present: entry row + dropped/kept/token rows.
                 assert!(!header.is_empty());

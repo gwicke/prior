@@ -67,6 +67,25 @@ pub(crate) struct TouchedFile {
     pub modified: bool,
 }
 
+/// Markdown / documentation file. Compaction summaries separate these from
+/// other touched files so the user (or an LLM reading the summary) can
+/// quickly find narrative context vs. code/config artifacts.
+///
+/// The check is the basename suffix `.md` / `.markdown` (case-insensitive).
+/// We intentionally keep this conservative — no MIME sniffing, no
+/// "looking inside the file" — because the input here is a tool-call
+/// path the user already used, so the file's role is what the path
+/// declares.
+pub(crate) fn is_document_path(path: &str) -> bool {
+    // Take the last path component (after the final `/` or `\`).
+    let base = match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    };
+    let lower = base.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
 /// Serialize one pi user/assistant AgentMessage into the text-only summary.
 /// Returns `None` for messages with no renderable text (tool results,
 /// reasoning-only assistant messages, empty content).
@@ -203,23 +222,91 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
     flush_turn(&mut out, &mut turn_assistant);
 
     if !files.is_empty() {
-        out.push_str("\n---\n# [files touched]\n");
-        // Modified first, then reads; each group alphabetical for stability.
-        let mut modified: Vec<&TouchedFile> =
-            files.iter().filter(|f| f.modified).collect();
-        let mut read: Vec<&TouchedFile> = files.iter().filter(|f| !f.modified).collect();
-        modified.sort_by(|a, b| a.path.cmp(&b.path));
-        read.sort_by(|a, b| a.path.cmp(&b.path));
-        let mut lines: Vec<String> = Vec::new();
-        for f in modified {
-            lines.push(format!("- modified: {}", f.path));
-        }
-        for f in read {
-            lines.push(format!("- read: {}", f.path));
-        }
-        out.push_str(&lines.join("\n"));
+        // Split into Documents (markdown) and Files (everything else) so the
+        // reader can quickly find narrative context vs. code/config. Within
+        // each group, modified first then reads; both groups alphabetical
+        // for stability across runs. A group that is empty is omitted.
+        render_files_section(&mut out, &files, "Documents");
+        render_files_section(&mut out, &files, "Files");
     }
     out.trim_start_matches('\n').to_string()
+}
+
+/// Build a deterministic, user-editable template for `manual`-mode
+/// compaction. Unlike `text only`, this contains NO conversation
+/// content (user prompts or assistant text) — it is purely a
+/// hand-edited set of pointers the user can populate or wipe before
+/// confirming the compaction.
+///
+/// Shape (when the dropped span touches at least one file):
+///
+///   # Compaction notes
+///
+///   ## Documents
+///   - <path>  # markdown (*.md) files touched
+///
+///   ## Files
+///   - <path>  # all other files touched
+///
+/// Within each group: modified first, then reads; each group alphabetical.
+/// Empty groups (no `.md` files or no other files) are omitted. A span
+/// that touches no files returns the empty string — i.e. manual-mode
+/// compaction remains a no-op when there is nothing to point at.
+pub(crate) fn build_manual_template(dropped: &[SessionEntry]) -> String {
+    let mut files: Vec<TouchedFile> = Vec::new();
+    for entry in dropped {
+        if let SessionEntryContent::Message { message } = &entry.content {
+            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                collect_touched_files(message, &mut files);
+            }
+        }
+    }
+    if files.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str("# Compaction notes\n\n");
+    render_files_section(&mut out, &files, "Documents");
+    render_files_section(&mut out, &files, "Files");
+    // Trim a single trailing newline; the reviewer opens this in $EDITOR
+    // and a clean ending makes for cleaner edits.
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Append a single labeled files group (`# [label]`, then bullet lines) to
+/// `out`. The split key (`is_document_path`) routes `.md` files to one
+/// group and everything else to another; this function picks one side per
+/// call. Pass the same `files` list to two calls with two different labels
+/// to get the split Documents / Files rendering.
+///
+/// A group with no matching files emits nothing — the caller can then
+/// decide whether to omit the section header entirely. This keeps the
+/// output compact: if no `.md` was touched, the Documents section simply
+/// doesn't appear, and the summary stays single-section.
+fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
+    // Group + sort: modified first, then read; alphabetical within each.
+    let mut modified: Vec<&TouchedFile> = files
+        .iter()
+        .filter(|f| f.modified && is_document_path(&f.path) == (label == "Documents"))
+        .collect();
+    let mut read: Vec<&TouchedFile> = files
+        .iter()
+        .filter(|f| !f.modified && is_document_path(&f.path) == (label == "Documents"))
+        .collect();
+    if modified.is_empty() && read.is_empty() {
+        return;
+    }
+    modified.sort_by(|a, b| a.path.cmp(&b.path));
+    read.sort_by(|a, b| a.path.cmp(&b.path));
+    out.push_str(&format!("\n---\n# [{}]\n", label));
+    let mut lines: Vec<String> = Vec::new();
+    for f in modified {
+        lines.push(format!("- modified: {}", f.path));
+    }
+    for f in read {
+        lines.push(format!("- read: {}", f.path));
+    }
+    out.push_str(&lines.join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2702,8 +2789,10 @@ mod tests {
         let second = s.find("second prompt").unwrap();
         assert!(first < second);
         // HR separators before every section: 2 user turns, 2 assistant
-        // responses, and the files list. (The very first separator has its
-        // leading newline trimmed off.)
+        // responses, and 1 files section (the .rs read in this span
+        // belongs to "Files", not "Documents", so the split is a single
+        // group here). (The very first separator has its leading newline
+        // trimmed off.)
         assert_eq!(s.matches("---\n# [").count(), 5);
         assert!(s.starts_with("---\n# [user]\nfirst prompt"));
     }
@@ -2725,8 +2814,10 @@ mod tests {
             ])),
         ];
         let s = build_text_only_summary(&dropped);
+        // No .md files in this span, so only the "Files" section appears.
+        assert!(s.contains("# [Files]"));
+        assert!(!s.contains("# [Documents]"));
         // Modified files listed as modified (read-then-edit promotes).
-        assert!(s.contains("# [files touched]"));
         assert!(s.contains("- modified: a.txt"));
         assert!(s.contains("- read: b.txt"));
         // Non-file tools ignored; a.txt appears once in the read list and
@@ -2809,7 +2900,9 @@ mod tests {
         assert!(text.starts_with(COMPACTION_SUMMARY_PREFIX));
         assert!(text.contains("# [user]\nearly task"));
         assert!(text.contains("[assistant]"));
-        assert!(text.contains("# [files touched]"));
+        // src/lib.rs is non-markdown → it lands in the Files section.
+        assert!(text.contains("# [Files]"));
+        assert!(!text.contains("# [Documents]"));
         assert!(text.contains("- modified: src/lib.rs"));
         let second_text = match &transformed[1].content {
             SessionEntryContent::Message { message } => {
@@ -2818,5 +2911,186 @@ mod tests {
             _ => panic!("expected Message"),
         };
         assert_eq!(second_text, "kept prompt");
+    }
+
+    #[test]
+    fn is_document_path_classifies_markdown_only() {
+        // Plain `.md` / `.markdown` (case-insensitive) are documents.
+        assert!(is_document_path("README.md"));
+        assert!(is_document_path("readme.MD"));
+        assert!(is_document_path("notes.markdown"));
+        assert!(is_document_path("Notes.Markdown"));
+        // Subpaths preserved (only the suffix matters).
+        assert!(is_document_path("docs/spec/plan.md"));
+        assert!(is_document_path("a\\b\\c.md"));
+        // Non-markdown is not a document, even if it looks "document-y".
+        assert!(!is_document_path("main.rs"));
+        assert!(!is_document_path("data.json"));
+        assert!(!is_document_path("notes.mdx"));
+        assert!(!is_document_path("notes.md5"));
+        // Edge: file literally named `.md` is a document.
+        assert!(is_document_path(".md"));
+        // Trailing dot does NOT match (we only treat the final suffix).
+        assert!(!is_document_path("notes.md."));
+    }
+
+    #[test]
+    fn text_only_summary_splits_documents_and_files() {
+        // The dropped span touches both markdown and non-markdown files;
+        // the text-only summary must render them under separate headers,
+        // with each group sorted (modified before reads, alphabetical
+        // within).
+        let dropped = vec![
+            sum_user("m0", None, "do work"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "text", "text": "working"},
+                // Non-markdown (code) — goes to "Files".
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "src/lib.rs", "edits": []}},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "README.md"}},
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "docs/plan.md", "edits": []}},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "CHANGELOG.md"}},
+            ])),
+        ];
+        let s = build_text_only_summary(&dropped);
+        // Both headers present.
+        assert!(s.contains("# [Documents]"), "missing Documents section: {s}");
+        assert!(s.contains("# [Files]"), "missing Files section: {s}");
+        // Documents section: only .md files, modified (docs/plan.md) before
+        // read (README.md, CHANGELOG.md), alphabetical within each.
+        let docs_start = s.find("# [Documents]").unwrap();
+        let files_start = s.find("# [Files]").unwrap();
+        assert!(docs_start < files_start);
+        let docs_block = &s[docs_start..files_start];
+        assert!(docs_block.contains("- modified: docs/plan.md"));
+        assert!(docs_block.contains("- read: CHANGELOG.md"));
+        assert!(docs_block.contains("- read: README.md"));
+        // No non-.md in Documents.
+        assert!(!docs_block.contains("src/lib.rs"));
+        // Files section: only non-.md, modified (src/lib.rs).
+        let files_block = &s[files_start..];
+        assert!(files_block.contains("- modified: src/lib.rs"));
+        assert!(!files_block.contains("README.md"));
+        assert!(!files_block.contains("docs/plan.md"));
+        // Modified still comes before reads in each group.
+        let docs_m = docs_block.find("- modified:").unwrap();
+        let docs_r = docs_block.find("- read:").unwrap();
+        assert!(docs_m < docs_r);
+    }
+
+    #[test]
+    fn text_only_summary_omits_empty_files_group() {
+        // If the dropped span touches ONLY markdown files, the Files
+        // section is empty and must be omitted (no header, no empty
+        // bullets). Same for the converse.
+        let only_md = vec![
+            sum_user("m0", None, "read docs"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "README.md"}},
+            ])),
+        ];
+        let s = build_text_only_summary(&only_md);
+        assert!(s.contains("# [Documents]"));
+        assert!(!s.contains("# [Files]"));
+
+        let only_rs = vec![
+            sum_user("m0", None, "read code"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "src/lib.rs"}},
+            ])),
+        ];
+        let s = build_text_only_summary(&only_rs);
+        assert!(s.contains("# [Files]"));
+        assert!(!s.contains("# [Documents]"));
+    }
+
+    #[test]
+    fn build_manual_template_is_empty_when_no_files_touched() {
+        // No file-touching tool calls in the dropped span → no template
+        // (the user has nothing to point at). `run_compaction` falls back
+        // to writing an empty summary in this case.
+        let dropped = vec![
+            sum_user("m0", None, "no files"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "text", "text": "just text"},
+                {"type": "toolCall", "name": "bash",
+                 "arguments": {"command": "ls"}},
+            ])),
+        ];
+        assert_eq!(build_manual_template(&dropped), "");
+    }
+
+    #[test]
+    fn build_manual_template_splits_documents_and_files() {
+        // The manual template is a user-editable scaffold: no
+        // conversation content, only the two labeled file lists.
+        let dropped = vec![
+            sum_user("m0", None, "do work"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "src/lib.rs", "edits": []}},
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "README.md"}},
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "docs/plan.md", "edits": []}},
+            ])),
+        ];
+        let t = build_manual_template(&dropped);
+        // Title.
+        assert!(t.starts_with("# Compaction notes\n\n"));
+        // Both sections present, Documents before Files.
+        let docs_i = t.find("# [Documents]").unwrap();
+        let files_i = t.find("# [Files]").unwrap();
+        assert!(docs_i < files_i);
+        // Documents: only .md files, in modified-then-read order.
+        let docs_block = &t[docs_i..files_i];
+        assert!(docs_block.contains("- modified: docs/plan.md"));
+        assert!(docs_block.contains("- read: README.md"));
+        assert!(!docs_block.contains("src/lib.rs"));
+        // Files: only non-.md files.
+        let files_block = &t[files_i..];
+        assert!(files_block.contains("- modified: src/lib.rs"));
+        assert!(!files_block.contains("README.md"));
+        // No user prompts / assistant text leaked into the template.
+        assert!(!t.contains("do work"));
+        assert!(!t.contains("# [user]"));
+        assert!(!t.contains("# [assistant]"));
+        // No tool-call syntax / arguments leaked.
+        assert!(!t.contains("toolCall"));
+        assert!(!t.contains("arguments"));
+    }
+
+    #[test]
+    fn build_manual_template_omits_empty_group() {
+        // Only non-.md touched: no Documents section, only Files.
+        let dropped = vec![
+            sum_user("m0", None, "code work"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "toolCall", "name": "edit",
+                 "arguments": {"path": "src/lib.rs", "edits": []}},
+            ])),
+        ];
+        let t = build_manual_template(&dropped);
+        assert!(!t.contains("# [Documents]"));
+        assert!(t.contains("# [Files]"));
+        assert!(t.contains("- modified: src/lib.rs"));
+
+        // Only .md touched: no Files section, only Documents.
+        let dropped = vec![
+            sum_user("m0", None, "doc work"),
+            sum_assistant("a0", Some("m0"), serde_json::json!([
+                {"type": "toolCall", "name": "read",
+                 "arguments": {"path": "README.md"}},
+            ])),
+        ];
+        let t = build_manual_template(&dropped);
+        assert!(t.contains("# [Documents]"));
+        assert!(!t.contains("# [Files]"));
+        assert!(t.contains("- read: README.md"));
     }
 }
