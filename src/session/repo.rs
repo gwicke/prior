@@ -71,11 +71,9 @@ pub struct JsonlSessionRepo {
 
 /// Cached metadata for one session directory (one encoded-CWD subdirectory).
 struct CachedDir {
-    /// mtime of the directory itself.
-    dir_mtime: Option<SystemTime>,
     /// Per-file mtime for each `.jsonl` in this directory.
     file_mtimes: HashMap<PathBuf, SystemTime>,
-    /// Sorted sessions (most recent first, by `timestamp`).
+    /// Sorted sessions (most recent first, by `last_prompt_timestamp`).
     sessions: Vec<SessionMetadata>,
 }
 
@@ -513,15 +511,9 @@ impl JsonlSessionRepo {
         cache.last_validated_at = Instant::now();
 
         for dir in &dirs {
-            let dir_meta = std::fs::symlink_metadata(dir).ok();
-            let dir_mtime = dir_meta.and_then(|m| m.modified().ok());
-            let cached = cache.dirs.get(dir);
-
-            if cached.and_then(|c| c.dir_mtime) == dir_mtime && cached.is_some() {
-                continue;  // directory untouched, all files inside are unchanged
-            }
-
-            // Re-scan: stat each .jsonl, only re-read changed/new files.
+            // Always re-scan files; directory mtime doesn't change when existing
+            // files are modified (only on create/delete). We must stat each file
+            // to detect content changes.
             let mut sessions = Vec::new();
             let mut file_mtimes: HashMap<PathBuf, SystemTime> = HashMap::new();
 
@@ -535,10 +527,10 @@ impl JsonlSessionRepo {
 
                     // Reuse cached metadata if file mtime matches.
                     if let Some(file_mt) = file_mtime {
-                        let cached_mt = cached
+                        let cached_mt = cache.dirs.get(dir)
                             .and_then(|c| c.file_mtimes.get(&path).copied());
                         if Some(file_mt) == cached_mt {
-                            if let Some(old) = cached
+                            if let Some(old) = cache.dirs.get(dir)
                                 .and_then(|c| c.sessions.iter().find(|s| s.path == path))
                             {
                                 sessions.push(old.clone());
@@ -567,7 +559,7 @@ impl JsonlSessionRepo {
             });
             cache.dirs.insert(
                 dir.clone(),
-                CachedDir { dir_mtime, file_mtimes, sessions },
+                CachedDir { file_mtimes, sessions },
             );
         }
 
