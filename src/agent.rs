@@ -2986,6 +2986,54 @@ pub(crate) enum CompactionTarget {
 /// draft as-is" (quiet / test paths).
 pub(crate) type CompactionSummaryReview = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// Result of `run_compaction`.
+#[derive(Debug)]
+pub(crate) enum CompactionResult {
+    /// Compaction entry written.
+    Done,
+    /// User cancelled at the review step; no entry written.
+    Cancelled,
+    /// Unrecoverable error.
+    Err(String),
+}
+
+impl std::fmt::Display for CompactionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactionResult::Done => write!(f, "done"),
+            CompactionResult::Cancelled => write!(f, "cancelled"),
+            CompactionResult::Err(e) => write!(f, "error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for CompactionResult {}
+
+impl CompactionResult {
+    /// True if the compaction succeeded (entry written).
+    pub fn is_done(&self) -> bool {
+        matches!(self, CompactionResult::Done)
+    }
+}
+
+impl From<std::result::Result<(), String>> for CompactionResult {
+    fn from(r: std::result::Result<(), String>) -> Self {
+        match r {
+            Ok(()) => CompactionResult::Done,
+            Err(e) => CompactionResult::Err(e),
+        }
+    }
+}
+
+impl From<CompactionResult> for std::result::Result<(), String> {
+    fn from(r: CompactionResult) -> Self {
+        match r {
+            CompactionResult::Done | CompactionResult::Cancelled => Ok(()),
+            CompactionResult::Err(e) => Err(e),
+        }
+    }
+}
+
 /// Run a compaction of `mode` at the resolved target. Shared by the
 /// `/tree <id> compact` and `/compact` (→ `/tree <last_user_id> compact`)
 /// paths. The caller is responsible for the up-front validation
@@ -2994,9 +3042,6 @@ pub(crate) type CompactionSummaryReview = Box<dyn Fn(&str) -> Option<String> + S
 ///
 /// - `target`: where to write the result (a `Compaction` entry at the
 ///   resolved point; a `BranchSummary` for the abandoned-branch case).
-/// - `old_leaf_id`: the session's current leaf before any move. Used
-///   by the LLM mode to restore the leaf after `agent.summarize`
-///   returns, so the user-visible session position never changes.
 /// - `llm_payload`: user-editable prompt override (only consulted when
 ///   `mode == Llm`); when empty, `settings.llm_compact_prompt()` is
 ///   used instead.
@@ -3007,12 +3052,11 @@ pub(crate) type CompactionSummaryReview = Box<dyn Fn(&str) -> Option<String> + S
 ///   into the LLM summarization so a retry back-off can be interrupted with
 ///   `<Esc>` (same as a normal prompt).
 ///
-/// On success, appends the compaction entry, optionally renders the
-/// summary inline, and returns `Ok(())`. On failure (no agent,
-/// `summarize` error, empty response, `append_compaction` error) the
-/// leaf is restored if it was moved, the error is rendered to `output`,
-/// and `Err(msg)` is returned for the caller to log if desired. A
-/// user-cancelled review returns `Ok(())` without writing.
+/// Returns `CompactionResult::Done` on success, `CompactionResult::Cancelled`
+/// when the user cancelled at the review step (no entry written),
+/// `CompactionResult::Err(msg)` on failure. The caller is responsible for
+/// handling `Cancelled` — typically by returning to the editor with the
+/// original prompt line pre-filled (e.g. via `pending_prefill`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     session: &Session,
@@ -3025,7 +3069,7 @@ pub(crate) async fn run_compaction(
     review: Option<CompactionSummaryReview>,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-) -> std::result::Result<(), String> {
+) -> CompactionResult {
     match target {
         CompactionTarget::AtPoint {
             target_id,
@@ -3045,6 +3089,7 @@ pub(crate) async fn run_compaction(
                 cancel_notify,
             )
             .await
+            .into()
         }
         CompactionTarget::Abandoned { common_ancestor_id } => {
             // Future: wire the abandoned-branch summary here. The
@@ -3053,7 +3098,7 @@ pub(crate) async fn run_compaction(
             // called with `AtPoint` today, so the `dead_code` arm sits
             // dormant until the `SwitchAction` UI extension lands.
             let _ = common_ancestor_id;
-            Err("abandoned-branch summary not yet wired up".to_string())
+            CompactionResult::Err("abandoned-branch summary not yet wired up".to_string())
         }
     }
 }
@@ -3073,7 +3118,7 @@ async fn run_compaction_at_point(
     review: Option<CompactionSummaryReview>,
     user_cancel: &Arc<AtomicBool>,
     cancel_notify: &Arc<tokio::sync::Notify>,
-) -> std::result::Result<(), String> {
+) -> CompactionResult {
     // -------------------------------------------------------------------------
     // Shared preamble: tree pivot and dropped span (all modes)
     // -------------------------------------------------------------------------
@@ -3110,7 +3155,7 @@ async fn run_compaction_at_point(
     // 4. LLM mode requires a valid predecessor to scope the summarization
     //    context. Manual and text-only modes tolerate root-level compactions.
     if predecessor_id.is_none() && matches!(mode, CompactSummaryMode::Llm) {
-        return Err("nothing before this point".to_string());
+        return Err("nothing before this point".to_string()).into();
     }
 
     // 5. The dropped span is everything on the original branch strictly
@@ -3139,21 +3184,25 @@ async fn run_compaction_at_point(
                 match &review {
                     Some(r) => match r(&draft) {
                         Some(s) => s,
-                        None => return Ok(()), // user cancelled
+                        None => return CompactionResult::Cancelled, // user cancelled
                     },
                     None => draft, // non-interactive (tests, pipe): accept as-is
                 }
             };
-            session
+            match session
                 .append_compaction(&summary, target_id, tokens_before)
                 .await
                 .map(|_| ())
-                .map_err(|e| format!("Cannot compact session: {}", e))?;
+                .map_err(|e| e.to_string())
+            {
+                Ok(()) => {}
+                Err(e) => return CompactionResult::Err(e),
+            }
             if !summary.is_empty() {
                 output.display_separator();
                 output.display_markdown(&summary);
             }
-            Ok(())
+            CompactionResult::Done
         }
         CompactSummaryMode::TextOnly => {
             // Deterministic text-only summary: user prompts + assistant text
@@ -3164,19 +3213,24 @@ async fn run_compaction_at_point(
             let summary = match &review {
                 Some(r) => match r(&draft) {
                     Some(s) => s,
-                    None => return Ok(()),
+                    None => return CompactionResult::Cancelled,
                 },
                 None => draft,
             };
-            session
+            match session
                 .append_compaction(&summary, target_id, tokens_before)
                 .await
-                .map_err(|e| format!("Cannot compact session: {}", e))?;
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            {
+                Ok(()) => {}
+                Err(e) => return CompactionResult::Err(e),
+            }
             if !summary.is_empty() {
                 output.display_separator();
                 output.display_markdown(&summary);
             }
-            Ok(())
+            CompactionResult::Done
         }
         CompactSummaryMode::Llm => {
             // 6. Compose the user-tweakable instruction: trailing text on
@@ -3206,37 +3260,42 @@ async fn run_compaction_at_point(
                     .await;
                     match r {
                         Ok(t) => t,
-                        Err(e) => return Err(format!("Summary failed: {}", e)),
+                        Err(e) => return Err(format!("Summary failed: {}", e)).into(),
                     }
                 }
-                None => return Err("no agent".to_string()),
+                None => return Err("no agent".to_string()).into(),
             };
 
             // 8. Empty response: soft-fail.
             let summary_text = summary_text.trim().to_string();
             if summary_text.is_empty() {
-                return Err("Summary was empty; nothing written.".to_string());
+                return Err("Summary was empty; nothing written.".to_string()).into();
             }
 
             // 9. Summary review / edit gate.
             let summary_text = match &review {
                 Some(r) => match r(&summary_text) {
                     Some(s) => s,
-                    None => return Ok(()),
+                    None => return CompactionResult::Cancelled,
                 },
                 None => summary_text,
             };
 
             // 10. Append the compaction entry.
-            session
+            match session
                 .append_compaction(&summary_text, target_id, tokens_before)
                 .await
-                .map_err(|e| format!("Cannot compact session: {}", e))?;
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            {
+                Ok(()) => {}
+                Err(e) => return CompactionResult::Err(e),
+            }
 
             // 11. Render the summary.
             output.display_separator();
             output.display_markdown(&summary_text);
-            Ok(())
+            CompactionResult::Done
         }
     }
 }
@@ -4018,7 +4077,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                     None
                                 };
 
-                            if let Err(msg) = run_compaction(
+                            match run_compaction(
                                 s,
                                 &agent,
                                 settings,
@@ -4035,7 +4094,16 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             )
                             .await
                             {
-                                config.output.display_text(&msg);
+                                CompactionResult::Done => {}
+                                // User cancelled at the review step: restore the
+                                // prompt line to the editor so they can switch
+                                // methods or tune the LLM prompt.
+                                CompactionResult::Cancelled => {
+                                    pending_prefill = Some(input.clone());
+                                }
+                                CompactionResult::Err(msg) => {
+                                    config.output.display_text(&msg);
+                                }
                             }
                             // The compaction entry is now the leaf; for
                             // the LLM mode the leaf was restored before
@@ -4685,7 +4753,7 @@ mod tests {
         find_predecessor_on_active_branch,
         is_anthropic_family, last_turns_start,
         maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
-        retry_summarization, run_compaction, CompactionSummaryReview, CompactionTarget,
+        retry_summarization, run_compaction, CompactionResult, CompactionSummaryReview, CompactionTarget,
         MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
@@ -5301,7 +5369,7 @@ mod tests {
         let old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5315,9 +5383,7 @@ mod tests {
             None,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("manual compaction should succeed");
+        ).await.is_done(), "manual compaction should succeed");
 
         // The new leaf should be a Compaction entry.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -5348,7 +5414,7 @@ mod tests {
         let old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5363,9 +5429,7 @@ mod tests {
             None,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("text-only compaction should succeed");
+        ).await.is_done(), "text-only compaction should succeed");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let new_entry = s.get_entry(&new_leaf).await.expect("entry");
@@ -5414,7 +5478,10 @@ mod tests {
             &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
-        assert!(res.is_err(), "expected error when no agent available");
+        assert!(
+            matches!(res, CompactionResult::Err(_)),
+            "expected error when no agent available"
+        );
         // The leaf should not have changed (no compaction entry).
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let entry = s.get_entry(&new_leaf).await.expect("entry");
@@ -5439,7 +5506,7 @@ mod tests {
         let old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5454,9 +5521,7 @@ mod tests {
             None,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("text-only compaction should succeed");
+        ).await.is_done(), "text-only compaction should succeed");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let new_entry = s.get_entry(&new_leaf).await.expect("entry");
@@ -5498,7 +5563,7 @@ mod tests {
 
         let settings = test_settings();
         let out = null_output();
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5513,9 +5578,7 @@ mod tests {
             None,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("manual re-compaction over a leaf-compaction must succeed");
+        ).await.is_done(), "manual re-compaction over a leaf-compaction must succeed");
 
         // New leaf is a Compaction entry with empty summary and firstKept=u0.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -5558,7 +5621,7 @@ mod tests {
 
         let settings = test_settings();
         let out = null_output();
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5573,9 +5636,7 @@ mod tests {
             None,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("text-only re-compaction over a leaf-compaction must succeed");
+        ).await.is_done(), "text-only re-compaction over a leaf-compaction must succeed");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
@@ -5623,7 +5684,7 @@ mod tests {
             );
             Some(format!("{}\n\nEDITED BY USER", draft))
         }));
-        run_compaction(
+        assert!(run_compaction(
             &s,
             &None,
             &settings,
@@ -5638,9 +5699,7 @@ mod tests {
             review,
             &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &std::sync::Arc::new(tokio::sync::Notify::new()),
-        )
-        .await
-        .expect("text-only compaction with review should succeed");
+        ).await.is_done(), "text-only compaction with review should succeed");
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
@@ -5692,8 +5751,8 @@ mod tests {
         )
         .await;
         assert!(
-            res.is_ok(),
-            "cancelled review should return Ok (no error), got {:?}",
+            matches!(res, CompactionResult::Cancelled),
+            "cancelled review should return Cancelled, got {:?}",
             res
         );
         // Leaf unchanged (still the assistant message), and no compaction
@@ -5752,7 +5811,7 @@ mod tests {
         )
         .await;
         assert!(
-            res.is_err(),
+            matches!(res, CompactionResult::Err(_)),
             "expected error when no agent available even with leaf==compaction"
         );
     }

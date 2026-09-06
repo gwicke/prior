@@ -1854,8 +1854,13 @@ impl Output for ConsoleOutput {
         self.reader_paused.store(false, Ordering::SeqCst);
 
         // Echo the resolved choice (raw mode has no terminal echo).
-        println!("  {}", options[choice]);
-        self.note_lines(1);
+        // Only echo on Accept; on Cancel / Esc print nothing so the
+        // return to the editor is clean (no extra line before the
+        // next prompt).
+        if choice == 0 {
+            println!("  {}", options[choice]);
+            self.note_lines(1);
+        }
 
         choice == 0
     }
