@@ -143,7 +143,7 @@ Then `buildSessionContext` (`session-manager.ts:457`) converts each entry:
 message with pi's wrapper:
 
 ```
-COMPACTION_SUMMARY_PREFIX = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
+COMPACTION_SUMMARY_PREFIX = "Conversation before this point:\n\n<summary>\n"
 COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
 ```
 

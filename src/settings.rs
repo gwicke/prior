@@ -91,12 +91,9 @@ pub fn default_show_reasoning_handle() -> ShowReasoningHandle {
 /// the default prompt tells the model to treat that as the existing context
 /// checkpoint and merge rather than replace — iterative re-compaction is
 /// lossless (see doc/nested_compactions.md phase B).
-pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation so far in less than 2000 words. \
-     Preserve the key technical decisions, file paths touched, current \
-     task state, and any unresolved questions. Note that the context
-     leading up to this point may already contain a `<summary>...</summary>`
-     wrapper from an earlier compaction — treat it as the existing context
-     checkpoint and merge new information into it rather than replacing it.";
+pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation in less than 2000 words. \
+     Preserve the key documents, technical decisions, file paths, current \
+     task state, and any unresolved questions.";
 
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
