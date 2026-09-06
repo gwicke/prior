@@ -153,7 +153,50 @@ fn collect_touched_files(message: &serde_json::Value, files: &mut Vec<TouchedFil
     }
 }
 
-/// Build a deterministic, text-only compaction summary from the branch
+/// Like `collect_touched_files` but skips paths already in `seen_paths`.
+/// Adds new entries to `files` and records their paths in `seen_paths`.
+fn collect_touched_files_filtered(
+    message: &serde_json::Value,
+    files: &mut Vec<TouchedFile>,
+    seen_paths: &mut std::collections::HashSet<String>,
+) {
+    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let modified = match name {
+            "write" | "edit" => true,
+            "read" => false,
+            _ => continue,
+        };
+        let Some(path) = item
+            .get("arguments")
+            .and_then(|a| a.get("path"))
+            .and_then(|p| p.as_str())
+        else {
+            continue;
+        };
+        // Skip already-seen paths (preserve earlier entry's order).
+        if seen_paths.contains(path) {
+            // If the new entry is "modified" and the existing is "read", upgrade it.
+            if modified {
+                if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+                    existing.modified = true;
+                }
+            }
+            continue;
+        }
+        seen_paths.insert(path.to_string());
+        files.push(TouchedFile {
+            path: path.to_string(),
+            modified,
+        });
+    }
+}
 /// entries a compaction drops (everything before `firstKeptEntryId`).
 ///
 /// Contains, in chronological order:
@@ -268,24 +311,32 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
 pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>) -> String {
+    // Build the file list: previous-summary files first, then newly-touched
+    // files from the dropped span, de-duplicated. De-dup is by path; the earlier
+    // entry wins (previous-summary files are "authoritative").
     let mut files: Vec<TouchedFile> = Vec::new();
-    for entry in dropped {
-        if let SessionEntryContent::Message { message } = &entry.content {
-            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                collect_touched_files(message, &mut files);
-            }
-        }
-    }
-
-    // Collect seed text (notes paragraph) and carry-forward files.
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seed_text: Vec<String> = Vec::new();
+
+    // Carry-forward files from the previous summary first.
     if let Some(summary) = previous_summary {
         let (parsed_files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
         for pf in parsed_files {
+            seen_paths.insert(pf.path.clone());
             files.push(pf);
         }
         seed_text = notes;
     }
+
+    // Collect newly-touched files from the dropped span (skip duplicates).
+    for entry in dropped {
+        if let SessionEntryContent::Message { message } = &entry.content {
+            if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                collect_touched_files_filtered(message, &mut files, &mut seen_paths);
+            }
+        }
+    }
+
     // No previous summary: seed with the first user prompt.
     if seed_text.is_empty() {
         if let Some(prompt) = first_user_prompt(dropped) {
