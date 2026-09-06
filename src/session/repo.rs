@@ -105,7 +105,13 @@ impl SessionMetaCache {
                 all.extend(d.sessions.iter().cloned());
             }
         }
-        all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        // Sort by last prompt timestamp (most recent activity first),
+        // falling back to session creation timestamp.
+        all.sort_by(|a, b| {
+            let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
+            let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
+            b_ts.cmp(a_ts)
+        });
         all
     }
 }
