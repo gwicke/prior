@@ -6142,19 +6142,19 @@ mod tests {
         let probe = "/sandbox_probe_xyz".to_string();
 
         let sandbox = SandboxConfig {
-            timeout_secs: Some(30),
+            timeout_secs: crate::config::SandboxTimeoutSecs(Some(30)),
             network: Some(false),
-            memory_mb: None,
+            memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: Some(16),
+            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro: vec![],
             rw: vec![BindPath::Remap {
                 from: host_path.display().to_string(),
                 to: probe.clone(),
             }],
             env: None,
-            max_output_bytes: None,
+            max_output_bytes: crate::config::SandboxMaxOutputBytes(None),
         };
 
         // In-memory `Output`: replays a fixed script and records what is shown.
