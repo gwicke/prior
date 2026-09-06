@@ -85,6 +85,26 @@ pub trait PicoAgent: Send + Sync {
     /// Generate a concise summary of the given text using the agent's model.
     /// Used by `/tree --summarize` to summarise abandoned branches.
     async fn summarize(&self, prompt: &str) -> Result<String>;
+    /// Run a one-shot summarization whose **request context is the live
+    /// conversation prefix** at the session's current leaf, plus
+    /// `instruction` as the final user message.
+    ///
+    /// This is the cache-preserving compaction request shape: the leading
+    /// history is built by exactly the same `Session::build_context()` (plus
+    /// the same `maybe_strip_reasoning` pass) that a normal user prompt at
+    /// that position would use, so the provider's prefix cache — warmed by
+    /// the live turns — hits for the whole conversation span. Only the
+    /// summarization instruction itself is a fresh (cache-write) tail.
+    ///
+    /// The session's leaf is READ but never MODIFIED here: callers that need
+    /// to summarize a *prefix* of the conversation move the leaf to the
+    /// desired position first (the `/tree <id> compact llm` leaf dance) and
+    /// restore it on every return path afterwards.
+    async fn summarize_with_session_context(
+        &self,
+        session: &Session,
+        instruction: &str,
+    ) -> Result<String>;
 }
 
 /// Per-turn persistence state threaded across `prompt()` retries inside one
@@ -216,27 +236,23 @@ impl PicoAgent for CodeAgent {
         turn.initialize_base(session).await;
 
         // Build prior context from session, or use empty vec as fallback.
-        let prior: Vec<Message> = if let Some(s) = session {
-            match s.build_context().await {
-                Ok(ctx) => {
-                    // Apply reasoning stripping to the LLM-bound context.
-                    // The session stores pre-strip messages; stripping is
-                    // applied here before sending to the service.
-                    maybe_strip_reasoning(
-                        ctx.messages,
-                        self.reasoning_in_context,
-                        &self.provider,
-                        &self.model,
-                    )
-                }
+        let prior: Vec<Message> = match session {
+            Some(s) => match session_context_messages(
+                s,
+                self.reasoning_in_context,
+                &self.provider,
+                &self.model,
+            )
+            .await
+            {
+                Ok(m) => m,
                 Err(e) => {
                     // Session index may be stale; log and fall back to empty.
                     eprintln!("Warning: session build_context failed: {}", e);
                     Vec::new()
                 }
-            }
-        } else {
-            Vec::new()
+            },
+            None => Vec::new(),
         };
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
@@ -646,6 +662,39 @@ impl PicoAgent for CodeAgent {
         let mut history: Vec<Message> = vec![];
         self.agent
             .chat(msg, &mut history)
+            .await
+            .map_err(|e| classify_prompt_error(&e, "summarize"))
+    }
+
+    async fn summarize_with_session_context(
+        &self,
+        session: &Session,
+        instruction: &str,
+    ) -> Result<String> {
+        // Leading history = the live conversation prefix at the current leaf,
+        // built by the SAME helper a normal user prompt uses
+        // (`session_context_messages` — `Session::build_context()` +
+        // `maybe_strip_reasoning`), so this request shares the provider's
+        // prefix cache (warmed by live turns) for the whole span.
+        // `Session::build_context()` applies the compaction transforms, so a
+        // prior compaction active at this position emits its summary as the
+        // leading `<summary>` wrapper — implicit incremental-compaction
+        // semantics from the tree structure alone.
+        //
+        // The leaf is READ but never MODIFIED here: callers that need to
+        // summarize a *prefix* of the conversation move the leaf to the
+        // desired position first (the `/tree <id> compact llm` leaf dance)
+        // and restore it on every return path afterwards.
+        let prior = session_context_messages(
+            session,
+            self.reasoning_in_context,
+            &self.provider,
+            &self.model,
+        )
+        .await?;
+
+        self.agent
+            .chat(Message::user(instruction), &mut prior.clone())
             .await
             .map_err(|e| classify_prompt_error(&e, "summarize"))
     }
@@ -2778,6 +2827,35 @@ fn build_summary_prompt(entries: &[crate::session::SessionEntry]) -> String {
     text
 }
 
+/// Build the LLM-bound conversation prefix for the session's current leaf.
+///
+/// Shared by the normal agent turn (`prompt`) and the session-context
+/// summarizer (`summarize_with_session_context`) so the two requests build
+/// their leading history identically — this is what preserves the provider
+/// prefix-cache property: a summarization at a given position sends the same
+/// bytes as a user prompt at that position, so the cached span (warmed by live
+/// turns) hits. `Session::build_context()` applies the compaction transforms,
+/// which re-activates a prior compaction active at the leaf as the leading
+/// `<summary>` wrapper (see `doc/nested_compactions.md`).
+///
+/// Unlike `prompt` (which falls back to an empty vec on a stale index), the
+/// summarizer treats an index failure as fatal — summarizing an empty prefix
+/// would silently drop the whole conversation.
+async fn session_context_messages(
+    session: &Session,
+    reasoning_in_context: bool,
+    provider: &str,
+    model: &str,
+) -> crate::Result<Vec<Message>> {
+    let ctx = session.build_context().await?;
+    Ok(maybe_strip_reasoning(
+        ctx.messages,
+        reasoning_in_context,
+        provider,
+        model,
+    ))
+}
+
 /// Walk from `old_leaf` to root and from `new_target` to root, find the common
 /// ancestor, and return `(abandoned_entries, common_ancestor_id)`.
 ///
@@ -2824,83 +2902,7 @@ fn find_predecessor_on_active_branch(
     }
 }
 
-/// Select the `previousSummary` for a new compaction at `target_id` on the
-/// active branch (doc/nested_compactions.md, phase B, strict-before rule).
-///
-/// Walks the active branch root→leaf. A prior `Compaction` qualifies iff its
-/// own `first_kept_entry_id` is **strictly before** `target_id` on the branch
-/// (compares path positions). Among qualifying compactions, the deepest —
-/// closest to the leaf — wins (last assignment while scanning root→leaf).
-///
-/// A prior compaction whose `first_kept_entry_id` equals or follows
-/// `target_id` is being superseded by the new compaction (the new summary
-/// re-derives that content from the dropped span) and is therefore NOT
-/// merged in. This makes re-compacting at an exact prior boundary behave
-/// like the original compaction at that point: the summarizer sees the
-/// strictly-earlier context, not the about-to-be-superseded summary.
-///
-/// Returns `None` when no prior compaction strictly precedes the target —
-/// i.e. the new compaction is at or before the earliest compaction boundary
-/// on the branch, matching the context the *first* compaction at that point
-/// would have seen.
-fn find_previous_summary_on_active_branch(
-    index: &crate::session::SessionIndex,
-    target_id: &str,
-) -> Option<String> {
-    let leaf = index.leaf_id.as_deref()?;
-    let branch = index.get_path_to_root(leaf); // root → leaf
-    let target_pos = branch.iter().position(|e| e.id == target_id)?;
 
-    let mut previous_summary: Option<String> = None;
-    for entry in &branch {
-        if let crate::session::SessionEntryContent::Compaction {
-            summary,
-            first_kept_entry_id,
-            ..
-        } = &entry.content
-        {
-            // The compaction's first_kept_entry_id must be on the branch for
-            // the positional comparison to be meaningful; if not (defensive
-            // fallback), skip it.
-            if let Some(fk_pos) = branch
-                .iter()
-                .position(|e| e.id == first_kept_entry_id.as_str())
-            {
-                if fk_pos < target_pos {
-                    // Strictly before the new target → qualifies. Last
-                    // assignment wins while scanning root→leaf, so the
-                    // deepest (closest-to-target) qualifying compaction
-                    // is kept.
-                    previous_summary = Some(summary.clone());
-                }
-            }
-        }
-    }
-    previous_summary
-}
-
-/// Compose the summarizer prompt for LLM compaction mode: the user's
-/// summarization instruction, the dropped span (raw `Message` entries), and
-/// optionally the `previousSummary` selected by strict-before
-/// (doc/nested_compactions.md phase B). An empty previous summary is not
-/// injected (no `--- PREVIOUS SUMMARY ---` section).
-fn compose_compaction_llm_prompt(
-    user_prompt: &str,
-    dropped_span: &str,
-    previous_summary: Option<&str>,
-) -> String {
-    let mut composed = format!(
-        "{}\n\n--- BEGIN DROPPED SPAN ---\n{}\n--- END DROPPED SPAN ---",
-        user_prompt, dropped_span,
-    );
-    if let Some(prev) = previous_summary.filter(|s| !s.is_empty()) {
-        composed = format!(
-            "{}\n\n--- PREVIOUS SUMMARY ---\n{}\n--- END PREVIOUS SUMMARY ---",
-            composed, prev,
-        );
-    }
-    composed
-}
 
 /// Where the compaction result gets written. Lets `run_compaction` serve
 /// both the `/tree <id> compact` / `/compact` path (a `Compaction` entry
@@ -2952,6 +2954,9 @@ pub(crate) type CompactionSummaryReview = Box<dyn Fn(&str) -> Option<String> + S
 /// - `review`: optional review hook consulted for the summary-producing
 ///   modes (`TextOnly`, `Llm`) right before the compaction entry is
 ///   written; it can edit the draft and/or cancel.
+/// - `user_cancel` / `cancel_notify`: the REPL's Esc-cancel flags, threaded
+///   into the LLM summarization so a retry back-off can be interrupted with
+///   `<Esc>` (same as a normal prompt).
 ///
 /// On success, appends the compaction entry, optionally renders the
 /// summary inline, and returns `Ok(())`. On failure (no agent,
@@ -2970,6 +2975,8 @@ pub(crate) async fn run_compaction(
     llm_payload: &str,
     output: &dyn Output,
     review: Option<CompactionSummaryReview>,
+    user_cancel: &Arc<AtomicBool>,
+    cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> std::result::Result<(), String> {
     match target {
         CompactionTarget::AtPoint {
@@ -2987,6 +2994,8 @@ pub(crate) async fn run_compaction(
                 llm_payload,
                 output,
                 review,
+                user_cancel,
+                cancel_notify,
             )
             .await
         }
@@ -3016,6 +3025,8 @@ async fn run_compaction_at_point(
     llm_payload: &str,
     output: &dyn Output,
     review: Option<CompactionSummaryReview>,
+    user_cancel: &Arc<AtomicBool>,
+    cancel_notify: &Arc<tokio::sync::Notify>,
 ) -> std::result::Result<(), String> {
     match mode {
         CompactSummaryMode::Truncate => session
@@ -3059,9 +3070,10 @@ async fn run_compaction_at_point(
             Ok(())
         }
         CompactSummaryMode::Llm => {
-            // 1. Find the entry just before target_id on the active
-            //    branch. The LLM call will run from this position so
-            //    its prior context = the dropped span.
+            // 1. Find the entry just before target_id on the active branch.
+            //    The summarization request runs with the live conversation
+            //    prefix up to this position, so its context = the span the
+            //    compaction entry will drop.
             let predecessor_id = {
                 let index = session.index().lock().await;
                 find_predecessor_on_active_branch(&index, target_id)
@@ -3073,62 +3085,60 @@ async fn run_compaction_at_point(
             // "predecessor == current leaf" check; `run_compaction`
             // assumes the inputs are already validated.
 
-            // 2. Build the dropped span = branch entries strictly
-            //    BEFORE target_id.
-            let dropped = {
-                let index = session.index().lock().await;
-                let branch = index.get_path_to_root(old_leaf_id);
-                branch
-                    .into_iter()
-                    .take_while(|e| e.id != target_id)
-                    .collect::<Vec<_>>()
-            };
-            let span = build_summary_prompt(&dropped);
-
-            // 2b. Select the previousSummary to merge into the new summary:
-            //     the deepest prior compaction on the active branch whose
-            //     first_kept_entry_id is strictly before target_id
-            //     (doc/nested_compactions.md phase B, strict-before rule).
-            let previous_summary = {
-                let index = session.index().lock().await;
-                find_previous_summary_on_active_branch(&index, target_id)
-            };
-
-            // 3. Compose the user-tweakable payload: trailing text on
+            // 2. Compose the user-tweakable instruction: trailing text on
             //    the committed line wins; otherwise the setting (with
-            //    built-in fallback).
-            let user_prompt = if llm_payload.trim().is_empty() {
+            //    built-in fallback). This is the ONLY new content in the
+            //    summarization request — the conversation prefix rides as
+            //    real messages (cache-preserving; see
+            //    `summarize_with_session_context`).
+            let instruction = if llm_payload.trim().is_empty() {
                 settings.llm_compact_prompt()
             } else {
                 llm_payload.to_string()
             };
-            let composed = compose_compaction_llm_prompt(
-                &user_prompt,
-                &span,
-                previous_summary.as_deref(),
-            );
 
-            // 4. Switch the leaf to the predecessor. Remember
-            //    old_leaf_id for step 7.
+            // 3. The leaf dance (restored to its original purpose): move the
+            //    leaf to the predecessor so `build_context()` scopes to
+            //    everything strictly before target_id. A prior compaction on
+            //    that prefix re-activates implicitly: `apply_compaction_
+            //    transforms` emits its summary as the leading `<summary>`
+            //    wrapper. A compaction AT the exact target boundary is a
+            //    descendant of the predecessor, not an ancestor, so it is
+            //    NOT in the prefix — the new summary re-derives its content
+            //    from the raw span (the strict-before supersede rule of
+            //    doc/nested_compactions.md, now emergent from the tree
+            //    rather than injected textually). The compaction entries
+            //    themselves never reach the wire (stepped over by the
+            //    transform).
             let _ = session.move_leaf(Some(predecessor_id.clone())).await;
 
-            // 5. Run the LLM. Use the non-streaming `summarize()`
-            //    surface — `prompt()` would emit Thinking…/stream/tool
-            //    noise inappropriate for a summary destined to be
-            //    wrapped in <summary>.
+            // 4. Run the LLM with the real conversation prefix as history and
+            //    the instruction as the final user message. Retry behavior
+            //    mirrors a normal prompt (same back-off / Esc-cancel loop).
+            //    Note `build` reads the (already-moved) session leaf each
+            //    attempt, so the retry re-sends the identical prefix — there
+            //    is no synthetic steer feedback for a one-shot summary.
+            //    On every outcome the leaf is restored to its original value.
             let summary_text = match agent.as_ref() {
-                Some(a) => match a.summarize(&composed).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // 5a. Failure: switch the leaf BACK to
-                        //     old_leaf_id, surface the error, do not
-                        //     append.
-                        let _ = session
-                            .move_leaf(Some(old_leaf_id.to_string()))
-                            .await;
-                        return Err(format!("Summary failed: {}", e));
+                Some(a) => {
+                    let instruction = instruction.clone();
+                    let r = retry_summarization(
+                        output,
+                        user_cancel,
+                        cancel_notify,
+                        &mut || a.summarize_with_session_context(session, &instruction),
+                    )
+                    .await;
+                    match r {
+                        Ok(t) => t,
+                        Err(e) => {
+                            let _ = session
+                                .move_leaf(Some(old_leaf_id.to_string()))
+                                .await;
+                            return Err(format!("Summary failed: {}", e));
+                        }
                     }
-                },
+                }
                 None => {
                     let _ = session
                         .move_leaf(Some(old_leaf_id.to_string()))
@@ -3137,7 +3147,7 @@ async fn run_compaction_at_point(
                 }
             };
 
-            // 6. Empty response: soft-fail.
+            // 5. Empty response: soft-fail.
             let summary_text = summary_text.trim().to_string();
             if summary_text.is_empty() {
                 let _ = session
@@ -3146,7 +3156,7 @@ async fn run_compaction_at_point(
                 return Err("Summary was empty; nothing written.".to_string());
             }
 
-            // 7. Switch the leaf back to old_leaf_id. The
+            // 6. Switch the leaf back to old_leaf_id. The
             //    user-visible session position is restored.
             let _ = session
                 .move_leaf(Some(old_leaf_id.to_string()))
@@ -3177,6 +3187,59 @@ async fn run_compaction_at_point(
             output.display_separator();
             output.display_markdown(&summary_text);
             Ok(())
+        }
+    }
+}
+
+/// Run a *summarization* request with the same auto-retry / back-off / Esc-
+/// cancel behaviour as a regular user prompt (`prompt()`'s retry loop in
+/// `run_interactive`).
+///
+/// `build` produces the summarization request and returns the model's reply
+/// (or a classified `PicocodeError`). On a retryable failure it is re-invoked
+/// (previous `build` again) after `retry_delay_secs` seconds of
+/// `cancellable_sleep`; non-retryable errors and cancellation propagate out.
+///
+/// The leaf dance (if any) is the caller's responsibility: `build` reads the
+/// session's *current* leaf to assemble context but must NOT move it, so the
+/// caller can restore the original leaf on every return path. This keeps the
+/// helper agnostic between the compaction path (leaf moved to the predecessor
+/// for a conversation prefix) and the abandoned-branch path (no move).
+async fn retry_summarization<F, Fut>(
+    output: &dyn Output,
+    user_cancel: &Arc<AtomicBool>,
+    cancel_notify: &Arc<tokio::sync::Notify>,
+    build: &mut F,
+) -> std::result::Result<String, crate::PicocodeError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<String, crate::PicocodeError>>,
+{
+    let mut consecutive_failures: u8 = 0;
+    loop {
+        match build().await {
+            Ok(text) => return Ok(text),
+            Err(crate::PicocodeError::Cancelled(_)) => {
+                return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+            }
+            Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                output.display_text(&format!("Error: {}", e));
+                let secs = retry_delay_secs(&e, consecutive_failures);
+                output.display_text(&format!("Retrying in {secs}s..."));
+                let slept = cancellable_sleep(user_cancel, cancel_notify, secs).await;
+                if !slept {
+                    return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                }
+                // `build` is re-invoked verbatim on the retry (re-sends the
+                // same conversation prefix from the session leaf; cheap, and
+                // identical to a normal prompt retry).
+                if user_cancel.load(Ordering::SeqCst) {
+                    return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -3738,7 +3801,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                                     .display_thinking("Summarizing abandoned branch...");
                                                 let prompt = build_summary_prompt(&abandoned);
                                                 if let Some(ref agent) = agent {
-                                                    match agent.summarize(&prompt).await {
+                                                    let r = retry_summarization(
+                                                        config.output.as_ref(),
+                                                        &config.user_cancel,
+                                                        &config.cancel_notify,
+                                                        &mut || agent.summarize(&prompt),
+                                                    )
+                                                    .await;
+                                                    match r {
                                                         Ok(summary) => {
                                                             let _ = s
                                                                 .append_branch_summary(
@@ -3865,6 +3935,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 &llm_payload,
                                 config.output.as_ref(),
                                 review,
+                                &config.user_cancel,
+                                &config.cancel_notify,
                             )
                             .await
                             {
@@ -4513,12 +4585,13 @@ mod tests {
     use crate::session::storage::SessionStorage;
     use crate::SettingsStore;
     use super::{
-        build_replay_units, compose_compaction_llm_prompt, compute_resume_model_prefill,
+        build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir,
-        find_predecessor_on_active_branch, find_previous_summary_on_active_branch,
+        find_predecessor_on_active_branch,
         is_anthropic_family, last_turns_start,
         maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
-        run_compaction, CompactionSummaryReview, CompactionTarget, MessageLogger,
+        retry_summarization, run_compaction, CompactionSummaryReview, CompactionTarget,
+        MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
@@ -4867,6 +4940,7 @@ mod tests {
     /// are tree nodes), so a chain like `["m0", "c1", "m1"]` means c1
     /// is parented at m0 and m1 is parented at c1. `first_kept` refers to
     /// a message id earlier in the chain.
+    #[cfg(any())]
     fn build_index_with_compactions(
         ids: &[&str],
         compactions: &[(&str, &str, &str)],
@@ -4893,129 +4967,6 @@ mod tests {
         index
     }
 
-    #[test]
-    fn find_previous_summary_selects_deepest_strictly_before_target() {
-        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 -> m2 ->
-        //         c2{firstKept:m1, summary:"s2"} -> m3  (leaf=m3)
-        // Compacting at target=m3 (after both): c2 qualifies (its
-        // first_kept m1 is strictly before m3), and it's deeper than c1.
-        let index = build_index_with_compactions(
-            &["m0", "c1", "m1", "m2", "c2", "m3"],
-            &[("c1", "m0", "s1"), ("c2", "m1", "s2")],
-        );
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m3"),
-            Some("s2".to_string())
-        );
-    }
-
-    #[test]
-    fn find_previous_summary_at_exact_boundary_steps_over_superseded() {
-        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 (leaf=m1).
-        // Re-compacting at target=m0 (c1's own first_kept) means c1 is
-        // being superseded at exactly its own boundary; strict-before
-        // skips it and falls back to None (there is no earlier compaction
-        // to merge). This is the "same as the first compaction at that
-        // point saw" behaviour — the original compaction at m0 had no
-        // prior summary to merge either.
-        let index = build_index_with_compactions(
-            &["m0", "c1", "m1"],
-            &[("c1", "m0", "s1")],
-        );
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m0"),
-            None
-        );
-    }
-
-    #[test]
-    fn find_previous_summary_falls_back_to_shallower_when_deeper_superseded() {
-        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 ->
-        //         c2{firstKept:m1, summary:"s2"} -> m2 -> m3 (leaf=m3).
-        // Re-compacting at target=m1: c2's first_kept (m1) EQUALS the target
-        // (c2 is superseded → skipped); c1's first_kept (m0) is strictly
-        // before m1 → qualifies. Result: s1.
-        let index = build_index_with_compactions(
-            &["m0", "c1", "m1", "c2", "m2", "m3"],
-            &[("c1", "m0", "s1"), ("c2", "m1", "s2")],
-        );
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m1"),
-            Some("s1".to_string())
-        );
-    }
-
-    #[test]
-    fn find_previous_summary_no_compaction_before_target_is_none() {
-        // Branch: m0 -> c1{firstKept:m0, summary:"s1"} -> m1 -> m2
-        // (leaf=m2). Compacting at target=m0: no compaction precedes m0
-        // on the branch → None.
-        let index = build_index_with_compactions(
-            &["m0", "c1", "m1", "m2"],
-            &[("c1", "m0", "s1")],
-        );
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m0"),
-            None
-        );
-        // Same session, target = m2: c1's first_kept m0 precedes m2 → s1.
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m2"),
-            Some("s1".to_string())
-        );
-    }
-
-    #[test]
-    fn find_previous_summary_returns_empty_string_for_empty_qualifying_summary() {
-        // Selection is purely positional: an empty qualifying summary is
-        // still returned as Some(""). The caller (run_compaction_at_point)
-        // filters empties out before injecting a PREVIOUS SUMMARY section.
-        // This test pins down the helper's contract.
-        let index = build_index_with_compactions(
-            &["m0", "c1", "m1"],
-            &[("c1", "m0", "")],
-        );
-        // c1.first_kept (m0) is strictly before target (m1) → qualifies,
-        // even though its summary is empty.
-        assert_eq!(
-            find_previous_summary_on_active_branch(&index, "m1"),
-            Some("".to_string())
-        );
-    }
-
-    #[test]
-    fn compose_llm_prompt_includes_previous_summary_section_when_present() {
-        let prompt = compose_compaction_llm_prompt(
-            "Summarize this.",
-            "user: hello\nassistant: hi",
-            Some("EARLIER SUMMARY"),
-        );
-        assert!(prompt.contains("--- BEGIN DROPPED SPAN ---"));
-        assert!(prompt.contains("--- END DROPPED SPAN ---"));
-        assert!(prompt.contains("user: hello\nassistant: hi"));
-        assert!(prompt.contains("--- PREVIOUS SUMMARY ---"));
-        assert!(prompt.contains("EARLIER SUMMARY"));
-        // PREVIOUS SUMMARY must come after the dropped span.
-        assert!(
-            prompt.find("--- END DROPPED SPAN ---").unwrap()
-                < prompt.find("--- PREVIOUS SUMMARY ---").unwrap()
-        );
-    }
-
-    #[test]
-    fn compose_llm_prompt_omits_previous_summary_when_none_or_empty() {
-        let p1 = compose_compaction_llm_prompt("Prompt", "span", None);
-        assert!(!p1.contains("--- PREVIOUS SUMMARY ---"));
-        let p2 = compose_compaction_llm_prompt("Prompt", "span", Some(""));
-        assert!(!p2.contains("--- PREVIOUS SUMMARY ---"));
-        // Both still contain the dropped span markers and user prompt.
-        for p in [&p1, &p2] {
-            assert!(p.starts_with("Prompt"));
-            assert!(p.contains("--- BEGIN DROPPED SPAN ---"));
-            assert!(p.contains("--- END DROPPED SPAN ---"));
-        }
-    }
-
     // ---- run_compaction ----
     //
     // The /compact command (now rewriting to /tree <last_user_id>
@@ -5026,6 +4977,111 @@ mod tests {
     // predecessor / move-back / append dance. The mode plumbing is
     // already covered by the `parse_tree_args` tests, so we focus
     // here on the side effects of `run_compaction`.
+
+    #[tokio::test]
+    async fn retry_summarization_succeeds_on_first_attempt() {
+        let mut calls = 0;
+        let output = null_output();
+        let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
+        let r = retry_summarization(
+            output.as_ref(),
+            cancel,
+            notify,
+            &mut || {
+                calls += 1;
+                async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), "summary");
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_summarization_retries_on_rate_limit_then_succeeds() {
+        // First call fails with a retryable 429; the back-off is cancellable
+        // and the second attempt succeeds. Verify the retrier runs build
+        // twice. (The sleep is 1s; acceptable for a focused test.)
+        let mut calls = 0;
+        let output = null_output();
+        let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
+        let r = retry_summarization(
+            output.as_ref(),
+            cancel,
+            notify,
+            &mut || {
+                calls += 1;
+                async move {
+                    if calls == 1 {
+                        Err(crate::PicocodeError::LlmRateLimited {
+                            retry_after_secs: Some(1),
+                        })
+                    } else {
+                        Ok("second".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), "second");
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_summarization_propagates_non_retryable() {
+        let mut calls = 0;
+        let output = null_output();
+        let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
+        let r = retry_summarization(
+            output.as_ref(),
+            cancel,
+            notify,
+            &mut || {
+                calls += 1;
+                async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
+            },
+        )
+        .await;
+        assert!(matches!(r, Err(crate::PicocodeError::Llm(_))));
+        assert_eq!(calls, 1, "non-retryable must not retry");
+    }
+
+    #[tokio::test]
+    async fn retry_summarization_cancels_after_esc_sleep() {
+        // A provider hint of 1s: set the cancel flag so
+        // `cancellable_sleep` returns immediately and the retrier
+        // surfaces `Cancelled` without a second attempt.
+        let mut calls = 0;
+        let output = null_output();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cancel_out = cancel.clone();
+        // Cancel fires right after the first (failed) call, via a spawned
+        // task that races the sleep.
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let r = retry_summarization(
+            output.as_ref(),
+            &cancel_out,
+            &notify,
+            &mut || {
+                calls += 1;
+                async { Err(crate::PicocodeError::LlmRateLimited {
+                    retry_after_secs: Some(5),
+                }) }
+            },
+        )
+        .await;
+        let _ = handle.await;
+        assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
+        assert_eq!(calls, 1, "cancelled during back-off must not retry");
+    }
 
     /// Build a writable `Session` from `entries` for `run_compaction`
     /// tests. The agent's `build_session_with_entries` opens the
@@ -5148,6 +5204,8 @@ mod tests {
             "",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("truncate compaction should succeed");
@@ -5194,6 +5252,8 @@ mod tests {
             "",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5241,6 +5301,8 @@ mod tests {
             "user payload",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(res.is_err(), "expected error when no agent available");
@@ -5281,6 +5343,8 @@ mod tests {
             "",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction should succeed");
@@ -5338,6 +5402,8 @@ mod tests {
             "",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("truncate re-compaction over a leaf-compaction must succeed");
@@ -5396,6 +5462,8 @@ mod tests {
             "",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only re-compaction over a leaf-compaction must succeed");
@@ -5459,6 +5527,8 @@ mod tests {
             "",
             out.as_ref(),
             review,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await
         .expect("text-only compaction with review should succeed");
@@ -5508,6 +5578,8 @@ mod tests {
             "",
             out.as_ref(),
             review,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(
@@ -5566,6 +5638,8 @@ mod tests {
             "user payload",
             out.as_ref(),
             None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
         )
         .await;
         assert!(

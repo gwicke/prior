@@ -85,17 +85,18 @@ pub fn default_show_reasoning_handle() -> ShowReasoningHandle {
 /// trailing text after `llm`, the LLM-compaction handler substitutes this
 /// value (or the built-in `DEFAULT_LLM_COMPACT_PROMPT` if empty).
 ///
-/// The `--- PREVIOUS SUMMARY ---` section is injected by LLM compaction
-/// mode when a prior compaction's summary strictly precedes the new
-/// boundary (see doc/nested_compactions.md phase B). The default prompt
-/// tells the model to merge that section rather than treat it as
-/// unrelated, so iterative re-compaction is lossless.
+/// The LLM-compaction handler sends the live conversation prefix (same
+/// construction as a normal prompt) plus this instruction. A prior
+/// compaction active at the prefix re-activates as a `<summary>` wrapper, so
+/// the default prompt tells the model to treat that as the existing context
+/// checkpoint and merge rather than replace — iterative re-compaction is
+/// lossless (see doc/nested_compactions.md phase B).
 pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation so far in less than 2000 words. \
      Preserve the key technical decisions, file paths touched, current \
-     task state, and any unresolved questions. When a \
-     `--- PREVIOUS SUMMARY ---` section is present, treat it as the \
-     existing context checkpoint and merge new information into it \
-     rather than replacing it.";
+     task state, and any unresolved questions. Note that the context
+     leading up to this point may already contain a `<summary>...</summary>`
+     wrapper from an earlier compaction — treat it as the existing context
+     checkpoint and merge new information into it rather than replacing it.";
 
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

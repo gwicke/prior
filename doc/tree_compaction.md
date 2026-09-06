@@ -1043,21 +1043,18 @@ it would emit "Thinking…", stream the response, possibly run tools — all of
 which is wrong for a summary step whose output is destined to be wrapped
 in `<summary>…</summary>` in the compaction entry.
 
-### 6.6 The summary prompt payload
+### 6.6 The summary request shape
 
-The handler composes a single user-role prompt of the form:
+The handler moves the leaf to the entry immediately before the compaction
+point, then runs `summarize_with_session_context(session, user_payload)`:
 
-```
-<user_payload>
-
---- BEGIN DROPPED SPAN ---
-[user] <prompt 1>
-[assistant] <response 1>
-[user] <prompt 2>
-…
-[assistant] <response N>
---- END DROPPED SPAN ---
-```
+- The **request prefix** is the live conversation context at that position,
+  built by the same `session_context_messages` helper a normal user prompt
+  uses (`Session::build_context()` + `maybe_strip_reasoning`) — so the
+  request shares the provider's prefix cache with the live turns.
+- The **final user message** is `<user_payload>` (the summarization
+  instruction). No flattened transcript is embedded: the real messages ARE
+  the context.
 
 `<user_payload>` is, in order of precedence:
 
@@ -1067,11 +1064,9 @@ The handler composes a single user-role prompt of the form:
    `/set llm_compact_prompt …`), which itself defaults to the built-in
    `DEFAULT_LLM_COMPACT_PROMPT` from §6.9 when the setting is empty.
 
-The bracketed transcript uses the same `build_summary_prompt`-style
-serialization already used by `/tree switch --summarize` (see
-`build_summary_prompt` in `agent.rs`), keeping the prompt construction
-cheap and consistent. For very large spans the LLM is the right tool for
-compressing the transcript; we do not need to pre-truncate it here. The
+A prior compaction active at the prefix re-activates as the leading
+`<summary>` wrapper via the compaction transform — the incremental-compaction
+merge behaviour is structural (see `doc/nested_compactions.md` phase B). The
 model returns a free-form `String`, which is written verbatim into the
 compaction entry's `summary`.
 

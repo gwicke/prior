@@ -9,14 +9,13 @@ Phases implemented:
       every `SessionEntryContent::Compaction` entry encountered in the kept
       range. Only the *latest* compaction's `summary` is emitted at the
       front. Older nested compactions are invisible to the runtime LLM.
-- [x] **B. Inject `previousSummary` into the LLM compaction summarizer.**
-      `run_compaction_at_point` LLM arm. Selection rule: strict-before
-      (deepest prior compaction on the active branch whose
-      `first_kept_entry_id` is strictly before the new target). Done via
-      `find_previous_summary_on_active_branch`;
-      `compose_compaction_llm_prompt` appends the `--- PREVIOUS SUMMARY ---`
-      section (omitted when none/empty). Default `llm_compact_prompt` now
-      instructs the model to merge it.
+- [x] **B. Preserve prior context in LLM compaction via the leaf dance.**
+      The `compact llm` summarization runs with the session moved to the
+      entry just before the target, and the request prefix is built by the
+      SAME `session_context_messages` helper a normal prompt uses — so a
+      prior compaction on that prefix re-activates its `<summary>` wrapper
+      from the tree structure (no textual `previousSummary` injection;
+      see below). This also restores the provider prefix-cache property.
 - [x] **C. Drop the leaf-is-compaction guard.** `src/agent.rs`. The dispatch
       block is removed; the LLM-mode "nothing before" guard still covers
       the empty-dropped-span no-op case. Multi-mode interop verified:
@@ -43,11 +42,13 @@ compaction needs three things today:
    summary text mid-turn is redundant noise and, when later iterations
    supersede earlier ones, actively misleading. The LLM cannot tell which
    summary is authoritative.
-2. **LLM compaction mode should be lossless across iterations.** Today
-   picocode's `run_compaction_at_point` LLM arm summarises the raw dropped
-   span but never threads the prior compaction's `summary` into the
-   prompt, so re-compacting forward discards the prior summary's content.
-   Pi avoids this via `previousSummary` injection (`compaction.ts:546‑579`).
+2. **LLM compaction mode should be lossless across iterations and cache-
+   friendly.** Re-compacting forward must preserve the prior summary's
+   content and, ideally, share the provider prefix-cache with the live
+   turns. The leaf dance achieves both: the summarizer runs at the
+   predecessor with the same context a prompt there would send, which
+   re-activates the prior compaction's `<summary>` wrapper (lossless) and
+   sends identical leading bytes (cache hit).
 3. **The "leaf is a compaction" guard blocks legitimate re-compaction.**
    Pi refuses only when the dropped span is empty (`compaction.ts:688`),
    not when the leaf is a compaction. Picocode should match.
@@ -67,48 +68,37 @@ picocode-iterated session will see the older compaction summaries re-emit
 at their path positions — the same noise pi itself produces for its own
 nested-compaction sessions.
 
-### B. `previousSummary` injection in LLM compaction mode (done)
+### B. `previousSummary` injection in LLM compaction mode (superseded by the leaf dance)
 
-Implemented as two functions in `src/agent.rs`:
+**The original textual injection is gone.** The leaf dance (move to the
+predecessor, summarize with the live prefix, restore) now makes the
+`previousSummary` semantics **emergent from the tree structure**:
 
-- `find_previous_summary_on_active_branch(index, target_id) -> Option<String>`:
-  walks the active branch root→leaf and returns the deepest
-  `SessionEntryContent::Compaction`'s `summary` whose `first_kept_entry_id`
-  position is **strictly before** the new target's position. Last
-  assignment wins while scanning root→leaf, so the deepest (closest to
-  target) qualifying compaction is kept. Returns the empty string when a
-  qualifying compaction has an empty summary (the caller filters it out).
-- `compose_compaction_llm_prompt(user_prompt, dropped_span, previous_summary)`:
-  appends the `--- PREVIOUS SUMMARY ---` section after the dropped span
-  when `previous_summary` is non-empty; omits it otherwise.
-
-Selection semantics (strict-before):
-
-- A prior compaction whose `first_kept_entry_id` equals the new target is
-  being superseded by the new compaction; it is not merged in. The new
-  summarizer sees whatever strictly-previous context exists on the
-  branch — i.e. exactly what the original compaction at that boundary saw.
+- `run_compaction_at_point` moves the session leaf to the entry strictly
+  before `target_id`, then calls `summarize_with_session_context`, which
+  builds the request prefix via `session_context_messages` — the SAME
+  helper (`Session::build_context()` + `maybe_strip_reasoning`) a normal
+  user prompt uses. `apply_compaction_transforms` then re-activates the
+  latest compaction on that root→predecessor prefix as the leading
+  `<summary>` wrapper.
 - A prior compaction whose `first_kept_entry_id` is strictly before the
-  target represents older context the new compaction is not covering
-  itself; injecting it preserves that context across the new compaction.
+  target is an **ancestor** of the predecessor, so its summary lands in the
+  context as the loader wrapper — preserving it across the new compaction
+  (the phase-B merge behaviour, now structural).
+- A prior compaction AT the target's own boundary is a **descendant** of the
+  predecessor, NOT an ancestor, so it is excluded — the new summary
+  re-derives its content from the raw kept messages, exactly what the
+  original compaction at that point saw (the strict-before supersede rule).
 
-Composed prompt (in LLM mode only):
+This also fixes the provider **prefix-cache property**: the summarization
+request sends the same leading context bytes as a prompt at that position,
+so the cached prefix (warmed by live turns) hits instead of re-tokenising a
+flattened transcript (`doc/provider_caching.md`).
 
-```
-{user_prompt}
-
---- BEGIN DROPPED SPAN ---
-{serialised dropped span (Message entries only)}
---- END DROPPED SPAN ---
-
---- PREVIOUS SUMMARY ---        # only when previous_summary is non-empty
-{prior compaction's summary text}
---- END PREVIOUS SUMMARY ---
-```
-
-The user-controlled `user_prompt` is the primary instruction. The default
-`llm_compact_prompt` now mentions the `--- PREVIOUS SUMMARY ---` section so
-users get merge behaviour by default.
+The two phase-B helpers (`find_previous_summary_on_active_branch`,
+`compose_compaction_llm_prompt`) and the `--- PREVIOUS SUMMARY ---` prose in
+`DEFAULT_LLM_COMPACT_PROMPT` were removed; the context-cache prefix makes
+them redundant.
 
 ### C. Drop the leaf-is-compaction guard (done)
 

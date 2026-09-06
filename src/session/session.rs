@@ -2238,6 +2238,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_context_at_pre_compaction_point_reactivates_prior_summary() {
+        // The cache/prefix property the `compact llm` leaf dance relies on:
+        // move the leaf to the entry just BEFORE the compaction point and
+        // `build_context()` must produce EXACTLY the context a normal prompt
+        // at that position would send — including re-activating a prior
+        // compaction's summary as the leading `<summary>` wrapper.
+        //
+        // Session: u0 a0 c1{firstKept:u0, summary:"S1"} u1 a1 u2 (leaf).
+        // Compacting at target=u2 -> predecessor = a1. Branch to a1 is
+        // [u0 a0 c1 u1 a1]; latest compaction on that prefix is c1, so the
+        // context must be [summary(S1)] + [u1 a1] (c1 itself stepped over,
+        // u0 a0 covered by the summary).
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-cmp-prefix-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        session.append_message(&Message::user("u0")).await.unwrap();
+        session.append_message(&Message::assistant("a0")).await.unwrap();
+        // c1 summaries everything before u1 (firstKept=u0's successor). Use
+        // the message id of u1 as firstKept.
+        let branch = session.get_branch().await;
+        let u0_id = branch[0].id.clone();
+        session.append_compaction("S1", &u0_id, 100).await.unwrap();
+        session.append_message(&Message::user("u1")).await.unwrap();
+        session.append_message(&Message::assistant("a1")).await.unwrap();
+        session.append_message(&Message::user("u2")).await.unwrap();
+
+        // Leaf dance: move to the predecessor of a hypothetical new
+        // compaction at u2 (i.e. a1). Find a1 by its content.
+        let branch = session.get_branch().await;
+        let a1_id = branch
+            .iter()
+            .find(|e| {
+                if let crate::session::SessionEntryContent::Message { message } = &e.content {
+                    message
+                        .get("content")
+                        .and_then(|c| c.as_array())
+                        .and_then(|arr| arr[0].get("text"))
+                        .and_then(|t| t.as_str())
+                        == Some("a1")
+                } else {
+                    false
+                }
+            })
+            .expect("a1 entry")
+            .id
+            .clone();
+        session.move_leaf(Some(a1_id.clone())).await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        let texts: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => match &content[0] {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // Context at a1 = the prefix a normal prompt at a1 would receive:
+        // [summary(S1)] + [u0] + [u1]. The prior compaction c1 re-activates
+        // (S1 leading wrapper); c1 itself is stepped over; the kept range is
+        // firstKept(u0) .. leaf(a1), which includes u0/a0 (pre-compaction
+        // messages, summarized into S1) and u1/a1 (post-compaction). The
+        // compaction entries never reach the wire.
+        assert_eq!(texts.len(), 3, "user texts at a1: {texts:?}");
+        assert!(texts[0].contains("S1"), "summary wrapper first: {texts:?}");
+        assert!(texts[0].contains("<summary>"), "pi wrapper format: {texts:?}");
+        assert_eq!(texts[1], "u0");
+        assert_eq!(texts[2], "u1");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_context_at_exact_compaction_boundary_excludes_that_compaction() {
+        // The strict-before rule, now emergent from the tree: a compaction AT
+        // the target boundary is a DESCENDANT of the predecessor, so moving
+        // the leaf to the predecessor excludes it from context. The new
+        // summary therefore re-derives from raw messages — exactly what the
+        // original compaction at that point saw.
+        //
+        // Session: u0 a0 c1{firstKept:u0} (leaf=c1). Re-compact at target=u0
+        // -> predecessor = (root, none?) u0 has no predecessor -> guard
+        // triggers. Use the MEANINGFUL case: target = a0 -> predecessor = u0.
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-cmp-boundary-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let header = SessionHeader::new(Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        session.append_message(&Message::user("u0")).await.unwrap();
+        session.append_message(&Message::assistant("a0")).await.unwrap();
+        let u0_id = session.get_branch().await[0].id.clone();
+        session.append_compaction("S1", &u0_id, 50).await.unwrap();
+
+        // Leaf dance: move to u0 (predecessor of a0, the new boundary).
+        session.move_leaf(Some(u0_id.clone())).await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        let texts: Vec<String> = ctx
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User { content } => match &content[0] {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        // No compaction is on the [u0] prefix -> NO summary wrapper, just u0.
+        assert_eq!(texts, vec!["u0"], "context at u0: {texts:?}");
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
     async fn test_toolname_in_toolresult() {
         let dir = std::env::temp_dir().join(format!(
             "picocode-toolname-test-{}",
