@@ -391,8 +391,13 @@ impl SessionRepo for JsonlSessionRepo {
             }
         }
 
-        // Sort by timestamp descending (most recent first).
-        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        // Sort by last prompt timestamp (most recent activity first),
+        // falling back to session creation timestamp.
+        sessions.sort_by(|a, b| {
+            let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
+            let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
+            b_ts.cmp(a_ts)
+        });
         Ok(sessions)
     }
 
@@ -553,7 +558,13 @@ impl JsonlSessionRepo {
                 }
             }
 
-            sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            sessions.sort_by(|a, b| {
+                // Sort by last prompt timestamp (most recent activity first),
+                // falling back to session creation timestamp.
+                let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
+                let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
+                b_ts.cmp(a_ts)
+            });
             cache.dirs.insert(
                 dir.clone(),
                 CachedDir { dir_mtime, file_mtimes, sessions },
