@@ -3799,6 +3799,35 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                                 config
                                                     .output
                                                     .display_thinking("Summarizing abandoned branch...");
+                                                // Lazy agent build, mirroring the
+                                                // `compact llm` arm: a
+                                                // `/tree <id> switch --summarize`
+                                                // right after `/session resume`
+                                                // (before any prompt) would
+                                                // otherwise hit the `None` arm
+                                                // below and silently skip the
+                                                // summary. A non-empty abandoned
+                                                // branch is the signal that an
+                                                // LLM call is needed, so we
+                                                // build the agent on demand and
+                                                // store it for the next prompt
+                                                // to reuse.
+                                                if agent.is_none() {
+                                                    match create_agent(config.clone()).await {
+                                                        Ok(a) => agent = Some(a),
+                                                        Err(e) => {
+                                                            config.output.display_text(&format!(
+                                                                "Cannot start agent: {}",
+                                                                e
+                                                            ));
+                                                            continue;
+                                                            // (Inside the `summarize`
+                                                            //  branch of `Switch`. Skip
+                                                            //  the summary; the leaf
+                                                            //  still moves below.)
+                                                        }
+                                                    }
+                                                }
                                                 let prompt = build_summary_prompt(&abandoned);
                                                 if let Some(ref agent) = agent {
                                                     let r = retry_summarization(
@@ -3879,6 +3908,27 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             };
 
                             let resolved_mode = mode.unwrap_or(CompactSummaryMode::Truncate);
+
+                            // LLM mode needs a live agent. Startup is lazy:
+                            // `agent` is only built on the first normal prompt
+                            // (or /model etc.), so `compact llm` right after a
+                            // `/session resume` (before any prompt) would
+                            // otherwise hit `run_compaction`'s `None` arm and
+                            // fail with "no agent". Build it here, mirroring
+                            // the lazy first-prompt creation below. Truncate /
+                            // TextOnly never touch the agent, so they stay
+                            // network-free regardless.
+                            if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
+                                match create_agent(config.clone()).await {
+                                    Ok(a) => agent = Some(a),
+                                    Err(e) => {
+                                        config
+                                            .output
+                                            .display_text(&format!("Cannot start agent: {}", e));
+                                        continue;
+                                    }
+                                }
+                            }
 
                             // LLM mode-specific early-out: refuse if the
                             // dropped span is empty. (Truncate / TextOnly
