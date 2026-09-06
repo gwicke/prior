@@ -431,9 +431,12 @@ pub(crate) enum ActiveOverlay {
     },
 
     /// `/tree <id>` action menu (switch / compact). `target_id` is the
-    /// resolved entry ID; the filter used to find it is dropped on commit.
+    /// resolved entry ID; `prev_id` / `next_id` are the adjacent IDs in
+    /// tree order (used by PageUp/PageDown to navigate entries).
     TreeAction {
         target_id: String,
+        prev_id: Option<String>,
+        next_id: Option<String>,
         /// Pre-rendered info header rows (selected entry body — multi-line
         /// for messages, single-line otherwise; the entry ID is intentionally
         /// omitted since it is already visible in the prompt buffer).
@@ -447,6 +450,8 @@ pub(crate) enum ActiveOverlay {
     /// `/tree <id> switch` sub-menu (just switch / summarize branch).
     SwitchAction {
         target_id: String,
+        prev_id: Option<String>,
+        next_id: Option<String>,
         /// Pre-rendered info header rows (selected entry body — multi-line
         /// for messages, single-line otherwise; the entry ID is intentionally
         /// omitted since it is already visible in the prompt buffer).
@@ -463,6 +468,8 @@ pub(crate) enum ActiveOverlay {
     /// info header. No such info is ever printed inline after the commit.
     CompactSummary {
         target_id: String,
+        prev_id: Option<String>,
+        next_id: Option<String>,
         header: Vec<String>,
         /// Fuzzy-filtered mode labels (truncate; more modes later).
         opts: Vec<String>,
@@ -634,8 +641,12 @@ impl ActiveOverlay {
                         l == first || l.replace(' ', "-") == first_normalized
                     })
                     .or(_fuzzy_active);
+                let (prev_id, next_id) =
+                    Repl::prev_next_entry_id(&ctx.tree, Some(leaf_id), &target_id);
                 ActiveOverlay::CompactSummary {
                     target_id,
+                    prev_id,
+                    next_id,
                     header,
                     opts,
                     active,
@@ -783,8 +794,12 @@ impl ActiveOverlay {
                                     max_body_lines,
                                     &mut header,
                                 );
+                                let (prev_id, next_id) =
+                                    Repl::prev_next_entry_id(&ctx.tree, ctx.leaf_id.as_deref(), &target_id);
                                 return ActiveOverlay::SwitchAction {
                                     target_id,
+                                    prev_id,
+                                    next_id,
                                     header,
                                     opts,
                                     active,
@@ -822,8 +837,12 @@ impl ActiveOverlay {
                                             || l.replace(' ', "-") == first_normalized
                                     })
                                     .or(_fuzzy_active);
+                                let (prev_id, next_id) =
+                                    Repl::prev_next_entry_id(&ctx.tree, ctx.leaf_id.as_deref(), &target_id);
                                 return ActiveOverlay::CompactSummary {
                                     target_id,
+                                    prev_id,
+                                    next_id,
                                     header,
                                     opts,
                                     active,
@@ -844,8 +863,12 @@ impl ActiveOverlay {
                             max_body_lines,
                             &mut header,
                         );
+                        let (prev_id, next_id) =
+                            Repl::prev_next_entry_id(&ctx.tree, ctx.leaf_id.as_deref(), &target_id);
                         return ActiveOverlay::TreeAction {
                             target_id,
+                            prev_id,
+                            next_id,
                             header,
                             opts,
                             active,
@@ -2253,19 +2276,56 @@ impl Repl {
                             KeyCode::Up => {
                                 if sel > 0 { sel -= 1; }
                             }
-                            KeyCode::PageDown => {
+                            KeyCode::PageDown | KeyCode::PageUp => {
+                                // PageUp/PageDown in the tree action sub-menus
+                                // navigate to the previous/next entry in the tree
+                                // view rather than scrolling the action menu.
+                                let (prev_id, next_id) = match &overlay {
+                                    ActiveOverlay::TreeAction { prev_id, next_id, .. } =>
+                                        (prev_id.clone(), next_id.clone()),
+                                    ActiveOverlay::SwitchAction { prev_id, next_id, .. } =>
+                                        (prev_id.clone(), next_id.clone()),
+                                    ActiveOverlay::CompactSummary { prev_id, next_id, .. } =>
+                                        (prev_id.clone(), next_id.clone()),
+                                    _ => (None, None),
+                                };
+                                let new_id = match key.code {
+                                    KeyCode::PageUp => prev_id,
+                                    _ => next_id, // PageDown
+                                };
+                                if let Some(id) = new_id {
+                                    // Strip any typed action/filter suffix so we
+                                    // land on the new entry's action menu.
+                                    let base = format!("/tree <{}>", id);
+                                    let buf = editor.text();
+                                    // `after` holds the trailing token(s) from the
+                                    // original prompt (`switch`, `compact llm <text>`
+                                    // etc.).  Preserve them on the new prompt so the
+                                    // user can PageUp/Down through entries while
+                                    // keeping the same mode active.
+                                    let after = buf
+                                        .strip_prefix("/tree <")
+                                        .and_then(|s| s.find('>').map(|i| &s[i + 1..]))
+                                        .unwrap_or("")
+                                        .trim();
+                                    let new_line = if after.is_empty() {
+                                        base.clone()
+                                    } else {
+                                        format!("{} {}", base, after)
+                                    };
+                                    editor.set(&new_line);
+                                }
+                                // else: no prev/next entry; bell is fine (or fall
+                                // through to the generic page-scroll as a fallback).
                                 let page = {
                                     let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
                                     (h as usize).saturating_sub(2).max(1)
                                 };
-                                sel = (sel + page).min(opts.len().saturating_sub(1));
-                            }
-                            KeyCode::PageUp => {
-                                let page = {
-                                    let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                                    (h as usize).saturating_sub(2).max(1)
-                                };
-                                sel = sel.saturating_sub(page);
+                                if matches!(key.code, KeyCode::PageDown) {
+                                    sel = (sel + page).min(opts.len().saturating_sub(1));
+                                } else {
+                                    sel = sel.saturating_sub(page);
+                                }
                             }
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
@@ -3478,6 +3538,36 @@ impl Repl {
             None
         }
         walk(nodes, id)
+    }
+
+    /// Return `(prev_id, next_id)` for the entry at `target_id` in tree order.
+    /// The flat list is built exactly as `tree_overlay_entries` does — same
+    /// filtering, same ordering — so PageUp/PageDown in the action sub-menus
+    /// land on the same entries the user would navigate with ↑/↓ in the
+    /// `/tree` list overlay.
+    fn prev_next_entry_id(
+        tree: &[SessionTreeNode],
+        leaf_id: Option<&str>,
+        target_id: &str,
+    ) -> (Option<String>, Option<String>) {
+        let active_path: std::collections::HashSet<String> = leaf_id
+            .map(|lid| {
+                let mut path = std::collections::HashSet::new();
+                collect_active_path(tree, lid, &mut path);
+                path
+            })
+            .unwrap_or_default();
+        let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
+        Self::flatten_tree_nodes(tree, 0, leaf_id, &active_path, &mut flat);
+        let pos = flat.iter().position(|(_, _, id, _, _, _)| id == target_id);
+        match pos {
+            Some(p) => {
+                let prev = p.checked_sub(1).and_then(|i| flat.get(i)).map(|(_, _, id, _, _, _)| id.clone());
+                let next = flat.get(p + 1).map(|(_, _, id, _, _, _)| id.clone());
+                (prev, next)
+            }
+            None => (None, None),
+        }
     }
 
     /// Walk the tree looking for a node whose `id` matches, and return
