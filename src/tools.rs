@@ -6,7 +6,8 @@ use std::sync::Arc;
 use tokio::fs;
 use rig_core::tool::ToolContext;
 
-use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig};
+#[allow(unused_imports)]
+use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes};
 use crate::edit_match;
 use crate::path_util::relativize_path;
 
@@ -105,7 +106,13 @@ fn walk_files(base: &std::path::Path) -> impl Iterator<Item = ignore::DirEntry> 
     description = "Read file with line numbers",
     required(path, offset, limit)
 )]
-pub async fn read_file(path: String, offset: u64, limit: u64) -> Result<String, ToolError> {
+pub async fn read_file(
+    path: String,
+    offset: ReadOffset,
+    limit: ReadLimit,
+) -> Result<String, ToolError> {
+    let offset: u64 = offset.into();
+    let limit: u64 = limit.into();
     let content = fs::read_to_string(get_path(&path)?).await?;
     let lines: Vec<_> = content
         .lines()
@@ -296,7 +303,7 @@ pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolErro
 
     let cfg = sandbox_config();
     let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
-    let timeout = cfg.timeout_secs.or(Some(60));
+    let timeout: Option<u64> = cfg.timeout_secs.map(|v| v.into());
 
     // Constrained ripgrep, passed as a discrete argv list (no shell, no string
     // construction). The pattern and path are argv elements, so regex
@@ -337,7 +344,7 @@ pub struct BashArgs {
     /// finite number; values above the maximum are rejected. Leave unset to use
     /// the configured default.
     #[serde(default)]
-    pub timeout: Option<u64>,
+    pub timeout: BashTimeout,
 }
 
 pub struct Bash;
@@ -362,7 +369,7 @@ impl rig_core::tool::Tool for Bash {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
-        let (out, exit_code) = run_sandboxed_with_status(&args.command, args.timeout).await?;
+        let (out, exit_code) = run_sandboxed_with_status(&args.command, args.timeout.map(|v| v.into())).await?;
         // The bash tool result is shown verbatim to the user (via
         // `LoggingHook::on_tool_result` → `display_tool_result`) AND handed
         // straight back to the LLM as the tool message. An empty stdout
@@ -499,7 +506,7 @@ pub(crate) async fn run_sandboxed(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs);
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -556,7 +563,7 @@ pub(crate) async fn run_sandboxed_with_status(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs);
+    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -865,10 +872,11 @@ fn prlimit_available() -> bool {
 ///   `false`, so it runs `target` uncapped (matching prior behavior, where the
 ///   argv path never enforced a memory limit).
 fn memory_wrapped_target(
-    memory_mb: Option<u64>,
+    memory_mb: crate::config::SandboxMemoryMb,
     target: Vec<String>,
     allow_shell_fallback: bool,
 ) -> Vec<String> {
+    let memory_mb: Option<u64> = memory_mb.into();
     let Some(mb) = memory_mb else {
         return target;
     };
@@ -1367,16 +1375,16 @@ mod sandbox_tests {
         timeout_secs: Option<u64>,
     ) -> SandboxConfig {
         SandboxConfig {
-            timeout_secs,
+            timeout_secs: timeout_secs.map(|v| crate::config::SandboxTimeoutSecs(Some(v))).unwrap_or(crate::config::SandboxTimeoutSecs(None)),
             network: Some(false),
-            memory_mb: None,
+            memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: Some(16),
+            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro,
             rw,
             env: None,
-            max_output_bytes: None,
+            max_output_bytes: crate::config::SandboxMaxOutputBytes(None),
         }
     }
 
@@ -1704,7 +1712,7 @@ mod sandbox_tests {
             "from-shell"
         );
         // And the non-shell tool can read what the shell wrote.
-        let read = super::read_file("/tmp/x2.txt".to_string(), 0, 0).await.unwrap();
+        let read = super::read_file("/tmp/x2.txt".to_string(), crate::config::ReadOffset(0), crate::config::ReadLimit(0)).await.unwrap();
         assert!(read.contains("from-shell"));
     }
 
@@ -1747,16 +1755,16 @@ mod sandbox_tests {
     /// Set a sandbox with an explicit `env` policy.
     fn sandbox_with_env(env: EnvPolicy) -> SandboxConfig {
         SandboxConfig {
-            timeout_secs: Some(30),
+            timeout_secs: crate::config::SandboxTimeoutSecs(Some(30)),
             network: Some(false),
-            memory_mb: None,
+            memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
             drop_caps: Some(true),
-            tmp_size_mb: Some(16),
+            tmp_size_mb: crate::config::SandboxTmpSizeMb(Some(16)),
             ro: vec![],
             rw: vec![],
             env: Some(env),
-            max_output_bytes: None,
+            max_output_bytes: crate::config::SandboxMaxOutputBytes(None),
         }
     }
 

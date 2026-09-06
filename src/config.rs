@@ -4,6 +4,560 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+// Wrapper types that can deserialize from both JSON numbers and strings.
+/// These handle the common case where LLMs send numeric parameters as strings.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, serde::Serialize)]
+pub struct ReadOffset(pub u64);
+
+impl<'de> serde::Deserialize<'de> for ReadOffset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = u64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for read offset (not a string)")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(value)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid read offset: negative value not allowed"));
+                }
+                Ok(value as u64)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(format!("invalid read offset: '{}' - must be number, is string", value)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(ReadOffset)
+    }
+}
+
+impl ReadOffset {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
+        f(self.0)
+    }
+}
+
+impl From<ReadOffset> for u64 {
+    fn from(w: ReadOffset) -> u64 {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, serde::Serialize)]
+pub struct ReadLimit(pub u64);
+
+impl<'de> serde::Deserialize<'de> for ReadLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = u64;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for read limit (not a string)")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(value)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid read limit: negative value not allowed"));
+                }
+                Ok(value as u64)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Err(E::custom(format!("invalid read limit: '{}' - must be number, is string", value)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(ReadLimit)
+    }
+}
+
+impl ReadLimit {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
+        f(self.0)
+    }
+}
+
+impl From<ReadLimit> for u64 {
+    fn from(w: ReadLimit) -> u64 {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+pub struct BashTimeout(pub Option<u64>);
+
+impl<'de> serde::Deserialize<'de> for BashTimeout {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<u64>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for bash timeout (not a string), or null")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid bash timeout: negative value not allowed"));
+                }
+                Ok(Some(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Err(E::custom(format!("invalid bash timeout: '{}' - must be number, is string", value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(BashTimeout)
+    }
+}
+
+impl BashTimeout {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> Option<U> {
+        self.0.map(f)
+    }
+
+    pub fn unwrap_or(self, default: u64) -> u64 {
+        self.0.unwrap_or(default)
+    }
+
+    pub fn or(self, other: BashTimeout) -> BashTimeout {
+        if self.0.is_some() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl From<BashTimeout> for Option<u64> {
+    fn from(w: BashTimeout) -> Option<u64> {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+pub struct SandboxTimeoutSecs(pub Option<u64>);
+
+impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<u64>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for timeout_secs (not a string), or null")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid timeout_secs: negative value not allowed"));
+                }
+                Ok(Some(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Err(E::custom(format!("invalid timeout_secs: '{}' - must be number, is string", value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(SandboxTimeoutSecs)
+    }
+}
+
+impl SandboxTimeoutSecs {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> Option<U> {
+        self.0.map(f)
+    }
+
+    pub fn unwrap_or(self, default: u64) -> u64 {
+        self.0.unwrap_or(default)
+    }
+
+    pub fn or(self, other: SandboxTimeoutSecs) -> SandboxTimeoutSecs {
+        if self.0.is_some() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl From<SandboxTimeoutSecs> for Option<u64> {
+    fn from(w: SandboxTimeoutSecs) -> Option<u64> {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+pub struct SandboxMemoryMb(pub Option<u64>);
+
+impl<'de> serde::Deserialize<'de> for SandboxMemoryMb {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<u64>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for memory_mb (not a string), or null")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid memory_mb: negative value not allowed"));
+                }
+                Ok(Some(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Err(E::custom(format!("invalid memory_mb: '{}' - must be number, is string", value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(SandboxMemoryMb)
+    }
+}
+
+impl SandboxMemoryMb {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> Option<U> {
+        self.0.map(f)
+    }
+
+    pub fn unwrap_or(self, default: u64) -> u64 {
+        self.0.unwrap_or(default)
+    }
+
+    pub fn or(self, other: SandboxMemoryMb) -> SandboxMemoryMb {
+        if self.0.is_some() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl From<SandboxMemoryMb> for Option<u64> {
+    fn from(w: SandboxMemoryMb) -> Option<u64> {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+pub struct SandboxTmpSizeMb(pub Option<u64>);
+
+impl<'de> serde::Deserialize<'de> for SandboxTmpSizeMb {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<u64>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for tmp_size_mb (not a string), or null")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid tmp_size_mb: negative value not allowed"));
+                }
+                Ok(Some(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Err(E::custom(format!("invalid tmp_size_mb: '{}' - must be number, is string", value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(SandboxTmpSizeMb)
+    }
+}
+
+impl SandboxTmpSizeMb {
+    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> Option<U> {
+        self.0.map(f)
+    }
+
+    pub fn unwrap_or(self, default: u64) -> u64 {
+        self.0.unwrap_or(default)
+    }
+
+    pub fn or(self, other: SandboxTmpSizeMb) -> SandboxTmpSizeMb {
+        if self.0.is_some() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl From<SandboxTmpSizeMb> for Option<u64> {
+    fn from(w: SandboxTmpSizeMb) -> Option<u64> {
+        w.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+pub struct SandboxMaxOutputBytes(pub Option<usize>);
+
+impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Option<usize>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for max_output_bytes (not a string), or null")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Some(value as usize))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid max_output_bytes: negative value not allowed"));
+                }
+                Ok(Some(value as usize))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                Err(E::custom(format!("invalid max_output_bytes: '{}' - must be number, is string", value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(None)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(SandboxMaxOutputBytes)
+    }
+}
+
+impl SandboxMaxOutputBytes {
+    pub fn map<U, F: FnOnce(usize) -> U>(self, f: F) -> Option<U> {
+        self.0.map(f)
+    }
+
+    pub fn unwrap_or(self, default: usize) -> usize {
+        self.0.unwrap_or(default)
+    }
+
+    pub fn or(self, other: SandboxMaxOutputBytes) -> SandboxMaxOutputBytes {
+        if self.0.is_some() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl From<SandboxMaxOutputBytes> for Option<usize> {
+    fn from(w: SandboxMaxOutputBytes) -> Option<usize> {
+        w.0
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]
@@ -64,13 +618,13 @@ pub struct ToolSettings {
 pub struct SandboxConfig {
     /// Wall-clock timeout (seconds) for the whole command. `None`/0 = no timeout.
     #[serde(default)]
-    pub timeout_secs: Option<u64>,
+    pub timeout_secs: SandboxTimeoutSecs,
     /// Give the sandbox network access. Default false (network is unshared).
     #[serde(default)]
     pub network: Option<bool>,
     /// RLIMIT_AS in MB (virtual-memory cap). Default none (unlimited).
     #[serde(default)]
-    pub memory_mb: Option<u64>,
+    pub memory_mb: SandboxMemoryMb,
     /// Run in a fresh PID namespace. Default true.
     #[serde(default)]
     pub pid_isolation: Option<bool>,
@@ -79,7 +633,7 @@ pub struct SandboxConfig {
     pub drop_caps: Option<bool>,
     /// Size of the tmpfs mounted at /tmp inside the sandbox (MB). Default 256.
     #[serde(default)]
-    pub tmp_size_mb: Option<u64>,
+    pub tmp_size_mb: SandboxTmpSizeMb,
     /// Read-only filesystem bindings. Each entry is either a bare path (mounted
     /// at the same in-sandbox location) or an explicit `{ from, to }` remap.
     /// Paths are resolved relative to the agent CWD (`~` expands to the home
@@ -101,7 +655,7 @@ pub struct SandboxConfig {
     /// command. Output beyond this is truncated with a notice. Default:
     /// [`DEFAULT_MAX_OUTPUT_BYTES`].
     #[serde(default)]
-    pub max_output_bytes: Option<usize>,
+    pub max_output_bytes: SandboxMaxOutputBytes,
 }
 
 /// Default cap on combined stdout+stderr (bytes) retained per sandboxed
@@ -117,16 +671,16 @@ impl SandboxConfig {
     /// switch to resolve here. This only fills in the remaining defaults.
     pub fn with_defaults(&self) -> SandboxConfig {
         SandboxConfig {
-            timeout_secs: self.timeout_secs.or(Some(120)),
+            timeout_secs: self.timeout_secs.or(SandboxTimeoutSecs(Some(120))),
             network: self.network.or(Some(false)),
             memory_mb: self.memory_mb,
             pid_isolation: self.pid_isolation.or(Some(true)),
             drop_caps: self.drop_caps.or(Some(true)),
-            tmp_size_mb: self.tmp_size_mb.or(Some(256)),
+            tmp_size_mb: self.tmp_size_mb.or(SandboxTmpSizeMb(Some(256))),
             ro: self.ro.clone(),
             rw: self.rw.clone(),
             env: self.env.clone(),
-            max_output_bytes: self.max_output_bytes.or(Some(DEFAULT_MAX_OUTPUT_BYTES)),
+            max_output_bytes: self.max_output_bytes.or(SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))),
         }
     }
 
@@ -136,7 +690,7 @@ impl SandboxConfig {
     /// [`DEFAULT_MAX_OUTPUT_BYTES`]. Used by the bash and grep/rg reader paths
     /// to bound how much child output is kept in memory.
     pub fn max_output_bytes(&self) -> usize {
-        self.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+        self.max_output_bytes.clone().map(|v| v.into()).unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
     }
 }
 
@@ -583,32 +1137,32 @@ mod tests {
     #[test]
     fn with_defaults_merges() {
         let raw = SandboxConfig {
-            timeout_secs: Some(5),
+            timeout_secs: SandboxTimeoutSecs(Some(5)),
             network: None,
-            memory_mb: Some(512),
+            memory_mb: SandboxMemoryMb(Some(512)),
             pid_isolation: None,
             drop_caps: None,
-            tmp_size_mb: None,
+            tmp_size_mb: SandboxTmpSizeMb(None),
             ro: vec![],
             rw: vec![],
             env: None,
-            max_output_bytes: None,
+            max_output_bytes: SandboxMaxOutputBytes(None),
         };
         let d = raw.with_defaults();
-        assert_eq!(d.timeout_secs, Some(5));
+        assert_eq!(d.timeout_secs, SandboxTimeoutSecs(Some(5)));
         assert_eq!(d.network, Some(false));
-        assert_eq!(d.memory_mb, Some(512));
+        assert_eq!(d.memory_mb, SandboxMemoryMb(Some(512)));
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
-        assert_eq!(d.tmp_size_mb, Some(256));
+        assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
         // Output cap defaults when unset.
-        assert_eq!(d.max_output_bytes, Some(DEFAULT_MAX_OUTPUT_BYTES));
+        assert_eq!(d.max_output_bytes, SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES)));
         // ...and a user value is preserved.
         let raw2 = SandboxConfig {
-            max_output_bytes: Some(4096),
+            max_output_bytes: SandboxMaxOutputBytes(Some(4096)),
             ..Default::default()
         };
-        assert_eq!(raw2.with_defaults().max_output_bytes, Some(4096));
+        assert_eq!(raw2.with_defaults().max_output_bytes, SandboxMaxOutputBytes(Some(4096)));
     }
 
     #[test]
@@ -620,12 +1174,12 @@ mod tests {
         // omitted.
         let raw = SandboxConfig::default();
         let d = raw.with_defaults();
-        assert_eq!(d.timeout_secs, Some(120));
+        assert_eq!(d.timeout_secs, SandboxTimeoutSecs(Some(120)));
         assert_eq!(d.network, Some(false));
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
-        assert_eq!(d.tmp_size_mb, Some(256));
-        assert_eq!(d.max_output_bytes, Some(DEFAULT_MAX_OUTPUT_BYTES));
+        assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
+        assert_eq!(d.max_output_bytes, SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES)));
     }
 
     #[test]
