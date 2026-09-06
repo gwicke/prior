@@ -171,6 +171,19 @@ Mechanics:
   *before* committing — is rendered as non-selectable **header rows** in the
   menu (`BG_HEADER`), the same place `SessionAction` shows its session info.
   After the committed line is printed, nothing informational follows it.
+- **Cancel during review → re-enter the prompt.** Some commands have a
+  **review step** after commit: the user is shown a generated artifact
+  (e.g. a compaction summary draft) in `$EDITOR`, then asked to Accept or
+  Cancel. When the user cancels (or presses `Esc`), do **not** print a cancel
+  message. Instead, set `pending_prefill = Some(input.clone())` in the main
+  loop (where `input` is the committed prompt, e.g. `/tree <id> compact
+  llm`) and `continue`. The next `read_input` call will seed the editor with
+  the same line, dropping the user back into the menu/overlay state so they
+  can switch modes, tune a parameter, or abandon the action entirely — without
+  any extra output. The `CompactionResult` enum in `src/agent.rs`
+  (`Done / Cancelled / Err`) encodes this three-way distinction at the
+  handler level, keeping the re-entry logic in one place. This pattern is
+  applicable to any slash command that has a review/edit step before writing.
 
 Why: the scrollback becomes a clean, greppable transcript of *what the user
 did* (`/model anthropic:claude-…`, `/session <id> fork`, `/tree <id> switch
@@ -229,7 +242,10 @@ action should instead be in this header *before* the action.
 7. Wire `display_rows`, `overlay_disc`, the header rendering arm (`overlay_lines`
    forward with `Some(header)`), and the `title`.
 8. Tests: `from_buffer` promotion, filtering/active, pre-selection,
-   Tab/Enter/Esc transitions, canonical committed line, no extra inline output.
+   Tab/Enter/Esc transitions, canonical committed line, no extra inline
+   output. If the command has a review step, verify that cancel sets
+   `pending_prefill` and the next prompt re-enters the editor with the
+   same line.
 
 ---
 
