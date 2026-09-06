@@ -2540,85 +2540,111 @@ async fn handle_session_command(
                     .map(|s| crate::agent::parse_replay_len_arg(s, default))
                     .unwrap_or((default, false));
 
-                match repo.as_ref().unwrap().open(&meta).await {
-                    Ok((storage, index)) => {
-                        // No silent restore of provider/model/thinking on
-                        // resume: doing so would mutate `config` and rebuild
-                        // the running agent behind the user's back, removing
-                        // the chance to accept/abort/choose a model. The
-                        // resumed session is loaded and replay is rendered
-                        // below; the model/thinking decision is surfaced to
-                        // the user via `compute_resume_model_prefill`, which
-                        // returns a `/model <provider>:<model_id>` prefill
-                        // when a `ModelChange` is on the active path or the
-                        // header carries provider/model metadata, otherwise
-                        // leaves the prompt empty.
-                        let new_session = Session::new_persisted(storage, index);
-                        let id = new_session.get_session_id().to_string();
-
-                        if count > 0 {
-                            // Replay from the RAW branch so compaction entries
-                            // render as markers while the whole history is
-                            // available; only the agent context is scoped.
-                            let branch = new_session.get_branch().await;
-                            let units = build_replay_units(&branch);
-                            let total = count_turns(&units);
-                            output.display_separator();
-                            if is_lines {
-                                // Line-based: capture full replay via writer, tail lines.
-                                output.begin_capture();
-                                replay_units(output.as_ref(), &units, 0);
-                                let bytes = output.end_capture();
-                                let captured = String::from_utf8_lossy(&bytes);
-                                let lines: Vec<&str> = captured.lines().collect();
-                                let start = lines.len().saturating_sub(count);
-                                use std::io::Write as _;
-                                let stdout = std::io::stdout();
-                                let mut handle = stdout.lock();
-                                for line in &lines[start..] {
-                                    let _ = writeln!(handle, "{}", line);
-                                }
-                                let _ = handle.flush();
-                            } else {
-                                replay_last_turns(output.as_ref(), &units, count.min(total));
-                            }
-                        }
-
-                        // Build the model-restoration prefill: find the latest
-                        // `ModelChange` on the active leaf→root path, fall back
-                        // to the session header's provider/model when no entry
-                        // exists, otherwise leave the next prompt empty so the
-                        // user is not nudged to switch. We only restore the
-                        // model (not thinking level) — they share the single
-                        // input field, and silently setting `config.model` plus
-                        // rebuilding the agent bypasses the user's chance to
-                        // accept/abort/choose. Pending: a slug syntax that
-                        // bundles model + thinking into one prefill (see
-                        // doc/todo.md). The full `provider:model_id` form is
-                        // used so the `/model` overlay's fuzzy filter matches
-                        // the catalog entry directly; Enter then dispatches
-                        // `InputAction::SetModel` and rebuilds the agent.
-                        //
-                        // Computed BEFORE moving `new_session` into
-                        // `*session` because `compute_resume_model_prefill`
-                        // takes `&Session`.
-                        let prefill = compute_resume_model_prefill(&new_session).await;
-
-                        *session = Some(new_session);
-
-                        SessionCommandResult::Switched { id, prefill }
+                // Resume in a different directory -> fork the session to the new
+                // cwd and delete the original. This migrates the session file to
+                // the current location and sets the header's `cwd` field.
+                let cwd = match std::env::current_dir() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        config.output.display_text("Cannot determine current directory");
+                        return SessionCommandResult::Handled;
                     }
-                    Err(e) => {
-                        config.output.display_text(&format!("Cannot resume session: {}", e));
-                        SessionCommandResult::Handled
+                };
+
+                let (storage, index) = if meta.cwd != cwd {
+                    let repo = repo.as_ref().unwrap();
+                    match repo.fork(&meta, "", &cwd).await {
+                        Ok(forked_storage) => {
+                            let index = match forked_storage.build_index().await {
+                                Ok(i) => i,
+                                Err(e) => {
+                                    config.output.display_text(&format!("Cannot build session index: {}", e));
+                                    return SessionCommandResult::Handled;
+                                }
+                            };
+                            if let Err(e) = repo.delete(&meta).await {
+                                config.output.display_text(&format!("Cannot remove old session: {}", e));
+                                return SessionCommandResult::Handled;
+                            }
+                            (forked_storage, index)
+                        }
+                        Err(e) => {
+                            config.output.display_text(&format!("Cannot fork session: {}", e));
+                            return SessionCommandResult::Handled;
+                        }
+                    }
+                } else {
+                    match repo.as_ref().unwrap().open(&meta).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            config.output.display_text(&format!("Cannot resume session: {}", e));
+                            return SessionCommandResult::Handled;
+                        }
+                    }
+                };
+
+                // No silent restore of provider/model/thinking on resume: doing so
+                // would mutate `config` and rebuild the running agent behind the
+                // user's back, removing the chance to accept/abort/choose a model.
+                // The resumed session is loaded and replay is rendered below; the
+                // model/thinking decision is surfaced via `compute_resume_model_prefill`,
+                // which returns a `/model <provider>:<model_id>` prefill when a
+                // `ModelChange` is on the active path or the header carries
+                // provider/model metadata, otherwise leaves the prompt empty so the
+                // user is not nudged to switch. We only restore the model (not
+                // thinking level) -- they share the single input field, and silently
+                // setting `config.model` plus rebuilding the agent bypasses the
+                // user's chance to accept/abort/choose. Pending: a slug syntax
+                // that bundles model + thinking into one prefill (see
+                // doc/todo.md). The full `provider:model_id` form is used so the
+                // `/model` overlay's fuzzy filter matches the catalog entry
+                // directly; Enter then dispatches `InputAction::SetModel` and
+                // rebuilds the agent.
+                //
+                // Computed BEFORE moving `new_session` into `*session` because
+                // `compute_resume_model_prefill` takes `&Session`.
+                let new_session = Session::new_persisted(storage, index);
+                let id = new_session.get_session_id().to_string();
+
+                if count > 0 {
+                    // Replay from the RAW branch so compaction entries render as
+                    // markers while the whole history is available; only the agent
+                    // context is scoped.
+                    let branch = new_session.get_branch().await;
+                    let units = build_replay_units(&branch);
+                    let total = count_turns(&units);
+                    output.display_separator();
+                    if is_lines {
+                        // Line-based: capture full replay via writer, tail lines.
+                        output.begin_capture();
+                        replay_units(output.as_ref(), &units, 0);
+                        let bytes = output.end_capture();
+                        let captured = String::from_utf8_lossy(&bytes);
+                        let lines: Vec<&str> = captured.lines().collect();
+                        let start = lines.len().saturating_sub(count);
+                        use std::io::Write as _;
+                        let stdout = std::io::stdout();
+                        let mut handle = stdout.lock();
+                        for line in &lines[start..] {
+                            let _ = writeln!(handle, "{}", line);
+                        }
+                        let _ = handle.flush();
+                    } else {
+                        replay_last_turns(output.as_ref(), &units, count.min(total));
                     }
                 }
+
+                let prefill = compute_resume_model_prefill(&new_session).await;
+
+                *session = Some(new_session);
+
+                SessionCommandResult::Switched { id, prefill }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
             }
         }
-        "fork" => {
+"fork" => {
             if let Some(meta) = meta {
                 let cwd = match std::env::current_dir() {
                     Ok(c) => c,
@@ -3078,6 +3104,9 @@ async fn run_compaction_at_point(
         None
     };
 
+    // Session directory for relativizing file paths in compaction summaries.
+    let session_dir = std::path::PathBuf::from(session.index().lock().await.header.cwd.clone());
+
     // 4. LLM mode requires a valid predecessor to scope the summarization
     //    context. Manual and text-only modes tolerate root-level compactions.
     if predecessor_id.is_none() && matches!(mode, CompactSummaryMode::Llm) {
@@ -3103,7 +3132,7 @@ async fn run_compaction_at_point(
             // compaction). The user edits it in the review gate before it is
             // stored. A span with no files and no seed text has nothing to
             // point at, so we fall through to the empty-summary no-op.
-            let draft = crate::session::build_manual_template(&dropped, seed_text.as_deref());
+            let draft = crate::session::build_manual_template(&dropped, seed_text.as_deref(), &session_dir);
             let summary = if draft.is_empty() {
                 String::new()
             } else {
@@ -3131,7 +3160,7 @@ async fn run_compaction_at_point(
             // responses per turn, plus touched-files list. Seed text from the
             // pivot context is available (via `seed_text`) but intentionally
             // not included — text-only summarises the dropped span directly.
-            let draft = crate::session::build_text_only_summary(&dropped);
+            let draft = crate::session::build_text_only_summary(&dropped, &session_dir);
             let summary = match &review {
                 Some(r) => match r(&draft) {
                     Some(s) => s,

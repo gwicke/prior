@@ -115,11 +115,33 @@ fn summary_message_text(message: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Strip `session_dir` prefix from `path`, returning a compact relative path
+/// (no leading `./`). Both sides are canonicalized (symlink-resolved) before
+/// comparison to handle path portability. Returns `None` if `path` is not
+/// a sub-path of `session_dir`, or if canonicalization fails.
+pub(crate) fn relativize_path(session_dir: &std::path::Path, path: &str) -> Option<String> {
+    let session_dir = session_dir.canonicalize().ok()?;
+    let abs_path = std::path::Path::new(path).canonicalize().ok()?;
+    let rel = abs_path.strip_prefix(&session_dir).ok()?.to_str()?;
+    // strip_prefix succeeds for equal paths, returning "". Treat as outside.
+    if rel.is_empty() {
+        return None;
+    }
+    Some(rel.to_string())
+}
+
 /// Extract touched files from one pi assistant message's `toolCall` blocks.
 /// Appends into `files`, promoting existing read-only entries to modified
 /// when a later write/edit touches the same path. Only `read`, `write`, and
 /// `edit` calls are considered; all other tools are ignored.
-fn collect_touched_files(message: &serde_json::Value, files: &mut Vec<TouchedFile>) {
+///
+/// Paths below `session_dir` are stored as compact relative paths
+/// (no leading `./`). Paths outside `session_dir` are stored as-is.
+fn collect_touched_files(
+    message: &serde_json::Value,
+    files: &mut Vec<TouchedFile>,
+    session_dir: &std::path::Path,
+) {
     let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
         return;
     };
@@ -140,13 +162,14 @@ fn collect_touched_files(message: &serde_json::Value, files: &mut Vec<TouchedFil
         else {
             continue;
         };
-        if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+        let normalized = relativize_path(session_dir, path).unwrap_or_else(|| path.to_string());
+        if let Some(existing) = files.iter_mut().find(|f| f.path == normalized) {
             if modified {
                 existing.modified = true; // read-then-write → modified
             }
         } else {
             files.push(TouchedFile {
-                path: path.to_string(),
+                path: normalized,
                 modified,
             });
         }
@@ -155,10 +178,13 @@ fn collect_touched_files(message: &serde_json::Value, files: &mut Vec<TouchedFil
 
 /// Like `collect_touched_files` but skips paths already in `seen_paths`.
 /// Adds new entries to `files` and records their paths in `seen_paths`.
+/// De-duplication handles both relative and absolute paths by normalising
+/// all extracted paths via `relativize_path` before lookup.
 fn collect_touched_files_filtered(
     message: &serde_json::Value,
     files: &mut Vec<TouchedFile>,
     seen_paths: &mut std::collections::HashSet<String>,
+    session_dir: &std::path::Path,
 ) {
     let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
         return;
@@ -180,19 +206,22 @@ fn collect_touched_files_filtered(
         else {
             continue;
         };
+        // Normalise to relative form for de-dup key; fall back to absolute.
+        let normalized = relativize_path(session_dir, path).unwrap_or_else(|| path.to_string());
+
         // Skip already-seen paths (preserve earlier entry's order).
-        if seen_paths.contains(path) {
+        if seen_paths.contains(&normalized) {
             // If the new entry is "modified" and the existing is "read", upgrade it.
             if modified {
-                if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+                if let Some(existing) = files.iter_mut().find(|f| f.path == normalized) {
                     existing.modified = true;
                 }
             }
             continue;
         }
-        seen_paths.insert(path.to_string());
+        seen_paths.insert(normalized.clone());
         files.push(TouchedFile {
-            path: path.to_string(),
+            path: normalized,
             modified,
         });
     }
@@ -209,7 +238,7 @@ fn collect_touched_files_filtered(
 ///
 /// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
 /// ("text only" mode). Empty when the dropped span has no renderable text.
-pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
+pub(crate) fn build_text_only_summary(dropped: &[SessionEntry], session_dir: &std::path::Path) -> String {
     let mut out = String::new();
     let mut files: Vec<TouchedFile> = Vec::new();
     // Assistant text accumulates until the next user prompt closes the turn.
@@ -247,7 +276,7 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
                         }
                     }
                     Some("assistant") => {
-                        collect_touched_files(message, &mut files);
+                        collect_touched_files(message, &mut files, session_dir);
                         if let Some(text) = summary_message_text(message) {
                             turn_assistant.push(text);
                         }
@@ -310,7 +339,7 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry]) -> String {
 /// Empty groups (no `.md` files or no other files) are omitted. A span
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
-pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>) -> String {
+pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>, session_dir: &std::path::Path) -> String {
     // Build the file list: previous-summary files first, then newly-touched
     // files from the dropped span, de-duplicated. De-dup is by path; the earlier
     // entry wins (previous-summary files are "authoritative").
@@ -332,7 +361,7 @@ pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: 
     for entry in dropped {
         if let SessionEntryContent::Message { message } = &entry.content {
             if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                collect_touched_files_filtered(message, &mut files, &mut seen_paths);
+                collect_touched_files_filtered(message, &mut files, &mut seen_paths, session_dir);
             }
         }
     }
@@ -3184,6 +3213,7 @@ mod tests {
 
     #[test]
     fn text_only_summary_user_prompts_and_assistant_text() {
+        let session_dir = std::path::PathBuf::from("/test");
         let dropped = vec![
             sum_user("m0", None, "first prompt"),
             sum_assistant("a0", Some("m0"), serde_json::json!([
@@ -3209,7 +3239,7 @@ mod tests {
                 {"type": "text", "text": "second answer"}
             ])),
         ];
-        let s = build_text_only_summary(&dropped);
+        let s = build_text_only_summary(&dropped, &session_dir);
         assert!(s.contains("# [user]\nfirst prompt"));
         assert!(s.contains("# [assistant]\nfirst answer"));
         assert!(s.contains("# [user]\nsecond prompt"));
@@ -3234,6 +3264,7 @@ mod tests {
 
     #[test]
     fn text_only_summary_lists_touched_files() {
+        let session_dir = std::path::PathBuf::from("/test");
         let dropped = vec![
             sum_user("m0", None, "do work"),
             sum_assistant("a0", Some("m0"), serde_json::json!([
@@ -3248,7 +3279,7 @@ mod tests {
                  "arguments": {"command": "ls"}},
             ])),
         ];
-        let s = build_text_only_summary(&dropped);
+        let s = build_text_only_summary(&dropped, &session_dir);
         // No .md files in this span, so only the "Files" section appears.
         assert!(s.contains("# [Files]"));
         assert!(!s.contains("# [Documents]"));
@@ -3270,7 +3301,8 @@ mod tests {
 
     #[test]
     fn text_only_summary_empty_for_empty_span() {
-        assert_eq!(build_text_only_summary(&[]), "");
+        let session_dir = std::path::PathBuf::from("/test");
+        assert_eq!(build_text_only_summary(&[], &session_dir), "");
         // Tool results only → still empty.
         let dropped = vec![SessionEntry {
             id: "t".into(),
@@ -3283,11 +3315,12 @@ mod tests {
                 }),
             },
         }];
-        assert_eq!(build_text_only_summary(&dropped), "");
+        assert_eq!(build_text_only_summary(&dropped, &session_dir), "");
     }
 
     #[test]
     fn text_only_summary_end_of_compacted_context_check() {
+        let session_dir = std::path::PathBuf::from("/test");
         // The summary is written into a Compaction entry; applying the
         // compaction transforms must project it as the FIRST context message,
         // before the kept messages (pi contract).
@@ -3299,7 +3332,7 @@ mod tests {
                  "arguments": {"path": "src/lib.rs", "edits": []}}
             ])),
         ];
-        let summary = build_text_only_summary(&dropped);
+        let summary = build_text_only_summary(&dropped, &session_dir);
         assert!(!summary.is_empty());
         assert!(summary.contains("- modified: src/lib.rs"));
 
@@ -3371,6 +3404,7 @@ mod tests {
 
     #[test]
     fn text_only_summary_splits_documents_and_files() {
+        let session_dir = std::path::PathBuf::from("/test");
         // The dropped span touches both markdown and non-markdown files;
         // the text-only summary must render them under separate headers,
         // with each group sorted (modified before reads, alphabetical
@@ -3390,7 +3424,7 @@ mod tests {
                  "arguments": {"path": "CHANGELOG.md"}},
             ])),
         ];
-        let s = build_text_only_summary(&dropped);
+        let s = build_text_only_summary(&dropped, &session_dir);
         // Both headers present.
         assert!(s.contains("# [Documents]"), "missing Documents section: {s}");
         assert!(s.contains("# [Files]"), "missing Files section: {s}");
@@ -3418,6 +3452,7 @@ mod tests {
 
     #[test]
     fn text_only_summary_omits_empty_files_group() {
+        let session_dir = std::path::PathBuf::from("/test");
         // If the dropped span touches ONLY markdown files, the Files
         // section is empty and must be omitted (no header, no empty
         // bullets). Same for the converse.
@@ -3428,7 +3463,7 @@ mod tests {
                  "arguments": {"path": "README.md"}},
             ])),
         ];
-        let s = build_text_only_summary(&only_md);
+        let s = build_text_only_summary(&only_md, &session_dir);
         assert!(s.contains("# [Documents]"));
         assert!(!s.contains("# [Files]"));
 
@@ -3439,13 +3474,14 @@ mod tests {
                  "arguments": {"path": "src/lib.rs"}},
             ])),
         ];
-        let s = build_text_only_summary(&only_rs);
+        let s = build_text_only_summary(&only_rs, &session_dir);
         assert!(s.contains("# [Files]"));
         assert!(!s.contains("# [Documents]"));
     }
 
     #[test]
     fn build_manual_template_is_empty_when_no_files_touched() {
+        let session_dir = std::path::PathBuf::from("/test");
         // No file-touching tool calls in the dropped span → no file section,
         // but the seed text (first user prompt) is always included.
         let dropped = vec![
@@ -3456,7 +3492,7 @@ mod tests {
                  "arguments": {"command": "ls"}},
             ])),
         ];
-        let t = build_manual_template(&dropped, None);
+        let t = build_manual_template(&dropped, None, &session_dir);
         // Seed text is always present; no file sections since bash doesn't touch files.
         assert_eq!(
             t,
@@ -3466,6 +3502,7 @@ mod tests {
 
     #[test]
     fn build_manual_template_splits_documents_and_files() {
+        let session_dir = std::path::PathBuf::from("/test");
         // The manual template is a user-editable scaffold: file lists
         // preceded by the first user prompt as seed text.
         let dropped = vec![
@@ -3479,7 +3516,7 @@ mod tests {
                  "arguments": {"path": "docs/plan.md", "edits": []}},
             ])),
         ];
-        let t = build_manual_template(&dropped, None);
+        let t = build_manual_template(&dropped, None, &session_dir);
         // Title section ends with the first file section heading.
         assert!(t.contains("# Compaction notes\n\n"));
         assert!(t.contains("\n---\n# [Documents]"));
@@ -3505,6 +3542,7 @@ mod tests {
 
     #[test]
     fn build_manual_template_omits_empty_group() {
+        let session_dir = std::path::PathBuf::from("/test");
         // Only non-.md touched: no Documents section, only Files.
         let dropped = vec![
             sum_user("m0", None, "code work"),
@@ -3513,7 +3551,7 @@ mod tests {
                  "arguments": {"path": "src/lib.rs", "edits": []}},
             ])),
         ];
-        let t = build_manual_template(&dropped, None);
+        let t = build_manual_template(&dropped, None, &session_dir);
         assert!(!t.contains("# [Documents]"));
         assert!(t.contains("# [Files]"));
         assert!(t.contains("- modified: src/lib.rs"));
@@ -3528,7 +3566,7 @@ mod tests {
                  "arguments": {"path": "README.md"}},
             ])),
         ];
-        let t = build_manual_template(&dropped, None);
+        let t = build_manual_template(&dropped, None, &session_dir);
         assert!(t.contains("# [Documents]"));
         assert!(!t.contains("# [Files]"));
         assert!(t.contains("- read: README.md"));
@@ -3696,5 +3734,70 @@ mod tests {
             model: None,
         };
         assert!(crate::session::Session::extract_seed_from_context(&ctx).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Relativize path
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn relativize_path_returns_relative_for_sub_path() {
+        // Paths below session_dir become compact relative (no leading ./)
+        // Use a temp dir + file so canonicalize works on both sides.
+        let tmp = std::path::PathBuf::from(std::env::temp_dir())
+            .join("picocode_relpath_test");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("marker"), b"").unwrap();
+        // Create the nested file so canonicalize resolves the path.
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::write(tmp.join("src/main.rs"), b"").unwrap();
+        let result = crate::session::session::relativize_path(
+            &tmp,
+            tmp.join("src/main.rs").to_str().unwrap(),
+        );
+        assert_eq!(result, Some("src/main.rs".into()));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn relativize_path_returns_none_for_parent_path() {
+        let tmp = std::path::PathBuf::from(std::env::temp_dir())
+            .join("picocode_relpath_test2");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The parent of session_dir is not a sub-path.
+        std::fs::write(tmp.join("marker"), b"").unwrap();
+        let result = crate::session::session::relativize_path(
+            &tmp,
+            std::env::temp_dir().to_str().unwrap(),
+        );
+        assert_eq!(result, None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn relativize_path_returns_none_for_equal_path() {
+        let tmp = std::path::PathBuf::from(std::env::temp_dir())
+            .join("picocode_relpath_test3");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("marker"), b"").unwrap();
+        // The path itself is the session_dir; strip_prefix succeeds but yields "".
+        let result = crate::session::session::relativize_path(&tmp, tmp.to_str().unwrap());
+        assert_eq!(result, None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn relativize_path_returns_none_for_nonexistent() {
+        let tmp = std::path::PathBuf::from(std::env::temp_dir())
+            .join("picocode_relpath_test4");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A nonexistent file inside the session_dir -> canonicalize fails -> None.
+        std::fs::write(tmp.join("marker"), b"").unwrap();
+        let result = crate::session::session::relativize_path(
+            &tmp,
+            tmp.join("nonexistent.rs").to_str().unwrap(),
+        );
+        assert_eq!(result, None);
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
