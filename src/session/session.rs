@@ -650,7 +650,7 @@ fn parse_summary_into_sections(
 /// previous compaction summary — the first prompt usually establishes a
 /// significant amount of context.
 fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
-    for entry in entries.iter().rev() {
+    for entry in entries.iter() {
         if let SessionEntryContent::Message { message } = &entry.content {
             if message.get("role").and_then(|r| r.as_str()) == Some("user") {
                 if let Some(text) = summary_message_text(message) {
