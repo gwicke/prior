@@ -686,7 +686,8 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
         }
         "edit" | "edit_file" => {
             let path = get_str("path").unwrap_or("");
-            // Try canonical format (edits array) first, fall back to old format.
+            // Try canonical format (edits array) first, then the legacy
+            // single-edit top-level shape, then the old "old/new" fields.
             let edits: Vec<EditOp> = if let Some(edits_array) =
                 obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
             {
@@ -699,6 +700,12 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                         })
                     })
                     .collect()
+            } else if let (Some(old), Some(new)) = (get_str("oldText"), get_str("newText")) {
+                // Legacy single-edit shape (accepted but undocumented).
+                vec![EditOp {
+                    old_text: old.to_string(),
+                    new_text: new.to_string(),
+                }]
             } else {
                 vec![]
             };
@@ -2291,6 +2298,21 @@ mod tests {
         let (label, diff) = get_preview("edit_file", &args);
         assert_eq!(label, "edit /no/such/file.rs");
         assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn get_preview_edit_legacy_single_edit_shape() {
+        // The legacy top-level oldText/newText shape (accepted by the edit
+        // tool but undocumented) must still produce a diff preview.
+        let args = serde_json::json!({
+            "path": "/no/such/file.rs",
+            "oldText": "a",
+            "newText": "b"
+        });
+        let (label, diff) = get_preview("edit_file", &args);
+        assert_eq!(label, "edit /no/such/file.rs");
+        // File doesn't exist, so no range, but the edit was recognized.
+        assert!(diff.is_empty(), "nonexistent file yields no diff: {diff:?}");
     }
 
     #[test]

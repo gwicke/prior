@@ -146,11 +146,146 @@ pub struct EditOp {
     pub new_text: String,
 }
 
-#[rig_tool(
-    name = "edit",
-    description = "Replace text in file using one or more targeted edits. Each edit must match unique text. Edits target the original file, not the output of previous edits.",
-    required(path, edits)
-)]
+/// Arguments accepted by the `edit` tool.
+///
+/// The canonical wire shape is `{path, edits: [{oldText, newText}]}`. The
+/// custom `Deserialize` impl additionally tolerates a legacy single-edit
+/// shape (`{path, oldText, newText}`) by normalizing it onto `edits`. That
+/// legacy form is deliberately undocumented: the schema (see
+/// `EditFile::parameters`) and every error message only ever show the
+/// canonical shape, so models are guided toward it.
+#[derive(Serialize, JsonSchema)]
+pub struct EditArgs {
+    /// File to edit, relative to the working directory.
+    pub path: String,
+    /// One or more targeted text replacements.
+    pub edits: Vec<EditOp>,
+}
+
+/// Cap on the JSON echoed back in an invalid-parameters error, so a bad call
+/// carrying a huge blob (e.g. file contents pasted into the wrong field)
+/// can't blow up the tool message.
+const MAX_ECHOED_ARGS: usize = 400;
+
+const EDIT_ARGS_EXAMPLE: &str = r#"{
+    "path": "some/path",
+    "edits": [
+        { "oldText": "The original text", "newText": "The replacement text" }
+    ]
+}"#;
+
+/// Truncate the echoed parameter JSON to [`MAX_ECHOED_ARGS`] chars on a
+/// char boundary, appending an ellipsis when cut.
+fn truncate_wire_repr(raw: &serde_json::Value) -> String {
+    let s = raw.to_string();
+    if s.len() <= MAX_ECHOED_ARGS {
+        return s;
+    }
+    let mut cut = MAX_ECHOED_ARGS;
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{} …", &s[..cut])
+}
+
+impl EditArgs {
+    /// Parse the wire JSON, accepting the canonical `edits` array and — as
+    /// an undocumented compatibility shim — the legacy top-level
+    /// single-edit shape. Any other payload yields an error that echoes the
+    /// received parameters (truncated) plus the canonical shape, so the
+    /// model can self-correct in a single retry.
+    fn from_wire(raw: &serde_json::Value) -> Result<Self, String> {
+        // Canonical first: exact field names, unknown extras ignored.
+        #[derive(serde::Deserialize)]
+        struct Canonical {
+            path: String,
+            edits: Vec<EditOp>,
+        }
+        if let Ok(c) = serde_json::from_value::<Canonical>(raw.clone()) {
+            return Ok(EditArgs {
+                path: c.path,
+                edits: c.edits,
+            });
+        }
+
+        // Legacy single-edit shim: {path, oldText, newText} -> one edit.
+        #[derive(serde::Deserialize)]
+        struct Legacy {
+            path: String,
+            #[serde(rename = "oldText")]
+            old_text: String,
+            #[serde(rename = "newText")]
+            new_text: String,
+        }
+        if let Ok(l) = serde_json::from_value::<Legacy>(raw.clone()) {
+            return Ok(EditArgs {
+                path: l.path,
+                edits: vec![EditOp {
+                    old_text: l.old_text,
+                    new_text: l.new_text,
+                }],
+            });
+        }
+
+        Err(format!(
+            "Expected parameters like:\n{}\nInvalid parameters received: {}",
+            EDIT_ARGS_EXAMPLE,
+            truncate_wire_repr(raw),
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for EditArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Self::from_wire(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Static tool facade for `edit`, mirroring what `#[rig_tool]` would emit.
+/// Hand-written instead of macro-generated so the args deserializer can
+/// accept the legacy single-edit shape without advertising it — see
+/// [`EditArgs`]. The `Bash` tool follows the same manual-impl pattern.
+pub struct EditFile;
+
+impl rig_core::tool::Tool for EditFile {
+    type Args = EditArgs;
+    type Output = String;
+    type Error = ToolError;
+
+    const NAME: &'static str = "edit";
+
+    fn description(&self) -> String {
+        "Replace text in file using one or more targeted edits. Each edit must match unique text. Edits target the original file, not the output of previous edits.".into()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        static SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+            let mut schema = schemars::schema_for!(EditArgs).to_value();
+            // Providers expect an explicit `required` array even when no
+            // parameter is required (mirrors the macro-generated schema).
+            if let Some(object) = schema.as_object_mut() {
+                object
+                    .entry("required")
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            }
+            schema
+        });
+        SCHEMA.clone()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
+        edit_file(args.path, args.edits).await
+    }
+}
+
 pub async fn edit_file(
     path: String,
     edits: Vec<EditOp>,
@@ -1949,14 +2084,15 @@ mod edit_file_tests {
     /// RAII guard that chdirs into a fresh tempdir and restores the
     /// original cwd on drop. Required because `get_path_with` requires
     /// the file to be inside CWD, and parallel tests stepping on the
-    /// same global cwd would otherwise race.
-    struct CwdGuard {
+    /// same global cwd would otherwise race. `pub(crate)` so sibling
+    /// test modules (e.g. `edit_args_wire_tests`) can reuse it.
+    pub(crate) struct CwdGuard {
         _dir: tempfile::TempDir,
         prev: std::path::PathBuf,
     }
 
     impl CwdGuard {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             crate::tools::set_sandbox(None);
             let dir = tempdir().unwrap();
             let prev = std::env::current_dir().unwrap();
@@ -2232,5 +2368,219 @@ mod edit_file_tests {
             ui.contains("Closest match"),
             "expected per-edit ui summary in single-failure batch, got: {ui}",
         );
+    }
+}
+
+#[cfg(test)]
+mod edit_args_wire_tests {
+    //! End-to-end tests for the `edit` tool's argument parsing: raw JSON wire
+    //! input -> `EditArgs` -> execution, exercised through rig's erased-tool
+    //! boundary (`ErasedTool::execute`) — the same dispatch path a real model
+    //! tool call takes, without needing a mocked model turn.
+
+    use super::*;
+    use crate::edit_match::looks_like_edit_failure;
+    use rig_core::tool::{ErasedTool, ToolContext};
+    use serial_test::serial;
+
+    /// Run the tool exactly as the runtime would: serialize the args JSON to
+    /// a string and dispatch through the erased boundary.
+    async fn execute_edit(args_json: serde_json::Value) -> rig_core::tool::ToolResult {
+        let ctx = &mut ToolContext::new();
+        EditFile
+            .execute(serde_json::to_string(&args_json).unwrap(), ctx)
+            .await
+    }
+
+    // ---- Canonical shape ----
+
+    #[tokio::test]
+    #[serial]
+    async fn canonical_edits_array_parses_and_applies() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("canon.txt", "hello\nworld\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "canon.txt",
+            "edits": [{"oldText": "hello", "newText": "goodbye"}]
+        }))
+        .await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert!(
+            result.output().render().starts_with("Replaced"),
+            "unexpected output: {}",
+            result.output().render()
+        );
+        let after = tokio::fs::read_to_string("canon.txt").await.unwrap();
+        assert_eq!(after, "goodbye\nworld\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn canonical_multi_edit_applies_all() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("multi.txt", "a\nb\nc\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "multi.txt",
+            "edits": [
+                {"oldText": "a", "newText": "A"},
+                {"oldText": "c", "newText": "C"}
+            ]
+        }))
+        .await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("multi.txt").await.unwrap();
+        assert_eq!(after, "A\nb\nC\n");
+    }
+
+    // ---- Legacy shape (accepted, undocumented) ----
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_top_level_oldtext_newtext_is_accepted() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("legacy.txt", "keep me\nreplace me\n")
+            .await
+            .unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "legacy.txt",
+            "oldText": "replace me",
+            "newText": "replaced"
+        }))
+        .await;
+        assert!(
+            result.is_success(),
+            "legacy single-edit shape must be accepted, got: {result:?}"
+        );
+        let after = tokio::fs::read_to_string("legacy.txt").await.unwrap();
+        assert_eq!(after, "keep me\nreplaced\n");
+    }
+
+    // ---- Malformed shapes: echo + guidance, never applied ----
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_args_echo_input_and_show_expected_shape() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("bad.txt", "unchanged\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "bad.txt",
+            "old": "wrong field names entirely"
+        }))
+        .await;
+        assert!(result.is_error(), "malformed args must fail: {result:?}");
+        let msg = result.output().render();
+        // rig's generic parse-error prefix comes first; our informative
+        // payload follows and is what matters. Canonical example first,
+        // then the echo of the actual (bad) input — the input can be
+        // arbitrarily long, so it goes last.
+        assert!(
+            msg.contains("Expected parameters like:\n{\n    \"path\": \"some/path\",\n    \"edits\": ["),
+            "must lead with the canonical example, got: {msg}"
+        );
+        let example_end = msg.find("Invalid parameters received:").expect("echo marker");
+        let echo_start = msg.find("wrong field names entirely").expect("echoed input");
+        assert!(
+            example_end < echo_start,
+            "example must precede the echoed input, got: {msg}"
+        );
+        // Echo of the actual (bad) input so the model can see what it sent.
+        assert!(
+            msg.contains("wrong field names entirely"),
+            "must echo the received args, got: {msg}"
+        );
+        // The expected shape is spelled out.
+        assert!(
+            msg.contains("\"edits\":") && msg.contains("\"oldText\":"),
+            "must show the canonical example, got: {msg}"
+        );
+        let after = tokio::fs::read_to_string("bad.txt").await.unwrap();
+        assert_eq!(after, "unchanged\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn missing_new_text_errors_with_guidance() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let result = execute_edit(serde_json::json!({
+            "path": "whatever.txt",
+            "oldText": "no newText field"
+        }))
+        .await;
+        assert!(result.is_error(), "missing newText must fail: {result:?}");
+        let msg = result.output().render();
+        assert!(
+            msg.contains("Invalid parameters received: "),
+            "got: {msg}"
+        );
+        assert!(msg.contains("\"edits\":"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn non_object_args_error_informatively() {
+        let result = execute_edit(serde_json::json!("just a string")).await;
+        assert!(result.is_error());
+        assert!(
+            result
+                .output()
+                .render()
+                .contains("Invalid parameters received:"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn oversized_bad_args_are_truncated_in_error() {
+        // A huge blob in the wrong field must not blow up the tool message.
+        let blob = "x".repeat(5_000);
+        let result = execute_edit(serde_json::json!({ "path": "p", "stuff": blob })).await;
+        assert!(result.is_error());
+        let msg = result.output().render();
+        assert!(
+            msg.len() < 1_000,
+            "echo must be truncated, got {} chars",
+            msg.len()
+        );
+        assert!(msg.contains("…"), "truncation marker missing: {msg}");
+    }
+
+    // ---- Schema advertisement ----
+
+    #[test]
+    fn schema_advertises_only_the_canonical_shape() {
+        let schema = EditFile.parameters();
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array present")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            required.contains(&"path") && required.contains(&"edits"),
+            "path and edits must be required: {required:?}"
+        );
+        // The legacy top-level fields must NOT be advertised.
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("edits").is_some());
+        assert!(props.get("oldText").is_none());
+        assert!(props.get("newText").is_none());
+    }
+
+    #[test]
+    fn edit_failure_envelope_still_recognized() {
+        // The structured {ui_view, model_view} failure envelope keeps its
+        // wire shape so display_tool_result routing is unaffected.
+        let s = crate::edit_match::render_batch(&crate::edit_match::BatchEditFailure::build(
+            1,
+            vec![crate::edit_match::BatchItem {
+                edit_index: 0,
+                failure: crate::edit_match::EditFailure {
+                    ui_view: "u".into(),
+                    model_view: "m".into(),
+                },
+            }],
+        ));
+        assert!(looks_like_edit_failure(&s));
     }
 }
