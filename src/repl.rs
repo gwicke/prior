@@ -4465,7 +4465,7 @@ impl Repl {
                 editor.insert_newline();
                 None
             }
-            KeyCode::Esc => Some(InputAction::Submit(String::new())),
+            KeyCode::Esc => None,
             KeyCode::Char(c) => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     match c {
