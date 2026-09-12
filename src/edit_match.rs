@@ -149,6 +149,9 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     // file.
     let win_start = anchor_start.saturating_sub(query.len() + WINDOW_PAD);
     let win_end = (anchor_end + query.len() + WINDOW_PAD).min(file_text.len());
+    // Align to character boundaries to avoid slicing inside multi-byte chars.
+    let win_start = file_text.floor_char_boundary(win_start);
+    let win_end = file_text.ceil_char_boundary(win_end);
     let window = &file_text[win_start..win_end];
 
     // Stage 3: Myers diff between the model's `query` and the on-disk
@@ -587,5 +590,47 @@ mod tests {
         // No redundant "edit #1 oldText not found." line in the body
         // (that's the ui_view's job).
         assert!(!b.model_view.contains("edit #1 oldText not found."));
+    }
+
+    #[test]
+    fn diagnose_handles_multibyte_char_boundaries() {
+        // Regression test for: start byte index is not a char boundary;
+        // it is inside '─' (or any multi-byte UTF-8 character).
+        // The fix aligns win_start/win_end to char boundaries using
+        // floor_char_boundary/ceil_char_boundary.
+        let file_text = "start ─── middle ─── end"; // '─' is 3 bytes each
+        // Query that will match near a multi-byte char boundary
+        let query = "─── midd"; // This overlaps the 3-byte chars
+        let f = diagnose(query, file_text).expect("should diagnose");
+        assert!(f.model_view.contains("Closest match"));
+        // The window slice must not panic
+        assert!(f.model_view.contains("Diff"));
+    }
+
+    #[test]
+    fn diagnose_handles_multibyte_at_file_edges() {
+        // Test when the anchor is near the start/end of file with multi-byte chars
+        let file_text = "───start"; // 3-byte chars at start
+        let query = "───sta";
+        let f = diagnose(query, file_text).expect("should diagnose");
+        assert!(f.model_view.contains("Closest match"));
+        
+        let file_text2 = "end───"; // 3-byte chars at end
+        let query2 = "nd───";
+        let f2 = diagnose(query2, file_text2).expect("should diagnose");
+        assert!(f2.model_view.contains("Closest match"));
+    }
+
+    #[test]
+    fn diagnose_handles_large_offset_with_multibyte() {
+        // Test the exact panic scenario: large file with multi-byte char
+        // at position where adding WINDOW_PAD + query.len() crosses a
+        // multi-byte boundary.
+        let file_text = "a".repeat(1016) + "─" + &"b".repeat(100); // '─' at byte 1016 (3 bytes)
+        // Query matching a region that includes the multi-byte char
+        let query = &file_text[1000..1030]; // Includes the '─'
+        let f = diagnose(query, &file_text).expect("should diagnose");
+        assert!(f.model_view.contains("Closest match"));
+        assert!(f.model_view.contains("Diff"));
     }
 }
