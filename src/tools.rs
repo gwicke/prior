@@ -104,7 +104,7 @@ fn walk_files(base: &std::path::Path) -> impl Iterator<Item = ignore::DirEntry> 
 #[rig_tool(
     name = "read",
     description = "Read file with line numbers",
-    required(path, offset, limit)
+    required(path)
 )]
 pub async fn read_file(
     path: String,

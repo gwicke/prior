@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 // Wrapper types that can deserialize from both JSON numbers and strings.
 /// These handle the common case where LLMs send numeric parameters as strings.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
 pub struct ReadOffset(pub u64);
 
 impl<'de> serde::Deserialize<'de> for ReadOffset {
@@ -69,7 +69,7 @@ impl From<ReadOffset> for u64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
 pub struct ReadLimit(pub u64);
 
 impl<'de> serde::Deserialize<'de> for ReadLimit {
