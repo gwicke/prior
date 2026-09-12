@@ -3334,9 +3334,8 @@ where
             }
             Err(e) if e.is_auto_retryable() && consecutive_failures < retry_budget(&e) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                output.display_text(&format!("Error: {}", e));
                 let secs = retry_delay_secs(&e, consecutive_failures);
-                output.display_text(&format!("Retrying in {secs}s..."));
+                output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
                 let slept = cancellable_sleep(user_cancel, cancel_notify, secs).await;
                 if !slept {
                     return Err(crate::PicocodeError::Cancelled("Aborted.".into()));
@@ -4393,11 +4392,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 // original `input` is already in the session,
                                 // so re-sending it would duplicate the user's
                                 // request.
-                                config.output.display_text(&format!("Error: {}", cause));
                                 let secs = retry_delay_secs(&cause, 1);
-                                config
-                                    .output
-                                    .display_text(&format!("Retrying in {secs}s..."));
+                                config.output.display_text(&format!("Error: {}. Retrying in {secs}s...", cause));
                                 let slept = cancellable_sleep(
                                     &config.user_cancel,
                                     &config.cancel_notify,
@@ -4468,11 +4464,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                     && consecutive_failures < retry_budget(&e) =>
                             {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
-                                config.output.display_text(&format!("Error: {}", e));
                                 let secs = retry_delay_secs(&e, consecutive_failures);
-                                config
-                                    .output
-                                    .display_text(&format!("Retrying in {secs}s..."));
+                                config.output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
                                 let slept = cancellable_sleep(
                                     &config.user_cancel,
                                     &config.cancel_notify,

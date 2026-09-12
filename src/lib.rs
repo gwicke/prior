@@ -71,7 +71,7 @@ pub enum PicocodeError {
     /// failure) and retries up to the per-turn budget (see [`retry_budget`]).
     /// [`retry_budget`]: crate::agent::retry_budget
     #[error(
-        "Rate-limited by provider (HTTP 429){}. Retrying after the back-off.",
+        "Rate-limited by provider (HTTP 429){}.",
         match .retry_after_secs { Some(s) => format!("; retry-after {s}s"), None => String::new() }
     )]
     LlmRateLimited {
@@ -80,7 +80,7 @@ pub enum PicocodeError {
     },
 
     /// Provider returned a 5xx. Transient by default — the REPL re-prompts once.
-    #[error("Upstream provider error (HTTP {status}). Retrying.")]
+    #[error("Upstream provider error (HTTP {status}.)")]
     LlmUpstream {
         /// HTTP status code reported by the provider.
         status: u16,
@@ -98,13 +98,13 @@ pub enum PicocodeError {
     /// Transport-level failure with no captured HTTP status: connection
     /// refused, DNS, TLS, mid-stream drop, request timeout. Transient by
     /// default — the REPL re-prompts once.
-    #[error("Network/transport error: {0}. Retrying.")]
+    #[error("Network/transport error: {0}.")]
     LlmTransport(String),
 
     /// The streaming protocol violated expectations but had no captured HTTP
     /// status: the provider stream ended without a terminal record, or the
     /// SSE format diverged. Transient by default.
-    #[error("Streaming protocol error: {0}. Retrying.")]
+    #[error("Streaming protocol error: {0}.")]
     LlmStreamProtocol(String),
 
     /// Provider stream assembled a tool call whose JSON arguments were
