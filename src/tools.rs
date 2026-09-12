@@ -7,7 +7,7 @@ use tokio::fs;
 use rig_core::tool::ToolContext;
 
 #[allow(unused_imports)]
-use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes};
+use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes, EditStartLine, EditEndLine};
 use crate::edit_match;
 use crate::path_util::relativize_path;
 
@@ -135,7 +135,7 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
 }
 
 /// A single targeted text replacement within a file.
-#[derive(Deserialize, Serialize, JsonSchema)]
+#[derive(Deserialize, Serialize, JsonSchema, Default)]
 pub struct EditOp {
     /// Exact text to replace. Must be unique in the file and must not
     /// overlap with any other edit's old_text in the same call.
@@ -144,6 +144,16 @@ pub struct EditOp {
     /// Replacement text.
     #[serde(rename = "newText")]
     pub new_text: String,
+    /// Optional: restrict the search to this line range (1-indexed, inclusive)
+    /// in the original file. When set, the match must occur entirely within
+    /// these lines. Useful when oldText appears multiple times.
+    #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<EditStartLine>,
+    /// Optional: restrict the search to this line range (1-indexed, inclusive)
+    /// in the original file. When set, the match must occur entirely within
+    /// these lines.
+    #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<EditEndLine>,
 }
 
 /// Arguments accepted by the `edit` tool.
@@ -223,6 +233,8 @@ impl EditArgs {
                 edits: vec![EditOp {
                     old_text: l.old_text,
                     new_text: l.new_text,
+                    start_line: None,
+                    end_line: None,
                 }],
             });
         }
@@ -286,6 +298,71 @@ impl rig_core::tool::Tool for EditFile {
     }
 }
 
+/// Convert 1-indexed inclusive line numbers to byte range (start inclusive, end exclusive).
+/// Returns (start_byte, end_byte) in the text.
+fn line_range_to_byte_range(
+    text: &str,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> Result<(usize, usize), ToolError> {
+    let total_lines = text.lines().count();
+    if total_lines == 0 {
+        return Ok((0, 0));
+    }
+
+    // Convert to 0-indexed
+    let start = start_line.map(|l| (l - 1) as usize).unwrap_or(0);
+    let end = end_line
+        .map(|l| l as usize)
+        .unwrap_or(total_lines);
+
+    if start >= total_lines {
+        return Err(ToolError::Generic(format!(
+            "startLine {} exceeds file length ({} lines)",
+            start + 1,
+            total_lines
+        )));
+    }
+    if end == 0 || end > total_lines {
+        return Err(ToolError::Generic(format!(
+            "endLine {} exceeds file length ({} lines)",
+            end,
+            total_lines
+        )));
+    }
+    if start >= end {
+        return Err(ToolError::Generic(format!(
+            "startLine {} must be less than endLine {}",
+            start + 1,
+            end
+        )));
+    }
+
+    // Find byte offset of start line
+    let mut byte_start = 0;
+    for (idx, line) in text.lines().enumerate() {
+        if idx == start {
+            break;
+        }
+        byte_start += line.len() + 1; // +1 for newline
+    }
+
+    // Find byte offset of end line (after the line)
+    let mut byte_end = 0;
+    for (idx, line) in text.lines().enumerate() {
+        if idx == end {
+            break;
+        }
+        byte_end += line.len() + 1; // +1 for newline
+    }
+    // If end == total_lines, byte_end should be text.len()
+    if end >= total_lines {
+        byte_end = text.len();
+    }
+
+    Ok((byte_start, byte_end))
+}
+
 pub async fn edit_file(
     path: String,
     edits: Vec<EditOp>,
@@ -296,30 +373,70 @@ pub async fn edit_file(
     let mut failures: Vec<edit_match::BatchItem> = Vec::new();
 
     for (i, edit) in edits.iter().enumerate() {
-        if !text.contains(&edit.old_text) {
-            // Exact match failed. Try to give the model a useful
-            // diagnostic for this edit; if no close match exists, fall
-            // back to a plain error. We DO NOT return early — collect
-            // every edit's failure so the model can fix them all in one
-            // retry.
+        let start_line = edit.start_line.map(|l| l.0);
+        let end_line = edit.end_line.map(|l| l.0);
+
+        // Determine the search range
+        let (search_start, search_end) = line_range_to_byte_range(&text, start_line, end_line)?;
+        let search_text = &text[search_start..search_end];
+
+        if !search_text.contains(&edit.old_text) {
+            // Exact match failed in the specified range.
+            // Check if it exists elsewhere in the file for a better error message.
+            let exists_elsewhere = text.contains(&edit.old_text);
             let edit_idx_1 = i + 1;
-            let failure = match edit_match::diagnose(&edit.old_text, &text) {
+            // Pass the line range to diagnose so it can report correct file line numbers
+            let (diag_start_line, diag_end_line) = match (start_line, end_line) {
+                (Some(s), Some(e)) => (Some(s as usize), Some(e as usize)),
+                (Some(s), None) => (Some(s as usize), None),
+                (None, Some(e)) => (None, Some(e as usize)),
+                (None, None) => (None, None),
+            };
+            let failure = match edit_match::diagnose(&edit.old_text, &text, diag_start_line, diag_end_line) {
                 Some(mut f) => {
-                    // Combine the per-edit ui_view into a single line
-                    // so the human sees:
-                    //   "edit #1 oldText not found. Closest match at..."
-                    // The model_view body remains header-free; the
-                    // batch envelope adds the `--- edit #N ---` separator
-                    // and the "N of M failed" header.
+                    // Add line range info to the diagnostic
+                    let range_info = match (start_line, end_line) {
+                        (Some(s), Some(e)) => format!(" (searched lines {}-{})", s, e),
+                        (Some(s), None) => format!(" (searched from line {} to end)", s),
+                        (None, Some(e)) => format!(" (searched lines 1-{})", e),
+                        (None, None) => String::new(),
+                    };
                     f.ui_view = format!(
-                        "edit #{edit_idx_1} oldText not found. {}",
-                        f.ui_view,
+                        "edit #{} oldText not found.{}. {}",
+                        edit_idx_1,
+                        range_info,
+                        f.ui_view
                     );
                     f
                 }
-                None => edit_match::EditFailure::not_found_no_match(
-                    edit_idx_1, &edit.old_text,
-                ),
+                None => {
+                    let range_info = match (start_line, end_line) {
+                        (Some(s), Some(e)) => format!(" in lines {}-{}", s, e),
+                        (Some(s), None) => format!(" from line {} to end", s),
+                        (None, Some(e)) => format!(" in lines 1-{}", e),
+                        (None, None) => String::new(),
+                    };
+                    let mut msg = format!(
+                        "edit #{} oldText not found{}. ",
+                        edit_idx_1,
+                        range_info
+                    );
+                    if exists_elsewhere {
+                        msg.push_str("Note: oldText exists elsewhere in the file; adjust startLine/endLine or include more context.");
+                    } else {
+                        msg.push_str("No similar region in file.");
+                    }
+                    edit_match::EditFailure {
+                        ui_view: msg,
+                        model_view: format!(
+                            "oldText not found{}. No close-enough region in the file; 
+                             please re-read the file and re-anchor your edit. 
+                             Original oldText: '{}'.",
+                            range_info,
+                            edit.old_text
+                        ),
+                    }
+                }
             };
             failures.push(edit_match::BatchItem {
                 edit_index: i,
@@ -327,22 +444,30 @@ pub async fn edit_file(
             });
             continue;
         }
-        let count = text.matches(&edit.old_text).count();
+
+        // Count matches in the search range
+        let count = search_text.matches(&edit.old_text).count();
         if count > 1 {
-            // List the line numbers of every occurrence so the model can
-            // re-anchor and pick one (or include more surrounding context
-            // in oldText). Cap at 10 to keep the message bounded.
+            // List the line numbers of every occurrence in the search range
             let mut line_numbers: Vec<usize> = Vec::with_capacity(count.min(10));
             let mut listed = 0usize;
-            for (byte_off, _) in text.match_indices(&edit.old_text) {
+            for (byte_off, _) in search_text.match_indices(&edit.old_text) {
                 if listed >= 10 {
                     break;
                 }
                 line_numbers.push(
-                    crate::edit_match::count_lines(&text[..byte_off]) + 1,
+                    crate::edit_match::count_lines(&search_text[..byte_off]) + 1,
                 );
                 listed += 1;
             }
+            // Adjust line numbers to be relative to the file (not the search range)
+            let line_offset = if search_start == 0 {
+                0
+            } else {
+                crate::edit_match::count_lines(&text[..search_start])
+            };
+            let line_numbers: Vec<usize> = line_numbers.into_iter().map(|n| n + line_offset).collect();
+
             failures.push(edit_match::BatchItem {
                 edit_index: i,
                 failure: edit_match::EditFailure::non_unique(
@@ -363,10 +488,27 @@ pub async fn edit_file(
         return Ok(edit_match::render_batch(&batch));
     }
 
-    let mut result = text;
+    // Compute all offsets against the original text first, then apply from end to start
+    // Edits target the original file, not the output of previous edits.
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new(); // (start, end, new_text)
     for edit in &edits {
-        result = result.replacen(&edit.old_text, &edit.new_text, 1);
+        let start_line = edit.start_line.map(|l| l.0);
+        let end_line = edit.end_line.map(|l| l.0);
+        let (search_start, search_end) = line_range_to_byte_range(&text, start_line, end_line)?;
+        let search_text = &text[search_start..search_end];
+        let match_offset = search_text.find(&edit.old_text).expect("validated earlier");
+        let absolute_start = search_start + match_offset;
+        let absolute_end = absolute_start + edit.old_text.len();
+        replacements.push((absolute_start, absolute_end, edit.new_text.clone()));
     }
+
+    // Sort by start position descending so we can apply from end to start
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut result = text;
+    for (start, end, new_text) in replacements {
+        result.replace_range(start..end, &new_text);
+    }
+
     fs::write(&p, result).await?;
     // Render the path the model will see as relative to cwd when possible,
     // so the success string stays portable across checkouts (the model
@@ -2117,6 +2259,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2142,6 +2286,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2175,6 +2321,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "fn main() {\n   let x = 1;\n    let y = 2;\n}\n".into(),
                 new_text: "noop".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2204,6 +2352,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "completely different unrelated content here that shares no characters with the file".into(),
                 new_text: "noop".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2238,6 +2388,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "foo".into(),
                 new_text: "bar".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2264,6 +2416,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "x ".into(),
                 new_text: "y ".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await
@@ -2297,14 +2451,20 @@ mod edit_file_tests {
                 EditOp {
                     old_text: "    let a = 1;".into(),
                     new_text: "    let a = 42;".into(),
+                    start_line: None,
+                    end_line: None,
                 },
                 EditOp {
                     old_text: "    let nonexistent = 99;".into(),
                     new_text: "    let z = 99;".into(),
+                    start_line: None,
+                    end_line: None,
                 },
                 EditOp {
                     old_text: "fn".into(),
                     new_text: "function".into(),
+                    start_line: None,
+                    end_line: None,
                 },
             ],
         )
@@ -2355,6 +2515,8 @@ mod edit_file_tests {
             vec![EditOp {
                 old_text: "fn main() {\n   let x = 1;\n}\n".into(),
                 new_text: "noop".into(),
+                start_line: None,
+                end_line: None,
             }],
         )
         .await

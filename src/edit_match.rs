@@ -132,14 +132,91 @@ pub fn render_batch(failure: &BatchEditFailure) -> String {
 /// file contents. On exact-match (the normal path) we never get here; this
 /// is only called when `text.contains(query)` already returned `false`.
 ///
+/// Optional `start_line` and `end_line` (1-indexed, inclusive) restrict the
+/// search to a specific line range in the file. This allows the diagnostic
+/// to focus on the region the user specified.
+///
 /// Returns `None` if no region is similar enough to be worth showing.
-pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
+pub fn diagnose(
+    query: &str,
+    file_text: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Option<EditFailure> {
     if query.is_empty() || file_text.is_empty() {
         return None;
     }
 
+    // If line range is specified, restrict the search to that range
+    let (search_text, line_offset) = if let (Some(sl), Some(el)) = (start_line, end_line) {
+        // Convert 1-indexed inclusive to 0-indexed byte range
+        let total_lines = file_text.lines().count();
+        if sl == 0 || sl > total_lines || el == 0 || el > total_lines || sl > el {
+            return None; // Invalid range, no diagnosis
+        }
+        let start_idx = sl - 1;
+        let end_idx = el; // exclusive
+        
+        // Find byte offsets
+        let mut byte_start = 0;
+        for (idx, line) in file_text.lines().enumerate() {
+            if idx == start_idx {
+                break;
+            }
+            byte_start += line.len() + 1;
+        }
+        let mut byte_end = 0;
+        for (idx, line) in file_text.lines().enumerate() {
+            if idx == end_idx {
+                break;
+            }
+            byte_end += line.len() + 1;
+        }
+        if end_idx >= total_lines {
+            byte_end = file_text.len();
+        }
+        
+        (&file_text[byte_start..byte_end], sl - 1)
+    } else if let Some(sl) = start_line {
+        // From start_line to end of file
+        let total_lines = file_text.lines().count();
+        if sl == 0 || sl > total_lines {
+            return None;
+        }
+        let start_idx = sl - 1;
+        let mut byte_start = 0;
+        for (idx, line) in file_text.lines().enumerate() {
+            if idx == start_idx {
+                break;
+            }
+            byte_start += line.len() + 1;
+        }
+        (&file_text[byte_start..], sl - 1)
+    } else if let Some(el) = end_line {
+        // From start of file to end_line
+        let total_lines = file_text.lines().count();
+        if el == 0 || el > total_lines {
+            return None;
+        }
+        let end_idx = el;
+        let mut byte_end = 0;
+        for (idx, line) in file_text.lines().enumerate() {
+            if idx == end_idx {
+                break;
+            }
+            byte_end += line.len() + 1;
+        }
+        if end_idx >= total_lines {
+            byte_end = file_text.len();
+        }
+        (&file_text[..byte_end], 0)
+    } else {
+        // No line range specified, search entire file
+        (file_text, 0)
+    };
+
     // Stage 1: anchor via longest-common-substring.
-    let anchor = find_anchor(file_text, query, MIN_ANCHOR_LEN)?;
+    let anchor = find_anchor(search_text, query, MIN_ANCHOR_LEN)?;
     let (anchor_start, anchor_len) = anchor;
     let anchor_end = anchor_start + anchor_len;
 
@@ -148,11 +225,11 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     // each side so the diff stays informative without scanning the whole
     // file.
     let win_start = anchor_start.saturating_sub(query.len() + WINDOW_PAD);
-    let win_end = (anchor_end + query.len() + WINDOW_PAD).min(file_text.len());
+    let win_end = (anchor_end + query.len() + WINDOW_PAD).min(search_text.len());
     // Align to character boundaries to avoid slicing inside multi-byte chars.
-    let win_start = file_text.floor_char_boundary(win_start);
-    let win_end = file_text.ceil_char_boundary(win_end);
-    let window = &file_text[win_start..win_end];
+    let win_start = search_text.floor_char_boundary(win_start);
+    let win_end = search_text.ceil_char_boundary(win_end);
+    let window = &search_text[win_start..win_end];
 
     // Stage 3: Myers diff between the model's `query` and the on-disk
     // `window`. Cap the rendered output at MAX_DIFF_LINES lines so a huge
@@ -183,7 +260,7 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
 
     // Translate the window-relative line numbers back to file-relative
     // line numbers so the model can `read` the right region.
-    let window_line_offset = count_lines(&file_text[..win_start]);
+    let window_line_offset = line_offset + count_lines(&search_text[..win_start]);
 
     // Build the rich model_view body (no header; the caller adds a
     // batch envelope around it).
@@ -195,7 +272,7 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
         similarity,
         window_line_offset + 1,
         window_line_offset + window.lines().count().max(1),
-        window_line_offset + count_lines(&file_text[..anchor_start]) + 1,
+        window_line_offset + count_lines(&search_text[..anchor_start]) + 1,
         anchor_len,
     ));
 
@@ -387,7 +464,7 @@ mod tests {
         let q = "completely unrelated content here";
         // The longest common substring will be very small; similarity
         // should fall below MIN_SIMILARITY.
-        assert!(diagnose(q, file).is_none());
+        assert!(diagnose(q, file, None, None).is_none());
     }
 
     #[test]
@@ -396,7 +473,7 @@ mod tests {
         // Off-by-one indentation in the query — the dominant real-world
         // failure mode.
         let q = "fn main() {\n   let x = 1;\n    let y = 2;\n}\n";
-        let f = diagnose(q, file).expect("should diagnose");
+        let f = diagnose(q, file, None, None).expect("should diagnose");
         assert!(f.ui_view.contains("Closest match"));
         assert!(f.model_view.contains("Closest match"));
         // UI view should NOT contain large chunks of file content.
@@ -408,7 +485,7 @@ mod tests {
     fn ui_view_does_not_echo_file_regions() {
         let file = "secret_token = \"ABCDEFG12345\"\n";
         let q = "secret_token = \"ABCDEFG12346\"\n";
-        let f = diagnose(q, file).expect("should diagnose");
+        let f = diagnose(q, file, None, None).expect("should diagnose");
         // The UI summary must not leak the secret token.
         assert!(!f.ui_view.contains("ABCDEFG12345"));
         // The model view SHOULD contain it — that's the whole point.
@@ -441,8 +518,8 @@ mod tests {
 
     #[test]
     fn empty_inputs_return_none() {
-        assert!(diagnose("", "anything").is_none());
-        assert!(diagnose("anything", "").is_none());
+        assert!(diagnose("", "anything", None, None).is_none());
+        assert!(diagnose("anything", "", None, None).is_none());
     }
 
     #[test]
@@ -450,7 +527,7 @@ mod tests {
         // Tab-vs-space drift: the model wrote spaces, the file has tabs.
         let file = "fn main() {\n\tlet x = 1;\n}\n";
         let q = "fn main() {\n    let x = 1;\n}\n";
-        let f = diagnose(q, file);
+        let f = diagnose(q, file, None, None);
         // Should produce a diagnosis (it's close enough).
         assert!(f.is_some());
     }
@@ -601,7 +678,7 @@ mod tests {
         let file_text = "start ─── middle ─── end"; // '─' is 3 bytes each
         // Query that will match near a multi-byte char boundary
         let query = "─── midd"; // This overlaps the 3-byte chars
-        let f = diagnose(query, file_text).expect("should diagnose");
+        let f = diagnose(query, file_text, None, None).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         // The window slice must not panic
         assert!(f.model_view.contains("Diff"));
@@ -612,12 +689,12 @@ mod tests {
         // Test when the anchor is near the start/end of file with multi-byte chars
         let file_text = "───start"; // 3-byte chars at start
         let query = "───sta";
-        let f = diagnose(query, file_text).expect("should diagnose");
+        let f = diagnose(query, file_text, None, None).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         
         let file_text2 = "end───"; // 3-byte chars at end
         let query2 = "nd───";
-        let f2 = diagnose(query2, file_text2).expect("should diagnose");
+        let f2 = diagnose(query2, file_text2, None, None).expect("should diagnose");
         assert!(f2.model_view.contains("Closest match"));
     }
 
@@ -629,7 +706,7 @@ mod tests {
         let file_text = "a".repeat(1016) + "─" + &"b".repeat(100); // '─' at byte 1016 (3 bytes)
         // Query matching a region that includes the multi-byte char
         let query = &file_text[1000..1030]; // Includes the '─'
-        let f = diagnose(query, &file_text).expect("should diagnose");
+        let f = diagnose(query, &file_text, None, None).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         assert!(f.model_view.contains("Diff"));
     }

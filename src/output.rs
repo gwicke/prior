@@ -688,8 +688,8 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             let path = get_str("path").unwrap_or("");
             // Try canonical format (edits array) first, then the legacy
             // single-edit top-level shape, then the old "old/new" fields.
-            let edits: Vec<EditOp> = if let Some(edits_array) =
-                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
+            let edits: Vec<EditOp> = if let Some(edits_array) = 
+                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array()) 
             {
                 edits_array
                     .iter()
@@ -697,6 +697,8 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                         Some(EditOp {
                             old_text: e.get("oldText")?.as_str()?.to_string(),
                             new_text: e.get("newText")?.as_str()?.to_string(),
+                            start_line: e.get("startLine").and_then(|v| v.as_u64()).map(crate::config::EditStartLine),
+                            end_line: e.get("endLine").and_then(|v| v.as_u64()).map(crate::config::EditEndLine),
                         })
                     })
                     .collect()
@@ -705,6 +707,8 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 vec![EditOp {
                     old_text: old.to_string(),
                     new_text: new.to_string(),
+                    start_line: None,
+                    end_line: None,
                 }]
             } else {
                 vec![]
@@ -715,7 +719,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 // Old format: old/new fields.
                 let old = get_str("old").unwrap_or("");
                 let new_str = get_str("new").unwrap_or("");
-                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string() }])
+                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None, end_line: None }])
             };
             let mut s = format!("edit {}", path);
             if let Some(r) = range {
@@ -2337,6 +2341,8 @@ mod tests {
         let edits = vec![crate::tools::EditOp {
             old_text: old_text.clone(),
             new_text: new_text.clone(),
+            start_line: None,
+            end_line: None,
         }];
         let (_range, diff) = edit_preview(path.to_str().unwrap(), &edits);
 
