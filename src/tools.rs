@@ -2636,10 +2636,10 @@ mod edit_args_wire_tests {
         // then the echo of the actual (bad) input — the input can be
         // arbitrarily long, so it goes last.
         assert!(
-            msg.contains("Expected parameters like:\n{\n    \"path\": \"some/path\",\n    \"edits\": ["),
+            msg.contains("Send valid JSON parameters like:\n{\n    \"path\": \"some/path\",\n    \"edits\": ["),
             "must lead with the canonical example, got: {msg}"
         );
-        let example_end = msg.find("Invalid parameters received:").expect("echo marker");
+        let example_end = msg.find("Send valid JSON parameters like:").expect("echo marker");
         let echo_start = msg.find("wrong field names entirely").expect("echoed input");
         assert!(
             example_end < echo_start,
@@ -2671,7 +2671,7 @@ mod edit_args_wire_tests {
         assert!(result.is_error(), "missing newText must fail: {result:?}");
         let msg = result.output().render();
         assert!(
-            msg.contains("Invalid parameters received: "),
+            msg.contains("Send valid JSON parameters like:"),
             "got: {msg}"
         );
         assert!(msg.contains("\"edits\":"), "got: {msg}");
@@ -2686,7 +2686,7 @@ mod edit_args_wire_tests {
             result
                 .output()
                 .render()
-                .contains("Invalid parameters received:"),
+                .contains("Send valid JSON parameters like:"),
         );
     }
 
