@@ -237,6 +237,25 @@ fn truncate_wire_repr(raw: &serde_json::Value) -> String {
     format!("{} …", &s[..cut])
 }
 
+/// Extract a clean, user-friendly error from serde's untagged enum mismatch.
+fn clean_error(e: &serde_json::Error) -> String {
+    let msg = e.to_string();
+    if msg.contains("data did not match any variant of untagged enum") {
+        "provided arguments don't match any accepted format".to_string()
+    } else if msg.contains("missing field `path`") {
+        "missing required field 'path'".to_string()
+    } else if msg.contains("missing field `edits`") {
+        "missing required field 'edits' (for canonical format)".to_string()
+    } else if msg.contains("missing field `oldText`") {
+        "missing required field 'oldText' (for legacy format)".to_string()
+    } else if msg.contains("missing field `newText`") {
+        "missing required field 'newText' (for legacy format)".to_string()
+    } else {
+        msg.replace("RawEditArgsVariant", "the expected format")
+            .replace("RawEditArgs", "the expected format")
+    }
+}
+
 impl EditArgs {
     /// Parse the wire JSON, accepting both the canonical `edits` array and
     /// the legacy top-level single-edit shape (with optional startLine/endLine).
@@ -277,8 +296,8 @@ impl EditArgs {
                 },
             }),
             Err(e) => Err(format!(
-                "Failed to parse edit arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
-                e,
+                "Invalid edit tool arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
+                clean_error(&e),
                 EDIT_ARGS_EXAMPLE,
                 truncate_wire_repr(raw),
             )),
@@ -2673,7 +2692,7 @@ mod edit_args_wire_tests {
         let msg = result.output().render();
         // Error should contain the canonical example and echo the input
         assert!(
-            msg.contains("Failed to parse edit arguments:"),
+            msg.contains("Invalid edit tool arguments:"),
             "must indicate parse failure, got: {msg}"
         );
         assert!(
@@ -2705,7 +2724,7 @@ mod edit_args_wire_tests {
         assert!(result.is_error(), "missing newText must fail: {result:?}");
         let msg = result.output().render();
         assert!(
-            msg.contains("Failed to parse edit arguments:"),
+            msg.contains("Invalid edit tool arguments:"),
             "got: {msg}"
         );
         assert!(
@@ -2722,7 +2741,7 @@ mod edit_args_wire_tests {
         assert!(result.is_error());
         let msg = result.output().render();
         assert!(
-            msg.contains("Failed to parse edit arguments:"),
+            msg.contains("Invalid edit tool arguments:"),
             "got: {msg}"
         );
     }
