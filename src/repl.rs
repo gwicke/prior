@@ -434,6 +434,13 @@ pub(crate) enum ActiveOverlay {
         active: Option<usize>,
     },
 
+    DefaultModel {
+        entries: Vec<model_catalog::ModelEntry>,
+        filter: ModelFilter,
+        /// Index of the currently-active model (for the `*` marker).
+        active: Option<usize>,
+    },
+
     Thinking {
         levels: Vec<thinking::ThinkingLevel>,
     },
@@ -631,6 +638,7 @@ impl ActiveOverlay {
                 let cands = Repl::setting_value_candidates(
                     crate::settings::SettingKey::DefaultPersona,
                     ctx,
+                    None,
                 );
                 let filtered: Vec<ValueCandidate> = if filter.is_empty() {
                     cands
@@ -1120,6 +1128,40 @@ impl ActiveOverlay {
                 }
                 let opts = table.render_multiline(avail);
                 ("Personas  (up/down, Enter select, Esc back)",
+                 opts, *active, false)
+            }
+            ActiveOverlay::DefaultModel { entries, filter: _, active } => {
+                if entries.is_empty() {
+                    return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
+                            vec!["(no matches)".into()], None, false);
+                }
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Model", "Ctx", "Coding", "Cost", "?"])
+                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Left])
+                    .with_min_widths(&[12, 5, 6, 14, 3])
+                    .with_priorities(&[3, 1, 1, 2, 1])
+                    .set_gap(2);
+                for e in entries {
+                    table.add_row(&[
+                        e.qualified(),
+                        model_catalog::ctx_cell(e),
+                        model_catalog::coding_index_cell(e),
+                        model_catalog::cost_cell(e),
+                        model_catalog::reason_cell(e),
+                    ]);
+                }
+                let rows = table.render_multiline(avail);
+                let opts: Vec<String> = rows.into_iter().enumerate().map(|(i, row)| {
+                    if model_catalog::provider_available(&entries[i].provider) {
+                        row
+                    } else {
+                        row.lines()
+                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }).collect();
+                ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                  opts, *active, false)
             }
             ActiveOverlay::Stat { lines } => {
@@ -1960,6 +2002,7 @@ impl ActiveOverlay {
             ActiveOverlay::TreeAction { .. } => 16,
             ActiveOverlay::SwitchAction { .. } => 17,
             ActiveOverlay::CompactSummary { .. } => 18,
+            ActiveOverlay::DefaultModel { .. } => 19,
         }
     }
 
@@ -2940,7 +2983,7 @@ impl Repl {
     }
 
     /// Candidate values for a setting's value-pick overlay.
-    fn setting_value_candidates(key: SettingKey, ctx: &ReplCtx) -> Vec<ValueCandidate> {
+    fn setting_value_candidates(key: SettingKey, ctx: &ReplCtx, vq: Option<&str>) -> Vec<ValueCandidate> {
         match key {
             SettingKey::SecurityMode => vec![
                 ValueCandidate { display: "confirm".into(), value: "confirm".into(), desc: "ask before each tool call".into() },
@@ -2965,7 +3008,8 @@ impl Repl {
                 v
             }
             SettingKey::DefaultModel => {
-                let (entries, _) = Self::model_overlay_entries(ctx, "");
+                let filter = vq.unwrap_or("").trim().to_string();
+                let (entries, active) = Self::model_selection_overlay_entries(ctx, &filter, false);
                 entries.iter().map(Self::model_candidate).collect()
             }
             SettingKey::ToolCallLimit => Vec::new(),
@@ -2989,9 +3033,14 @@ impl Repl {
         ctx: &ReplCtx,
         vq: &str,
     ) -> Vec<ValueCandidate> {
-        let cands = Self::setting_value_candidates(key, ctx);
+        let cands = Self::setting_value_candidates(key, ctx, Some(vq));
         if vq.trim().is_empty() {
             cands
+        } else if key == SettingKey::DefaultModel {
+            // For default_model, parse filter/sort modifiers from vq
+            let filter = vq.trim().to_string();
+            let (entries, _) = Self::model_selection_overlay_entries(ctx, &filter, false);
+            entries.iter().map(Self::model_candidate).collect()
         } else {
             crate::fuzzy::fuzzy_filter_bonus(&cands, vq, |c| c.display.clone())
                 .into_iter()
@@ -2999,6 +3048,7 @@ impl Repl {
                 .collect()
         }
     }
+
     /// Map a catalog `ModelEntry` to a `default_model` value candidate.
     /// Both `value` and `display` carry the `provider:model` form so the panel
     /// always shows — and stores — a fully-qualified model id.
@@ -3007,7 +3057,7 @@ impl Repl {
         ValueCandidate {
             display: q.clone(),
             value: q,
-            desc: format!("ctx {} | {}", model_catalog::ctx_cell(e), model_catalog::cost_cell(e)),
+            desc: format!("ctx {} | coding {} | {}", model_catalog::ctx_cell(e), model_catalog::coding_index_cell(e), model_catalog::cost_cell(e)),
         }
     }
 
@@ -3162,9 +3212,10 @@ impl Repl {
         }
     }
 
-    fn model_overlay_entries(
+    fn model_selection_overlay_entries(
         ctx: &ReplCtx,
         filter: &str,
+        allow_recent_boost: bool,
     ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
         // Parse filter for .category: .sort: etc. modifiers
         let (search_terms, mut model_filter) = Self::parse_model_filter(filter);
@@ -3227,8 +3278,8 @@ impl Repl {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         
-        let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() && model_filter.sort.is_none() {
-            // No search terms AND no explicit sort: boost the active model + 5 most recently used models to the top
+        let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() && model_filter.sort.is_none() && allow_recent_boost {
+            // No search terms AND no explicit sort AND allow recent boost: boost the active model + 5 most recently used models to the top
             // (in LRU order), then the rest in repository sort order.
             let mut seen = std::collections::HashSet::new();
             let mut recent_shown = Vec::new();
@@ -3263,6 +3314,9 @@ impl Repl {
             });
             recent_shown.extend(rest);
             recent_shown
+        } else if model_filter.search_terms.trim().is_empty() {
+            // No search terms, but explicit sort requested: use the catalog sort order directly
+            entries
         } else {
             // With search terms: blend fuzzy match score with server rank
             let mut sorted: Vec<model_catalog::ModelEntry> = entries;
@@ -3295,8 +3349,13 @@ impl Repl {
         let active = filtered.iter().position(|e| e.id == active_id);
         (filtered, active)
     }
-
-    /// Build the `/thinking` overlay rows for `filter`.
+    
+    fn model_overlay_entries(
+        ctx: &ReplCtx,
+        filter: &str,
+    ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
+        Self::model_selection_overlay_entries(ctx, filter, true)
+    }
     fn thinking_overlay_entries(filter: &str) -> Vec<thinking::ThinkingLevel> {
         let all = [
             thinking::ThinkingLevel::Off,
