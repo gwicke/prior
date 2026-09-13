@@ -750,10 +750,10 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
 ///
 /// Uses the first edit in the `edits` slice. Locates `old_text` in the current
 /// file contents (the edit has not run yet, so the text still matches) to
-/// derive the 1-based `[start..end]` line window, and emits a compact `-`/`+`
-/// preview of the change. A failed read, missing old_text, or empty edits all
-/// degrade gracefully to `(None, [])` so the caller just prints `edit <path>`
-/// with no range/diff.
+/// derive the 1-based `[start..end]` line window, and emits a refined unified
+/// diff preview of the change. A failed read, missing old_text, or empty edits
+/// all degrade gracefully to `(None, [])` so the caller just prints `edit
+/// <path>` with no range/diff.
 fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
     let first = match edits.first() {
         Some(e) => e,
@@ -774,30 +774,70 @@ fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
         format!("{start}..{end}")
     };
 
-    // Compact diff preview: removed lines, then added lines, capped so huge
-    // replacements don't flood the scrollback.
-    const MAX: usize = 14;
-    let old_lines: Vec<&str> = first.old_text.split('\n').collect();
-    let new_lines: Vec<&str> = first.new_text.split('\n').collect();
-    let clip = |lines: &[&str]| -> Vec<String> {
-        if lines.len() > MAX {
-            lines[..MAX - 1]
-                .iter()
-                .map(|l| l.to_string())
-                .chain(std::iter::once("…".to_string()))
-                .collect()
-        } else {
-            lines.iter().map(|l| l.to_string()).collect()
-        }
-    };
-    let mut diff = Vec::new();
-    for l in clip(&old_lines) {
-        diff.push(format!("- {l}"));
-    }
-    for l in clip(&new_lines) {
-        diff.push(format!("+ {l}"));
-    }
+    // Compact diff preview: refined unified diff (removed/added lines plus two
+    // lines of context) capped so huge replacements don't flood the scrollback.
+    // Each returned line carries its marker (`-`/`+`/` `) with no trailing
+    // newline, ready for `tool_panel`'s diff-marker coloring.
+    let diff = refined_diff_lines(&first.old_text, &first.new_text);
     (Some(range), diff)
+}
+
+/// Build a refined unified-diff preview of `old -> new`.
+///
+/// Uses Myers diff (via `similar`) so only genuinely changed regions show up,
+/// each with two lines of context. Changed lines are emitted as `<marker>
+/// <content>` (`-` removed, `+` added) and unchanged context as `<marker>
+/// <content>` with `<marker>` a single space — the space after the marker keeps
+/// all content columns aligned and matches `tool_panel`'s `- ` / `+ ` diff
+/// detection. Lines are free of trailing newlines, so `tool_panel` can reflow
+/// them without inserting spurious blank rows. A cap keeps pathological
+/// replacements (e.g. replacing the whole file) from flooding the scrollback.
+fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
+    const MAX: usize = 60;
+    const CONTEXT: usize = 2;
+
+    let diff = TextDiff::from_lines(old, new);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(CONTEXT);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for hunk in unified.iter_hunks() {
+        for (idx, change) in hunk.iter_changes().enumerate() {
+            if idx == 0 {
+                // Emit a hunk header as its own neutral context line.
+                out.push(format!("{}", hunk.header()));
+                if out.len() >= MAX {
+                    truncated = true;
+                    break;
+                }
+            }
+            if out.len() >= MAX {
+                truncated = true;
+                break;
+            }
+            let marker = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            // `from_lines` includes the trailing newline on each value; strip it
+            // so `tool_panel` wraps the line as one physical row. The space
+            // after the marker keeps `- ` / `+ ` recognizable to `tool_panel`
+            // and aligns context lines with changed lines.
+            let value = change.value().trim_end_matches('\n');
+            out.push(format!("{marker} {value}"));
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        out.push("    … (diff truncated)".to_string());
+    }
+    out
 }
 
 impl ConsoleOutput {
@@ -1220,39 +1260,6 @@ impl ConsoleOutput {
         }
     }
 
-    /// Render a unified diff for a successful edit operation.
-    /// Shows only changed hunks with 2 lines of context around each change.
-    fn render_edit_diff(&self, old_text: &str, new_text: &str) {
-        let diff = TextDiff::from_lines(old_text, new_text);
-        let mut unified = diff.unified_diff();
-        unified.context_radius(2);
-
-        let mut any_changes = false;
-        for hunk in unified.iter_hunks() {
-            any_changes = true;
-            // Render hunk header: @@ -old_start,old_count +new_start,new_count @@
-            let header = hunk.header();
-            let header_str = format!("{}", header);
-            self.tool_panel(&header_str, false, true);
-
-            // Render each line in the hunk with proper diff markers
-            for change in hunk.iter_changes() {
-                let marker = match change.tag() {
-                    ChangeTag::Delete => "-",
-                    ChangeTag::Insert => "+",
-                    ChangeTag::Equal => " ",
-                };
-                // change.value() includes the line content (without trailing newline)
-                let line = format!("{}{}", marker, change.value());
-                self.tool_panel(&line, false, true);
-            }
-        }
-
-        if !any_changes {
-            self.tool_panel("(no changes)", false, true);
-        }
-    }
-
     fn create_spinner(message: &str) -> ProgressBar {
         let pb = ProgressBar::new_spinner();
         pb.enable_steady_tick(Duration::from_millis(120));
@@ -1594,43 +1601,6 @@ impl Output for ConsoleOutput {
 
         // Check for successful edit_file result and render a diff preview
         // Success format: "Replaced N block(s) in <path>"
-        let is_edit_success = result.starts_with("Replaced") && result.contains("block");
-
-        if is_edit_success {
-            if let Some((tool_name, args)) = self.last_tool.lock().unwrap().as_ref() {
-                if tool_name.eq_ignore_ascii_case("edit_file")
-                    || tool_name.eq_ignore_ascii_case("edit")
-                {
-                    // Extract edits from args (supports both canonical `edits` array and legacy single-edit)
-                    if let Some(arr) = args.get("edits").and_then(|v| v.as_array()) {
-                        // Canonical format: edits array
-                        if !arr.is_empty() {
-                            // Print a brief success header first
-                            self.tool_panel(result, false, false);
-
-                            // Render diff for each edit
-                            for edit in arr {
-                                if let (Some(old_text), Some(new_text)) = (
-                                    edit.get("oldText").and_then(|v| v.as_str()),
-                                    edit.get("newText").and_then(|v| v.as_str()),
-                                ) {
-                                    self.render_edit_diff(old_text, new_text);
-                                }
-                            }
-                            return;
-                        }
-                    } else if let (Some(old_text), Some(new_text)) = (
-                        args.get("oldText").and_then(|v| v.as_str()),
-                        args.get("newText").and_then(|v| v.as_str()),
-                    ) {
-                        // Legacy single-edit format
-                        self.tool_panel(result, false, false);
-                        self.render_edit_diff(old_text, new_text);
-                        return;
-                    }
-                }
-            }
-        }
 
         let unquoted = serde_json::from_str::<Value>(result)
             .ok()
@@ -2449,61 +2419,72 @@ mod tests {
     }
 
     #[test]
-    fn render_edit_diff_shows_unified_diff_with_context() {
-        let out = ConsoleOutput::default();
-        out.begin_capture_inner();
-
+    fn refined_diff_lines_shows_changes_without_trailing_newlines() {
         let old_text = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
         let new_text = "fn main() {\n    let x = 42;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
-        out.render_edit_diff(old_text, new_text);
+        let lines = refined_diff_lines(old_text, new_text);
 
-        let captured = out.end_capture_inner();
-        let output = strip_ansi(&String::from_utf8_lossy(&captured));
-
-        // Should contain the hunk header
-        assert!(output.contains("@@"), "should contain hunk header");
-        // Should show the change
-        assert!(output.contains("-    let x = 1;"), "should show removed line");
-        assert!(output.contains("+    let x = 42;"), "should show added line");
-        // Should show context lines
-        assert!(output.contains("    let y = 2;"), "should show context line");
-        assert!(output.contains("    println!"), "should show context line");
+        // Hunk header present.
+        assert!(lines.iter().any(|l| l.contains("@@")), "should contain hunk header: {lines:?}");
+        // Show the changed lines with marker + space + indented content.
+        assert!(lines.iter().any(|l| l == "-     let x = 1;"), "removed line: {lines:?}");
+        assert!(lines.iter().any(|l| l == "+     let x = 42;"), "added line: {lines:?}");
+        // Context lines use a space marker + space then the source indent.
+        assert!(lines.iter().any(|l| l == "      let y = 2;"), "context line: {lines:?}");
+        // No line may carry a trailing newline (would split into blank rows).
+        for l in &lines {
+            assert!(!l.ends_with('\n'), "line must not end with newline: {:?}", l);
+        }
     }
 
     #[test]
-    fn render_edit_diff_handles_multiple_hunks() {
-        let out = ConsoleOutput::default();
-        out.begin_capture_inner();
+    fn refined_diff_lines_handles_multiple_hunks() {
+        // Changes separated by more than the context radius form distinct
+        // hunks (close changes would merge into a single hunk).
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..30 {
+            if i == 2 {
+                old.push_str("    a = 1;\n");
+                new.push_str("    a = 10;\n");
+            } else if i == 25 {
+                old.push_str("    b = 2;\n");
+                new.push_str("    b = 20;\n");
+            } else {
+                old.push_str(&format!("    line {i};\n"));
+                new.push_str(&format!("    line {i};\n"));
+            }
+        }
+        let lines = refined_diff_lines(&old, &new);
 
-        let old_text = "fn foo() {\n    let a = 1;\n}\n\nfn bar() {\n    let b = 2;\n}\n";
-        let new_text = "fn foo() {\n    let a = 10;\n}\n\nfn bar() {\n    let b = 20;\n}\n";
-        out.render_edit_diff(old_text, new_text);
-
-        let captured = out.end_capture_inner();
-        let output = strip_ansi(&String::from_utf8_lossy(&captured));
-
-        // Should contain two hunk headers
-        let hunk_count = output.matches("@@").count();
-        assert_eq!(hunk_count, 2, "should have two hunks, got: {}", output);
-        // Should show both changes
-        assert!(output.contains("-    let a = 1;"));
-        assert!(output.contains("+    let a = 10;"));
-        assert!(output.contains("-    let b = 2;"));
-        assert!(output.contains("+    let b = 20;"));
+        let hunk_count = lines.iter().filter(|l| l.contains("@@")).count();
+        assert_eq!(hunk_count, 2, "should have two hunks, got: {lines:?}");
+        assert!(lines.iter().any(|l| l == "-     a = 1;"));
+        assert!(lines.iter().any(|l| l == "+     a = 10;"));
+        assert!(lines.iter().any(|l| l == "-     b = 2;"));
+        assert!(lines.iter().any(|l| l == "+     b = 20;"));
     }
 
     #[test]
-    fn render_edit_diff_no_changes_shows_message() {
-        let out = ConsoleOutput::default();
-        out.begin_capture_inner();
-
+    fn refined_diff_lines_no_changes_is_empty() {
         let text = "fn main() {\n    let x = 1;\n}\n";
-        out.render_edit_diff(text, text);
+        let lines = refined_diff_lines(text, text);
+        assert!(lines.is_empty(), "identical text yields no diff lines: {lines:?}");
+    }
 
-        let captured = out.end_capture_inner();
-        let output = strip_ansi(&String::from_utf8_lossy(&captured));
-
-        assert!(output.contains("no changes"), "should show 'no changes' message");
+    #[test]
+    fn refined_diff_lines_caps_very_large_replacements() {
+        // A huge replacement must be capped and flagged as truncated rather
+        // than flooding the output with the entire file.
+        let mut old = String::new();
+        let mut new = String::new();
+        for i in 0..500 {
+            old.push_str(&format!("line {i}\n"));
+            new.push_str(&format!("line {i} changed\n"));
+        }
+        let lines = refined_diff_lines(&old, &new);
+        assert!(lines.len() < 200, "should cap huge diffs, got {}", lines.len());
+        assert!(lines.iter().any(|l| l.contains("truncated")), "should flag truncation: {lines:?}");
     }
 
     #[test]
