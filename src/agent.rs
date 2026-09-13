@@ -2350,6 +2350,14 @@ fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: 
                     output.display_tool_result(result_text);
                 }
             }
+            // Mirror the live path, where each `CompletionCall` — including one
+            // that closes a tool round and is followed by more assistant text —
+            // fires `end_response_segment`. Flushing after the tool block here
+            // guarantees a blank line separates the tool result from any text
+            // segment that follows it in the replay, exactly as in live output.
+            if !is_last_segment {
+                output.end_response_segment();
+            }
         } else if !is_last_segment {
             output.end_response_segment();
         }

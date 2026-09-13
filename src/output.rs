@@ -2987,4 +2987,37 @@ mod tests {
         let c = strip_ansi(&String::from_utf8_lossy(&c));
         eprintln!("=== Case C (tool + trailing thinking) ===\n{:?}", c);
     }
+
+    #[test]
+    fn tool_result_followed_by_text_has_blank_separator() {
+        // Regression (replay path): render_turn must fire `end_response_segment`
+        // after a tool block when more text follows, so replay output matches
+        // the live path (where each CompletionCall flushes) — the trailing text
+        // is separated from the tool-result line by a blank line.
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+        out.stream_text("Let me edit.\n");
+        out.end_response_segment();
+        out.display_tool_call(
+            "edit_file",
+            &serde_json::json!({"path": "/no/such.rs", "oldText": "a", "newText": "b"}),
+        );
+        out.display_tool_result("\"Replaced 1 block(s) in ./no_such.rs\"");
+        // The fix: segment boundary after the tool block (mirrors live path).
+        out.end_response_segment();
+        out.stream_text("Done.\n");
+        out.end_response();
+        let d = out.end_capture_inner();
+        let d = strip_ansi(&String::from_utf8_lossy(&d));
+        let after = d.find("Replaced 1 block(s) in ./no_such.rs").unwrap()
+            + "Replaced 1 block(s) in ./no_such.rs".len();
+        let between = &d[after..d.find("Done.").unwrap()];
+        assert!(
+            between.contains("\n\n"),
+            "expected a blank line between the tool result and trailing text, got {:?}",
+            between
+        );
+    }
 }
