@@ -159,8 +159,8 @@ pub struct EditOp {
 /// Arguments accepted by the `edit` tool.
 ///
 /// Accepts two wire formats:
-/// - Canonical: `{path, edits: [{oldText, newText, startLine?, endLine?}]}`
-/// - Legacy (single edit): `{path, oldText, newText, startLine?, endLine?}`
+/// - Single (single edit): `{path, oldText, newText, startLine?, endLine?}`
+/// - Batch: `{path, edits: [{oldText, newText, startLine?, endLine?}]}`
 ///
 /// The schema advertises both formats via `anyOf`.
 #[derive(Serialize, JsonSchema)]
@@ -178,13 +178,8 @@ pub struct EditArgs {
 #[derive(Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum EditArgsVariant {
-    /// Canonical format: one or more edits in an array.
-    Canonical {
-        /// One or more targeted text replacements.
-        edits: Vec<EditOp>,
-    },
-    /// Legacy format: single edit at top level (for backwards compatibility).
-    Legacy {
+    /// Single format: single edit at top level (for backwards compatibility).
+    Single {
         #[serde(rename = "oldText")]
         old_text: String,
         #[serde(rename = "newText")]
@@ -194,14 +189,19 @@ pub enum EditArgsVariant {
         #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
         end_line: Option<EditEndLine>,
     },
+    /// Batch format: one or more edits in an array.
+    Batch {
+        /// One or more targeted text replacements.
+        edits: Vec<EditOp>,
+    },
 }
 
 impl EditArgs {
     /// Get the list of edits, converting from legacy format if needed.
     pub fn edits(&self) -> Vec<EditOp> {
         match &self.variant {
-            EditArgsVariant::Canonical { edits } => edits.clone(),
-            EditArgsVariant::Legacy { old_text, new_text, start_line, end_line } => vec![EditOp {
+            EditArgsVariant::Batch { edits } => edits.clone(),
+            EditArgsVariant::Single { old_text, new_text, start_line, end_line } => vec![EditOp {
                 old_text: old_text.clone(),
                 new_text: new_text.clone(),
                 start_line: start_line.clone(),
@@ -216,11 +216,8 @@ impl EditArgs {
 /// can't blow up the tool message.
 const MAX_ECHOED_ARGS: usize = 400;
 
-const EDIT_ARGS_EXAMPLE: &str = r#"{
-    "path": "some/path",
-    "edits": [
-        { "oldText": "original text", "newText": "replacement text" }
-    ]
+const EDIT_ARGS_EXAMPLE: &str = r#"Single: {"path": "some/path", "oldText": "original text", "newText": "replacement text" }
+Batch: {"path": "some/path","edits": [{ "oldText": "original text", "newText": "replacement text" }]
 }"#;
 
 /// Truncate the echoed parameter JSON to [`MAX_ECHOED_ARGS`] chars on a
@@ -273,8 +270,8 @@ impl EditArgs {
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
         enum RawEditArgsVariant {
-            Canonical { edits: Vec<EditOp> },
-            Legacy {
+            Batch { edits: Vec<EditOp> },
+            Single {
                 #[serde(rename = "oldText")]
                 old_text: String,
                 #[serde(rename = "newText")]
@@ -289,9 +286,9 @@ impl EditArgs {
             Ok(raw_args) => Ok(EditArgs {
                 path: raw_args.path,
                 variant: match raw_args.variant {
-                    RawEditArgsVariant::Canonical { edits } => EditArgsVariant::Canonical { edits },
-                    RawEditArgsVariant::Legacy { old_text, new_text, start_line, end_line } => {
-                        EditArgsVariant::Legacy { old_text, new_text, start_line, end_line }
+                    RawEditArgsVariant::Batch { edits } => EditArgsVariant::Batch { edits },
+                    RawEditArgsVariant::Single { old_text, new_text, start_line, end_line } => {
+                        EditArgsVariant::Single { old_text, new_text, start_line, end_line }
                     }
                 },
             }),
@@ -2613,7 +2610,7 @@ mod edit_args_wire_tests {
             .await
     }
 
-    // ---- Canonical shape ----
+    // ---- Batch shape ----
 
     #[tokio::test]
     #[serial]
@@ -2653,7 +2650,7 @@ mod edit_args_wire_tests {
         assert_eq!(after, "A\nb\nC\n");
     }
 
-    // ---- Legacy shape (accepted, undocumented) ----
+    // ---- Single shape (accepted, undocumented) ----
 
     #[tokio::test]
     #[serial]
