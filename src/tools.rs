@@ -180,7 +180,7 @@ const MAX_ECHOED_ARGS: usize = 400;
 const EDIT_ARGS_EXAMPLE: &str = r#"{
     "path": "some/path",
     "edits": [
-        { "oldText": "The original text", "newText": "The replacement text" }
+        { "oldText": "original text", "newText": "replacement text" }
     ]
 }"#;
 
@@ -240,7 +240,7 @@ impl EditArgs {
         }
 
         Err(format!(
-            "Expected parameters like:\n{}\nInvalid parameters received: {}",
+            "Send valid JSON parameters like:\n{}\nActual parameters received: {}",
             EDIT_ARGS_EXAMPLE,
             truncate_wire_repr(raw),
         ))
