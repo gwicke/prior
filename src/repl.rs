@@ -273,8 +273,95 @@ pub struct ReplCtx {
     /// the `/tree compact` sub-menu header; the compact handler writes the
     /// same estimate as `tokensBefore` (same `estimate_context_tokens` call).
     pub context_tokens: u64,
+    /// Current model filter/sort state for the `/model` overlay.
+    pub model_filter: ModelFilter,
 }
 
+
+/// Model filter state for the `/model` overlay.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelFilter {
+    /// Sort order (e.g., "most-popular", "created", "coding", "intelligence", "agentic", "price_input", "price_output")
+    pub sort: Option<String>,
+    /// Maximum prompt (input) price per million tokens
+    pub price_input: Option<f64>,
+    /// Maximum output (completion) price per million tokens
+    pub price_output: Option<f64>,
+    /// Minimum coding index (0-100)
+    pub min_coding_index: Option<f32>,
+    /// Minimum intelligence index (0-100)
+    pub min_intelligence_index: Option<f32>,
+    /// Minimum agentic index (0-100)
+    pub min_agentic_index: Option<f32>,
+    /// Maximum model age in days
+    pub max_age_days: Option<u32>,
+    /// Minimum context length
+    pub min_context: Option<u32>,
+    /// Search terms (after removing .sort: etc. modifiers)
+    pub search_terms: String,
+}
+
+impl ModelFilter {
+    /// Convert to ModelFilterParams for API calls.
+    pub fn to_params(&self) -> model_catalog::ModelFilterParams {
+        model_catalog::ModelFilterParams {
+            sort: self.sort.clone(),
+            price_input: self.price_input,
+            price_output: self.price_output,
+            min_coding_index: self.min_coding_index,
+            min_intelligence_index: self.min_intelligence_index,
+            min_agentic_index: self.min_agentic_index,
+            max_age_days: self.max_age_days,
+            min_context: self.min_context,
+        }
+    }
+
+    /// Default filter: no category/sort restrictions (show all models)
+    pub fn default_for_coding() -> Self {
+        Self {
+            ..Default::default()
+        }
+    }
+
+    /// Generate a display string for the overlay title.
+    pub fn title_suffix(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(s) = &self.sort {
+            parts.push(format!("sort:{}", s));
+        }
+        if let Some(p) = self.price_input {
+            if p == 0.0 {
+                parts.push("free".to_string());
+            } else {
+                parts.push(format!("in:${:.2}/M", p));
+            }
+        }
+        if let Some(p) = self.price_output {
+            parts.push(format!("out:${:.2}/M", p));
+        }
+        if let Some(v) = self.min_coding_index {
+            parts.push(format!("coding>={}", v));
+        }
+        if let Some(v) = self.min_intelligence_index {
+            parts.push(format!("intel>={}", v));
+        }
+        if let Some(v) = self.min_agentic_index {
+            parts.push(format!("agentic>={}", v));
+        }
+        if let Some(v) = self.max_age_days {
+            parts.push(format!("age<={}d", v));
+        }
+        if let Some(v) = self.min_context {
+            parts.push(format!("ctx>={}", v));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", parts.join(" "))
+        }
+    }
+
+}
 /// Lightweight session metadata for the `/session` overlay.
 #[derive(Clone)]
 pub struct SessionMeta {
@@ -331,7 +418,7 @@ pub(crate) enum ActiveOverlay {
 
     Model {
         entries: Vec<model_catalog::ModelEntry>,
-        _filter: String,
+        filter: ModelFilter,
         /// Index of the currently-active model (for the `*` marker).
         active: Option<usize>,
     },
@@ -519,7 +606,9 @@ impl ActiveOverlay {
             "model" | "models" | "m" => {
                 let filter = rest.trim().to_string();
                 let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
-                ActiveOverlay::Model { entries, _filter: filter, active }
+                // The model_overlay_entries now returns the filter with search terms parsed
+                let (_, model_filter) = Repl::parse_model_filter(&filter);
+                ActiveOverlay::Model { entries, filter: model_filter, active }
             }
             "thinking" | "think" | "t" => {
                 let filter = rest.trim().to_string();
@@ -925,7 +1014,7 @@ impl ActiveOverlay {
                      opts, None, true)
                 }
             }
-            ActiveOverlay::Model { entries, active, .. } => {
+            ActiveOverlay::Model { entries, filter: _, active } => {
                 if entries.is_empty() {
                     return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                             vec!["(loading models... or no matches)".into()],
@@ -956,8 +1045,7 @@ impl ActiveOverlay {
                             .join("\n")
                     }
                 }).collect();
-                ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
-                 opts, *active, false)
+                ("", opts, *active, false)
             }
             ActiveOverlay::Thinking { levels } => {
                 let opts: Vec<String> = levels.iter().map(|l| l.as_str().to_string()).collect();
@@ -1077,6 +1165,9 @@ impl ActiveOverlay {
 
     fn title(&self) -> String {
         match self {
+            ActiveOverlay::Model { filter, .. } => {
+                format!("Models{}", filter.title_suffix())
+            }
             ActiveOverlay::SettingsVal { key, .. } => {
                 let name = crate::settings::SETTINGS
                     .iter()
@@ -2740,6 +2831,72 @@ impl Repl {
     /// recently-used, fuzzy-filtered by `filter`. Returns the (sorted+filtered)
     /// entries and the position of the active model within them.
 
+    /// Parse the model filter string for modifiers like `.sort:`, `.max_price:`, etc.
+    /// Returns (search_terms, ModelFilter).
+    /// Empty value after colon (e.g. `.sort:`) clears that filter.
+    fn parse_model_filter(input: &str) -> (String, ModelFilter) {
+        let mut filter = ModelFilter::default();
+        let mut search_parts = Vec::new();
+        
+        for token in input.split_whitespace() {
+            if let Some(rest) = token.strip_prefix(".sort:") {
+                if rest.is_empty() {
+                    filter.sort = None;
+                } else {
+                    filter.sort = Some(rest.to_string());
+                }
+            } else if let Some(rest) = token.strip_prefix(".price_input:") {
+                if rest.is_empty() {
+                    filter.price_input = None;
+                } else if rest == "0" || rest == "free" {
+                    filter.price_input = Some(0.0);
+                } else if let Ok(v) = rest.parse::<f64>() {
+                    filter.price_input = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".price_output:") {
+                if rest.is_empty() {
+                    filter.price_output = None;
+                } else if let Ok(v) = rest.parse::<f64>() {
+                    filter.price_output = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".coding:") {
+                if rest.is_empty() {
+                    filter.min_coding_index = None;
+                } else if let Ok(v) = rest.parse::<f32>() {
+                    filter.min_coding_index = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".intelligence:") {
+                if rest.is_empty() {
+                    filter.min_intelligence_index = None;
+                } else if let Ok(v) = rest.parse::<f32>() {
+                    filter.min_intelligence_index = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".agentic:") {
+                if rest.is_empty() {
+                    filter.min_agentic_index = None;
+                } else if let Ok(v) = rest.parse::<f32>() {
+                    filter.min_agentic_index = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".max_age_days:") {
+                if rest.is_empty() {
+                    filter.max_age_days = None;
+                } else if let Ok(v) = rest.parse::<u32>() {
+                    filter.max_age_days = Some(v);
+                }
+            } else if let Some(rest) = token.strip_prefix(".context:") {
+                if rest.is_empty() {
+                    filter.min_context = None;
+                } else if let Ok(v) = rest.parse::<u32>() {
+                    filter.min_context = Some(v);
+                }
+            } else {
+                search_parts.push(token);
+            }
+        }
+        
+        (search_parts.join(" "), filter)
+    }
+
     /// Parse the `/settings` argument string into (setting, value query, is_value_mode).
     ///
     /// Value mode opens only when the first token EXACTLY matches a setting
@@ -2991,53 +3148,123 @@ impl Repl {
         ctx: &ReplCtx,
         filter: &str,
     ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
-        let entries = model_catalog::catalog_cached();
+        // Parse filter for .category: .sort: etc. modifiers
+        let (search_terms, mut model_filter) = Self::parse_model_filter(filter);
+        
+        // Merge with existing filter state (persist non-overridden values)
+        if model_filter.sort.is_none() {
+            model_filter.sort = ctx.model_filter.sort.clone();
+        }
+        if model_filter.price_input.is_none() {
+            model_filter.price_input = ctx.model_filter.price_input;
+        }
+        if model_filter.price_output.is_none() {
+            model_filter.price_output = ctx.model_filter.price_output;
+        }
+        if model_filter.min_coding_index.is_none() {
+            model_filter.min_coding_index = ctx.model_filter.min_coding_index;
+        }
+        if model_filter.min_intelligence_index.is_none() {
+            model_filter.min_intelligence_index = ctx.model_filter.min_intelligence_index;
+        }
+        if model_filter.min_agentic_index.is_none() {
+            model_filter.min_agentic_index = ctx.model_filter.min_agentic_index;
+        }
+        if model_filter.max_age_days.is_none() {
+            model_filter.max_age_days = ctx.model_filter.max_age_days;
+        }
+        if model_filter.min_context.is_none() {
+            model_filter.min_context = ctx.model_filter.min_context;
+        }
+        
+        // Update the search terms
+        model_filter.search_terms = search_terms;
+        
+        // Check if filter params changed (excluding search_terms)
+        let params_changed = model_filter.sort != ctx.model_filter.sort
+            || model_filter.price_input != ctx.model_filter.price_input
+            || model_filter.price_output != ctx.model_filter.price_output
+            || model_filter.min_coding_index != ctx.model_filter.min_coding_index
+            || model_filter.min_intelligence_index != ctx.model_filter.min_intelligence_index
+            || model_filter.min_agentic_index != ctx.model_filter.min_agentic_index
+            || model_filter.max_age_days != ctx.model_filter.max_age_days
+            || model_filter.min_context != ctx.model_filter.min_context;
+        
+        // Fetch catalog with the filter params applied at the repository level
+        let entries = model_catalog::get_filtered_catalog(&model_filter.to_params());
+        
+        // If filter params changed, trigger a background refresh
+        if params_changed {
+            tokio::spawn(async move {
+                let _ = model_catalog::refresh_catalog().await;
+            });
+        }
+        
         let active_id = Self::active_entry_id(&entries, &ctx.provider, &ctx.model);
-        let filtered: Vec<model_catalog::ModelEntry> = if filter.trim().is_empty() {
-            // No filter: show the top 10 most recently used (available) models
-            // first, then the rest of the catalog alphabetically.
+        
+        // Build server rank map (position in the filtered+sorted catalog)
+        let server_rank: std::collections::HashMap<String, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
+        
+        let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() {
+            // No search terms: boost the 5 most recently used models to the top
+            // (in LRU order), then the rest in repository sort order.
             let mut seen = std::collections::HashSet::new();
             let mut recent_shown = Vec::new();
             for recent_id in &ctx.recent {
-                if recent_shown.len() >= 10 {
+                if recent_shown.len() >= 5 {
                     break;
                 }
-                // Find the catalog entry that best matches this recent id.
-                // Prefer a Direct entry over an OpenRouter entry when both exist.
                 if let Some(e) = entries.iter().find(|e| e.id == *recent_id && model_catalog::provider_available(&e.provider)) {
                     if seen.insert(e.id.clone()) {
                         recent_shown.push(e.clone());
                     }
                 }
             }
-            // Sort remaining entries alphabetically.
+            // Remaining entries in repository order (already sorted by repo)
             let mut rest: Vec<model_catalog::ModelEntry> = entries
                 .into_iter()
                 .filter(|e| !seen.contains(&e.id))
                 .collect();
-            rest.sort_by(|a, b| a.display.cmp(&b.display));
+            rest.sort_by(|a, b| {
+                let ra = server_rank.get(&a.id).copied().unwrap_or(usize::MAX);
+                let rb = server_rank.get(&b.id).copied().unwrap_or(usize::MAX);
+                ra.cmp(&rb)
+            });
             recent_shown.extend(rest);
             recent_shown
         } else {
-            // With filter: fuzzy-match across all catalog entries (current behaviour).
+            // With search terms: blend fuzzy match score with server rank
             let mut sorted: Vec<model_catalog::ModelEntry> = entries;
             sorted.sort_by(|a, b| {
                 Self::model_rank(&a.id, &active_id, &ctx.recent)
                     .cmp(&Self::model_rank(&b.id, &active_id, &ctx.recent))
                     .then_with(|| a.display.cmp(&b.display))
             });
-            crate::fuzzy::fuzzy_filter(
+            let fuzzy_results = crate::fuzzy::fuzzy_filter(
                 &sorted,
-                filter,
-                // Searchable text leads with the `provider:model` display (so a
-                // `provider:model` query matches directly) and also includes the
-                // bare provider, the slash-id form, and the qualified form.
+                &model_filter.search_terms,
                 |e| format!("{} {} {} {}", e.provider, e.display, e.id, e.qualified()),
-            )
-            .into_iter()
-            .map(|r| r.item.clone())
-            .collect()
+            );
+            
+            // Blend: combined_score = fuzzy_score * 100 - server_position
+            // This prioritizes fuzzy matches but respects server popularity
+            let mut ranked: Vec<(model_catalog::ModelEntry, i64)> = fuzzy_results
+                .into_iter()
+                .map(|r| {
+                    let server_pos = server_rank.get(&r.item.id).copied().unwrap_or(usize::MAX) as i64;
+                    let combined_score = r.score * 100 - server_pos;
+                    (r.item.clone(), combined_score)
+                })
+                .collect();
+            
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.into_iter().map(|(e, _)| e).collect()
         };
+        
         let active = filtered.iter().position(|e| e.id == active_id);
         (filtered, active)
     }
@@ -5494,6 +5721,10 @@ mod tests {
             completion_cost: None,
             reasoning: false,
             cost_source: model_catalog::CostSource::OpenRouterEstimate,
+            created: None,
+            coding_index: None,
+            intelligence_index: None,
+            agentic_index: None,
         };
         let c = Repl::model_candidate(&e);
         assert_eq!(c.value, "anthropic:claude-3-5-sonnet");
@@ -5511,6 +5742,10 @@ mod tests {
             completion_cost: None,
             reasoning: false,
             cost_source: model_catalog::CostSource::OpenRouterEstimate,
+            created: None,
+            coding_index: None,
+            intelligence_index: None,
+            agentic_index: None,
         };
         let c2 = Repl::model_candidate(&e2);
         assert_eq!(c2.value, "openrouter:deepseek/deepseek-v4-flash");
@@ -5621,6 +5856,7 @@ mod tests {
             tree,
             leaf_id: Some("leaf-entry".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         }
     }
 
@@ -5869,6 +6105,7 @@ mod tests {
             tree,
             leaf_id: Some("root-entry".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -5931,6 +6168,7 @@ mod tests {
             tree,
             leaf_id: Some("root-entry".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6203,6 +6441,7 @@ mod tests {
             )],
             leaf_id: Some("u2".into()), // mid-turn: leaf IS a user message
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6253,6 +6492,7 @@ mod tests {
             )],
             leaf_id: Some("a2".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6294,6 +6534,7 @@ mod tests {
             tree: vec![],
             leaf_id: None,
             context_tokens: 0,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7061,6 +7302,7 @@ mod tests {
             tree,
             leaf_id: Some("m1".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7140,6 +7382,7 @@ mod tests {
             tree,
             leaf_id: Some("c1".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7202,6 +7445,7 @@ mod tests {
             tree,
             leaf_id: Some("m2".into()),
             context_tokens: 1234,
+            model_filter: ModelFilter::default_for_coding(),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
