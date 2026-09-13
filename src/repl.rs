@@ -3227,10 +3227,9 @@ impl Repl {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         
-        let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() {
-            // No search terms: boost the active model + 5 most recently used models to the top
-            // (in LRU order), then the rest in repository sort order (which already includes
-            // the requested sort like .sort:coding_price).
+        let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() && model_filter.sort.is_none() {
+            // No search terms AND no explicit sort: boost the active model + 5 most recently used models to the top
+            // (in LRU order), then the rest in repository sort order.
             let mut seen = std::collections::HashSet::new();
             let mut recent_shown = Vec::new();
             
@@ -3252,11 +3251,16 @@ impl Repl {
                     }
                 }
             }
-            // Remaining entries in repository order (already sorted by repo with the requested sort)
+            // Remaining entries in repository order (already sorted by repo)
             let mut rest: Vec<model_catalog::ModelEntry> = entries
                 .into_iter()
                 .filter(|e| !seen.contains(&e.id))
                 .collect();
+            rest.sort_by(|a, b| {
+                let ra = server_rank.get(&a.id).copied().unwrap_or(usize::MAX);
+                let rb = server_rank.get(&b.id).copied().unwrap_or(usize::MAX);
+                ra.cmp(&rb)
+            });
             recent_shown.extend(rest);
             recent_shown
         } else {
