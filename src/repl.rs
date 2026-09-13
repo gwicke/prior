@@ -277,16 +277,17 @@ pub struct ReplCtx {
     pub model_filter: ModelFilter,
 }
 
-
 /// Model filter state for the `/model` overlay.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelFilter {
-    /// Sort order (e.g., "most-popular", "created", "coding", "intelligence", "agentic", "price_input", "price_output")
+    /// Sort order (e.g., "most-popular", "created", "coding", "intelligence", "agentic", "price_input", "price_output", "price", "coding_price", "intelligence_price", "agentic_price")
     pub sort: Option<String>,
     /// Maximum prompt (input) price per million tokens
     pub price_input: Option<f64>,
     /// Maximum output (completion) price per million tokens
     pub price_output: Option<f64>,
+    /// Maximum combined price (input + output) per million tokens
+    pub price: Option<f64>,
     /// Minimum coding index (0-100)
     pub min_coding_index: Option<f32>,
     /// Minimum intelligence index (0-100)
@@ -301,6 +302,8 @@ pub struct ModelFilter {
     pub search_terms: String,
 }
 
+/// Model filter state for the `/model` overlay.
+
 impl ModelFilter {
     /// Convert to ModelFilterParams for API calls.
     pub fn to_params(&self) -> model_catalog::ModelFilterParams {
@@ -308,6 +311,7 @@ impl ModelFilter {
             sort: self.sort.clone(),
             price_input: self.price_input,
             price_output: self.price_output,
+            price: self.price,
             min_coding_index: self.min_coding_index,
             min_intelligence_index: self.min_intelligence_index,
             min_agentic_index: self.min_agentic_index,
@@ -338,6 +342,13 @@ impl ModelFilter {
         }
         if let Some(p) = self.price_output {
             parts.push(format!("out:${:.2}/M", p));
+        }
+        if let Some(p) = self.price {
+            if p == 0.0 {
+                parts.push("free".to_string());
+            } else {
+                parts.push(format!("${:.2}/M", p));
+            }
         }
         if let Some(v) = self.min_coding_index {
             parts.push(format!("coding>={}", v));
@@ -1021,15 +1032,16 @@ impl ActiveOverlay {
                             None, false);
                 }
                 let avail = crate::output::term_width().saturating_sub(2);
-                let mut table = Table::new(&["Model", "Ctx", "Cost", "?"])
-                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Left])
-                    .with_min_widths(&[12, 5, 14, 3])
-                    .with_priorities(&[3, 1, 2, 1])
+                let mut table = Table::new(&["Model", "Ctx", "Coding", "Cost", "?"])
+                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Left])
+                    .with_min_widths(&[12, 5, 6, 14, 3])
+                    .with_priorities(&[3, 1, 1, 2, 1])
                     .set_gap(2);
                 for e in entries {
                     table.add_row(&[
                         e.qualified(),
                         model_catalog::ctx_cell(e),
+                        model_catalog::coding_index_cell(e),
                         model_catalog::cost_cell(e),
                         model_catalog::reason_cell(e),
                     ]);
@@ -2859,6 +2871,12 @@ impl Repl {
                 } else if let Ok(v) = rest.parse::<f64>() {
                     filter.price_output = Some(v);
                 }
+            } else if let Some(rest) = token.strip_prefix(".price:") {
+                if rest.is_empty() {
+                    filter.price = None;
+                } else if let Ok(v) = rest.parse::<f64>() {
+                    filter.price = Some(v);
+                }
             } else if let Some(rest) = token.strip_prefix(".coding:") {
                 if rest.is_empty() {
                     filter.min_coding_index = None;
@@ -3210,30 +3228,35 @@ impl Repl {
             .collect();
         
         let filtered: Vec<model_catalog::ModelEntry> = if model_filter.search_terms.trim().is_empty() {
-            // No search terms: boost the 5 most recently used models to the top
-            // (in LRU order), then the rest in repository sort order.
+            // No search terms: boost the active model + 5 most recently used models to the top
+            // (in LRU order), then the rest in repository sort order (which already includes
+            // the requested sort like .sort:coding_price).
             let mut seen = std::collections::HashSet::new();
             let mut recent_shown = Vec::new();
+            
+            // First, ensure the active model is at the very top if it exists in entries
+            if let Some(active_entry) = entries.iter().find(|e| e.id == active_id) {
+                if seen.insert(active_entry.id.clone()) {
+                    recent_shown.push(active_entry.clone());
+                }
+            }
+            
+            // Then add up to 4 more recent models (for a total of 5)
             for recent_id in &ctx.recent {
                 if recent_shown.len() >= 5 {
                     break;
                 }
-                if let Some(e) = entries.iter().find(|e| e.id == *recent_id && model_catalog::provider_available(&e.provider)) {
+                if let Some(e) = entries.iter().find(|e| e.id == *recent_id) {
                     if seen.insert(e.id.clone()) {
                         recent_shown.push(e.clone());
                     }
                 }
             }
-            // Remaining entries in repository order (already sorted by repo)
+            // Remaining entries in repository order (already sorted by repo with the requested sort)
             let mut rest: Vec<model_catalog::ModelEntry> = entries
                 .into_iter()
                 .filter(|e| !seen.contains(&e.id))
                 .collect();
-            rest.sort_by(|a, b| {
-                let ra = server_rank.get(&a.id).copied().unwrap_or(usize::MAX);
-                let rb = server_rank.get(&b.id).copied().unwrap_or(usize::MAX);
-                ra.cmp(&rb)
-            });
             recent_shown.extend(rest);
             recent_shown
         } else {
