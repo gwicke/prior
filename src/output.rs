@@ -1625,7 +1625,7 @@ impl Output for ConsoleOutput {
         } else if is_read {
             10
         } else {
-            4
+            8
         };
 
         let width = term_width();
