@@ -391,6 +391,45 @@ impl ModelFilterParams {
 }
 
 
+/// One dotted modifier token usable in a filter string (e.g. `.sort:coding`,
+/// `.price:0.5`).  This is the **single source of truth** for both the parser
+/// (`apply_modifier`) and the in-prompt auto-complete overlay: adding a new
+/// `.*` option means adding one row here (plus a field and an apply arm when it
+/// targets a new `ModelFilter` field).
+#[derive(Debug, Clone, Copy)]
+pub struct ModifierSpec {
+    /// The token without the leading dot or colon — e.g. `"sort"`.
+    pub token: &'static str,
+    /// One-line description shown as the row's detail column.
+    pub desc: &'static str,
+    /// The enumerated value set, when the value is one of a fixed list
+    /// (`None` means the value is a free-form number the user types).
+    pub choices: Option<&'static [&'static str]>,
+}
+
+/// The dotted modifiers understood by the `/model` filter.  Shared between the
+/// parser and the auto-complete overlay so they can never drift apart.
+pub const MODEL_MODIFIERS: &[ModifierSpec] = &[
+    ModifierSpec {
+        token: "sort",
+        desc: "sort order",
+        choices: Some(&[
+            "most-popular", "created", "coding", "intelligence", "agentic",
+            "price_input", "price_output", "price", "coding_price",
+            "intelligence_price", "agentic_price",
+        ]),
+    },
+    ModifierSpec { token: "price_input", desc: "max prompt $/M", choices: None },
+    ModifierSpec { token: "price_output", desc: "max output $/M", choices: None },
+    ModifierSpec { token: "price", desc: "max combined $/M", choices: None },
+    ModifierSpec { token: "coding", desc: "min coding index", choices: None },
+    ModifierSpec { token: "intelligence", desc: "min intel index", choices: None },
+    ModifierSpec { token: "agentic", desc: "min agentic index", choices: None },
+    ModifierSpec { token: "max_age_days", desc: "max model age (days)", choices: None },
+    ModifierSpec { token: "context", desc: "min context length", choices: None },
+];
+
+
 /// Apply client-side filters and sorting to the cached catalog.
 /// This is the main entry point for the `/model` overlay.
 pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {

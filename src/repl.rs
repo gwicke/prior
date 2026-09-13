@@ -397,7 +397,7 @@ pub struct SessionMeta {
 }
 
 /// A candidate value shown in a setting's value-pick overlay.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct ValueCandidate {
     display: String,
     value: String,
@@ -432,6 +432,18 @@ pub(crate) enum ActiveOverlay {
         filter: ModelFilter,
         /// Index of the currently-active model (for the `*` marker).
         active: Option<usize>,
+    },
+
+    /// Dotted-modifier completion for a filter menu (`/model .sort:…`).
+    /// Promoted from the list overlay when the trailing token starts with `.`;
+    /// lists modifier names (and, once a `.name:` is typed, the enumerated
+    /// `.name` values). Selecting Tab/Enter rewrites the dotted token into the
+    /// buffer and the next `from_buffer` pass re-derives the state.
+    Mod {
+        rows: Vec<ValueCandidate>,
+        /// `true` => user is selecting among a modifier's enumerated values
+        /// (a `.name:<prefix>` is in the buffer); `false` => among modifier names.
+        want_value: bool,
     },
 
     Thinking {
@@ -616,6 +628,19 @@ impl ActiveOverlay {
         match word {
             "model" | "models" | "m" => {
                 let filter = rest.trim().to_string();
+                // If the trailing token is a dotted-modifier prefix (starting
+                // with `.`), show the modifier auto-complete overlay instead of
+                // the model list. A bare `.` lists all modifiers.
+                let last_tok = filter.split_whitespace().last().unwrap_or("");
+                if last_tok.starts_with('.') && !last_tok.starts_with("..") {
+                    let (mod_rows, want_value) = Repl::modifier_overlay_entries(&filter);
+                    if !mod_rows.is_empty() {
+                        return ActiveOverlay::Mod { rows: mod_rows, want_value };
+                    }
+                    // No completions → the dotted token is complete (a full
+                    // `.name:value` or a free-form `.name:` waiting for the
+                    // number): fall through to the model list.
+                }
                 let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
                 // The model_overlay_entries now returns the filter with search terms parsed
                 let (_, model_filter) = Repl::parse_model_filter(&filter);
@@ -1060,6 +1085,27 @@ impl ActiveOverlay {
                 }).collect();
                 ("", opts, *active, false)
             }
+            ActiveOverlay::Mod { rows, want_value } => {
+                if rows.is_empty() {
+                    return ("", vec!["(no completions)".into()], None, false);
+                }
+                let title = if *want_value {
+                    "Modifier values  (type to filter, up/down, Enter select, Esc back)"
+                } else {
+                    "Modifier options  (type to filter, up/down, Enter select, Esc back)"
+                };
+                let avail = crate::output::term_width().saturating_sub(2);
+                let mut table = Table::new(&["Modifier", "Description"])
+                    .with_aligns(&[Align::Left, Align::Left])
+                    .with_min_widths(&[20, 40])
+                    .with_priorities(&[2, 1])
+                    .set_gap(2);
+                for c in rows {
+                    table.add_row(&[c.display.clone(), c.desc.clone()]);
+                }
+                let opts = table.render_multiline(avail);
+                (title, opts, None, false)
+            }
             ActiveOverlay::Thinking { levels } => {
                 let opts: Vec<String> = levels.iter().map(|l| l.as_str().to_string()).collect();
                 if opts.is_empty() {
@@ -1212,6 +1258,16 @@ impl ActiveOverlay {
                 if let Some(e) = entries.get(sel) {
                     let buf = editor.text();
                     editor.set(&Repl::replace_last_token(&buf, &e.display));
+                }
+            }
+            ActiveOverlay::Mod { rows, .. } => {
+                if let Some(c) = rows.get(sel) {
+                    let buf = editor.text();
+                    // Finish the dotted token. If we're completing a full
+                    // `.name:value`, replace the whole token; otherwise replace
+                    // just the trailing `.xxx` fragment with `.name:`.
+                    let val = &c.value;
+                    editor.set(&Repl::replace_last_token(&buf, val));
                 }
             }
             ActiveOverlay::Thinking { levels } => {
@@ -1537,6 +1593,13 @@ impl ActiveOverlay {
                 } else {
                     OverlayAction::Continue
                 }
+            }
+            ActiveOverlay::Mod { rows, .. } => {
+                if let Some(c) = rows.get(sel) {
+                    let buf = editor.text();
+                    editor.set(&Repl::replace_last_token(&buf, &c.value));
+                }
+                OverlayAction::Continue
             }
             ActiveOverlay::Thinking { levels } => {
                 if let Some(l) = levels.get(sel) {
@@ -1924,6 +1987,11 @@ impl ActiveOverlay {
             ActiveOverlay::Tree { .. } => {
                 editor.set("");
             }
+            ActiveOverlay::Mod { .. } => {
+                // Back up from the modifier auto-complete to the model list,
+                // dropping the trailing dotted token (the parent level).
+                editor.set("/model ");
+            }
             ActiveOverlay::TreeAction { target_id, .. } => {
                 // Back to the tree list (keep nothing: the id may have come
                 // from Enter-complete; the list is the parent level).
@@ -1946,6 +2014,7 @@ impl ActiveOverlay {
             ActiveOverlay::Help => 1,
             ActiveOverlay::CommandList { .. } => 2,
             ActiveOverlay::Model { .. } => 3,
+            ActiveOverlay::Mod { .. } => 19,
             ActiveOverlay::Thinking { .. } => 4,
             ActiveOverlay::Settings { .. } => 5,
             ActiveOverlay::SettingsVal { .. } => 6,
@@ -2844,76 +2913,74 @@ impl Repl {
     /// recently-used, fuzzy-filtered by `filter`. Returns the (sorted+filtered)
     /// entries and the position of the active model within them.
 
-    /// Parse the model filter string for modifiers like `.sort:`, `.max_price:`, etc.
+    /// Parse the model filter string for `.*` modifiers and search terms.
     /// Returns (search_terms, ModelFilter).
-    /// Empty value after colon (e.g. `.sort:`) clears that filter.
+    ///
+    /// Modifier tokens (`.sort:coding`, `.price:0.5`, …) are consumed via the
+    /// data-driven [`MODEL_MODIFIERS`](crate::model_catalog::MODEL_MODIFIERS)
+    /// table (`apply_modifier`), so adding a modifier there keeps the parser in
+    /// sync automatically. An empty value after the colon (e.g. `.sort:`) clears
+    /// that filter. Anything that isn't a known modifier token falls through as a
+    /// fuzzy search term.
     fn parse_model_filter(input: &str) -> (String, ModelFilter) {
         let mut filter = ModelFilter::default();
         let mut search_parts = Vec::new();
-        
+
         for token in input.split_whitespace() {
-            if let Some(rest) = token.strip_prefix(".sort:") {
-                if rest.is_empty() {
-                    filter.sort = None;
-                } else {
-                    filter.sort = Some(rest.to_string());
+            if token.starts_with('.') {
+                // `.name` (no colon → intro) or `.name:value` / `.name:`
+                if let Some((name, val)) = token[1..].split_once(':') {
+                    if crate::model_catalog::MODEL_MODIFIERS
+                        .iter()
+                        .any(|m| m.token == name)
+                    {
+                        Self::apply_modifier(&mut filter, name, val);
+                        continue;
+                    }
                 }
-            } else if let Some(rest) = token.strip_prefix(".price_input:") {
-                if rest.is_empty() {
-                    filter.price_input = None;
-                } else if rest == "0" || rest == "free" {
-                    filter.price_input = Some(0.0);
-                } else if let Ok(v) = rest.parse::<f64>() {
-                    filter.price_input = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".price_output:") {
-                if rest.is_empty() {
-                    filter.price_output = None;
-                } else if let Ok(v) = rest.parse::<f64>() {
-                    filter.price_output = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".price:") {
-                if rest.is_empty() {
-                    filter.price = None;
-                } else if let Ok(v) = rest.parse::<f64>() {
-                    filter.price = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".coding:") {
-                if rest.is_empty() {
-                    filter.min_coding_index = None;
-                } else if let Ok(v) = rest.parse::<f32>() {
-                    filter.min_coding_index = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".intelligence:") {
-                if rest.is_empty() {
-                    filter.min_intelligence_index = None;
-                } else if let Ok(v) = rest.parse::<f32>() {
-                    filter.min_intelligence_index = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".agentic:") {
-                if rest.is_empty() {
-                    filter.min_agentic_index = None;
-                } else if let Ok(v) = rest.parse::<f32>() {
-                    filter.min_agentic_index = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".max_age_days:") {
-                if rest.is_empty() {
-                    filter.max_age_days = None;
-                } else if let Ok(v) = rest.parse::<u32>() {
-                    filter.max_age_days = Some(v);
-                }
-            } else if let Some(rest) = token.strip_prefix(".context:") {
-                if rest.is_empty() {
-                    filter.min_context = None;
-                } else if let Ok(v) = rest.parse::<u32>() {
-                    filter.min_context = Some(v);
-                }
-            } else {
-                search_parts.push(token);
+            }
+            search_parts.push(token);
+        }
+
+        (search_parts.join(" "), filter)
+    }
+
+    /// Apply one `.name:value` modifier to `filter`, using the data-driven
+    /// `MODEL_MODIFIERS` table for the token's value kind. An empty `value`
+    /// clears the field. Unknown modifier names are ignored (the exact-token
+    /// match in `parse_model_filter` prevents them reaching here).
+    fn apply_modifier(filter: &mut ModelFilter, name: &str, value: &str) {
+        use std::str::FromStr;
+        // Helper to apply a numeric modifier, clearing on empty value.
+        fn num<T: FromStr>(filter: &mut ModelFilter, value: &str, set: impl Fn(&mut ModelFilter, Option<T>)) {
+            if value.is_empty() {
+                set(filter, None);
+            } else if let Ok(v) = value.parse::<T>() {
+                set(filter, Some(v));
             }
         }
-        
-        (search_parts.join(" "), filter)
+        match name {
+            "sort" => {
+                filter.sort = if value.is_empty() { None } else { Some(value.to_string()) };
+            }
+            "price_input" => {
+                if value.is_empty() {
+                    filter.price_input = None;
+                } else if value == "0" || value == "free" {
+                    filter.price_input = Some(0.0);
+                } else if let Ok(v) = value.parse::<f64>() {
+                    filter.price_input = Some(v);
+                }
+            }
+            "price_output" => num(filter, value, |f, v| f.price_output = v),
+            "price" => num(filter, value, |f, v| f.price = v),
+            "coding" => num(filter, value, |f, v| f.min_coding_index = v),
+            "intelligence" => num(filter, value, |f, v| f.min_intelligence_index = v),
+            "agentic" => num(filter, value, |f, v| f.min_agentic_index = v),
+            "max_age_days" => num(filter, value, |f, v| f.max_age_days = v),
+            "context" => num(filter, value, |f, v| f.min_context = v),
+            _ => {}
+        }
     }
 
     /// Parse the `/settings` argument string into (setting, value query, is_value_mode).
@@ -3016,6 +3083,103 @@ impl Repl {
             display: q.clone(),
             value: q,
             desc: format!("ctx {} | coding {} | {}", model_catalog::ctx_cell(e), model_catalog::coding_index_cell(e), model_catalog::cost_cell(e)),
+        }
+    }
+
+    /// Build the dotted-modifier completion rows for `filter`.
+    ///
+    /// `filter` is the buffer text after `/model `. The trailing token decides the
+    /// phase:
+    /// - a bare `.` (or partial `.x`) lists the modifier *names*;
+    /// - `.name:` (or `.name:part`) for an enumerated modifier lists that
+    ///   modifier's fixed *values* (filtered by `part`);
+    /// - `.name:` for a free-form numeric modifier yields no overlay (returns
+    ///   `(row, want_values=false)`) so the list overlay takes over for typing the
+    ///   number.
+    /// Returns `(rows, want_value)`: `want_value` tells the caller the user is
+    /// picking among enumerated values for a single modifier.
+    fn modifier_overlay_entries(filter: &str) -> (Vec<ValueCandidate>, bool) {
+        use crate::model_catalog::MODEL_MODIFIERS;
+
+        let last = filter.split_whitespace().last().unwrap_or("");
+        let Some(inner) = last.strip_prefix('.') else {
+            // No dotted token in the buffer — nothing to complete.
+            return (Vec::new(), false);
+        };
+
+        let (name, has_colon) = match inner.split_once(':') {
+            Some((n, _)) => (n, true),
+            None => (inner, false),
+        };
+
+        if let Some(m) = MODEL_MODIFIERS.iter().find(|m| m.token == name && !name.is_empty()) {
+            if let Some(_choices) = m.choices {
+                // Enumerated modifier: if the user has typed a *complete* value
+                // (`.sort:coding`), nothing more to complete — hand back to the
+                // model list. A bare `.name:` or partial value shows the filtered
+                // value set.
+                let value_query = last.strip_prefix(&format!(".{}:", m.token)).unwrap_or("");
+                if has_colon && !value_query.is_empty() {
+                    let exact = m.choices.unwrap_or_default().iter()
+                        .any(|c| *c == value_query);
+                    if exact {
+                        return (Vec::new(), false);
+                    }
+                }
+                return (Self::modifier_value_rows(m, filter), true);
+            }
+            // Free-form numeric modifier. If the user has typed past the colon
+            // (`.coding:` or `.coding:80`), hand control back to the model list
+            // so they can type the number — nothing more to complete. Only a
+            // bare `.coding` (no colon) shows the single name row as a hint.
+            if !has_colon {
+                let q = format!(".{}:", name);
+                return (vec![ValueCandidate { display: q.clone(), value: q, desc: m.desc.into() }], false);
+            }
+            return (Vec::new(), false);
+        }
+
+        // Unknown/partial name or bare `.`: list modifier names, fuzzy-filtered.
+        let base: Vec<ValueCandidate> = MODEL_MODIFIERS
+            .iter()
+            .map(|m| {
+                let q = format!(".{}:", m.token);
+                ValueCandidate { display: q.clone(), value: q, desc: m.desc.into() }
+            })
+            .collect();
+        if name.is_empty() {
+            (base, false)
+        } else {
+            let rows = crate::fuzzy::fuzzy_filter_bonus(&base, name, |c| c.display.clone())
+                .into_iter()
+                .map(|r| r.item.clone())
+                .collect();
+            (rows, false)
+        }
+    }
+
+    /// Rows for the enumerated values of modifier `m`, filtered by the value
+    /// text the user has typed after `.m:`.
+    fn modifier_value_rows(m: &model_catalog::ModifierSpec, filter: &str) -> Vec<ValueCandidate> {
+        let last = filter.split_whitespace().last().unwrap_or("");
+        let prefix = format!(".{}:", m.token);
+        let value_query = last.strip_prefix(&prefix).unwrap_or("").to_string();
+        let base: Vec<ValueCandidate> = m
+            .choices
+            .unwrap_or_default()
+            .iter()
+            .map(|c| {
+                let v = format!(".{}:{}", m.token, c);
+                ValueCandidate { display: v.clone(), value: v, desc: m.desc.into() }
+            })
+            .collect();
+        if value_query.trim().is_empty() {
+            base
+        } else {
+            crate::fuzzy::fuzzy_filter_bonus(&base, &value_query, |c| c.display.clone())
+                .into_iter()
+                .map(|r| r.item.clone())
+                .collect()
         }
     }
 
@@ -5805,6 +5969,89 @@ mod tests {
     }
 
     #[test]
+    fn modifier_overlay_bare_dot_lists_all_names() {
+        let (rows, want_value) = Repl::modifier_overlay_entries(".");
+        assert!(!want_value, "bare dot lists modifier names, not values");
+        let tokens: Vec<&str> = rows.iter().map(|c| c.value.as_str()).collect();
+        assert!(tokens.contains(&".sort:"), "sort present: {:?}", tokens);
+        assert!(tokens.contains(&".price:"), "price present: {:?}", tokens);
+        assert!(tokens.contains(&".context:"), "context present: {:?}", tokens);
+        // Every row is a `.name:` token.
+        assert!(rows.iter().all(|c| c.value.starts_with('.') && c.value.ends_with(':')));
+    }
+
+    #[test]
+    fn modifier_overlay_partial_name_filters() {
+        let (rows, want_value) = Repl::modifier_overlay_entries(".so");
+        assert!(!want_value);
+        // fuzzy matches `.sort:` (and possibly no others) — `so` matches sort.
+        assert!(rows.iter().any(|c| c.value == ".sort:"), "rows: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn modifier_overlay_enum_values_after_colon() {
+        let (rows, want_value) = Repl::modifier_overlay_entries(".sort:");
+        assert!(want_value, "enumerated modifier with colon → value phase");
+        let values: Vec<String> = rows.iter().map(|c| c.value.clone()).collect();
+        assert!(values.contains(&".sort:most-popular".to_string()));
+        assert!(values.contains(&".sort:coding".to_string()));
+        assert!(values.contains(&".sort:price".to_string()));
+    }
+
+    #[test]
+    fn modifier_overlay_enum_values_filtered() {
+        let (rows, want_value) = Repl::modifier_overlay_entries(".sort:pri");
+        assert!(want_value);
+        assert!(!rows.is_empty(), "rows not empty");
+        // Query narrows the enumerated values to the price-related ones.
+        assert!(rows.iter().any(|c| c.value == ".sort:price"));
+        assert!(rows.iter().all(|c| c.value.contains("price")), "values filtered: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
+        // Unrelated options (e.g. created) are filtered out.
+        assert!(!rows.iter().any(|c| c.value == ".sort:created"));
+    }
+
+    #[test]
+    fn modifier_overlay_freeform_after_colon_hands_back() {
+        // `.coding:` is a free-form numeric modifier → no value phase (empty rows).
+        let (rows, want_value) = Repl::modifier_overlay_entries(".coding:");
+        assert_eq!(want_value, false);
+        assert!(rows.is_empty(), "free-form modifier past colon offers nothing: {:?}", rows);
+        // But a bare `.coding` shows the single name as a hint.
+        let (rows, want_value) = Repl::modifier_overlay_entries(".coding");
+        assert!(!want_value);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, ".coding:");
+    }
+
+    #[test]
+    fn modifier_overlay_prefix_searches_across_names() {
+        // `.p` fuzzy-matches price_input, price_output, price, and more.
+        let (rows, _) = Repl::modifier_overlay_entries(".p");
+        assert!(!rows.is_empty());
+        assert!(rows.iter().any(|c| c.value == ".price:"));
+    }
+
+    #[test]
+    fn parse_model_filter_remains_data_driven() {
+        // `.sort:coding` consumed into the filter, not the search terms.
+        let (search, f) = Repl::parse_model_filter(".sort:coding");
+        assert_eq!(search.trim(), "");
+        assert_eq!(f.sort.as_deref(), Some("coding"));
+        // `.price:0.5` parsed as number.
+        let (_, f) = Repl::parse_model_filter(".price:0.5");
+        assert_eq!(f.price, Some(0.5));
+        // Empty value clears.
+        let (_, f) = Repl::parse_model_filter(".sort:");
+        assert_eq!(f.sort, None);
+        // Free-form number captured.
+        let (_, f) = Repl::parse_model_filter(".context:100");
+        assert_eq!(f.min_context, Some(100));
+        // Search terms still fall through.
+        let (search, _) = Repl::parse_model_filter("deepseek .price:0.1");
+        assert_eq!(search.trim(), "deepseek");
+    }
+
+    #[test]
     fn parse_tree_id_angle_brackets_only() {
         // Angle-bracketed → entry id.
         assert_eq!(
@@ -5921,6 +6168,65 @@ mod tests {
             path: None,
         };
         ActiveOverlay::from_buffer(buf, &ctx, &settings, false, &[])
+    }
+
+    fn model_overlay(buf: &str) -> ActiveOverlay {
+        let ctx = tree_ctx();
+        let settings = SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        ActiveOverlay::from_buffer(buf, &ctx, &settings, false, &[])
+    }
+
+    #[test]
+    fn from_buffer_model_bare_dot_promotes_to_modifier_overlay() {
+        match model_overlay("/model .") {
+            ActiveOverlay::Mod { rows, want_value } => {
+                assert!(!want_value, "bare dot => modifier names");
+                assert!(!rows.is_empty());
+                assert!(rows.iter().any(|c| c.value == ".sort:"));
+            }
+            other => panic!("expected Mod for '/model .', got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_model_sort_colon_promotes_to_value_overlay() {
+        match model_overlay("/model .sort:") {
+            ActiveOverlay::Mod { rows, want_value } => {
+                assert!(want_value, "`.sort:` => enumerated value phase");
+                assert!(rows.iter().any(|c| c.value == ".sort:coding"));
+            }
+            other => panic!("expected Mod for '/model .sort:', got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[test]
+    fn from_buffer_model_plain_filter_stays_in_list() {
+        // A non-dotted filter must NOT promote to the modifier overlay.
+        match model_overlay("/model deep "){
+            ActiveOverlay::Model { .. } => {}
+            other => panic!("expected Model for '/model deep ', got disc {:?}", other.overlay_disc()),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_buffer_model_complete_modifier_returns_to_list() {
+        // A fully-specified `.name:value` has nothing left to complete → the
+        // modifier overlay hands back to the list (which the user Enters).
+        match model_overlay("/model .sort:coding"){
+            ActiveOverlay::Model { .. } => {}
+            other => panic!("expected Model for complete '.sort:coding', got disc {:?}", other.overlay_disc()),
+        }
     }
 
     #[test]

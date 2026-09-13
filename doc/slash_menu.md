@@ -142,6 +142,30 @@ states the navigation keys exactly; keep it consistent.
   Enter's structural step**: Tab on a list row completes the token that
   promotes (same editor state as Enter on that row, minus the commit).
 
+### 4.1 Dotted-modifier auto-complete (`.sort:`, `.price:`, …)
+
+Some lists accept **`.*` filter modifiers** (e.g. `/model .sort:coding`,
+`/model .price:0.5`). These are made discoverable with a data-driven
+auto-complete overlay (`ActiveOverlay::Mod`), so the option set stays in one
+place:
+
+- **A bare `.` (e.g. `/model .`) lists every modifier** with a one-line
+  description, so the option set is always discoverable.
+- **Typing `.s` narrows by fuzzy match** to `.sort:`; **Tab/Enter** fills the
+  token `.sort:` (staying in the menu for the value step).
+- For **enumerated** modifiers (`.sort:`), the overlay then lists the **fixed
+  value set** (fuzzy-filtered as you type) — `.sort:most-popular`, `.sort:coding`,
+  etc. Choosing one rewrites the token and returns to the list.
+- For **free-form numeric** modifiers (`.coding:`, `.price:`, …), a bare `.coding`
+  shows the single name as a hint; once `.coding:` is typed the overlay hands
+  back to the list so you can type the number.
+- A fully-formed `.name:value` returns to the list (nothing left to complete).
+
+The parser (`parse_model_filter`) and the overlay both read the same
+`MODEL_MODIFIERS` table, so **adding a modifier is one entry in that table**
+(plus, if it targets a new field, a field on `ModelFilter` and a match arm in
+`apply_modifier`). Escape from the modifier overlay returns to `/model `.
+
 ---
 
 ## 5. On final accept: the prompt self-documents
@@ -253,7 +277,7 @@ action should instead be in this header *before* the action.
 
 | Command | Levels | Commit example | Key helpers |
 | --- | --- | --- | --- |
-| `/model` | list → Enter | `/model anthropic:claude-…` → `InputAction::SetModel` | `model_overlay_entries`, `active_entry_id` |
+| `/model` | list → filter modifiers → Enter | `/model anthropic:claude-…` → `InputAction::SetModel` | `model_overlay_entries`, `active_entry_id`, `modifier_overlay_entries` (`.` prefix) |
 | `/thinking` off/low/med/high | list → Enter | `/thinking high` → `SetThinking` | `thinking_overlay_entries` |
 | `/set <key>` | list → value eval | `editor.set("/set <key> ")` promotion; `SettingsVal` value-errors rendered red above title | `parse_settings`, `filtered_value_candidates` |
 | `/persona` | list → Enter | `/persona none` → `SetPersona` | `setting_value_candidates` |

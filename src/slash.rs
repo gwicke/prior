@@ -44,8 +44,8 @@ pub fn registry() -> &'static [SlashCommand] {
         },
         SlashCommand {
             name: "/model",
-            help: "Select a model (provider:name) with limits and cost",
             kind: SlashKind::Model,
+            help: "Select a model (provider:name); type . for filter options (.sort: .price: ...)",
         },
         SlashCommand {
             name: "/set",
