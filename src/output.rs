@@ -1,6 +1,7 @@
 use console::{style, StyledObject};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
+use similar::{ChangeTag, TextDiff};
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::io::IsTerminal;
@@ -1219,6 +1220,39 @@ impl ConsoleOutput {
         }
     }
 
+    /// Render a unified diff for a successful edit operation.
+    /// Shows only changed hunks with 2 lines of context around each change.
+    fn render_edit_diff(&self, old_text: &str, new_text: &str) {
+        let diff = TextDiff::from_lines(old_text, new_text);
+        let mut unified = diff.unified_diff();
+        unified.context_radius(2);
+
+        let mut any_changes = false;
+        for hunk in unified.iter_hunks() {
+            any_changes = true;
+            // Render hunk header: @@ -old_start,old_count +new_start,new_count @@
+            let header = hunk.header();
+            let header_str = format!("{}", header);
+            self.tool_panel(&header_str, false, true);
+
+            // Render each line in the hunk with proper diff markers
+            for change in hunk.iter_changes() {
+                let marker = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                // change.value() includes the line content (without trailing newline)
+                let line = format!("{}{}", marker, change.value());
+                self.tool_panel(&line, false, true);
+            }
+        }
+
+        if !any_changes {
+            self.tool_panel("(no changes)", false, true);
+        }
+    }
+
     fn create_spinner(message: &str) -> ProgressBar {
         let pb = ProgressBar::new_spinner();
         pb.enable_steady_tick(Duration::from_millis(120));
@@ -1555,6 +1589,46 @@ impl Output for ConsoleOutput {
             ) {
                 self.tool_panel(ui, true, true);
                 return;
+            }
+        }
+
+        // Check for successful edit_file result and render a diff preview
+        // Success format: "Replaced N block(s) in <path>"
+        let is_edit_success = result.starts_with("Replaced") && result.contains("block");
+
+        if is_edit_success {
+            if let Some((tool_name, args)) = self.last_tool.lock().unwrap().as_ref() {
+                if tool_name.eq_ignore_ascii_case("edit_file")
+                    || tool_name.eq_ignore_ascii_case("edit")
+                {
+                    // Extract edits from args (supports both canonical `edits` array and legacy single-edit)
+                    if let Some(arr) = args.get("edits").and_then(|v| v.as_array()) {
+                        // Canonical format: edits array
+                        if !arr.is_empty() {
+                            // Print a brief success header first
+                            self.tool_panel(result, false, false);
+
+                            // Render diff for each edit
+                            for edit in arr {
+                                if let (Some(old_text), Some(new_text)) = (
+                                    edit.get("oldText").and_then(|v| v.as_str()),
+                                    edit.get("newText").and_then(|v| v.as_str()),
+                                ) {
+                                    self.render_edit_diff(old_text, new_text);
+                                }
+                            }
+                            return;
+                        }
+                    } else if let (Some(old_text), Some(new_text)) = (
+                        args.get("oldText").and_then(|v| v.as_str()),
+                        args.get("newText").and_then(|v| v.as_str()),
+                    ) {
+                        // Legacy single-edit format
+                        self.tool_panel(result, false, false);
+                        self.render_edit_diff(old_text, new_text);
+                        return;
+                    }
+                }
             }
         }
 
@@ -2372,6 +2446,64 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn render_edit_diff_shows_unified_diff_with_context() {
+        let out = ConsoleOutput::default();
+        out.begin_capture_inner();
+
+        let old_text = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
+        let new_text = "fn main() {\n    let x = 42;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
+        out.render_edit_diff(old_text, new_text);
+
+        let captured = out.end_capture_inner();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain the hunk header
+        assert!(output.contains("@@"), "should contain hunk header");
+        // Should show the change
+        assert!(output.contains("-    let x = 1;"), "should show removed line");
+        assert!(output.contains("+    let x = 42;"), "should show added line");
+        // Should show context lines
+        assert!(output.contains("    let y = 2;"), "should show context line");
+        assert!(output.contains("    println!"), "should show context line");
+    }
+
+    #[test]
+    fn render_edit_diff_handles_multiple_hunks() {
+        let out = ConsoleOutput::default();
+        out.begin_capture_inner();
+
+        let old_text = "fn foo() {\n    let a = 1;\n}\n\nfn bar() {\n    let b = 2;\n}\n";
+        let new_text = "fn foo() {\n    let a = 10;\n}\n\nfn bar() {\n    let b = 20;\n}\n";
+        out.render_edit_diff(old_text, new_text);
+
+        let captured = out.end_capture_inner();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain two hunk headers
+        let hunk_count = output.matches("@@").count();
+        assert_eq!(hunk_count, 2, "should have two hunks, got: {}", output);
+        // Should show both changes
+        assert!(output.contains("-    let a = 1;"));
+        assert!(output.contains("+    let a = 10;"));
+        assert!(output.contains("-    let b = 2;"));
+        assert!(output.contains("+    let b = 20;"));
+    }
+
+    #[test]
+    fn render_edit_diff_no_changes_shows_message() {
+        let out = ConsoleOutput::default();
+        out.begin_capture_inner();
+
+        let text = "fn main() {\n    let x = 1;\n}\n";
+        out.render_edit_diff(text, text);
+
+        let captured = out.end_capture_inner();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        assert!(output.contains("no changes"), "should show 'no changes' message");
     }
 
     #[test]
