@@ -775,7 +775,7 @@ fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
 
     // Compact diff preview: removed lines, then added lines, capped so huge
     // replacements don't flood the scrollback.
-    const MAX: usize = 8;
+    const MAX: usize = 14;
     let old_lines: Vec<&str> = first.old_text.split('\n').collect();
     let new_lines: Vec<&str> = first.new_text.split('\n').collect();
     let clip = |lines: &[&str]| -> Vec<String> {
