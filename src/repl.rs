@@ -434,13 +434,6 @@ pub(crate) enum ActiveOverlay {
         active: Option<usize>,
     },
 
-    DefaultModel {
-        entries: Vec<model_catalog::ModelEntry>,
-        filter: ModelFilter,
-        /// Index of the currently-active model (for the `*` marker).
-        active: Option<usize>,
-    },
-
     Thinking {
         levels: Vec<thinking::ThinkingLevel>,
     },
@@ -1128,40 +1121,6 @@ impl ActiveOverlay {
                 }
                 let opts = table.render_multiline(avail);
                 ("Personas  (up/down, Enter select, Esc back)",
-                 opts, *active, false)
-            }
-            ActiveOverlay::DefaultModel { entries, filter: _, active } => {
-                if entries.is_empty() {
-                    return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
-                            vec!["(no matches)".into()], None, false);
-                }
-                let avail = crate::output::term_width().saturating_sub(2);
-                let mut table = Table::new(&["Model", "Ctx", "Coding", "Cost", "?"])
-                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Left])
-                    .with_min_widths(&[12, 5, 6, 14, 3])
-                    .with_priorities(&[3, 1, 1, 2, 1])
-                    .set_gap(2);
-                for e in entries {
-                    table.add_row(&[
-                        e.qualified(),
-                        model_catalog::ctx_cell(e),
-                        model_catalog::coding_index_cell(e),
-                        model_catalog::cost_cell(e),
-                        model_catalog::reason_cell(e),
-                    ]);
-                }
-                let rows = table.render_multiline(avail);
-                let opts: Vec<String> = rows.into_iter().enumerate().map(|(i, row)| {
-                    if model_catalog::provider_available(&entries[i].provider) {
-                        row
-                    } else {
-                        row.lines()
-                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                }).collect();
-                ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                  opts, *active, false)
             }
             ActiveOverlay::Stat { lines } => {
@@ -2002,7 +1961,6 @@ impl ActiveOverlay {
             ActiveOverlay::TreeAction { .. } => 16,
             ActiveOverlay::SwitchAction { .. } => 17,
             ActiveOverlay::CompactSummary { .. } => 18,
-            ActiveOverlay::DefaultModel { .. } => 19,
         }
     }
 
@@ -2983,7 +2941,7 @@ impl Repl {
     }
 
     /// Candidate values for a setting's value-pick overlay.
-    fn setting_value_candidates(key: SettingKey, ctx: &ReplCtx, vq: Option<&str>) -> Vec<ValueCandidate> {
+    fn setting_value_candidates(key: SettingKey, _ctx: &ReplCtx, vq: Option<&str>) -> Vec<ValueCandidate> {
         match key {
             SettingKey::SecurityMode => vec![
                 ValueCandidate { display: "confirm".into(), value: "confirm".into(), desc: "ask before each tool call".into() },
@@ -3007,12 +2965,6 @@ impl Repl {
                 v.push(ValueCandidate { display: "none".into(), value: String::new(), desc: "no persona".into() });
                 v
             }
-            SettingKey::DefaultModel => {
-                let filter = vq.unwrap_or("").trim().to_string();
-                let (entries, active) = Self::model_selection_overlay_entries(ctx, &filter, false);
-                entries.iter().map(Self::model_candidate).collect()
-            }
-            SettingKey::ToolCallLimit => Vec::new(),
             SettingKey::ShowReasoning => vec![
                 ValueCandidate { display: "disabled".into(), value: "disabled".into(), desc: "show neither indicator nor reasoning text".into() },
                 ValueCandidate { display: "indicator".into(), value: "indicator".into(), desc: "show only a Thinking… spinner".into() },
@@ -3024,6 +2976,12 @@ impl Repl {
             ],
             SettingKey::SessionResumeReplayTurns => Vec::new(),
             SettingKey::LlmCompactPrompt => Vec::new(),
+            SettingKey::ToolCallLimit => Vec::new(),
+            SettingKey::DefaultModel => {
+                let filter = vq.unwrap_or("").trim().to_string();
+                let (entries, _active) = Self::model_selection_overlay_entries(_ctx, &filter, false);
+                entries.iter().map(Self::model_candidate).collect()
+            }
         }
     }
 
