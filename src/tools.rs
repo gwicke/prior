@@ -240,7 +240,7 @@ impl EditArgs {
         }
 
         Err(format!(
-            "Send valid JSON parameters like:\n{}\nActual parameters received: {}",
+            "Send valid JSON parameters like:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
             EDIT_ARGS_EXAMPLE,
             truncate_wire_repr(raw),
         ))
