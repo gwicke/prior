@@ -748,38 +748,71 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
 
 /// Best-effort line range + diff preview for an edit tool call.
 ///
-/// Uses the first edit in the `edits` slice. Locates `old_text` in the current
-/// file contents (the edit has not run yet, so the text still matches) to
-/// derive the 1-based `[start..end]` line window, and emits a refined unified
-/// diff preview of the change. A failed read, missing old_text, or empty edits
-/// all degrade gracefully to `(None, [])` so the caller just prints `edit
-/// <path>` with no range/diff.
+/// The refined unified diff for **every** edit in the batch is derived from
+/// each edit's `old_text` vs `new_text`, so all diffs render even when the file
+/// can't be read or `old_text` has drifted (e.g. session replay after the edit
+/// already applied). Each unioned `@@` hunk header already conveys the change
+/// regions, so small batches concatenate their diffs directly with no
+/// separators or labels; very large batches are truncated so the preview
+/// doesn't flood the scrollback. The 1-based line *range* in the label
+/// reflects the first edit and requires reading the file and finding its
+/// `old_text`; otherwise the range is omitted but the diffs are still shown.
+/// Empty edits yield `(None, [])`.
 fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
     let first = match edits.first() {
         Some(e) => e,
         None => return (None, Vec::new()),
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (None, Vec::new());
-    };
-    let Some(idx) = content.find(&first.old_text) else {
-        return (None, Vec::new());
-    };
-    // 1-based line number of the first line of `old_text`.
-    let start = content[..idx].matches('\n').count() + 1;
-    let end = start + first.old_text.matches('\n').count();
-    let range = if start == end {
-        format!("{start}")
-    } else {
-        format!("{start}..{end}")
-    };
 
-    // Compact diff preview: refined unified diff (removed/added lines plus two
-    // lines of context) capped so huge replacements don't flood the scrollback.
-    // Each returned line carries its marker (`-`/`+`/` `) with no trailing
-    // newline, ready for `tool_panel`'s diff-marker coloring.
-    let diff = refined_diff_lines(&first.old_text, &first.new_text);
-    (Some(range), diff)
+    // The refined diffs are derived purely from each edit's oldText vs newText,
+    // so they are always available — even during replay or after the target text
+    // has drifted in the on-disk file. Only the 1-based line *range* requires
+    // reading the file and finding `old_text` in its current contents; a
+    // missing/read-error file or a no-longer-present oldText degrades to a
+    // `None` range while still yielding the diff previews.
+    const MAX_OUT: usize = 80;
+    let mut diff: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for edit in edits {
+        if diff.len() >= MAX_OUT {
+            truncated = true;
+            break;
+        }
+        for line in refined_diff_lines(&edit.old_text, &edit.new_text) {
+            if diff.len() >= MAX_OUT {
+                truncated = true;
+                break;
+            }
+            diff.push(line);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if truncated {
+        diff.push("    … (diff truncated)".to_string());
+    }
+
+    let range = (|| {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return None;
+        };
+        let Some(idx) = content.find(&first.old_text) else {
+            return None;
+        };
+        // 1-based line number of the first line of `old_text`.
+        let start = content[..idx].matches('\n').count() + 1;
+        let end = start + first.old_text.matches('\n').count();
+        Some(if start == end {
+            format!("{start}")
+        } else {
+            format!("{start}..{end}")
+        })
+    })();
+
+    (range, diff)
 }
 
 /// Build a refined unified-diff preview of `old -> new`.
@@ -2345,7 +2378,9 @@ mod tests {
         });
         let (label, diff) = get_preview("edit_file", &args);
         assert_eq!(label, "edit /no/such/file.rs");
-        assert!(diff.is_empty());
+        // The refined diff is derived purely from oldText/newText, so it is
+        // shown even when the file cannot be read (e.g. during replay).
+        assert_eq!(diff, vec!["@@ -1 +1 @@", "- a", "+ b"], "diff should come from old/new: {diff:?}");
     }
 
     #[test]
@@ -2359,8 +2394,37 @@ mod tests {
         });
         let (label, diff) = get_preview("edit_file", &args);
         assert_eq!(label, "edit /no/such/file.rs");
-        // File doesn't exist, so no range, but the edit was recognized.
-        assert!(diff.is_empty(), "nonexistent file yields no diff: {diff:?}");
+        // File doesn't exist, so no range, but the diff is still rendered from
+        // oldText/newText (this is what guarantees replay shows the edits).
+        assert_eq!(diff, vec!["@@ -1 +1 @@", "- a", "+ b"], "diff should come from oldText/newText: {diff:?}");
+    }
+
+    #[test]
+    fn get_preview_edit_multiple_edits_in_batch() {
+        // A multi-edit batch should render a diff for each edit, concatenated
+        // directly (the `@@` headers already distinguish the change regions),
+        // so a single tool call previews every change it makes.
+        let args = serde_json::json!({
+            "path": "/no/such/file.rs",
+            "edits": [
+                {"oldText": "a", "newText": "b"},
+                {"oldText": "x", "newText": "y"}
+            ]
+        });
+        let (label, diff) = get_preview("edit_file", &args);
+        assert_eq!(label, "edit /no/such/file.rs");
+        assert_eq!(
+            diff,
+            vec![
+                "@@ -1 +1 @@",
+                "- a",
+                "+ b",
+                "@@ -1 +1 @@",
+                "- x",
+                "+ y",
+            ],
+            "each batch edit should produce its own diff: {diff:?}"
+        );
     }
 
     #[test]
