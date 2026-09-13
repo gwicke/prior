@@ -1,5 +1,5 @@
 use crate::output::Confirmation;
-use crate::repl::{InputAction, Repl, ReplCtx};
+use crate::repl::{InputAction, Repl, ReplCtx, ModelFilter};
 use crate::settings::SettingsStore;
 use crate::session::Session;
 use crate::session::repo::SessionRepo;
@@ -3597,6 +3597,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                     tree,
                     leaf_id,
                     context_tokens,
+                    model_filter: ModelFilter::default_for_coding(),
                 };
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop

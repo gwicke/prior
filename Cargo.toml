@@ -47,6 +47,7 @@ shellexpand = "3.1"
 path-clean = "1.0"
 uuid = { version = "1.0", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+urlencoding = "2.1"
 
 [features]
 default = []
