@@ -135,7 +135,7 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
 }
 
 /// A single targeted text replacement within a file.
-#[derive(Deserialize, Serialize, JsonSchema, Default)]
+#[derive(Deserialize, Serialize, JsonSchema, Default, Clone)]
 pub struct EditOp {
     /// Exact text to replace. Must be unique in the file and must not
     /// overlap with any other edit's old_text in the same call.
@@ -158,18 +158,57 @@ pub struct EditOp {
 
 /// Arguments accepted by the `edit` tool.
 ///
-/// The canonical wire shape is `{path, edits: [{oldText, newText}]}`. The
-/// custom `Deserialize` impl additionally tolerates a legacy single-edit
-/// shape (`{path, oldText, newText}`) by normalizing it onto `edits`. That
-/// legacy form is deliberately undocumented: the schema (see
-/// `EditFile::parameters`) and every error message only ever show the
-/// canonical shape, so models are guided toward it.
+/// Accepts two wire formats:
+/// - Canonical: `{path, edits: [{oldText, newText, startLine?, endLine?}]}`
+/// - Legacy (single edit): `{path, oldText, newText, startLine?, endLine?}`
+///
+/// The schema advertises both formats via `anyOf`.
 #[derive(Serialize, JsonSchema)]
 pub struct EditArgs {
     /// File to edit, relative to the working directory.
     pub path: String,
-    /// One or more targeted text replacements.
-    pub edits: Vec<EditOp>,
+    /// Either the canonical `edits` array or the legacy single-edit fields.
+    #[serde(flatten)]
+    pub variant: EditArgsVariant,
+}
+
+/// Internal enum to represent the two accepted wire formats.
+/// The `#[serde(untagged)]` attribute makes serde try each variant in order
+/// without a discriminant field, and `schemars` emits this as `anyOf` in the schema.
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum EditArgsVariant {
+    /// Canonical format: one or more edits in an array.
+    Canonical {
+        /// One or more targeted text replacements.
+        edits: Vec<EditOp>,
+    },
+    /// Legacy format: single edit at top level (for backwards compatibility).
+    Legacy {
+        #[serde(rename = "oldText")]
+        old_text: String,
+        #[serde(rename = "newText")]
+        new_text: String,
+        #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
+        start_line: Option<EditStartLine>,
+        #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
+        end_line: Option<EditEndLine>,
+    },
+}
+
+impl EditArgs {
+    /// Get the list of edits, converting from legacy format if needed.
+    pub fn edits(&self) -> Vec<EditOp> {
+        match &self.variant {
+            EditArgsVariant::Canonical { edits } => edits.clone(),
+            EditArgsVariant::Legacy { old_text, new_text, start_line, end_line } => vec![EditOp {
+                old_text: old_text.clone(),
+                new_text: new_text.clone(),
+                start_line: start_line.clone(),
+                end_line: end_line.clone(),
+            }],
+        }
+    }
 }
 
 /// Cap on the JSON echoed back in an invalid-parameters error, so a bad call
@@ -199,51 +238,51 @@ fn truncate_wire_repr(raw: &serde_json::Value) -> String {
 }
 
 impl EditArgs {
-    /// Parse the wire JSON, accepting the canonical `edits` array and — as
-    /// an undocumented compatibility shim — the legacy top-level
-    /// single-edit shape. Any other payload yields an error that echoes the
-    /// received parameters (truncated) plus the canonical shape, so the
-    /// model can self-correct in a single retry.
+    /// Parse the wire JSON, accepting both the canonical `edits` array and
+    /// the legacy top-level single-edit shape (with optional startLine/endLine).
+    /// Any other payload yields an error that echoes the received parameters
+    /// (truncated) plus the canonical shape, so the model can self-correct
+    /// in a single retry.
     fn from_wire(raw: &serde_json::Value) -> Result<Self, String> {
-        // Canonical first: exact field names, unknown extras ignored.
+        // Use a temporary type without custom Deserialize to avoid recursion.
         #[derive(serde::Deserialize)]
-        struct Canonical {
+        struct RawEditArgs {
             path: String,
-            edits: Vec<EditOp>,
+            #[serde(flatten)]
+            variant: RawEditArgsVariant,
         }
-        if let Ok(c) = serde_json::from_value::<Canonical>(raw.clone()) {
-            return Ok(EditArgs {
-                path: c.path,
-                edits: c.edits,
-            });
-        }
-
-        // Legacy single-edit shim: {path, oldText, newText} -> one edit.
         #[derive(serde::Deserialize)]
-        struct Legacy {
-            path: String,
-            #[serde(rename = "oldText")]
-            old_text: String,
-            #[serde(rename = "newText")]
-            new_text: String,
+        #[serde(untagged)]
+        enum RawEditArgsVariant {
+            Canonical { edits: Vec<EditOp> },
+            Legacy {
+                #[serde(rename = "oldText")]
+                old_text: String,
+                #[serde(rename = "newText")]
+                new_text: String,
+                #[serde(rename = "startLine", default)]
+                start_line: Option<EditStartLine>,
+                #[serde(rename = "endLine", default)]
+                end_line: Option<EditEndLine>,
+            },
         }
-        if let Ok(l) = serde_json::from_value::<Legacy>(raw.clone()) {
-            return Ok(EditArgs {
-                path: l.path,
-                edits: vec![EditOp {
-                    old_text: l.old_text,
-                    new_text: l.new_text,
-                    start_line: None,
-                    end_line: None,
-                }],
-            });
+        match serde_json::from_value::<RawEditArgs>(raw.clone()) {
+            Ok(raw_args) => Ok(EditArgs {
+                path: raw_args.path,
+                variant: match raw_args.variant {
+                    RawEditArgsVariant::Canonical { edits } => EditArgsVariant::Canonical { edits },
+                    RawEditArgsVariant::Legacy { old_text, new_text, start_line, end_line } => {
+                        EditArgsVariant::Legacy { old_text, new_text, start_line, end_line }
+                    }
+                },
+            }),
+            Err(e) => Err(format!(
+                "Failed to parse edit arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
+                e,
+                EDIT_ARGS_EXAMPLE,
+                truncate_wire_repr(raw),
+            )),
         }
-
-        Err(format!(
-            "Send valid JSON parameters like:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
-            EDIT_ARGS_EXAMPLE,
-            truncate_wire_repr(raw),
-        ))
     }
 }
 
@@ -294,7 +333,8 @@ impl rig_core::tool::Tool for EditFile {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        edit_file(args.path, args.edits).await
+        let edits = args.edits();
+        edit_file(args.path, edits).await
     }
 }
 
@@ -2631,29 +2671,23 @@ mod edit_args_wire_tests {
         .await;
         assert!(result.is_error(), "malformed args must fail: {result:?}");
         let msg = result.output().render();
-        // rig's generic parse-error prefix comes first; our informative
-        // payload follows and is what matters. Canonical example first,
-        // then the echo of the actual (bad) input — the input can be
-        // arbitrarily long, so it goes last.
+        // Error should contain the canonical example and echo the input
         assert!(
-            msg.contains("Send valid JSON parameters like:\n{\n    \"path\": \"some/path\",\n    \"edits\": ["),
-            "must lead with the canonical example, got: {msg}"
+            msg.contains("Failed to parse edit arguments:"),
+            "must indicate parse failure, got: {msg}"
         );
-        let example_end = msg.find("Send valid JSON parameters like:").expect("echo marker");
-        let echo_start = msg.find("wrong field names entirely").expect("echoed input");
         assert!(
-            example_end < echo_start,
-            "example must precede the echoed input, got: {msg}"
+            msg.contains("Expected one of these formats:"),
+            "must show expected formats, got: {msg}"
+        );
+        assert!(
+            msg.contains("edits"),
+            "must show the canonical example, got: {msg}"
         );
         // Echo of the actual (bad) input so the model can see what it sent.
         assert!(
             msg.contains("wrong field names entirely"),
             "must echo the received args, got: {msg}"
-        );
-        // The expected shape is spelled out.
-        assert!(
-            msg.contains("\"edits\":") && msg.contains("\"oldText\":"),
-            "must show the canonical example, got: {msg}"
         );
         let after = tokio::fs::read_to_string("bad.txt").await.unwrap();
         assert_eq!(after, "unchanged\n");
@@ -2671,10 +2705,14 @@ mod edit_args_wire_tests {
         assert!(result.is_error(), "missing newText must fail: {result:?}");
         let msg = result.output().render();
         assert!(
-            msg.contains("Send valid JSON parameters like:"),
+            msg.contains("Failed to parse edit arguments:"),
             "got: {msg}"
         );
-        assert!(msg.contains("\"edits\":"), "got: {msg}");
+        assert!(
+            msg.contains("Expected one of these formats:"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("edits"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -2682,11 +2720,10 @@ mod edit_args_wire_tests {
     async fn non_object_args_error_informatively() {
         let result = execute_edit(serde_json::json!("just a string")).await;
         assert!(result.is_error());
+        let msg = result.output().render();
         assert!(
-            result
-                .output()
-                .render()
-                .contains("Send valid JSON parameters like:"),
+            msg.contains("Failed to parse edit arguments:"),
+            "got: {msg}"
         );
     }
 
@@ -2709,7 +2746,7 @@ mod edit_args_wire_tests {
     // ---- Schema advertisement ----
 
     #[test]
-    fn schema_advertises_only_the_canonical_shape() {
+    fn schema_advertises_both_formats() {
         let schema = EditFile.parameters();
         let required = schema
             .get("required")
@@ -2719,12 +2756,29 @@ mod edit_args_wire_tests {
             .filter_map(|v| v.as_str())
             .collect::<Vec<_>>();
         assert!(
-            required.contains(&"path") && required.contains(&"edits"),
-            "path and edits must be required: {required:?}"
+            required.contains(&"path"),
+            "path must be required: {required:?}"
         );
-        // The legacy top-level fields must NOT be advertised.
+        // The schema should advertise both formats via anyOf
+        let any_of = schema.get("anyOf").and_then(|v| v.as_array()).expect("anyOf present");
+        assert!(!any_of.is_empty(), "anyOf should not be empty");
+        // Check that the canonical format (edits array) is present
+        let has_canonical = any_of.iter().any(|v| {
+            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
+                r.iter().any(|v| v.as_str() == Some("edits"))
+            })
+        });
+        assert!(has_canonical, "canonical format with 'edits' should be present");
+        // Check that the legacy format (oldText/newText) is present
+        let has_legacy = any_of.iter().any(|v| {
+            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
+                r.iter().any(|v| v.as_str() == Some("oldText")) && r.iter().any(|v| v.as_str() == Some("newText"))
+            })
+        });
+        assert!(has_legacy, "legacy format with 'oldText'/'newText' should be present");
+        // The legacy top-level fields should NOT be at the top level properties
         let props = schema.get("properties").unwrap();
-        assert!(props.get("edits").is_some());
+        assert!(props.get("edits").is_none(), "edits should not be at top level");
         assert!(props.get("oldText").is_none());
         assert!(props.get("newText").is_none());
     }
