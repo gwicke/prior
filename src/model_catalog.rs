@@ -274,6 +274,11 @@ pub fn reason_cell(e: &ModelEntry) -> String {
     if e.reasoning { "✓".to_string() } else { "✗".to_string() }
 }
 
+/// Cell text for the `Coding` column showing the Artificial Analysis coding index.
+pub fn coding_index_cell(e: &ModelEntry) -> String {
+    e.coding_index.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "—".to_string())
+}
+
 /// Human-readable one-line description for the `/model` picker.
 /// When the local `DIRECT_PRICING` table has no explicit cost, the OpenRouter
 /// (per-token) price is shown instead, tagged `(est)` — it's in the ballpark.
@@ -358,12 +363,14 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
 /// Parameters for filtering/sorting the model list (client-side only).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelFilterParams {
-    /// Sort order: "most-popular", "created", "coding", "intelligence", "agentic", "price_input", "price_output"
+    /// Sort order: "most-popular", "created", "coding", "intelligence", "agentic", "price_input", "price_output", "price", "coding_price", "intelligence_price", "agentic_price"
     pub sort: Option<String>,
     /// Maximum prompt (input) price per million tokens
     pub price_input: Option<f64>,
     /// Maximum output (completion) price per million tokens
     pub price_output: Option<f64>,
+    /// Maximum combined price (input + output) per million tokens
+    pub price: Option<f64>,
     /// Minimum coding index (0-100)
     pub min_coding_index: Option<f32>,
     /// Minimum intelligence index (0-100)
@@ -437,6 +444,18 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
             "price_output" => {
                 entries.sort_by(|a, b| a.completion_cost.unwrap_or(f64::MAX).partial_cmp(&b.completion_cost.unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
             }
+            "price" => {
+                entries.sort_by(|a, b| combined_price(a).unwrap_or(f64::MAX).partial_cmp(&combined_price(b).unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            "coding_price" => {
+                entries.sort_by(|a, b| price_to_index_ratio(b, b.coding_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.coding_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            "intelligence_price" => {
+                entries.sort_by(|a, b| price_to_index_ratio(b, b.intelligence_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.intelligence_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            "agentic_price" => {
+                entries.sort_by(|a, b| price_to_index_ratio(b, b.agentic_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.agentic_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+            }
             _ => {}
         }
     }
@@ -444,25 +463,26 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
     entries
 }
 
-/// Refresh the catalog cache in the background (fetches from OpenRouter with default params).
-pub async fn refresh_catalog() -> Vec<ModelEntry> {
-    catalog().await
+/// Compute combined price (input + output) for a model entry.
+fn combined_price(e: &ModelEntry) -> Option<f64> {
+    match (e.prompt_cost, e.completion_cost) {
+        (Some(p), Some(c)) => Some(p + c),
+        _ => None,
+    }
 }
 
-/// Look up a curated direct price; fall back to OpenRouter's price (estimate)./// Look up a curated direct price; fall back to OpenRouter's price (estimate).
-fn direct_price(
-    ns: &str,
-    model: &str,
-    or_pc: Option<f64>,
-    or_cc: Option<f64>,
-) -> (Option<f64>, Option<f64>, CostSource) {
-    if let Some(row) = DIRECT_PRICING
-        .iter()
-        .find(|(p, m, _, _, _, _)| *p == ns && *m == model)
-    {
-        (Some(row.3), Some(row.4), CostSource::Direct)
-    } else {
-        (or_pc, or_cc, CostSource::OpenRouterEstimate)
+/// Compute price-to-index ratio for a model entry.
+/// Uses a nominal minimal fee (0.0000001) for free models so they sort before paid models
+/// but still have relative ordering based on their indices.
+fn price_to_index_ratio(e: &ModelEntry, index: Option<f32>) -> Option<f64> {
+    let total_price = combined_price(e);
+    match (total_price, index) {
+        (Some(p), Some(i)) if p <= 0.0 && i > 0.0 => {
+            // Free model with index: use nominal minimal fee for sorting
+            Some(i as f64 / 0.0000001)
+        }
+        (Some(p), Some(i)) if p > 0.0 => Some(i as f64 / p),
+        _ => None,
     }
 }
 
@@ -494,6 +514,29 @@ fn static_fallback() -> Vec<ModelEntry> {
     }
     entries
 }
+
+/// Refresh the catalog cache in the background (fetches from OpenRouter with default params).
+pub async fn refresh_catalog() -> Vec<ModelEntry> {
+    catalog().await
+}
+
+/// Look up a curated direct price; fall back to OpenRouter's price (estimate)./// Look up a curated direct price; fall back to OpenRouter's price (estimate).
+fn direct_price(
+    ns: &str,
+    model: &str,
+    or_pc: Option<f64>,
+    or_cc: Option<f64>,
+) -> (Option<f64>, Option<f64>, CostSource) {
+    if let Some(row) = DIRECT_PRICING
+        .iter()
+        .find(|(p, m, _, _, _, _)| *p == ns && *m == model)
+    {
+        (Some(row.3), Some(row.4), CostSource::Direct)
+    } else {
+        (or_pc, or_cc, CostSource::OpenRouterEstimate)
+    }
+}
+
 
 /// Live ids from a provider's native `/models` endpoint (best-effort).
 async fn native_models(provider: &str) -> Vec<String> {
