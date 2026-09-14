@@ -1579,6 +1579,7 @@ impl ActiveOverlay {
         dirty: &mut bool,
         value_error: &mut Option<String>,
         help_view: &mut bool,
+        ctx: &ReplCtx,
     ) -> OverlayAction {
         match self {
             ActiveOverlay::CommandList { cmds } => {
@@ -1634,13 +1635,34 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::Thinking { rows, .. } => {
-                if let Some(r) = rows.get(sel) {
-                    let line = format!("/thinking {}", r.id);
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    OverlayAction::Action(InputAction::SetThinking(r.id.clone()))
-                } else {
-                    OverlayAction::Continue
+            ActiveOverlay::Thinking { .. } => {
+                // v2 engine owns the Enter flow: bare level → drill
+                // (buffer "/thinking ", value menu shows); partial value →
+                // complete; valid value → SetThinking.
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                match engine.interpreter.enter(&line) {
+                    crate::slashdot_menu::interpreter::OverlayAction::Buffer(b) => {
+                        editor.set(&format!("/{}", b));
+                        OverlayAction::Continue
+                    }
+                    crate::slashdot_menu::interpreter::OverlayAction::Submit(canon) => {
+                        // canon is "thinking <level>"; translate to the
+                        // host action directly (no commit echo needed —
+                        // agent.rs prints the level change).
+                        let level = canon
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .to_string();
+                        let echo = format!("/thinking {}", level);
+                        Repl::emit_commit(
+                            output, editor, redraw, sel, input_row, &echo, "", false,
+                        );
+                        OverlayAction::Action(InputAction::SetThinking(level))
+                    }
+                    _ => OverlayAction::Continue,
                 }
             }
             ActiveOverlay::Persona { cands, .. } => {
@@ -2543,6 +2565,7 @@ impl Repl {
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
                                         settings, dirty, &mut value_error, &mut help_view,
+                                        ctx,
                                     ) {
                                         OverlayAction::Continue => {}
                                         OverlayAction::Action(action) => return Some(action),
@@ -8014,6 +8037,21 @@ mod tests {
         let mut dirty = false;
         let mut value_error: Option<String> = None;
         let mut help_view = false;
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree: vec![],
+            leaf_id: None,
+            context_tokens: 0,
+            model_filter: ModelFilter::default_for_coding(),
+            thinking_level: None,
+        };
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8024,6 +8062,7 @@ mod tests {
             &mut dirty,
             &mut value_error,
             &mut help_view,
+            &ctx,
         );
         match action {
             OverlayAction::Action(InputAction::Submit(line)) => {
@@ -8066,6 +8105,21 @@ mod tests {
         let mut dirty = false;
         let mut value_error: Option<String> = None;
         let mut help_view = false;
+        let ctx = ReplCtx {
+            provider: "p".into(),
+            model: "m".into(),
+            recent: vec![],
+            persona: None,
+            session_usage: Default::default(),
+            repo: None,
+            current_session_id: "s".into(),
+            branch_messages: vec![],
+            tree: vec![],
+            leaf_id: None,
+            context_tokens: 0,
+            model_filter: ModelFilter::default_for_coding(),
+            thinking_level: None,
+        };
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8076,6 +8130,7 @@ mod tests {
             &mut dirty,
             &mut value_error,
             &mut help_view,
+            &ctx,
         );
         match action {
             OverlayAction::Continue => {

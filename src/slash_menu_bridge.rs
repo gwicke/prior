@@ -219,6 +219,21 @@ mod tests {
         assert!(st.candidates.len() < 4);
     }
 
+    /// Regression: `/thinking` (bare, no trailing word) + Enter must drill
+    /// (buffer "/thinking "), not submit the level name as a level value
+    /// ("thinking thinking" → "unknown thinking level").
+    #[test]
+    fn thinking_enter_bare_drills_not_submits() {
+        let mut e = MenuEngine::new(&ctx());
+        let act = e.interpreter.enter("thinking");
+        assert_eq!(act, OverlayAction::Buffer("thinking ".to_string()));
+        // Sanity: a completed value still submits.
+        assert_eq!(
+            e.interpreter.enter("thinking med"),
+            OverlayAction::Submit("thinking med".to_string())
+        );
+    }
+
     /// Regression: `/thinking` + Tab (no trailing word) must expand to
     /// `/thinking ` so the value menu shows (same as Enter). The host
     /// re-adds the leading slash.
