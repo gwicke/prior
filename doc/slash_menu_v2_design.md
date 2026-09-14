@@ -73,6 +73,9 @@ no separate stateful-handler interface is needed:
   Because the engine is persistent (§12), closures never go stale.
 - **Leaf handlers** are plain closures; per-leaf mutable state, when needed,
   lives in the handler instance itself (a closure capturing its own cell).
+  Leaf handlers perform app-data mutations directly through the shared
+  handles they captured (see the host-outcome split in §9) — the host
+  applies only control flow, messages, and redraw.
 - **Confirm flows** are *two handlers*, not one stateful handler (revised
   from D5's "single stateful instance"): the `leaf_handler` performs the
   prep step and returns a "confirm pending" result (payload it wants the
@@ -423,13 +426,22 @@ is generic over the host's action type. It carries:
   **return a new path** (buffer rewrite, e.g. `/compact` →
   `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy),
   pause for confirm (§9), launch the editor, interstitial text;
-- an **opaque action payload** `T` the engine treats as uninterpreted data
-  (host picks `T = InputAction`). The host translates the payload to its
-  action directly — no canonical-line re-parsing, no per-command
-  translation table.
+- a **narrow host-outcome payload** `T` the engine treats as uninterpreted
+  data — *only* the effects belonging to the REPL outer loop, not app-data
+  mutations: `flow` (stay in menu / commit line / quit), an optional
+  success/error message, and the redraw signal. App-data mutations
+  (set model, write session, update recents, trigger a background refresh)
+  are performed **by the handlers themselves** via the shared handles they
+  captured at build time — they run at accept time, after the frame's
+  engine decisions are made, so there is no re-entrancy into the engine's
+  ongoing work. The consequence: app state a handler mutates must live in
+  shared cells (single-threaded `Rc<RefCell>`), not in loop-owned
+  `&mut` borrows — an explicit app-side structuring step.
 
 Purity comes from the crate boundary + generics (the engine compiles
-without knowing what `T` is), not from an intermediate result vocabulary.
+without knowing what `T` is), not from an intermediate result vocabulary;
+the host applies only what only the host *can* apply (control flow,
+terminal, transcript).
 
 ---
 
@@ -484,7 +496,7 @@ without knowing what `T` is), not from an intermediate result vocabulary.
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache) carried as opaque engine-owned data; handlers read app state at call time; no rebuild, no Arcs (§2, §12). |
 | Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
-| Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; app action as opaque `T`. No canonical-line re-parsing (§9). |
+| Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only. App-data mutations live in handlers; no canonical-line re-parsing (§9). |
 
 ---
 
@@ -532,17 +544,18 @@ they need (§2).
   by handlers at call time (§2), never passed through engine constructors;
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
-- dispatching the leaf result's opaque action payload to `InputAction`
-  (SetModel, SetThinking, Quit, …) — generic `T`, engine-typed as data
-  only (§9). Engine purity rests on the crate boundary + generics, not on
-  an intermediate result vocabulary;
+- applying the leaf result's narrow host outcome: control flow (commit /
+  quit / stay), messages, redraw. App-data mutations happen in handlers
+  (§9) via shared handles; the host loop applies only what the outer loop
+  owns. Engine purity rests on the crate boundary + generics, not on an
+  intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
 
 | Layer | Owns |
 | --- | --- |
 | Engine (pure) | descriptor, prompt-derived state, per-activation state (cursor/frames/cache), key decisions |
-| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`active_selector`, §5.1) |
+| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`active_selector`, §5.1); perform app-data mutations directly via shared handles |
 | Host | app state itself, terminal I/O, rendering the plan, translating `LeafResult` → `InputAction` |
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the

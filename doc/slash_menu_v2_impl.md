@@ -315,13 +315,16 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    `take`/`restore` pair. The host holds it between keypresses and never
    inspects it. Migrate the existing carry points (key loop, buffer
    re-derives, Tab/Enter/arrow arms).
-2. **Engine constructors lose ctx**: `MenuEngine::new(root: MenuNode)` +
-   handler registration, no `ctx`/`for_model` parameters. The host builds
-   descriptors once per activation; handlers are closures capturing
-   `&ReplCtx` (or `&SettingsStore`) created at build time and read at
-   call time (read-borrows; leaf *mutations* still flow via the result —
-   handlers never mutate app state directly, and any cross-call scratch
-   state is an `Rc<RefCell<>>` owned by the closure, single-threaded).
+2. **Engine constructors lose ctx; shared app-state cells**: 
+   `MenuEngine::new(root: MenuNode)` + handler registration, no
+   `ctx`/`for_model` parameters. The host builds descriptors once per
+   activation; handlers are closures created at build time and read app
+   state at call time. **App state that handlers mutate** (model, persona,
+   settings, session store) moves into shared cells (`Rc<RefCell<>>`,
+   single-threaded) owned by the REPL so loop `&mut` uses and handler
+   writes agree on one storage — an explicit structuring step, sequenced
+   before the handler migration. Data providers keep plain read-borrows
+   for fetch-time reads where no mutation is needed.
    Bridge constructors collapse; `for_model`'s filter capture disappears
    (the provider derives its filter from the modifiers the engine passes
    to `fetch`, reading catalog state via ctx closure).
@@ -336,9 +339,13 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    `confirm` property deprecated). `LeafResult` becomes generic
    `LeafResult<T>` (design §9): menu-semantic variants (close, new path,
    pause, editor, interstitial) stay engine-typed; the app action is the
-   opaque `T` (host = `InputAction`). Leaf handlers return
-   `(outcome, action)` — the host stops re-parsing canonical lines into
-   SlashKind. Prep leaf returns a payload; the confirm step invokes
+   opaque `T` = the **narrow host outcome**: control flow (commit / quit /
+   stay), optional success/error message, redraw signal (design §9).
+   App-data mutations (SetModel, SetPersona, session writes, LRU, catalog
+   refresh triggers) move *into* the leaf handlers via the shared cells
+   from step 2 — the host stops re-parsing canonical lines into SlashKind
+   and its dispatch table shrinks to flow+message. Prep leaf returns a
+   payload; the confirm step invokes
    `confirm_handler(payload)`. Migrate `/tree <id> compact llm` and
    `/session … delete` to the pair; drop `ConfirmState` instance threading
    and the translation table.
