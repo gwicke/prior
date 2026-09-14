@@ -144,6 +144,15 @@ impl slashdot_menu::provider::DataProvider for SessionProvider {
             ..Default::default()
         }
     }
+
+    /// The current session row (`*` marker); `None` when no current id.
+    fn active_selector(&self) -> Option<String> {
+        if self.current_id.is_empty() {
+            None
+        } else {
+            Some(self.current_id.clone())
+        }
+    }
 }
 
 /// DataProvider over the model catalog (§10 step 4). One-shot fetch:
@@ -156,6 +165,16 @@ pub struct ModelProvider {
 }
 
 impl slashdot_menu::provider::DataProvider for ModelProvider {
+    /// The currently-active model row (`*` marker, design §5.1): the id
+    /// handed in at build time, resolved against the candidate set.
+    fn active_selector(&self) -> Option<String> {
+        if self.active_id.is_empty() {
+            None
+        } else {
+            Some(self.active_id.clone())
+        }
+    }
+
     fn fetch(
         &mut self,
         _modifiers: &[slashdot_menu::grammar::ModifierToken],

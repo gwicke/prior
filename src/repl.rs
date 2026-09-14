@@ -670,6 +670,11 @@ impl ActiveOverlay {
             ("", after)
         };
         match word {
+            _ if Self::bare_listing_word(buf) => {
+                // Phase 6.6 uniform listing rule (design §3): a bare
+                // listing command stays in the root list (pinned).
+                return Self::root_list_overlay(ctx, buf, rest, cursors);
+            }
             "model" | "models" | "m" => {
                 let filter = rest.trim().to_string();
                 // If the trailing token is a dotted-modifier prefix (starting
@@ -1246,21 +1251,59 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                // v2 engine root list (Phase 6 step 2): the command registry
-                // IS the root descriptor; the engine ranks and pins. The
-                // sticky cursor map (Phase 6.5) seeds `active` so arrow
-                // moves survive the per-frame engine rebuild.
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
-                engine.restore_cursors(cursors.clone());
-                let line = buf.trim_start_matches('/').to_string();
-                let st = engine.interpreter.state(&line);
-                ActiveOverlay::CommandList {
-                    cmds: slash::filter_commands(rest),
-                    engine_rows: st.candidates.clone(),
-                    engine_active: st.active,
-                }
+                Self::root_list_overlay(ctx, buf, rest, cursors)
             }
         }
+    }
+
+    /// v2 engine root list (Phase 6 step 2): the command registry IS the
+    /// root descriptor; the engine ranks and pins. The sticky cursor map
+    /// (Phase 6.5) seeds `active` so arrow moves survive the per-frame
+    /// rebuild. Phase 6.6: a *bare* listing command (e.g. `/model`, no
+    /// trailing space) is routed here too (uniform listing rule, design
+    /// §3) — the interpreter's `state(line)` pins that command at the root,
+    /// so the root list shows with it highlighted; only a trailing space or
+    /// terms drills into the command's own dialog.
+    fn root_list_overlay(
+        ctx: &ReplCtx,
+        buf: &str,
+        rest: &str,
+        cursors: &slashdot_menu::interpreter::CursorMap,
+    ) -> Self {
+        let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+        engine.restore_cursors(cursors.clone());
+        let line = buf.trim_start_matches('/').to_string();
+        let st = engine.interpreter.state(&line);
+        ActiveOverlay::CommandList {
+            cmds: slash::filter_commands(rest),
+            engine_rows: st.candidates.clone(),
+            engine_active: st.active,
+        }
+    }
+
+    /// Phase 6.6 uniform listing rule (design §3): a *bare* listing command
+    /// ("/model", no space in the buffer) stays in the root command list,
+    /// already pinned/highlighted by the interpreter. A trailing space or
+    /// any following token drills into that command's dialog. Returns
+    /// `true` if the caller should render the root list instead.
+    fn bare_listing_word(buf: &str) -> bool {
+        // A listing command is bare when the buffer holds exactly the
+        // command token (no space → no drill-in, no terms).
+        !buf.contains(' ')
+            && Self::is_listing_command(&buf[1..])
+    }
+
+    /// Is `word` a listing command (has its own dialog)? Phase 6.6: the
+    /// uniform trailing-space rule applies only to these; leaves still
+    /// submit directly.
+    fn is_listing_command(word: &str) -> bool {
+        matches!(word, "model" | "models" | "m"
+            | "thinking" | "think" | "t"
+            | "set" | "s"
+            | "persona" | "personas" | "p"
+            | "session" | "sessions"
+            | "tree"
+            | "sandbox" | "sb")
     }
 
     /// Display parameters: `(title, logical options, active index, wrap_opts)`.
@@ -6898,6 +6941,67 @@ mod tests {
     }
 
     #[test]
+    fn from_buffer_bare_listing_command_shows_root_list() {
+        // Phase 6.6 uniform listing rule (design §3): a bare listing
+        // command (no trailing space) stays in the root command list,
+        // pinned/highlighted — it must NOT open the command's dialog.
+        for (buf, word) in [
+            ("/model", "model"),
+            ("/thinking", "thinking"),
+            ("/set", "set"),
+            ("/persona", "persona"),
+            ("/session", "session"),
+            ("/tree", "tree"),
+            ("/sandbox", "sandbox"),
+        ] {
+            match model_overlay(buf) {
+                ActiveOverlay::CommandList { engine_rows, engine_active, .. } => {
+                    // The pinned command is the cursor row: the row whose
+                    // id equals the command must be active.
+                    assert!(
+                        engine_rows.get(engine_active).map(|r| r.id.as_str())
+                            == Some(word),
+                        "expected cursor on pinned {word:?}, got active={engine_active} rows={:?}",
+                        engine_rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
+                    );
+                }
+                other => panic!(
+                    "expected root CommandList for bare {buf:?} (listing rule), \
+                     got disc {:?}",
+                    other.overlay_disc()
+                ),
+            }
+            let _ = word;
+        }
+    }
+
+    #[test]
+    fn from_buffer_trailing_space_opens_listing_dialog() {
+        // The same command WITH a trailing space drills into its dialog.
+        match model_overlay("/model ") {
+            ActiveOverlay::Model { .. } => {}
+            other => panic!(
+                "expected Model for '/model ' (drill in), got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+        match model_overlay("/set ") {
+            ActiveOverlay::Settings { .. } => {}
+            other => panic!(
+                "expected Settings for '/set ' (drill in), got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+        match model_overlay("/thinking ") {
+            ActiveOverlay::Thinking { .. } => {}
+            other => panic!(
+                "expected Thinking for '/thinking ' (drill in), got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+    }
+
+    #[test]
     fn from_buffer_tree_id_promotes_to_action_menu() {
         let ov = tree_overlay("/tree <root-entry>");
         match ov {
@@ -8340,7 +8444,7 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let ov = ActiveOverlay::from_buffer("/tree ", &ctx, &settings, false, &[]);
         let (title, opts, active, _) = ov.display_rows();
         assert!(
             opts.iter().any(|r| r.contains("compaction")),
@@ -8421,7 +8525,7 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let ov = ActiveOverlay::from_buffer("/tree ", &ctx, &settings, false, &[]);
         let (_title, opts, active, _) = ov.display_rows();
         // m0, a0, c1 all reachable; c1 is the active row.
         assert!(opts.iter().any(|r| r.contains("kept prompt")), "got: {opts:#?}");
@@ -8485,7 +8589,7 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let ov = ActiveOverlay::from_buffer("/tree", &ctx, &settings, false, &[]);
+        let ov = ActiveOverlay::from_buffer("/tree ", &ctx, &settings, false, &[]);
         let (_title, opts, active, _) = ov.display_rows();
         // Every visible label must show.
         for needle in &["first prompt", "first answer", "compaction", "after compact 1", "after compact answer", "after compact 2"] {

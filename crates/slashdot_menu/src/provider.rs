@@ -40,6 +40,17 @@ pub trait DataProvider {
     /// interpreter applies front-end filters/sorting.
     fn fetch(&mut self, modifiers: &[ModifierToken]) -> DataResult;
 
+    /// The id of the row that is *currently active* (design §5.1): the
+    /// real-world current state the menu reflects before any change — the
+    /// active model, the current session, the current tree leaf, the
+    /// current thinking level. The engine resolves it to the `*`-marked
+    /// row per frame; a fresh menu (no sticky cursor) seeds its cursor on
+    /// it. `None` when no row is "currently in effect" (e.g. the root
+    /// command list has none).
+    fn active_selector(&self) -> Option<String> {
+        None
+    }
+
     /// Live-filter fetch: called per level change. `Ok(LiveResult::NotChanged)`
     /// keeps the current view narrowing in place.
     fn fetch_live(&mut self, query: &str, modifiers: &[ModifierToken]) -> LiveResult {

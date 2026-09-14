@@ -260,6 +260,7 @@ mod tests {
             active: 0,
             pin_lost: false,
             level_is_dynamic: false,
+            active_row_marker: None,
         }
     }
 

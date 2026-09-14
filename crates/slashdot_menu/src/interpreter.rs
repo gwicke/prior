@@ -32,6 +32,12 @@ pub struct MenuState {
     pub pin_lost: bool,
     /// The displayed level is a dynamic (data-provider) level.
     pub level_is_dynamic: bool,
+    /// The row that is *currently in effect* (`*` marker, design §5.1),
+    /// from the provider's `active_selector` (or enum/static analogue),
+    /// resolved against `candidates`. `None` when no row is active (root
+    /// command list, or the selector didn't resolve). Distinct from
+    /// `active` (the cursor row), though a fresh cursor seeds on it.
+    pub active_row_marker: Option<usize>,
 }
 
 impl MenuState {
@@ -213,9 +219,19 @@ impl Interpreter {
         }
     }
 
-    /// Does `word` name a selection at `node`'s level? Exact key match for
-    /// static children; permissive for value-typed children (any token).
-    /// Does `word` name a selection at `node`'s level? Exact key match for
+/// Resolve the provider's `active_selector` against the candidate `rows`
+/// (design §5.1). Uses an immutable borrow of `dynamic_paths` so it can be
+/// called while `dynamic_rows` caching holds a mutable borrow elsewhere.
+fn resolve_active_selector(
+    path_key: &str,
+    providers: &std::collections::HashMap<String, Box<dyn DataProvider>>,
+    rows: &[Row],
+) -> Option<usize> {
+    let id = providers.get(path_key)?.active_selector()?;
+    rows.iter().position(|r| r.id == id)
+}
+
+/// Does `word` name a selection at `node`'s level? Exact key match for
     /// static children; permissive for value-typed children (any token).
     fn is_selection_at(node: &MenuNode) -> SelectionRule {
         if node.dynamic {
@@ -348,13 +364,35 @@ impl Interpreter {
             .cursors
             .get(&path_key)
             .cloned();
+        // `*` row (design §5.1): resolve the provider's active selector
+        // against the ranked candidates. Dynamic levels use the provider;
+        // enum/static value levels resolve a pre-pinned selector below.
+        let active_row_marker = if node.dynamic {
+            Self::resolve_active_selector(
+                &path_key,
+                &self.dynamic_paths,
+                &rank.rows,
+            )
+        } else {
+            // Static/level: a pinned selection naming the active value (or
+            // an enum set carrying an active selector) — see §5.1. For
+            // listing levels with no explicit selector, None.
+            selection
+                .as_ref()
+                .and_then(|sel| rank.rows.iter().position(|r| &r.id == sel))
+                .filter(|_| node.value.is_some())
+        };
+
         let active = match stored {
+            // Sticky cursor present → keep it (clamped).
             Some((idx, prev_sel, prev_terms))
                 if prev_sel == selection && prev_terms == lvl.terms =>
             {
                 idx.min(rank.rows.len().saturating_sub(1))
             }
-            _ => rank.active,
+            // Fresh level → seed the cursor on the active row if any,
+            // else the derived pin.
+            _ => active_row_marker.unwrap_or(rank.active),
         };
         self.cursors.insert(
             path_key,
@@ -370,6 +408,7 @@ impl Interpreter {
             active,
             pin_lost: !rank.pinned_survived && lvl.selection.is_some(),
             level_is_dynamic: node.dynamic,
+            active_row_marker,
         }
     }
 
@@ -383,10 +422,18 @@ impl Interpreter {
         dynamic: bool,
     ) -> MenuState {
         let path_key = path.join(" ");
+        // `*` marker (design §5.1) on the drilled level, from the provider
+        // (dynamic) — the current-state row the cursor seeds on when fresh.
+        let active_row_marker = if dynamic {
+            Self::resolve_active_selector(&path_key, &self.dynamic_paths, &rows)
+        } else {
+            None
+        };
         let stored = self.cursors.get(&path_key).cloned();
-        let active = stored
-            .map(|(idx, _, _)| idx.min(rows.len().saturating_sub(1)))
-            .unwrap_or(0);
+        let active = match stored {
+            Some((idx, _, _)) => idx.min(rows.len().saturating_sub(1)),
+            None => active_row_marker.unwrap_or(0),
+        };
         self.cursors
             .insert(path_key, (active, None, String::new()));
         MenuState {
@@ -398,6 +445,7 @@ impl Interpreter {
             active,
             pin_lost: false,
             level_is_dynamic: dynamic,
+            active_row_marker,
         }
     }
 
@@ -890,6 +938,47 @@ mod tests {
         let st = i.state("model model-b");
         assert_eq!(st.selection.as_deref(), Some("model-b"));
         assert_eq!(st.active, 1);
+    }
+
+    #[test]
+    fn active_selector_seeds_cursor_and_marker() {
+        // design §5.1: a dynamic provider's active_selector() becomes the
+        // `*` row, and a fresh drilled level seeds its cursor on it.
+        struct Sel {
+            rows: Vec<crate::fields::Row>,
+            active: String,
+        }
+        impl crate::provider::DataProvider for Sel {
+            fn fetch(&mut self, _m: &[crate::grammar::ModifierToken]) -> crate::provider::DataResult {
+                crate::provider::DataResult {
+                    rows: self.rows.clone(),
+                    ..Default::default()
+                }
+            }
+            fn active_selector(&self) -> Option<String> {
+                Some(self.active.clone())
+            }
+        }
+        let rows = dyn_provider_rows(); // model-a, model-b, model-c
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(Sel { rows: rows.clone(), active: "model-b".into() }),
+        );
+        let st = i.state("model ");
+        // Active model is model-b (index 1): fresh cursor AND marker land there.
+        assert_eq!(st.active_row_marker, Some(1));
+        assert_eq!(st.active, 1);
+
+        // A sticky cursor (arrow move) overrides the marker for the cursor,
+        // while the marker stays pinned to the active row.
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(Sel { rows, active: "model-b".into() }),
+        );
+        i.move_cursor("model ", 2);
+        let st = i.state("model ");
+        assert_eq!(st.active, 2);
+        assert_eq!(st.active_row_marker, Some(1));
     }
 
     #[test]
