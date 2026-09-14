@@ -257,6 +257,13 @@ impl MenuEngine {
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
                 }
+                "compact" => {
+                    // §10 step 6/R8-8: leaf that returns a rewritten path —
+                    // pure sugar over /tree (no parallel hierarchy).
+                    *c = MenuNode::new("compact")
+                        .desc("compact the session at the current position")
+                        .leaf();
+                }
                 "stat" => {
                     // §10 step 8: interstitial, no leaf (D4) — second Enter
                     // dismisses; text lives in the node property.
@@ -361,6 +368,15 @@ impl MenuEngine {
         controller.register(
             &["replay"],
             Box::new(|inv: &LeafInvocation| LeafResult::Done(Some(inv.line.clone()))),
+        );
+        // /compact (R8-8): leaf returns the rewritten /tree path; the host
+        // resolves the target id (needs tree ctx) via NewPath with the
+        // sentinel "<last-user>" the host replaces.
+        controller.register(
+            &["compact"],
+            Box::new(|_inv: &LeafInvocation| {
+                LeafResult::NewPath("tree <last-user> compact ".to_string())
+            }),
         );
         // /thinking <level>: translate to SetThinking via the leaf result
         // convention — Done(Some(msg)) closes; the *action* is carried by

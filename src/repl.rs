@@ -782,6 +782,9 @@ impl ActiveOverlay {
                 }
             }
             "compact" => {
+                // v2 (R8-8): /compact is a leaf whose accept rewrites the
+                // path to /tree <last-user-id> compact . The resolved
+                // CompactSummary view below is the *rewritten* menu state.
                 // `/compact` auto-resolves `target_id` to the last
                 // user message on the active branch, so the committed
                 // line is `/tree <last_user_id> compact <mode>` and
