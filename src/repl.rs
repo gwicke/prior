@@ -752,15 +752,15 @@ impl ActiveOverlay {
                 }
             }
             "stat" | "stats" => {
-                // Load the current session's metadata (name, created, last
-                // update, message_count) so the panel can render a session:
-                // section alongside the model/context stats. Falls back to
-                // `None` when the repo is unavailable (e.g. tests) so the
-                // model section still renders cleanly.
+                // v2 engine (Phase 6 step 8): the interstitial phase lives
+                // in AcceptController (D4); the panel lines still render
+                // from the v1 stats path.
                 let session_info = Repl::current_session_stats_info(ctx);
                 let lines = crate::agent::session_stats_lines(
                     &ctx.provider, &ctx.model, ctx.session_usage, session_info,
                 );
+                // D4 phase: first Enter shows (this arm); the phase is
+                // tracked in `stat_phase` and flipped by the Enter handler.
                 ActiveOverlay::Stat { lines }
             }
             "replay" => {
@@ -2517,6 +2517,9 @@ impl Repl {
         // replays newest-first (previous filter state + cursor) before
         // structural pops. Cleared when the user edits the line.
         let mut menu_frames: Vec<slash_menu_bridge::Frame> = Vec::new();
+        // D4 interstitial phase for /stat: first Enter shows the panel,
+        // second Enter dismisses the menu entirely.
+        let mut stat_phase = false;
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -2900,6 +2903,18 @@ impl Repl {
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    // D4: /stat second Enter dismisses the
+                                    // menu (interstitial with no leaf).
+                                    if matches!(overlay, ActiveOverlay::Stat { .. }) {
+                                        if stat_phase {
+                                            editor.set("");
+                                            stat_phase = false;
+                                            continue;
+                                        }
+                                        stat_phase = true;
+                                    } else {
+                                        stat_phase = false;
+                                    }
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
                                         settings, dirty, &mut value_error, &mut help_view,

@@ -257,6 +257,23 @@ impl MenuEngine {
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
                 }
+                "stat" => {
+                    // §10 step 8: interstitial, no leaf (D4) — second Enter
+                    // dismisses; text lives in the node property.
+                    *c = MenuNode::new("stat")
+                        .desc("session stats: context window, usage, cost, cache hit")
+                        .interstitial("context window, token usage, cost, cache hit rate");
+                }
+                "replay" => {
+                    // Interstitial + leaf (D4): first Enter shows the help
+                    // panel, next Enter invokes the replay.
+                    *c = MenuNode::new("replay")
+                        .desc("re-render session history")
+                        .interstitial(
+                            "replay: 10 = last 10 turns, 10t = turns, 10l = lines\n                             Examples: /replay  /replay 5  /replay 50l",
+                        )
+                        .leaf();
+                }
                 "sandbox" => {
                     // §10 step 7: static subcommand children (add_ro/add_rw
                     // with back-end fs modifier value completion; remove is
@@ -339,6 +356,12 @@ impl MenuEngine {
     }
 
     fn register_handlers(controller: &mut AcceptController) {
+        // /replay: leaf → the host submits the line (agent.rs handles the
+        // actual replay rendering). Signal via Done with the echo line.
+        controller.register(
+            &["replay"],
+            Box::new(|inv: &LeafInvocation| LeafResult::Done(Some(inv.line.clone()))),
+        );
         // /thinking <level>: translate to SetThinking via the leaf result
         // convention — Done(Some(msg)) closes; the *action* is carried by
         // the picocode side reading the canonical line.
