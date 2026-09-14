@@ -350,6 +350,28 @@ impl Interpreter {
 
     /// Core of Tab: returns the rewritten buffer, optionally flagged as a
     /// promotion (drill with trailing space).
+    /// Does the node the current selection points at have a child menu
+    /// (static children or a value child)? Such nodes promote on Tab when
+    /// the level is otherwise empty.
+    fn tab_promotes(root: &MenuNode, st: &MenuState) -> bool {
+        // Resolve the node the selection lands on: walk node_path, then
+        // the pinned selection if present.
+        let mut node = root.clone();
+        for p in &st.node_path {
+            if let Some(c) = node.child(p) {
+                node = c.clone();
+            }
+        }
+        if let Some(sel) = &st.selection {
+            if let Some(c) = node.child(sel) {
+                node = c.clone();
+            } else {
+                return false; // pinned id is a dynamic row or value: no child menu
+            }
+        }
+        !node.children.is_empty() || node.value.is_some()
+    }
+
     fn tab_inner(&mut self, line: &str) -> TabResult {
         let st = self.state(line);
         let Some(sel) = st.selected() else {
@@ -363,6 +385,17 @@ impl Interpreter {
             // Pinned/drilled level: complete the active candidate of the
             // displayed level as a pinned selection.
             parts.push(token.clone());
+        } else if st.terms.is_empty() && Self::tab_promotes(&self.root, &st) {
+            // Bare level with nothing typed at the child level (the pinned
+            // word is the level name itself, e.g. "/thinking" on a root
+            // child): Tab promotes exactly like Enter — trailing space so
+            // the child/value menu shows. The full line is node_path +
+            // the pinned level-name selection.
+            let mut full = parts.clone();
+            if let Some(sel) = &st.selection {
+                full.push(sel.clone());
+            }
+            return TabResult::BufferDrill(full.join(" "));
         } else {
             // Trailing word handling:
             // - Static level: the last word is the selection-in-progress

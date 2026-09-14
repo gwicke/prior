@@ -219,31 +219,21 @@ mod tests {
         assert!(st.candidates.len() < 4);
     }
 
-    /// Regression: `/thinking` + Tab (no trailing word) must keep the
-    /// command prefix — "/thinking" + active completion, not just "thinking".
-    /// The buffer keeps its leading slash through the engine round-trip.
+    /// Regression: `/thinking` + Tab (no trailing word) must expand to
+    /// `/thinking ` so the value menu shows (same as Enter). The host
+    /// re-adds the leading slash.
     #[test]
     fn thinking_tab_preserves_slash_prefix() {
         let mut e = MenuEngine::new(&ctx());
-        // Engine-level: Tab on bare "thinking" (no trailing word) drills
-        // into the level (trailing space) — the host re-adds the slash.
+        // Bare level: Tab promotes (drill), host re-adds the slash.
         let act = e.interpreter.tab("thinking");
-        match act {
-            OverlayAction::Buffer(b) => {
-                let host_line = format!("/{}", b);
-                assert!(
-                    host_line.starts_with("/thinking"),
-                    "prefix lost: {:?}", host_line
-                );
-            }
-            other => panic!("expected buffer, got {:?}", other),
-        }
-        // Host-level round trip: "/thinking h" → "/thinking high".
+        assert_eq!(act, OverlayAction::Buffer("thinking ".to_string()));
+        assert_eq!(format!("/{}", "thinking "), "/thinking ");
+        // Partial value: Tab completes, prefix intact.
         let act2 = e.interpreter.tab("thinking h");
         assert_eq!(
             act2,
             OverlayAction::Buffer("thinking high".to_string())
         );
-        assert_eq!(format!("/{}", "thinking high"), "/thinking high");
     }
 }
