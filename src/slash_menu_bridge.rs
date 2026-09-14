@@ -19,6 +19,39 @@ use crate::slashdot_menu::{
 pub struct Frame {
     pub line: String,
     pub cursor: usize,
+    /// Level identity: the node path this frame belongs to. Edit
+    /// invalidation is scoped per level — typing at a deep branch does not
+    /// discard the filter state of ancestor levels.
+    pub level: Vec<String>,
+}
+
+/// Compute a level's path identity from a prompt line: the node path the
+/// interpreter walks to (pinned level-name selections included).
+fn level_of(engine: &mut MenuEngine, line: &str) -> Vec<String> {
+    let st = engine.interpreter.state(line);
+    let mut path = st.node_path.clone();
+    // A pinned selection whose node is a level (has children/value) IS the
+    // level name (e.g. "thinking" pinned at root = the thinking level).
+    if let Some(sel) = &st.selection {
+        if let Some(node) = resolve_node(&engine.interpreter.root, &path, sel) {
+            if !node.children.is_empty() || node.value.is_some() {
+                path.push(sel.clone());
+            }
+        }
+    }
+    path
+}
+
+fn resolve_node(
+    root: &crate::slashdot_menu::node::MenuNode,
+    path: &[String],
+    sel: &str,
+) -> Option<crate::slashdot_menu::node::MenuNode> {
+    let mut node = root.clone();
+    for p in path {
+        node = node.child(p)?.clone();
+    }
+    node.child(sel).cloned()
 }
 
 /// The shared menu engine, built per prompt iteration from picocode state.
@@ -141,7 +174,7 @@ impl MenuEngine {
     /// Push a traversal frame when an accept/drill rewrote the buffer
     /// downward (the pre-accept prompt + cursor are the "back" target).
     fn push_frame_on(
-        &self,
+        &mut self,
         ix_action: OverlayAction,
         line: &str,
         cursor: usize,
@@ -157,9 +190,36 @@ impl MenuEngine {
                 frames.push(Frame {
                     line: line.to_string(),
                     cursor,
+                    level: level_of(self, line),
                 });
             }
         }
+    }
+
+    /// Edit invalidation (design review, scoped): when the user edits the
+    /// line, drop the traversal memory *of the current level only* — a
+    /// deeply nested drill-down keeps its ancestors' filter state.
+    ///
+    /// Criterion: the edit is attributed to the level whose segment changed
+    /// (`prev_line`'s level when the line had menu state). Removing *only*
+    /// a trailing space is navigation (returning to the parent menu), not
+    /// an edit — the level segment is unchanged, so nothing is cleared.
+    pub fn on_edit(
+        &mut self,
+        prev_line: &str,
+        line: &str,
+        frames: &mut Vec<Frame>,
+    ) -> bool {
+        // Pure trailing-space removal: navigation, keep everything.
+        if prev_line.trim_end() == line.trim_end() {
+            return false;
+        }
+        // Attribute the edit to the level of the *previous* line (the one
+        // the user was editing); clear that level's frames.
+        let edited_level = level_of(self, prev_line);
+        let before = frames.len();
+        frames.retain(|f| &f.level != &edited_level);
+        frames.len() != before
     }
 
     /// Cursor-agnostic step (engine default row).
@@ -358,6 +418,29 @@ mod tests {
         let mut frames: Vec<Frame> = Vec::new();
         let r = e.step_at("thinking med", 0, HostKey::Esc, &mut frames);
         assert_eq!(r.buffer, Some("thinking ".to_string()));
+    }
+
+    /// Scoped edit invalidation: an ID edit at the current level clears
+    /// that level's frames; deeper edits keep ancestor levels' state; and
+    /// a pure trailing-space removal is navigation (clears nothing).
+    #[test]
+    fn on_edit_scoped_invalidation() {
+        let mut e = MenuEngine::new(&ctx());
+        let mut frames: Vec<Frame> = Vec::new();
+        // Build depth: accept "thinking" (frame at root level), then drill.
+        let _ = e.step_at("thinking", 0, HostKey::Tab, &mut frames);
+        let _ = e.step_at("thinking ", 0, HostKey::Tab, &mut frames);
+        // Two frames, both at the thinking level (value child has no deeper
+        // static level): "thinking" (pre-accept) and "thinking " (pre-pin).
+        assert_eq!(frames.len(), 2);
+        // ID edit at the same level → both cleared (same level identity).
+        assert!(e.on_edit("thinking off", "thinking low", &mut frames));
+        assert!(frames.is_empty());
+        // Trailing-space removal → navigation, nothing cleared.
+        let _ = e.step_at("thinking", 0, HostKey::Tab, &mut frames);
+        assert_eq!(frames.len(), 1);
+        assert!(!e.on_edit("thinking ", "thinking", &mut frames));
+        assert_eq!(frames.len(), 1);
     }
 
     /// Frames are pushed on drill too: Esc from a drilled child returns to

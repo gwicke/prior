@@ -2604,6 +2604,7 @@ impl Repl {
                                     path_completions.clear();
                                     completion_pos = None;
                                 }
+                                let prev_line = editor.text();
                                 if let Some(a) = Self::edit_key(
                                     key, &mut editor, history, &mut nav, &mut draft, prompt)
                                 {
@@ -2611,6 +2612,17 @@ impl Repl {
                                         redraw(&LineEditor::new(), &[], sel, &mut input_row);
                                     }
                                     return Some(a);
+                                }
+                                // Content edit on a v2 menu line: scoped
+                                // traversal-memory invalidation. The engine
+                                // compares the edited line's level segment;
+                                // removing only a trailing space is
+                                // navigation (parent menu), not an edit.
+                                let now = editor.text();
+                                if now.starts_with('/') || prev_line.starts_with('/') {
+                                    let mut engine =
+                                        slash_menu_bridge::MenuEngine::new(ctx);
+                                    let _ = engine.on_edit(&prev_line, &now, &mut menu_frames);
                                 }
                             }
                         }
