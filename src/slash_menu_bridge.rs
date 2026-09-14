@@ -492,6 +492,47 @@ mod tests {
         );
     }
 
+    /// Persona level (Phase 6 step 3): PERSONAS + "none" as a value child.
+    #[test]
+    fn persona_level_from_registry() {
+        let mut e = MenuEngine::new(&ctx());
+        let st = e.interpreter.state("persona ");
+        let ids: Vec<&str> = st.candidates.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"none"));
+        assert!(!ids.is_empty());
+        // Filter by prefix.
+        let st2 = e.interpreter.state("persona none");
+        assert_eq!(st2.selection.as_deref(), Some("none"));
+        // Accept semantics: Tab pins path+id only.
+        assert_eq!(
+            e.interpreter.tab("persona none"),
+            OverlayAction::Buffer("persona none".to_string())
+        );
+    }
+
+    /// Settings levels (Phase 6 step 3): SETTINGS children exist with
+    /// value children per ValueKind; pinned setting drills to its values.
+    #[test]
+    fn settings_levels_from_metadata() {
+        let mut e = MenuEngine::new(&ctx());
+        // Enum setting: security_mode.
+        let st = e.interpreter.state("set security_mode ");
+        assert_eq!(st.node_path, vec!["set", "security_mode"]);
+        assert_eq!(
+            st.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["yolo", "confirm"]
+        );
+        // Int setting: Number value child (no static candidates).
+        let st2 = e.interpreter.state("set tool_call_limit ");
+        assert_eq!(st2.node_path, vec!["set", "tool_call_limit"]);
+        // FreeText setting: plain leaf (no value child).
+        let st3 = e.interpreter.state("set llm_compact_prompt ");
+        assert_eq!(st3.node_path, vec!["set", "llm_compact_prompt"]);
+        // Filter at the settings level.
+        let st4 = e.interpreter.state("set security");
+        assert!(st4.candidates.iter().any(|r| r.id == "security_mode"));
+    }
+
     /// Scoped edit invalidation: an ID edit at the current level clears
     /// that level's frames; deeper edits keep ancestor levels' state; and
     /// a pure trailing-space removal is navigation (clears nothing).
