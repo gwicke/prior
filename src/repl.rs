@@ -554,6 +554,9 @@ pub(crate) enum ActiveOverlay {
         targets: Vec<String>,
         active: Option<usize>,
         _filter: String,
+        /// v2 engine rows (Phase 6 step 6): flattened tree as provider
+        /// rows; drives Tab/Enter cursor semantics when non-empty.
+        engine_rows: Vec<crate::slashdot_menu::fields::Row>,
     },
 
     /// `/tree <id>` action menu (switch / compact). `target_id` is the
@@ -1141,12 +1144,39 @@ impl ActiveOverlay {
                     &mut targets,
                     &mut active,
                 );
+                // v2 engine view (Phase 6 step 6): flatten through v1 logic
+                // so ordering/labels/indents are identical; the engine
+                // ranks by terms and pins the target ids.
+                let active_path: std::collections::HashSet<String> = ctx
+                    .leaf_id
+                    .as_deref()
+                    .map(|lid| {
+                        let mut p = std::collections::HashSet::new();
+                        collect_active_path(&ctx.tree, lid, &mut p);
+                        p
+                    })
+                    .unwrap_or_default();
+                let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
+                Repl::flatten_tree_nodes(&ctx.tree, 0, ctx.leaf_id.as_deref(), &active_path, &mut flat);
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                engine.interpreter = engine.interpreter.with_provider(
+                    &["tree"],
+                    Box::new(slash_menu_bridge::TreeProvider {
+                        entries: flat.clone(),
+                        leaf_id: ctx.leaf_id.clone(),
+                    }),
+                );
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
+                let _ = (&rows, &row_bgs, &targets, &active);
+                let _ = &flat;
                 ActiveOverlay::Tree {
                     rows,
                     row_bgs,
                     targets,
                     active,
                     _filter: filter,
+                    engine_rows: st.candidates.clone(),
                 }
             }
             _ => {
@@ -1663,10 +1693,27 @@ impl ActiveOverlay {
                     }
                 }
             }
-            ActiveOverlay::Tree { targets, .. } => {
+            ActiveOverlay::Tree { targets, engine_rows, .. } => {
                 // Complete the id into the buffer; the next from_buffer pass
                 // promotes to the action menu (mirrors the Session overlay).
-                if let Some(target_id) = targets.get(sel) {
+                // v2 engine path when rows present: host cursor decides.
+                if !engine_rows.is_empty() {
+                    let buf = editor.text();
+                    let line = buf.trim_start_matches('/').to_string();
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let r = engine.step_at(
+                        &line,
+                        sel,
+                        slash_menu_bridge::HostKey::Tab,
+                        menu_frames,
+                    );
+                    if let Some(b) = r.buffer {
+                        // Canonical v2 line "tree <id>" → the host's
+                        // angle-bracket id form (the v1 action-menu parser).
+                        let id = b.split_whitespace().nth(1).unwrap_or("");
+                        editor.set(&format!("/tree <{}>", id));
+                    }
+                } else if let Some(target_id) = targets.get(sel) {
                     editor.set(&format!("/tree <{}>", target_id));
                 }
             }
@@ -2131,7 +2178,25 @@ ActiveOverlay::Model { entries, engine_rows, .. } => {
                     OverlayAction::Continue
                 }
             }
-            ActiveOverlay::Tree { targets, .. } => {
+            ActiveOverlay::Tree { targets, engine_rows, .. } => {
+                // v2 engine Enter when rows present (host cursor decides);
+                // legacy targets path unchanged.
+                if !engine_rows.is_empty() {
+                    let buf = editor.text();
+                    let line = buf.trim_start_matches('/').to_string();
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let r = engine.step_at(
+                        &line,
+                        sel,
+                        slash_menu_bridge::HostKey::Enter,
+                        menu_frames,
+                    );
+                    if let Some(b) = r.buffer {
+                        let id = b.split_whitespace().nth(1).unwrap_or("");
+                        editor.set(&format!("/tree <{}>", id));
+                    }
+                    return OverlayAction::Continue;
+                }
                 if let Some(target_id) = targets.get(sel) {
                     editor.set(&format!("/tree <{}>", target_id));
                 }

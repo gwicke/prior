@@ -63,6 +63,47 @@ pub struct MenuEngine {
     pub controller: AcceptController,
 }
 
+/// DataProvider over the session tree entries (§10 step 6). The host
+/// flattens the tree (v1 logic) and hands over the flat list; rows carry
+/// id/label/indent/active-path/current so the engine ranks and pins.
+pub struct TreeProvider {
+    /// (indent, label, entry_id, on_active_path, is_current, branch_depth)
+    /// — v1's flatten_tree_nodes tuple, passed through.
+    pub entries: Vec<(usize, String, String, bool, bool, usize)>,
+    pub leaf_id: Option<String>,
+}
+
+impl slashdot_menu::provider::DataProvider for TreeProvider {
+    fn fetch(
+        &mut self,
+        _modifiers: &[slashdot_menu::grammar::ModifierToken],
+    ) -> slashdot_menu::provider::DataResult {
+        use slashdot_menu::value::Value;
+        let rows: Vec<slashdot_menu::fields::Row> = self
+            .entries
+            .iter()
+            .map(|(indent, label, id, on_path, is_current, branch_depth)| {
+                let mut r = slashdot_menu::fields::Row::new(id.clone())
+                    .desc(label.clone())
+                    .field("label", Value::Str(label.clone()))
+                    .field("indent", Value::Num(*indent as f64))
+                    .field("branch_depth", Value::Num(*branch_depth as f64));
+                if *on_path {
+                    r = r.field("on_path", Value::Str("1".into()));
+                }
+                if *is_current {
+                    r = r.field("leaf", Value::Str("1".into()));
+                }
+                r
+            })
+            .collect();
+        slashdot_menu::provider::DataResult {
+            rows,
+            ..Default::default()
+        }
+    }
+}
+
 /// DataProvider over the session list (§10 step 5). Rows carry the
 /// session metadata the action level renders in its per-row header.
 pub struct SessionProvider {
@@ -215,6 +256,26 @@ impl MenuEngine {
                         .desc("set runtime persona")
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
+                }
+                "tree" => {
+                    // §10 step 6: dynamic level (tree entries) → shared
+                    // static action level (switch/compact); compact modes
+                    // are single-token enum children; llm leaf carries the
+                    // `.prompt` modifier (free text) + confirm.
+                    *c = MenuNode::new("tree")
+                        .desc("navigate session history — select a point to continue from")
+                        .dynamic()
+                        .children(vec![
+                            MenuNode::new("switch").desc("continue from this entry").leaf(),
+                            MenuNode::new("compact").desc("compact at this entry").children(vec![
+                                MenuNode::new("manual").desc("summarize the kept text yourself"),
+                                MenuNode::new("text-only").desc("truncate to text, drop tool output"),
+                                MenuNode::new("llm")
+                                    .desc("LLM summary; .prompt:<text> sets the prompt")
+                                    .confirm()
+                                    .leaf(),
+                            ]),
+                        ]);
                 }
                 "session" => {
                     // §10 step 5: dynamic level (sessions) → static action
