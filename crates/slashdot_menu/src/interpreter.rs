@@ -104,12 +104,44 @@ impl Interpreter {
     /// metadata (FieldMeta) or inferred from row types (§8.1).
     fn field_space_for(&mut self, path_key: &str) -> Option<crate::fields::FieldSpace> {
         let result = self.data_cache.get(path_key)?;
+        if result.fields.is_empty() {
+            return None; // no explicit metadata → fall through to inference
+        }
         let fields = result
             .fields
             .iter()
             .map(|m| m.spec.clone())
             .collect();
         Some(crate::fields::FieldSpace::new(fields))
+    }
+
+    /// Field space for a level: explicit metadata when provided, else
+    /// inferred from the cached rows (types by first non-missing value).
+    fn field_space(&mut self, path_key: &str, rows: &[Row]) -> crate::fields::FieldSpace {
+        if let Some(space) = self.field_space_for(path_key) {
+            return space;
+        }
+        // Infer: a field is a number when its first present value is Num.
+        let mut names: Vec<String> = Vec::new();
+        for r in rows {
+            for (k, _) in &r.fields {
+                if !names.contains(k) {
+                    names.push(k.clone());
+                }
+            }
+        }
+        let specs = names
+            .iter()
+            .map(|k| {
+                let is_num = rows
+                    .iter()
+                    .find_map(|r| r.field_value(k))
+                    .map(|v| matches!(v, crate::value::Value::Num(_)))
+                    .unwrap_or(false);
+                crate::fields::FieldSpec::new(k.clone(), is_num)
+            })
+            .collect();
+        crate::fields::FieldSpace::new(specs)
     }
 
     /// Resolve rows for a dynamic node, using the cache when populated.
@@ -306,9 +338,7 @@ impl Interpreter {
         // Front-end filter/sort over cached rows (§7.1) on dynamic levels.
         let all_rows_final: Vec<Row> = if node.dynamic && !lvl.modifiers.is_empty() {
             let path_key = path.join(" ");
-            let field_space = self
-                .field_space_for(&path_key)
-                .unwrap_or_default();
+            let field_space = self.field_space(&path_key, &all_rows_probe);
             let q = crate::filter::compile_query(&lvl.modifiers, &field_space);
             crate::filter::apply_query(&all_rows_probe, &q, &field_space)
         } else {

@@ -675,13 +675,29 @@ impl ActiveOverlay {
                 mf.search_terms = search_terms;
                 // Build the entries via the legacy path (provider plumbing,
                 // recent-boost, active resolution) so behavior is identical;
-                // the engine supplies the ranked view in later steps.
+                // the engine supplies the ranked view + cursor semantics.
                 let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
+                // Engine view: dynamic level with the ModelProvider; the
+                // active model row feeds the `*` marker via its position.
+                let qualified_active = active
+                    .and_then(|i| entries.get(i))
+                    .map(|e| e.qualified())
+                    .unwrap_or_default();
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                engine.interpreter = engine.interpreter.with_provider(
+                    &["model"],
+                    Box::new(slash_menu_bridge::ModelProvider {
+                        filter: mf.clone(),
+                        active_id: qualified_active.clone(),
+                    }),
+                );
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
                 ActiveOverlay::Model {
                     entries,
                     active,
                     filter: mf,
-                    engine_rows: Vec::new(),
+                    engine_rows: st.candidates.clone(),
                 }
             }
             "thinking" | "think" | "t" => {
