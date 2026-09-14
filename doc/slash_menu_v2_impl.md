@@ -231,7 +231,10 @@ Migrate commands one by one, each step replacing bespoke overlay variants and
    dynamic value menu)
 8. `/stat`, `/replay` (interstitial)
 9. Delete dead overlay variants + arms as each lands (Phase E of the design
-   roadmap — do it incrementally per step, not at the end).
+   roadmap — do it incrementally per step, not at the end). *(Revised by
+   Phase 7.1: the remaining bespoke variants collapse in one switch
+   instead; steps 1–8 land descriptors/handlers per command, the host
+   arms survive until the switch.)*
 
 - **Verify** per step: existing UX behaviours from `slash_menu.md` keep
   passing (the v1 doc doubles as an acceptance checklist, superseded
@@ -309,64 +312,163 @@ exceptions.
 Mechanical migration to the §12 settled ownership model. The engine keeps
 no per-frame rebuild; handlers become the sole carriers of app state.
 
-1. **Per-activation state object (engine)**: bundle cursor map + traversal
-   frames + `data_cache` into one struct (e.g. `MenuState`/`Activation`).
-   Replace `take_cursors`/`restore_cursors` with a single opaque
-   `take`/`restore` pair. The host holds it between keypresses and never
-   inspects it. Migrate the existing carry points (key loop, buffer
-   re-derives, Tab/Enter/arrow arms).
-2. **Engine constructors lose ctx; shared app-state cells**: 
-   `MenuEngine::new(root: MenuNode)` + handler registration, no
-   `ctx`/`for_model` parameters. The host builds descriptors once per
-   activation; handlers are closures created at build time and read app
-   state at call time. **App state that handlers mutate** (model, persona,
-   settings, session store) moves into shared cells (`Rc<RefCell<>>`,
-   single-threaded) owned by the REPL so loop `&mut` uses and handler
-   writes agree on one storage — an explicit structuring step, sequenced
-   before the handler migration. Data providers keep plain read-borrows
-   for fetch-time reads where no mutation is needed.
-   Bridge constructors collapse; `for_model`'s filter capture disappears
-   (the provider derives its filter from the modifiers the engine passes
-   to `fetch`, reading catalog state via ctx closure).
-3. **Persistent-engine verification**: buffer re-derives (`state(line)`
-   per frame) must yield identical results to the old rebuild path —
-   the sticky cursor, frames, and cache are now simply *there*, not
-   carried. Data cache invalidation: cache is per-activation (cleared when
-   the menu closes/reopens); expensive sources keep their own app-level
-   caches (unchanged).
-4. **Confirm as two handlers + generic leaf result (engine + bridge)**:
-   node gains `confirm_handler` alongside `leaf_handler` (boolean
-   `confirm` property deprecated). `LeafResult` becomes generic
-   `LeafResult<T>` (design §9): menu-semantic variants (close, new path,
-   pause, editor, interstitial) stay engine-typed; the app action is the
-   opaque `T` = the **narrow host outcome**: control flow (commit / quit /
-   stay), optional success/error message, redraw signal (design §9).
-   App-data mutations (SetModel, SetPersona, session writes, LRU, catalog
-   refresh triggers) move *into* the leaf handlers via the shared cells
-   from step 2 — the host stops re-parsing canonical lines into SlashKind
-   and its dispatch table shrinks to flow+message. Prep leaf returns a
-   payload; the confirm step invokes
-   `confirm_handler(payload)`. Migrate `/tree <id> compact llm` and
-   `/session … delete` to the pair; drop `ConfirmState` instance threading
-   and the translation table.
-5. **Tests**: persistent engine across simulated keypresses (cursor, frames,
-   cache survive); handler closure reads live ctx (provider sees a change
-   without rebuild); confirm two-handler flow (prep → pause → accept/cancel);
-   activation state opaque (host compiles without engine internals).
+**Shape of the end state** (drives every step below):
 
-### Phase 7 — cleanup
+- The **descriptor tree is long-lived**: built once (per REPL, refreshed
+  only when the static metadata itself changes), with stateful handler
+  closures bound at build time. Handlers capture shared handles into
+  application state and read/write it **at call time**; closures never go
+  stale because the engine is persistent (§12).
+- Shared application state lives in **shared cells** — `Rc<RefCell<…>>`
+  (single-threaded app) — owned by the REPL; `Arc` only where a background
+  thread participates (e.g. catalog refresh). Handlers mutate app data
+  directly through the cells; the host loop applies only loop-owned
+  effects (control flow, terminal, transcript, redraw).
+- The **model provider is one-shot + cached**: `fetch` runs once per menu
+  activation into the data cache; **all** filtering/sorting stays
+  engine-side over the cached rows (§7.1). The only per-frame-fresh datum
+  is the **active-selector indication**: `active_selector()` reads the
+  current model id directly from settings (authoritative) on every call,
+  independent of the cached catalog rows.
 
-- Remove `ActiveOverlay` variants that no longer have consumers; collapse
-  `from_buffer`/`handle_tab`/`handle_enter`/`handle_esc` to interpreter
-  delegation; drop `slash::registry()` bespoke filtering (root list renders
-  from the root descriptor).
-- Collapse the overlay set to the design §12 end state: one
-  `ActiveOverlay::Menu`-shaped dispatch; per-command code lives only in
-  descriptors, providers, and leaf-result translation.
-- Final audit: no picocode types leak into `slashdot_menu` (compile-time
-  check: the crate must build without the parent in the workspace); the
-  host renders the engine's plan verbatim (§12) — no per-variant marker or
-  cursor policy survives.
+1. **App-state structuring (host, prerequisite)**: introduce a
+   `MenuShared`-style handle bundle holding exactly the mutable slices
+   menu handlers touch, each in an `Rc<RefCell<…>>`:
+   - settings store (all `/set` writes; the **active model id lives here**,
+     so `active_selector` can read it per call);
+   - active-model resolution (today `ReplCtx::model` +
+     `resolve_active_model` — becomes a closure over the settings cell);
+   - session store + current-session id (rename/fork/delete/resume
+     writes; the tree/session read snapshots stay behind read handles);
+   - tree read snapshot (tree rows read at fetch time);
+   - catalog snapshot + refresh-trigger flag (the flag is what a
+     background thread may share via `Arc`; the menu itself never touches
+     the thread).
+   The REPL keeps building `ReplCtx` snapshots from the same underlying
+   storage, so the rest of the REPL is untouched. Explicitly *not* in
+   scope: restructuring REPL internals beyond these slices.
+2. **Long-lived descriptors; constructors lose ctx (bridge)**:
+   `MenuEngine::new(&MenuShared)` — no `ReplCtx`, no `for_model`.
+   Descriptors built once; leaf/confirm handlers registered at build time
+   as closures capturing the shared handles. Providers become closures
+   over shared state:
+   - `ModelProvider`: `fetch` = one-shot per activation over the catalog
+     snapshot (cached in `data_cache`, §8); **no filter capture** — the
+     engine's query compiler applies the prompt's modifiers over cached
+     rows (§7.1), so `for_model`'s merged-`ModelFilter` ladder disappears;
+     `active_selector()` reads the current model id from settings on
+     every call (fresh per frame, cache-independent).
+   - `SessionProvider` / `TreeProvider`: rows read from shared
+     session/tree state at fetch time; `active_selector` reads the
+     current session id / leaf id likewise.
+   Bridge constructors collapse to the single `new`.
+3. **Activation absorbs traversal memory + accept phase (engine +
+   bridge)**: bundle `{ cursors, frames, data_cache, accept_phase }` into
+   the opaque `Activation`. `Frame` (traversal memory) moves from the
+   host into the engine; the accept `AcceptPhase` (interstitial/confirm
+   pause) moves from the controller/`stat_phase` REPL fields into the
+   bundle. `step_at` loses the `frames: &mut Vec<Frame>` parameter;
+   `on_edit` becomes an engine method mutating the bundle's frames. The
+   host carries exactly **one opaque `Activation`** between keypresses
+   (replacing `menu_cursors` + `menu_frames` + confirm threading), via
+   the single `take_activation`/`restore_activation` pair.
+   `Activation::cursors()` remains only as the transition escape for the
+   display arms (removed in Phase 7).
+4. **Generic leaf result + confirm two-handler (engine + bridge)**:
+   `LeafResult<T>` (design §9): menu-semantic variants stay engine-typed
+   (close, new path/R8-8, editor handoff, interstitial pause); `T` is the
+   **narrow host outcome** `{ flow: Stay | Commit(line) | Quit,
+   message: Option<String>, redraw }` (design §9's redraw signal). Node
+   gains `confirm_handler` alongside
+   `leaf_handler` (boolean `confirm` deprecated): the prep step is the
+   `leaf_handler` returning a payload the engine stashes in
+   `ConfirmPrep`; the accept step invokes `confirm_handler(payload)`.
+   Drop `ConfirmState` instance threading and the host's translation
+   table. Migrate `/tree <id> compact llm` and `/session … delete` to the
+   pair as the reference cases; all other leaves may temporarily return
+   `T = Commit(line)` so the host's canonical-line parse keeps working
+   until their handler migration (Phase 7.3).
+5. **RenderPlan emission (bridge)**: the bridge maps `MenuState` →
+   `RenderPlan` verbatim (§6): title from the descriptor path, static
+   child header, per-row derived header (R8-4: row fields /
+   `child_description`), candidate rows via the table builder +
+   declared columndefs, `>` cursor row, `*` active-selector row (from
+   `active_row_marker`; `*` wins per §5.1), interstitial/confirm panels
+   as plans. No host-side per-variant titles, headers, marker decisions,
+   or column layouts remain for menu overlays.
+6. **Tests (persistent-engine contract)**:
+   - persistent-engine equivalence: replaying a key sequence against the
+     carried `Activation` yields identical cursor map, frames, data
+     cache, and accept phase to a single never-rebuilt engine instance
+     (the "forgot to carry X" bug class is gone);
+   - activation clears per menu close/reopen: the data cache and accept
+     phase reset; the sticky cursor map survives reopen (Phase 6.5
+     behavior);
+   - handler closure reads live shared state: a settings change made by
+     one handler is visible to the next frame's provider/selector without
+     any rebuild;
+   - model provider: `fetch` called exactly once per activation despite
+     keypresses/filter edits; `active_selector` reflects a mid-menu model
+     change immediately;
+   - confirm two-handler flow: prep → pause → Esc cancel → re-prep →
+     accept applies the payload;
+   - engine purity: `cargo build -p slashdot_menu` in isolation (the
+     crate must compile without the parent in the workspace).
+
+### Phase 7 — the switch (host) + cleanup
+
+The host conversion happens **once, at a single switch point** — not per
+command. Before the switch, descriptors/handlers exist; after it, the
+host has no per-command menu logic at all.
+
+7.1. **Overlay collapse (host)**: `ActiveOverlay` shrinks to
+   `None | Help | PathComplete | Menu`, where `Menu` carries only the
+   engine's `RenderPlan` (+ a handle to the `MenuState` the plan was
+   built from). `from_buffer_cursors`' per-command arms collapse to:
+   buffer starts with `/` → menu (engine `state(line)` + plan); Help
+   view; bare-prompt path completion; `None`. The "open without trailing
+   space" word list and `bare_listing_word` special cases die (uniform
+   listing rule, §3/6.6-1). The REPL owns **one persistent
+   `MenuEngine`** plus its `Activation` while the menu is open; the
+   activation is dropped/cleared on close and restored on reopen. This
+   is also where the 6.7-3 take/restore ceremony ends: with the engine
+   living in the loop, the activation is simply engine-owned state
+   (no per-frame rebuild, no take/restore).
+7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
+   `handle_esc` / arrows / paging collapse to one arm:
+   `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer
+   rewrite + restore-cursor to the editor) and the `HostOutcome` to the
+   loop (`Stay` → redraw, `Commit(line)` → submit, `Quit` → exit);
+   messages printed; interstitial/editor/confirm arrive as
+   `AcceptOutcome`. `cursor_sel_policy`, `engine_for`, `engine_seed`,
+   `engine_arrow`, `engine_esc`, and the `menu_cursors`/`menu_frames`
+   loop variables disappear. **Unmigrated commands ride a temporary
+   shim**: their descriptor's leaf handler returns `T = Commit(line)` and
+   the legacy `SlashKind` parse in the submit path stays until each
+   command's handler migration (7.3).
+7.3. **Per-command handler migration (host, incremental)**: for each
+   command in §10 order: write the real leaf/confirm handler (mutating
+   `MenuShared` directly), then delete its `SlashKind` parse arm and
+   bespoke helpers (`session_overlay_entries`, `tree_overlay_entries`,
+   `sandbox_overlay_entries`, `filtered_value_candidates`,
+   `modifier_overlay_entries`, the `parse_model_filter` merge ladder,
+   `model_overlay_entries`, …). The per-command overlay arms are already
+   gone with 7.1; only the parse arms and helpers remain per command.
+7.4. **Final cleanup/audit**:
+   - drop `Activation::cursors()` (the last opaque-bundle escape);
+   - delete `SlashKind` + `slash::registry()` once no parse arms remain —
+     the root list renders from the root descriptor only;
+   - remove dead `engine_rows` fields, `#[allow(dead_code)]` overlay
+     machinery, and any remaining take/restore ceremony;
+   - audit: `slashdot_menu` builds without the parent crate; the host
+     renders the engine's plan verbatim (§12) — no per-variant marker or
+     cursor policy survives; `grep ActiveOverlay` shows only the four
+     variants;
+   - verify the `slash_menu.md` acceptance checklist (v1 behaviors,
+     superseded row-by-row by the v2 design where they conflict) plus the
+     v2 additions: cursor-row Tab/Enter, accept-clears-filter with Esc
+     traversal-memory restore, bare-level Tab promote, `*`/`>` marker
+     split, positional ids without `<…>`.
 
 ---
 
