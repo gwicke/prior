@@ -674,24 +674,22 @@ impl ActiveOverlay {
                 ActiveOverlay::Thinking { rows: st.candidates.clone(), active }
             }
             "persona" | "personas" | "p" => {
-                let filter = rest.trim().to_string();
-                let cands = Repl::setting_value_candidates(
-                    crate::settings::SettingKey::DefaultPersona,
-                    ctx,
-                    None,
-                );
-                let filtered: Vec<ValueCandidate> = if filter.is_empty() {
-                    cands
-                } else {
-                    crate::fuzzy::fuzzy_filter_bonus(&cands, &filter, |c| c.display.clone())
-                        .into_iter()
-                        .map(|r| r.item.clone())
-                        .collect()
-                };
-                let active = filtered.iter().position(|c| {
-                    !c.value.is_empty() && ctx.persona.as_deref() == Some(c.value.as_str())
+                // v2 engine (Phase 6 step 3): persona is a value child of
+                // the persona node; the engine ranks and pins. `*` marker
+                // from ctx (current persona).
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
+                let active = ctx.persona.as_deref().and_then(|p| {
+                    // "none" row carries the empty value.
+                    let name = if p.is_empty() { "none" } else { p };
+                    st.candidates.iter().position(|r| r.id == name)
                 });
-                ActiveOverlay::Persona { cands: filtered, _filter: filter, active }
+                ActiveOverlay::Persona { cands: st.candidates.iter().map(|r| ValueCandidate {
+                    display: r.id.clone(),
+                    value: if r.id == "none" { String::new() } else { r.id.clone() },
+                    desc: r.description.clone().unwrap_or_default(),
+                }).collect(), _filter: rest.trim().to_string(), active }
             }
             "set" | "s" => {
                 let filter = rest.to_string();

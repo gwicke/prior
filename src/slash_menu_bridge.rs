@@ -91,17 +91,54 @@ impl MenuEngine {
             .collect();
         // §10 step 1: /thinking — static level with one enum positional
         // value child (off|low|med|high), shared leaf = SetThinking.
+        // §10 step 3: /persona — value child backed by the persona list
+        // ("none" = empty value); /set — static children, each a level
+        // whose value kind comes from SETTINGS metadata.
         for c in children.iter_mut() {
-            if c.key == "thinking" {
-                *c = MenuNode::new("thinking")
-                    .desc("set thinking level")
-                    .value(crate::slashdot_menu::node::ValueChild::Enum(vec![
-                        "off".into(),
-                        "low".into(),
-                        "med".into(),
-                        "high".into(),
-                    ]))
-                    .leaf();
+            match c.key.as_str() {
+                "thinking" => {
+                    *c = MenuNode::new("thinking")
+                        .desc("set thinking level")
+                        .value(crate::slashdot_menu::node::ValueChild::Enum(vec![
+                            "off".into(),
+                            "low".into(),
+                            "med".into(),
+                            "high".into(),
+                        ]))
+                        .leaf();
+                }
+                "persona" => {
+                    let mut vals: Vec<String> = crate::persona::PERSONAS
+                        .iter()
+                        .map(|p| p.name.to_string())
+                        .collect();
+                    vals.push("none".into());
+                    *c = MenuNode::new("persona")
+                        .desc("set runtime persona")
+                        .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
+                        .leaf();
+                }
+                "set" => {
+                    let setting_children: Vec<MenuNode> = crate::settings::SETTINGS
+                        .iter()
+                        .map(|m| {
+                            let n = MenuNode::new(m.name).desc(m.description);
+                            match m.kind {
+                                crate::settings::ValueKind::Enum(vals) => {
+                                    n.value(crate::slashdot_menu::node::ValueChild::Enum(
+                                        vals.iter().map(|v| v.to_string()).collect(),
+                                    ))
+                                }
+                                crate::settings::ValueKind::Int => {
+                                    n.value(crate::slashdot_menu::node::ValueChild::Number)
+                                }
+                                _ => n,
+                            }
+                        })
+                        .collect();
+                    *c = MenuNode::new("set").desc("view and edit settings").children(setting_children);
+                }
+                _ => {}
             }
         }
         MenuNode::new("root").children(children)
