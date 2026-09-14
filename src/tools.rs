@@ -217,8 +217,7 @@ impl EditArgs {
 const MAX_ECHOED_ARGS: usize = 400;
 
 const EDIT_ARGS_EXAMPLE: &str = r#"Single: {"path": "some/path", "oldText": "original text", "newText": "replacement text" }
-Batch: {"path": "some/path","edits": [{ "oldText": "original text", "newText": "replacement text" }]
-}"#;
+Batch: {"path": "some/path","edits": [{"oldText": "original text", "newText": "replacement text"}]}"#;
 
 /// Truncate the echoed parameter JSON to [`MAX_ECHOED_ARGS`] chars on a
 /// char boundary, appending an ellipsis when cut.
@@ -293,7 +292,7 @@ impl EditArgs {
                 },
             }),
             Err(e) => Err(format!(
-                "Invalid edit tool arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
+                "Invalid edit tool arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nPlease do NOT use sed or python for editing, they lack the protections of this tool.",
                 clean_error(&e),
                 EDIT_ARGS_EXAMPLE,
                 truncate_wire_repr(raw),
