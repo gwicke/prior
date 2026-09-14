@@ -6,17 +6,19 @@ pub mod platform;
 pub mod tools;
 pub mod persona;
 pub mod config;
-pub mod fuzzy;
 pub mod edit_match;
 pub mod slash;
 pub mod repl;
 pub mod model_catalog;
 pub mod thinking;
-pub mod table;
 pub mod sandbox_bindings;
 pub mod settings;
 pub mod path_util;
 pub mod session;
+
+// Table + fuzzy primitives moved into the `slashdot_menu` crate; re-exported
+// here so internal paths (`crate::table`, `crate::fuzzy`) keep working.
+pub use slashdot_menu::{fuzzy, table};
 
 pub use config::{Config, Recipe, ToolSettings};
 pub use settings::{SettingKey, SettingsStore, ShowReasoning, ShowReasoningHandle};

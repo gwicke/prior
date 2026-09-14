@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/slashdot_menu"]
+resolver = "2"
+
 [package]
 name = "picocode"
 version = "0.6.0"
@@ -15,6 +19,7 @@ exclude = ["picocode.gif", ".github/"]
 
 [dependencies]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
+slashdot_menu = { path = "crates/slashdot_menu" }
 rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
 tokio = { version = "1.0", features = ["full"] }

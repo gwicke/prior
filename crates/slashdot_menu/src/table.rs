@@ -15,7 +15,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::output::wrap;
+use crate::wrap::wrap;
 
 /// Horizontal alignment of a column's cells (and its header).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +121,7 @@ impl Table {
     /// by logical row, not by visual line).
     ///
     /// ```
-    /// # use picocode::table::{Align, Table};
+    /// # use slashdot_menu::table::{Align, Table};
     /// let mut t = Table::new(&["Setting", "Description"])
     ///     .with_aligns(&[Align::Left, Align::Left]);
     /// t.add_row(&["default_model", "a fairly long description that must wrap"]);
