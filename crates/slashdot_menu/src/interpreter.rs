@@ -341,7 +341,14 @@ impl Interpreter {
     /// (has children or a value child), Tab promotes exactly like Enter:
     /// a trailing space is appended so the child menu shows.
     pub fn tab(&mut self, line: &str) -> OverlayAction {
-        match self.tab_inner(line) {
+        let active = self.state(line).active;
+        self.tab_at(line, active)
+    }
+
+    /// Tab acting on the host cursor row (`cursor` clamped to the view);
+    /// the no-cursor variant uses the engine's default (pinned/active).
+    pub fn tab_at(&mut self, line: &str, cursor: usize) -> OverlayAction {
+        match self.tab_inner(line, Some(cursor)) {
             TabResult::Buffer(b) => OverlayAction::Buffer(b),
             TabResult::BufferDrill(b) => OverlayAction::Buffer(format!("{} ", b)),
             TabResult::None => OverlayAction::None,
@@ -372,8 +379,15 @@ impl Interpreter {
         !node.children.is_empty() || node.value.is_some()
     }
 
-    fn tab_inner(&mut self, line: &str) -> TabResult {
-        let st = self.state(line);
+    fn tab_inner(&mut self, line: &str, cursor: Option<usize>) -> TabResult {
+        let mut st = self.state(line);
+        // Host cursor wins: Tab/Enter act on the row the user highlighted,
+        // not the engine's internal active default.
+        if let Some(c) = cursor {
+            if st.candidates.get(c).is_some() {
+                st.active = c;
+            }
+        }
         let Some(sel) = st.selected() else {
             return TabResult::None;
         };
@@ -403,24 +417,11 @@ impl Interpreter {
             // - Dynamic level (D2): Tab *adds* the id, leaving fuzzy terms
             //   in place ("model flag" → "model flag model-a"); an already
             //   valid pinned id is replaced (cursoring).
-            let trimmed = line.trim_end();
-            let words: Vec<&str> = trimmed.split(' ').collect();
-            let last_is_selection = if st.selection.is_some() && !st.pin_lost {
-                true
-            } else {
-                // Static level: the last word is the selection-in-progress
-                // slot — positional replace.
-                !st.level_is_dynamic
-            };
-            let kept_end = if last_is_selection {
-                words.len() - 1
-            } else {
-                words.len()
-            };
-            for w in words.iter().take(kept_end).skip(st.node_path.len()) {
-                parts.push((*w).to_string());
-            }
-            parts.push(token.clone());
+            // Accept semantics (v2 revised): the prompt holds the canonical
+            // path + the committed id only — fuzzy terms/modifiers are
+            // *refinement* state, cleared on accept. Back-navigation
+            // restores them via the traversal stack (MenuEngine frames).
+            parts.push(token);
         }
         let buf = parts.join(" ");
 
@@ -455,9 +456,15 @@ impl Interpreter {
     /// 2. If the pinned node is a leaf → submit the canonical line.
     /// 3. Otherwise Enter behaves like Tab + trailing space (drill).
     pub fn enter(&mut self, line: &str) -> OverlayAction {
+        let active = self.state(line).active;
+        self.enter_at(line, active)
+    }
+
+    /// Enter acting on the host cursor row (see [`Interpreter::tab_at`]).
+    pub fn enter_at(&mut self, line: &str, cursor: usize) -> OverlayAction {
         // Enter = Tab + trailing space for structural promotion; Tab already
         // promotes listings (same as Enter), so delegate and reuse logic.
-        match self.tab(line) {
+        match self.tab_at(line, cursor) {
             OverlayAction::Buffer(b) if !line.ends_with(' ') && !b.ends_with(' ') => {
                 // Tab produced a pin (leaf or value child) — Enter adds the
                 // drill space to show the next level (per contract, Enter
@@ -768,11 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tab_pins_id_keeping_terms() {
+    fn dynamic_tab_pins_id_clearing_terms() {
         let mut i = dyn_ix();
         let act = i.tab("model flag");
-        // Active candidate after "flag" is model-a → tab pins it, terms stay.
-        assert_eq!(act, OverlayAction::Buffer("model flag model-a".to_string()));
+        // Accept semantics: the id is committed, refinement terms are
+        // cleared (back-navigation restores them via the traversal stack).
+        assert_eq!(act, OverlayAction::Buffer("model model-a".to_string()));
     }
 
     #[test]

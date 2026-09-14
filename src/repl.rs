@@ -660,14 +660,12 @@ impl ActiveOverlay {
                 let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
-                let active = st
-                    .selection
+                // `*` = the CURRENT level (pre-change state), from ctx —
+                // never from the typed/pinned selection.
+                let active = ctx
+                    .thinking_level
                     .as_deref()
-                    .and_then(|sel| {
-                        st.candidates
-                            .iter()
-                            .position(|r| &r.id == sel)
-                    });
+                    .and_then(|lvl| st.candidates.iter().position(|r| r.id == lvl));
                 ActiveOverlay::Thinking { rows: st.candidates.clone(), active }
             }
             "persona" | "personas" | "p" => {
@@ -1267,12 +1265,13 @@ impl ActiveOverlay {
     /// Handle Tab on a selected row.  Mutates the editor in-place.
     fn handle_tab(
         &self,
-        sel: usize,
+        mut sel: usize,
         editor: &mut LineEditor,
         path_completions: &mut Vec<String>,
         completion_pos: &mut Option<(usize, usize)>,
         settings: &SettingsStore,
         ctx: &ReplCtx,
+        menu_frames: &mut Vec<slash_menu_bridge::Frame>,
     ) {
         match self {
             ActiveOverlay::CommandList { cmds } => {
@@ -1297,16 +1296,23 @@ impl ActiveOverlay {
                 }
             }
             ActiveOverlay::Thinking { .. } => {
-                // v2 engine owns the Tab rewrite (positional replace with
-                // the active candidate; preserves the "/thinking " prefix).
+                // v2 engine owns the Tab rewrite; the host cursor (`sel`)
+                // decides which row is completed. Frames pushed by the
+                // engine support Esc back-navigation.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
                 let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
-                match engine.interpreter.tab(&line) {
-                    crate::slashdot_menu::interpreter::OverlayAction::Buffer(b) => {
-                        editor.set(&format!("/{}", b));
-                    }
-                    _ => {}
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Tab,
+                    menu_frames,
+                );
+                if let Some(b) = r.buffer {
+                    editor.set(&format!("/{}", b));
+                }
+                if let Some(c) = r.restore_cursor {
+                    sel = c;
                 }
             }
             ActiveOverlay::Settings { rows, .. } => {
@@ -1570,7 +1576,7 @@ impl ActiveOverlay {
     /// Handle Enter on a selected row.  Returns an action for the caller.
     fn handle_enter<F: Fn(&LineEditor, &[&str], usize, &mut usize)>(
         &self,
-        sel: usize,
+        mut sel: usize,
         editor: &mut LineEditor,
         output: &dyn Output,
         redraw: &F,
@@ -1580,6 +1586,7 @@ impl ActiveOverlay {
         value_error: &mut Option<String>,
         help_view: &mut bool,
         ctx: &ReplCtx,
+        menu_frames: &mut Vec<slash_menu_bridge::Frame>,
     ) -> OverlayAction {
         match self {
             ActiveOverlay::CommandList { cmds } => {
@@ -1636,21 +1643,31 @@ impl ActiveOverlay {
                 OverlayAction::Continue
             }
             ActiveOverlay::Thinking { .. } => {
-                // v2 engine owns the Enter flow: bare level → drill
-                // (buffer "/thinking ", value menu shows); partial value →
-                // complete; valid value → SetThinking.
+                // v2 engine owns the Enter flow; the host cursor decides
+                // the row. Bare level → drill (value menu shows); valid
+                // value → SetThinking.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
                 let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
-                match engine.interpreter.enter(&line) {
-                    crate::slashdot_menu::interpreter::OverlayAction::Buffer(b) => {
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Enter,
+                    menu_frames,
+                );
+                match r.action {
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
+                    ) => {
                         editor.set(&format!("/{}", b));
+                        if let Some(c) = r.restore_cursor {
+                            sel = c;
+                        }
                         OverlayAction::Continue
                     }
-                    crate::slashdot_menu::interpreter::OverlayAction::Submit(canon) => {
-                        // canon is "thinking <level>"; translate to the
-                        // host action directly (no commit echo needed —
-                        // agent.rs prints the level change).
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
+                    ) => {
                         let level = canon
                             .split_whitespace()
                             .nth(1)
@@ -2179,6 +2196,10 @@ impl Repl {
         let mut completion_pos: Option<(usize, usize)> = None;
         let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
         let mut last_active: Option<usize> = None; // last frame's `active` row (see `cursor_sel_policy`)
+        // Traversal memory (v2 menus): frames pushed on accept/drill, Esc
+        // replays newest-first (previous filter state + cursor) before
+        // structural pops. Cleared when the user edits the line.
+        let mut menu_frames: Vec<slash_menu_bridge::Frame> = Vec::new();
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -2558,14 +2579,14 @@ impl Repl {
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
                                     &mut path_completions, &mut completion_pos,
-                                    settings, ctx);
+                                    settings, ctx, &mut menu_frames);
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
                                         settings, dirty, &mut value_error, &mut help_view,
-                                        ctx,
+                                        ctx, &mut menu_frames,
                                     ) {
                                         OverlayAction::Continue => {}
                                         OverlayAction::Action(action) => return Some(action),
@@ -8063,6 +8084,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
+            &mut Vec::new(),
         );
         match action {
             OverlayAction::Action(InputAction::Submit(line)) => {
@@ -8131,6 +8153,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
+            &mut Vec::new(),
         );
         match action {
             OverlayAction::Continue => {
