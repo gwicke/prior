@@ -244,26 +244,24 @@ impl Interpreter {
         let lvl = parse_level(&tail, &rule);
 
         // Dynamic level demotion (D2): the grammar accepts any trailing
-        // word permissively; a token that matches no cached row id is a
-        // fuzzy term, not a pinned id.
+        // word permissively; a token that matches no candidate id (cached
+        // dynamic rows or an enum value set) is a fuzzy term, not a pin.
+        // Validity is always checked against the candidate set (R8-5).
         let all_rows_probe = self.level_rows(&path, &node, &lvl.modifiers);
-        let lvl = if node.dynamic {
-            match &lvl.selection {
-                Some(sel) if !all_rows_probe.iter().any(|r| &r.id == sel) => {
-                    let mut terms = lvl.terms.clone();
-                    if !terms.is_empty() {
-                        terms.push(' ');
-                    }
-                    terms.push_str(sel);
-                    crate::grammar::LevelTokens {
-                        terms,
-                        ..lvl
-                    }
+        let lvl = match &lvl.selection {
+            Some(sel) if !all_rows_probe.iter().any(|r| &r.id == sel) => {
+                let mut terms = lvl.terms.clone();
+                if !terms.is_empty() {
+                    terms.push(' ');
                 }
-                _ => lvl,
+                terms.push_str(sel);
+                crate::grammar::LevelTokens {
+                    terms,
+                    selection: None,
+                    ..lvl
+                }
             }
-        } else {
-            lvl
+            _ => lvl,
         };
 
         // Trailing space after a selection = drill in (design §3): a static
@@ -471,6 +469,11 @@ impl Interpreter {
             }
             return OverlayAction::Buffer(parent);
         }
+        if st.drill_in {
+            // Drilled level popped → back to the parent path (the node
+            // whose child menu was shown).
+            return OverlayAction::Buffer(st.node_path.join(" "));
+        }
         let parent = st.node_path[..st.node_path.len() - 1].join(" ");
         OverlayAction::Buffer(parent)
     }
@@ -617,10 +620,10 @@ mod tests {
             ix().esc("tree compact"),
             OverlayAction::Buffer("tree ".to_string())
         );
-        // Drilled level popped → parent path.
+        // Drilled level popped → back to the drilled-from path.
         assert_eq!(
             ix().esc("tree compact "),
-            OverlayAction::Buffer("tree".to_string())
+            OverlayAction::Buffer("tree compact".to_string())
         );
         // Root → clear.
         assert_eq!(ix().esc("tree"), OverlayAction::Buffer(String::new()));

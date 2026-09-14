@@ -3606,6 +3606,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                     leaf_id,
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
+            thinking_level: config.thinking_level.clone(),
                 };
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop

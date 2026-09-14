@@ -16,6 +16,7 @@ use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, Pu
 use crate::output::{term_height, term_width, wrap, Output};
 use crate::model_catalog;
 use crate::slash;
+use crate::slash_menu_bridge;
 use crate::thinking;
 use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
@@ -275,6 +276,8 @@ pub struct ReplCtx {
     pub context_tokens: u64,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
+    /// Currently-active thinking level (for the `*` marker in `/thinking`).
+    pub thinking_level: Option<String>,
 }
 
 /// Model filter state for the `/model` overlay.
@@ -447,7 +450,11 @@ pub(crate) enum ActiveOverlay {
     },
 
     Thinking {
-        levels: Vec<thinking::ThinkingLevel>,
+        /// Candidates after the engine's rank (fuzzy terms applied, active
+        /// pinned). Empty ⇒ "(no matches)".
+        rows: Vec<crate::slashdot_menu::fields::Row>,
+        /// Index of the active (current) level, for the `*` marker.
+        active: Option<usize>,
     },
 
     Settings {
@@ -647,9 +654,21 @@ impl ActiveOverlay {
                 ActiveOverlay::Model { entries, filter: model_filter, active }
             }
             "thinking" | "think" | "t" => {
-                let filter = rest.trim().to_string();
-                let levels = Repl::thinking_overlay_entries(&filter);
-                ActiveOverlay::Thinking { levels }
+                // v2 engine: descriptor tree + rank_and_pin (Phase 6 step 1).
+                // The buffer is "/thinking <terms...>"; the engine's
+                // canonical line strips the leading slash.
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
+                let active = st
+                    .selection
+                    .as_deref()
+                    .and_then(|sel| {
+                        st.candidates
+                            .iter()
+                            .position(|r| &r.id == sel)
+                    });
+                ActiveOverlay::Thinking { rows: st.candidates.clone(), active }
             }
             "persona" | "personas" | "p" => {
                 let filter = rest.trim().to_string();
@@ -1106,14 +1125,20 @@ impl ActiveOverlay {
                 let opts = table.render_multiline(avail);
                 (title, opts, None, false)
             }
-            ActiveOverlay::Thinking { levels } => {
-                let opts: Vec<String> = levels.iter().map(|l| l.as_str().to_string()).collect();
+            ActiveOverlay::Thinking { rows, active } => {
+                let opts: Vec<String> = rows
+                    .iter()
+                    .map(|r| match &r.description {
+                        Some(d) => format!("{} — {}", r.id, d),
+                        None => r.id.clone(),
+                    })
+                    .collect();
                 if opts.is_empty() {
                     ("Thinking levels  (up/down, Enter select, Esc back)",
-                     vec!["(no matches)".into()], None, false)
+                     vec!["(no matches)".into()], *active, false)
                 } else {
                     ("Thinking levels  (up/down, Enter select, Esc back)",
-                     opts, None, false)
+                     opts, *active, false)
                 }
             }
             ActiveOverlay::Settings { rows, .. } => {
@@ -1270,10 +1295,10 @@ impl ActiveOverlay {
                     editor.set(&Repl::replace_last_token(&buf, val));
                 }
             }
-            ActiveOverlay::Thinking { levels } => {
-                if let Some(l) = levels.get(sel) {
+            ActiveOverlay::Thinking { rows, .. } => {
+                if let Some(r) = rows.get(sel) {
                     let buf = editor.text();
-                    editor.set(&Repl::replace_last_token(&buf, l.as_str()));
+                    editor.set(&Repl::replace_last_token(&buf, &r.id));
                 }
             }
             ActiveOverlay::Settings { rows, .. } => {
@@ -1601,11 +1626,11 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::Thinking { levels } => {
-                if let Some(l) = levels.get(sel) {
-                    let line = format!("/thinking {}", l.as_str());
+            ActiveOverlay::Thinking { rows, .. } => {
+                if let Some(r) = rows.get(sel) {
+                    let line = format!("/thinking {}", r.id);
                     Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    OverlayAction::Action(InputAction::SetThinking(l.as_str().to_string()))
+                    OverlayAction::Action(InputAction::SetThinking(r.id.clone()))
                 } else {
                     OverlayAction::Continue
                 }
@@ -3478,23 +3503,6 @@ impl Repl {
     ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
         Self::model_selection_overlay_entries(ctx, filter, true)
     }
-    fn thinking_overlay_entries(filter: &str) -> Vec<thinking::ThinkingLevel> {
-        let all = [
-            thinking::ThinkingLevel::Off,
-            thinking::ThinkingLevel::Low,
-            thinking::ThinkingLevel::Med,
-            thinking::ThinkingLevel::High,
-        ];
-        if filter.trim().is_empty() {
-            all.to_vec()
-        } else {
-            crate::fuzzy::fuzzy_filter_bonus(&all, filter, |l| l.as_str().to_string())
-                .into_iter()
-                .map(|r| *r.item)
-                .collect()
-        }
-    }
-
     /// Build the `/session` overlay rows.
     ///
     /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
@@ -6148,6 +6156,7 @@ mod tests {
             leaf_id: Some("leaf-entry".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         }
     }
 
@@ -6456,6 +6465,7 @@ mod tests {
             leaf_id: Some("root-entry".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6519,6 +6529,7 @@ mod tests {
             leaf_id: Some("root-entry".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6792,6 +6803,7 @@ mod tests {
             leaf_id: Some("u2".into()), // mid-turn: leaf IS a user message
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6843,6 +6855,7 @@ mod tests {
             leaf_id: Some("a2".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -6885,6 +6898,7 @@ mod tests {
             leaf_id: None,
             context_tokens: 0,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7653,6 +7667,7 @@ mod tests {
             leaf_id: Some("m1".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7733,6 +7748,7 @@ mod tests {
             leaf_id: Some("c1".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
@@ -7796,6 +7812,7 @@ mod tests {
             leaf_id: Some("m2".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
+            thinking_level: Some("low".into()),
         };
         let settings = SettingsStore {
             default_model: "p:m".into(),
