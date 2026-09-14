@@ -74,15 +74,16 @@ pub struct LevelTokens {
     pub trailing_space: bool,
 }
 
-/// Outcome flags controlling selection detection while tokenizing.
-#[derive(Clone, Copy, Default)]
-pub struct SelectionRule<'a> {
+/// Selection predicate: owns its closure so it can be built freely and
+/// passed to `parse_level` by reference.
+#[derive(Clone, Default)]
+pub struct SelectionRule {
     /// Is `word` a valid selection at this level? (exact key/id match, or
     /// permissive for value-typed children).
-    pub is_selection: Option<&'a dyn Fn(&str) -> bool>,
+    pub is_selection: Option<std::sync::Arc<dyn Fn(&str) -> bool>>,
 }
 
-impl<'a> std::fmt::Debug for SelectionRule<'a> {
+impl std::fmt::Debug for SelectionRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SelectionRule { .. }")
     }
@@ -96,7 +97,7 @@ impl<'a> std::fmt::Debug for SelectionRule<'a> {
 /// there or continues after a space (drill). Everything before it is
 /// re-parsed left-to-right: dotted words start/continue modifiers, plain
 /// words are either fuzzy terms or modifier-value continuations.
-pub fn parse_level(s: &str, rule: &SelectionRule<'_>) -> LevelTokens {
+pub fn parse_level(s: &str, rule: &SelectionRule) -> LevelTokens {
     let trailing_space = s.ends_with(' ');
     let trimmed = s.trim_end();
     let words: Vec<&str> = if trimmed.is_empty() {
@@ -112,7 +113,11 @@ pub fn parse_level(s: &str, rule: &SelectionRule<'_>) -> LevelTokens {
     let mut body_end = words.len();
     if let Some(last) = words.last() {
         let sel_ok = !last.starts_with('.')
-            && rule.is_selection.map(|f| f(last)).unwrap_or(false);
+            && rule
+                .is_selection
+                .as_ref()
+                .map(|f| f(last))
+                .unwrap_or(false);
         if sel_ok {
             // Only treat it as a selection if the words before it do not
             // *require* it as a modifier value (i.e. a pending multi-word
@@ -181,9 +186,9 @@ mod tests {
         matches!(word, "switch" | "compact" | "resume" | "delete")
     }
 
-    fn rule_static() -> SelectionRule<'static> {
+    fn rule_static() -> SelectionRule {
         SelectionRule {
-            is_selection: Some(&is_sel_static),
+            is_selection: Some(std::sync::Arc::new(is_sel_static)),
         }
     }
 
@@ -286,7 +291,7 @@ mod tests {
     fn dynamic_level_accepts_any_id() {
         // Dynamic levels: any space-free word (except dotted) can be an id.
         let rule = SelectionRule {
-            is_selection: Some(&always_sel),
+            is_selection: Some(std::sync::Arc::new(always_sel)),
         };
         let t = parse_level("model abc-123 ", &rule);
         assert_eq!(t.terms, "model");

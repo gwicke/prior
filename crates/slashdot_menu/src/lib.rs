@@ -12,10 +12,13 @@
 //! See `doc/slash_menu_v2_design.md` in the picocode repository for the
 //! design this implements.
 
+pub mod cursor;
 pub mod fields;
 pub mod filter;
 pub mod fuzzy;
 pub mod grammar;
+pub mod interpreter;
+pub mod node;
 pub mod prompt;
 pub mod table;
 pub mod value;
