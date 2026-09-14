@@ -316,16 +316,7 @@ impl Interpreter {
                 node = child;
                 path.push(sel.clone());
                 let rows = self.level_rows(&path, &node, &[]);
-                return MenuState {
-                    node_path: path,
-                    terms: String::new(),
-                    selection: None,
-                    drill_in: true,
-                    candidates: rows,
-                    active: 0,
-                    pin_lost: false,
-                    level_is_dynamic: node.dynamic,
-                };
+                return self.drilled_state(path, rows, node.dynamic);
             }
             if node.dynamic {
                 // Dynamic row drilled: the shared action level applies to
@@ -333,16 +324,7 @@ impl Interpreter {
                 // as a static level below the row id.
                 path.push(sel.clone());
                 let rows = Self::child_rows(&node);
-                return MenuState {
-                    node_path: path,
-                    terms: String::new(),
-                    selection: None,
-                    drill_in: true,
-                    candidates: rows,
-                    active: 0,
-                    pin_lost: false,
-                    level_is_dynamic: false,
-                };
+                return self.drilled_state(path, rows, false);
             }
         }
 
@@ -388,6 +370,34 @@ impl Interpreter {
             active,
             pin_lost: !rank.pinned_survived && lvl.selection.is_some(),
             level_is_dynamic: node.dynamic,
+        }
+    }
+
+    /// Build the MenuState for a drilled level (pinned selection +
+    /// trailing space), resolving the engine-owned sticky cursor (Phase
+    /// 6.5) instead of a hard-coded row 0.
+    fn drilled_state(
+        &mut self,
+        path: Vec<String>,
+        rows: Vec<Row>,
+        dynamic: bool,
+    ) -> MenuState {
+        let path_key = path.join(" ");
+        let stored = self.cursors.get(&path_key).cloned();
+        let active = stored
+            .map(|(idx, _, _)| idx.min(rows.len().saturating_sub(1)))
+            .unwrap_or(0);
+        self.cursors
+            .insert(path_key, (active, None, String::new()));
+        MenuState {
+            node_path: path,
+            terms: String::new(),
+            selection: None,
+            drill_in: true,
+            candidates: rows,
+            active,
+            pin_lost: false,
+            level_is_dynamic: dynamic,
         }
     }
 

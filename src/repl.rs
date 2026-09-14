@@ -616,6 +616,9 @@ pub(crate) enum ActiveOverlay {
 
 impl ActiveOverlay {
     /// Construct the overlay from the current buffer and external state.
+    /// (Legacy signature: test convenience; the live loop uses
+    /// [`Self::from_buffer_cursors`].)
+    #[cfg(test)]
     fn from_buffer(
         buf: &str,
         ctx: &ReplCtx,
