@@ -218,4 +218,32 @@ mod tests {
         // "e" fuzzy-matches "med" and "high". Just verify filtering happened.
         assert!(st.candidates.len() < 4);
     }
+
+    /// Regression: `/thinking` + Tab (no trailing word) must keep the
+    /// command prefix — "/thinking" + active completion, not just "thinking".
+    /// The buffer keeps its leading slash through the engine round-trip.
+    #[test]
+    fn thinking_tab_preserves_slash_prefix() {
+        let mut e = MenuEngine::new(&ctx());
+        // Engine-level: Tab on bare "thinking" (no trailing word) drills
+        // into the level (trailing space) — the host re-adds the slash.
+        let act = e.interpreter.tab("thinking");
+        match act {
+            OverlayAction::Buffer(b) => {
+                let host_line = format!("/{}", b);
+                assert!(
+                    host_line.starts_with("/thinking"),
+                    "prefix lost: {:?}", host_line
+                );
+            }
+            other => panic!("expected buffer, got {:?}", other),
+        }
+        // Host-level round trip: "/thinking h" → "/thinking high".
+        let act2 = e.interpreter.tab("thinking h");
+        assert_eq!(
+            act2,
+            OverlayAction::Buffer("thinking high".to_string())
+        );
+        assert_eq!(format!("/{}", "thinking high"), "/thinking high");
+    }
 }

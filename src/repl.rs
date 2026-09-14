@@ -1272,6 +1272,7 @@ impl ActiveOverlay {
         path_completions: &mut Vec<String>,
         completion_pos: &mut Option<(usize, usize)>,
         settings: &SettingsStore,
+        ctx: &ReplCtx,
     ) {
         match self {
             ActiveOverlay::CommandList { cmds } => {
@@ -1295,10 +1296,17 @@ impl ActiveOverlay {
                     editor.set(&Repl::replace_last_token(&buf, val));
                 }
             }
-            ActiveOverlay::Thinking { rows, .. } => {
-                if let Some(r) = rows.get(sel) {
-                    let buf = editor.text();
-                    editor.set(&Repl::replace_last_token(&buf, &r.id));
+            ActiveOverlay::Thinking { .. } => {
+                // v2 engine owns the Tab rewrite (positional replace with
+                // the active candidate; preserves the "/thinking " prefix).
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                match engine.interpreter.tab(&line) {
+                    crate::slashdot_menu::interpreter::OverlayAction::Buffer(b) => {
+                        editor.set(&format!("/{}", b));
+                    }
+                    _ => {}
                 }
             }
             ActiveOverlay::Settings { rows, .. } => {
@@ -2528,7 +2536,7 @@ impl Repl {
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
                                     &mut path_completions, &mut completion_pos,
-                                    settings);
+                                    settings, ctx);
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
