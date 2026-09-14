@@ -1736,7 +1736,34 @@ impl ActiveOverlay {
                 let _ = engine_rows;
                 OverlayAction::Continue
             }
-ActiveOverlay::Model { entries, .. } => {
+ActiveOverlay::Model { entries, engine_rows, .. } => {
+                // v2 engine Enter (Phase 6 step 4): dynamic row + leaf →
+                // Submit with the canonical line; the host translates to
+                // SetModel. Legacy entries path unchanged.
+                if !engine_rows.is_empty() {
+                    let buf = editor.text();
+                    let line = buf.trim_start_matches('/').to_string();
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let r = engine.step_at(
+                        &line,
+                        sel,
+                        slash_menu_bridge::HostKey::Enter,
+                        menu_frames,
+                    );
+                    if let crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
+                    ) = r.action
+                    {
+                        let qualified = canon.split_whitespace().nth(1).unwrap_or("");
+                        let (provider, model) = qualified
+                            .split_once(':')
+                            .map(|(p, m)| (p.to_string(), m.to_string()))
+                            .unwrap_or((ctx.provider.clone(), qualified.to_string()));
+                        Repl::emit_commit(output, editor, redraw, sel, input_row, &format!("/model {}", qualified), "", false);
+                        return OverlayAction::Action(InputAction::SetModel(provider, model));
+                    }
+                    return OverlayAction::Continue;
+                }
                 if let Some(e) = entries.get(sel) {
                     let (provider, model) = e.qualified_parts();
                     let line = format!("/model {}", e.qualified());
