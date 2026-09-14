@@ -319,21 +319,29 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    handler registration, no `ctx`/`for_model` parameters. The host builds
    descriptors once per activation; handlers are closures capturing
    `&ReplCtx` (or `&SettingsStore`) created at build time and read at
-   call time. Bridge constructors collapse; `for_model`'s filter capture
-   disappears (the provider derives its filter from the modifiers the
-   engine passes to `fetch`, reading catalog state via ctx closure).
+   call time (read-borrows; leaf *mutations* still flow via the result —
+   handlers never mutate app state directly, and any cross-call scratch
+   state is an `Rc<RefCell<>>` owned by the closure, single-threaded).
+   Bridge constructors collapse; `for_model`'s filter capture disappears
+   (the provider derives its filter from the modifiers the engine passes
+   to `fetch`, reading catalog state via ctx closure).
 3. **Persistent-engine verification**: buffer re-derives (`state(line)`
    per frame) must yield identical results to the old rebuild path —
    the sticky cursor, frames, and cache are now simply *there*, not
    carried. Data cache invalidation: cache is per-activation (cleared when
    the menu closes/reopens); expensive sources keep their own app-level
    caches (unchanged).
-4. **Confirm as two handlers (engine + bridge)**: node gains
-   `confirm_handler` alongside `leaf_handler` (boolean `confirm` property
-   deprecated). Prep leaf returns a payload; controller stores the payload
-   in the paused flow; the confirm step invokes `confirm_handler(payload)`.
-   Migrate `/tree <id> compact llm` and `/session … delete` to the pair;
-   drop `ConfirmState` instance threading.
+4. **Confirm as two handlers + generic leaf result (engine + bridge)**:
+   node gains `confirm_handler` alongside `leaf_handler` (boolean
+   `confirm` property deprecated). `LeafResult` becomes generic
+   `LeafResult<T>` (design §9): menu-semantic variants (close, new path,
+   pause, editor, interstitial) stay engine-typed; the app action is the
+   opaque `T` (host = `InputAction`). Leaf handlers return
+   `(outcome, action)` — the host stops re-parsing canonical lines into
+   SlashKind. Prep leaf returns a payload; the confirm step invokes
+   `confirm_handler(payload)`. Migrate `/tree <id> compact llm` and
+   `/session … delete` to the pair; drop `ConfirmState` instance threading
+   and the translation table.
 5. **Tests**: persistent engine across simulated keypresses (cursor, frames,
    cache survive); handler closure reads live ctx (provider sees a change
    without rebuild); confirm two-handler flow (prep → pause → accept/cancel);

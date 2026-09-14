@@ -416,14 +416,20 @@ distinct and each is framework-owned where it can be:
    "launch editor"); not an interstitial. Cancellation re-enters the prompt
    via the existing `pending_prefill` mechanism.
 
-**Leaf handler results** (formalized from R8-8): a leaf may
+**Leaf handler results** (formalized from R8-8, revised): `LeafResult<T>`
+is generic over the host's action type. It carries:
 
-- perform its action and close the menu (success / failure with optional
-  messages), or
-- **return a new path** — rewriting the buffer to another menu state, e.g.
-  `/compact` becomes a leaf that returns `/tree <last-user-id> compact ` (with
-  trailing space so the compact menu shows immediately). No parallel
-  `/compact` hierarchy exists any more; it is pure sugar over `/tree`.
+- **Menu-semantic outcomes** the engine drives itself: close the menu,
+  **return a new path** (buffer rewrite, e.g. `/compact` →
+  `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy),
+  pause for confirm (§9), launch the editor, interstitial text;
+- an **opaque action payload** `T` the engine treats as uninterpreted data
+  (host picks `T = InputAction`). The host translates the payload to its
+  action directly — no canonical-line re-parsing, no per-command
+  translation table.
+
+Purity comes from the crate boundary + generics (the engine compiles
+without knowing what `T` is), not from an intermediate result vocabulary.
 
 ---
 
@@ -478,6 +484,7 @@ distinct and each is framework-owned where it can be:
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache) carried as opaque engine-owned data; handlers read app state at call time; no rebuild, no Arcs (§2, §12). |
 | Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
+| Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; app action as opaque `T`. No canonical-line re-parsing (§9). |
 
 ---
 
@@ -525,8 +532,10 @@ they need (§2).
   by handlers at call time (§2), never passed through engine constructors;
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
-- dispatching the engine's *submit* result to `InputAction` (SetModel,
-  SetThinking, Quit, …) — the engine never interprets picocode actions;
+- dispatching the leaf result's opaque action payload to `InputAction`
+  (SetModel, SetThinking, Quit, …) — generic `T`, engine-typed as data
+  only (§9). Engine purity rests on the crate boundary + generics, not on
+  an intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
 
