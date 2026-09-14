@@ -126,7 +126,13 @@ At every level the buffer has the shape:
   (§4, §5); up/down cursoring moves the view cursor without rewriting it.
 - **Trailing space** after the selection token means: show the next level
   (drill in). Absence means the selection is merely *pinned*; its sub-menu is
-  not shown yet.
+  not shown yet. This is a uniform, engine-owned rule for every **listing
+  level** (a node with children, a value child, or a data handler):
+  `/model` (no trailing space) stays in the *root* command list with the
+  `model` entry pinned/highlighted; only `/model ` shows the model list.
+  The same applies to `/thinking`, `/set`, `/session`, `/tree`, `/sandbox`.
+  The host must not keep a per-command "open without trailing space" list —
+  the grammar decides. Leaf nodes (no children/handler) accept directly.
 - Dynamic nodes encapsulate *two* node levels when static sub-actions are
   specified, so the grammar applies at two levels.
 
@@ -183,14 +189,9 @@ signal, so it does not interact with the level grammar.
      declared).
   3. Otherwise Enter behaves like Tab-drill: append trailing space and show
      the child level.
-- **Esc** = back navigation with traversal memory:
-  1. If a traversal frame exists for the current branch, replay it — restore
-     the previous prompt (filter state) AND cursor position. This gives the
-     seamless "back to the list where I was" experience (e.g. `/tree`
-     detail → list without losing filter or highlight).
-  2. Otherwise pop one level structurally: rewrite the buffer to the parent
-     state (removes the trailing selection token / trailing space). Esc at
-     the root clears the buffer (v1 rule retained).
+- **Esc** = back navigation with traversal memory, resolved by the
+  per-level ladder in §5.1 (trailing space → frame replay → clear
+  refinement → clear selection → clear buffer at root).
 - **Traversal frames** are pushed only on accept/drill (downward
   transitions) and carry `{line, cursor, level}`. Because they only ever
   contain ancestors of the current position, Esc replay walks strictly up
@@ -204,6 +205,42 @@ signal, so it does not interact with the level grammar.
   value in effect before any menu change), sourced from application context
   — never from the typed/pinned selection. On a fresh menu the cursor seeds
   on the active row, marked `*`.
+
+### 5.1 Active-state sourcing (`active_selector`)
+
+The "active" row of every candidate list must come from a single, uniform
+mechanism inside the engine — the host never computes or renders it per
+overlay:
+
+- **`DataProvider::active_selector() -> Option<String>`**: dynamic providers
+  report the id of the row that is currently in effect (e.g. the active
+  model's `provider:name`, the current session id, the current leaf's tree
+  entry id). The engine resolves the selector to a row index in the
+  candidate set per frame and renders `*` there.
+- **Enum / static levels**: the same selector notion, from the node
+  descriptor (`active_selector` on the level or value child, e.g.
+  `/thinking`'s currently-set level, `/persona`'s current persona) or from
+  the provider supplying the enum rows. A level with no selector (root
+  command list) renders no `*` anywhere.
+- The engine's `MenuState` exposes `active_row_marker: Option<usize>` (the
+  `*` position) separately from `active` (the cursor position). The host
+  renders `*` from the first and `>` from the second with no per-variant
+  logic; when both land on one row, `*` wins.
+- Open-time cursor seeding falls out of this: when a level is first
+  displayed and no sticky cursor exists for it, the cursor seeds on the
+  active row if the selector resolves; otherwise row 0.
+
+- **Esc** = a strict per-level ladder (each step applies only when the next
+  does not):
+  1. Strip a trailing space (drill-out one level, cursor memory preserved
+     via traversal frames).
+  2. Replay a traversal frame (restore the previous prompt + filter state +
+     cursor) — §5 rules.
+  3. Clear the current level's fuzzy terms and modifiers (the buffer
+     rewrite reflects the level with refinement dropped).
+  4. Clear the level's selection token (leaving the parent level with a
+     trailing space so the parent list stays visible).
+  5. At the root level, clear the entire buffer (v1 rule retained).
 
 ---
 
@@ -410,3 +447,53 @@ distinct and each is framework-owned where it can be:
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
 | Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
 | `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
+| Active-state sourcing | Single engine mechanism (`active_selector` on providers/descriptors) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
+| Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
+| Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
+
+---
+
+## 12. Role split: engine vs. host (final state)
+
+The recurring integration friction (cursor sync, marker policy, overlay
+dispatch) traces to fuzzy ownership boundaries. The settled division:
+
+**The engine (`slashdot_menu`) owns everything derived from the prompt
+state.** Per frame it produces, from `(line, cursor map, providers,
+descriptor)`:
+
+- the resolved level (node path) and whether it is a listing or a pinned
+  level awaiting drill (the trailing-space rule, §3 — uniform, no host
+  exceptions);
+- the candidate rows (ranked, filtered, sorted), including the `*`
+  active-state row resolved from `active_selector` (§5.1);
+- the cursor row (sticky cursor map), and Tab/Enter/Esc **decisions**:
+  the new buffer text, whether to push/pop a traversal frame, and whether
+  the accept is a submit (canonical line) or an intermediate state;
+- Esc as the per-level ladder (§5.1) — pure buffer/state rewrites.
+
+The engine is *pure*: no terminal I/O, no picocode types, no async. It
+emits a **render plan** (level, rows with marker positions, header, title
+hint) rather than strings where possible, so the host's table renderer can
+format.
+
+**The host (`repl.rs`) owns everything not derivable from the prompt:**
+
+- application context (ReplCtx: active model/session/tree/usage) and
+  feeding it to providers as `active_selector` data;
+- terminal I/O, table rendering (columndefs from the descriptor), row
+  highlight painting, scrolling;
+- dispatching the engine's *submit* result to `InputAction` (SetModel,
+  SetThinking, Quit, …) — the engine never interprets picocode actions;
+- non-slash affordances: bare-prompt path completion, `!shell`, general Esc
+  with an empty menu, editor handoff (`$EDITOR`).
+
+**Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
+final state (impl Phase 7). The host's key loop is uniform: build engine →
+`state(line)` → render plan → read key → `step(line, key)` → apply result
+(buffer edit / frames / submit). Per-command code exists only in
+descriptors + providers + leaf-result translation, never as overlay arms.
+
+**Until Phase 7 completes**, legacy overlay arms may temporarily read host
+state (markers, filters), but every *new* behavior added in Phase 6.5+ must
+follow this split; no new host-side per-variant policy.

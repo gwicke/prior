@@ -266,14 +266,57 @@ conflation). This phase makes the **engine the single owner of the cursor**:
   rendered marker matches engine state for every migrated overlay;
   open-time seeding via `set_cursor`; Esc replay restores the cursor.
 
+### Phase 6.6 — uniform listing rule, active-selector, Esc ladder
+
+Follow-ups surfaced while manually exercising `/model` after Phase 6.5
+(design §3 listing rule, §5.1 active-selector, §5.1 Esc ladder, §12 role
+split). The engine owns all of it; the host must not keep per-command
+exceptions.
+
+1. **Listing-open rule (engine)**: a *pinned* selection on a listing node
+   (children or handler) shows the **parent** list with the pinned row
+   highlighted; only the trailing space shows the child menu. Today
+   `/model` (no space) opens the model dialog via the host's
+   "open without trailing space" match list — remove that list and let
+   `state("model")` route to the root `CommandList` (the interpreter
+   already returns `path=[]`, `sel=Some("model")`, the root rows with the
+   pinned row as cursor). Applies to `/thinking`, `/set`, `/persona`,
+   `/session`, `/tree`, `/sandbox`, `/compact` uniformly.
+2. **`active_selector` (engine)**: `DataProvider::active_selector()` (and
+   the enum/static analogue on nodes) reports the currently-in-effect id;
+   the engine resolves it to the `*` row per frame. Migrate the host's
+   ctx-driven `active` computations (Model, Thinking, Persona, Session,
+   Tree) into providers; `MenuState` gains `active_row_marker: Option<usize>`
+   distinct from the cursor `active`; open-time cursor seeds on the marker
+   row when no sticky cursor exists. Fixes "`/model ` doesn't focus the
+   active model on entry" (the cursor currently seeds at the pinned/recent
+   top, not the selector).
+3. **Esc ladder (engine)**: replace the host's per-variant `handle_esc`
+   buffer rewrites with the §5.1 ladder, decided in the engine
+   (trailing space → frame replay → clear level terms/modifiers → clear
+   level selection → clear buffer at root). Repairs "Esc from a filtered
+   view clears the entire prompt".
+4. **Cursor consistency `/model` vs `/model `**: the pinned root level and
+   the drilled listing must share cursor provenance (same sticky-map
+   seeding; entering the dialog seeds on the active-selector row, backing
+   out restores the root cursor).
+5. **Tab-into-prompt mismatch**: Tab completing from a filtered view must
+   write the *cursor row's* id (verify `tab_at` uses the sticky cursor,
+   not the pre-filter pin; regression-guard with a rank-reorder test).
+
 ### Phase 7 — cleanup
 
 - Remove `ActiveOverlay` variants that no longer have consumers; collapse
   `from_buffer`/`handle_tab`/`handle_enter`/`handle_esc` to interpreter
   delegation; drop `slash::registry()` bespoke filtering (root list renders
   from the root descriptor).
+- Collapse the overlay set to the design §12 end state: one
+  `ActiveOverlay::Menu`-shaped dispatch; per-command code lives only in
+  descriptors, providers, and leaf-result translation.
 - Final audit: no picocode types leak into `slashdot_menu` (compile-time
-  check: the crate must build without the parent in the workspace).
+  check: the crate must build without the parent in the workspace); the
+  host renders the engine's plan verbatim (§12) — no per-variant marker or
+  cursor policy survives.
 
 ---
 
