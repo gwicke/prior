@@ -49,6 +49,21 @@ pub enum OverlayAction {
     Submit(String),
     /// Nothing to do.
     None,
+    /// Interstitial (D4): show plain text; the framework keeps the menu
+    /// state. Next Enter dismisses (no leaf) or invokes the leaf.
+    Interstitial {
+        text: String,
+        /// Canonical line at the moment of the interstitial.
+        line: String,
+    },
+    /// Editor handoff (§9): the leaf handler asked for an `$EDITOR` pass.
+    /// Cancellation re-enters the prompt via `pending_prefill`.
+    Editor {
+        line: String,
+    },
+    /// Leaf returned a new path (R8-8): rewrite the buffer to another menu
+    /// state (e.g. `/compact` → `/tree <id> compact `).
+    Rewrite(String),
 }
 
 /// Internal Tab outcome: plain buffer rewrite or buffer + drill (promote).

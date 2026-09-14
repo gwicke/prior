@@ -34,6 +34,13 @@ pub struct MenuNode {
     pub is_leaf: bool,
     /// Dynamic level marker: rows come from a registered DataProvider.
     pub dynamic: bool,
+    /// Interstitial text (D4): shown on Enter before any leaf call or
+    /// drilling. With no leaf handler: second Enter dismisses (/stat).
+    /// With a leaf: first Enter shows, next Enter invokes (/replay).
+    pub interstitial: Option<String>,
+    /// Confirm property (D5): the leaf runs in two steps through a single
+    /// handler instance (prep then accept/abort), state surviving between.
+    pub confirm: bool,
 }
 
 impl MenuNode {
@@ -69,6 +76,18 @@ impl MenuNode {
     /// Dynamic level: rows come from a registered DataProvider (§8).
     pub fn dynamic(mut self) -> Self {
         self.dynamic = true;
+        self
+    }
+
+    /// Interstitial text (D4).
+    pub fn interstitial(mut self, text: impl Into<String>) -> Self {
+        self.interstitial = Some(text.into());
+        self
+    }
+
+    /// Confirm flow (D5): two-step leaf through one handler instance.
+    pub fn confirm(mut self) -> Self {
+        self.confirm = true;
         self
     }
 

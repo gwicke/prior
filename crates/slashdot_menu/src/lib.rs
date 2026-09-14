@@ -12,6 +12,7 @@
 //! See `doc/slash_menu_v2_design.md` in the picocode repository for the
 //! design this implements.
 
+pub mod accept;
 pub mod cursor;
 pub mod fields;
 pub mod filter;
