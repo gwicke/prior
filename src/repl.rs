@@ -1669,6 +1669,41 @@ impl ActiveOverlay {
         *cursors = engine.take_cursors();
     }
 
+    /// Phase 6.6 item 3 (design §5.1): route Esc through the engine's
+    /// back-navigation ladder for engine-backed overlays. `menu_frames`
+    /// are replayed (previous filter/cursor) before the structural
+    /// per-level pop; the engine produces the new buffer. Returns `true`
+    /// if the engine handled it (buffer written).
+    #[must_use]
+    fn engine_esc(
+        &self,
+        editor: &mut LineEditor,
+        ctx: &ReplCtx,
+        frames: &mut Vec<slash_menu_bridge::Frame>,
+        cursors: &mut slashdot_menu::interpreter::CursorMap,
+    ) -> bool {
+        let Some(mut engine) = self.engine_for(ctx) else {
+            return false;
+        };
+        engine.restore_cursors(std::mem::take(cursors));
+        let line = editor.text().trim_start_matches('/').to_string();
+        let r = engine.step_at(
+            &line,
+            0,
+            slash_menu_bridge::HostKey::Esc,
+            frames,
+        );
+        if let Some(b) = r.buffer {
+            if b.is_empty() {
+                editor.set("");
+            } else {
+                editor.set(&format!("/{}", b));
+            }
+        }
+        *cursors = engine.take_cursors();
+        true
+    }
+
     /// Handle Tab on a selected row.  Mutates the editor in-place.
     fn handle_tab(
         &self,
@@ -3211,8 +3246,15 @@ impl Repl {
                                 }
                             }
                             KeyCode::Esc => {
-                                overlay.handle_esc(&mut editor,
-                                    &mut path_completions, &mut completion_pos);
+                                // Phase 6.6 item 3: engine-backed overlays
+                                // route Esc through the engine's per-level
+                                // ladder (frame replay + esc()); legacy
+                                // overlays keep their bespoke rewrites until
+                                // they migrate.
+                                if !overlay.engine_esc(&mut editor, ctx, &mut menu_frames, &mut menu_cursors) {
+                                    overlay.handle_esc(&mut editor,
+                                        &mut path_completions, &mut completion_pos);
+                                }
                             }
                             _ => {
                                 // Editing key while path-completion overlay is active

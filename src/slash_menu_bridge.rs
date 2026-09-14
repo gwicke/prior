@@ -506,12 +506,13 @@ impl MenuEngine {
             }
             HostKey::Esc => {
                 // Esc already returned above (frame replay) or falls through
-                // as a structural pop; treat like Tab for buffer handling.
+                // as the structural ladder pop. Esc never *pushes* frames
+                // (it only walks up); applying the ladder's rewrite must not
+                // create a new back-target.
                 let buffer = match &ix_action {
                     OverlayAction::Buffer(b) => Some(b.clone()),
                     _ => None,
                 };
-                self.push_frame_on(ix_action, line, cursor, frames);
                 StepResult {
                     buffer,
                     restore_cursor: None,
@@ -785,9 +786,15 @@ mod tests {
         // structural pop (pinned level → drilled "thinking ").
         let r3 = e.step_at("thinking e", 0, HostKey::Esc, &mut frames);
         assert_eq!(r3.buffer, Some("thinking e".to_string()));
+        // Frames exhausted → the structural ladder (design §5.1): clear
+        // this level's terms keeping the list open, then strip the
+        // trailing space, then clear the buffer at the top level.
         let r4 = e.step_at("thinking e", 0, HostKey::Esc, &mut frames);
-        // Structural pop at the root list = clear (v1 rule).
-        assert_eq!(r4.buffer, Some(String::new()));
+        assert_eq!(r4.buffer, Some("thinking ".to_string()));
+        let r5 = e.step_at("thinking ", 0, HostKey::Esc, &mut frames);
+        assert_eq!(r5.buffer, Some("thinking".to_string()));
+        let r6 = e.step_at("thinking", 0, HostKey::Esc, &mut frames);
+        assert_eq!(r6.buffer, Some(String::new()));
     }
 
     /// Esc with an empty stack falls back to the structural level pop

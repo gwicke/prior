@@ -681,27 +681,40 @@ fn resolve_active_selector(
 
     /// Esc: pop one level — rewrite the buffer to the parent state.
     /// Esc at the root clears the buffer (v1 rule).
+    /// Esc: per-level back-navigation ladder (design §5.1). Each Esc press
+    /// advances one step; traversal frames are replayed by the caller
+    /// (`step_at` HostKey::Esc) *before* this is reached, so frames are not
+    /// consulted here:
+    ///   1. strip a trailing space (drill-out one level);
+    ///   2. (— frame replay — handled by the caller);
+    ///   3. clear this level's fuzzy terms/modifiers, keeping the level's
+    ///      list visible (path + trailing space) — e.g. `/model gpt4` →
+    ///      `/model `;
+    ///   4. clear the level's pinned selection, leaving a trailing space so
+    ///      the parent list stays visible;
+    ///   5. at the top level, clear the whole buffer.
     pub fn esc(&mut self, line: &str) -> OverlayAction {
         let st = self.state(line);
-        if st.node_path.is_empty() && st.selection.is_none() {
-            return OverlayAction::Buffer(String::new());
+        // Step 1: strip a trailing space (drill-out).
+        if line.ends_with(' ') {
+            return OverlayAction::Buffer(line.trim_end().to_string());
         }
+        // Step 3: a listing level with refinement (terms/modifiers) but no
+        // pinned selection → clear the refinement, keep the list open.
+        if !st.node_path.is_empty() && st.selection.is_none() {
+            return OverlayAction::Buffer(format!("{} ", st.node_path.join(" ")));
+        }
+        // Step 4: clear a pinned selection; leave a trailing space when a
+        // parent level exists so that parent's list stays shown.
         if st.selection.is_some() {
-            // Pop the pinned selection back to a trailing space (show the
-            // drilled level again).
             let mut parent = st.node_path.join(" ");
             if !parent.is_empty() {
                 parent.push(' ');
             }
             return OverlayAction::Buffer(parent);
         }
-        if st.drill_in {
-            // Drilled level popped → back to the parent path (the node
-            // whose child menu was shown).
-            return OverlayAction::Buffer(st.node_path.join(" "));
-        }
-        let parent = st.node_path[..st.node_path.len() - 1].join(" ");
-        OverlayAction::Buffer(parent)
+        // Step 5: top level → clear.
+        OverlayAction::Buffer(String::new())
     }
 }
 
@@ -1072,6 +1085,39 @@ mod tests {
             st3.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["model-c", "model-a"]
         );
+    }
+
+    #[test]
+    fn dynamic_tab_uses_arrowed_cursor_after_rank() {
+        // Phase 6.6 item 5: Tab from a filtered view must complete the
+        // *cursor* row, not the pre-filter default. Simulate: filter that
+        // ranks, arrow to a non-default row, re-derive, Tab.
+        let root = MenuNode::new("root").children(vec![
+            MenuNode::new("model").dynamic().leaf(),
+        ]);
+        struct P;
+        impl crate::provider::DataProvider for P {
+            fn fetch(&mut self, _m: &[crate::grammar::ModifierToken]) -> crate::provider::DataResult {
+                crate::provider::DataResult {
+                    rows: vec![
+                        crate::fields::Row::new("p:gpt4o").desc("GPT-4o flagship"),
+                        crate::fields::Row::new("p:gpt4-mini").desc("GPT-4 mini fast"),
+                        crate::fields::Row::new("c:opus").desc("Claude opus"),
+                    ],
+                    ..Default::default()
+                }
+            }
+        }
+        let mut i = Interpreter::new(root.clone()).with_provider(&["model"], Box::new(P));
+        // Filter narrows to [gpt4o, gpt4-mini]; arrow to index 1 (gpt4-mini).
+        let st = i.state("model gpt4");
+        assert_eq!(st.candidates.len(), 2);
+        i.move_cursor("model gpt4", 1);
+        // The cursor survives the re-derive; Tab on it completes gpt4-mini,
+        // not the pre-filter pin/default (gpt4o).
+        let st = i.state("model gpt4");
+        let act = i.tab_at("model gpt4", st.active);
+        assert_eq!(act, OverlayAction::Buffer("model p:gpt4-mini".to_string()));
     }
 
     #[test]
