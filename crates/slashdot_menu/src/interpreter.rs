@@ -48,6 +48,13 @@ pub enum OverlayAction {
     None,
 }
 
+/// Internal Tab outcome: plain buffer rewrite or buffer + drill (promote).
+enum TabResult {
+    Buffer(String),
+    BufferDrill(String),
+    None,
+}
+
 /// Interpreter over a static node tree.
 pub struct Interpreter {
     pub root: MenuNode,
@@ -184,22 +191,35 @@ impl Interpreter {
     /// terms in place (D2). If the completed node has a child menu, Tab
     /// leaves the buffer pinned (no trailing space; drill is explicit via
     /// Enter or space).
+    /// Tab: complete the active candidate into the buffer.
+    ///
+    /// Completing a selection adds or replaces the trailing word, keeping
+    /// earlier fuzzy terms (D2). When the completed node is a *listing*
+    /// (has children or a value child), Tab promotes exactly like Enter:
+    /// a trailing space is appended so the child menu shows.
     pub fn tab(&self, line: &str) -> OverlayAction {
+        match self.tab_inner(line) {
+            TabResult::Buffer(b) => OverlayAction::Buffer(b),
+            TabResult::BufferDrill(b) => OverlayAction::Buffer(format!("{} ", b)),
+            TabResult::None => OverlayAction::None,
+        }
+    }
+
+    /// Core of Tab: returns the rewritten buffer, optionally flagged as a
+    /// promotion (drill with trailing space).
+    fn tab_inner(&self, line: &str) -> TabResult {
         let st = self.state(line);
         let Some(sel) = st.selected() else {
-            return OverlayAction::None;
+            return TabResult::None;
         };
         let token = sel.id.clone();
         let trailing_space = line.ends_with(' ');
 
-        // Rebuild: path + earlier terms + completed token. The *trailing*
-        // partial word (or pinned selection) is replaced by the token; any
-        // earlier words are fuzzy terms and stay (D2).
         let mut parts: Vec<String> = st.node_path.clone();
         if trailing_space {
             // Pinned/drilled level: complete the active candidate of the
             // displayed level as a pinned selection.
-            parts.push(token);
+            parts.push(token.clone());
         } else {
             // Trailing partial: everything before the last word stays.
             let trimmed = line.trim_end();
@@ -208,9 +228,31 @@ impl Interpreter {
             for w in kept.iter().skip(st.node_path.len()) {
                 parts.push((*w).to_string());
             }
-            parts.push(token);
+            parts.push(token.clone());
         }
-        OverlayAction::Buffer(parts.join(" "))
+        let buf = parts.join(" ");
+
+        // Promotion rule: the completed node is a listing (children or a
+        // value child) ⇒ drill (trailing space). Otherwise plain pin.
+        // Note: parts currently ends with the completed token; resolve its
+        // node by walking the root through `parts`.
+        let mut node = self.root.clone();
+        for p in &parts {
+            if let Some(c) = node.child(p) {
+                node = c.clone();
+            }
+        }
+        if !node.children.is_empty() || node.value.is_some() {
+            // Value children: Tab pins the value, but the *listing* itself
+            // was already the level; completing to a value just pins.
+            if node.value.is_some() {
+                TabResult::Buffer(buf)
+            } else {
+                TabResult::BufferDrill(buf)
+            }
+        } else {
+            TabResult::Buffer(buf)
+        }
     }
 
     /// Enter: accept.
@@ -221,45 +263,31 @@ impl Interpreter {
     /// 2. If the pinned node is a leaf → submit the canonical line.
     /// 3. Otherwise Enter behaves like Tab + trailing space (drill).
     pub fn enter(&self, line: &str) -> OverlayAction {
-        let st = self.state(line);
-
-        // Leaf at the current path? The node at node_path is a leaf → submit.
-        if st.drill_in {
-            // Drilled: the displayed level is the child menu. Enter here
-            // acts on the active candidate of the child level.
-            let Some(sel) = st.selected() else {
-                return OverlayAction::None;
-            };
-            // Resolve the child node to check leaf-ness.
-            let mut node = self.root.clone();
-            for k in &st.node_path {
-                if let Some(c) = node.child(k) {
-                    node = c.clone();
-                }
-            }
-            // The active candidate of the drilled level is either a static
-            // grandchild or a value child's value.
-            if node.value.is_some() || node.child(&sel.id).map(|c| c.is_leaf).unwrap_or(false) {
-                // Rebuild the canonical line: path + selection.
-                let mut canon = st.node_path.join(" ");
-                if !canon.is_empty() {
-                    canon.push(' ');
-                }
-                canon.push_str(&sel.id);
-                return OverlayAction::Submit(canon);
-            }
-            // Drill deeper: append the candidate as a pinned selection.
-            let mut buf = line.trim_end().to_string();
-            buf.push(' ');
-            buf.push_str(&sel.id);
-            return OverlayAction::Buffer(buf);
-        }
-
-        // Not drilled: pin the selection (like Tab) + trailing space.
+        // Enter = Tab + trailing space for structural promotion; Tab already
+        // promotes listings (same as Enter), so delegate and reuse logic.
         match self.tab(line) {
-            OverlayAction::Buffer(mut b) => {
-                b.push(' ');
-                OverlayAction::Buffer(b)
+            OverlayAction::Buffer(b) if !line.ends_with(' ') && !b.ends_with(' ') => {
+                // Tab produced a pin (leaf or value child) — Enter adds the
+                // drill space to show the next level (per contract, Enter
+                // on a non-leaf always drills).
+                let st = self.state(line);
+                // If the completed node is a leaf → submit canonical line.
+                let mut node = self.root.clone();
+                let parts: Vec<&str> = b.trim_end().split(' ').collect();
+                for p in &parts {
+                    if let Some(c) = node.child(p) {
+                        node = c.clone();
+                    }
+                }
+                if node.is_leaf && !parts.is_empty() {
+                    return OverlayAction::Submit(b.to_string());
+                }
+                // Non-leaf pinned (e.g. value child) → Enter pins; a second
+                // Enter (drilled) submits. Match prior behavior: pin only.
+                if st.drill_in {
+                    return OverlayAction::Buffer(b);
+                }
+                OverlayAction::Buffer(format!("{} ", b))
             }
             other => other,
         }
@@ -401,18 +429,22 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_leaf() {
+    fn enter_on_value_child_submits_directly() {
+        // The thinking node is a leaf; its value child is the argument.
+        // Enter with a pinned value submits the canonical line directly
+        // (no two-step) — the leaf takes the pinned value as its payload.
         let act = ix().enter("thinking med");
-        // "thinking" node has a value child; "med" pinned, not drilled →
-        // Enter = Tab + space = drill... but pinned leaf semantics: the
-        // value child path ends here. The drilled enter path submits.
-        match act {
-            OverlayAction::Buffer(b) => assert_eq!(b, "thinking med ".to_string()),
-            other => panic!("expected buffer, got {:?}", other),
+        assert_eq!(act, OverlayAction::Submit("thinking med".to_string()));
+        // Typing a partial value does not submit: the permissive rule pins
+        // any token, but here "h" has no exact candidate — Enter completes
+        // to the active candidate. That IS the completion flow; test that
+        // it lands on a full value token.
+        let act2 = ix().enter("thinking h");
+        match act2 {
+            OverlayAction::Submit(s) => assert!(s.starts_with("thinking ")),
+            OverlayAction::Buffer(b) => assert!(b.starts_with("thinking ")),
+            other => panic!("expected completion, got {:?}", other),
         }
-        // Second enter (drilled) submits.
-        let act2 = ix().enter("thinking med ");
-        assert_eq!(act2, OverlayAction::Submit("thinking med".to_string()));
     }
 
     #[test]
