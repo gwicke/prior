@@ -198,64 +198,6 @@ fn collect_touched_files(
 }
 
 /// Like `collect_touched_files` but skips paths already in `seen_paths`.
-/// Adds new entries to `files` and records their paths in `seen_paths`.
-/// De-duplication handles both relative and absolute paths by normalising
-/// all extracted paths via `relativize_path` before lookup.
-fn collect_touched_files_filtered(
-    message: &serde_json::Value,
-    files: &mut Vec<TouchedFile>,
-    seen_paths: &mut std::collections::HashSet<String>,
-    session_dir: &std::path::Path,
-) {
-    let Some(content) = message.get("content").and_then(|c| c.as_array()) else {
-        return;
-    };
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
-            continue;
-        }
-        let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let modified = match name {
-            "write" | "edit" => true,
-            "read" => false,
-            _ => continue,
-        };
-        let Some(path) = item
-            .get("arguments")
-            .and_then(|a| a.get("path"))
-            .and_then(|p| p.as_str())
-        else {
-            continue;
-        };
-        // Normalise to relative form for de-dup key; fall back to absolute.
-        let normalized = relativize_path(session_dir, path).unwrap_or_else(|| path.to_string());
-
-        // Skip already-seen paths (preserve earlier entry's order).
-        // Upgrade descriptor if the new entry is "modified" and the existing is "read".
-        if seen_paths.contains(&normalized) {
-            if modified {
-                if let Some(existing) = files.iter_mut().find(|f| f.path == normalized) {
-                    if existing.descriptor.as_deref() == Some("read") {
-                        existing.descriptor = Some("modified".to_string());
-                    }
-                    existing.modified = true;
-                }
-            }
-            continue;
-        }
-        seen_paths.insert(normalized.clone());
-        let descriptor = if modified {
-            Some("modified".to_string())
-        } else {
-            Some("read".to_string())
-        };
-        files.push(TouchedFile {
-            path: normalized,
-            modified,
-            descriptor,
-        });
-    }
-}
 /// entries a compaction drops (everything before `firstKeptEntryId`).
 ///
 /// Contains, in chronological order:
@@ -370,14 +312,15 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry], session_dir: &st
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
 pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>, session_dir: &std::path::Path) -> String {
-    // Build the file list: previous-summary files first, then newly-touched
-    // files from the dropped span, de-duplicated. De-dup is by path; the earlier
-    // entry wins (previous-summary files are "authoritative").
+    // Build the file list: previous-summary files first (in their original
+    // order), then newly-touched files from the dropped span (in chronological
+    // session order), de-duplicated. De-dup promotes read→modified in-place at
+    // the original position; new paths are appended at the end.
     let mut files: Vec<TouchedFile> = Vec::new();
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seed_text: Vec<String> = Vec::new();
 
-    // Carry-forward files from the previous summary first.
+    // Carry-forward files from the previous summary first (preserve their order).
     if let Some(summary) = previous_summary {
         let (parsed_files, notes) = parse_summary_into_sections(summary, &["files", "documents"]);
         for pf in parsed_files {
@@ -387,12 +330,30 @@ pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: 
         seed_text = notes;
     }
 
-    // Collect newly-touched files from the dropped span (skip duplicates).
+    // Collect newly-touched files from the dropped span in chronological order.
+    let mut new_files: Vec<TouchedFile> = Vec::new();
     for entry in dropped {
         if let SessionEntryContent::Message { message } = &entry.content {
             if message.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                collect_touched_files_filtered(message, &mut files, &mut seen_paths, session_dir);
+                collect_touched_files(message, &mut new_files, session_dir);
             }
+        }
+    }
+
+    // Merge: iterate new_files in chronological order, deduplicate against seen_paths.
+    // If path exists, promote read→modified in-place at original position.
+    // If new, append at end (preserving chronological order of first appearance).
+    for new_file in new_files {
+        if let Some(existing_idx) = files.iter().position(|f| f.path == new_file.path) {
+            if new_file.modified {
+                files[existing_idx].modified = true;
+                if files[existing_idx].descriptor.as_deref() == Some("read") {
+                    files[existing_idx].descriptor = Some("modified".to_string());
+                }
+            }
+        } else {
+            seen_paths.insert(new_file.path.clone());
+            files.push(new_file);
         }
     }
 
@@ -692,28 +653,20 @@ fn first_user_prompt(entries: &[SessionEntry]) -> Option<String> {
 }
 
 fn render_files_section(out: &mut String, files: &[TouchedFile], label: &str) {
-    // Group + sort: modified first, then read; alphabetical within each.
-    let mut modified: Vec<&TouchedFile> = files
+    // Preserve collection order (chronological). No sorting — the caller builds
+    // the `files` vector in the desired order: previous-summary files first
+    // (in their original order), then newly-touched files from the dropped
+    // span (in chronological session order), with read→modified promotion
+    // happening in-place at the original position.
+    let filtered: Vec<&TouchedFile> = files
         .iter()
-        .filter(|f| f.modified && is_document_path(&f.path) == (label == "Documents"))
+        .filter(|f| is_document_path(&f.path) == (label == "Documents"))
         .collect();
-    let mut read: Vec<&TouchedFile> = files
-        .iter()
-        .filter(|f| !f.modified && is_document_path(&f.path) == (label == "Documents"))
-        .collect();
-    if modified.is_empty() && read.is_empty() {
+    if filtered.is_empty() {
         return;
     }
-    modified.sort_by(|a, b| a.path.cmp(&b.path));
-    read.sort_by(|a, b| a.path.cmp(&b.path));
     out.push_str(&format!("\n---\n# [{}]\n", label));
-    let mut lines: Vec<String> = Vec::new();
-    for f in modified {
-        lines.push(file_line(f));
-    }
-    for f in read {
-        lines.push(file_line(f));
-    }
+    let lines: Vec<String> = filtered.iter().map(|f| file_line(f)).collect();
     out.push_str(&lines.join("\n"));
 }
 
@@ -3319,20 +3272,19 @@ mod tests {
         // No .md files in this span, so only the "Files" section appears.
         assert!(s.contains("# [Files]"));
         assert!(!s.contains("# [Documents]"));
-        // Modified files listed as modified (read-then-edit promotes).
-        assert!(s.contains("- modified: a.txt"));
+        // Chronological order: b.txt (read) appears first, then a.txt (read, then promoted to modified).
         assert!(s.contains("- read: b.txt"));
-        // Non-file tools ignored; a.txt appears once in the read list and
-        // once as modified, but NOT as a plain read (promoted).
+        assert!(s.contains("- modified: a.txt"));
+        // Non-file tools ignored; a.txt appears once as modified (promoted from read).
         let read_lines: Vec<&str> = s.lines().filter(|l| l.starts_with("- read: ")).collect();
         assert_eq!(read_lines, vec!["- read: b.txt"]);
         // No tool-call syntax or arguments leaked.
         assert!(!s.contains("toolCall"));
         assert!(!s.contains("arguments"));
-        // Modified before reads.
-        let m = s.find("- modified:").unwrap();
-        let r = s.find("- read:").unwrap();
-        assert!(m < r);
+        // Order preserved: b.txt (first seen) before a.txt (first seen later).
+        let b_pos = s.find("- read: b.txt").unwrap();
+        let a_pos = s.find("- modified: a.txt").unwrap();
+        assert!(b_pos < a_pos);
     }
 
     #[test]
@@ -3443,8 +3395,7 @@ mod tests {
         let session_dir = std::path::PathBuf::from("/test");
         // The dropped span touches both markdown and non-markdown files;
         // the text-only summary must render them under separate headers,
-        // with each group sorted (modified before reads, alphabetical
-        // within).
+        // with each group in chronological order of first appearance.
         let dropped = vec![
             sum_user("m0", None, "do work"),
             sum_assistant("a0", Some("m0"), serde_json::json!([
@@ -3464,26 +3415,24 @@ mod tests {
         // Both headers present.
         assert!(s.contains("# [Documents]"), "missing Documents section: {s}");
         assert!(s.contains("# [Files]"), "missing Files section: {s}");
-        // Documents section: only .md files, modified (docs/plan.md) before
-        // read (README.md, CHANGELOG.md), alphabetical within each.
+        // Documents section: only .md files, in chronological order of first appearance.
         let docs_start = s.find("# [Documents]").unwrap();
         let files_start = s.find("# [Files]").unwrap();
         assert!(docs_start < files_start);
         let docs_block = &s[docs_start..files_start];
-        assert!(docs_block.contains("- modified: docs/plan.md"));
-        assert!(docs_block.contains("- read: CHANGELOG.md"));
-        assert!(docs_block.contains("- read: README.md"));
+        // Order: README.md (read, first), docs/plan.md (edit, second), CHANGELOG.md (read, third)
+        let readme_pos = docs_block.find("- read: README.md").unwrap();
+        let plan_pos = docs_block.find("- modified: docs/plan.md").unwrap();
+        let changelog_pos = docs_block.find("- read: CHANGELOG.md").unwrap();
+        assert!(readme_pos < plan_pos);
+        assert!(plan_pos < changelog_pos);
         // No non-.md in Documents.
         assert!(!docs_block.contains("src/lib.rs"));
-        // Files section: only non-.md, modified (src/lib.rs).
+        // Files section: only non-.md, in chronological order.
         let files_block = &s[files_start..];
         assert!(files_block.contains("- modified: src/lib.rs"));
         assert!(!files_block.contains("README.md"));
         assert!(!files_block.contains("docs/plan.md"));
-        // Modified still comes before reads in each group.
-        let docs_m = docs_block.find("- modified:").unwrap();
-        let docs_r = docs_block.find("- read:").unwrap();
-        assert!(docs_m < docs_r);
     }
 
     #[test]
