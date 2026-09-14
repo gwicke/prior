@@ -846,6 +846,40 @@ impl ActiveOverlay {
             }
             "sandbox" | "sb" => {
                 let filter = rest.trim().to_string();
+                // v2 engine subcommands (Phase 6 step 7): the sandbox node's
+                // static children rank/filter via the engine; path-value
+                // completion (add_ro/add_rw) and remove stay on the v1
+                // overlay for now (fs live-filter lands with the modifier
+                // value-completion migration).
+                let line = buf.trim_start_matches('/').to_string();
+                let last_tok = filter.split_whitespace().next().unwrap_or("");
+                let is_value_phase = {
+                    let words: Vec<&str> = filter.split_whitespace().collect();
+                    words.len() >= 2
+                        || words.first().map(|w| {
+                            matches!(*w, "add_ro" | "add_rw" | "remove")
+                        }).unwrap_or(false) && !filter.ends_with(' ') && words.len() >= 1
+                };
+                if !is_value_phase {
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let st = engine.interpreter.state(&line);
+                    if st.candidates.iter().any(|r| {
+                        matches!(r.id.as_str(), "add_ro" | "add_rw" | "remove")
+                    }) {
+                        let items: Vec<String> = st
+                            .candidates
+                            .iter()
+                            .map(|r| {
+                                let name = format!("{:<10}", r.id);
+                                match &r.description {
+                                    Some(d) => format!("{} {}", name, d),
+                                    None => name,
+                                }
+                            })
+                            .collect();
+                        return ActiveOverlay::Sandbox { sub: None, items, _filter: filter };
+                    }
+                }
                 let mut items = Vec::new();
                 let mut active = None;
                 let sub = Repl::sandbox_overlay_entries(&filter, &mut items, &mut active);

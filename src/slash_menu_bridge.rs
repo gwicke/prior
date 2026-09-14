@@ -257,6 +257,18 @@ impl MenuEngine {
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
                 }
+                "sandbox" => {
+                    // §10 step 7: static subcommand children (add_ro/add_rw
+                    // with back-end fs modifier value completion; remove is
+                    // a value child whose ids are the current bindings).
+                    *c = MenuNode::new("sandbox")
+                        .desc("manage session path bindings: add_ro | add_rw | remove")
+                        .children(vec![
+                            MenuNode::new("add_ro").desc("make path available read-only"),
+                            MenuNode::new("add_rw").desc("make path available read-write"),
+                            MenuNode::new("remove").desc("remove a path from the bindings"),
+                        ]);
+                }
                 "tree" => {
                     // §10 step 6: dynamic level (tree entries) → shared
                     // static action level (switch/compact); compact modes
