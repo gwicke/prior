@@ -78,21 +78,33 @@ impl MenuEngine {
 
     /// The static descriptor tree: one child per command (§10). Only the
     /// commands migrated so far are referenced by ActiveOverlay; the rest
-    /// are descriptors for the root list (Phase 6 step 2).
+    /// are descriptors for the root list (Phase 6 step 2 — done).
     fn root_descriptor(_ctx: &crate::repl::ReplCtx) -> MenuNode {
-        MenuNode::new("root").children(vec![
-            // §10 step 1: /thinking — static level with one enum positional
-            // value child (off|low|med|high), shared leaf = SetThinking.
-            MenuNode::new("thinking")
-                .desc("set thinking level")
-                .value(crate::slashdot_menu::node::ValueChild::Enum(vec![
-                    "off".into(),
-                    "low".into(),
-                    "med".into(),
-                    "high".into(),
-                ]))
-                .leaf(),
-        ])
+        // Root list from the static command registry (name → key without
+        // the leading slash; help → description), plus the migrated
+        // per-command sub-descriptors (§10 order; thinking first).
+        let mut children: Vec<MenuNode> = crate::slash::registry()
+            .iter()
+            .map(|c| {
+                MenuNode::new(c.name.trim_start_matches('/')).desc(c.help)
+            })
+            .collect();
+        // §10 step 1: /thinking — static level with one enum positional
+        // value child (off|low|med|high), shared leaf = SetThinking.
+        for c in children.iter_mut() {
+            if c.key == "thinking" {
+                *c = MenuNode::new("thinking")
+                    .desc("set thinking level")
+                    .value(crate::slashdot_menu::node::ValueChild::Enum(vec![
+                        "off".into(),
+                        "low".into(),
+                        "med".into(),
+                        "high".into(),
+                    ]))
+                    .leaf();
+            }
+        }
+        MenuNode::new("root").children(children)
     }
 
     fn register_handlers(controller: &mut AcceptController) {
@@ -418,6 +430,29 @@ mod tests {
         let mut frames: Vec<Frame> = Vec::new();
         let r = e.step_at("thinking med", 0, HostKey::Esc, &mut frames);
         assert_eq!(r.buffer, Some("thinking ".to_string()));
+    }
+
+    /// Root list (Phase 6 step 2): the command registry is the root
+    /// descriptor; bare "/" lists all commands in registry order; a filter
+    /// term ranks them; Tab/Enter drill into the pinned command.
+    #[test]
+    fn root_list_from_registry() {
+        let mut e = MenuEngine::new(&ctx());
+        let st = e.interpreter.state("");
+        let ids: Vec<&str> = st.candidates.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"help"));
+        assert!(ids.contains(&"thinking"));
+        assert!(ids.contains(&"quit"));
+        // Filter ranks by name+desc ("mo" → model).
+        let st2 = e.interpreter.state("mo");
+        assert!(st2.candidates.iter().any(|r| r.id == "model"));
+        // Drill into a pinned command opens its level.
+        let st3 = e.interpreter.state("thinking ");
+        assert_eq!(st3.node_path, vec!["thinking"]);
+        assert_eq!(
+            st3.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["off", "low", "med", "high"]
+        );
     }
 
     /// Scoped edit invalidation: an ID edit at the current level clears

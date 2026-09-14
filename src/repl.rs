@@ -428,6 +428,11 @@ pub(crate) enum ActiveOverlay {
 
     CommandList {
         cmds: Vec<crate::fuzzy::Ranked<'static, slash::SlashCommand>>,
+        /// v2 engine rows (root descriptor, ranked). When non-empty these
+        /// drive display/Tab/Enter; the legacy `cmds` list stays until the
+        /// per-command handlers migrate (Phase 6 step 2).
+        engine_rows: Vec<crate::slashdot_menu::fields::Row>,
+        engine_active: usize,
     },
 
     Model {
@@ -1041,8 +1046,16 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                let cmds = slash::filter_commands(rest);
-                ActiveOverlay::CommandList { cmds }
+                // v2 engine root list (Phase 6 step 2): the command registry
+                // IS the root descriptor; the engine ranks and pins.
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
+                ActiveOverlay::CommandList {
+                    cmds: slash::filter_commands(rest),
+                    engine_rows: st.candidates.clone(),
+                    engine_active: st.active,
+                }
             }
         }
     }
@@ -1056,10 +1069,15 @@ impl ActiveOverlay {
                 let lines: Vec<String> = slash::render_help().lines().map(String::from).collect();
                 ("Help  (any key closes)", lines, None, true)
             }
-            ActiveOverlay::CommandList { cmds } => {
-                let opts: Vec<String> = cmds.iter().map(|r| {
-                    format!("{:<10} {}", r.item.name, r.item.help)
+            ActiveOverlay::CommandList { engine_rows, engine_active, .. } => {
+                let opts: Vec<String> = engine_rows.iter().map(|r| {
+                    let name = format!("/{}", r.id);
+                    match &r.description {
+                        Some(d) => format!("{:<10} {}", name, d),
+                        None => name,
+                    }
                 }).collect();
+                let _ = engine_active;
                 if opts.is_empty() {
                     ("Commands  (type to filter, up/down, Tab/Enter select)",
                      vec!["(no matching command)".into()], None, false)
@@ -1274,10 +1292,22 @@ impl ActiveOverlay {
         menu_frames: &mut Vec<slash_menu_bridge::Frame>,
     ) {
         match self {
-            ActiveOverlay::CommandList { cmds } => {
-                if let Some(c) = cmds.get(sel) {
-                    editor.set(&Repl::complete_command(&c.item));
+            ActiveOverlay::CommandList { engine_rows, .. } => {
+                // v2 engine Tab (Phase 6 step 2): host cursor decides the
+                // row; engine handles bare-level promote vs completion.
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Tab,
+                    menu_frames,
+                );
+                if let Some(b) = r.buffer {
+                    editor.set(&format!("/{}", b));
                 }
+                let _ = engine_rows;
             }
             ActiveOverlay::Model { entries, .. } => {
                 if let Some(e) = entries.get(sel) {
@@ -1589,43 +1619,85 @@ impl ActiveOverlay {
         menu_frames: &mut Vec<slash_menu_bridge::Frame>,
     ) -> OverlayAction {
         match self {
-            ActiveOverlay::CommandList { cmds } => {
-                if let Some(cmd) = cmds.get(sel) {
-                    match cmd.item.kind {
-                        slash::SlashKind::Help => {
-                            *help_view = true;
-                            editor.set("");
+            ActiveOverlay::CommandList { engine_rows, .. } => {
+                // v2 engine Enter (Phase 6 step 2): host cursor decides.
+                // A pinned root child drills (buffer "<cmd> ", arg menu
+                // opens); leaf dispatch still goes through SlashKind
+                // below once the id is committed.
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Enter,
+                    menu_frames,
+                );
+                match r.action {
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
+                    ) => {
+                        editor.set(&format!("/{}", b));
+                        if let Some(c) = r.restore_cursor {
+                            sel = c;
                         }
-                        slash::SlashKind::Quit => {
-                            redraw(&LineEditor::new(), &[], sel, input_row);
-                            output.display_plain("");
-                            return OverlayAction::Action(InputAction::Quit);
-                        }
-                        slash::SlashKind::Model => editor.set("/model "),
-                        slash::SlashKind::Thinking => editor.set("/thinking "),
-                        slash::SlashKind::Settings => editor.set("/set "),
-                        slash::SlashKind::Persona => editor.set("/persona "),
-                        slash::SlashKind::Stat => editor.set("/stat "),
-                        slash::SlashKind::Sandbox => editor.set("/sandbox "),
-                        slash::SlashKind::Session => editor.set("/session path:. "),
-                        slash::SlashKind::Tree => editor.set("/tree "),
-                        slash::SlashKind::Compact => editor.set("/compact "),
-                        slash::SlashKind::Clear => {
-                            redraw(&LineEditor::new(), &[], sel, input_row);
-                            output.display_plain("/clear");
-                            return OverlayAction::Action(InputAction::Submit("/clear".into()));
-                        }
-                        slash::SlashKind::New => {
-                            redraw(&LineEditor::new(), &[], sel, input_row);
-                            output.display_plain("/new");
-                            return OverlayAction::Action(InputAction::Submit("/new".into()));
-                        }
-                        slash::SlashKind::Replay => editor.set("/replay "),
+                        return OverlayAction::Continue;
                     }
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
+                    ) => {
+                        // Leaf command accepted: translate the canonical
+                        // line to the SlashKind dispatch (same path as
+                        // typed submission).
+                        let key = canon.split(' ').next().unwrap_or("");
+                        let item = slash::registry()
+                            .iter()
+                            .find(|c| c.name.trim_start_matches('/') == key);
+                        if let Some(cmd) = item {
+                            match cmd.kind {
+                                slash::SlashKind::Help => {
+                                    *help_view = true;
+                                    editor.set("");
+                                }
+                                slash::SlashKind::Quit => {
+                                    redraw(&LineEditor::new(), &[], sel, input_row);
+                                    output.display_plain("");
+                                    return OverlayAction::Action(InputAction::Quit);
+                                }
+                                slash::SlashKind::Model => editor.set("/model "),
+                                slash::SlashKind::Thinking => editor.set("/thinking "),
+                                slash::SlashKind::Settings => editor.set("/set "),
+                                slash::SlashKind::Persona => editor.set("/persona "),
+                                slash::SlashKind::Stat => editor.set("/stat "),
+                                slash::SlashKind::Sandbox => editor.set("/sandbox "),
+                                slash::SlashKind::Session => editor.set("/session path:. "),
+                                slash::SlashKind::Tree => editor.set("/tree "),
+                                slash::SlashKind::Compact => editor.set("/compact "),
+                                slash::SlashKind::Clear => {
+                                    redraw(&LineEditor::new(), &[], sel, input_row);
+                                    output.display_plain("/clear");
+                                    return OverlayAction::Action(
+                                        InputAction::Submit("/clear".into()),
+                                    );
+                                }
+                                slash::SlashKind::New => {
+                                    redraw(&LineEditor::new(), &[], sel, input_row);
+                                    output.display_plain("/new");
+                                    return OverlayAction::Action(
+                                        InputAction::Submit("/new".into()),
+                                    );
+                                }
+                                slash::SlashKind::Replay => editor.set("/replay "),
+                            }
+                        }
+                        return OverlayAction::Continue;
+                    }
+                    _ => {}
                 }
+                let _ = engine_rows;
                 OverlayAction::Continue
             }
-            ActiveOverlay::Model { entries, .. } => {
+ActiveOverlay::Model { entries, .. } => {
                 if let Some(e) = entries.get(sel) {
                     let (provider, model) = e.qualified_parts();
                     let line = format!("/model {}", e.qualified());
