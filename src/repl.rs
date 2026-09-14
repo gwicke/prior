@@ -851,8 +851,9 @@ impl ActiveOverlay {
             "session" | "sessions" => {
                 let filter = rest.trim().to_string();
 
-                // Check for delete confirmation: buffer is `/session <name> delete`
-                // or `/session <name> delete current` (for current session → /clear).
+                // Delete confirmation (unchanged v1 path): the Confirm
+                // overlay handles the two-step; the v2 confirm flow for
+                // this command lands with the accept-flow migration.
                 if !filter.is_empty() {
                     let (name_part, after_name) = crate::agent::parse_session_name_after(&filter);
                     if !name_part.is_empty() {
@@ -914,13 +915,76 @@ impl ActiveOverlay {
                     let current_name = meta.name.clone();
                     ActiveOverlay::SessionAction { session_name, current_name, is_current, header, opts, active, _filter: filter }
                 } else {
-                    let mut opts = Vec::new();
-                    let mut active = None;
-                    Repl::session_overlay_entries(ctx, &filter, &mut opts, &mut active);
-                    let names: Vec<String> = filtered
-                        .iter()
-                        .map(|m| m.id.clone())
+                    // v2 engine list (Phase 6 step 5): SessionProvider rows;
+                    // `*` on the current session (ctx).
+                    let (dir_f, fuzzy_f) = Repl::parse_session_path_filter(&filter);
+                    let cwd_filter = dir_f.as_ref()
+                        .and_then(|d| if d.is_empty() { None } else { Some(std::path::Path::new(d)) });
+                    let all_sessions = if let Some(ref repo) = ctx.repo {
+                        repo.list_sessions_sync(cwd_filter)
+                    } else {
+                        Vec::new()
+                    };
+                    // Reuse the v1 meta mapping + sort (current first, then
+                    // recency) so the engine sees the same ordering.
+                    let mut sessions: Vec<SessionMeta> = all_sessions.into_iter()
+                        .map(|m| SessionMeta {
+                            id: m.id,
+                            name: m.name,
+                            timestamp: m.timestamp,
+                            cwd: m.cwd,
+                            parent_session: m.parent_session.map(|p| p.display().to_string()),
+                            message_count: m.message_count,
+                            user_message_count: m.user_message_count,
+                            first_prompt_preview: m.first_prompt_preview,
+                            last_prompt_text: m.last_prompt_text,
+                            last_prompt_timestamp: m.last_prompt_timestamp,
+                            path: Some(m.path),
+                        })
                         .collect();
+                    sessions.sort_by(|a, b| {
+                        let a_cur = a.id == ctx.current_session_id;
+                        let b_cur = b.id == ctx.current_session_id;
+                        if a_cur && !b_cur { std::cmp::Ordering::Less }
+                        else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+                        else {
+                            let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
+                            let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
+                            b_ts.cmp(a_ts)
+                        }
+                    });
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    engine.interpreter = engine.interpreter.with_provider(
+                        &["session"],
+                        Box::new(slash_menu_bridge::SessionProvider {
+                            sessions,
+                            current_id: ctx.current_session_id.clone(),
+                        }),
+                    );
+                    let line = buf.trim_start_matches('/').to_string();
+                    let st = engine.interpreter.state(&line);
+                    let opts: Vec<String> = st.candidates.iter().map(|r| {
+                        let get_str = |k: &str| r.field_value(k).and_then(|v| {
+                            if let crate::slashdot_menu::value::Value::Str(s) = v { Some(s.clone()) } else { None }
+                        });
+                        let get_num = |k: &str| r.field_value(k).and_then(|v| {
+                            if let crate::slashdot_menu::value::Value::Num(n) = v { Some(*n as usize) } else { None }
+                        });
+                        let name = get_str("name").unwrap_or_else(|| r.id.clone());
+                        let msgs = get_num("msgs").unwrap_or(0);
+                        let cwd = get_str("cwd").unwrap_or_default();
+                        let dir = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
+                        let ts = get_str("timestamp")
+                            .map(|t| Repl::format_session_timestamp(&t))
+                            .unwrap_or_default();
+                        format!("{} · {} {} · {}", name, msgs, dir, ts)
+                    }).collect();
+                    let names: Vec<String> = st.candidates.iter().map(|r| r.id.clone()).collect();
+                    let active = st
+                        .candidates
+                        .iter()
+                        .position(|r| r.id == ctx.current_session_id);
+                    let _ = fuzzy_f;
                     ActiveOverlay::Session { opts, names, active, _filter: filter }
                 }
             }

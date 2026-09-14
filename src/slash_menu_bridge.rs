@@ -63,6 +63,47 @@ pub struct MenuEngine {
     pub controller: AcceptController,
 }
 
+/// DataProvider over the session list (§10 step 5). Rows carry the
+/// session metadata the action level renders in its per-row header.
+pub struct SessionProvider {
+    pub sessions: Vec<crate::repl::SessionMeta>,
+    pub current_id: String,
+}
+
+impl slashdot_menu::provider::DataProvider for SessionProvider {
+    fn fetch(
+        &mut self,
+        _modifiers: &[slashdot_menu::grammar::ModifierToken],
+    ) -> slashdot_menu::provider::DataResult {
+        use slashdot_menu::value::Value;
+        let rows: Vec<slashdot_menu::fields::Row> = self
+            .sessions
+            .iter()
+            .map(|m| {
+                let display = m.name.clone().unwrap_or_else(|| m.id.clone());
+                let mut r = slashdot_menu::fields::Row::new(m.id.clone())
+                    .desc(&display)
+                    .field("name", Value::Str(display))
+                    .field("turns", Value::Num(m.user_message_count as f64))
+                    .field("msgs", Value::Num(m.message_count as f64))
+                    .field("cwd", Value::Str(m.cwd.clone()))
+                    .field("timestamp", Value::Str(m.timestamp.clone()));
+                if m.id == self.current_id {
+                    r = r.field("current", Value::Str("1".into()));
+                }
+                if let Some(p) = &m.parent_session {
+                    r = r.field("parent", Value::Str(p.clone()));
+                }
+                r
+            })
+            .collect();
+        slashdot_menu::provider::DataResult {
+            rows,
+            ..Default::default()
+        }
+    }
+}
+
 /// DataProvider over the model catalog (§10 step 4). One-shot fetch:
 /// applies the parsed modifier state to the repository filter and maps the
 /// entries to rows with number fields the engine can sort/filter.
@@ -174,6 +215,19 @@ impl MenuEngine {
                         .desc("set runtime persona")
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
+                }
+                "session" => {
+                    // §10 step 5: dynamic level (sessions) → static action
+                    // children shared by all rows; delete is a confirm leaf.
+                    *c = MenuNode::new("session")
+                        .desc("list, rename, resume, fork, or delete sessions")
+                        .dynamic()
+                        .children(vec![
+                            MenuNode::new("resume").desc("continue the session"),
+                            MenuNode::new("fork").desc("branch from this point"),
+                            MenuNode::new("rename").desc("rename the session"),
+                            MenuNode::new("delete").desc("delete from disk").confirm().leaf(),
+                        ]);
                 }
                 "model" => {
                     // §10 step 4: dynamic level over the catalog. Fields
