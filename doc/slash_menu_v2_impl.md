@@ -43,7 +43,8 @@ crates/slashdot_menu/
 
   Implemented in picocode over the existing editor (`set`/`set_text` is
   already the primitive the v1 overlays use). No cursor movement, no spans,
-  no editing operations leak into the crate.
+  no editing operations leak into the crate. The *view cursor* (highlighted
+  row) is separate: the host passes it into `tab_at`/`enter_at` (§4).
 
 - **Rendering**: the crate emits a **render plan**, not a ratatui frame. The
   plan is plain data (rows of styled segments, marker chars, alignment), so
@@ -164,16 +165,18 @@ Phase 0 and reused everywhere.
 ### Phase 3 — interpreter core (static levels)
 
 - `cursor.rs` + `interpreter.rs`: state derivation from buffer, Tab/Enter/Esc
-  contract (design §5), pinned-id/view rule (§4), exact/unique-match
-  preselection, value-typed children (§2).
+  contract (design §5), exact/unique-match preselection, value-typed
+  children (§2). *Revised per design review:* accepts commit path+id and
+  clear refinement (§4); Tab/Enter act on the host cursor row
+  (`tab_at`/`enter_at`); Tab on a bare level name promotes (trailing space).
 - **Tests**: static-level scenarios only — `/thinking`-shaped enum child,
-  drill/promote, Esc pop, pinned-id precedence.
+  drill/promote, Esc pop, accept-clears-terms, cursor-row Tab.
 
 ### Phase 4 — dynamic levels + rendering
 
-- Wire `DataProvider` into the interpreter: row candidate sets, cursor↔id
-  rewriting, preprocessing pass (distinct string values per field, D7
-  dataset-derived completion).
+- Wire `DataProvider` into the interpreter: row candidate sets with
+  candidate-set validation of selection tokens, preprocessing pass
+  (distinct string values per field, D7 dataset-derived completion).
 - `render.rs`: render plan — title, `child_header`, per-row derived header
   (R8-4), table from `ColumnDef`, markers, vertical budget (frame.rs).
 - **Tests**: dynamic scenarios (fake provider), header composition, table
@@ -183,6 +186,22 @@ Phase 0 and reused everywhere.
 
 - Leaf invocation, interstitial, confirm (stateful instance), editor handoff
   signal, "return new path" rewrites (design §9).
+
+### Phase 5.5 — traversal memory (post-design-review)
+
+- `MenuEngine::step_at(line, cursor, key, frames)`: Tab/Enter act on the
+  host cursor; frames `{line, cursor, level}` pushed on accept/drill; Esc
+  replays newest-first (restore filter state + cursor) before structural
+  pops; strict up-walk guaranteed by push-only-on-descend.
+- Scoped edit invalidation: `on_edit(prev, now)` clears the edited level's
+  frames only; pure trailing-space removal = navigation (clears nothing).
+- `*` marker from application context (`ReplCtx`), never the typed
+  selection.
+- Host loop carries `menu_frames`; slash lines route edits through the
+  engine.
+- **Tests**: frame push on accept AND drill, Esc replay chain (accept →
+  replay → structural pop), scoped invalidation (deep edit keeps
+  ancestors), trailing-space-removal is not an edit.
 - **Tests**: `/stat`-like (interstitial no-leaf), confirm prep→accept state
   survival, leaf-returns-path (the `/compact` case).
 
@@ -206,8 +225,11 @@ Migrate commands one by one, each step replacing bespoke overlay variants and
    roadmap — do it incrementally per step, not at the end).
 
 - **Verify** per step: existing UX behaviours from `slash_menu.md` keep
-  passing (the v1 doc doubles as an acceptance checklist), plus new v2
-  behaviors (Tab-preserves-filter, positional ids without `<…>`).
+  passing (the v1 doc doubles as an acceptance checklist, superseded
+  row-by-row where the v2 design revised cursoring/accept — see §4–§5),
+  plus new v2 behaviors: cursor-row Tab/Enter, accept-clears-filter with
+  Esc traversal-memory restore, bare-level Tab promote, positional ids
+  without `<…>`.
 
 ### Phase 7 — cleanup
 
@@ -235,8 +257,12 @@ Migrate commands one by one, each step replacing bespoke overlay variants and
 
 - `repl.rs` is ~9.4k lines; Phase 6 steps must stay small and individually
   shippable (one command per PR).
-- The pinned-id/view rule (§4) is the subtlest behavior; Phase 3 tests should
-  cover edit-terms-after-Tab sequences explicitly.
+- The accept/clear + traversal-memory model (design §4–§5) is the subtlest
+  behavior; tests must cover edit-terms-after-accept sequences, Esc replay
+  chains, and scoped edit invalidation explicitly (Phase 5.5).
 - `<…>` removal is a user-visible change; call it out in release notes.
+- Behavior change vs. v1 contract: cursoring no longer rewrites the prompt;
+  Tab/Enter commit explicitly (design §4). `slash_menu.md` (v1) rows on
+  cursoring are superseded by the v2 design where they conflict.
 - Editor `pending_prefill` / `$EDITOR` handoff: Phase 5 only defines the
   signal; wiring into the existing editor flow is Phase 6 (tree step) work.

@@ -1,4 +1,11 @@
 # Slash menu v2 design doc
+
+> **Status: superseded by `slash_menu_v2_design.md`** (the resolved design).
+> Kept as the audit/brainstorm record. Notably, the "cursor-updated id"
+> principle below was revised during implementation review — see the design
+> doc §4 (view cursor + explicit Tab/Enter commits) and §5 (traversal
+> memory).
+
 Goals
 - Regular and data driven: Replace custom key bindings with data structure
   defining the structure, leaving low-level key handling to the generic menu

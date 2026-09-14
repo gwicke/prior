@@ -20,10 +20,13 @@ anything not changed here), `src/repl.rs` (`ActiveOverlay` dispatch loop),
    descriptor. Per-menu `ActiveOverlay` variants and hand-written
    `from_buffer` / `handle_tab` / `handle_enter` / `handle_esc` arms collapse
    into generic interpreter states.
-2. **The prompt is the state** (unchanged from v1). The buffer fully
-   determines: which level is active, the fuzzy filter, applied modifiers, and
-   the current selection. Nothing selection-related lives outside the buffer,
-   except the cached row data (see §8).
+2. **The prompt is the state** (revised): the buffer determines level, filter
+   state, and the *committed* selection — but the view cursor and the
+   traversal memory (back-navigation, §5) live outside the buffer, alongside
+   the cached row data (§8). Rationale: the original "everything in the
+   prompt" model made cursoring rewrite the id token, which conflicts with
+   cursor-at-end refinement (§4); the revised model commits ids explicitly
+   via Tab/Enter and keeps refinement ephemeral (restored via Esc).
 3. **Uniform per-level grammar.** The same token rules apply recursively at
    every level of every menu; no menu-specific parser.
 4. **Surface changes are allowed where they buy uniformity** (D1): minor
@@ -115,11 +118,12 @@ At every level the buffer has the shape:
   token; a modifier's value consumes following words until the next
   dot-modifier, a valid selection token, or end of prompt (R8-7).
 - **Selection token**: space-free. Either a child `key` (static), a row id
-  (dynamic), or a value-typed child's value (§2). It is *last in its level*,
-  cursor-updated, and — for keys/ids — validated by a cheap lookup against the
+  (dynamic), or a value-typed child's value (§2). It is *last in its level*
+  and — for keys/ids — validated by a cheap lookup against the
   current candidate set (D2 — the `<…>` disambiguator is dropped;
   model/session/tree all become uniform). Value-typed selection tokens are
-  permissively valid (§2).
+  permissively valid (§2). The token enters the prompt only via Tab/Enter
+  (§4, §5); up/down cursoring moves the view cursor without rewriting it.
 - **Trailing space** after the selection token means: show the next level
   (drill in). Absence means the selection is merely *pinned*; its sub-menu is
   not shown yet.
@@ -136,18 +140,22 @@ signal, so it does not interact with the level grammar.
 
 ## 4. Selection & cursor semantics
 
-- **Cursor lives in the path.** The selection is the trailing selection token,
-  not a hidden index.
-- **Cursoring (up/down) rewrites the id into the prompt** at the trailing
-  position (dynamic levels and value-typed child levels), replacing any
-  previous selection.
-- **Tab does not erase the filter.** Completing a selection *adds or replaces
-  the id token*, leaving fuzzy search terms in place (Q2 note / D2).
-- **Pinned id precedence with a view rule** (R8-5): while the pinned id is
-  still within the currently filtered view, editing the fuzzy terms must not
-  move the selection off it. If re-filtering pushes the pinned id out of the
-  view, the id is replaced by the new first-match selection (if any). This
-  keeps "prompt = state" honest while avoiding a silently stale selection.
+- **Cursor lives in the view; the prompt holds the commit.** The selection is
+  the trailing selection token; up/down moves the *view cursor* only and does
+  NOT rewrite the prompt (revised from the original cursoring design: with
+  the cursor defaulting to the end of the prompt, cursor-rewrites fight
+  filter refinement).
+- **Tab/Enter act on the view cursor row** (not an internally derived
+  default). Positioning the cursor on a row and pressing Tab writes *that*
+  row's id into the prompt.
+- **Accept clears refinement state.** Tab/Enter on a selection rewrite the
+  prompt to *path + committed id only* — fuzzy terms and modifiers are
+  ephemeral refinement, dropped on accept. (Revised from "Tab keeps the
+  filter": with the cursor-at-end model, keeping terms after an id makes
+  further refinement awkward.)
+- **Traversal memory backs the clearing** (see §5 Esc): the previous filter
+  state and cursor are remembered per level, so "clear on accept" never
+  destroys state the user cannot get back.
 - Exact-token preselection and fuzzy-unique auto-jumps (today's per-menu
   special cases) become one generic rule: exact match ⇒ pinned; unique fuzzy
   match ⇒ pinned.
@@ -157,8 +165,11 @@ signal, so it does not interact with the level grammar.
 ## 5. Key contract (Tab / Enter / Esc)
 
 - **Tab** completes the current candidate into the buffer (key, id, modifier
-  name, or modifier value per its completion source), leaving finer
-  filtering/cursoring to the interpreter.
+  name, or modifier value per its completion source):
+  - bare level (no terms typed at the child level) ⇒ *promote* (trailing
+    space; the child/value menu shows) — same as Enter;
+  - otherwise complete the cursor row's id into the selection slot
+    (clearing refinement terms, §4).
 - **Enter**:
   1. If the node has an `interstitial`, show it first (second Enter dismisses
      if there is no leaf handler; otherwise the next Enter proceeds, §10).
@@ -166,9 +177,27 @@ signal, so it does not interact with the level grammar.
      declared).
   3. Otherwise Enter behaves like Tab-drill: append trailing space and show
      the child level.
-- **Esc** pops one level: rewrites the buffer to the parent state (removes the
-  trailing selection token / trailing space). Esc at the root clears the
-  buffer (v1 rule retained).
+- **Esc** = back navigation with traversal memory:
+  1. If a traversal frame exists for the current branch, replay it — restore
+     the previous prompt (filter state) AND cursor position. This gives the
+     seamless "back to the list where I was" experience (e.g. `/tree`
+     detail → list without losing filter or highlight).
+  2. Otherwise pop one level structurally: rewrite the buffer to the parent
+     state (removes the trailing selection token / trailing space). Esc at
+     the root clears the buffer (v1 rule retained).
+- **Traversal frames** are pushed only on accept/drill (downward
+  transitions) and carry `{line, cursor, level}`. Because they only ever
+  contain ancestors of the current position, Esc replay walks strictly up
+  the tree — never to siblings.
+- **Edit invalidation** (scoped): editing the line drops the traversal
+  memory *of the edited level only* — a deeply nested drill-down keeps its
+  ancestors' filter state. Criterion: the edit must change the level's
+  segment (the id); removing *only* a trailing space is navigation
+  (returning to the parent menu), not an edit, and clears nothing.
+- **`*` active marker**: always indicates the *currently active* state (the
+  value in effect before any menu change), sourced from application context
+  — never from the typed/pinned selection. On a fresh menu the cursor seeds
+  on the active row, marked `*`.
 
 ---
 
@@ -352,7 +381,7 @@ distinct and each is framework-owned where it can be:
 | Question | Resolution |
 | --- | --- |
 | Q1 surface changes | Allowed where they buy uniformity (D1). |
-| Q2 `<…>` disambiguator | Dropped; positional ids (D2). Tab keeps the filter, adds/replaces the id. |
+| Q2 `<…>` disambiguator | Dropped; positional ids (D2). Revised: accepts clear the filter, traversal memory restores it (§4, §5). |
 | Q3 modifier grammar | Dot-modifiers uniformly for values; children stay bare words (D3). |
 | Q4 `/stat` `/replay` | In scope via interstitial (D4). |
 | Q5 confirm | Node property, stateful single handler instance (D5). |
@@ -363,7 +392,7 @@ distinct and each is framework-owned where it can be:
 | R8-2 space vs slash | Different contexts; structural terminators; parsing unaffected. |
 | R8-3 paused accepts | Three distinct mechanisms (interstitial / confirm / editor handoff), §9. |
 | R8-4 headers | Static `child_header` + per-row derived header (§6). |
-| R8-5 pinned id | Cursor in path; id replaced only when it leaves the filtered view (§4). |
+| R8-5 pinned id | Revised: accepts commit the id and clear refinement; prompt state is path+id, filters ephemeral with traversal-memory restore (§4, §5). |
 | R8-6 handler kinds | One-shot vs live-filter (§8); front-end vs back-end modifiers (§7). |
 | R8-7 spaces in tokens | Selection tokens space-free; values and fuzzy terms may contain spaces (§3, §7). |
 | R8-8 `/compact` | Leaf "return new path" rewrite (§9); no parallel hierarchy. |
@@ -373,3 +402,5 @@ distinct and each is framework-owned where it can be:
 | Positional enum / number values | `enum` / `number` value-typed child kinds; shared handler; permissive parse, backend validates (§2). |
 | Field filtering / sorting | `.field:value`, `.field:>v`/`<v`, `.sort:>f`/`<f` (+ per-field default direction); computed fields replace named sorts (§7.1). |
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
+| Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
+| `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
