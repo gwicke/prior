@@ -109,7 +109,7 @@ pub fn parse_sort_spec(
 ///
 /// Missing filtered fields → row dropped. Missing sorted field → sorted
 /// last regardless of direction (stable among themselves).
-pub fn apply_query(rows: &[Row], q: &Query, space: &FieldSpace) -> Vec<Row> {
+pub fn apply_query(rows: &[Row], q: &Query, _space: &FieldSpace) -> Vec<Row> {
     let mut out: Vec<Row> = rows
         .iter()
         .filter(|r| {

@@ -8,7 +8,7 @@
 use crate::grammar::{parse_level, SelectionRule};
 use crate::node::MenuNode;
 use crate::fields::Row;
-use crate::provider::{DataResult, DataProvider, FieldMeta};
+use crate::provider::{DataResult, DataProvider};
 
 /// What the interpreter derived from the prompt for one level.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +39,11 @@ impl MenuState {
         self.candidates.get(self.active)
     }
 }
+
+/// Sticky per-level view-cursor state (Phase 6.5): path → (index, pin at
+/// set time, terms at set time). Typed input that changes the pin or terms
+/// resets the cursor to the derived pin.
+pub type CursorMap = std::collections::HashMap<String, (usize, Option<String>, String)>;
 
 /// Key handling results.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +86,12 @@ pub struct Interpreter {
     data_cache: std::collections::HashMap<String, DataResult>,
     /// Node paths whose dynamic node needs a provider to resolve rows.
     dynamic_paths: std::collections::HashMap<String, Box<dyn DataProvider>>,
+    /// Engine-owned view cursor (Phase 6.5): sticky per displayed level,
+    /// keyed by node path → (active index, pin at the time it was set).
+    /// The stored index survives buffer re-derives (arrow keys move it;
+    /// typing rewrites it) until the pin or terms change — then it resets
+    /// to the derived pin.
+    cursors: CursorMap,
 }
 
 impl Interpreter {
@@ -89,6 +100,7 @@ impl Interpreter {
             root,
             data_cache: Default::default(),
             dynamic_paths: Default::default(),
+            cursors: Default::default(),
         }
     }
 
@@ -346,16 +358,77 @@ impl Interpreter {
         };
         let rank = crate::cursor::rank_and_pin(&all_rows_final, &lvl.terms, selection.as_deref());
 
+        // Engine-owned cursor (Phase 6.5): a sticky per-level index set by
+        // Up/Down survives buffer re-derives. It resets to the derived pin
+        // when the pin or terms change (typed input re-targets the cursor).
+        let path_key = path.join(" ");
+        let stored = self
+            .cursors
+            .get(&path_key)
+            .cloned();
+        let active = match stored {
+            Some((idx, prev_sel, prev_terms))
+                if prev_sel == selection && prev_terms == lvl.terms =>
+            {
+                idx.min(rank.rows.len().saturating_sub(1))
+            }
+            _ => rank.active,
+        };
+        self.cursors.insert(
+            path_key,
+            (active, selection.clone(), lvl.terms.clone()),
+        );
+
         MenuState {
             node_path: path,
             terms: lvl.terms,
             selection,
             drill_in: trailing_space && lvl.selection.is_some(),
             candidates: rank.rows,
-            active: rank.active,
+            active,
             pin_lost: !rank.pinned_survived && lvl.selection.is_some(),
             level_is_dynamic: node.dynamic,
         }
+    }
+
+    /// Move the engine-owned view cursor by `delta` (clamped to the
+    /// candidate list). Returns the new active index.
+    pub fn move_cursor(&mut self, line: &str, delta: isize) -> usize {
+        let st = self.state(line);
+        let len = st.candidates.len();
+        if len == 0 {
+            return 0;
+        }
+        let next = (st.active as isize + delta).clamp(0, len as isize - 1) as usize;
+        self.cursors.insert(
+            st.node_path.join(" "),
+            (next, st.selection.clone(), st.terms.clone()),
+        );
+        next
+    }
+
+    /// Open-time cursor seeding (e.g. `/tree` starts on the current leaf):
+    /// force the sticky cursor for the displayed level to `idx`.
+    /// Take the sticky cursor state (Phase 6.5): the host rebuilds the
+    /// engine per frame, so the map travels between frames via this pair.
+    pub fn take_cursors(&mut self) -> CursorMap {
+        std::mem::take(&mut self.cursors)
+    }
+
+    /// Restore previously taken cursor state (see [`Self::take_cursors`]).
+    pub fn restore_cursors(&mut self, map: CursorMap) {
+        self.cursors = map;
+    }
+
+    pub fn set_cursor(&mut self, line: &str, idx: usize) -> usize {
+        let st = self.state(line);
+        let len = st.candidates.len();
+        let next = idx.min(len.saturating_sub(1));
+        self.cursors.insert(
+            st.node_path.join(" "),
+            (next, st.selection.clone(), st.terms.clone()),
+        );
+        next
     }
 
     /// Tab: complete the active candidate into the buffer.
@@ -406,7 +479,7 @@ impl Interpreter {
                 return false; // pinned id is a dynamic row or value: no child menu
             }
         }
-        !node.children.is_empty() || node.value.is_some()
+        !node.children.is_empty() || node.value.is_some() || node.dynamic
     }
 
     fn tab_inner(&mut self, line: &str, cursor: Option<usize>) -> TabResult {
@@ -434,11 +507,9 @@ impl Interpreter {
             // word is the level name itself, e.g. "/thinking" on a root
             // child): Tab promotes exactly like Enter — trailing space so
             // the child/value menu shows. The full line is node_path +
-            // the pinned level-name selection.
+            // the selected id (host cursor row when nothing is pinned).
             let mut full = parts.clone();
-            if let Some(sel) = &st.selection {
-                full.push(sel.clone());
-            }
+            full.push(token);
             return TabResult::BufferDrill(full.join(" "));
         } else {
             // Trailing word handling:
@@ -455,17 +526,28 @@ impl Interpreter {
         }
         let buf = parts.join(" ");
 
-        // Promotion rule: the completed node is a listing (children or a
-        // value child) ⇒ drill (trailing space). Otherwise plain pin.
-        // Note: parts currently ends with the completed token; resolve its
-        // node by walking the root through `parts`.
+        // Promotion rule: the completed node is a listing (children, a
+        // value child, or a dynamic provider level) ⇒ drill (trailing
+        // space). Otherwise plain pin. Note: parts currently ends with the
+        // completed token; resolve its node by walking the root through
+        // `parts`.
         let mut node = self.root.clone();
         for p in &parts {
             if let Some(c) = node.child(p) {
                 node = c.clone();
             }
         }
-        if !node.children.is_empty() || node.value.is_some() {
+        // If the walk resolved the completed token as a static child, the
+        // landed node is that child (its key == token). For a dynamic row
+        // id the walk stops at the dynamic level itself — its key is the
+        // level name, not the row id. Only a static-child completion drills.
+        let completed = parts.last().map(String::as_str).unwrap_or("");
+        let landed_on_child = node.key == completed
+            && parts.len() == st.node_path.len() + 1;
+        if !node.children.is_empty()
+            || node.value.is_some()
+            || (node.dynamic && landed_on_child)
+        {
             // Value children: Tab pins the value, but the *listing* itself
             // was already the level; completing to a value just pins.
             if node.value.is_some() {
@@ -518,6 +600,22 @@ impl Interpreter {
                     return OverlayAction::Buffer(b);
                 }
                 OverlayAction::Buffer(format!("{} ", b))
+            }
+            OverlayAction::Buffer(b) if line.ends_with(' ') && !b.ends_with(' ') => {
+                // Drilled level pinned a row (Tab completed the id). If the
+                // drilled level is dynamic and leaf-marked, the pin IS the
+                // commit: submit the canonical line (design §5 — Enter on a
+                // drilled leaf submits).
+                let mut node = self.root.clone();
+                for p in b.split(' ').filter(|p| !p.is_empty()) {
+                    if let Some(c) = node.child(p).cloned() {
+                        node = c;
+                    }
+                }
+                if node.dynamic && node.is_leaf {
+                    return OverlayAction::Submit(b);
+                }
+                OverlayAction::Buffer(b)
             }
             other => other,
         }

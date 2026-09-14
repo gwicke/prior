@@ -189,6 +189,15 @@ Phase 0 and reused everywhere.
 
 ### Phase 5.5 — traversal memory (post-design-review)
 
+> **Follow-up (cursor ownership, learned in Phase 6):** the host-cursor
+> contract above ("Tab/Enter act on the host cursor") was implemented as a
+> reconciliation loop — host `sel` overrides the engine's `active` on each
+> key, and the host re-derives `sel` from `active` next frame via
+> `cursor_sel_policy` with per-variant flags (`seed_on_open`,
+> `follows_active`, `last_active`). This dual-cursor split is a recurring
+> bug source (root-list pins ignored, cursor/marker conflation). **Phase 6.5
+> (below) replaces it: the engine owns the cursor.**
+
 - `MenuEngine::step_at(line, cursor, key, frames)`: Tab/Enter act on the
   host cursor; frames `{line, cursor, level}` pushed on accept/drill; Esc
   replays newest-first (restore filter state + cursor) before structural
@@ -230,6 +239,32 @@ Migrate commands one by one, each step replacing bespoke overlay variants and
   plus new v2 behaviors: cursor-row Tab/Enter, accept-clears-filter with
   Esc traversal-memory restore, bare-level Tab promote, positional ids
   without `<…>`.
+
+### Phase 6.5 — engine-owned cursor (consolidation)
+
+The Phase 6 integration left cursor sync split between the host (`sel`,
+reconciled per frame via `cursor_sel_policy` with per-variant flags) and the
+engine (`active`, derived from the typed pin). That feedback loop is brittle
+and produced several regressions (root-list pins ignored, `*`/`>` marker
+conflation). This phase makes the **engine the single owner of the cursor**:
+
+- `MenuEngine::step_at` accepts `HostKey::Up`/`Down` (and `Home`/`End` /
+  PgUp/PgDn) and mutates the engine's active row. The host no longer
+  tracks `sel` for engine-driven overlays; it passes key events only.
+- Each frame the host queries `state(line)` and renders it verbatim:
+  one marker rule (`>` = cursor row; `*` = current-state row, only where a
+  persistent "current" exists — e.g. active model/thinking level/session —
+  never on the root command list), no `cursor_sel_policy`, no
+  `follows_active`/`last_active` tracking, no per-variant marker decisions
+  in `display_rows`.
+- One-shot behaviors become explicit engine API instead of host policy
+  flags: `set_cursor(idx)` for open-time seeding (e.g. `/tree` starts on
+  the current leaf row).
+- Non-engine overlays (path completion, legacy arms pending migration)
+  keep the v1 host cursor until their step lands.
+- **Tests**: Up/Down mutate engine state and survive a buffer re-derive;
+  rendered marker matches engine state for every migrated overlay;
+  open-time seeding via `set_cursor`; Esc replay restores the cursor.
 
 ### Phase 7 — cleanup
 

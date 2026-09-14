@@ -140,6 +140,12 @@ signal, so it does not interact with the level grammar.
 
 ## 4. Selection & cursor semantics
 
+> **Implementation note (Phase 6.5, learned during integration):** the
+> "view cursor" lives in the *engine*, not the host. The host forwards
+> Up/Down as key events and renders the engine's state verbatim each frame;
+> a two-cursor model (host `sel` ↔ engine `active` reconciliation) proved
+> brittle in practice. See the impl plan's Phase 6.5 for the migration.
+
 - **Cursor lives in the view; the prompt holds the commit.** The selection is
   the trailing selection token; up/down moves the *view cursor* only and does
   NOT rewrite the prompt (revised from the original cursoring design: with

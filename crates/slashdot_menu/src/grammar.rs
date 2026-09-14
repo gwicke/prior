@@ -138,7 +138,12 @@ pub fn parse_level(s: &str, rule: &SelectionRule) -> LevelTokens {
     let mut in_value: Option<usize> = None; // index into modifiers collecting value words
     for word in &words[..body_end] {
         if let Some(tok) = parse_dot_token(word) {
-            in_value = None;
+            // A new dot-token resets the value-collection state; both
+            // match arms below immediately re-arm it for the new modifier.
+            #[allow(unused_assignments)]
+            {
+                in_value = None;
+            }
             match tok {
                 DotToken::Key(key) => {
                     // `.foo` with no colon: key settled, value still empty.

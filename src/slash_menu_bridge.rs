@@ -4,6 +4,7 @@
 //! `ActiveOverlay` arms delegate to the shared interpreter instead of
 //! bespoke overlay variants. Phase 6 starts with `/thinking` (§10 step 1).
 
+use crate::slash;
 use crate::slashdot_menu::{
     accept::{AcceptController, AcceptOutcome, LeafInvocation, LeafResult},
     interpreter::{Interpreter, MenuState, OverlayAction},
@@ -215,6 +216,37 @@ impl MenuEngine {
         }
     }
 
+    /// Take the engine's sticky cursor map (Phase 6.5) so the host can
+    /// carry it to the next frame's rebuilt engine.
+    pub fn take_cursors(&mut self) -> slashdot_menu::interpreter::CursorMap {
+        self.interpreter.take_cursors()
+    }
+
+    /// Restore a cursor map previously taken from a rebuilt-away engine
+    /// (see [`Self::take_cursors`]).
+    pub fn restore_cursors(&mut self, map: slashdot_menu::interpreter::CursorMap) {
+        self.interpreter.restore_cursors(map);
+    }
+
+    /// Engine with the ModelProvider attached to the `model` dynamic level.
+    /// The Tab/Enter arms must use this (not `new`) so the dynamic level
+    /// resolves against the same merged-filter rows the display built.
+    pub fn for_model(
+        ctx: &crate::repl::ReplCtx,
+        mf: crate::repl::ModelFilter,
+        active_id: String,
+    ) -> Self {
+        let mut e = Self::new(ctx);
+        e.interpreter = e.interpreter.with_provider(
+            &["model"],
+            Box::new(ModelProvider {
+                filter: mf,
+                active_id,
+            }),
+        );
+        e
+    }
+
     /// The static descriptor tree: one child per command (§10). Only the
     /// commands migrated so far are referenced by ActiveOverlay; the rest
     /// are descriptors for the root list (Phase 6 step 2 — done).
@@ -222,10 +254,19 @@ impl MenuEngine {
         // Root list from the static command registry (name → key without
         // the leading slash; help → description), plus the migrated
         // per-command sub-descriptors (§10 order; thinking first).
+        // Leaf commands: help, quit, clear, new — no args, submit directly.
         let mut children: Vec<MenuNode> = crate::slash::registry()
             .iter()
             .map(|c| {
-                MenuNode::new(c.name.trim_start_matches('/')).desc(c.help)
+                let mut n = MenuNode::new(c.name.trim_start_matches('/')).desc(c.help);
+                // Leaf commands: no args, direct submit.
+                if matches!(c.kind, slash::SlashKind::Help
+                    | slash::SlashKind::Quit
+                    | slash::SlashKind::Clear
+                    | slash::SlashKind::New) {
+                    n = n.leaf();
+                }
+                n
             })
             .collect();
         // §10 step 1: /thinking — static level with one enum positional
@@ -407,6 +448,14 @@ impl MenuEngine {
         let ix_action = match action {
             HostKey::Tab => self.interpreter.tab_at(line, cursor),
             HostKey::Enter => self.interpreter.enter_at(line, cursor),
+            HostKey::Up | HostKey::Down => {
+                // Phase 6.5: the engine owns the cursor; arrows mutate it.
+                // A fresh derive after the move keeps `state` accurate.
+                let delta = if action == HostKey::Up { -1 } else { 1 };
+                self.interpreter.move_cursor(line, delta);
+                self.interpreter.state(line);
+                OverlayAction::None
+            }
             HostKey::Esc => {
                 // Back navigation: replay the newest frame (previous
                 // filter state + cursor) before falling back to the
@@ -432,6 +481,32 @@ impl MenuEngine {
                     buffer: None,
                     restore_cursor: None,
                     action: out,
+                    state: st,
+                    frames_cleared: false,
+                }
+            }
+            HostKey::Esc => {
+                // Esc already returned above (frame replay) or falls through
+                // as a structural pop; treat like Tab for buffer handling.
+                let buffer = match &ix_action {
+                    OverlayAction::Buffer(b) => Some(b.clone()),
+                    _ => None,
+                };
+                self.push_frame_on(ix_action, line, cursor, frames);
+                StepResult {
+                    buffer,
+                    restore_cursor: None,
+                    action: AcceptOutcome::Continue(OverlayAction::None),
+                    state: st,
+                    frames_cleared: false,
+                }
+            }
+            HostKey::Up | HostKey::Down => {
+                // Pure cursor move: no buffer rewrite, no frame push.
+                StepResult {
+                    buffer: None,
+                    restore_cursor: None,
+                    action: AcceptOutcome::Continue(OverlayAction::None),
                     state: st,
                     frames_cleared: false,
                 }
@@ -518,6 +593,10 @@ pub enum HostKey {
     Tab,
     Enter,
     Esc,
+    /// Move the engine-owned view cursor up one row.
+    Up,
+    /// Move the engine-owned view cursor down one row.
+    Down,
 }
 
 /// Result of one engine step.
@@ -795,7 +874,9 @@ mod tests {
     fn drill_pushes_frame_esc_returns() {
         let mut e = MenuEngine::new(&ctx());
         let mut frames: Vec<Frame> = Vec::new();
-        let r = e.step_at("thinking", 0, HostKey::Enter, &mut frames);
+        // Host cursor decides: the buffer "/thinking" pins "thinking",
+        // whose row index in the root list is 1 (help first).
+        let r = e.step_at("thinking", 1, HostKey::Enter, &mut frames);
         // Enter returns the action via `action`, not `buffer`.
         match &r.action {
             AcceptOutcome::Continue(OverlayAction::Buffer(b)) => {
@@ -806,7 +887,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         let r2 = e.step_at("thinking ", 0, HostKey::Esc, &mut frames);
         assert_eq!(r2.buffer, Some("thinking".to_string()));
-        assert_eq!(r2.restore_cursor, Some(0));
+        assert_eq!(r2.restore_cursor, Some(1));
     }
 
     /// Regression: `/thinking` + Tab (no trailing word) must expand to
