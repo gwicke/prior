@@ -69,6 +69,25 @@ pub struct Activation {
     pub(crate) data_cache: std::collections::HashMap<String, DataResult>,
 }
 
+impl Clone for Activation {
+    fn clone(&self) -> Self {
+        Activation {
+            cursors: self.cursors.clone(),
+            data_cache: self.data_cache.clone(),
+        }
+    }
+}
+
+impl Activation {
+    /// Cursor-map read for the host's display path, which still builds the
+    /// overlay from a cursor map until Phase 7 collapses those arms. The
+    /// bundle itself is opaque; this is the lone deliberate escape for the
+    /// not-yet-migrated display readers (which only need the cursor map).
+    pub fn cursors(&self) -> &CursorMap {
+        &self.cursors
+    }
+}
+
 impl Default for Activation {
     fn default() -> Self {
         Activation {
