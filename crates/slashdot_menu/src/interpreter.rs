@@ -8,6 +8,7 @@
 use crate::grammar::{parse_level, SelectionRule};
 use crate::node::MenuNode;
 use crate::fields::Row;
+use crate::provider::{DataResult, DataProvider, FieldMeta};
 
 /// What the interpreter derived from the prompt for one level.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,8 @@ pub struct MenuState {
     /// A pinned selection existed but fell out of the filtered view
     /// (R8-5): the interpreter reports it so the host can rewrite the id.
     pub pin_lost: bool,
+    /// The displayed level is a dynamic (data-provider) level.
+    pub level_is_dynamic: bool,
 }
 
 impl MenuState {
@@ -58,15 +61,77 @@ enum TabResult {
 /// Interpreter over a static node tree.
 pub struct Interpreter {
     pub root: MenuNode,
+    /// Cached one-shot data per dynamic node path (design §8: fetched once
+    /// per menu open). Key = node path joined with spaces.
+    data_cache: std::collections::HashMap<String, DataResult>,
+    /// Node paths whose dynamic node needs a provider to resolve rows.
+    dynamic_paths: std::collections::HashMap<String, Box<dyn DataProvider>>,
 }
 
 impl Interpreter {
     pub fn new(root: MenuNode) -> Self {
-        Interpreter { root }
+        Interpreter {
+            root,
+            data_cache: Default::default(),
+            dynamic_paths: Default::default(),
+        }
+    }
+
+    /// Register a data provider for the node at `path` (e.g. `["model"]`).
+    /// The node must be marked dynamic via [`MenuNode::dynamic`].
+    pub fn with_provider(mut self, path: &[&str], provider: Box<dyn DataProvider>) -> Self {
+        self.dynamic_paths
+            .insert(path.join(" "), provider);
+        self
+    }
+
+    /// Field space for a dynamic level, derived from cached provider
+    /// metadata (FieldMeta) or inferred from row types (§8.1).
+    fn field_space_for(&mut self, path_key: &str) -> Option<crate::fields::FieldSpace> {
+        let result = self.data_cache.get(path_key)?;
+        let fields = result
+            .fields
+            .iter()
+            .map(|m| m.spec.clone())
+            .collect();
+        Some(crate::fields::FieldSpace::new(fields))
+    }
+
+    /// Resolve rows for a dynamic node, using the cache when populated.
+    fn dynamic_rows(
+        &mut self,
+        path_key: &str,
+        modifiers: &[crate::grammar::ModifierToken],
+    ) -> Option<DataResult> {
+        if let Some(cached) = self.data_cache.get(path_key) {
+            return Some(cached.clone());
+        }
+        let provider = self.dynamic_paths.get_mut(path_key)?;
+        let result = provider.fetch(modifiers);
+        self.data_cache.insert(path_key.to_string(), result.clone());
+        Some(result)
     }
 
     /// Candidate rows for a node's child menu: static children become rows
-    /// (id = key, description); a value child becomes its value set rows.
+    /// (id = key, description); a value child becomes its value set rows;
+    /// a dynamic node resolves via its registered provider (§8).
+    fn level_rows(
+        &mut self,
+        path: &[String],
+        node: &MenuNode,
+        modifiers: &[crate::grammar::ModifierToken],
+    ) -> Vec<Row> {
+        if node.dynamic {
+            let path_key = path.join(" ");
+            if let Some(result) = self.dynamic_rows(&path_key, modifiers) {
+                return result.rows;
+            }
+            return Vec::new();
+        }
+        Self::child_rows(node)
+    }
+
+    /// Static/value child rows (no provider involved).
     fn child_rows(node: &MenuNode) -> Vec<Row> {
         if let Some(vc) = &node.value {
             match vc {
@@ -94,6 +159,18 @@ impl Interpreter {
     /// Does `word` name a selection at `node`'s level? Exact key match for
     /// static children; permissive for value-typed children (any token).
     fn is_selection_at(node: &MenuNode) -> SelectionRule {
+        if node.dynamic {
+            // Dynamic level: a trailing word is a selection candidate if it
+            // is space-free and non-dotted; *validity* (cheap id lookup, D2)
+            // happens in the cursor against the cached rows — the grammar
+            // accepts it permissively so parse-level is row-independent.
+            return SelectionRule {
+                is_selection: Some(std::sync::Arc::new(|word: &str| {
+                    !word.starts_with('.')
+                })),
+            };
+        }
+        // static: unchanged
         let owned_keys: Vec<String> = node.children.iter().map(|c| c.key.clone()).collect();
         let has_value_child = node.value.is_some();
         SelectionRule {
@@ -111,7 +188,7 @@ impl Interpreter {
     /// Walks the node tree: each pinned selection drills into the child
     /// level; the last level's tokens (terms/modifiers/selection) come from
     /// the prompt tail after the parent path.
-    pub fn state(&self, line: &str) -> MenuState {
+    pub fn state(&mut self, line: &str) -> MenuState {
         let mut node = self.root.clone();
         let mut path: Vec<String> = Vec::new();
 
@@ -151,28 +228,80 @@ impl Interpreter {
         let rule = Self::is_selection_at(&node);
         let lvl = parse_level(&tail, &rule);
 
-        // Trailing space after a static-child selection = drill in: the
-        // child menu is shown as a fresh level (design §3). A value child
-        // keeps the selection pinned on the same level instead.
+        // Dynamic level demotion (D2): the grammar accepts any trailing
+        // word permissively; a token that matches no cached row id is a
+        // fuzzy term, not a pinned id.
+        let all_rows_probe = self.level_rows(&path, &node, &lvl.modifiers);
+        let lvl = if node.dynamic {
+            match &lvl.selection {
+                Some(sel) if !all_rows_probe.iter().any(|r| &r.id == sel) => {
+                    let mut terms = lvl.terms.clone();
+                    if !terms.is_empty() {
+                        terms.push(' ');
+                    }
+                    terms.push_str(sel);
+                    crate::grammar::LevelTokens {
+                        terms,
+                        ..lvl
+                    }
+                }
+                _ => lvl,
+            }
+        } else {
+            lvl
+        };
+
+        // Trailing space after a selection = drill in (design §3): a static
+        // child becomes the next node level; a dynamic row id drills into
+        // the row's shared static action level.
         if let (Some(sel), true) = (&lvl.selection, trailing_space) {
             if let Some(child) = node.child(sel).cloned() {
                 node = child;
                 path.push(sel.clone());
+                let rows = self.level_rows(&path, &node, &[]);
                 return MenuState {
                     node_path: path,
                     terms: String::new(),
                     selection: None,
                     drill_in: true,
-                    candidates: Self::child_rows(&node),
+                    candidates: rows,
                     active: 0,
                     pin_lost: false,
+                    level_is_dynamic: node.dynamic,
+                };
+            }
+            if node.dynamic {
+                // Dynamic row drilled: the shared action level applies to
+                // all rows (design §2). Show the action children (if any)
+                // as a static level below the row id.
+                path.push(sel.clone());
+                let rows = Self::child_rows(&node);
+                return MenuState {
+                    node_path: path,
+                    terms: String::new(),
+                    selection: None,
+                    drill_in: true,
+                    candidates: rows,
+                    active: 0,
+                    pin_lost: false,
+                    level_is_dynamic: false,
                 };
             }
         }
 
-        let all_rows = Self::child_rows(&node);
         let selection = lvl.selection.clone();
-        let rank = crate::cursor::rank_and_pin(&all_rows, &lvl.terms, selection.as_deref());
+        // Front-end filter/sort over cached rows (§7.1) on dynamic levels.
+        let all_rows_final: Vec<Row> = if node.dynamic && !lvl.modifiers.is_empty() {
+            let path_key = path.join(" ");
+            let field_space = self
+                .field_space_for(&path_key)
+                .unwrap_or_default();
+            let q = crate::filter::compile_query(&lvl.modifiers, &field_space);
+            crate::filter::apply_query(&all_rows_probe, &q, &field_space)
+        } else {
+            all_rows_probe
+        };
+        let rank = crate::cursor::rank_and_pin(&all_rows_final, &lvl.terms, selection.as_deref());
 
         MenuState {
             node_path: path,
@@ -182,6 +311,7 @@ impl Interpreter {
             candidates: rank.rows,
             active: rank.active,
             pin_lost: !rank.pinned_survived && lvl.selection.is_some(),
+            level_is_dynamic: node.dynamic,
         }
     }
 
@@ -197,7 +327,7 @@ impl Interpreter {
     /// earlier fuzzy terms (D2). When the completed node is a *listing*
     /// (has children or a value child), Tab promotes exactly like Enter:
     /// a trailing space is appended so the child menu shows.
-    pub fn tab(&self, line: &str) -> OverlayAction {
+    pub fn tab(&mut self, line: &str) -> OverlayAction {
         match self.tab_inner(line) {
             TabResult::Buffer(b) => OverlayAction::Buffer(b),
             TabResult::BufferDrill(b) => OverlayAction::Buffer(format!("{} ", b)),
@@ -207,7 +337,7 @@ impl Interpreter {
 
     /// Core of Tab: returns the rewritten buffer, optionally flagged as a
     /// promotion (drill with trailing space).
-    fn tab_inner(&self, line: &str) -> TabResult {
+    fn tab_inner(&mut self, line: &str) -> TabResult {
         let st = self.state(line);
         let Some(sel) = st.selected() else {
             return TabResult::None;
@@ -221,11 +351,27 @@ impl Interpreter {
             // displayed level as a pinned selection.
             parts.push(token.clone());
         } else {
-            // Trailing partial: everything before the last word stays.
+            // Trailing word handling:
+            // - Static level: the last word is the selection-in-progress
+            //   slot — replace it (e.g. "think" → "thinking").
+            // - Dynamic level (D2): Tab *adds* the id, leaving fuzzy terms
+            //   in place ("model flag" → "model flag model-a"); an already
+            //   valid pinned id is replaced (cursoring).
             let trimmed = line.trim_end();
             let words: Vec<&str> = trimmed.split(' ').collect();
-            let kept = &words[..words.len() - 1];
-            for w in kept.iter().skip(st.node_path.len()) {
+            let last_is_selection = if st.selection.is_some() && !st.pin_lost {
+                true
+            } else {
+                // Static level: the last word is the selection-in-progress
+                // slot — positional replace.
+                !st.level_is_dynamic
+            };
+            let kept_end = if last_is_selection {
+                words.len() - 1
+            } else {
+                words.len()
+            };
+            for w in words.iter().take(kept_end).skip(st.node_path.len()) {
                 parts.push((*w).to_string());
             }
             parts.push(token.clone());
@@ -262,7 +408,7 @@ impl Interpreter {
     ///    the active leaf or drills further.
     /// 2. If the pinned node is a leaf → submit the canonical line.
     /// 3. Otherwise Enter behaves like Tab + trailing space (drill).
-    pub fn enter(&self, line: &str) -> OverlayAction {
+    pub fn enter(&mut self, line: &str) -> OverlayAction {
         // Enter = Tab + trailing space for structural promotion; Tab already
         // promotes listings (same as Enter), so delegate and reuse logic.
         match self.tab(line) {
@@ -279,7 +425,8 @@ impl Interpreter {
                         node = c.clone();
                     }
                 }
-                if node.is_leaf && !parts.is_empty() {
+                // A dynamic row's leaf-ness is the dynamic node's leaf flag.
+                if (node.is_leaf || node.dynamic) && !parts.is_empty() {
                     return OverlayAction::Submit(b.to_string());
                 }
                 // Non-leaf pinned (e.g. value child) → Enter pins; a second
@@ -295,7 +442,7 @@ impl Interpreter {
 
     /// Esc: pop one level — rewrite the buffer to the parent state.
     /// Esc at the root clears the buffer (v1 rule).
-    pub fn esc(&self, line: &str) -> OverlayAction {
+    pub fn esc(&mut self, line: &str) -> OverlayAction {
         let st = self.state(line);
         if st.node_path.is_empty() && st.selection.is_none() {
             return OverlayAction::Buffer(String::new());
@@ -472,5 +619,204 @@ mod tests {
             st.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["manual", "text-only", "llm"]
         );
+    }
+
+    // --- dynamic levels (Phase 4) ---
+
+    fn dyn_provider_rows() -> Vec<crate::fields::Row> {
+        vec![
+            crate::fields::Row::new("model-a")
+                .desc("flagship")
+                .field("tier", crate::value::Value::Str("paid".into()))
+                .field("price", crate::value::Value::Num(3.0)),
+            crate::fields::Row::new("model-b")
+                .desc("small")
+                .field("tier", crate::value::Value::Str("free".into()))
+                .field("price", crate::value::Value::Num(0.0)),
+            crate::fields::Row::new("model-c")
+                .desc("mid")
+                .field("tier", crate::value::Value::Str("paid".into()))
+                .field("price", crate::value::Value::Num(1.0)),
+        ]
+    }
+
+    fn dyn_tree() -> MenuNode {
+        MenuNode::new("root").children(vec![
+            // Leaf dynamic level: Enter commits the selected row (/model).
+            MenuNode::new("model").dynamic().leaf(),
+            // Non-leaf dynamic level: Enter drills into the shared action
+            // level (/tree, /session).
+            MenuNode::new("session").dynamic().children(vec![
+                MenuNode::new("resume").leaf(),
+                MenuNode::new("fork").leaf(),
+                MenuNode::new("delete").leaf(),
+            ]),
+        ])
+    }
+
+    fn dyn_session_ix() -> Interpreter {
+        Interpreter::new(dyn_tree()).with_provider(
+            &["session"],
+            Box::new(crate::provider::StaticProvider {
+                result: crate::provider::DataResult {
+                    rows: vec![crate::fields::Row::new("s1").desc("main session")],
+                    ..Default::default()
+                },
+            }),
+        )
+    }
+
+    fn dyn_ix() -> Interpreter {
+        Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(crate::provider::StaticProvider {
+                result: crate::provider::DataResult {
+                    rows: dyn_provider_rows(),
+                    ..Default::default()
+                },
+            }),
+        )
+    }
+
+    #[test]
+    fn dynamic_level_lists_rows() {
+        let mut i = dyn_ix();
+        let st = i.state("model ");
+        assert_eq!(st.node_path, vec!["model"]);
+        assert_eq!(st.drill_in, true);
+        assert_eq!(st.candidates.len(), 3);
+        assert_eq!(st.candidates[0].id, "model-a");
+    }
+
+    #[test]
+    fn dynamic_row_pins_by_id() {
+        let mut i = dyn_ix();
+        let st = i.state("model model-b");
+        assert_eq!(st.selection.as_deref(), Some("model-b"));
+        assert_eq!(st.active, 1);
+    }
+
+    #[test]
+    fn dynamic_terms_filter_rows() {
+        let mut i = dyn_ix();
+        let st = i.state("model flag");
+        assert_eq!(st.candidates.len(), 1);
+        assert_eq!(st.candidates[0].id, "model-a");
+    }
+
+    #[test]
+    fn dynamic_pin_wins_over_terms() {
+        let mut i = dyn_ix();
+        // Terms "mid" filter; pinned model-b survives (still in view).
+        let st = i.state("model mid model-b");
+        // "mid" matches model-c's desc; model-b "small" does not match "mid"
+        // → pin falls out of view.
+        assert!(!st.candidates.iter().any(|r| r.id == "model-b"));
+        assert_eq!(st.pin_lost, true);
+        assert_eq!(st.active, 0);
+    }
+
+    #[test]
+    fn dynamic_tab_pins_id_keeping_terms() {
+        let mut i = dyn_ix();
+        let act = i.tab("model flag");
+        // Active candidate after "flag" is model-a → tab pins it, terms stay.
+        assert_eq!(act, OverlayAction::Buffer("model flag model-a".to_string()));
+    }
+
+    #[test]
+    fn dynamic_enter_pins_then_drills() {
+        let mut i = dyn_session_ix();
+        // Non-leaf dynamic row: Enter = Tab + space (drill into the row's
+        // shared action level).
+        let act = i.enter("session s1");
+        match act {
+            OverlayAction::Buffer(b) => assert_eq!(b, "session s1 ".to_string()),
+            other => panic!("expected buffer, got {:?}", other),
+        }
+        // Drilled: the action level shows.
+        let st = i.state("session s1 ");
+        assert_eq!(st.node_path, vec!["session", "s1"]);
+        assert_eq!(st.drill_in, true);
+        assert_eq!(
+            st.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["resume", "fork", "delete"]
+        );
+        // Leaf dynamic level (/model shape): Enter submits directly.
+        let mut m = dyn_ix();
+        assert_eq!(
+            m.enter("model model-b"),
+            OverlayAction::Submit("model model-b".to_string())
+        );
+    }
+
+    #[test]
+    fn dynamic_field_filters_and_sort() {
+        use crate::fields::{FieldSpec, SortDir};
+        use crate::grammar::ModifierToken;
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(crate::provider::StaticProvider {
+                result: crate::provider::DataResult {
+                    rows: dyn_provider_rows(),
+                    fields: vec![
+                        crate::provider::FieldMeta {
+                            spec: FieldSpec::new("tier", false),
+                            enum_values: None,
+                        },
+                        crate::provider::FieldMeta {
+                            spec: FieldSpec::new("price", true).dir(SortDir::Asc),
+                            enum_values: None,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            }),
+        );
+        // Filter: tier=free → only model-b.
+        let st = i.state("model .tier:free ");
+        assert_eq!(st.candidates.len(), 1);
+        assert_eq!(st.candidates[0].id, "model-b");
+        // Sort: price ascending via default_dir (paid 3.0, mid 1.0, free 0.0).
+        let st2 = i.state("model .sort:price ");
+        assert_eq!(st2.candidates[0].id, "model-b");
+        // Combined: paid + price ascending → model-c (1.0) then model-a (3.0).
+        let st3 = i.state("model .tier:paid .sort:price ");
+        assert_eq!(
+            st3.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["model-c", "model-a"]
+        );
+    }
+
+    #[test]
+    fn dynamic_fetch_cached_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Counting {
+            rows: Vec<Row>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::provider::DataProvider for Counting {
+            fn fetch(&mut self, _m: &[crate::grammar::ModifierToken]) -> crate::provider::DataResult {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::provider::DataResult {
+                    rows: self.rows.clone(),
+                    ..Default::default()
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(Counting {
+                rows: dyn_provider_rows(),
+                calls: calls.clone(),
+            }),
+        );
+        let _ = i.state("model ");
+        let _ = i.state("model a");
+        let _ = i.tab("model ");
+        let _ = i.enter("model ");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one-shot fetch is cached");
     }
 }

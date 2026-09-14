@@ -20,6 +20,8 @@ pub mod grammar;
 pub mod interpreter;
 pub mod node;
 pub mod prompt;
+pub mod render;
+pub mod provider;
 pub mod table;
 pub mod value;
 pub mod wrap;

@@ -32,6 +32,8 @@ pub struct MenuNode {
     /// Leaf flag: node has an accept handler (Enter commits; Phase 5 wires
     /// the actual invocation). Absent ⇒ Enter behaves like Tab + drill.
     pub is_leaf: bool,
+    /// Dynamic level marker: rows come from a registered DataProvider.
+    pub dynamic: bool,
 }
 
 impl MenuNode {
@@ -61,6 +63,12 @@ impl MenuNode {
     /// Leaf node (commits on Enter).
     pub fn leaf(mut self) -> Self {
         self.is_leaf = true;
+        self
+    }
+
+    /// Dynamic level: rows come from a registered DataProvider (§8).
+    pub fn dynamic(mut self) -> Self {
+        self.dynamic = true;
         self
     }
 
