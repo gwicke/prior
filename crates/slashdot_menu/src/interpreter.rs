@@ -51,6 +51,33 @@ impl MenuState {
 /// resets the cursor to the derived pin.
 pub type CursorMap = std::collections::HashMap<String, (usize, Option<String>, String)>;
 
+/// Opaque per-activation state bundle (Phase 6.7 step 1). Across menu
+/// frames the *engine* is rebuilt while this bundle survives with the host;
+/// it carries everything the engine knows that is *not* derived from the
+/// prompt line: the sticky per-level cursor map and the one-shot provider
+/// data cache (design §8 — fetched once per menu open; persisting it here
+/// stops re-fetching dynamic rows on every keypress). Traversal frames live
+/// with the bridge/host today and join this bundle as part of the same
+/// consolidation.
+///
+/// The host must treat this as opaque: it takes it before dropping the
+/// engine and restores it into the next engine via
+/// [`Interpreter::take_activation`]/[`Interpreter::restore_activation`] and
+/// never inspects its fields.
+pub struct Activation {
+    pub(crate) cursors: CursorMap,
+    pub(crate) data_cache: std::collections::HashMap<String, DataResult>,
+}
+
+impl Default for Activation {
+    fn default() -> Self {
+        Activation {
+            cursors: Default::default(),
+            data_cache: Default::default(),
+        }
+    }
+}
+
 /// Key handling results.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayAction {
@@ -467,13 +494,30 @@ fn resolve_active_selector(
 
     /// Open-time cursor seeding (e.g. `/tree` starts on the current leaf):
     /// force the sticky cursor for the displayed level to `idx`.
-    /// Take the sticky cursor state (Phase 6.5): the host rebuilds the
-    /// engine per frame, so the map travels between frames via this pair.
+    /// Take the engine's non-prompt-derived per-activation state (Phase
+    /// 6.7 step 1): cursor map + provider data cache. The host carries this
+    /// between rebuilt engines and restores it on the next frame.
+    pub fn take_activation(&mut self) -> Activation {
+        Activation {
+            cursors: std::mem::take(&mut self.cursors),
+            data_cache: std::mem::take(&mut self.data_cache),
+        }
+    }
+
+    /// Restore previously taken per-activation state (see
+    /// [`Self::take_activation`]).
+    pub fn restore_activation(&mut self, act: Activation) {
+        self.cursors = act.cursors;
+        self.data_cache = act.data_cache;
+    }
+
+    /// Take the sticky cursor map only (legacy Phase 6.5 bridge API; Phase
+    /// 6.7 consolidates this into [`Self::take_activation`]).
     pub fn take_cursors(&mut self) -> CursorMap {
         std::mem::take(&mut self.cursors)
     }
 
-    /// Restore previously taken cursor state (see [`Self::take_cursors`]).
+    /// Restore a previously taken cursor map (legacy Phase 6.5 bridge API).
     pub fn restore_cursors(&mut self, map: CursorMap) {
         self.cursors = map;
     }
@@ -1150,5 +1194,56 @@ mod tests {
         let _ = i.tab("model ");
         let _ = i.enter("model ");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one-shot fetch is cached");
+    }
+
+    #[test]
+    fn activation_bundle_persists_cache_across_engines() {
+        // Phase 6.7 step 1: the opaque per-activation bundle carries the
+        // one-shot data cache across engine rebuilds (menu re-opens / frame
+        // re-derives), so a dynamic provider is fetched once per open, not
+        // once per keypress.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Counting {
+            rows: Vec<Row>,
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::provider::DataProvider for Counting {
+            fn fetch(&mut self, _m: &[crate::grammar::ModifierToken]) -> crate::provider::DataResult {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                crate::provider::DataResult {
+                    rows: self.rows.clone(),
+                    ..Default::default()
+                }
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(Counting {
+                rows: dyn_provider_rows(),
+                calls: calls.clone(),
+            }),
+        );
+        let _ = i.state("model ");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Rebuild (as the host does per keypress): take the bundle, drop,
+        // build a fresh engine, restore.
+        let act = i.take_activation();
+        let mut i2 = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(Counting {
+                rows: dyn_provider_rows(),
+                calls: calls.clone(),
+            }),
+        );
+        // Without the restored cache the fresh engine would re-fetch.
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no re-fetch before restore");
+        let _ = i2.state("model ");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "fresh engine re-fetches");
+        i2.restore_activation(act);
+        let _ = i2.state("model ");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "restored cache avoids re-fetch");
     }
 }
