@@ -442,6 +442,8 @@ consequence of a decision above, and should be settled before lower-level work.
   `text-only` only for pre-seletion. Under a single-token-per-level grammar this  is ambiguous. Decision needed: canonicalize modes to a single hyphenated token
   (`text-only`) as the committed form and keep a spaced display label only if
   desired. Same audit applies to any other spaced option label.
+  - Requiring space-free commands / child identifiers is okay. Drop the spaced
+    display - consistency is good and simpler.
 - **R8-2 — Trailing-space (menu drill) vs trailing-slash (fs descent).** v2
   uses *trailing space* to promote a level; D8's fs value-complete uses
   *trailing slash* to descend a directory. These are two different
@@ -450,6 +452,13 @@ consequence of a decision above, and should be settled before lower-level work.
   (`/` for a filesystem value, space otherwise), or adopt v2's core rule
   wholesale — "a value consumes words until the next dot-modifier / valid id /
   end of prompt" — so the *terminator* is structural, not a whitespace peek.
+  - The difference is that one (trailing space) only applies at menu levels,
+    while the fs descent is only a behavior for a specific modifier value
+    auto-complete. So pretty different contexts.
+    Unless I am missing something, I do not think the parsing rules are
+    affected by this? The `/sandbox` modifiers would either be in trailing
+    position (match until the end of string, since trailing word won't be a
+    valid ID), or followed by another dot modifier.
 - **R8-3 — Three overlapping "paused accept" flows.** The doc now has (a) the
   informational interstitial (D4), (b) the stateful confirm (D5), and (c) the
   pre-existing *review-after-commit* flow (compaction summary shown in `$EDITOR`,
@@ -458,6 +467,11 @@ consequence of a decision above, and should be settled before lower-level work.
   concept with an optional **stateful** handler, where (a) has no handler, (b)
   is a confirm-with-accept/abort handler, and (c) is an external-editor variant  that re-enters via `pending_prefill`. Otherwise the interpreter three
   special-cases a single concept.
+  - I was thinking that the interstitial would be plain text display (good to
+    handle in the framework), while the editor would be something that
+    *replaces* the UI temporarily - so could be driven by the initial handler
+    call? The implications / trade-offs here might be good to check in the
+    code.
 - **R8-4 — Header depth.** The single-line `child menu description` (new field)
   covers a static header, but the rich multi-line `BG_HEADER` rows (session
   stats, compactation drop/token counts, entry preview) are dynamic and built
@@ -465,26 +479,51 @@ consequence of a decision above, and should be settled before lower-level work.
   menu header string and (ii) a per-row header derived from the same
   key-value fields + table columndef that drives the list. That merges issue #9
   with the new descriptor field.
+  - This makes sense. For sub-menus directly below dynamic menus, show the
+    static child menu header line (if any), then the description string (same
+    as usually displayed in the table listing), or, if overriden, a
+    child_description or similar. The data supplier can pre-format the latter
+    with stats, an expanded message preview etc. The generic UI limits size to
+    available vertical space, as already done for the `/tree <id>` sub-menu
+    (taking into account space needed for the menu options).
 - **R8-5 — Pinned id vs `active follows filter`.** Once a valid trailing id is
   in the prompt (D2), the `active`/cursor must be **that id**, not the first
   fuzzy match; re-editing the fuzzy terms must not silently move selection off
   the pinned id. State the precedence (pinned id wins) or the "cursor lives in
   the path" guarantee breaks the moment a user touches the terms after Tab.
+  - cursor lives in the path is good I think. if the terms are changed, and
+    the ID is no longer in the current view, replace the ID with the new
+    selected ID (if any).
 - **R8-6 — Back-end vs front-end modifier filtering boundary.** D8 lets a
   data-fetch handler take modifier inputs (back-end filtering over non-resident
   data, e.g. fs). But `/model` applies its modifiers in-memory today
   (`apply_modifier`). Decision needed: mark each modifier as *back-end* (passed
   through to the fetch handler) vs *front-end* (applied in the interpreter over
   cached rows); `MODEL_MODIFIERS` metadata is the seed for this split.
+  - Yes, I think those two kinds of dynamic data handlers are needed. One
+    takes live filter inputs, the other does not. The "dynamic filter" handler
+    can return a "not changed" value if the completion list would be identical
+    (e.g. same fs directory level), in which case the fuzzy match keeps
+    narrowing. Tab at the UI level expands to the currently selected entry
+    (possibly trailing slash), and re-runs the handler to ether load more
+    children, or return "not changed" for a leaf.
+    One-shot handlers are only called once per menu open, and then the UI does
+    all the filtering / sorting.
 - **R8-7 — Value tokens that legitimately contain words.** v2 core already
   says a modifier value "consumes following words ... up to the next dot
   modifier / valid id / end of prompt" (.prompt: for compact). D1/D3 say the
   *selection* token must be space-free, but a *value after a modifier* may be
   multi-word. Confirm this distinction (space-free selection vs word-consuming
   value) is explicit, or multi-word values collide with R8-1.
+  - Correct- IDs / selectoin tokens are space free, modifier values and fuzzy
+    search terms might contain spaces.
 - **R8-8 — `/compact` default target vs default-on-tab.** `/compact` is a
   shortcut that synthesizes `/tree <last-user-id> compact <mode>`. With
   positional ids (D2) it stays sugar, but its silently-derived target must be
   the same "default value on tab-complete" mechanism used elsewhere, not a
   hidden resolve (issue #7). Confirm it reuses D8's default-value slot.
+  - Would it make sense to add a "return new path" return type option for leaf
+    handlers? Basically make the rewrite to `/tree ID compact ` (trailing
+    space so menu shows) immediately obvious - do not have a parallel
+    `/compact` hierarchy.
 
