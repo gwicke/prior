@@ -87,7 +87,21 @@ pub fn parse_filter_value(s: &str) -> Option<FilterValue> {
         ("<", Cmp::Lt),
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
-            return rest.parse::<f64>().ok().map(|n| FilterValue::Compare(cmp, n));
+            // Numeric compare only when the rest parses as a number; a
+            // bare `>`/`<` with nothing after is not a valid filter (None),
+            // and a non-numeric remainder falls back to exact string match
+            // (e.g. `<3.5x` matches the literal string).
+            return rest
+                .parse::<f64>()
+                .ok()
+                .map(|n| FilterValue::Compare(cmp, n))
+                .or_else(|| {
+                    if rest.is_empty() {
+                        None
+                    } else {
+                        Some(FilterValue::Exact(Value::Str(s.to_string())))
+                    }
+                });
         }
     }
     Some(FilterValue::Exact(Value::parse(s)))
@@ -135,8 +149,7 @@ mod tests {
             parse_filter_value("<3.5x"),
             Some(FilterValue::Exact(Value::Str("<3.5x".into())))
         );
-        assert_eq!(parse_filter_value(">"), None);
-    }
+        assert_eq!(parse_filter_value(">"), None);    }
 
     #[test]
     fn cmp_matches() {
