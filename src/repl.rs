@@ -1333,8 +1333,23 @@ impl ActiveOverlay {
                 }
                 let _ = engine_rows;
             }
-            ActiveOverlay::Model { entries, .. } => {
-                if let Some(e) = entries.get(sel) {
+            ActiveOverlay::Model { entries, engine_rows, .. } => {
+                // v2 engine Tab (Phase 6 step 4): host cursor decides the
+                // row; clear-filter accept semantics (path+id only).
+                if !engine_rows.is_empty() {
+                    let buf = editor.text();
+                    let line = buf.trim_start_matches('/').to_string();
+                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let r = engine.step_at(
+                        &line,
+                        sel,
+                        slash_menu_bridge::HostKey::Tab,
+                        menu_frames,
+                    );
+                    if let Some(b) = r.buffer {
+                        editor.set(&format!("/{}", b));
+                    }
+                } else if let Some(e) = entries.get(sel) {
                     let buf = editor.text();
                     editor.set(&Repl::replace_last_token(&buf, &e.display));
                 }
