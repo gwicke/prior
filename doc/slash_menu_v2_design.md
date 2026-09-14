@@ -56,13 +56,36 @@ Each node has:
 | `children` | Nested nodes (static subtree). A node is a *list level* if it has either static children, or a data handler (below). |
 | `modifiers` | Optional typed value/argument slots (§7): `key` + value kind + default + completion source + front-end/back-end flag. |
 | `data_handler` | Optional data-fetch handler (marks the level dynamic; §8). Absent ⇒ static level. |
-| `accept_handler` | Optional accept handler (§10). Absent ⇒ Enter behaves like Tab: add trailing space, drill into the child level. |
+| `leaf_handler` | Optional accept handler (§10, first step). Absent ⇒ Enter behaves like Tab: add trailing space, drill into the child level. |
+| `confirm_handler` | Optional second-step handler on a confirm leaf (§9): invoked on the final accept, after the `leaf_handler` prep and the confirm dialog. Presence ⇒ the leaf is a confirm flow (replaces the boolean `confirm` property). |
 | `interstitial_handler` | Optional handler returning a static string, shown on Enter *before* any leaf call or drilling (§10). |
 | `confirm` | Optional stateful confirm property on a leaf (§10). |
 | `table` | Optional declarative column definition for list rendering (D6): headers, order, alignment, min-widths (priority), ellipsis vs wrap. |
 
 Handlers attached to nodes receive as arguments: positional ids collected from
 the path, and modifier key-values (typed).
+
+**Handler binding (settled).** Plain closures suffice for every handler kind;
+no separate stateful-handler interface is needed:
+
+- **Data handlers** read application state at call time via captured
+  references/closures (the engine passes only the prompt-derived inputs).
+  Because the engine is persistent (§12), closures never go stale.
+- **Leaf handlers** are plain closures; per-leaf mutable state, when needed,
+  lives in the handler instance itself (a closure capturing its own cell).
+- **Confirm flows** are *two handlers*, not one stateful handler (revised
+  from D5's "single stateful instance"): the `leaf_handler` performs the
+  prep step and returns a "confirm pending" result (payload it wants the
+  final accept to see); the `confirm_handler` is invoked only on the final
+  accept, receiving the prep payload. Esc/cancel simply drops the payload —
+  no surviving instance state to manage. `compact` = two closures
+  (`prep` + `commit`), each independent and testable.
+
+The engine's *own* contract with handlers stays narrow: data handlers get
+`fetch(modifiers)` (prompt-derived tokens only), leaf handlers get
+`LeafInvocation` (line, path, row fields) and return results. Any
+application context the handlers need is captured in the closure, never
+passed through the engine (§12).
 
 ### Level classification
 
@@ -380,11 +403,14 @@ distinct and each is framework-owned where it can be:
    Enter before any leaf call/drilling. With no leaf handler: second Enter
    dismisses (`/stat`). With a leaf handler: first Enter shows it, next Enter
    invokes the leaf (`/replay`).
-2. **Confirm (D5)** — a node property on a leaf. A *single handler instance*
-   is used for both the prep call (e.g. compaction precompute) and the final
-   accept/abort decision, because state must survive between them.
-   Re-entering the same prompt from scratch would re-run the prep. This is
-   expected to be the only stateful accept path.
+2. **Confirm (D5, revised)** — a leaf with both a `leaf_handler` and a
+   `confirm_handler` (§2). First accept invokes the prep (leaf) handler; it
+   may launch the editor, precompute, and returns a payload + confirm
+   prompt. The framework pauses; the dialog's accept invokes the
+   `confirm_handler` with the prep payload; Esc/cancel discards it.
+   Handlers are independent closures (§2) — no shared mutable instance, no
+   surviving state. Re-entering the same prompt from scratch re-runs the
+   prep (same as D5).
 3. **Editor handoff** — the external `$EDITOR` review *replaces the UI
    temporarily* and is driven by the leaf handler call itself (handler returns
    "launch editor"); not an interstitial. Cancellation re-enters the prompt
@@ -427,7 +453,7 @@ distinct and each is framework-owned where it can be:
 | Q2 `<…>` disambiguator | Dropped; positional ids (D2). Revised: accepts clear the filter, traversal memory restores it (§4, §5). |
 | Q3 modifier grammar | Dot-modifiers uniformly for values; children stay bare words (D3). |
 | Q4 `/stat` `/replay` | In scope via interstitial (D4). |
-| Q5 confirm | Node property, stateful single handler instance (D5). |
+| Q5 confirm | Revised: two independent handlers (prep leaf + confirm accept); prep payload passed to the confirm step, dropped on cancel (§2, §9). |
 | Q6 tables | Generalize now, low cost (D6). |
 | Q7 dataset values | Default per modifier (D7). |
 | Q8 fs completion | Dynamic completion handler within modifier value completion (D8). |
@@ -450,6 +476,8 @@ distinct and each is framework-owned where it can be:
 | Active-state sourcing | Single engine mechanism (`active_selector` on providers/descriptors) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
 | Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
+| Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache) carried as opaque engine-owned data; handlers read app state at call time; no rebuild, no Arcs (§2, §12). |
+| Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
 
 ---
 
@@ -477,10 +505,24 @@ emits a **render plan** (level, rows with marker positions, header, title
 hint) rather than strings where possible, so the host's table renderer can
 format.
 
+**Engine lifetime — persistent, with opaque per-activation state.** The
+engine is *not* rebuilt per keypress. It is built once per menu activation
+(menu closed → menu opened) and the host carries its non-prompt-derived
+state across keypresses as **opaque data owned by the engine**: the cursor
+map, traversal frames, and the provider data cache. The UI holds this
+struct between turns but never inspects it — one accessor pair
+(`take_state`/`restore_state`) replaces the per-piece ceremony. This
+removes the rebuild's costs: provider snapshots never go stale (handlers
+read app state at call time, §2), the data cache survives frames instead of
+re-fetching per keypress, and the "forgot to carry X across the rebuild"
+bug class disappears. Persistence requires no `Arc`s: the engine reads the
+buffer at step entry and mutates nothing app-owned; handlers capture what
+they need (§2).
+
 **The host (`repl.rs`) owns everything not derivable from the prompt:**
 
-- application context (ReplCtx: active model/session/tree/usage) and
-  feeding it to providers as `active_selector` data;
+- application context (ReplCtx: active model/session/tree/usage) — read
+  by handlers at call time (§2), never passed through engine constructors;
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
 - dispatching the engine's *submit* result to `InputAction` (SetModel,
@@ -488,11 +530,17 @@ format.
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
 
+| Layer | Owns |
+| --- | --- |
+| Engine (pure) | descriptor, prompt-derived state, per-activation state (cursor/frames/cache), key decisions |
+| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`active_selector`, §5.1) |
+| Host | app state itself, terminal I/O, rendering the plan, translating `LeafResult` → `InputAction` |
+
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
-final state (impl Phase 7). The host's key loop is uniform: build engine →
-`state(line)` → render plan → read key → `step(line, key)` → apply result
-(buffer edit / frames / submit). Per-command code exists only in
-descriptors + providers + leaf-result translation, never as overlay arms.
+final state (impl Phase 7). The host's key loop is uniform: `state(line)` →
+render plan → read key → `step(line, key)` → apply result (buffer edit /
+frames / submit). Per-command code exists only in descriptors + handlers +
+leaf-result translation, never as overlay arms.
 
 **Until Phase 7 completes**, legacy overlay arms may temporarily read host
 state (markers, filters), but every *new* behavior added in Phase 6.5+ must

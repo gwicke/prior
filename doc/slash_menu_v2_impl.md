@@ -304,6 +304,41 @@ exceptions.
    write the *cursor row's* id (verify `tab_at` uses the sticky cursor,
    not the pre-filter pin; regression-guard with a rank-reorder test).
 
+### Phase 6.7 — persistent engine + handler-owned state (end-state plumbing)
+
+Mechanical migration to the §12 settled ownership model. The engine keeps
+no per-frame rebuild; handlers become the sole carriers of app state.
+
+1. **Per-activation state object (engine)**: bundle cursor map + traversal
+   frames + `data_cache` into one struct (e.g. `MenuState`/`Activation`).
+   Replace `take_cursors`/`restore_cursors` with a single opaque
+   `take`/`restore` pair. The host holds it between keypresses and never
+   inspects it. Migrate the existing carry points (key loop, buffer
+   re-derives, Tab/Enter/arrow arms).
+2. **Engine constructors lose ctx**: `MenuEngine::new(root: MenuNode)` +
+   handler registration, no `ctx`/`for_model` parameters. The host builds
+   descriptors once per activation; handlers are closures capturing
+   `&ReplCtx` (or `&SettingsStore`) created at build time and read at
+   call time. Bridge constructors collapse; `for_model`'s filter capture
+   disappears (the provider derives its filter from the modifiers the
+   engine passes to `fetch`, reading catalog state via ctx closure).
+3. **Persistent-engine verification**: buffer re-derives (`state(line)`
+   per frame) must yield identical results to the old rebuild path —
+   the sticky cursor, frames, and cache are now simply *there*, not
+   carried. Data cache invalidation: cache is per-activation (cleared when
+   the menu closes/reopens); expensive sources keep their own app-level
+   caches (unchanged).
+4. **Confirm as two handlers (engine + bridge)**: node gains
+   `confirm_handler` alongside `leaf_handler` (boolean `confirm` property
+   deprecated). Prep leaf returns a payload; controller stores the payload
+   in the paused flow; the confirm step invokes `confirm_handler(payload)`.
+   Migrate `/tree <id> compact llm` and `/session … delete` to the pair;
+   drop `ConfirmState` instance threading.
+5. **Tests**: persistent engine across simulated keypresses (cursor, frames,
+   cache survive); handler closure reads live ctx (provider sees a change
+   without rebuild); confirm two-handler flow (prep → pause → accept/cancel);
+   activation state opaque (host compiles without engine internals).
+
 ### Phase 7 — cleanup
 
 - Remove `ActiveOverlay` variants that no longer have consumers; collapse
