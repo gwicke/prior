@@ -63,6 +63,63 @@ pub struct MenuEngine {
     pub controller: AcceptController,
 }
 
+/// DataProvider over the model catalog (§10 step 4). One-shot fetch:
+/// applies the parsed modifier state to the repository filter and maps the
+/// entries to rows with number fields the engine can sort/filter.
+pub struct ModelProvider {
+    pub filter: crate::repl::ModelFilter,
+    /// Search terms extracted by the caller (engine fuzzy-ranks them).
+    pub active_id: String,
+}
+
+impl slashdot_menu::provider::DataProvider for ModelProvider {
+    fn fetch(
+        &mut self,
+        _modifiers: &[slashdot_menu::grammar::ModifierToken],
+    ) -> slashdot_menu::provider::DataResult {
+        let entries = crate::model_catalog::get_filtered_catalog(&self.filter.to_params());
+        let rows: Vec<slashdot_menu::fields::Row> = entries
+            .iter()
+            .map(|e| {
+                let mut r = slashdot_menu::fields::Row::new(e.qualified())
+                    .desc(e.display.clone());
+                if let Some(v) = e.context_length {
+                    r = r.field("context", slashdot_menu::value::Value::Num(v as f64));
+                }
+                if let Some(v) = e.prompt_cost {
+                    r = r.field("price_input", slashdot_menu::value::Value::Num(v));
+                }
+                if let Some(v) = e.completion_cost {
+                    r = r.field("price_output", slashdot_menu::value::Value::Num(v));
+                }
+                // Combined price (computed): v1's get_filtered_catalog never
+                // read ModelFilterParams.price, so `.price:X` filtered
+                // nothing — surfaced here as a real field.
+                if let (Some(p), Some(c)) = (e.prompt_cost, e.completion_cost) {
+                    r = r.field("price", slashdot_menu::value::Value::Num(p + c));
+                }
+                if let Some(v) = e.coding_index {
+                    r = r.field("coding", slashdot_menu::value::Value::Num(v as f64));
+                }
+                if let Some(v) = e.intelligence_index {
+                    r = r.field("intelligence", slashdot_menu::value::Value::Num(v as f64));
+                }
+                if let Some(v) = e.agentic_index {
+                    r = r.field("agentic", slashdot_menu::value::Value::Num(v as f64));
+                }
+                if let Some(t) = e.created {
+                    r = r.field("created", slashdot_menu::value::Value::Num(t as f64));
+                }
+                r
+            })
+            .collect();
+        slashdot_menu::provider::DataResult {
+            rows,
+            ..Default::default()
+        }
+    }
+}
+
 impl MenuEngine {
     /// Build the engine: the full descriptor tree (all commands) with
     /// handlers bound per command as they migrate (§10 order).
@@ -116,6 +173,16 @@ impl MenuEngine {
                     *c = MenuNode::new("persona")
                         .desc("set runtime persona")
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
+                        .leaf();
+                }
+                "model" => {
+                    // §10 step 4: dynamic level over the catalog. Fields
+                    // from MODEL_MODIFIERS semantics: numeric filters map
+                    // to number fields; `sort` is the special-cased token
+                    // in the engine's Query compiler.
+                    *c = MenuNode::new("model")
+                        .desc("select a model (provider:name); type . for filter options")
+                        .dynamic()
                         .leaf();
                 }
                 "set" => {

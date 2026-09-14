@@ -440,6 +440,10 @@ pub(crate) enum ActiveOverlay {
         filter: ModelFilter,
         /// Index of the currently-active model (for the `*` marker).
         active: Option<usize>,
+        /// v2 engine rows (Phase 6 step 4): pre-filtered/sorted by the
+        /// ModelProvider; drives display + Tab/Enter when non-empty.
+        #[allow(dead_code)]
+        engine_rows: Vec<crate::slashdot_menu::fields::Row>,
     },
 
     /// Dotted-modifier completion for a filter menu (`/model .sort:…`).
@@ -653,10 +657,32 @@ impl ActiveOverlay {
                     // `.name:value` or a free-form `.name:` waiting for the
                     // number): fall through to the model list.
                 }
+                // v2 engine (Phase 6 step 4): dynamic level over the catalog
+                // via ModelProvider; modifiers parse via the engine's grammar
+                // but the provider consumes the legacy ModelFilter (merged
+                // with ctx state) so filter plumbing stays identical.
+                let (search_terms, mut mf) = Repl::parse_model_filter(&filter);
+                // Merge with persisted filter state (v1 behavior).
+                if mf.sort.is_none() { mf.sort = ctx.model_filter.sort.clone(); }
+                if mf.price_input.is_none() { mf.price_input = ctx.model_filter.price_input; }
+                if mf.price_output.is_none() { mf.price_output = ctx.model_filter.price_output; }
+                if mf.price.is_none() { mf.price = ctx.model_filter.price; }
+                if mf.min_coding_index.is_none() { mf.min_coding_index = ctx.model_filter.min_coding_index; }
+                if mf.min_intelligence_index.is_none() { mf.min_intelligence_index = ctx.model_filter.min_intelligence_index; }
+                if mf.min_agentic_index.is_none() { mf.min_agentic_index = ctx.model_filter.min_agentic_index; }
+                if mf.max_age_days.is_none() { mf.max_age_days = ctx.model_filter.max_age_days; }
+                if mf.min_context.is_none() { mf.min_context = ctx.model_filter.min_context; }
+                mf.search_terms = search_terms;
+                // Build the entries via the legacy path (provider plumbing,
+                // recent-boost, active resolution) so behavior is identical;
+                // the engine supplies the ranked view in later steps.
                 let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
-                // The model_overlay_entries now returns the filter with search terms parsed
-                let (_, model_filter) = Repl::parse_model_filter(&filter);
-                ActiveOverlay::Model { entries, filter: model_filter, active }
+                ActiveOverlay::Model {
+                    entries,
+                    active,
+                    filter: mf,
+                    engine_rows: Vec::new(),
+                }
             }
             "thinking" | "think" | "t" => {
                 // v2 engine: descriptor tree + rank_and_pin (Phase 6 step 1).
@@ -1084,7 +1110,7 @@ impl ActiveOverlay {
                      opts, None, true)
                 }
             }
-            ActiveOverlay::Model { entries, filter: _, active } => {
+            ActiveOverlay::Model { entries, filter: _, active, .. } => {
                 if entries.is_empty() {
                     return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                             vec!["(loading models... or no matches)".into()],
