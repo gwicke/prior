@@ -662,7 +662,8 @@ impl ActiveOverlay {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
-        Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &shared, &Default::default())
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
+        Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &mut engine)
     }
 
     /// Like [`Self::from_buffer`], but seeds the engine-derived overlays
@@ -675,8 +676,7 @@ impl ActiveOverlay {
         settings: &SettingsStore,
         help_view: bool,
         path_completions: &[String],
-        shared: &MenuShared,
-        cursors: &slashdot_menu::interpreter::CursorMap,
+        engine: &mut slash_menu_bridge::MenuEngine,
     ) -> Self {
         if help_view {
             return ActiveOverlay::Help;
@@ -710,7 +710,7 @@ impl ActiveOverlay {
             _ if Self::bare_listing_word(buf) => {
                 // Phase 6.6 uniform listing rule (design §3): a bare
                 // listing command stays in the root list (pinned).
-                return Self::root_list_overlay(shared, buf, rest, cursors);
+                return Self::root_list_overlay(engine, buf, rest);
             }
             "model" | "models" | "m" => {
                 let filter = rest.trim().to_string();
@@ -727,13 +727,10 @@ impl ActiveOverlay {
                     // `.name:value` or a free-form `.name:` waiting for the
                     // number): fall through to the model list.
                 }
-                // Step 2: the engine owns the listing. The ModelProvider
-                // serves the catalog in recency×popularity order (active
-                // model first); the engine's generic query applies fuzzy
-                // terms + any `.sort:`/field modifiers. No v1
-                // model_overlay_entries / filter-merge here anymore.
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(cursors.clone());
+                // Phase 6.7 step 3: derive from the persistent engine. The
+                // ModelProvider serves the catalog in recency×popularity
+                // order (active model first); the engine's generic query
+                // applies fuzzy terms + any `.sort:`/field modifiers.
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 ActiveOverlay::Model {
@@ -747,8 +744,6 @@ impl ActiveOverlay {
                 // v2 engine: descriptor tree + rank_and_pin (Phase 6 step 1).
                 // The buffer is "/thinking <terms...>"; the engine's
                 // canonical line strips the leading slash.
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 // `*` = the CURRENT level (pre-change state), from ctx —
@@ -763,8 +758,6 @@ impl ActiveOverlay {
                 // v2 engine (Phase 6 step 3): persona is a value child of
                 // the persona node; the engine ranks and pins. `*` marker
                 // from ctx (current persona).
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let active = ctx.persona.as_deref().and_then(|p| {
@@ -906,8 +899,6 @@ impl ActiveOverlay {
                         }).unwrap_or(false) && !filter.ends_with(' ') && words.len() >= 1
                 };
                 if !is_value_phase {
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                    engine.restore_cursors(cursors.clone());
                     let st = engine.interpreter.state(&line);
                     if st.candidates.iter().any(|r| {
                         matches!(r.id.as_str(), "add_ro" | "add_rw" | "remove")
@@ -1003,8 +994,6 @@ impl ActiveOverlay {
                     // providers attach in `MenuEngine::new(&shared)` — no
                     // per-arm wiring here.
                     let (_dir_f, _fuzzy_f) = Repl::parse_session_path_filter(&filter);
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                    engine.restore_cursors(cursors.clone());
                     let line = buf.trim_start_matches('/').to_string();
                     let st = engine.interpreter.state(&line);
                     let opts: Vec<String> = st.candidates.iter().map(|r| {
@@ -1184,10 +1173,8 @@ impl ActiveOverlay {
                 // v2 engine view (Phase 6 step 6): the TreeProvider reads the shared
                 // flattened-tree mirror; ordering/labels/indents are the
                 // provider's own (v1 flatten logic) and the engine ranks
-                // by terms and pins the target ids. Step 2: providers
-                // attach in `MenuEngine::new(&shared)` — no per-arm wiring.
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(cursors.clone());
+                // by terms and pins the target ids. Phase 6.7 step 3:
+                // derive from the persistent engine (no construction).
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let _ = (&rows, &row_bgs, &targets, &active);
@@ -1201,7 +1188,7 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                Self::root_list_overlay(shared, buf, rest, cursors)
+                Self::root_list_overlay(engine, buf, rest)
             }
         }
     }
@@ -1215,13 +1202,10 @@ impl ActiveOverlay {
     /// so the root list shows with it highlighted; only a trailing space or
     /// terms drills into the command's own dialog.
     fn root_list_overlay(
-        shared: &MenuShared,
+        engine: &mut slash_menu_bridge::MenuEngine,
         buf: &str,
         rest: &str,
-        cursors: &slashdot_menu::interpreter::CursorMap,
     ) -> Self {
-        let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-        engine.restore_cursors(cursors.clone());
         let line = buf.trim_start_matches('/').to_string();
         let st = engine.interpreter.state(&line);
         ActiveOverlay::CommandList {
@@ -1511,63 +1495,34 @@ impl ActiveOverlay {
         }
     }
 
-    /// Build the engine that backs this overlay's displayed level (Phase
-    /// 6.5): providers attach in `MenuEngine::new` from shared state, so
-    /// there is no per-variant wiring here anymore (step 2). Returns
-    /// `None` for overlays not backed by the engine (legacy v1 arms
-    /// pending migration; they keep the host cursor).
-    pub fn engine_for(&self, shared: &MenuShared) -> Option<slash_menu_bridge::MenuEngine> {
-        match self {
-            ActiveOverlay::CommandList { .. }
-            | ActiveOverlay::Thinking { .. }
-            | ActiveOverlay::Persona { .. }
-            | ActiveOverlay::Sandbox { sub: None, .. }
-            | ActiveOverlay::Model { .. }
-            | ActiveOverlay::Session { .. }
-            | ActiveOverlay::Tree { .. } => Some(slash_menu_bridge::MenuEngine::new(shared)),
-            _ => None,
-        }
-    }
-
-    /// Phase 6.5: force the engine cursor to an absolute row (host paging
-    /// sync; open-time seeding). The next frame re-derives `sel` from it.
+    /// Phase 6.5/6.7: force the engine cursor to an absolute row (host paging
+    /// sync; open-time seeding). The engine is persistent, so the next
+    /// frame re-derives `sel` from the same instance.
     fn engine_seed(
         &self,
         editor: &LineEditor,
-        shared: &MenuShared,
+        engine: &mut slash_menu_bridge::MenuEngine,
         idx: usize,
-        cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) {
-        let Some(mut engine) = self.engine_for(shared) else {
-            return;
-        };
-        engine.restore_cursors(std::mem::take(cursors));
         let line = editor.text().trim_start_matches('/').to_string();
         engine.interpreter.set_cursor(&line, idx);
-        *cursors = engine.take_cursors();
     }
 
     /// Phase 6.5: route an Up/Down key through the engine's cursor
-    /// (`move_cursor`), carrying the sticky cursor map across frames. The
-    /// next frame re-derives `sel` from the engine's `active`.
+    /// (`move_cursor`). The engine is persistent; the next frame re-derives
+    /// `sel` from its `active`.
     fn engine_arrow(
         &self,
         editor: &LineEditor,
-        shared: &MenuShared,
+        engine: &mut slash_menu_bridge::MenuEngine,
         delta: isize,
-        cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) {
-        let Some(mut engine) = self.engine_for(shared) else {
-            return;
-        };
-        engine.restore_cursors(std::mem::take(cursors));
         let line = editor.text().trim_start_matches('/').to_string();
         engine.interpreter.move_cursor(&line, delta);
-        *cursors = engine.take_cursors();
     }
 
     /// Phase 6.6 item 3 (design §5.1): route Esc through the engine's
-    /// back-navigation ladder for engine-backed overlays. `menu_frames`
+    /// back-navigation ladder for engine-backed overlays. Traversal frames
     /// are replayed (previous filter/cursor) before the structural
     /// per-level pop; the engine produces the new buffer. Returns `true`
     /// if the engine handled it (buffer written).
@@ -1575,20 +1530,13 @@ impl ActiveOverlay {
     fn engine_esc(
         &self,
         editor: &mut LineEditor,
-        shared: &MenuShared,
-        frames: &mut Vec<slash_menu_bridge::Frame>,
-        cursors: &mut slashdot_menu::interpreter::CursorMap,
+        engine: &mut slash_menu_bridge::MenuEngine,
     ) -> bool {
-        let Some(mut engine) = self.engine_for(shared) else {
-            return false;
-        };
-        engine.restore_cursors(std::mem::take(cursors));
         let line = editor.text().trim_start_matches('/').to_string();
         let r = engine.step_at(
             &line,
             0,
             slash_menu_bridge::HostKey::Esc,
-            frames,
         );
         if let Some(b) = r.buffer {
             if b.is_empty() {
@@ -1597,7 +1545,6 @@ impl ActiveOverlay {
                 editor.set(&format!("/{}", b));
             }
         }
-        *cursors = engine.take_cursors();
         true
     }
 
@@ -1609,26 +1556,20 @@ impl ActiveOverlay {
         path_completions: &mut Vec<String>,
         completion_pos: &mut Option<(usize, usize)>,
         settings: &SettingsStore,
-        shared: &MenuShared,
-        menu_frames: &mut Vec<slash_menu_bridge::Frame>,
-        menu_cursors: &mut slashdot_menu::interpreter::CursorMap,
+        engine: &mut slash_menu_bridge::MenuEngine,
     ) {
         match self {
             ActiveOverlay::CommandList { engine_rows, .. } => {
-                // v2 engine Tab (Phase 6 step 2). Phase 6.5: the engine owns
+                // v2 engine Tab (Phase 6 step 2). Phase 6.7: the engine owns
                 // the cursor — the sticky map carries the arrow-moved row;
                 // `sel` is only a fallback for the first frame.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
                     sel,
                     slash_menu_bridge::HostKey::Tab,
-                    menu_frames,
                 );
-                *menu_cursors = engine.take_cursors();
                 if let Some(b) = r.buffer {
                     editor.set(&format!("/{}", b));
                 }
@@ -1641,15 +1582,11 @@ impl ActiveOverlay {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                    engine.restore_cursors(std::mem::take(menu_cursors));
                     let r = engine.step_at(
                         &line,
                         sel,
                         slash_menu_bridge::HostKey::Tab,
-                        menu_frames,
                     );
-                    *menu_cursors = engine.take_cursors();
                     if let Some(b) = r.buffer {
                         editor.set(&format!("/{}", b));
                     }
@@ -1666,21 +1603,16 @@ impl ActiveOverlay {
                 }
             }
             ActiveOverlay::Thinking { .. } => {
-                // v2 engine owns the Tab rewrite. Phase 6.5: the sticky
-                // cursor map carries the arrow-moved row; `sel` is a
-                // fallback. Frames pushed by the engine support Esc
-                // back-navigation.
+                // v2 engine owns the Tab rewrite. Phase 6.7: engine is
+                // persistent — cursor + frames live inside; `sel` is a
+                // fallback for the first frame.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
                     sel,
                     slash_menu_bridge::HostKey::Tab,
-                    menu_frames,
                 );
-                *menu_cursors = engine.take_cursors();
                 if let Some(b) = r.buffer {
                     editor.set(&format!("/{}", b));
                 }
@@ -1892,12 +1824,10 @@ impl ActiveOverlay {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     let r = engine.step_at(
                         &line,
                         sel,
                         slash_menu_bridge::HostKey::Tab,
-                        menu_frames,
                     );
                     if let Some(b) = r.buffer {
                         // Canonical v2 line "tree <id>" → the host's
@@ -1974,29 +1904,22 @@ impl ActiveOverlay {
         value_error: &mut Option<String>,
         help_view: &mut bool,
         ctx: &ReplCtx,
-        shared: &MenuShared,
-        menu_frames: &mut Vec<slash_menu_bridge::Frame>,
-        menu_cursors: &mut slashdot_menu::interpreter::CursorMap,
+        engine: &mut slash_menu_bridge::MenuEngine,
     ) -> OverlayAction {
         match self {
             ActiveOverlay::CommandList { engine_rows, .. } => {
-                // v2 engine Enter (Phase 6 step 2). Phase 6.5: the engine
-                // owns the cursor — the sticky map carries the arrow-moved
-                // row; `sel` is only a fallback for the first frame.
-                // A pinned root child drills (buffer "<cmd> ", arg menu
-                // opens); leaf dispatch still goes through SlashKind
-                // below once the id is committed.
+                // v2 engine Enter (Phase 6 step 2). Phase 6.7: engine is
+                // persistent — cursor/frames live inside; `sel` is only a
+                // fallback for the first frame. A pinned root child drills
+                // (buffer "<cmd> ", arg menu opens); leaf dispatch still
+                // goes through SlashKind below once the id is committed.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
                     sel,
                     slash_menu_bridge::HostKey::Enter,
-                    menu_frames,
                 );
-                *menu_cursors = engine.take_cursors();
                 match r.action {
                     crate::slashdot_menu::accept::AcceptOutcome::Continue(
                         crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
@@ -2068,15 +1991,11 @@ ActiveOverlay::Model { engine_rows, .. } => {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                    engine.restore_cursors(std::mem::take(menu_cursors));
                     let r = engine.step_at(
                         &line,
                         sel,
                         slash_menu_bridge::HostKey::Enter,
-                        menu_frames,
                     );
-                    *menu_cursors = engine.take_cursors();
                     if let crate::slashdot_menu::accept::AcceptOutcome::Continue(
                         crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
                     ) = r.action
@@ -2106,15 +2025,11 @@ ActiveOverlay::Model { engine_rows, .. } => {
                 // value → SetThinking.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
-                engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
                     sel,
                     slash_menu_bridge::HostKey::Enter,
-                    menu_frames,
                 );
-                *menu_cursors = engine.take_cursors();
                 match r.action {
                     crate::slashdot_menu::accept::AcceptOutcome::Continue(
                         crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
@@ -2379,12 +2294,10 @@ ActiveOverlay::Model { engine_rows, .. } => {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     let r = engine.step_at(
                         &line,
                         sel,
                         slash_menu_bridge::HostKey::Enter,
-                        menu_frames,
                     );
                     if let Some(b) = r.buffer {
                         let id = b.split_whitespace().nth(1).unwrap_or("");
@@ -2686,14 +2599,11 @@ impl Repl {
         let mut completion_pos: Option<(usize, usize)> = None;
         let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
         let mut last_active: Option<usize> = None; // last frame's `active` row (see `cursor_sel_policy`)
-        // Traversal memory (v2 menus): frames pushed on accept/drill, Esc
-        // replays newest-first (previous filter state + cursor) before
-        // structural pops. Cleared when the user edits the line.
-        let mut menu_frames: Vec<slash_menu_bridge::Frame> = Vec::new();
-        // Phase 6.5 engine-owned cursor state, carried across frames (the
-        // engine is rebuilt per frame; the sticky per-level cursor map
-        // travels with the host loop like `menu_frames`).
-        let mut menu_cursors: slashdot_menu::interpreter::CursorMap = Default::default();
+        // Phase 6.7 step 3: ONE persistent engine per prompt. Cursors,
+        // traversal frames, provider data cache, and accept phase all live
+        // inside it; the host keeps the same instance across keypresses
+        // (no rebuild, no take/restore, no host frames/cursors threading).
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
         let mut stat_phase = false;
@@ -2841,7 +2751,7 @@ impl Repl {
             // --- Compute the overlay from the current buffer. ---
             let overlay = ActiveOverlay::from_buffer_cursors(
                 &editor.text(), ctx, settings, help_view, &path_completions,
-                &shared, &menu_cursors,
+                &mut engine,
             );
             // Hoisted before the sel-reset so `active` (the menu's
             // default/current-state row) can drive the cursor policy below.
@@ -2868,11 +2778,11 @@ impl Repl {
             // re-derivations (that would yank the cursor as the user types a
             // search term). The action sub-menus seed AND follow `active`.
             let is_tree_list = matches!(overlay, ActiveOverlay::Tree { .. });
-            if overlay.engine_for(&shared).is_some() {
-                // Phase 6.5: engine-owned cursor — `sel` IS the engine's
-                // cursor row (arrows mutate engine state; Tab/Enter act on
-                // it). The marker `active` (ctx-driven `*`) is separate.
-                // No host-side cursor policy for these overlays.
+            if overlay.cursor_row().is_some() {
+                // Engine-owned cursor: `sel` IS the engine's cursor row
+                // (arrows mutate engine state; Tab/Enter act on it). The
+                // marker `active` (ctx-driven `*`) is separate. No
+                // host-side cursor policy for these overlays.
                 sel = overlay
                     .cursor_row()
                     .unwrap_or(active.unwrap_or(0))
@@ -3039,9 +2949,9 @@ impl Repl {
                                 // Phase 6.5: engine-backed overlays route
                                 // arrows through the engine's cursor; the
                                 // next frame's `sel` re-derives from it.
-                                if overlay.engine_for(&shared).is_some() {
+                                if overlay.cursor_row().is_some() {
                                     let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    overlay.engine_arrow(&editor, &shared, delta, &mut menu_cursors);
+                                    overlay.engine_arrow(&editor, &mut engine, delta);
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
@@ -3103,14 +3013,14 @@ impl Repl {
                                 // Phase 6.5: keep the engine cursor in sync
                                 // with host paging on engine-backed overlays
                                 // (they have no tree prev/next to navigate).
-                                if overlay.engine_for(&shared).is_some() {
-                                    overlay.engine_seed(&editor, &shared, sel, &mut menu_cursors);
+                                if overlay.cursor_row().is_some() {
+                                    overlay.engine_seed(&editor, &mut engine, sel);
                                 }
                             }
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
                                     &mut path_completions, &mut completion_pos,
-                                    settings, &shared, &mut menu_frames, &mut menu_cursors);
+                                    settings, &mut engine);
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3129,7 +3039,7 @@ impl Repl {
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
                                         settings, dirty, &mut value_error, &mut help_view,
-                                        ctx, &shared, &mut menu_frames, &mut menu_cursors,
+                                        ctx, &mut engine,
                                     ) {
                                         OverlayAction::Continue => {}
                                         OverlayAction::Action(action) => return Some(action),
@@ -3142,7 +3052,7 @@ impl Repl {
                                 // ladder (frame replay + esc()); legacy
                                 // overlays keep their bespoke rewrites until
                                 // they migrate.
-                                if !overlay.engine_esc(&mut editor, &shared, &mut menu_frames, &mut menu_cursors) {
+                                if !overlay.engine_esc(&mut editor, &mut engine) {
                                     overlay.handle_esc(&mut editor,
                                         &mut path_completions, &mut completion_pos);
                                 }
@@ -3170,9 +3080,7 @@ impl Repl {
                                 // navigation (parent menu), not an edit.
                                 let now = editor.text();
                                 if now.starts_with('/') || prev_line.starts_with('/') {
-                                    let mut engine =
-                                        slash_menu_bridge::MenuEngine::new(&shared);
-                                    let _ = engine.on_edit(&prev_line, &now, &mut menu_frames);
+                                    let _ = engine.on_edit(&prev_line, &now);
                                 }
                             }
                         }
@@ -8712,6 +8620,7 @@ mod tests {
             thinking_level: None,
         };
         let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8723,9 +8632,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
-            &shared,
-            &mut Vec::new(),
-            &mut Default::default(),
+            &mut engine,
         );
         match action {
             OverlayAction::Action(InputAction::Submit(line)) => {
@@ -8784,6 +8691,7 @@ mod tests {
             thinking_level: None,
         };
         let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8795,9 +8703,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
-            &shared,
-            &mut Vec::new(),
-            &mut Default::default(),
+            &mut engine,
         );
         match action {
             OverlayAction::Continue => {
@@ -10165,7 +10071,6 @@ mod model_v2_tests {
         let ov = model_ov("/model ");
         let mut editor = editor_with("/model ");
         let ctx = model_ctx();
-        let mut frames = Vec::new();
         let settings = SettingsStore {
             default_model: "p:m".into(),
             security_mode: "confirm".into(),
@@ -10179,8 +10084,9 @@ mod model_v2_tests {
             path: None,
         };
         let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         ov.handle_tab(1, &mut editor, &mut Vec::new(), &mut None,
-            &settings, &shared, &mut frames, &mut Default::default());
+            &settings, &mut engine);
         let text = editor.text();
         // Row 1 of the engine rows (the list is provider-filtered) must be
         // what Tab commits: `/model <qualified-id>`.
@@ -10216,10 +10122,11 @@ mod model_v2_tests {
         let mut value_error: Option<String> = None;
         let mut help_view = false;
         let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         let action = ov.handle_enter(
             1, &mut editor, &output, &redraw, &mut input_row,
             &mut settings, &mut dirty, &mut value_error, &mut help_view,
-            &ctx, &shared, &mut Vec::new(), &mut Default::default(),
+            &ctx, &mut engine,
         );
         match action {
             OverlayAction::Action(InputAction::SetModel(p, m)) => {

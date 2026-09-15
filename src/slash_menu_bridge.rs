@@ -74,6 +74,11 @@ fn resolve_node(
 pub struct MenuEngine {
     pub interpreter: Interpreter,
     pub controller: AcceptController,
+    /// Traversal memory (Phase 5.5): frames pushed on accept/drill, Esc
+    /// replays newest-first. Engine-owned since Phase 6.7 step 3 — the
+    /// host keeps this engine instance across keypresses, so frames stay
+    /// inside it (no host threading).
+    pub frames: Vec<Frame>,
 }
 
 /// Shared application state the menu handlers read/write at call time
@@ -367,8 +372,10 @@ impl MenuEngine {
     /// Build the engine: the full descriptor tree (all commands) with
     /// handlers bound per command as they migrate (§10 order). Providers
     /// are attached here from shared state (no `ReplCtx`, no `for_model`);
-    /// the host's `menu_cursors`/`menu_frames` live for the whole
-    /// `read_input` loop, so a once-attached provider survives every frame.
+    /// the engine is long-lived per prompt (Phase 6.7 step 3): the host
+    /// builds it once and keeps the same instance across keypresses, so
+    /// cursors, traversal frames, the provider data cache, and the accept
+    /// phase all survive inside it.
     pub fn new(shared: &MenuShared) -> Self {
         let root = Self::root_descriptor();
         let mut controller = AcceptController::new(root.clone());
@@ -381,19 +388,8 @@ impl MenuEngine {
         MenuEngine {
             interpreter,
             controller,
+            frames: Vec::new(),
         }
-    }
-
-    /// Take the engine's sticky cursor map (Phase 6.5) so the host can
-    /// carry it to the next frame's rebuilt engine.
-    pub fn take_cursors(&mut self) -> slashdot_menu::interpreter::CursorMap {
-        self.interpreter.take_cursors()
-    }
-
-    /// Restore a cursor map previously taken from a rebuilt-away engine
-    /// (see [`Self::take_cursors`]).
-    pub fn restore_cursors(&mut self, map: slashdot_menu::interpreter::CursorMap) {
-        self.interpreter.restore_cursors(map);
     }
 
     /// The static descriptor tree: one child per command (§10).
@@ -583,13 +579,13 @@ impl MenuEngine {
 
     /// Map an interpreter state + key action onto the host-facing result.
     /// `cursor` is the host's highlighted row (arrows move it); Tab/Enter
-    /// act on it. `frames` is the traversal memory in/out.
+    /// act on it. Traversal frames are engine-owned (`self.frames`), so
+    /// Esc back-navigation works across keypresses on the same engine.
     pub fn step_at(
         &mut self,
         line: &str,
         cursor: usize,
         action: HostKey,
-        frames: &mut Vec<Frame>,
     ) -> StepResult {
         let st = self.interpreter.state(line);
         let ix_action = match action {
@@ -608,7 +604,7 @@ impl MenuEngine {
                 // filter state + cursor) before falling back to the
                 // structural level pop. Frames are pushed only on
                 // accept/drill, so this walks strictly up the tree.
-                if let Some(f) = frames.pop() {
+                if let Some(f) = self.frames.pop() {
                     return StepResult {
                         buffer: Some(f.line),
                         restore_cursor: Some(f.cursor),
@@ -623,7 +619,7 @@ impl MenuEngine {
         match action {
             HostKey::Enter => {
                 let out = self.controller.on_enter(ix_action.clone(), &st, line);
-                self.push_frame_on(ix_action, line, cursor, frames);
+                self.push_frame_on(ix_action, line, cursor);
                 StepResult {
                     buffer: None,
                     restore_cursor: None,
@@ -664,7 +660,7 @@ impl MenuEngine {
                     OverlayAction::Buffer(b) => Some(b.clone()),
                     _ => None,
                 };
-                self.push_frame_on(ix_action, line, cursor, frames);
+                self.push_frame_on(ix_action, line, cursor);
                 StepResult {
                     buffer,
                     restore_cursor: None,
@@ -683,7 +679,6 @@ impl MenuEngine {
         ix_action: OverlayAction,
         line: &str,
         cursor: usize,
-        frames: &mut Vec<Frame>,
     ) {
         if let OverlayAction::Buffer(b) = &ix_action {
             // Drill (trailing space) or accept-rewrite: the previous line
@@ -692,11 +687,12 @@ impl MenuEngine {
             let drilled = b.ends_with(' ');
             let accepted = !drilled && !b.is_empty();
             if drilled || accepted {
-                frames.push(Frame {
+                let frame = Frame {
                     line: line.to_string(),
                     cursor,
                     level: level_of(self, line),
-                });
+                };
+                self.frames.push(frame);
             }
         }
     }
@@ -713,7 +709,6 @@ impl MenuEngine {
         &mut self,
         prev_line: &str,
         line: &str,
-        frames: &mut Vec<Frame>,
     ) -> bool {
         // Pure trailing-space removal: navigation, keep everything.
         if prev_line.trim_end() == line.trim_end() {
@@ -722,16 +717,15 @@ impl MenuEngine {
         // Attribute the edit to the level of the *previous* line (the one
         // the user was editing); clear that level's frames.
         let edited_level = level_of(self, prev_line);
-        let before = frames.len();
-        frames.retain(|f| &f.level != &edited_level);
-        frames.len() != before
+        let before = self.frames.len();
+        self.frames.retain(|f| &f.level != &edited_level);
+        self.frames.len() != before
     }
 
     /// Cursor-agnostic step (engine default row).
     pub fn step(&mut self, line: &str, action: HostKey) -> StepResult {
         let cursor = self.interpreter.state(line).active;
-        let mut frames = Vec::new();
-        self.step_at(line, cursor, action, &mut frames)
+        self.step_at(line, cursor, action)
     }
 }
 
@@ -782,7 +776,6 @@ pub(crate) fn row_str(r: &crate::slashdot_menu::fields::Row, k: &str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repl::ReplCtx;
 
     fn shared() -> MenuShared {
         let settings = crate::settings::SettingsStore {
@@ -885,39 +878,38 @@ mod tests {
     #[test]
     fn tab_acts_on_host_cursor_and_clears_terms() {
         let mut e = MenuEngine::new(&shared());
-        let mut frames: Vec<Frame> = Vec::new();
         // "e" ranks med first (1 candidate): cursor on row 0 must be the
         // completed id; cursor beyond the view is clamped to the same.
         let st = e.interpreter.state("thinking e");
         let top_id = st.candidates[0].id.clone();
-        let r = e.step_at("thinking e", 0, HostKey::Tab, &mut frames);
+        let r = e.step_at("thinking e", 0, HostKey::Tab);
         assert_eq!(
             r.buffer,
             Some(format!("thinking {}", top_id)),
             "Tab must honor the host cursor row"
         );
         // Out-of-range cursor falls back to the engine default row.
-        let r1 = e.step_at("thinking e", 9, HostKey::Tab, &mut frames);
+        let r1 = e.step_at("thinking e", 9, HostKey::Tab);
         assert_eq!(r1.buffer, Some(format!("thinking {}", top_id)));
-        // Both accepts pushed frames for back-navigation.
-        assert_eq!(frames.len(), 2);
+        // Both accepts pushed frames (engine-owned) for back-navigation.
+        assert_eq!(e.frames.len(), 2);
         // Esc replays the newest frame: previous filter state + cursor.
-        let r2 = e.step_at(&format!("thinking {}", top_id), 0, HostKey::Esc, &mut frames);
+        let r2 = e.step_at(&format!("thinking {}", top_id), 0, HostKey::Esc);
         assert_eq!(r2.buffer, Some("thinking e".to_string()));
         assert_eq!(r2.restore_cursor, Some(9));
-        assert_eq!(frames.len(), 1);
+        assert_eq!(e.frames.len(), 1);
         // Second Esc replays the first frame; third falls back to the
         // structural pop (pinned level → drilled "thinking ").
-        let r3 = e.step_at("thinking e", 0, HostKey::Esc, &mut frames);
+        let r3 = e.step_at("thinking e", 0, HostKey::Esc);
         assert_eq!(r3.buffer, Some("thinking e".to_string()));
         // Frames exhausted → the structural ladder (design §5.1): clear
         // this level's terms keeping the list open, then strip the
         // trailing space, then clear the buffer at the top level.
-        let r4 = e.step_at("thinking e", 0, HostKey::Esc, &mut frames);
+        let r4 = e.step_at("thinking e", 0, HostKey::Esc);
         assert_eq!(r4.buffer, Some("thinking ".to_string()));
-        let r5 = e.step_at("thinking ", 0, HostKey::Esc, &mut frames);
+        let r5 = e.step_at("thinking ", 0, HostKey::Esc);
         assert_eq!(r5.buffer, Some("thinking".to_string()));
-        let r6 = e.step_at("thinking", 0, HostKey::Esc, &mut frames);
+        let r6 = e.step_at("thinking", 0, HostKey::Esc);
         assert_eq!(r6.buffer, Some(String::new()));
     }
 
@@ -926,8 +918,7 @@ mod tests {
     #[test]
     fn esc_without_frames_pops_level() {
         let mut e = MenuEngine::new(&shared());
-        let mut frames: Vec<Frame> = Vec::new();
-        let r = e.step_at("thinking med", 0, HostKey::Esc, &mut frames);
+        let r = e.step_at("thinking med", 0, HostKey::Esc);
         assert_eq!(r.buffer, Some("thinking ".to_string()));
     }
 
@@ -1001,21 +992,21 @@ mod tests {
     #[test]
     fn on_edit_scoped_invalidation() {
         let mut e = MenuEngine::new(&shared());
-        let mut frames: Vec<Frame> = Vec::new();
         // Build depth: accept "thinking" (frame at root level), then drill.
-        let _ = e.step_at("thinking", 0, HostKey::Tab, &mut frames);
-        let _ = e.step_at("thinking ", 0, HostKey::Tab, &mut frames);
-        // Two frames, both at the thinking level (value child has no deeper
-        // static level): "thinking" (pre-accept) and "thinking " (pre-pin).
-        assert_eq!(frames.len(), 2);
+        let _ = e.step_at("thinking", 0, HostKey::Tab);
+        let _ = e.step_at("thinking ", 0, HostKey::Tab);
+        // Two frames (engine-owned), both at the thinking level (value
+        // child has no deeper static level): "thinking" (pre-accept) and
+        // "thinking " (pre-pin).
+        assert_eq!(e.frames.len(), 2);
         // ID edit at the same level → both cleared (same level identity).
-        assert!(e.on_edit("thinking off", "thinking low", &mut frames));
-        assert!(frames.is_empty());
+        assert!(e.on_edit("thinking off", "thinking low"));
+        assert!(e.frames.is_empty());
         // Trailing-space removal → navigation, nothing cleared.
-        let _ = e.step_at("thinking", 0, HostKey::Tab, &mut frames);
-        assert_eq!(frames.len(), 1);
-        assert!(!e.on_edit("thinking ", "thinking", &mut frames));
-        assert_eq!(frames.len(), 1);
+        let _ = e.step_at("thinking", 0, HostKey::Tab);
+        assert_eq!(e.frames.len(), 1);
+        assert!(!e.on_edit("thinking ", "thinking"));
+        assert_eq!(e.frames.len(), 1);
     }
 
     /// Frames are pushed on drill too: Esc from a drilled child returns to
@@ -1023,10 +1014,9 @@ mod tests {
     #[test]
     fn drill_pushes_frame_esc_returns() {
         let mut e = MenuEngine::new(&shared());
-        let mut frames: Vec<Frame> = Vec::new();
         // Host cursor decides: the buffer "/thinking" pins "thinking",
         // whose row index in the root list is 1 (help first).
-        let r = e.step_at("thinking", 1, HostKey::Enter, &mut frames);
+        let r = e.step_at("thinking", 1, HostKey::Enter);
         // Enter returns the action via `action`, not `buffer`.
         match &r.action {
             AcceptOutcome::Continue(OverlayAction::Buffer(b)) => {
@@ -1034,8 +1024,8 @@ mod tests {
             }
             other => panic!("expected drill buffer, got {:?}", other),
         }
-        assert_eq!(frames.len(), 1);
-        let r2 = e.step_at("thinking ", 0, HostKey::Esc, &mut frames);
+        assert_eq!(e.frames.len(), 1);
+        let r2 = e.step_at("thinking ", 0, HostKey::Esc);
         assert_eq!(r2.buffer, Some("thinking".to_string()));
         assert_eq!(r2.restore_cursor, Some(1));
     }
