@@ -7,8 +7,10 @@
 //! Token semantics:
 //! - `.field:value` — exact match on a string field
 //! - `.field:>v` / `<v` / `>=v` / `<=v` — numeric comparison
-//! - `.sort:<field` — ascending (small first), `.sort:>field` — descending
 //! - `.sort:field` — direction defaults to the field's `default_dir`
+//! - `.sort:field>` — descending (large first), `.sort:field<` — ascending
+//!   (small first); direction is a **suffix**, so type-ahead can pick the
+//!   field first, then append `>`/`<`.
 //!
 //! Composition: filters AND together, apply before sorting; fuzzy terms
 //! narrow further on top (handled by the interpreter, not here). A later
@@ -84,15 +86,23 @@ pub fn compile_query(tokens: &[ModifierToken], space: &FieldSpace) -> Query {
     q
 }
 
-/// Parse `.sort:<field` (asc) / `.sort:>field` (desc) / `.sort:field`
-/// (field's `default_dir`). Returns `None` for unknown/unsortable fields.
+/// Parse `.sort:field` (field's `default_dir`) / `.sort:field>` (descending)
+/// / `.sort:field<` (ascending). Direction is a **suffix** (more ergonomic
+/// with type-ahead — the user can type the field first then append `>`/`<`)
+/// rather than a prefix. Returns `None` for unknown/unsortable fields.
 pub fn parse_sort_spec(
     value: &str,
     space: &FieldSpace,
 ) -> Option<(String, crate::fields::SortDir)> {
-    let (name, explicit) = match value.chars().next() {
-        Some('<') => (&value[1..], Some(crate::fields::SortDir::Asc)),
-        Some('>') => (&value[1..], Some(crate::fields::SortDir::Desc)),
+    let (name, explicit) = match value.chars().next_back() {
+        Some('<') => (
+            &value[..value.len() - 1],
+            Some(crate::fields::SortDir::Asc),
+        ),
+        Some('>') => (
+            &value[..value.len() - 1],
+            Some(crate::fields::SortDir::Desc),
+        ),
         _ => (value, None),
     };
     if name.is_empty() {
@@ -229,36 +239,36 @@ mod tests {
 
     #[test]
     fn sort_ascending_with_explicit_direction() {
-        let q = compile_query(&toks(&[("sort", "<price")]), &space());
+        let q = compile_query(&toks(&[("sort", "price<")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
     }
 
     #[test]
     fn sort_descending_with_explicit_direction() {
-        let q = compile_query(&toks(&[("sort", ">price")]), &space());
+        let q = compile_query(&toks(&[("sort", "price>")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m1", "m3", "m2", "m4"]);
     }
 
     #[test]
     fn sort_direction_defaults_to_field_default() {
-        // price declares Asc: `.sort:price` == `.sort:<price`
+        // price declares Asc: `.sort:price` == `.sort:price<`
         let q = compile_query(&toks(&[("sort", "price")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
-        // coding declares Desc: `.sort:coding` == `.sort:>coding`
+        // coding declares Desc: `.sort:coding` == `.sort:coding>`
         let q2 = compile_query(&toks(&[("sort", "coding")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q2, &space())), vec!["m1", "m3", "m2", "m4"]);
     }
 
     #[test]
     fn later_sort_overrides_earlier() {
-        let q = compile_query(&toks(&[("sort", ">price"), ("sort", "<price")]), &space());
+        let q = compile_query(&toks(&[("sort", "price>"), ("sort", "price<")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
     }
 
     #[test]
     fn filter_before_sort() {
         let q = compile_query(
-            &toks(&[("tier", "paid"), ("sort", "<price")]),
+            &toks(&[("tier", "paid"), ("sort", "price<")]),
             &space(),
         );
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m3", "m1"]);
@@ -266,7 +276,7 @@ mod tests {
 
     #[test]
     fn sort_missing_field_goes_last_both_directions() {
-        for dir in ["<price", ">price"] {
+        for dir in ["price<", "price>"] {
             let q = compile_query(&toks(&[("sort", dir)]), &space());
             let out = apply_query(&rows(), &q, &space());
             assert_eq!(out.last().unwrap().id, "m4", "missing must be last ({dir})");
@@ -284,18 +294,19 @@ mod tests {
     #[test]
     fn unsortable_field_rejects_sort() {
         let sp = FieldSpace::new(vec![FieldSpec::new("uid", false).opt_out_sort()]);
-        assert!(parse_sort_spec("<uid", &sp).is_none());
+        assert!(parse_sort_spec("uid<", &sp).is_none());
         assert!(parse_sort_spec("uid", &sp).is_none());
     }
 
     #[test]
     fn parse_sort_spec_forms() {
+        // Suffix direction: `.sort:price<` asc, `.sort:price>` desc.
         assert_eq!(
-            parse_sort_spec("<price", &space()),
+            parse_sort_spec("price<", &space()),
             Some(("price".into(), SortDir::Asc))
         );
         assert_eq!(
-            parse_sort_spec(">price", &space()),
+            parse_sort_spec("price>", &space()),
             Some(("price".into(), SortDir::Desc))
         );
         assert_eq!(

@@ -602,6 +602,16 @@ host has no per-command menu logic at all.
       supplies one (the model provider reuses `MODEL_MODIFIERS` desc text),
       else its type (`string`/`number`). It never repeats the field/display
       text.
+    - **Systematic description format**: every row carries its type
+      (`string`/`number`); with a description it reads
+      `descr; min|max, type` (default sort order folds in when a real
+      description is present). The injected `.sort` gets a default
+      description ("sort field, append `>` or `<` for direction"). The
+      Modifier column shows just `.name:` (no repetition).
+    - **Sort direction is a suffix**: `.sort:field` (default order),
+      `.sort:field>` (desc), `.sort:field<` (asc) — more ergonomic with
+      type-ahead (pick the field, then append direction) than the v1 prefix
+      form.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

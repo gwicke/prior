@@ -326,9 +326,8 @@ cached rows — this generalizes the hand-written `ModelFilter` /
 | --- | --- |
 | `.field:value` | Exact match on a string field (id, description, or string key-value field). |
 | `.field:>v` / `.field:<v` | Numeric comparison (retain rows with value > / < v); `>=` / `<=` likewise. Comparison filters drop rows *missing* the field. |
-| `.sort:<field` | Sort ascending by field (small first — e.g. cheapest price first). |
-| `.sort:>field` | Sort descending by field (large first — e.g. highest index first). |
 | `.sort:field` | Direction defaults to the field's declared `default_dir` (§8.1), so legacy names like `.sort:coding` keep working. |
+| `.sort:field>` / `.sort:field<` | Explicit descending / ascending as a **suffix** (more ergonomic with type-ahead than a prefix: pick the field, then append the direction). |
 
 Rules:
 

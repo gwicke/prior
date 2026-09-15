@@ -96,7 +96,8 @@ impl Default for SortDir {
 }
 
 /// Sort direction. `>` = descending (large first), `<` = ascending
-/// (design §7.1 as user-adjusted: `.sort:<field` asc, `.sort:>field` desc).
+/// (design §7.1 as user-adjusted, suffix form: `.sort:field>` desc,
+/// `.sort:field<` asc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDir {
     Asc,

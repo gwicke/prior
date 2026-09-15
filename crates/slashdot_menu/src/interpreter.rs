@@ -597,19 +597,36 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         // added and the space-stripped dotted token is an exact completion
         // (e.g. `.sort:coding `), the auto-complete overlay dismisses and
         // control returns to the list — there is nothing left to complete.
-        // Field description for the Description column: the provider's
-        // `FieldSpec::description` when set, else the type
-        // (`string`/`number`). Never repeats the field name.
+        // Field description for the Description column (systematic, design
+        // §8.1):
+        //   - no description       -> "string" | "number"
+        //   - with description     -> "<desc>; string|number"
+        //   - + default sort order -> "<desc>; min|max, string|number"
+        // The type is always present; the default sort order (Asc=min,
+        // Desc=max) only alongside a description. Never repeats the field
+        // name.
         let field_desc = |name: &str| -> String {
-            field_space
-                .spec(name)
-                .and_then(|s| s.description.clone())
-                .unwrap_or_else(|| {
-                    field_space
-                        .spec(name)
-                        .map(|s| if s.is_number { "number" } else { "string" }.to_string())
-                        .unwrap_or_default()
-                })
+            use crate::fields::SortDir;
+            // The injected `sort` pseudo-field (not a real field): give it a
+            // default description + type so it reads consistently with the
+            // others in the list.
+            if name == "sort" {
+                return "sort field, append `>` or `<` for direction; string".to_string();
+            }
+            let Some(spec) = field_space.spec(name) else {
+                return String::new();
+            };
+            let ty = if spec.is_number { "number" } else { "string" };
+            match &spec.description {
+                Some(d) if !d.is_empty() => {
+                    let order = match spec.default_dir {
+                        SortDir::Asc => "min",
+                        SortDir::Desc => "max",
+                    };
+                    format!("{}; {}, {}", d, order, ty)
+                }
+                _ => ty.to_string(),
+            }
         };
         // Exit rule (design §5.1, listing nodes): if a trailing space was
         // added and the space-stripped dotted token is an exact completion
@@ -627,7 +644,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                     .filter(|f| f.contains(name.as_str()))
                     .map(|f| {
                         let v = format!(".{}:", f);
-                        (format!("{} {}", v, f), v, field_desc(f))
+                        (v.clone(), v, field_desc(f))
                     })
                     .collect();
                 if is_exact(&rows) {
@@ -645,7 +662,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                         .filter(|f| f.contains(value.as_str()))
                         .map(|f| {
                             let v = format!(".sort:{}", f);
-                            (format!("{} {}", v, f), v, field_desc(f))
+                            (v.clone(), v, field_desc(f))
                         })
                         .collect();
                     if is_exact(&rows) {
@@ -1351,6 +1368,14 @@ mod tests {
         assert_eq!(tier_desc.as_deref(), Some("string"));
         let price_desc = rows.iter().find(|(d, v, _)| v == ".price:").map(|(_, _, d)| d.clone());
         assert_eq!(price_desc.as_deref(), Some("number"));
+        // The injected `.sort` gets a default description + type.
+        let sort_desc = rows.iter().find(|(d, v, _)| v == ".sort:").map(|(_, _, d)| d.clone());
+        assert_eq!(sort_desc.as_deref(), Some("sort field, append `>` or `<` for direction; string"));
+        // Display never repeats the field/option text.
+        for (disp, _, desc) in &rows {
+            assert!(disp != desc, "display must not equal description: {:?}", disp);
+            assert!(desc.len() >= 6, "description too thin (missing type): {:?}", desc);
+        }
         // `.tier:` is a string field → distinct dataset values.
         let (want_value, rows) = i.field_options("model .tier:");
         assert!(want_value);
