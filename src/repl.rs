@@ -1597,8 +1597,13 @@ impl ActiveOverlay {
                     // Finish the dotted token. If we're completing a full
                     // `.name:value`, replace the whole token; otherwise replace
                     // just the trailing `.xxx` fragment with `.name:`.
+                    // A completed `.name:value` (does not end in `:`) appends
+                    // a trailing space so the auto-complete overlay dismisses
+                    // and the filter/sort applies (design §5.1 listing exit);
+                    // a value-in-progress `.name:` (ends in `:`) does not.
                     let val = &c.value;
-                    editor.set(&Repl::replace_last_token(&buf, val));
+                    let trailing = if val.ends_with(':') { "" } else { " " };
+                    editor.set(&Repl::replace_last_token(&buf, &format!("{}{}", val, trailing)));
                 }
             }
             ActiveOverlay::Thinking { .. } => {
@@ -2020,7 +2025,12 @@ ActiveOverlay::Model { engine_rows, .. } => {
             ActiveOverlay::Mod { rows, .. } => {
                 if let Some(c) = rows.get(sel) {
                     let buf = editor.text();
-                    editor.set(&Repl::replace_last_token(&buf, &c.value));
+                    // Mirror Tab: a completed `.name:value` appends the
+                    // trailing space (exit + apply), a value-in-progress
+                    // `.name:` doesn't.
+                    let val = &c.value;
+                    let trailing = if val.ends_with(':') { "" } else { " " };
+                    editor.set(&Repl::replace_last_token(&buf, &format!("{}{}", val, trailing)));
                 }
                 OverlayAction::Continue
             }

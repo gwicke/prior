@@ -582,6 +582,16 @@ host has no per-command menu logic at all.
       `engine.interpreter.modifier_options`. `MODEL_MODIFIERS`/
       `ModifierSpec` remain only for the still-v1 `/set default_model`
       completion path.
+    - **Exit-on-trailing-space** (design §5.1 listing exit): a trailing
+      space after an *exact* dotted completion (e.g. `.sort:coding `)
+      dismisses the overlay and returns to the list — an obvious path to
+      apply the sort. Enter/Tab on a completed `.name:value` appends the
+      trailing space (exit + apply); a value-in-progress `.name:` does not.
+    - **Value nodes are listing nodes**: completing a value command's word
+      (`/think` → `thinking `) now drills with a trailing space exactly like
+      a static/dynamic listing, instead of pinning and requiring a second
+      Tab. (A completion *inside* an already-drilled value level, e.g.
+      `thinking ` → `med`, still pins the value token.)
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

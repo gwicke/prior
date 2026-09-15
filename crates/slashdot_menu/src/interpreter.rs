@@ -572,6 +572,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         // last whitespace word after the path is the token to complete. A
         // `.` alone (bare dot) is a Key("").
         let tail = &line[st.node_path.join(" ").len()..];
+        let trailing_space = line.ends_with(' ');
         let last = tail.split_whitespace().next_back().unwrap_or("");
         let Some(dot) = crate::grammar::parse_dot_token(last) else {
             return (false, Vec::new());
@@ -580,6 +581,13 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         let field_space = self.field_space(&path_key, &result.rows);
         // All field names (design §7.1: every field is filterable+sortable).
         let field_names = field_space.names(true);
+        // Exit rule (design §5.1, listing nodes): if a trailing space was
+        // added and the space-stripped dotted token is an exact completion
+        // (e.g. `.sort:coding `), the auto-complete overlay dismisses and
+        // control returns to the list — there is nothing left to complete.
+        let is_exact = |rows: &[(String, String)]| {
+            trailing_space && rows.iter().any(|(_, v)| v == last)
+        };
         match dot {
             crate::grammar::DotToken::Key(name) => {
                 // Bare `.name` → list matching field names. Values complete
@@ -592,7 +600,11 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                         (format!("{} {}", v, f), v)
                     })
                     .collect();
-                (false, rows)
+                if is_exact(&rows) {
+                    (false, Vec::new())
+                } else {
+                    (false, rows)
+                }
             }
             crate::grammar::DotToken::NameValue { key, value } => {
                 // `.sort:` special-case: the sort operator's *value* is a
@@ -606,6 +618,9 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                             (format!("{} {}", v, f), v)
                         })
                         .collect();
+                    if is_exact(&rows) {
+                        return (true, Vec::new());
+                    }
                     return (true, rows);
                 }
                 // `.field:value` → completion depends on the field's type.
@@ -629,7 +644,11 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                     (full.clone(), full)
                 })
                 .collect();
-                (true, rows)
+                if is_exact(&rows) {
+                    (true, Vec::new())
+                } else {
+                    (true, rows)
+                }
             }
         }
     }
@@ -752,9 +771,13 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             || node.value.is_some()
             || (node.dynamic && landed_on_child)
         {
-            // Value children: Tab pins the value, but the *listing* itself
-            // was already the level; completing to a value just pins.
-            if node.value.is_some() {
+            // A value node is itself a listing (it presents its value set):
+            // completing the *command word* (landed_on_child) drills — e.g.
+            // `/thinking` → `thinking ` — exactly like a static listing or
+            // dynamic level. Only a completion *inside* an already-drilled
+            // value level (landed_on_child false, e.g. `thinking ` selecting
+            // `med`) pins the value token instead of drilling.
+            if node.value.is_some() && !landed_on_child {
                 TabResult::Buffer(buf)
             } else {
                 TabResult::BufferDrill(buf)
@@ -984,10 +1007,21 @@ mod tests {
 
     #[test]
     fn tab_completes_keeping_terms() {
+        // `/think` → `thinking `: a value node is a listing (it shows its
+        // value set), so completing its command word drills with a trailing
+        // space exactly like a static/dynamic listing node.
         let act = ix().tab("think");
         assert_eq!(
             act,
-            OverlayAction::Buffer("thinking".to_string())
+            OverlayAction::Buffer("thinking ".to_string())
+        );
+        // Selecting a value *inside* the drilled value level pins (no drill):
+        // `thinking ` completes the cursor row, which seeds to the first value
+        // (`off`) when no active provider marks a current level.
+        let act_val = ix().tab("thinking ");
+        assert_eq!(
+            act_val,
+            OverlayAction::Buffer("thinking off".to_string())
         );
         // terms preserved: "/tree think" → wait, root has no tree-chain here.
         let act2 = ix().tab("tree ");
@@ -1290,6 +1324,31 @@ mod tests {
         let vals: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
         assert!(vals.contains(&".sort:tier".to_string()));
         assert!(vals.contains(&".sort:price".to_string()));
+    }
+
+    /// design §5.1 listing exit: a trailing space after an *exact* dotted
+    /// completion dismisses the auto-complete overlay (nothing left to
+    /// complete) so the filter/sort applies and control returns to the list.
+    #[test]
+    fn modifier_options_exits_on_trailing_space_exact_match() {
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(crate::provider::StaticProvider {
+                result: crate::provider::DataResult {
+                    rows: dyn_provider_rows(), // tier(Str), price(Num)
+                    ..Default::default()
+                },
+            }),
+        );
+        // `.tier:paid ` (complete 'paid' + trailing space) → exit (empty).
+        let (_, rows) = i.modifier_options("model .tier:paid ");
+        assert!(rows.is_empty(), "exact value + space dismisses: {:?}", rows);
+        // `.sort:price ` (complete field + trailing space) → exit.
+        let (_, rows) = i.modifier_options("model .sort:price ");
+        assert!(rows.is_empty(), "exact sort field + space dismisses: {:?}", rows);
+        // Without the trailing space, the partial still offers completion.
+        let (_, rows) = i.modifier_options("model .sort:p");
+        assert!(!rows.is_empty(), "partial still completes: {:?}", rows);
     }
 
     #[test]
