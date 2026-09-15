@@ -117,8 +117,6 @@ impl RenderPlan {
     }
 }
 
-
-
 /// Compose a [`RenderPlan`] from menu state parts.
 pub struct PlanBuilder {
     pub title: String,
