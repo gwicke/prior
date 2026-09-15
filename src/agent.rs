@@ -1882,7 +1882,7 @@ fn build_rig_agent(
     builder.build()
 }
 
-use rig_core::tool::Tool;
+use rig_core::tool::{Tool, ToolErrorKind, ToolExecutionError};
 
 struct Guard<T: Tool> {
     tool: T,
@@ -1905,6 +1905,32 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
 
     fn parameters(&self) -> serde_json::Value {
         self.tool.parameters()
+    }
+
+    /// Map picocode's domain errors into rig's typed error taxonomy so the
+    /// model and hooks receive a meaningful classification instead of always
+    /// `ToolErrorKind::Other` (which renders as the generic "the tool failed").
+    ///
+    /// - `ToolError::Io` → `Other` (infrastructure failure, not auto-retryable)
+    /// - `ToolError::Generic` containing "timed out" → `Timeout` (auto-retryable)
+    /// - `ToolError::Generic` containing "cancelled" → `Cancelled` (not retryable)
+    /// - everything else → `Other` with the specific message preserved
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        use crate::tools::ToolError;
+
+        match error {
+            ToolError::Io(msg) => ToolExecutionError::other(msg),
+            ToolError::Generic(msg) => {
+                let kind = if msg.contains("timed out") {
+                    ToolErrorKind::Timeout
+                } else if msg.contains("cancelled") {
+                    ToolErrorKind::Cancelled
+                } else {
+                    ToolErrorKind::Other
+                };
+                ToolExecutionError::new(kind, msg)
+            }
+        }
     }
 
     async fn call(
