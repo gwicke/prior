@@ -324,44 +324,71 @@ no per-frame rebuild; handlers become the sole carriers of app state.
   thread participates (e.g. catalog refresh). Handlers mutate app data
   directly through the cells; the host loop applies only loop-owned
   effects (control flow, terminal, transcript, redraw).
-- The **model provider is one-shot + cached**: `fetch` runs once per menu
+- The **model provider is one-shot**: `fetch` runs once per menu
   activation into the data cache; **all** filtering/sorting stays
-  engine-side over the cached rows (§7.1). The only per-frame-fresh datum
-  is the **active-selector indication**: `active_selector()` reads the
-  current model id directly from settings (authoritative) on every call,
-  independent of the cached catalog rows.
+  engine-side over the cached rows (§7.1). The active row is **data**, not
+  a separate trait call: the provider sets `DataResult::active_row`
+  (the id of the current state — active model / current session / current
+  leaf) inside `fetch`, from its own live data source. The engine resolves
+  it to the `*`-marked row per frame; a fresh menu seeds its cursor on it.
 
 1. **App-state structuring (host, prerequisite)**: introduce a
    `MenuShared`-style handle bundle holding exactly the mutable slices
-   menu handlers touch, each in an `Rc<RefCell<…>>`:
+   menu handlers touch. Handles are **live stores**, not snapshots:
+   handlers read and write the same underlying data the rest of the app
+   uses. All `Rc<RefCell<…>>` (single-threaded app); `Arc` only where a
+   background thread participates (the catalog's global cache):
    - settings store (all `/set` writes; the **active model id lives here**,
-     so `active_selector` can read it per call);
-   - active-model resolution (today `ReplCtx::model` +
-     `resolve_active_model` — becomes a closure over the settings cell);
-   - session store + current-session id (rename/fork/delete/resume
-     writes; the tree/session read snapshots stay behind read handles);
-   - tree read snapshot (tree rows read at fetch time);
-   - catalog snapshot + refresh-trigger flag (the flag is what a
-     background thread may share via `Arc`; the menu itself never touches
-     the thread).
+     so the model provider reads it in `fetch`);
+   - session repository (live `JsonlSessionRepo`; the `/session` listing
+     provider calls `list_sessions_sync` on it) + current-session id;
+   - tree + leaf read mirror (the async `Session` only mutates between
+     turns, so the REPL refreshes this sync mirror once per loop
+     iteration; the `/tree` provider reads it per `fetch`);
+   - catalog: the **global cache** `catalog_cached()` IS the live store —
+     the provider reads it directly, no snapshot cell.
    The REPL keeps building `ReplCtx` snapshots from the same underlying
    storage, so the rest of the REPL is untouched. Explicitly *not* in
    scope: restructuring REPL internals beyond these slices.
 2. **Long-lived descriptors; constructors lose ctx (bridge)**:
    `MenuEngine::new(&MenuShared)` — no `ReplCtx`, no `for_model`.
    Descriptors built once; leaf/confirm handlers registered at build time
-   as closures capturing the shared handles. Providers become closures
-   over shared state:
-   - `ModelProvider`: `fetch` = one-shot per activation over the catalog
-     snapshot (cached in `data_cache`, §8); **no filter capture** — the
-     engine's query compiler applies the prompt's modifiers over cached
-     rows (§7.1), so `for_model`'s merged-`ModelFilter` ladder disappears;
-     `active_selector()` reads the current model id from settings on
-     every call (fresh per frame, cache-independent).
-   - `SessionProvider` / `TreeProvider`: rows read from shared
-     session/tree state at fetch time; `active_selector` reads the
-     current session id / leaf id likewise.
-   Bridge constructors collapse to the single `new`.
+   as closures capturing the shared handles. **Providers attach at
+   construction** (the host's `menu_cursors`/`menu_frames` live for the
+   whole `read_input` loop, so a once-attached provider survives every
+   frame — no per-variant `with_provider` wiring remains).
+   Providers are the sole owners of their data source:
+   - `ModelProvider`: `fetch` reads the **global catalog cache directly**
+     and the settings cell (for `active_row`); **no filter capture** — the
+     engine's query compiler applies the prompt's `.sort:`/field modifiers
+     over the cached rows (§7.1), so `for_model`'s merged-`ModelFilter`
+     ladder disappears. The provider also emits rows in its **default
+     sort order** (`fetch_recent_and_popular`: active model + 5 most
+     recent in LRU order, then repository popularity) — the engine's
+     `apply_query` passes un-`.sort:`ed provider order through, so no sort
+     = provider order. The v1 host-side LRU/recent boost, its five-row
+     window, and `model_overlay_entries`' fuzzy+rank blend die: the boost
+     folds into the provider's default ordering (data-handler concern),
+     fuzzy narrowing is the engine's generic `rank_and_pin`. Any explicit
+     `.sort:`/field filter is applied generically like for any table.
+   - `SessionProvider` / `TreeProvider`: rows read from the live repo /
+     sync tree mirror at `fetch` time (session provider keeps its
+     current-first + recency order in its own ordering); `active_row` is
+     the current session id / leaf id likewise.
+   Bridge constructors collapse to the single `new`; **all host
+   per-command provider wiring** (`engine_for`'s Session/Tree arms,
+   `for_model`, `model_engine_args`) is deleted in the same step.
+   Rendering is generic: the host's model table shows plain provider
+   fields (numbers as-is, no currency prefix/glyphs); the `/set
+   default_model` + modifier-completion paths still use the v1
+   `parse_model_filter`/`model_selection_overlay_entries` temporarily
+   (they migrate to the same provider later — only the leaf/handlers
+   differ).
+   **Revised (step-2 findings)**: `DataProvider::active_selector()` is
+   removed entirely — the active row is part of the provider *response*
+   (`DataResult::active_row`), set inside `fetch`. No mid-menu settings
+   mutation is possible (any leaf handler both terminates the menu
+   invocation), so one `active_row` per activation is always correct.
 3. **Activation absorbs traversal memory + accept phase (engine +
    bridge)**: bundle `{ cursors, frames, data_cache, accept_phase }` into
    the opaque `Activation`. `Frame` (traversal memory) moves from the
@@ -414,6 +441,47 @@ no per-frame rebuild; handlers become the sole carriers of app state.
      accept applies the payload;
    - engine purity: `cargo build -p slashdot_menu` in isolation (the
      crate must compile without the parent in the workspace).
+
+#### Follow-ups from the step-2 (6.7-1/2) implementation
+
+Recorded so they are not lost; each is a later-phase cleanup, not part of
+step 2.
+
+- **Model title/modifier summary**: `ActiveOverlay::Model` now carries a
+  stub `ModelFilter::default_for_coding()` only for `title()`; the
+  modifier summary (`sort:coding`, `price≤0.5`, …) the v1 table showed in
+  the header no longer renders. Recover it generically once the engine
+  exposes the parsed per-level modifiers (the `Query`/`FieldSpace` already
+  have them) or drop the title entirely at the Phase 7 overlay collapse.
+- **Rendering consolidation**: the host's `Model` `display_rows` builds a
+  plain column table (`Model/Ctx/Coding/Price in/Price out/Reason`) from
+  row fields — the same job the engine's `render.rs` does for dynamic
+  levels. Delete the host arm and paint the engine's `RenderPlan` verbatim
+  (Phase 6.7-5 / Phase 7.1). The `.field:`/`.sort:` completion overlay and
+  `/set default_model` still route through v1 `parse_model_filter` /
+  `model_selection_overlay_entries`; migrate them to the same provider
+  (only the leaf/handlers differ) and delete the v1 helpers.
+- **`active_row` staleness semantics**: providers set `active_row` once
+  per `fetch` (= per activation, since activation == engine instance and
+  settings can't change mid-menu). When Phase 7/6.7-3 makes the engine
+  persistent, decide whether providers re-poll live cells for
+  `active_row` per frame or keep the one-per-activation snapshot —
+  currently designed as one-per-activation (correct today).
+- **`model_catalog::provider_available` dimming**: the v1 table dimmed
+  rows whose provider wasn't available (ANSI `\x1b[2m`). Dropped with the
+  custom arm, since it was a per-row presentational computation in host
+  code. If wanted, the provider can surface it as a row field (boolean =>
+  number) and the generic render can style it; otherwise the behavior is
+  intentionally gone.
+- **`recent`/`model_filter` on `ReplCtx`**: still populated and used by
+  the temporary `/set default_model` + completion paths, and `recent` seeds
+  `MenuShared.recent_models`. Once those migrate, `ReplCtx.model_filter`
+  and the `run_interactive` <-> `MenuShared` recent-sync ceremony can be
+  deleted.
+- **`max_age_days` modifier**: has no row field (the row carries
+  `created`); the generic engine drops `.max_age_days:N` as unknown field.
+  v1 mapped it to a created-age cutoff. Either add a computed `age_days`
+  field in the model provider or drop the modifier from `MODEL_MODIFIERS`.
 
 ### Phase 7 — the switch (host) + cleanup
 

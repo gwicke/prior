@@ -4,12 +4,24 @@
 //! `ActiveOverlay` arms delegate to the shared interpreter instead of
 //! bespoke overlay variants. Phase 6 starts with `/thinking` (§10 step 1).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::session::repo::JsonlSessionRepo;
 use crate::slash;
 use crate::slashdot_menu::{
     accept::{AcceptController, AcceptOutcome, LeafInvocation, LeafResult},
     interpreter::{Interpreter, MenuState, OverlayAction},
     node::MenuNode,
     value::Value,
+};
+
+/// Verify `MenuShared`'s file-scoped cells stay inside the `RefCell`
+/// (compile-time: constructing a `MenuShared` takes plain `&self`-style
+/// borrows so nothing escapes as an `&mut`).
+const _: () = {
+    fn assert_cell<T>() {}
+    let _ = assert_cell::<Rc<RefCell<crate::settings::SettingsStore>>>;
 };
 
 /// One traversal memory frame: the prompt (with filter/modifier state)
@@ -56,35 +68,93 @@ fn resolve_node(
 }
 
 /// The shared menu engine, built per prompt iteration from picocode state.
-/// NOTE: rebuilt per key-press today (`MenuEngine::new(ctx)`), so the stack
-/// lives with the *host session* via the returned snapshot (see
-/// `StepResult.frames`); a persistent engine is Phase 6 cleanup.
+/// NOTE: rebuilt per key-press today (`MenuEngine::new(&MenuShared)`), so
+/// the stack lives with the *host session* via the returned snapshot (see
+/// `StepResult.frames`); a persistent engine is Phase 6 cleanup / Phase 7.
 pub struct MenuEngine {
     pub interpreter: Interpreter,
     pub controller: AcceptController,
 }
 
-/// DataProvider over the session tree entries (§10 step 6). The host
-/// flattens the tree (v1 logic) and hands over the flat list; rows carry
-/// id/label/indent/active-path/current so the engine ranks and pins.
-pub struct TreeProvider {
-    /// (indent, label, entry_id, on_active_path, is_current, branch_depth)
-    /// — v1's flatten_tree_nodes tuple, passed through.
-    pub entries: Vec<(usize, String, String, bool, bool, usize)>,
-    pub leaf_id: Option<String>,
+/// Shared application state the menu handlers read/write at call time
+/// (design §9/§12). Handles are **live** stores, not snapshots: handlers
+/// read and write the same underlying data the rest of the app uses. All
+/// `Rc<RefCell<…>>` (single-threaded app); `Arc` only where a background
+/// thread participates (the catalog's global cache). The REPL keeps
+/// building `ReplCtx` snapshots from the same storage for its own overlay
+/// rendering.
+pub struct MenuShared {
+    /// The settings store — canonical live state the `/set` handler and
+    /// `run_interactive` both mutate. Handlers read/write directly; the
+    /// menu's providers read it per `fetch` (active model id).
+    pub settings: Rc<RefCell<crate::settings::SettingsStore>>,
+    /// Session repository (if available). The `/session` listing provider
+    /// calls `list_sessions_sync` on it; session mutation handlers write
+    /// through it. `None` when no session store exists.
+    pub repo: Option<JsonlSessionRepo>,
+    /// The id of the currently-active session (empty = none). Written by
+    /// session actions; read per `fetch`.
+    pub current_session_id: Rc<RefCell<String>>,
+    /// Recently-used model ids (LRU, most recent first) — the provider's
+    /// recency boost source. `run_interactive` keeps this in sync with its
+    /// `recent_models` local on every SetModel.
+    pub recent_models: Rc<RefCell<Vec<String>>>,
+    /// Synchronous mirror of the async session tree (v1
+    /// `flatten_tree_nodes` tuples) + current leaf id. The async `Session`
+    /// only mutates between agent turns, so the REPL refreshes this once
+    /// per loop iteration; the `/tree` provider reads it per `fetch`.
+    pub tree: Rc<RefCell<Vec<(usize, String, String, bool, bool, usize)>>>,
+    pub leaf_id: Rc<RefCell<Option<String>>>,
 }
 
-impl slashdot_menu::provider::DataProvider for TreeProvider {
+impl MenuShared {
+    pub fn new(
+        settings: crate::settings::SettingsStore,
+        repo: Option<JsonlSessionRepo>,
+    ) -> Self {
+        MenuShared {
+            settings: Rc::new(RefCell::new(settings)),
+            repo,
+            current_session_id: Rc::new(RefCell::new(String::new())),
+            recent_models: Rc::new(RefCell::new(Vec::new())),
+            tree: Rc::new(RefCell::new(Vec::new())),
+            leaf_id: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Clone the cell *handles* (shared ownership), not their contents —
+    /// the engine and its providers then observe the same live cells the
+    /// REPL writes.
+    pub fn clone_shared(&self) -> MenuShared {
+        MenuShared {
+            settings: self.settings.clone(),
+            repo: self.repo.clone(),
+            current_session_id: self.current_session_id.clone(),
+            recent_models: self.recent_models.clone(),
+            tree: self.tree.clone(),
+            leaf_id: self.leaf_id.clone(),
+        }
+    }
+}
+
+/// DataProvider over the session tree entries (§10 step 6): rows from the
+/// shared flattened-tree snapshot, in provider order.
+pub struct TreeProvider {
+    pub shared: Rc<MenuShared>,
+}
+
+impl crate::slashdot_menu::provider::DataProvider for TreeProvider {
     fn fetch(
         &mut self,
-        _modifiers: &[slashdot_menu::grammar::ModifierToken],
-    ) -> slashdot_menu::provider::DataResult {
-        use slashdot_menu::value::Value;
-        let rows: Vec<slashdot_menu::fields::Row> = self
-            .entries
+        _modifiers: &[crate::slashdot_menu::grammar::ModifierToken],
+    ) -> crate::slashdot_menu::provider::DataResult {
+        use crate::slashdot_menu::value::Value;
+        let leaf_id = self.shared.leaf_id.borrow().clone();
+        let entries = self.shared.tree.borrow().clone();
+        let rows: Vec<crate::slashdot_menu::fields::Row> = entries
             .iter()
             .map(|(indent, label, id, on_path, is_current, branch_depth)| {
-                let mut r = slashdot_menu::fields::Row::new(id.clone())
+                let mut r = crate::slashdot_menu::fields::Row::new(id.clone())
                     .desc(label.clone())
                     .field("label", Value::Str(label.clone()))
                     .field("indent", Value::Num(*indent as f64))
@@ -98,39 +168,64 @@ impl slashdot_menu::provider::DataProvider for TreeProvider {
                 r
             })
             .collect();
-        slashdot_menu::provider::DataResult {
+        crate::slashdot_menu::provider::DataResult {
             rows,
+            active_row: leaf_id,
             ..Default::default()
         }
     }
 }
 
-/// DataProvider over the session list (§10 step 5). Rows carry the
-/// session metadata the action level renders in its per-row header.
+/// DataProvider over the session list (§10 step 5): rows from the live
+/// repo at `fetch` time; current-first + recency order is the provider's
+/// own (kept from v1) so the engine's default order is the v1 sort. The
+/// active-session id rides in `active_row` (provider data, not a trait
+/// call).
 pub struct SessionProvider {
-    pub sessions: Vec<crate::repl::SessionMeta>,
-    pub current_id: String,
+    pub shared: Rc<MenuShared>,
 }
 
-impl slashdot_menu::provider::DataProvider for SessionProvider {
+impl crate::slashdot_menu::provider::DataProvider for SessionProvider {
     fn fetch(
         &mut self,
-        _modifiers: &[slashdot_menu::grammar::ModifierToken],
-    ) -> slashdot_menu::provider::DataResult {
-        use slashdot_menu::value::Value;
-        let rows: Vec<slashdot_menu::fields::Row> = self
-            .sessions
+        _modifiers: &[crate::slashdot_menu::grammar::ModifierToken],
+    ) -> crate::slashdot_menu::provider::DataResult {
+        use crate::slashdot_menu::value::Value;
+        let current_id = self.shared.current_session_id.borrow().clone();
+        let active = if current_id.is_empty() { None } else { Some(current_id.clone()) };
+        // Live listing from the repo (the repo's own sync cache handles
+        // freshness); current-first + recency order is the provider's own.
+        let mut sessions: Vec<crate::repl::SessionMeta> = match &self.shared.repo {
+            Some(repo) => repo
+                .list_sessions_sync(None)
+                .into_iter()
+                .map(crate::repl::session_meta_from)
+                .collect(),
+            None => Vec::new(),
+        };
+        sessions.sort_by(|a, b| {
+            let a_cur = a.id == current_id;
+            let b_cur = b.id == current_id;
+            if a_cur && !b_cur { std::cmp::Ordering::Less }
+            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
+            else {
+                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
+                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
+                b_ts.cmp(a_ts)
+            }
+        });
+        let rows: Vec<crate::slashdot_menu::fields::Row> = sessions
             .iter()
             .map(|m| {
                 let display = m.name.clone().unwrap_or_else(|| m.id.clone());
-                let mut r = slashdot_menu::fields::Row::new(m.id.clone())
+                let mut r = crate::slashdot_menu::fields::Row::new(m.id.clone())
                     .desc(&display)
                     .field("name", Value::Str(display))
                     .field("turns", Value::Num(m.user_message_count as f64))
                     .field("msgs", Value::Num(m.message_count as f64))
                     .field("cwd", Value::Str(m.cwd.clone()))
                     .field("timestamp", Value::Str(m.timestamp.clone()));
-                if m.id == self.current_id {
+                if m.id == current_id {
                     r = r.field("current", Value::Str("1".into()));
                 }
                 if let Some(p) = &m.parent_session {
@@ -139,98 +234,152 @@ impl slashdot_menu::provider::DataProvider for SessionProvider {
                 r
             })
             .collect();
-        slashdot_menu::provider::DataResult {
+        crate::slashdot_menu::provider::DataResult {
             rows,
+            active_row: active,
             ..Default::default()
         }
     }
-
-    /// The current session row (`*` marker); `None` when no current id.
-    fn active_selector(&self) -> Option<String> {
-        if self.current_id.is_empty() {
-            None
-        } else {
-            Some(self.current_id.clone())
-        }
-    }
 }
 
-/// DataProvider over the model catalog (§10 step 4). One-shot fetch:
-/// applies the parsed modifier state to the repository filter and maps the
-/// entries to rows with number fields the engine can sort/filter.
+/// DataProvider over the model catalog (§10 step 4). One-shot fetch over
+/// the **global catalog cache** (the live store). **The provider's own
+/// ordering is the default sort**: rows come in recency × popularity
+/// order with the active model boosted first ([`Self::fetch_recent_and_popular`]).
+/// The engine's query compiler applies any explicit `.sort:`/field
+/// modifier generically over the cached rows (§7.1) and leaves the
+/// provider order alone when no `.sort:` is present.
 pub struct ModelProvider {
-    pub filter: crate::repl::ModelFilter,
-    /// Search terms extracted by the caller (engine fuzzy-ranks them).
-    pub active_id: String,
+    pub shared: Rc<MenuShared>,
 }
 
-impl slashdot_menu::provider::DataProvider for ModelProvider {
-    /// The currently-active model row (`*` marker, design §5.1): the id
-    /// handed in at build time, resolved against the candidate set.
-    fn active_selector(&self) -> Option<String> {
-        if self.active_id.is_empty() {
-            None
-        } else {
-            Some(self.active_id.clone())
-        }
+/// One model entry → engine row with the numeric fields the generic
+/// filter/sort/fuzzy logic addresses.
+fn model_row(e: &crate::model_catalog::ModelEntry) -> crate::slashdot_menu::fields::Row {
+    use crate::slashdot_menu::value::Value;
+    let mut r = crate::slashdot_menu::fields::Row::new(e.qualified()).desc(e.display.clone());
+    if let Some(v) = e.context_length {
+        r = r.field("context", Value::Num(v as f64));
     }
+    if let Some(v) = e.prompt_cost {
+        r = r.field("price_input", Value::Num(v));
+    }
+    if let Some(v) = e.completion_cost {
+        r = r.field("price_output", Value::Num(v));
+    }
+    if let Some(v) = e.coding_index {
+        r = r.field("coding", Value::Num(v as f64));
+    }
+    if let Some(v) = e.intelligence_index {
+        r = r.field("intelligence", Value::Num(v as f64));
+    }
+    if let Some(v) = e.agentic_index {
+        r = r.field("agentic", Value::Num(v as f64));
+    }
+    // Reasoning capability as a plain number (1/0) — the menu renders it
+    // as a number column like any other field.
+    r = r.field("reasoning", Value::Num(if e.reasoning { 1.0 } else { 0.0 }));
+    if let Some(t) = e.created {
+        r = r.field("created", Value::Num(t as f64));
+    }
+    r
+}
 
+impl crate::slashdot_menu::provider::DataProvider for ModelProvider {
     fn fetch(
         &mut self,
-        _modifiers: &[slashdot_menu::grammar::ModifierToken],
-    ) -> slashdot_menu::provider::DataResult {
-        let entries = crate::model_catalog::get_filtered_catalog(&self.filter.to_params());
-        let rows: Vec<slashdot_menu::fields::Row> = entries
-            .iter()
-            .map(|e| {
-                let mut r = slashdot_menu::fields::Row::new(e.qualified())
-                    .desc(e.display.clone());
-                if let Some(v) = e.context_length {
-                    r = r.field("context", slashdot_menu::value::Value::Num(v as f64));
-                }
-                if let Some(v) = e.prompt_cost {
-                    r = r.field("price_input", slashdot_menu::value::Value::Num(v));
-                }
-                if let Some(v) = e.completion_cost {
-                    r = r.field("price_output", slashdot_menu::value::Value::Num(v));
-                }
-                // Combined price (computed): v1's get_filtered_catalog never
-                // read ModelFilterParams.price, so `.price:X` filtered
-                // nothing — surfaced here as a real field.
-                if let (Some(p), Some(c)) = (e.prompt_cost, e.completion_cost) {
-                    r = r.field("price", slashdot_menu::value::Value::Num(p + c));
-                }
-                if let Some(v) = e.coding_index {
-                    r = r.field("coding", slashdot_menu::value::Value::Num(v as f64));
-                }
-                if let Some(v) = e.intelligence_index {
-                    r = r.field("intelligence", slashdot_menu::value::Value::Num(v as f64));
-                }
-                if let Some(v) = e.agentic_index {
-                    r = r.field("agentic", slashdot_menu::value::Value::Num(v as f64));
-                }
-                if let Some(t) = e.created {
-                    r = r.field("created", slashdot_menu::value::Value::Num(t as f64));
-                }
-                r
-            })
-            .collect();
-        slashdot_menu::provider::DataResult {
+        _modifiers: &[crate::slashdot_menu::grammar::ModifierToken],
+    ) -> crate::slashdot_menu::provider::DataResult {
+        // One-shot per activation. The catalog's own global cache is the
+        // live store (`catalog_cached`); no menu-level snapshot. The
+        // active-row id (fully-qualified `provider:model`, matching the
+        // settings value exactly) rides in the same response (§5.1); a
+        // disappeared model simply won't match a row.
+        let settings = self.shared.settings.borrow();
+        let active = crate::repl::active_model_id(&settings);
+        let entries = self.fetch_recent_and_popular();
+        let rows: Vec<crate::slashdot_menu::fields::Row> =
+            entries.iter().map(model_row).collect();
+        crate::slashdot_menu::provider::DataResult {
             rows,
+            active_row: active,
             ..Default::default()
         }
+    }
+}
+
+impl ModelProvider {
+    /// The provider's **default ordering** (design §12): recency ×
+    /// popularity, with the active model boosted first. The engine's
+    /// generic query applies any explicit `.sort:`/field filter *after*
+    /// this, and leaves the order alone when no `.sort:` is present, so
+    /// this ordering is what the user sees by default.
+    fn fetch_recent_and_popular(&self) -> Vec<crate::model_catalog::ModelEntry> {
+        let entries = crate::model_catalog::catalog_cached();
+        let active = crate::repl::active_model_id(&self.shared.settings.borrow());
+        let recent: Vec<String> = self.shared.recent_models.borrow().clone();
+
+        // Server position = index in the catalog's popularity order.
+        let server_rank: std::collections::HashMap<String, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut ordered: Vec<crate::model_catalog::ModelEntry> = Vec::new();
+        // 1. Active model first (if present in the catalog). Fully
+        // qualified ids match the settings value exactly; a disappeared
+        // model simply won't be found (no `*`, no boost) — that's fine.
+        let active_id = active.unwrap_or_default();
+        if let Some(active_entry) = entries.iter().find(|e| e.qualified() == active_id) {
+            if seen.insert(active_entry.id.clone()) {
+                ordered.push(active_entry.clone());
+            }
+        }
+        // 2. Up to 4 more recent models in LRU order (total 5 boosted).
+        for recent_id in &recent {
+            if ordered.len() >= 5 {
+                break;
+            }
+            if let Some(e) = entries.iter().find(|e| e.id == *recent_id) {
+                if seen.insert(e.id.clone()) {
+                    ordered.push(e.clone());
+                }
+            }
+        }
+        // 3. The rest in repository (popularity) order.
+        let mut rest: Vec<crate::model_catalog::ModelEntry> = entries
+            .into_iter()
+            .filter(|e| !seen.contains(&e.id))
+            .collect();
+        rest.sort_by(|a, b| {
+            let ra = server_rank.get(&a.id).copied().unwrap_or(usize::MAX);
+            let rb = server_rank.get(&b.id).copied().unwrap_or(usize::MAX);
+            ra.cmp(&rb)
+        });
+        ordered.extend(rest);
+        ordered
     }
 }
 
 impl MenuEngine {
     /// Build the engine: the full descriptor tree (all commands) with
-    /// handlers bound per command as they migrate (§10 order).
-    pub fn new(_ctx: &crate::repl::ReplCtx) -> Self {
-        let root = Self::root_descriptor(_ctx);
+    /// handlers bound per command as they migrate (§10 order). Providers
+    /// are attached here from shared state (no `ReplCtx`, no `for_model`);
+    /// the host's `menu_cursors`/`menu_frames` live for the whole
+    /// `read_input` loop, so a once-attached provider survives every frame.
+    pub fn new(shared: &MenuShared) -> Self {
+        let root = Self::root_descriptor();
         let mut controller = AcceptController::new(root.clone());
         Self::register_handlers(&mut controller);
+        let shared_rc = Rc::new(shared.clone_shared());
+        let interpreter = Interpreter::new(root)
+            .with_provider(&["model"], Box::new(ModelProvider { shared: shared_rc.clone() }))
+            .with_provider(&["session"], Box::new(SessionProvider { shared: shared_rc.clone() }))
+            .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc }));
         MenuEngine {
-            interpreter: Interpreter::new(root),
+            interpreter,
             controller,
         }
     }
@@ -247,29 +396,8 @@ impl MenuEngine {
         self.interpreter.restore_cursors(map);
     }
 
-    /// Engine with the ModelProvider attached to the `model` dynamic level.
-    /// The Tab/Enter arms must use this (not `new`) so the dynamic level
-    /// resolves against the same merged-filter rows the display built.
-    pub fn for_model(
-        ctx: &crate::repl::ReplCtx,
-        mf: crate::repl::ModelFilter,
-        active_id: String,
-    ) -> Self {
-        let mut e = Self::new(ctx);
-        e.interpreter = e.interpreter.with_provider(
-            &["model"],
-            Box::new(ModelProvider {
-                filter: mf,
-                active_id,
-            }),
-        );
-        e
-    }
-
-    /// The static descriptor tree: one child per command (§10). Only the
-    /// commands migrated so far are referenced by ActiveOverlay; the rest
-    /// are descriptors for the root list (Phase 6 step 2 — done).
-    fn root_descriptor(_ctx: &crate::repl::ReplCtx) -> MenuNode {
+    /// The static descriptor tree: one child per command (§10).
+    fn root_descriptor() -> MenuNode {
         // Root list from the static command registry (name → key without
         // the leading slash; help → description), plus the migrated
         // per-command sub-descriptors (§10 order; thinking first).
@@ -655,32 +783,28 @@ pub(crate) fn row_str(r: &crate::slashdot_menu::fields::Row, k: &str) -> Option<
 mod tests {
     use super::*;
     use crate::repl::ReplCtx;
-    use crate::agent::SessionUsage;
-    use crate::repl::ModelFilter;
 
-    fn ctx() -> ReplCtx {
-        ReplCtx {
-            provider: "p".into(),
-            model: "m".into(),
-            recent: vec![],
-            persona: None,
-            session_usage: SessionUsage::default(),
-            repo: None,
-            current_session_id: "s".into(),
-            branch_messages: vec![],
-            tree: vec![],
-            leaf_id: None,
-            context_tokens: 0,
-            model_filter: ModelFilter::default_for_coding(),
-            thinking_level: Some("low".into()),
-        }
+    fn shared() -> MenuShared {
+        let settings = crate::settings::SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        MenuShared::new(settings, None)
     }
 
     /// slash_menu.md acceptance: bare `/thinking` lists all levels in
     /// declaration order; the active level is surfaced for the `*` marker.
     #[test]
     fn thinking_bare_lists_all() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let st = e.interpreter.state("thinking ");
         assert_eq!(
             st.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -693,7 +817,7 @@ mod tests {
     /// to the id, replacing the partial (positional selection slot).
     #[test]
     fn thinking_tab_completes_partial() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let st = e.interpreter.state("thinking h");
         // "h" is not a valid enum value → demoted to a fuzzy term.
         assert_eq!(st.selection, None);
@@ -707,7 +831,7 @@ mod tests {
     /// parses it into SetThinking (same path as typed input).
     #[test]
     fn thinking_enter_submits() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let out = e.step("thinking med", HostKey::Enter);
         match out.action {
             AcceptOutcome::Continue(OverlayAction::Submit(line)) => {
@@ -721,7 +845,7 @@ mod tests {
     /// ("thinking ") → parent path → cleared.
     #[test]
     fn thinking_esc_pops_pin() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let out = e.step("thinking med", HostKey::Esc);
         assert_eq!(out.buffer, Some("thinking ".to_string()));
         let out2 = e.step("thinking ", HostKey::Esc);
@@ -733,7 +857,7 @@ mod tests {
     /// Fuzzy terms filter the value set and pin survives (R8-5).
     #[test]
     fn thinking_terms_filter() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let st = e.interpreter.state("thinking e");
         // "e" matches "high" (desc) and "med"… ids: off/low/med/high —
         // "e" fuzzy-matches "med" and "high". Just verify filtering happened.
@@ -745,7 +869,7 @@ mod tests {
     /// ("thinking thinking" → "unknown thinking level").
     #[test]
     fn thinking_enter_bare_drills_not_submits() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let act = e.interpreter.enter("thinking");
         assert_eq!(act, OverlayAction::Buffer("thinking ".to_string()));
         // Sanity: a completed value still submits.
@@ -760,7 +884,7 @@ mod tests {
     /// path + committed id.
     #[test]
     fn tab_acts_on_host_cursor_and_clears_terms() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let mut frames: Vec<Frame> = Vec::new();
         // "e" ranks med first (1 candidate): cursor on row 0 must be the
         // completed id; cursor beyond the view is clamped to the same.
@@ -801,7 +925,7 @@ mod tests {
     /// (strict up-walk preserved).
     #[test]
     fn esc_without_frames_pops_level() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let mut frames: Vec<Frame> = Vec::new();
         let r = e.step_at("thinking med", 0, HostKey::Esc, &mut frames);
         assert_eq!(r.buffer, Some("thinking ".to_string()));
@@ -812,7 +936,7 @@ mod tests {
     /// term ranks them; Tab/Enter drill into the pinned command.
     #[test]
     fn root_list_from_registry() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let st = e.interpreter.state("");
         let ids: Vec<&str> = st.candidates.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"help"));
@@ -833,7 +957,7 @@ mod tests {
     /// Persona level (Phase 6 step 3): PERSONAS + "none" as a value child.
     #[test]
     fn persona_level_from_registry() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let st = e.interpreter.state("persona ");
         let ids: Vec<&str> = st.candidates.iter().map(|r| r.id.as_str()).collect();
         assert!(ids.contains(&"none"));
@@ -852,7 +976,7 @@ mod tests {
     /// value children per ValueKind; pinned setting drills to its values.
     #[test]
     fn settings_levels_from_metadata() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         // Enum setting: security_mode.
         let st = e.interpreter.state("set security_mode ");
         assert_eq!(st.node_path, vec!["set", "security_mode"]);
@@ -876,7 +1000,7 @@ mod tests {
     /// a pure trailing-space removal is navigation (clears nothing).
     #[test]
     fn on_edit_scoped_invalidation() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let mut frames: Vec<Frame> = Vec::new();
         // Build depth: accept "thinking" (frame at root level), then drill.
         let _ = e.step_at("thinking", 0, HostKey::Tab, &mut frames);
@@ -898,7 +1022,7 @@ mod tests {
     /// the pre-drill line with the cursor.
     #[test]
     fn drill_pushes_frame_esc_returns() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         let mut frames: Vec<Frame> = Vec::new();
         // Host cursor decides: the buffer "/thinking" pins "thinking",
         // whose row index in the root list is 1 (help first).
@@ -921,7 +1045,7 @@ mod tests {
     /// re-adds the leading slash.
     #[test]
     fn thinking_tab_preserves_slash_prefix() {
-        let mut e = MenuEngine::new(&ctx());
+        let mut e = MenuEngine::new(&shared());
         // Bare level: Tab promotes (drill), host re-adds the slash.
         let act = e.interpreter.tab("thinking");
         assert_eq!(act, OverlayAction::Buffer("thinking ".to_string()));

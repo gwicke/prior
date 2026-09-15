@@ -33,10 +33,11 @@ pub struct MenuState {
     /// The displayed level is a dynamic (data-provider) level.
     pub level_is_dynamic: bool,
     /// The row that is *currently in effect* (`*` marker, design §5.1),
-    /// from the provider's `active_selector` (or enum/static analogue),
-    /// resolved against `candidates`. `None` when no row is active (root
-    /// command list, or the selector didn't resolve). Distinct from
-    /// `active` (the cursor row), though a fresh cursor seeds on it.
+    /// from the provider's `DataResult::active_row` (or enum/static
+    /// analogue), resolved against `candidates`. `None` when no row is
+    /// active (root command list, or the selector didn't resolve).
+    /// Distinct from `active` (the cursor row), though a fresh cursor
+    /// seeds on it.
     pub active_row_marker: Option<usize>,
 }
 
@@ -265,15 +266,13 @@ impl Interpreter {
         }
     }
 
-/// Resolve the provider's `active_selector` against the candidate `rows`
-/// (design §5.1). Uses an immutable borrow of `dynamic_paths` so it can be
-/// called while `dynamic_rows` caching holds a mutable borrow elsewhere.
-fn resolve_active_selector(
-    path_key: &str,
-    providers: &std::collections::HashMap<String, Box<dyn DataProvider>>,
-    rows: &[Row],
-) -> Option<usize> {
-    let id = providers.get(path_key)?.active_selector()?;
+/// Resolve a provider's active-row id (from the cached [`DataResult::active_row`])
+/// against the level's rows (design §5.1). `rows` are the *ranked /
+/// filtered* rows for the current frame; the active id names a full
+/// provider row, so a fuzzy/filtered view keeps the marker when it
+/// survives.
+fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> {
+    let id = active?;
     rows.iter().position(|r| r.id == id)
 }
 
@@ -410,15 +409,16 @@ fn resolve_active_selector(
             .cursors
             .get(&path_key)
             .cloned();
-        // `*` row (design §5.1): resolve the provider's active selector
-        // against the ranked candidates. Dynamic levels use the provider;
-        // enum/static value levels resolve a pre-pinned selector below.
+        // `*` row (design §5.1): resolve the provider's active-row id
+        // (from the cached DataResult) against the ranked candidates.
+        // Dynamic levels use the provider-declared active id; enum/static
+        // value levels resolve a pre-pinned selector below.
         let active_row_marker = if node.dynamic {
-            Self::resolve_active_selector(
-                &path_key,
-                &self.dynamic_paths,
-                &rank.rows,
-            )
+            let cached_active = self
+                .data_cache
+                .get(&path_key)
+                .and_then(|r| r.active_row.as_deref());
+            Self::resolve_active_selector(cached_active, &rank.rows)
         } else {
             // Static/level: a pinned selection naming the active value (or
             // an enum set carrying an active selector) — see §5.1. For
@@ -468,10 +468,15 @@ fn resolve_active_selector(
         dynamic: bool,
     ) -> MenuState {
         let path_key = path.join(" ");
-        // `*` marker (design §5.1) on the drilled level, from the provider
-        // (dynamic) — the current-state row the cursor seeds on when fresh.
+        // `*` marker (design §5.1) on the drilled level, from the cached
+        // provider result (dynamic) — the current-state row the cursor
+        // seeds on when fresh.
         let active_row_marker = if dynamic {
-            Self::resolve_active_selector(&path_key, &self.dynamic_paths, &rows)
+            let cached_active = self
+                .data_cache
+                .get(&path_key)
+                .and_then(|r| r.active_row.as_deref());
+            Self::resolve_active_selector(cached_active, &rows)
         } else {
             None
         };
@@ -1017,9 +1022,9 @@ mod tests {
     }
 
     #[test]
-    fn active_selector_seeds_cursor_and_marker() {
-        // design §5.1: a dynamic provider's active_selector() becomes the
-        // `*` row, and a fresh drilled level seeds its cursor on it.
+    fn active_row_seeds_cursor_and_marker() {
+        // design §5.1: a dynamic provider's DataResult::active_row becomes
+        // the `*` row, and a fresh drilled level seeds its cursor on it.
         struct Sel {
             rows: Vec<crate::fields::Row>,
             active: String,
@@ -1028,11 +1033,9 @@ mod tests {
             fn fetch(&mut self, _m: &[crate::grammar::ModifierToken]) -> crate::provider::DataResult {
                 crate::provider::DataResult {
                     rows: self.rows.clone(),
+                    active_row: Some(self.active.clone()),
                     ..Default::default()
                 }
-            }
-            fn active_selector(&self) -> Option<String> {
-                Some(self.active.clone())
             }
         }
         let rows = dyn_provider_rows(); // model-a, model-b, model-c

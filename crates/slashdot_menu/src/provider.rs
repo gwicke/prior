@@ -23,6 +23,14 @@ pub struct DataResult {
     pub default_sort: Option<(String, crate::fields::SortDir)>,
     /// Field names not filterable front-end (back-end passthrough).
     pub backend_fields: Vec<String>,
+    /// The id of the row that is *currently active* (design §5.1): the
+    /// real-world current state the menu reflects before any change — the
+    /// active model, the current session, the current tree leaf. The
+    /// provider decides this from its own data source at `fetch` time;
+    /// the engine resolves it to the `*`-marked row per frame and seeds a
+    /// fresh cursor on it. `None` when no row is "currently in effect"
+    /// (e.g. the root command list has none).
+    pub active_row: Option<String>,
 }
 
 /// Outcome of a live-filter fetch.
@@ -37,19 +45,9 @@ pub enum LiveResult {
 /// The two data-fetch kinds (design §8, R8-6).
 pub trait DataProvider {
     /// One-shot fetch: called once per menu open. Rows are cached; the
-    /// interpreter applies front-end filters/sorting.
+    /// interpreter applies front-end filters/sorting. The returned
+    /// [`DataResult::active_row`] names the currently-active row.
     fn fetch(&mut self, modifiers: &[ModifierToken]) -> DataResult;
-
-    /// The id of the row that is *currently active* (design §5.1): the
-    /// real-world current state the menu reflects before any change — the
-    /// active model, the current session, the current tree leaf, the
-    /// current thinking level. The engine resolves it to the `*`-marked
-    /// row per frame; a fresh menu (no sticky cursor) seeds its cursor on
-    /// it. `None` when no row is "currently in effect" (e.g. the root
-    /// command list has none).
-    fn active_selector(&self) -> Option<String> {
-        None
-    }
 
     /// Live-filter fetch: called per level change. `Ok(LiveResult::NotChanged)`
     /// keeps the current view narrowing in place.

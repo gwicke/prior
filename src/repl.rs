@@ -17,6 +17,7 @@ use crate::output::{term_height, term_width, wrap, Output};
 use crate::model_catalog;
 use crate::slash;
 use crate::slash_menu_bridge;
+use crate::slash_menu_bridge::MenuShared;
 use crate::settings::{SettingsStore, SettingKey, SETTINGS};
 use crate::table::{Align, Table};
 use crate::session::{SessionTreeNode, SessionEntry, SessionEntryContent};
@@ -228,6 +229,18 @@ pub struct Repl {
     guard: Arc<TermGuard>,
 }
 
+/// The currently-active model id, from the settings store (the authority).
+/// `provider:model` — the same canonical form rows carry (`qualified()`),
+/// so the model provider's `DataResult::active_row` matches exactly and
+/// the engine marks the `*` row per frame.
+pub fn active_model_id(settings: &crate::settings::SettingsStore) -> Option<String> {
+    if settings.default_model.is_empty() {
+        None
+    } else {
+        Some(settings.default_model.clone())
+    }
+}
+
 /// Result of one `read_input` interaction.
 pub enum InputAction {
     /// Submit a normal prompt (text may be empty when the line was cancelled).
@@ -406,6 +419,24 @@ pub(crate) struct ValueCandidate {
     desc: String,
 }
 
+/// Map a repo `SessionMetadata` listing entry to the lightweight
+/// [`SessionMeta`] used by the menu providers and the `/session` overlay.
+pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMeta {
+    SessionMeta {
+        id: m.id,
+        name: m.name,
+        timestamp: m.timestamp,
+        cwd: m.cwd,
+        parent_session: m.parent_session.map(|p| p.display().to_string()),
+        message_count: m.message_count,
+        user_message_count: m.user_message_count,
+        first_prompt_preview: m.first_prompt_preview,
+        last_prompt_text: m.last_prompt_text,
+        last_prompt_timestamp: m.last_prompt_timestamp,
+        path: Some(m.path),
+    }
+}
+
 // ── Option A: ActiveOverlay enum ───────────────────────────────────────
 
 /// What the caller should do after an overlay handles Enter.
@@ -437,13 +468,13 @@ pub(crate) enum ActiveOverlay {
     },
 
     Model {
-        entries: Vec<model_catalog::ModelEntry>,
         filter: ModelFilter,
-        /// Index of the currently-active model (for the `*` marker).
+        /// Index of the currently-active model (for the `*` marker) —
+        /// the engine's `active_row_marker` (provider-declared).
         active: Option<usize>,
-        /// v2 engine rows (Phase 6 step 4): pre-filtered/sorted by the
-        /// ModelProvider; drives display + Tab/Enter when non-empty.
-        #[allow(dead_code)]
+        /// Step 2: the engine's ranked/queried rows (provider order +
+        /// generic query) — the single source of truth for display +
+        /// Tab/Enter.
         engine_rows: Vec<crate::slashdot_menu::fields::Row>,
         /// Engine-owned view cursor (Phase 6.5): the row Tab/Enter act on.
         cursor: usize,
@@ -626,7 +657,12 @@ impl ActiveOverlay {
         help_view: bool,
         path_completions: &[String],
     ) -> Self {
-        Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &Default::default())
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
+        *shared.recent_models.borrow_mut() = ctx.recent.clone();
+        *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
+        *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
+        Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &shared, &Default::default())
     }
 
     /// Like [`Self::from_buffer`], but seeds the engine-derived overlays
@@ -639,6 +675,7 @@ impl ActiveOverlay {
         settings: &SettingsStore,
         help_view: bool,
         path_completions: &[String],
+        shared: &MenuShared,
         cursors: &slashdot_menu::interpreter::CursorMap,
     ) -> Self {
         if help_view {
@@ -673,7 +710,7 @@ impl ActiveOverlay {
             _ if Self::bare_listing_word(buf) => {
                 // Phase 6.6 uniform listing rule (design §3): a bare
                 // listing command stays in the root list (pinned).
-                return Self::root_list_overlay(ctx, buf, rest, cursors);
+                return Self::root_list_overlay(shared, buf, rest, cursors);
             }
             "model" | "models" | "m" => {
                 let filter = rest.trim().to_string();
@@ -690,53 +727,27 @@ impl ActiveOverlay {
                     // `.name:value` or a free-form `.name:` waiting for the
                     // number): fall through to the model list.
                 }
-                // v2 engine (Phase 6 step 4): dynamic level over the catalog
-                // via ModelProvider; modifiers parse via the engine's grammar
-                // but the provider consumes the legacy ModelFilter (merged
-                // with ctx state) so filter plumbing stays identical.
-                let (search_terms, mut mf) = Repl::parse_model_filter(&filter);
-                // Merge with persisted filter state (v1 behavior).
-                if mf.sort.is_none() { mf.sort = ctx.model_filter.sort.clone(); }
-                if mf.price_input.is_none() { mf.price_input = ctx.model_filter.price_input; }
-                if mf.price_output.is_none() { mf.price_output = ctx.model_filter.price_output; }
-                if mf.price.is_none() { mf.price = ctx.model_filter.price; }
-                if mf.min_coding_index.is_none() { mf.min_coding_index = ctx.model_filter.min_coding_index; }
-                if mf.min_intelligence_index.is_none() { mf.min_intelligence_index = ctx.model_filter.min_intelligence_index; }
-                if mf.min_agentic_index.is_none() { mf.min_agentic_index = ctx.model_filter.min_agentic_index; }
-                if mf.max_age_days.is_none() { mf.max_age_days = ctx.model_filter.max_age_days; }
-                if mf.min_context.is_none() { mf.min_context = ctx.model_filter.min_context; }
-                mf.search_terms = search_terms;
-                // Build the entries via the legacy path (provider plumbing,
-                // recent-boost, active resolution) so behavior is identical;
-                // the engine supplies the ranked view + cursor semantics.
-                let (entries, active) = Repl::model_overlay_entries(ctx, &filter);
-                // Engine view: dynamic level with the ModelProvider; the
-                // active model row feeds the `*` marker via its position.
-                let qualified_active = active
-                    .and_then(|i| entries.get(i))
-                    .map(|e| e.qualified())
-                    .unwrap_or_default();
-                let mut engine = slash_menu_bridge::MenuEngine::for_model(
-                    ctx,
-                    mf.clone(),
-                    qualified_active.clone(),
-                );
+                // Step 2: the engine owns the listing. The ModelProvider
+                // serves the catalog in recency×popularity order (active
+                // model first); the engine's generic query applies fuzzy
+                // terms + any `.sort:`/field modifiers. No v1
+                // model_overlay_entries / filter-merge here anymore.
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 ActiveOverlay::Model {
-                    entries,
-                    active,
-                    filter: mf,
                     engine_rows: st.candidates.clone(),
+                    active: st.active_row_marker,
                     cursor: st.active,
+                    filter: ModelFilter::default_for_coding(),
                 }
             }
             "thinking" | "think" | "t" => {
                 // v2 engine: descriptor tree + rank_and_pin (Phase 6 step 1).
                 // The buffer is "/thinking <terms...>"; the engine's
                 // canonical line strips the leading slash.
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
@@ -752,7 +763,7 @@ impl ActiveOverlay {
                 // v2 engine (Phase 6 step 3): persona is a value child of
                 // the persona node; the engine ranks and pins. `*` marker
                 // from ctx (current persona).
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
@@ -895,7 +906,7 @@ impl ActiveOverlay {
                         }).unwrap_or(false) && !filter.ends_with(' ') && words.len() >= 1
                 };
                 if !is_value_phase {
-                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     engine.restore_cursors(cursors.clone());
                     let st = engine.interpreter.state(&line);
                     if st.candidates.iter().any(|r| {
@@ -987,52 +998,12 @@ impl ActiveOverlay {
                     let current_name = meta.name.clone();
                     ActiveOverlay::SessionAction { session_name, current_name, is_current, header, opts, active, _filter: filter }
                 } else {
-                    // v2 engine list (Phase 6 step 5): SessionProvider rows;
-                    // `*` on the current session (ctx).
-                    let (dir_f, fuzzy_f) = Repl::parse_session_path_filter(&filter);
-                    let cwd_filter = dir_f.as_ref()
-                        .and_then(|d| if d.is_empty() { None } else { Some(std::path::Path::new(d)) });
-                    let all_sessions = if let Some(ref repo) = ctx.repo {
-                        repo.list_sessions_sync(cwd_filter)
-                    } else {
-                        Vec::new()
-                    };
-                    // Reuse the v1 meta mapping + sort (current first, then
-                    // recency) so the engine sees the same ordering.
-                    let mut sessions: Vec<SessionMeta> = all_sessions.into_iter()
-                        .map(|m| SessionMeta {
-                            id: m.id,
-                            name: m.name,
-                            timestamp: m.timestamp,
-                            cwd: m.cwd,
-                            parent_session: m.parent_session.map(|p| p.display().to_string()),
-                            message_count: m.message_count,
-                            user_message_count: m.user_message_count,
-                            first_prompt_preview: m.first_prompt_preview,
-                            last_prompt_text: m.last_prompt_text,
-                            last_prompt_timestamp: m.last_prompt_timestamp,
-                            path: Some(m.path),
-                        })
-                        .collect();
-                    sessions.sort_by(|a, b| {
-                        let a_cur = a.id == ctx.current_session_id;
-                        let b_cur = b.id == ctx.current_session_id;
-                        if a_cur && !b_cur { std::cmp::Ordering::Less }
-                        else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-                        else {
-                            let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                            let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                            b_ts.cmp(a_ts)
-                        }
-                    });
-                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
-                    engine.interpreter = engine.interpreter.with_provider(
-                        &["session"],
-                        Box::new(slash_menu_bridge::SessionProvider {
-                            sessions,
-                            current_id: ctx.current_session_id.clone(),
-                        }),
-                    );
+                    // v2 engine list (Phase 6 step 5): SessionProvider rows
+                    // from shared state; `*` on the current session. Step 2:
+                    // providers attach in `MenuEngine::new(&shared)` — no
+                    // per-arm wiring here.
+                    let (_dir_f, _fuzzy_f) = Repl::parse_session_path_filter(&filter);
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     engine.restore_cursors(cursors.clone());
                     let line = buf.trim_start_matches('/').to_string();
                     let st = engine.interpreter.state(&line);
@@ -1053,11 +1024,7 @@ impl ActiveOverlay {
                         format!("{} · {} {} · {}", name, msgs, dir, ts)
                     }).collect();
                     let names: Vec<String> = st.candidates.iter().map(|r| r.id.clone()).collect();
-                    let active = st
-                        .candidates
-                        .iter()
-                        .position(|r| r.id == ctx.current_session_id);
-                    let _ = fuzzy_f;
+                    let active = st.active_row_marker;
                     ActiveOverlay::Session { opts, names, active, _filter: filter }
                 }
             }
@@ -1214,33 +1181,16 @@ impl ActiveOverlay {
                     &mut targets,
                     &mut active,
                 );
-                // v2 engine view (Phase 6 step 6): flatten through v1 logic
-                // so ordering/labels/indents are identical; the engine
-                // ranks by terms and pins the target ids.
-                let active_path: std::collections::HashSet<String> = ctx
-                    .leaf_id
-                    .as_deref()
-                    .map(|lid| {
-                        let mut p = std::collections::HashSet::new();
-                        collect_active_path(&ctx.tree, lid, &mut p);
-                        p
-                    })
-                    .unwrap_or_default();
-                let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
-                Repl::flatten_tree_nodes(&ctx.tree, 0, ctx.leaf_id.as_deref(), &active_path, &mut flat);
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
-                engine.interpreter = engine.interpreter.with_provider(
-                    &["tree"],
-                    Box::new(slash_menu_bridge::TreeProvider {
-                        entries: flat.clone(),
-                        leaf_id: ctx.leaf_id.clone(),
-                    }),
-                );
+                // v2 engine view (Phase 6 step 6): the TreeProvider reads the shared
+                // flattened-tree mirror; ordering/labels/indents are the
+                // provider's own (v1 flatten logic) and the engine ranks
+                // by terms and pins the target ids. Step 2: providers
+                // attach in `MenuEngine::new(&shared)` — no per-arm wiring.
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(cursors.clone());
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let _ = (&rows, &row_bgs, &targets, &active);
-                let _ = &flat;
                 ActiveOverlay::Tree {
                     rows,
                     row_bgs,
@@ -1251,7 +1201,7 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                Self::root_list_overlay(ctx, buf, rest, cursors)
+                Self::root_list_overlay(shared, buf, rest, cursors)
             }
         }
     }
@@ -1265,12 +1215,12 @@ impl ActiveOverlay {
     /// so the root list shows with it highlighted; only a trailing space or
     /// terms drills into the command's own dialog.
     fn root_list_overlay(
-        ctx: &ReplCtx,
+        shared: &MenuShared,
         buf: &str,
         rest: &str,
         cursors: &slashdot_menu::interpreter::CursorMap,
     ) -> Self {
-        let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+        let mut engine = slash_menu_bridge::MenuEngine::new(shared);
         engine.restore_cursors(cursors.clone());
         let line = buf.trim_start_matches('/').to_string();
         let st = engine.interpreter.state(&line);
@@ -1338,38 +1288,47 @@ impl ActiveOverlay {
                      opts, active, true)
                 }
             }
-            ActiveOverlay::Model { entries, filter: _, active, .. } => {
-                if entries.is_empty() {
+            ActiveOverlay::Model { engine_rows, filter: _, active, .. } => {
+                if engine_rows.is_empty() {
                     return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                             vec!["(loading models... or no matches)".into()],
                             None, false);
                 }
+                // Plain generic table: id + provider fields as cells, with
+                // numbers rendered as-is (no currency prefix, no custom
+                // glyphs). The engine's `render.rs` does the same for
+                // dynamic levels; this only names the visible columns.
+                let cols = &[
+                    ("Model", "id"),
+                    ("Ctx", "context"),
+                    ("Coding", "coding"),
+                    ("Price in", "price_input"),
+                    ("Price out", "price_output"),
+                    ("Reason", "reasoning"),
+                ];
                 let avail = crate::output::term_width().saturating_sub(2);
-                let mut table = Table::new(&["Model", "Ctx", "Coding", "Cost", "?"])
-                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Left])
-                    .with_min_widths(&[12, 5, 6, 14, 3])
-                    .with_priorities(&[3, 1, 1, 2, 1])
+                let mut table = Table::new(&cols.iter().map(|(h, _)| *h).collect::<Vec<_>>())
+                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Right, Align::Right])
+                    .with_min_widths(&[12, 5, 6, 8, 8, 3])
+                    .with_priorities(&[3, 1, 1, 2, 2, 1])
                     .set_gap(2);
-                for e in entries {
-                    table.add_row(&[
-                        e.qualified(),
-                        model_catalog::ctx_cell(e),
-                        model_catalog::coding_index_cell(e),
-                        model_catalog::cost_cell(e),
-                        model_catalog::reason_cell(e),
-                    ]);
+                for r in engine_rows {
+                    let text = |k: &str| -> String {
+                        match r.field_value(k) {
+                            Some(crate::slashdot_menu::value::Value::Num(n)) => n.to_string(),
+                            Some(crate::slashdot_menu::value::Value::Str(s)) => s.clone(),
+                            None => String::new(),
+                        }
+                    };
+                    let mut row: Vec<String> = cols.iter().map(|(_, k)| {
+                        if *k == "id" { r.id.clone() } else { text(k) }
+                    }).collect();
+                    // The id column keeps the full qualified id; the rest
+                    // come straight from the row fields.
+                    let _ = &mut row;
+                    table.add_row(&row);
                 }
-                let rows = table.render_multiline(avail);
-                let opts: Vec<String> = rows.into_iter().enumerate().map(|(i, row)| {
-                    if model_catalog::provider_available(&entries[i].provider) {
-                        row
-                    } else {
-                        row.lines()
-                            .map(|l| format!("\x1b[2m{}\x1b[0m", l))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                }).collect();
+                let opts = table.render_multiline(avail);
                 ("", opts, *active, false)
             }
             ActiveOverlay::Mod { rows, want_value } => {
@@ -1518,7 +1477,15 @@ impl ActiveOverlay {
     fn title(&self) -> String {
         match self {
             ActiveOverlay::Model { filter, .. } => {
-                format!("Models{}", filter.title_suffix())
+                // Step 2: the engine owns filtering; the title carries the
+                // raw typed modifiers (the old ModelFilter title_suffix
+                // summarization is gone with the v1 filter plumbing).
+                let suffix = filter.title_suffix();
+                if suffix.is_empty() {
+                    "Models".to_string()
+                } else {
+                    format!("Models [{}]", suffix)
+                }
             }
             ActiveOverlay::SettingsVal { key, .. } => {
                 let name = crate::settings::SETTINGS
@@ -1545,89 +1512,19 @@ impl ActiveOverlay {
     }
 
     /// Build the engine that backs this overlay's displayed level (Phase
-    /// 6.5): the per-variant provider wiring lives in exactly one place.
-    /// Returns `None` for overlays not backed by the engine (legacy v1
-    /// arms pending migration; they keep the host cursor).
-    pub fn engine_for(&self, ctx: &ReplCtx) -> Option<slash_menu_bridge::MenuEngine> {
+    /// 6.5): providers attach in `MenuEngine::new` from shared state, so
+    /// there is no per-variant wiring here anymore (step 2). Returns
+    /// `None` for overlays not backed by the engine (legacy v1 arms
+    /// pending migration; they keep the host cursor).
+    pub fn engine_for(&self, shared: &MenuShared) -> Option<slash_menu_bridge::MenuEngine> {
         match self {
-            ActiveOverlay::CommandList { .. } => Some(slash_menu_bridge::MenuEngine::new(ctx)),
-            ActiveOverlay::Thinking { .. } => Some(slash_menu_bridge::MenuEngine::new(ctx)),
-            ActiveOverlay::Persona { .. } => Some(slash_menu_bridge::MenuEngine::new(ctx)),
-            ActiveOverlay::Sandbox { sub: None, .. } => Some(slash_menu_bridge::MenuEngine::new(ctx)),
-            ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
-                if engine_rows.is_empty() {
-                    return None;
-                }
-                let (mf, active_id) =
-                    Repl::model_engine_args(ctx, filter, entries, active);
-                Some(slash_menu_bridge::MenuEngine::for_model(ctx, mf, active_id))
-            }
-            ActiveOverlay::Session { .. } => {
-                // SessionProvider rows are built in `from_buffer_cursors`
-                // from the full session list; rebuild here from ctx.
-                let all_sessions = if let Some(ref repo) = ctx.repo {
-                    repo.list_sessions_sync(None)
-                } else {
-                    Vec::new()
-                };
-                let mut sessions: Vec<SessionMeta> = all_sessions.into_iter()
-                    .map(|m| SessionMeta {
-                        id: m.id,
-                        name: m.name,
-                        timestamp: m.timestamp,
-                        cwd: m.cwd,
-                        parent_session: m.parent_session.map(|p| p.display().to_string()),
-                        message_count: m.message_count,
-                        user_message_count: m.user_message_count,
-                        first_prompt_preview: m.first_prompt_preview,
-                        last_prompt_text: m.last_prompt_text,
-                        last_prompt_timestamp: m.last_prompt_timestamp,
-                        path: Some(m.path),
-                    })
-                    .collect();
-                sessions.sort_by(|a, b| {
-                    let a_cur = a.id == ctx.current_session_id;
-                    let b_cur = b.id == ctx.current_session_id;
-                    if a_cur && !b_cur { std::cmp::Ordering::Less }
-                    else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-                    else {
-                        let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                        let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                        b_ts.cmp(a_ts)
-                    }
-                });
-                let mut e = slash_menu_bridge::MenuEngine::new(ctx);
-                e.interpreter = e.interpreter.with_provider(
-                    &["session"],
-                    Box::new(slash_menu_bridge::SessionProvider {
-                        sessions,
-                        current_id: ctx.current_session_id.clone(),
-                    }),
-                );
-                Some(e)
-            }
-            ActiveOverlay::Tree { .. } => {
-                let active_path: std::collections::HashSet<String> = ctx
-                    .leaf_id
-                    .as_deref()
-                    .map(|lid| {
-                        let mut p = std::collections::HashSet::new();
-                        collect_active_path(&ctx.tree, lid, &mut p);
-                        p
-                    })
-                    .unwrap_or_default();
-                let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
-                Repl::flatten_tree_nodes(&ctx.tree, 0, ctx.leaf_id.as_deref(), &active_path, &mut flat);
-                let mut e = slash_menu_bridge::MenuEngine::new(ctx);
-                e.interpreter = e.interpreter.with_provider(
-                    &["tree"],
-                    Box::new(slash_menu_bridge::TreeProvider {
-                        entries: flat,
-                        leaf_id: ctx.leaf_id.clone(),
-                    }),
-                );
-                Some(e)
-            }
+            ActiveOverlay::CommandList { .. }
+            | ActiveOverlay::Thinking { .. }
+            | ActiveOverlay::Persona { .. }
+            | ActiveOverlay::Sandbox { sub: None, .. }
+            | ActiveOverlay::Model { .. }
+            | ActiveOverlay::Session { .. }
+            | ActiveOverlay::Tree { .. } => Some(slash_menu_bridge::MenuEngine::new(shared)),
             _ => None,
         }
     }
@@ -1637,11 +1534,11 @@ impl ActiveOverlay {
     fn engine_seed(
         &self,
         editor: &LineEditor,
-        ctx: &ReplCtx,
+        shared: &MenuShared,
         idx: usize,
         cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) {
-        let Some(mut engine) = self.engine_for(ctx) else {
+        let Some(mut engine) = self.engine_for(shared) else {
             return;
         };
         engine.restore_cursors(std::mem::take(cursors));
@@ -1656,11 +1553,11 @@ impl ActiveOverlay {
     fn engine_arrow(
         &self,
         editor: &LineEditor,
-        ctx: &ReplCtx,
+        shared: &MenuShared,
         delta: isize,
         cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) {
-        let Some(mut engine) = self.engine_for(ctx) else {
+        let Some(mut engine) = self.engine_for(shared) else {
             return;
         };
         engine.restore_cursors(std::mem::take(cursors));
@@ -1678,11 +1575,11 @@ impl ActiveOverlay {
     fn engine_esc(
         &self,
         editor: &mut LineEditor,
-        ctx: &ReplCtx,
+        shared: &MenuShared,
         frames: &mut Vec<slash_menu_bridge::Frame>,
         cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) -> bool {
-        let Some(mut engine) = self.engine_for(ctx) else {
+        let Some(mut engine) = self.engine_for(shared) else {
             return false;
         };
         engine.restore_cursors(std::mem::take(cursors));
@@ -1712,7 +1609,7 @@ impl ActiveOverlay {
         path_completions: &mut Vec<String>,
         completion_pos: &mut Option<(usize, usize)>,
         settings: &SettingsStore,
-        ctx: &ReplCtx,
+        shared: &MenuShared,
         menu_frames: &mut Vec<slash_menu_bridge::Frame>,
         menu_cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) {
@@ -1723,7 +1620,7 @@ impl ActiveOverlay {
                 // `sel` is only a fallback for the first frame.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
@@ -1737,18 +1634,14 @@ impl ActiveOverlay {
                 }
                 let _ = engine_rows;
             }
-            ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
+            ActiveOverlay::Model { engine_rows, .. } => {
                 // v2 engine Tab (Phase 6 step 4): host cursor decides the
-                // row; clear-filter accept semantics (path+id only).
-                // The engine must see the ModelProvider (dynamic rows).
+                // row; clear-filter accept semantics (path+id only). The
+                // engine sees the ModelProvider via `shared` (dynamic rows).
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let (mf, active_id) =
-                        Repl::model_engine_args(ctx, filter, entries, active);
-                    let mut engine = slash_menu_bridge::MenuEngine::for_model(
-                        ctx, mf, active_id,
-                    );
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     engine.restore_cursors(std::mem::take(menu_cursors));
                     let r = engine.step_at(
                         &line,
@@ -1760,9 +1653,6 @@ impl ActiveOverlay {
                     if let Some(b) = r.buffer {
                         editor.set(&format!("/{}", b));
                     }
-                } else if let Some(e) = entries.get(sel) {
-                    let buf = editor.text();
-                    editor.set(&Repl::replace_last_token(&buf, &e.display));
                 }
             }
             ActiveOverlay::Mod { rows, .. } => {
@@ -1782,7 +1672,7 @@ impl ActiveOverlay {
                 // back-navigation.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
@@ -2002,7 +1892,7 @@ impl ActiveOverlay {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     let r = engine.step_at(
                         &line,
                         sel,
@@ -2084,6 +1974,7 @@ impl ActiveOverlay {
         value_error: &mut Option<String>,
         help_view: &mut bool,
         ctx: &ReplCtx,
+        shared: &MenuShared,
         menu_frames: &mut Vec<slash_menu_bridge::Frame>,
         menu_cursors: &mut slashdot_menu::interpreter::CursorMap,
     ) -> OverlayAction {
@@ -2097,7 +1988,7 @@ impl ActiveOverlay {
                 // below once the id is committed.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
@@ -2170,19 +2061,14 @@ impl ActiveOverlay {
                 let _ = engine_rows;
                 OverlayAction::Continue
             }
-ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
+ActiveOverlay::Model { engine_rows, .. } => {
                 // v2 engine Enter (Phase 6 step 4): dynamic row + leaf →
                 // Submit with the canonical line; the host translates to
-                // SetModel. Legacy entries path unchanged. The engine must
-                // see the ModelProvider (dynamic rows).
+                // SetModel. The engine sees the ModelProvider via `shared`.
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let (mf, active_id) =
-                        Repl::model_engine_args(ctx, filter, entries, active);
-                    let mut engine = slash_menu_bridge::MenuEngine::for_model(
-                        ctx, mf, active_id,
-                    );
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     engine.restore_cursors(std::mem::take(menu_cursors));
                     let r = engine.step_at(
                         &line,
@@ -2205,14 +2091,7 @@ ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
                     }
                     return OverlayAction::Continue;
                 }
-                if let Some(e) = entries.get(sel) {
-                    let (provider, model) = e.qualified_parts();
-                    let line = format!("/model {}", e.qualified());
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    OverlayAction::Action(InputAction::SetModel(provider, model))
-                } else {
-                    OverlayAction::Continue
-                }
+                OverlayAction::Continue
             }
             ActiveOverlay::Mod { rows, .. } => {
                 if let Some(c) = rows.get(sel) {
@@ -2227,7 +2106,7 @@ ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
                 // value → SetThinking.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
-                let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                 engine.restore_cursors(std::mem::take(menu_cursors));
                 let r = engine.step_at(
                     &line,
@@ -2500,7 +2379,7 @@ ActiveOverlay::Model { entries, filter, active, engine_rows, .. } => {
                 if !engine_rows.is_empty() {
                     let buf = editor.text();
                     let line = buf.trim_start_matches('/').to_string();
-                    let mut engine = slash_menu_bridge::MenuEngine::new(ctx);
+                    let mut engine = slash_menu_bridge::MenuEngine::new(shared);
                     let r = engine.step_at(
                         &line,
                         sel,
@@ -2776,6 +2655,18 @@ impl Repl {
         initial_row: usize,
         output: &dyn Output,
     ) -> Option<InputAction> {
+        // Step 2 (Phase 6.7): engine providers come from shared live state.
+        // Build a `MenuShared` handle bundle for this activation; it shares
+        // the same SettingsStore the loop / run_interactive mutate, the
+        // session repo, and the current-session/tree sync mirrors.
+        let shared = MenuShared::new(
+            settings.clone(),
+            ctx.repo.clone(),
+        );
+        *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
+        *shared.recent_models.borrow_mut() = ctx.recent.clone();
+        *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
+        *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -2950,7 +2841,7 @@ impl Repl {
             // --- Compute the overlay from the current buffer. ---
             let overlay = ActiveOverlay::from_buffer_cursors(
                 &editor.text(), ctx, settings, help_view, &path_completions,
-                &menu_cursors,
+                &shared, &menu_cursors,
             );
             // Hoisted before the sel-reset so `active` (the menu's
             // default/current-state row) can drive the cursor policy below.
@@ -2977,7 +2868,7 @@ impl Repl {
             // re-derivations (that would yank the cursor as the user types a
             // search term). The action sub-menus seed AND follow `active`.
             let is_tree_list = matches!(overlay, ActiveOverlay::Tree { .. });
-            if overlay.engine_for(ctx).is_some() {
+            if overlay.engine_for(&shared).is_some() {
                 // Phase 6.5: engine-owned cursor — `sel` IS the engine's
                 // cursor row (arrows mutate engine state; Tab/Enter act on
                 // it). The marker `active` (ctx-driven `*`) is separate.
@@ -3148,9 +3039,9 @@ impl Repl {
                                 // Phase 6.5: engine-backed overlays route
                                 // arrows through the engine's cursor; the
                                 // next frame's `sel` re-derives from it.
-                                if overlay.engine_for(ctx).is_some() {
+                                if overlay.engine_for(&shared).is_some() {
                                     let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    overlay.engine_arrow(&editor, ctx, delta, &mut menu_cursors);
+                                    overlay.engine_arrow(&editor, &shared, delta, &mut menu_cursors);
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
@@ -3212,14 +3103,14 @@ impl Repl {
                                 // Phase 6.5: keep the engine cursor in sync
                                 // with host paging on engine-backed overlays
                                 // (they have no tree prev/next to navigate).
-                                if overlay.engine_for(ctx).is_some() {
-                                    overlay.engine_seed(&editor, ctx, sel, &mut menu_cursors);
+                                if overlay.engine_for(&shared).is_some() {
+                                    overlay.engine_seed(&editor, &shared, sel, &mut menu_cursors);
                                 }
                             }
                             KeyCode::Tab => {
                                 overlay.handle_tab(sel, &mut editor,
                                     &mut path_completions, &mut completion_pos,
-                                    settings, ctx, &mut menu_frames, &mut menu_cursors);
+                                    settings, &shared, &mut menu_frames, &mut menu_cursors);
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3238,7 +3129,7 @@ impl Repl {
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
                                         settings, dirty, &mut value_error, &mut help_view,
-                                        ctx, &mut menu_frames, &mut menu_cursors,
+                                        ctx, &shared, &mut menu_frames, &mut menu_cursors,
                                     ) {
                                         OverlayAction::Continue => {}
                                         OverlayAction::Action(action) => return Some(action),
@@ -3251,7 +3142,7 @@ impl Repl {
                                 // ladder (frame replay + esc()); legacy
                                 // overlays keep their bespoke rewrites until
                                 // they migrate.
-                                if !overlay.engine_esc(&mut editor, ctx, &mut menu_frames, &mut menu_cursors) {
+                                if !overlay.engine_esc(&mut editor, &shared, &mut menu_frames, &mut menu_cursors) {
                                     overlay.handle_esc(&mut editor,
                                         &mut path_completions, &mut completion_pos);
                                 }
@@ -3280,7 +3171,7 @@ impl Repl {
                                 let now = editor.text();
                                 if now.starts_with('/') || prev_line.starts_with('/') {
                                     let mut engine =
-                                        slash_menu_bridge::MenuEngine::new(ctx);
+                                        slash_menu_bridge::MenuEngine::new(&shared);
                                     let _ = engine.on_edit(&prev_line, &now, &mut menu_frames);
                                 }
                             }
@@ -4220,31 +4111,7 @@ impl Repl {
         let active = filtered.iter().position(|e| e.id == active_id);
         (filtered, active)
     }
-    
-    /// Merged ModelFilter + the active model's qualified id, for building
-    /// a `MenuEngine::for_model` in the Tab/Enter arms (mirrors the
-    /// display-side provider setup).
-    fn model_engine_args(
-        _ctx: &ReplCtx,
-        filter: &ModelFilter,
-        entries: &[model_catalog::ModelEntry],
-        active: &Option<usize>,
-    ) -> (ModelFilter, String) {
-        // The overlay's filter is already merged with persisted state by
-        // the display path — reuse it as-is.
-        let qualified_active = active
-            .and_then(|i| entries.get(i))
-            .map(|e| e.qualified())
-            .unwrap_or_default();
-        (filter.clone(), qualified_active)
-    }
 
-    fn model_overlay_entries(
-        ctx: &ReplCtx,
-        filter: &str,
-    ) -> (Vec<model_catalog::ModelEntry>, Option<usize>) {
-        Self::model_selection_overlay_entries(ctx, filter, true)
-    }
     /// Build the `/session` overlay rows.
     ///
     /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
@@ -5157,6 +5024,25 @@ impl Repl {
             &mut false, // not inside a user turn yet
             out,
         );
+    }
+
+    /// Flatten the whole session tree for a menu provider (Phase 6.7):
+    /// computes the active path from the leaf and returns the
+    /// `(indent, label, id, on_path, is_current, branch_depth)` tuples
+    /// `TreeProvider` turns into rows.
+    fn flatten_all_tree(ctx: &ReplCtx) -> Vec<(usize, String, String, bool, bool, usize)> {
+        let active_path: std::collections::HashSet<String> = ctx
+            .leaf_id
+            .as_deref()
+            .map(|lid| {
+                let mut p = std::collections::HashSet::new();
+                collect_active_path(&ctx.tree, lid, &mut p);
+                p
+            })
+            .unwrap_or_default();
+        let mut flat: Vec<(usize, String, String, bool, bool, usize)> = Vec::new();
+        Repl::flatten_tree_nodes(&ctx.tree, 0, ctx.leaf_id.as_deref(), &active_path, &mut flat);
+        flat
     }
 
     /// Find the id of the most recent user-role message on the active
@@ -8825,6 +8711,7 @@ mod tests {
             model_filter: ModelFilter::default_for_coding(),
             thinking_level: None,
         };
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8836,6 +8723,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
+            &shared,
             &mut Vec::new(),
             &mut Default::default(),
         );
@@ -8895,6 +8783,7 @@ mod tests {
             model_filter: ModelFilter::default_for_coding(),
             thinking_level: None,
         };
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
         let action = ov.handle_enter(
             sel,
             &mut editor,
@@ -8906,6 +8795,7 @@ mod tests {
             &mut value_error,
             &mut help_view,
             &ctx,
+            &shared,
             &mut Vec::new(),
             &mut Default::default(),
         );
@@ -10262,10 +10152,8 @@ mod model_v2_tests {
     #[test]
     fn model_menu_opens_with_dynamic_rows() {
         match model_ov("/model ") {
-            ActiveOverlay::Model { engine_rows, entries, .. } => {
+            ActiveOverlay::Model { engine_rows, .. } => {
                 assert!(!engine_rows.is_empty(), "engine rows empty");
-                assert_eq!(engine_rows.len(), entries.len(),
-                    "engine rows must mirror the legacy entries");
             }
             other => panic!("expected Model, got disc {:?}", other.overlay_disc()),
         }
@@ -10290,8 +10178,9 @@ mod model_v2_tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
         ov.handle_tab(1, &mut editor, &mut Vec::new(), &mut None,
-            &settings, &ctx, &mut frames, &mut Default::default());
+            &settings, &shared, &mut frames, &mut Default::default());
         let text = editor.text();
         // Row 1 of the engine rows (the list is provider-filtered) must be
         // what Tab commits: `/model <qualified-id>`.
@@ -10326,10 +10215,11 @@ mod model_v2_tests {
         let mut dirty = false;
         let mut value_error: Option<String> = None;
         let mut help_view = false;
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
         let action = ov.handle_enter(
             1, &mut editor, &output, &redraw, &mut input_row,
             &mut settings, &mut dirty, &mut value_error, &mut help_view,
-            &ctx, &mut Vec::new(), &mut Default::default(),
+            &ctx, &shared, &mut Vec::new(), &mut Default::default(),
         );
         match action {
             OverlayAction::Action(InputAction::SetModel(p, m)) => {
