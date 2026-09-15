@@ -544,6 +544,97 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         next
     }
 
+    /// Auto-completion candidates for a trailing dotted token at the current
+    /// level (design §7.1): the generic replacement for the host's
+    /// model-specific `modifier_overlay_entries`/`modifier_value_rows`.
+    ///
+    /// - Bare `.key` → `want_value=false`, listing the level's field names
+    ///   as `.key:` rows (all fields are filterable+sortable per §7.1; no
+    ///   special "sort" field — `sort` completes over all fields too).
+    /// - `.key:value` on a **string** field → `want_value=true`, listing the
+    ///   distinct string values from the provider's cached rows (fuzzy
+    ///   matched against the typed value); these are *suggestions* — any
+    ///   input is valid.
+    /// - `.key:value` on a **number** field → no candidates (free-form);
+    ///   returns an empty row set so the host hands control back to the list.
+    ///
+    /// Returns `(want_value, rows)` where each row is `(display, value)`.
+    pub fn modifier_options(&mut self, line: &str) -> (bool, Vec<(String, String)>) {
+        let st = self.state(line);
+        let path_key = st.node_path.join(" ");
+        let Some(result) = self.data_cache.get(&path_key).cloned() else {
+            // Not a dynamic (provider-backed) level — nothing to complete.
+            return (false, Vec::new());
+        };
+        // The trailing dotted token comes from the *raw prompt* (the part
+        // after the resolved node path). Dotted tokens are parsed into
+        // `lvl.modifiers` by the grammar, so they're not in `st.terms`; the
+        // last whitespace word after the path is the token to complete. A
+        // `.` alone (bare dot) is a Key("").
+        let tail = &line[st.node_path.join(" ").len()..];
+        let last = tail.split_whitespace().next_back().unwrap_or("");
+        let Some(dot) = crate::grammar::parse_dot_token(last) else {
+            return (false, Vec::new());
+        };
+
+        let field_space = self.field_space(&path_key, &result.rows);
+        // All field names (design §7.1: every field is filterable+sortable).
+        let field_names = field_space.names(true);
+        match dot {
+            crate::grammar::DotToken::Key(name) => {
+                // Bare `.name` → list matching field names. Values complete
+                // to `.{field}:` (name + colon, ready for a value).
+                let rows: Vec<(String, String)> = field_names
+                    .iter()
+                    .filter(|f| f.contains(name.as_str()))
+                    .map(|f| {
+                        let v = format!(".{}:", f);
+                        (format!("{} {}", v, f), v)
+                    })
+                    .collect();
+                (false, rows)
+            }
+            crate::grammar::DotToken::NameValue { key, value } => {
+                // `.sort:` special-case: the sort operator's *value* is a
+                // field name (design §7.1) — complete over all fields.
+                if key == "sort" {
+                    let rows: Vec<(String, String)> = field_names
+                        .iter()
+                        .filter(|f| f.contains(value.as_str()))
+                        .map(|f| {
+                            let v = format!(".sort:{}", f);
+                            (format!("{} {}", v, f), v)
+                        })
+                        .collect();
+                    return (true, rows);
+                }
+                // `.field:value` → completion depends on the field's type.
+                let Some(spec) = field_space.spec(&key) else {
+                    return (true, Vec::new());
+                };
+                if spec.is_number {
+                    // Numbers are free-form: no candidates; hand back.
+                    return (true, Vec::new());
+                }
+                // String field: distinct dataset values, fuzzy-matched.
+                let distinct = crate::fields::distinct_values(&result.rows, &key);
+                let rows: Vec<(String, String)> = crate::fuzzy::fuzzy_filter_bonus(
+                    &distinct,
+                    &value,
+                    |s| s.clone(),
+                )
+                .into_iter()
+                .map(|r| {
+                    let full = format!(".{}:{}", key, r.item);
+                    (full.clone(), full)
+                })
+                .collect();
+                (true, rows)
+            }
+        }
+    }
+
+
     /// Tab: complete the active candidate into the buffer.
     ///
     /// Completing a selection adds or replaces the id token, leaving fuzzy
@@ -1161,6 +1252,44 @@ mod tests {
             st3.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             vec!["model-c", "model-a"]
         );
+    }
+
+    /// design §7.1: `modifier_options` is the generic replacement for the
+    /// host's model-specific modifier completion. Bare `.` lists field
+    /// names; `.field:` on a string field lists distinct dataset values;
+    /// number fields and `.sort:` complete over fields (no enum).
+    #[test]
+    fn modifier_options_field_names_and_value_completion() {
+        let mut i = Interpreter::new(dyn_tree()).with_provider(
+            &["model"],
+            Box::new(crate::provider::StaticProvider {
+                result: crate::provider::DataResult {
+                    rows: dyn_provider_rows(), // tier(Str), price(Num)
+                    ..Default::default()
+                },
+            }),
+        );
+        // Bare `.` → all field names, `want_value=false`.
+        let (want_value, rows) = i.modifier_options("model .");
+        assert!(!want_value);
+        let names: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        assert!(names.contains(&".tier:".to_string()), "{:?}", names);
+        assert!(names.contains(&".price:".to_string()), "{:?}", names);
+        // `.tier:` is a string field → distinct dataset values.
+        let (want_value, rows) = i.modifier_options("model .tier:");
+        assert!(want_value);
+        let vals: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        assert!(vals.contains(&".tier:paid".to_string()));
+        assert!(vals.contains(&".tier:free".to_string()));
+        // Number field → no candidates (free-form values).
+        let (_, rows) = i.modifier_options("model .price:");
+        assert!(rows.is_empty(), "number fields offer no completion");
+        // `.sort:` completes over field names.
+        let (want_value, rows) = i.modifier_options("model .sort:");
+        assert!(want_value);
+        let vals: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        assert!(vals.contains(&".sort:tier".to_string()));
+        assert!(vals.contains(&".sort:price".to_string()));
     }
 
     #[test]

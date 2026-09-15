@@ -226,11 +226,16 @@ impl PlanBuilder {
             for r in &state.candidates {
                 let mut cells: Vec<String> = Vec::with_capacity(colnames.len());
                 for k in &colnames {
+                    // Display-string override wins; else render the value
+                    // (design §8.1 "display string" — sort/filter still read
+                    // the underlying value, not this).
                     cells.push(
-                        crate::fields::row_field_value(r, k)
-                            .map(|v| match v {
-                                crate::value::Value::Str(s) => s.clone(),
-                                crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                        r.field_display(k)
+                            .or_else(|| {
+                                crate::fields::row_field_value(r, k).map(|v| match v {
+                                    crate::value::Value::Str(s) => s.clone(),
+                                    crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                                })
                             })
                             .unwrap_or_default(),
                     );

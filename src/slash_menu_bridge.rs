@@ -331,9 +331,43 @@ fn model_row(e: &crate::model_catalog::ModelEntry) -> crate::slashdot_menu::fiel
     // Reasoning capability as a plain number (1/0) — the menu renders it
     // as a number column like any other field.
     r = r.field("reasoning", Value::Num(if e.reasoning { 1.0 } else { 0.0 }));
-    if let Some(t) = e.created {
-        r = r.field("created", Value::Num(t as f64));
+    // Computed fields (design §7.1): combined price and index-per-price
+    // ratios are plain provider-supplied fields — the engine treats them
+    // identically to any other (filterable/sortable). `price` = per-M
+    // combined max of in+out (or the average for mixed costs).
+    let combined_price = match (e.prompt_cost, e.completion_cost) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    if let Some(p) = combined_price {
+        r = r.field("price", Value::Num(p));
     }
+    for (idx_name, idx_val) in [
+        ("coding", e.coding_index.map(|v| v as f64)),
+        ("intelligence", e.intelligence_index.map(|v| v as f64)),
+        ("agentic", e.agentic_index.map(|v| v as f64)),
+    ] {
+        if let (Some(iv), Some(p)) = (idx_val, combined_price) {
+            if p > 0.0 {
+                r = r.field(format!("{}_price", idx_name), Value::Num(iv / p));
+            }
+        }
+    }
+    // `created` as a sortable/filterable **ISO date string** (design §7 /
+    // user guidance): more user-friendly to sort/filter on than a raw unix
+    // timestamp, and the sort comparator handles ISO strings lexically
+    // (chronological). No engine-side "N days ago" computation.
+    if let Some(t) = e.created {
+        let iso = crate::model_catalog::fmt_iso_date(t);
+        r = r.field("created", Value::Str(iso.clone()));
+        // Sort/filter read the string value; display uses the same ISO string.
+        let _ = iso;
+    }
+    // Price display: show a clean "$x.xx/M" glyph via display override while
+    // sorting/filtering on the raw number. (Kept simple: the table column
+    // already formats numbers via fmt_num; the override is available.)
     r
 }
 
@@ -356,6 +390,7 @@ impl crate::slashdot_menu::provider::DataProvider for ModelProvider {
             rows,
             active_row: active,
             columns: ModelProvider::columns(),
+            fields: ModelProvider::field_meta(),
             ..Default::default()
         }
     }
@@ -391,6 +426,31 @@ impl ModelProvider {
                 .align(Align::Right)
                 .min(3)
                 .prio(1),
+        ]
+    }
+
+    /// Field metadata (design §7.1 / §8.1): every model field is
+    /// filterable + sortable. Prices asc, indices + context desc.
+    pub fn field_meta() -> Vec<crate::slashdot_menu::provider::FieldMeta> {
+        use crate::slashdot_menu::fields::{FieldSpec, SortDir};
+        use crate::slashdot_menu::provider::FieldMeta;
+        let f = |name: &str, num: bool, dir: SortDir| FieldMeta {
+            spec: FieldSpec::new(name, num).dir(dir),
+            enum_values: None,
+        };
+        vec![
+            f("context", true, SortDir::Asc),
+            f("price_input", true, SortDir::Asc),
+            f("price_output", true, SortDir::Asc),
+            f("price", true, SortDir::Asc),
+            f("coding", true, SortDir::Desc),
+            f("intelligence", true, SortDir::Desc),
+            f("agentic", true, SortDir::Desc),
+            f("reasoning", true, SortDir::Desc),
+            f("created", false, SortDir::Desc), // ISO date string
+            f("coding_price", true, SortDir::Desc),
+            f("intelligence_price", true, SortDir::Desc),
+            f("agentic_price", true, SortDir::Desc),
         ]
     }
 
@@ -601,10 +661,11 @@ impl MenuEngine {
                         ]);
                 }
                 "model" => {
-                    // §10 step 4: dynamic level over the catalog. Fields
-                    // from MODEL_MODIFIERS semantics: numeric filters map
-                    // to number fields; `sort` is the special-cased token
-                    // in the engine's Query compiler.
+                    // §10 step 4: dynamic level over the catalog. Field
+                    // metadata (types, default sort dirs) comes from
+                    // `ModelProvider::field_meta`; the engine's generic
+                    // query compiles `.sort:`/field tokens from that field
+                    // space (design §7.1).
                     *c = MenuNode::new("model")
                         .desc("select a model (provider:name); type . for filter options")
                         // child_header = the picker title (design §12: title

@@ -739,12 +739,25 @@ impl ActiveOverlay {
                 let filter = rest.trim().to_string();
                 // If the trailing token is a dotted-modifier prefix (starting
                 // with `.`), show the modifier auto-complete overlay instead of
-                // the model list. A bare `.` lists all modifiers.
+                // the model list. A bare `.` lists all fields. Candidates come
+                // from the engine's generic `modifier_options` (design §7.1):
+                // field names for a bare `.key`, distinct string values for
+                // `.field:value`; number fields return none (free-form, fall
+                // through to the list).
                 let last_tok = filter.split_whitespace().last().unwrap_or("");
                 if last_tok.starts_with('.') && !last_tok.starts_with("..") {
-                    let (mod_rows, want_value) = Repl::modifier_overlay_entries(&filter);
-                    if !mod_rows.is_empty() {
-                        return ActiveOverlay::Mod { rows: mod_rows, want_value };
+                    let line = buf.trim_start_matches('/').to_string();
+                    let (want_value, rows) = engine.interpreter.modifier_options(&line);
+                    if !rows.is_empty() {
+                        let cands: Vec<ValueCandidate> = rows
+                            .into_iter()
+                            .map(|(disp, val)| ValueCandidate {
+                                display: disp,
+                                value: val,
+                                desc: String::new(),
+                            })
+                            .collect();
+                        return ActiveOverlay::Mod { rows: cands, want_value };
                     }
                     // No completions → the dotted token is complete (a full
                     // `.name:value` or a free-form `.name:` waiting for the
@@ -3666,103 +3679,6 @@ impl Repl {
         }
     }
 
-    /// Build the dotted-modifier completion rows for `filter`.
-    ///
-    /// `filter` is the buffer text after `/model `. The trailing token decides the
-    /// phase:
-    /// - a bare `.` (or partial `.x`) lists the modifier *names*;
-    /// - `.name:` (or `.name:part`) for an enumerated modifier lists that
-    ///   modifier's fixed *values* (filtered by `part`);
-    /// - `.name:` for a free-form numeric modifier yields no overlay (returns
-    ///   `(row, want_values=false)`) so the list overlay takes over for typing the
-    ///   number.
-    /// Returns `(rows, want_value)`: `want_value` tells the caller the user is
-    /// picking among enumerated values for a single modifier.
-    fn modifier_overlay_entries(filter: &str) -> (Vec<ValueCandidate>, bool) {
-        use crate::model_catalog::MODEL_MODIFIERS;
-
-        let last = filter.split_whitespace().last().unwrap_or("");
-        let Some(inner) = last.strip_prefix('.') else {
-            // No dotted token in the buffer — nothing to complete.
-            return (Vec::new(), false);
-        };
-
-        let (name, has_colon) = match inner.split_once(':') {
-            Some((n, _)) => (n, true),
-            None => (inner, false),
-        };
-
-        if let Some(m) = MODEL_MODIFIERS.iter().find(|m| m.token == name && !name.is_empty()) {
-            if let Some(_choices) = m.choices {
-                // Enumerated modifier: if the user has typed a *complete* value
-                // (`.sort:coding`), nothing more to complete — hand back to the
-                // model list. A bare `.name:` or partial value shows the filtered
-                // value set.
-                let value_query = last.strip_prefix(&format!(".{}:", m.token)).unwrap_or("");
-                if has_colon && !value_query.is_empty() {
-                    let exact = m.choices.unwrap_or_default().iter()
-                        .any(|c| *c == value_query);
-                    if exact {
-                        return (Vec::new(), false);
-                    }
-                }
-                return (Self::modifier_value_rows(m, filter), true);
-            }
-            // Free-form numeric modifier. If the user has typed past the colon
-            // (`.coding:` or `.coding:80`), hand control back to the model list
-            // so they can type the number — nothing more to complete. Only a
-            // bare `.coding` (no colon) shows the single name row as a hint.
-            if !has_colon {
-                let q = format!(".{}:", name);
-                return (vec![ValueCandidate { display: q.clone(), value: q, desc: m.desc.into() }], false);
-            }
-            return (Vec::new(), false);
-        }
-
-        // Unknown/partial name or bare `.`: list modifier names, fuzzy-filtered.
-        let base: Vec<ValueCandidate> = MODEL_MODIFIERS
-            .iter()
-            .map(|m| {
-                let q = format!(".{}:", m.token);
-                ValueCandidate { display: q.clone(), value: q, desc: m.desc.into() }
-            })
-            .collect();
-        if name.is_empty() {
-            (base, false)
-        } else {
-            let rows = crate::fuzzy::fuzzy_filter_bonus(&base, name, |c| c.display.clone())
-                .into_iter()
-                .map(|r| r.item.clone())
-                .collect();
-            (rows, false)
-        }
-    }
-
-    /// Rows for the enumerated values of modifier `m`, filtered by the value
-    /// text the user has typed after `.m:`.
-    fn modifier_value_rows(m: &model_catalog::ModifierSpec, filter: &str) -> Vec<ValueCandidate> {
-        let last = filter.split_whitespace().last().unwrap_or("");
-        let prefix = format!(".{}:", m.token);
-        let value_query = last.strip_prefix(&prefix).unwrap_or("").to_string();
-        let base: Vec<ValueCandidate> = m
-            .choices
-            .unwrap_or_default()
-            .iter()
-            .map(|c| {
-                let v = format!(".{}:{}", m.token, c);
-                ValueCandidate { display: v.clone(), value: v, desc: m.desc.into() }
-            })
-            .collect();
-        if value_query.trim().is_empty() {
-            base
-        } else {
-            crate::fuzzy::fuzzy_filter_bonus(&base, &value_query, |c| c.display.clone())
-                .into_iter()
-                .map(|r| r.item.clone())
-                .collect()
-        }
-    }
-
     /// Replace the last whitespace-delimited token of `s` with `repl`.
     fn replace_last_token(s: &str, repl: &str) -> String {
         if let Some(idx) = s.rfind(' ') {
@@ -6548,69 +6464,6 @@ mod tests {
     }
 
     #[test]
-    fn modifier_overlay_bare_dot_lists_all_names() {
-        let (rows, want_value) = Repl::modifier_overlay_entries(".");
-        assert!(!want_value, "bare dot lists modifier names, not values");
-        let tokens: Vec<&str> = rows.iter().map(|c| c.value.as_str()).collect();
-        assert!(tokens.contains(&".sort:"), "sort present: {:?}", tokens);
-        assert!(tokens.contains(&".price:"), "price present: {:?}", tokens);
-        assert!(tokens.contains(&".context:"), "context present: {:?}", tokens);
-        // Every row is a `.name:` token.
-        assert!(rows.iter().all(|c| c.value.starts_with('.') && c.value.ends_with(':')));
-    }
-
-    #[test]
-    fn modifier_overlay_partial_name_filters() {
-        let (rows, want_value) = Repl::modifier_overlay_entries(".so");
-        assert!(!want_value);
-        // fuzzy matches `.sort:` (and possibly no others) — `so` matches sort.
-        assert!(rows.iter().any(|c| c.value == ".sort:"), "rows: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn modifier_overlay_enum_values_after_colon() {
-        let (rows, want_value) = Repl::modifier_overlay_entries(".sort:");
-        assert!(want_value, "enumerated modifier with colon → value phase");
-        let values: Vec<String> = rows.iter().map(|c| c.value.clone()).collect();
-        assert!(values.contains(&".sort:most-popular".to_string()));
-        assert!(values.contains(&".sort:coding".to_string()));
-        assert!(values.contains(&".sort:price".to_string()));
-    }
-
-    #[test]
-    fn modifier_overlay_enum_values_filtered() {
-        let (rows, want_value) = Repl::modifier_overlay_entries(".sort:pri");
-        assert!(want_value);
-        assert!(!rows.is_empty(), "rows not empty");
-        // Query narrows the enumerated values to the price-related ones.
-        assert!(rows.iter().any(|c| c.value == ".sort:price"));
-        assert!(rows.iter().all(|c| c.value.contains("price")), "values filtered: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
-        // Unrelated options (e.g. created) are filtered out.
-        assert!(!rows.iter().any(|c| c.value == ".sort:created"));
-    }
-
-    #[test]
-    fn modifier_overlay_freeform_after_colon_hands_back() {
-        // `.coding:` is a free-form numeric modifier → no value phase (empty rows).
-        let (rows, want_value) = Repl::modifier_overlay_entries(".coding:");
-        assert_eq!(want_value, false);
-        assert!(rows.is_empty(), "free-form modifier past colon offers nothing: {:?}", rows);
-        // But a bare `.coding` shows the single name as a hint.
-        let (rows, want_value) = Repl::modifier_overlay_entries(".coding");
-        assert!(!want_value);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].value, ".coding:");
-    }
-
-    #[test]
-    fn modifier_overlay_prefix_searches_across_names() {
-        // `.p` fuzzy-matches price_input, price_output, price, and more.
-        let (rows, _) = Repl::modifier_overlay_entries(".p");
-        assert!(!rows.is_empty());
-        assert!(rows.iter().any(|c| c.value == ".price:"));
-    }
-
-    #[test]
     fn parse_model_filter_remains_data_driven() {
         // `.sort:coding` consumed into the filter, not the search terms.
         let (search, f) = Repl::parse_model_filter(".sort:coding");
@@ -6773,7 +6626,10 @@ mod tests {
             ActiveOverlay::Mod { rows, want_value } => {
                 assert!(!want_value, "bare dot => modifier names");
                 assert!(!rows.is_empty());
-                assert!(rows.iter().any(|c| c.value == ".sort:"));
+                // New design §7.1: a bare `.` lists the *field* names (all
+                // sortable/filterable), not the old MODEL_MODIFIERS list.
+                assert!(rows.iter().any(|c| c.value == ".context:"), "rows: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
+                assert!(rows.iter().any(|c| c.value == ".price_input:"));
             }
             other => panic!("expected Mod for '/model .', got disc {:?}", other.overlay_disc()),
         }
@@ -6783,8 +6639,10 @@ mod tests {
     fn from_buffer_model_sort_colon_promotes_to_value_overlay() {
         match model_overlay("/model .sort:") {
             ActiveOverlay::Mod { rows, want_value } => {
-                assert!(want_value, "`.sort:` => enumerated value phase");
-                assert!(rows.iter().any(|c| c.value == ".sort:coding"));
+                assert!(want_value, "`.sort:` => field-name value phase");
+                // `.sort:` completes over all fields (design §7.1).
+                assert!(rows.iter().any(|c| c.value == ".sort:coding"), "rows: {:?}", rows.iter().map(|c| &c.value).collect::<Vec<_>>());
+                assert!(rows.iter().any(|c| c.value == ".sort:context"));
             }
             other => panic!("expected Mod for '/model .sort:', got disc {:?}", other.overlay_disc()),
         }
@@ -6800,12 +6658,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn from_buffer_model_complete_modifier_returns_to_list() {
-        // A fully-specified `.name:value` has nothing left to complete → the
-        // modifier overlay hands back to the list (which the user Enters).
+    async fn from_buffer_model_sort_field_completes_remaining_fields() {
+        // New design §7.1: `.sort:<prefix>` completes over *all* field names.
+        // `coding` is a real sortable field, and `.sort:coding_price` also
+        // contains it, so there are still candidate rows — the overlay
+        // offers them rather than returning to the list.
         match model_overlay("/model .sort:coding"){
-            ActiveOverlay::Model { .. } => {}
-            other => panic!("expected Model for complete '.sort:coding', got disc {:?}", other.overlay_disc()),
+            ActiveOverlay::Mod { rows, want_value } => {
+                assert!(want_value);
+                assert!(rows.iter().any(|c| c.value == ".sort:coding"));
+                assert!(rows.iter().any(|c| c.value == ".sort:coding_price"));
+            }
+            other => panic!("expected Mod for '.sort:coding', got disc {:?}", other.overlay_disc()),
         }
     }
 

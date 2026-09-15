@@ -391,8 +391,15 @@ filtering, completion, and rendering:
 - **Computed fields**: pre-derived numeric/string values supplied by the data
   handler (combined price, index-per-price ratios, age in days, …) so filters
   and sorts never need special-cased names (§7.1).
+- **Display-string override** (per field, optional): a verbatim string used
+  for table display only — ignored by sorting `filtering` and completion,
+  which always read the raw field value. Lets a provider refine presentation
+  (an ISO date, a price glyph) in its own code with compiled performance,
+  with no added engine complexity.
 - `id` (string) and `description` (string) are implicit fields: exact-match
-  filterable, sortable, and always in the fuzzy-search space.
+  filterable, sortable, and always in the fuzzy-search space. All fields are
+  filterable + sortable by default (no special "sort" field — ``.sort:``
+  completes over all fields).
 
 For one-shot fetches, the interpreter runs a **preprocessing pass** once per
 fetch over the cached rows: extraction of distinct dataset-derived string

@@ -557,6 +557,31 @@ host has no per-command menu logic at all.
     fresh-level cursor seeding in `state()`: an explicit typed/pinned
     selection wins over the active-row marker for the seed (previously the
     active marker overrode a pin, breaking `thinking_enter_submits`).
+    **Slice-4 (implemented)**: the host's dotted-modifier completion for
+    `/model` (`Mod` overlay + `modifier_overlay_entries`/`modifier_value_rows`
+    + `MODEL_MODIFIERS`) moved into the generic engine whose §7.1 field
+    logic it now exercises:
+    - `Interpreter::modifier_options(line)` — the generic completion for a
+      trailing dotted token: a bare `.key` lists all field names (all
+      fields filterable+sortable per user guidance — no special "sort"
+      field, but `.sort:` also completes over all field names);
+      `.field:value` on a string field lists distinct dataset values
+      (fuzzy); number fields return no candidates (free-form → hand back
+      to the list).
+    - `Row::display_field` (design §8.1 display-string override): a
+      per-field verbatim display string used for table cells but ignored by
+      sort/filter/completion (which read raw `field_value`). Lets a
+      provider refine display (ISO date, price glyph) with no engine
+      complexity.
+    - `ModelProvider::field_meta()` + computed fields: the model level
+      declares its field specs (types + default sort dirs); `created` is
+      exposed as an ISO date *string* (sortable/filterable, no engine "N
+      days ago"); `price`, `coding_price`, `intelligence_price`,
+      `agentic_price` are plain provider-supplied computed fields.
+    - Removed the host `Mod`-overlay entry path; the model arm calls
+      `engine.interpreter.modifier_options`. `MODEL_MODIFIERS`/
+      `ModifierSpec` remain only for the still-v1 `/set default_model`
+      completion path.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

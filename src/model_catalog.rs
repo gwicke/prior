@@ -430,6 +430,14 @@ pub const MODEL_MODIFIERS: &[ModifierSpec] = &[
 ];
 
 
+pub fn fmt_iso_date(unix_secs: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Utc.timestamp_opt(unix_secs as i64, 0).single() {
+        Some(d) => d.format("%Y-%m-%d").to_string(),
+        None => unix_secs.to_string(),
+    }
+}
+
 /// Apply client-side filters and sorting to the cached catalog.
 /// This is the main entry point for the `/model` overlay.
 pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {

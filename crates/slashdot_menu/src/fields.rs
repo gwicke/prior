@@ -11,8 +11,15 @@ use crate::value::Value;
 pub struct Row {
     pub id: String,
     pub description: Option<String>,
-    /// Explicit fields (string or number values).
+    /// Explicit fields (string or number values). Sorting/filtering reads
+    /// these.
     pub fields: Vec<(String, Value)>,
+    /// Optional per-field display-string overrides (design §8.1 "display
+    /// string"): used verbatim for table display, but **ignored** in sorting
+    /// and filtering (which read `fields`). Lets a provider refine display
+    /// (e.g. an ISO date, a price glyph) without complicating the engine.
+    /// Keys parallel `fields`; absent key ⇒ render the field value itself.
+    pub display: Vec<(String, String)>,
 }
 
 impl Row {
@@ -33,6 +40,14 @@ impl Row {
         self
     }
 
+    /// Attach a display-string override for a field (design §8.1): rendered
+    /// verbatim in tables, ignored by sort/filter. Produces an empty string
+    /// (falls back to the value) if the override is empty/absent.
+    pub fn display_field(mut self, k: impl Into<String>, d: impl Into<String>) -> Self {
+        self.display.push((k.into(), d.into()));
+        self
+    }
+
     /// Explicit field value by name (does not consult implicit fields).
     pub fn field_value(&self, name: &str) -> Option<&Value> {
         self.fields
@@ -40,6 +55,17 @@ impl Row {
             .rev()
             .find(|(k, _)| k == name)
             .map(|(_, v)| v)
+    }
+
+    /// The display string for a field: the provider's `display` override if
+    /// present (non-empty), else the rendered field value.
+    pub fn field_display(&self, name: &str) -> Option<String> {
+        self.display
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, d)| d.clone())
+            .filter(|d| !d.is_empty())
     }
 }
 
@@ -228,5 +254,25 @@ mod tests {
         ]);
         assert_eq!(space.names(true), vec!["id", "description", "price"]);
         assert_eq!(space.names(false).len(), 4);
+    }
+
+    /// display string override (design §8.1): used verbatim for rendering
+    /// but ignored by value access (`row_field_value` / `distinct_values`),
+    /// so sorting/filtering/completion read the raw value.
+    #[test]
+    fn display_field_override_does_not_leak_into_value_access() {
+        let r = Row::new("a")
+            .field("created", crate::value::Value::Str("2024-01-01".into()))
+            .display_field("created", "Jan 1 2024");
+        // Display override present...
+        assert_eq!(r.field_display("created").as_deref(), Some("Jan 1 2024"));
+        // ...but value access (filter/sort/completion) reads the raw value.
+        assert_eq!(
+            row_field_value(&r, "created"),
+            Some(crate::value::Value::Str("2024-01-01".into()))
+        );
+        // Absent override → display falls back to the value.
+        let r2 = Row::new("b").field("created", crate::value::Value::Str("x".into()));
+        assert_eq!(r2.field_display("created"), None);
     }
 }
