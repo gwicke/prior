@@ -244,11 +244,13 @@ overlay:
   id, the current leaf's tree entry id), set from their own live data
   source. The engine resolves the id to a row index in the candidate set
   per frame and renders `*` there.
-- **Enum / static levels**: the same selector notion, from the node
-  descriptor (an active value on the level or value child, e.g.
-  `/thinking`'s currently-set level, `/persona`'s current persona) or from
-  the provider supplying the enum rows. A level with no selector (root
-  command list) renders no `*` anywhere.
+- **Enum / static levels**: the same selector notion — an optional
+  `ActiveProvider` registered on the level's node supplies just the active
+  id (e.g. `/thinking`'s currently-set level, `/persona`'s current persona)
+  from live app state; the engine resolves it against the descriptor-derived
+  rows exactly as `DataResult::active_row` (no host-side per-overlay marker
+  injection). A level with no selector (root command list) renders no `*`
+  anywhere.
 - The engine's `MenuState` exposes `active_row_marker: Option<usize>` (the
   `*` position) separately from `active` (the cursor position). The host
   renders `*` from the first and `>` from the second with no per-variant

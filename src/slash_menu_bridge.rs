@@ -143,6 +143,28 @@ impl MenuShared {
     }
 }
 
+/// Active-state provider over the runtime persona (design §5.1): the
+/// currently-in-effect persona sets the `*` marker on the static `/persona`
+/// value list. Reads the canonical live settings store (`default_persona`),
+/// which both `/set` and the persona picker write through — no host-side
+/// per-overlay marker injection. `None` (or empty) → no row marked.
+pub struct PersonaActiveProvider {
+    pub shared: Rc<MenuShared>,
+}
+
+impl crate::slashdot_menu::provider::ActiveProvider for PersonaActiveProvider {
+    fn active(&mut self) -> Option<String> {
+        let s = self.shared.settings.borrow();
+        let p = s.default_persona.as_deref()?;
+        if p.is_empty() {
+            // Empty persona = the "none" row (explicit clear).
+            Some("none".to_string())
+        } else {
+            Some(p.to_string())
+        }
+    }
+}
+
 /// DataProvider over the session tree entries (§10 step 6): rows from the
 /// shared flattened-tree snapshot, in provider order.
 pub struct TreeProvider {
@@ -418,7 +440,11 @@ impl MenuEngine {
         let interpreter = Interpreter::new(root)
             .with_provider(&["model"], Box::new(ModelProvider { shared: shared_rc.clone() }))
             .with_provider(&["session"], Box::new(SessionProvider { shared: shared_rc.clone() }))
-            .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc }));
+            .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc.clone() }))
+            .with_active_provider(
+                &["persona"],
+                Box::new(PersonaActiveProvider { shared: shared_rc }),
+            );
         MenuEngine {
             interpreter,
             controller,
@@ -472,6 +498,7 @@ impl MenuEngine {
                     vals.push("none".into());
                     *c = MenuNode::new("persona")
                         .desc("set runtime persona")
+                        .child_header("Personas")
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vals))
                         .leaf();
                 }

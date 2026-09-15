@@ -537,6 +537,20 @@ host has no per-command menu logic at all.
     (`cands→SetPersona`, `names`, host `targets`, …) is host-side — porting
     only their render would be throwaway. They follow in 7.3 with their
     accept migration.
+    **Slice-2 (implemented)**: `Persona` migrated to the engine end-to-end
+    like `Model` — accept (Tab/Enter) routes through `engine.step_at`
+    (canonical `persona <id>` → host maps to `SetPersona`, "none" → empty
+    name), and `ActiveOverlay::Persona` carries `plan: RenderPlan`,
+    rendering `plan.paint()` verbatim. The `*` marker is resolved by the
+    engine from a new `PersonaActiveProvider` (design §5.1): the static
+    value-child level registers an [`crate::slashdot_menu::provider::ActiveProvider`]
+    supplying just the active id (from `settings.default_persona`); the
+    engine resolves it against the descriptor rows per frame. This removes
+    the host-side `plan.active = ctx.persona…` injection — one uniform
+    active-state mechanism (same as `DataResult::active_row` for dynamic
+    levels). `thinking` will follow when its current-level source is
+    plumbed into the engine (runtime `config.thinking_level`, not yet on
+    `MenuShared`).
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

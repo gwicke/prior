@@ -97,6 +97,11 @@ pub struct Interpreter {
     data_cache: std::collections::HashMap<String, DataResult>,
     /// Node paths whose dynamic node needs a provider to resolve rows.
     dynamic_paths: std::collections::HashMap<String, Box<dyn DataProvider>>,
+    /// Node paths of static levels with a runtime active-state source
+    /// (`ActiveProvider`, design §5.1): the `*` marker for e.g. the current
+    /// persona / thinking level. Consulted when resolving
+    /// `active_row_marker` for static (descriptor-derived) levels.
+    active_paths: std::collections::HashMap<String, Box<dyn crate::provider::ActiveProvider>>,
     /// Engine-owned view cursor (Phase 6.5): sticky per displayed level,
     /// keyed by node path → (active index, pin at the time it was set).
     /// The stored index survives buffer re-derives (arrow keys move it;
@@ -111,6 +116,7 @@ impl Interpreter {
             root,
             data_cache: Default::default(),
             dynamic_paths: Default::default(),
+            active_paths: Default::default(),
             cursors: Default::default(),
         }
     }
@@ -119,6 +125,22 @@ impl Interpreter {
     /// The node must be marked dynamic via [`MenuNode::dynamic`].
     pub fn with_provider(mut self, path: &[&str], provider: Box<dyn DataProvider>) -> Self {
         self.dynamic_paths
+            .insert(path.join(" "), provider);
+        self
+    }
+
+    /// Register an active-state provider for a static level at `path`
+    /// (design §5.1): the node's rows come from its descriptor children /
+    /// enum value set, but the *currently in-effect* row (the `*` marker)
+    /// is runtime data — e.g. the current persona for `["persona"]`, the
+    /// current thinking level for `["thinking"]`. The engine resolves the
+    /// returned id against the descriptor-derived rows per frame.
+    pub fn with_active_provider(
+        mut self,
+        path: &[&str],
+        provider: Box<dyn crate::provider::ActiveProvider>,
+    ) -> Self {
+        self.active_paths
             .insert(path.join(" "), provider);
         self
     }
@@ -367,20 +389,28 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             .cursors
             .get(&path_key)
             .cloned();
-        // `*` row (design §5.1): resolve the provider's active-row id
-        // (from the cached DataResult) against the ranked candidates.
-        // Dynamic levels use the provider-declared active id; enum/static
-        // value levels resolve a pre-pinned selector below.
+        // `*` row (design §5.1): resolve the active-state source's id
+        // against the ranked candidates — one uniform mechanism. Dynamic
+        // levels use the provider-declared `DataResult::active_row`;
+        // static levels use a registered `ActiveProvider` (current persona /
+        // thinking level); with neither, fall back to a pinned selection
+        // naming the active value (or an enum set carrying a selector).
         let active_row_marker = if node.dynamic {
             let cached_active = self
                 .data_cache
                 .get(&path_key)
                 .and_then(|r| r.active_row.as_deref());
             Self::resolve_active_selector(cached_active, &rank.rows)
+        } else if let Some(active_id) = self
+            .active_paths
+            .get_mut(&path_key)
+            .and_then(|p| p.active())
+        {
+            Self::resolve_active_selector(Some(active_id.as_str()), &rank.rows)
         } else {
-            // Static/level: a pinned selection naming the active value (or
-            // an enum set carrying an active selector) — see §5.1. For
-            // listing levels with no explicit selector, None.
+            // Static/level with no ActiveProvider: a pinned selection naming
+            // the active value (or an enum set carrying an active selector) —
+            // see §5.1. For listing levels with no explicit selector, None.
             selection
                 .as_ref()
                 .and_then(|sel| rank.rows.iter().position(|r| &r.id == sel))
@@ -432,15 +462,23 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         dynamic: bool,
     ) -> MenuState {
         let path_key = path.join(" ");
-        // `*` marker (design §5.1) on the drilled level, from the cached
-        // provider result (dynamic) — the current-state row the cursor
-        // seeds on when fresh.
+        // `*` marker (design §5.1) on the drilled level, resolved uniformly:
+        // dynamic levels use the cached `DataResult::active_row`; static
+        // levels use a registered `ActiveProvider` (current persona / thinking
+        // level). The marker is the current-state row the cursor seeds on
+        // when fresh.
         let active_row_marker = if dynamic {
             let cached_active = self
                 .data_cache
                 .get(&path_key)
                 .and_then(|r| r.active_row.as_deref());
             Self::resolve_active_selector(cached_active, &rows)
+        } else if let Some(active_id) = self
+            .active_paths
+            .get_mut(&path_key)
+            .and_then(|p| p.active())
+        {
+            Self::resolve_active_selector(Some(active_id.as_str()), &rows)
         } else {
             None
         };
@@ -821,6 +859,29 @@ mod tests {
         assert_eq!(st.selection.as_deref(), Some("med"));
         assert_eq!(st.active, 2);
         assert!(st.candidates.iter().any(|r| r.id == "med"));
+    }
+
+    /// A trivial ActiveProvider carrying a fixed active id (test stand-in).
+    struct ConstActive(&'static str);
+
+    impl crate::provider::ActiveProvider for ConstActive {
+        fn active(&mut self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    #[test]
+    fn active_provider_marks_static_level() {
+        // A static (descriptor-derived) level with a registered
+        // ActiveProvider resolves the `*` marker from it (design §5.1),
+        // exactly as a dynamic provider's DataResult::active_row does. No
+        // host-side injection for the current-thinking-level case.
+        let mut i = ix().with_active_provider(&["thinking"], Box::new(ConstActive("med")));
+        let st = i.state("thinking ");
+        assert_eq!(st.level_is_dynamic, false);
+        assert_eq!(st.active_row_marker, Some(2), "active 'med' should be marked");
+        // A fresh cursor seeds on the active row.
+        assert_eq!(st.active, 2);
     }
 
     #[test]

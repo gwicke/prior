@@ -512,12 +512,14 @@ pub(crate) enum ActiveOverlay {
     },
 
     Persona {
-        cands: Vec<ValueCandidate>,
-        _filter: String,
-        /// Index of the currently-active persona (for the `*` marker).
-        active: Option<usize>,
         /// Engine-owned view cursor (Phase 6.5): the row Tab/Enter act on.
         cursor: usize,
+        /// Phase 6.7-5/7.1: the engine render plan — the display source.
+        /// The host paints it verbatim (no bespoke persona table/columns).
+        /// `plan.active` carries the current-persona `*` marker, resolved
+        /// by the engine from the registered `PersonaActiveProvider` (design
+        /// §5.1) — no host-side marker injection.
+        plan: crate::slashdot_menu::render::RenderPlan,
     },
 
     Stat {
@@ -644,6 +646,28 @@ pub(crate) enum ActiveOverlay {
 }
 
 impl ActiveOverlay {
+    /// Decompose an engine [`RenderPlan`] into the legacy `(opts, active)`
+    /// contract for a verbatim plan-painted overlay: one logical option per
+    /// candidate (visual lines joined with `\n`, marker-free text), plus the
+    /// plan's `*` active-marker index. Header lines are excluded from opts
+    /// (they are non-selectable); the caller's paint arm renders them.
+    /// The loop uses the returned opts only for cursor/focus math.
+    fn plan_rows(plan: &crate::slashdot_menu::render::RenderPlan) -> (Vec<String>, Option<usize>) {
+        let mut opts: Vec<String> = Vec::new();
+        for l in &plan.lines {
+            if l.is_header {
+                continue;
+            }
+            if let Some(o) = opts.get_mut(l.option) {
+                o.push('\n');
+                o.push_str(&l.text);
+            } else {
+                opts.push(l.text.clone());
+            }
+        }
+        (opts, plan.active)
+    }
+
     /// Construct the overlay from the current buffer and external state.
     /// (Legacy signature: test convenience; the live loop uses
     /// [`Self::from_buffer_cursors`].)
@@ -755,20 +779,16 @@ impl ActiveOverlay {
             }
             "persona" | "personas" | "p" => {
                 // v2 engine (Phase 6 step 3): persona is a value child of
-                // the persona node; the engine ranks and pins. `*` marker
-                // from ctx (current persona).
+                // the persona node; the engine ranks and pins. 7.1: render
+                // the engine's plan verbatim. The `*` marker (plan.active)
+                // comes from the registered PersonaActiveProvider (design
+                // §5.1) — the engine resolves it per frame; the host does
+                // not inject it here.
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
-                let active = ctx.persona.as_deref().and_then(|p| {
-                    // "none" row carries the empty value.
-                    let name = if p.is_empty() { "none" } else { p };
-                    st.candidates.iter().position(|r| r.id == name)
-                });
-                ActiveOverlay::Persona { cands: st.candidates.iter().map(|r| ValueCandidate {
-                    display: r.id.clone(),
-                    value: if r.id == "none" { String::new() } else { r.id.clone() },
-                    desc: r.description.clone().unwrap_or_default(),
-                }).collect(), _filter: rest.trim().to_string(), active, cursor: st.active }
+                let plan =
+                    engine.render_plan(&line, crate::output::term_width());
+                ActiveOverlay::Persona { cursor: st.active, plan }
             }
             "set" | "s" => {
                 let filter = rest.to_string();
@@ -1292,19 +1312,7 @@ impl ActiveOverlay {
                 // The paint arm below renders the plan verbatim (bypassing
                 // overlay_lines), so the returned title is unused; return ""
                 // to keep the legacy `(&str, …)` contract.
-                let mut opts: Vec<String> = Vec::new();
-                for l in &plan.lines {
-                    if l.is_header {
-                        continue;
-                    }
-                    if let Some(o) = opts.get_mut(l.option) {
-                        o.push('\n');
-                        o.push_str(&l.text);
-                    } else {
-                        opts.push(l.text.clone());
-                    }
-                }
-                let active = plan.active;
+                let (opts, active) = Self::plan_rows(plan);
                 ("", opts, active, false)
             }
             ActiveOverlay::Mod { rows, want_value } => {
@@ -1379,23 +1387,16 @@ impl ActiveOverlay {
                 // Title is set dynamically from the setting name
                 ("", opts, None, false)
             }
-            ActiveOverlay::Persona { cands, active, .. } => {
-                if cands.is_empty() {
+            ActiveOverlay::Persona { plan, .. } => {
+                if plan.lines.is_empty() {
                     return ("Personas  (up/down, Enter select, Esc back)",
                             vec!["(no matching persona)".into()], None, false);
                 }
-                let avail = crate::output::term_width().saturating_sub(2);
-                let mut table = Table::new(&["Persona", "Description"])
-                    .with_aligns(&[Align::Left, Align::Left])
-                    .with_min_widths(&[20, 30])
-                    .with_priorities(&[2, 1])
-                    .set_gap(2);
-                for c in cands {
-                    table.add_row(&[c.display.clone(), c.desc.clone()]);
-                }
-                let opts = table.render_multiline(avail);
-                ("Personas  (up/down, Enter select, Esc back)",
-                 opts, *active, false)
+                // 7.1: paint the engine's plan verbatim (markers/BG from
+                // `plan.active` = current persona). Decompose for cursor/
+                // focus math; the paint arm below restyles from the plan.
+                let (opts, active) = Self::plan_rows(plan);
+                ("", opts, active, false)
             }
             ActiveOverlay::Stat { lines } => {
                 ("Session stats  (Esc clears input to close)",
@@ -1628,16 +1629,22 @@ impl ActiveOverlay {
                     }
                 }
             }
-            ActiveOverlay::Persona { cands, .. } => {
-                if let Some(c) = cands.get(sel) {
-                    let buf = editor.text();
-                    let tok = if c.value.is_empty() {
-                        c.display.clone()
-                    } else {
-                        c.value.clone()
-                    };
-                    editor.set(&Repl::replace_last_token(&buf, &tok));
+            ActiveOverlay::Persona { .. } => {
+                // v2 engine owns the Tab rewrite (7.1). Phase 6.7: engine is
+                // persistent — cursor + frames live inside; `sel` is only a
+                // fallback for the first frame. `tab_at` pins the selected
+                // value id (keeping the /persona prefix via the engine).
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Tab,
+                );
+                if let Some(b) = r.buffer {
+                    editor.set(&format!("/{}", b));
                 }
+                let _ = r.restore_cursor;
             }
             ActiveOverlay::Sandbox { sub, .. } => {
                 let buf = editor.text();
@@ -2046,18 +2053,40 @@ ActiveOverlay::Model { engine_rows, .. } => {
                     _ => OverlayAction::Continue,
                 }
             }
-            ActiveOverlay::Persona { cands, .. } => {
-                if let Some(c) = cands.get(sel) {
-                    let name = if c.value.is_empty() {
-                        c.display.clone()
-                    } else {
-                        c.value.clone()
-                    };
-                    let line = format!("/persona {}", name);
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    OverlayAction::Action(InputAction::SetPersona(name))
-                } else {
-                    OverlayAction::Continue
+            ActiveOverlay::Persona { .. } => {
+                // v2 engine owns the Enter flow (7.1): bare level drills to
+                // the value menu; a pinned value submits the canonical
+                // "persona <name>" line → the host maps it to SetPersona
+                // (the "none" row → empty name ⇒ clear runtime persona).
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Enter,
+                );
+                match r.action {
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
+                    ) => {
+                        editor.set(&format!("/{}", b));
+                        // Cursor restore is not propagated: the caller
+                        // re-derives `sel` when the buffer re-renders.
+                        let _ = r.restore_cursor;
+                        OverlayAction::Continue
+                    }
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
+                    ) => {
+                        // Canonical is "persona <id>"; the "none" value
+                        // child maps to an empty name (clear runtime persona).
+                        let id = canon.split_whitespace().nth(1).unwrap_or("");
+                        let action_name = if id == "none" { String::new() } else { id.to_string() };
+                        let echo = format!("/persona {}", id);
+                        Repl::emit_commit(output, editor, redraw, sel, input_row, &echo, "", false);
+                        OverlayAction::Action(InputAction::SetPersona(action_name))
+                    }
+                    _ => OverlayAction::Continue,
                 }
             }
             ActiveOverlay::Settings { rows, .. } => {
@@ -2847,6 +2876,10 @@ impl Repl {
                     // host adds nothing per-variant here. `render_plan`
                     // built content to `term_width-2`; paint pads each line
                     // to the full terminal width (matching v1 panel).
+                    let paint = plan.paint(crate::output::term_width());
+                    paint.join("\n")
+                }
+                ActiveOverlay::Persona { plan, .. } => {
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
@@ -10017,6 +10050,21 @@ mod model_v2_tests {
         e
     }
 
+    fn test_settings() -> SettingsStore {
+        SettingsStore {
+            default_model: "p:m".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        }
+    }
+
     fn model_ctx() -> ReplCtx {
         ReplCtx {
             provider: "p".into(),
@@ -10135,6 +10183,65 @@ mod model_v2_tests {
             other => {
                 let disc = match other { OverlayAction::Continue => 0, OverlayAction::Action(_) => 1 };
                 panic!("expected SetModel action, got disc {disc}");
+            }
+        }
+    }
+
+    /// 7.1: /persona opens a plan-rendered value list whose `*` marker
+    /// (plan.active) reflects the current persona from the engine's
+    /// PersonaActiveProvider (design §5.1); Enter on the selected value
+    /// submits SetPersona through the engine's accept flow.
+    #[test]
+    fn persona_plan_active_marker_and_enter_flow() {
+        // Marker: with a current persona in the settings store (the active
+        // source), the plan marks it `*` — no host-side injection.
+        let mut settings = test_settings();
+        settings.default_persona = Some("academic".into());
+        let ctx = model_ctx();
+        let ov = ActiveOverlay::from_buffer("/persona ", &ctx, &settings, false, &[]);
+        match &ov {
+            ActiveOverlay::Persona { plan, .. } => {
+                assert_eq!(plan.title.as_deref(), Some("Personas"));
+                let active = plan.active.expect("current persona must be marked");
+                let line = plan.lines.iter().find(|l| l.option == active);
+                assert!(
+                    line.map(|l| l.text.contains("academic")).unwrap_or(false),
+                    "active row should be the current persona"
+                );
+            }
+            other => panic!("expected Persona overlay, got disc {:?}", other.overlay_disc()),
+        }
+
+        // Enter flow: select a row (sel = 0) and confirm it submits
+        // SetPersona with a non-empty name via the engine accept.
+        let ov = ActiveOverlay::from_buffer("/persona ", &ctx, &settings, false, &[]);
+        let mut editor = editor_with("/persona ");
+        let output = NoOutput;
+        let redraw = |_: &LineEditor, _: &[&str], _: usize, _: &mut usize| {};
+        let mut input_row = 0usize;
+        let mut dirty = false;
+        let mut value_error: Option<String> = None;
+        let mut help_view = false;
+        let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
+        let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
+        let action = ov.handle_enter(
+            0, &mut editor, &output, &redraw, &mut input_row,
+            &mut settings, &mut dirty, &mut value_error, &mut help_view,
+            &ctx, &mut engine,
+        );
+        match action {
+            OverlayAction::Action(InputAction::SetPersona(name)) => {
+                assert!(!name.is_empty(), "Selecting a persona must set a name");
+            }
+            OverlayAction::Continue => {
+                // A non-selected first Enter drills (value list); acceptable.
+            }
+            other => {
+                let disc = match other {
+                    OverlayAction::Continue => 0,
+                    OverlayAction::Action(_) => 1,
+                };
+                panic!("unexpected persona enter outcome, disc {disc}");
             }
         }
     }

@@ -91,7 +91,26 @@ pub enum LiveResult {
     NotChanged,
 }
 
-/// The two data-fetch kinds (design §8, R8-6).
+/// Active-state sourcing (design §5.1): the *active* row of a candidate
+/// list comes from a single, uniform engine mechanism — the host never
+/// computes or injects it per overlay.
+///
+/// Data providers carry both the candidate rows and the active state for a
+/// level. For *static* levels (rows come from the descriptor's children /
+/// enum value set — no data provider), only the **active** state varies at
+/// runtime (e.g. `/persona`'s current persona, `/thinking`'s current level).
+/// Those levels register an [`ActiveProvider`] instead: it supplies just the
+/// active id, and the engine resolves it against the descriptor-derived rows
+/// (`child_rows`) exactly as it resolves `DataResult::active_row` for dynamic
+/// levels. (`DataResult::active_row` is the dynamic-level analogue; a level
+/// has either a DataProvider or an ActiveProvider, never both.)
+pub trait ActiveProvider {
+    /// The id of the row that is currently in effect at this level (the
+    /// `*` marker, design §5.1), or `None` when nothing is in effect.
+    fn active(&mut self) -> Option<String>;
+}
+
+/// The two row-fetch kinds for dynamic levels (design §8, R8-6).
 pub trait DataProvider {
     /// One-shot fetch: called once per menu open. Rows are cached; the
     /// interpreter applies front-end filters/sorting. The returned
