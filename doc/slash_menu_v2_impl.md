@@ -592,6 +592,10 @@ host has no per-command menu logic at all.
       a static/dynamic listing, instead of pinning and requiring a second
       Tab. (A completion *inside* an already-drilled value level, e.g.
       `thinking ` → `med`, still pins the value token.)
+    - **`.sort` injected into the `.` auto-complete**: `sort` is really meta
+      (it names a field) but from the user's perspective it is a dot-modifier
+      like any other, so it appears in the bare-`.` field list. The `.sort:`
+      value completion still completes over the *real* fields only.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

@@ -580,7 +580,14 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
 
         let field_space = self.field_space(&path_key, &result.rows);
         // All field names (design §7.1: every field is filterable+sortable).
-        let field_names = field_space.names(true);
+        let real_field_names = field_space.names(true);
+        // `sort` is really meta (it names a field) but from the user's
+        // perspective it is a dot-modifier like any other — inject it into
+        // the field list so the `.` auto-complete shows it too.
+        let mut field_names = real_field_names.clone();
+        if !field_names.iter().any(|f| *f == "sort") {
+            field_names.push("sort");
+        }
         // Exit rule (design §5.1, listing nodes): if a trailing space was
         // added and the space-stripped dotted token is an exact completion
         // (e.g. `.sort:coding `), the auto-complete overlay dismisses and
@@ -610,7 +617,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                 // `.sort:` special-case: the sort operator's *value* is a
                 // field name (design §7.1) — complete over all fields.
                 if key == "sort" {
-                    let rows: Vec<(String, String)> = field_names
+                    let rows: Vec<(String, String)> = real_field_names
                         .iter()
                         .filter(|f| f.contains(value.as_str()))
                         .map(|f| {
@@ -1309,6 +1316,9 @@ mod tests {
         let names: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
         assert!(names.contains(&".tier:".to_string()), "{:?}", names);
         assert!(names.contains(&".price:".to_string()), "{:?}", names);
+        // `.sort` is injected into the field list (it is a dot-modifier to
+        // the user, even though it names a field).
+        assert!(names.contains(&".sort:".to_string()), "{:?}", names);
         // `.tier:` is a string field → distinct dataset values.
         let (want_value, rows) = i.modifier_options("model .tier:");
         assert!(want_value);
