@@ -13,6 +13,7 @@ use crate::slashdot_menu::{
     accept::{AcceptController, AcceptOutcome, LeafInvocation, LeafResult},
     interpreter::{Interpreter, MenuState, OverlayAction},
     node::MenuNode,
+    render::{PlanBuilder, RenderPlan},
     value::Value,
 };
 
@@ -308,12 +309,45 @@ impl crate::slashdot_menu::provider::DataProvider for ModelProvider {
         crate::slashdot_menu::provider::DataResult {
             rows,
             active_row: active,
+            columns: ModelProvider::columns(),
             ..Default::default()
         }
     }
 }
 
 impl ModelProvider {
+    /// Declared display columns for the model table (§8.1 / §6): mirrors the
+    /// v1 `Model` overlay columns (Model/Ctx/Coding/Price in/Price
+    /// out/Reason) so the generic renderer needs no host-side layout. The
+    /// "Model" column shows the implicit row `id`.
+    pub fn columns() -> Vec<crate::slashdot_menu::provider::ColumnDef> {
+        use crate::slashdot_menu::provider::ColumnDef;
+        use crate::slashdot_menu::table::Align;
+        vec![
+            ColumnDef::new("id", "Model").min(12).prio(3),
+            ColumnDef::new("context", "Ctx")
+                .align(Align::Right)
+                .min(5)
+                .prio(1),
+            ColumnDef::new("coding", "Coding")
+                .align(Align::Right)
+                .min(6)
+                .prio(1),
+            ColumnDef::new("price_input", "Price in")
+                .align(Align::Right)
+                .min(8)
+                .prio(2),
+            ColumnDef::new("price_output", "Price out")
+                .align(Align::Right)
+                .min(8)
+                .prio(2),
+            ColumnDef::new("reasoning", "Reason")
+                .align(Align::Right)
+                .min(3)
+                .prio(1),
+        ]
+    }
+
     /// The provider's **default ordering** (design §12): recency ×
     /// popularity, with the active model boosted first. The engine's
     /// generic query applies any explicit `.sort:`/field filter *after*
@@ -727,6 +761,51 @@ impl MenuEngine {
         let cursor = self.interpreter.state(line).active;
         self.step_at(line, cursor, action)
     }
+
+    /// Map a prompt line to the engine's [`RenderPlan`] (design §6): title
+    /// from the descriptor path's child header, per-row derived header
+    /// (R8-4), candidate rows via the table builder + declared column
+    /// defs, and the `>` / `*` row markers resolved from the menu state.
+    /// Phase 6.7-5: the bridge now emits the plan; the host's per-variant
+    /// render arms are the remaining (Phase 7.1) cleanup.
+    pub fn render_plan(&mut self, line: &str, term_width: usize) -> RenderPlan {
+        let st = self.interpreter.state(line);
+        // Walk to the level's node to source its static `child_header`.
+        let mut node = self.interpreter.root.clone();
+        for p in &st.node_path {
+            node = match node.child(p) {
+                Some(c) => c.clone(),
+                None => MenuNode::default(),
+            };
+        }
+        let child_header = node.child_header.clone();
+        PlanBuilder {
+            title: self.level_title(&st),
+            child_header,
+            row_header: None,
+        }
+        .build(&st, term_width)
+    }
+
+    /// Display title for the level the prompt is at: the child-level's
+    /// node `child_header`, else the last path key (or "Commands" at root).
+    fn level_title(&self, st: &MenuState) -> String {
+        let mut node = self.interpreter.root.clone();
+        for p in &st.node_path {
+            node = match node.child(p) {
+                Some(c) => c.clone(),
+                None => return p.clone(),
+            };
+        }
+        node.child_header
+            .clone()
+            .unwrap_or_else(|| {
+                st.node_path
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "Commands".to_string())
+            })
+    }
 }
 
 /// Keys the host forwards to the menu engine.
@@ -1045,6 +1124,30 @@ mod tests {
         assert_eq!(
             act2,
             OverlayAction::Buffer("thinking high".to_string())
+        );
+    }
+
+    /// Phase 6.7-5: the bridge emits a renderable plan for a dynamic
+    /// (model) level — declared columns drive the row layout.
+    #[test]
+    fn model_level_emits_render_plan() {
+        use crate::slashdot_menu::render::RenderPlan;
+        let mut e = MenuEngine::new(&shared());
+        // The provider declares 6 display columns (Model/Ctx/Coding/
+        // Price in/Price out/Reason); the engine surfaces them so the
+        // generic renderer needs no host-side column layout.
+        let st = e.interpreter.state("model ");
+        assert_eq!(st.columns.len(), 6);
+        assert!(st.columns.iter().any(|c| c.header == "Price in"));
+
+        let plan: RenderPlan = e.render_plan("model ", 100);
+        assert!(!plan.lines.is_empty(), "model level has rows");
+        assert_eq!(plan.selected, Some(0));
+        // Paint path: full-width padded rows (title + rows).
+        let painted = plan.paint(100);
+        assert!(
+            painted.iter().all(|l| l.starts_with("\x1b[48;5;")),
+            "every line carries a panel background"
         );
     }
 }

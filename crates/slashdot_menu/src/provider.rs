@@ -2,7 +2,53 @@
 
 use crate::fields::Row;
 use crate::grammar::ModifierToken;
+use crate::table::Align;
 use crate::value::Value;
+
+/// Presentation metadata for one displayed column of a dynamic level
+/// (design §8.1 / §6): which row field each column shows, its header label,
+/// alignment, and table-builder sizing hints. Declared by the provider so
+/// the generic renderer needs no per-command column layout in host code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    /// Row field name to render. Empty/absent means the row `id`.
+    pub field: String,
+    /// Header label shown above the column.
+    pub header: String,
+    pub align: Align,
+    /// Minimum visible width (table shrink floor).
+    pub min_width: usize,
+    /// Shrink priority (higher = kept wider under pressure).
+    pub priority: usize,
+}
+
+impl ColumnDef {
+    /// A default left-aligned column over a row field.
+    pub fn new(field: impl Into<String>, header: impl Into<String>) -> Self {
+        ColumnDef {
+            field: field.into(),
+            header: header.into(),
+            align: Align::Left,
+            min_width: 3,
+            priority: 1,
+        }
+    }
+
+    pub fn align(mut self, a: Align) -> Self {
+        self.align = a;
+        self
+    }
+
+    pub fn min(mut self, w: usize) -> Self {
+        self.min_width = w;
+        self
+    }
+
+    pub fn prio(mut self, p: usize) -> Self {
+        self.priority = p;
+        self
+    }
+}
 
 /// Field metadata for a dynamic level (design §8.1).
 #[derive(Debug, Clone)]
@@ -19,6 +65,9 @@ pub struct DataResult {
     pub rows: Vec<Row>,
     /// Field metadata (specs + optional pre-defined enums).
     pub fields: Vec<FieldMeta>,
+    /// Display columns (presentation hints for the generic renderer).
+    /// Empty ⇒ the renderer falls back to id + description.
+    pub columns: Vec<ColumnDef>,
     /// Default sort direction applied when the prompt has no `.sort:`.
     pub default_sort: Option<(String, crate::fields::SortDir)>,
     /// Field names not filterable front-end (back-end passthrough).

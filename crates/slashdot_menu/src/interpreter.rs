@@ -25,6 +25,10 @@ pub struct MenuState {
     /// Rows/candidates displayed, in display order (ranked by fuzzy match
     /// when terms are present, otherwise node/declaration order).
     pub candidates: Vec<Row>,
+    /// Display columns (presentation hints from the dynamic provider);
+    /// empty ⇒ renderer falls back to id + description. Non-empty only
+    /// for dynamic levels.
+    pub columns: Vec<crate::provider::ColumnDef>,
     /// Index into `candidates` of the active/default row.
     pub active: usize,
     /// A pinned selection existed but fell out of the filtered view
@@ -394,6 +398,11 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             // else the derived pin.
             _ => active_row_marker.unwrap_or(rank.active),
         };
+        let columns = self
+            .data_cache
+            .get(&path_key)
+            .map(|r| r.columns.clone())
+            .unwrap_or_default();
         self.cursors.insert(
             path_key,
             (active, selection.clone(), lvl.terms.clone()),
@@ -405,6 +414,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             selection,
             drill_in: trailing_space && lvl.selection.is_some(),
             candidates: rank.rows,
+            columns,
             active,
             pin_lost: !rank.pinned_survived && lvl.selection.is_some(),
             level_is_dynamic: node.dynamic,
@@ -439,6 +449,11 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             Some((idx, _, _)) => idx.min(rows.len().saturating_sub(1)),
             None => active_row_marker.unwrap_or(0),
         };
+        let columns = self
+            .data_cache
+            .get(&path_key)
+            .map(|r| r.columns.clone())
+            .unwrap_or_default();
         self.cursors
             .insert(path_key, (active, None, String::new()));
         MenuState {
@@ -447,6 +462,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             selection: None,
             drill_in: true,
             candidates: rows,
+            columns,
             active,
             pin_lost: false,
             level_is_dynamic: dynamic,

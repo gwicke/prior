@@ -430,6 +430,14 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    `active_row_marker`; `*` wins per §5.1), interstitial/confirm panels
    as plans. No host-side per-variant titles, headers, marker decisions,
    or column layouts remain for menu overlays.
+   **Implemented**: `DataProvider` gains a `DataResult::columns`
+   (`Vec<ColumnDef>` — field name, header label, alignment, min width,
+   shrink priority), threaded through `MenuState::columns`; the model
+   provider declares its 6 columns; `PlanBuilder::build` renders columns
+   when declared and paints the `*` active row (design §5.1, `*` wins on
+   the shared cursor/active row). The bridge adds
+   `MenuEngine::render_plan(line, width)` producing the plan. Host-side
+   per-variant render arms are now the remaining Phase 7.1 cleanup.
 6. **Tests (persistent-engine contract)**:
    - persistence: a single engine instance stepped through a key sequence
      (drill, arrows, edit, Esc replay, Tab, Enter) maintains cursor map,

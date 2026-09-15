@@ -72,6 +72,10 @@ pub struct RenderPlan {
     pub lines: Vec<RenderLine>,
     /// Index of the cursor-selected logical option.
     pub selected: Option<usize>,
+    /// Index of the current-state ("active") logical option (`*` marker,
+    /// design §5.1), resolved from `MenuState::active_row_marker`. When it
+    /// equals `selected`, `*` wins on the shared row.
+    pub active: Option<usize>,
 }
 
 impl RenderPlan {
@@ -85,32 +89,35 @@ impl RenderPlan {
             out.push(bg_line(title, Style::PANEL.bg));
         }
         for l in &self.lines {
+            let sel = self.selected == Some(l.option);
+            let act = self.active == Some(l.option);
             let bg = if l.is_header {
                 Style::HEADER.bg
-            } else if l.option == self.selected.unwrap_or(usize::MAX) {
+            } else if sel {
                 Style::SELECTED.bg
             } else {
                 Style::PANEL.bg
             };
-            let fg = if l.option == self.selected.unwrap_or(usize::MAX) {
-                Style::SELECTED.fg
+            let fg = if sel { Style::SELECTED.fg } else { "" };
+            // Marker slot: `>` cursor, `*` active; `*` wins when both.
+            let marker = if !l.is_marker_row {
+                "  "
+            } else if l.is_header {
+                "  "
+            } else if act {
+                Marker::Active.as_str()
+            } else if sel {
+                Marker::Cursor.as_str()
             } else {
-                ""
+                "  "
             };
-            let marker = if l.is_marker_row { Marker::Cursor.as_str_placeholder() } else { "  " };
-            let _ = marker;
-            let _ = &l.text;
-            out.push(bg_line(&format!("{}{}", fg, l.text), bg));
+            out.push(bg_line(&format!("{}{}{}", fg, marker, l.text), bg));
         }
         out
     }
 }
 
-impl Marker {
-    fn as_str_placeholder(&self) -> &'static str {
-        self.as_str()
-    }
-}
+
 
 /// Compose a [`RenderPlan`] from menu state parts.
 pub struct PlanBuilder {
@@ -170,30 +177,59 @@ impl PlanBuilder {
 
         // Candidate rows via the table builder when fields are present,
         // otherwise a single column of ids+descriptions.
-        let use_table = state
-            .candidates
-            .first()
-            .map(|r| !r.fields.is_empty())
-            .unwrap_or(false);
+        let use_table = if !state.columns.is_empty() {
+            true
+        } else {
+            state
+                .candidates
+                .first()
+                .map(|r| !r.fields.is_empty())
+                .unwrap_or(false)
+        };
         let row_texts: Vec<String> = if use_table {
-            let field_names: Vec<String> = state.candidates[0]
-                .fields
-                .iter()
-                .map(|(k, _)| k.clone())
-                .collect();
-            let headers: Vec<&str> = std::iter::once("id")
-                .chain(field_names.iter().map(String::as_str))
-                .collect();
-            let aligns = vec![Align::Left; headers.len()];
-            let prios: Vec<usize> = (1..=headers.len()).rev().collect();
+            // Declared columns (provider presentation hints) drive the
+            // layout; fall back to the row's field order + an id "Model"
+            // column when the provider declared none.
+            let colnames: Vec<String> = if state.columns.is_empty() {
+                let mut names = vec!["id".to_string()];
+                names.extend(
+                    state.candidates[0]
+                        .fields
+                        .iter()
+                        .map(|(k, _)| k.clone()),
+                );
+                names
+            } else {
+                state
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        if c.field.is_empty() {
+                            "id".to_string()
+                        } else {
+                            c.field.clone()
+                        }
+                    })
+                    .collect()
+            };
+            let headers: Vec<&str> = if state.columns.is_empty() {
+                colnames.iter().map(String::as_str).collect()
+            } else {
+                state.columns.iter().map(|c| c.header.as_str()).collect()
+            };
             let mut t = Table::new(&headers)
-                .with_aligns(&aligns)
-                .with_priorities(&prios);
+                .set_gap(2);
+            if !state.columns.is_empty() {
+                let aligns: Vec<Align> = state.columns.iter().map(|c| c.align).collect();
+                let mins: Vec<usize> = state.columns.iter().map(|c| c.min_width).collect();
+                let prios: Vec<usize> = state.columns.iter().map(|c| c.priority).collect();
+                t = t.with_aligns(&aligns).with_min_widths(&mins).with_priorities(&prios);
+            }
             for r in &state.candidates {
-                let mut cells: Vec<String> = vec![r.id.clone()];
-                for k in &field_names {
+                let mut cells: Vec<String> = Vec::with_capacity(colnames.len());
+                for k in &colnames {
                     cells.push(
-                        r.field_value(k)
+                        crate::fields::row_field_value(r, k)
                             .map(|v| match v {
                                 crate::value::Value::Str(s) => s.clone(),
                                 crate::value::Value::Num(n) => n.to_string(),
@@ -237,6 +273,7 @@ impl PlanBuilder {
             } else {
                 Some(state.active)
             },
+            active: state.active_row_marker,
         }
     }
 }
@@ -257,6 +294,7 @@ mod tests {
             selection: None,
             drill_in: false,
             candidates: vec![crate::fields::Row::new("a"), crate::fields::Row::new("b")],
+            columns: vec![],
             active: 0,
             pin_lost: false,
             level_is_dynamic: false,
@@ -297,10 +335,61 @@ mod tests {
         };
         let plan = b.build(&empty_state(), 40);
         let lines = plan.paint(40);
-        // title + 2 rows
+        // title + 2 rows (plus a leading marker column on each row)
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("T"));
         assert!(lines[1].contains("a"));
+    }
+
+    #[test]
+    fn declared_columns_drive_layout() {
+        use crate::provider::{ColumnDef, DataResult};
+        use crate::value::Value;
+        let mut st = empty_state();
+        st.candidates[0] = crate::fields::Row::new("a")
+            .field("price", Value::Num(2.5))
+            .field("ctx", Value::Num(1000.0));
+        st.candidates[1] = crate::fields::Row::new("b")
+            .field("price", Value::Num(0.1234))
+            .field("ctx", Value::Num(8000.0));
+        st.columns = vec![
+            ColumnDef::new("id", "Model").min(8).prio(3),
+            ColumnDef::new("price", "$/M")
+                .align(crate::table::Align::Right)
+                .min(4)
+                .prio(2),
+            ColumnDef::new("ctx", "Ctx")
+                .align(crate::table::Align::Right)
+                .min(3)
+                .prio(1),
+        ];
+        st.active_row_marker = Some(1);
+        let b = PlanBuilder {
+            title: "M".into(),
+            child_header: None,
+            row_header: None,
+        };
+        let plan = b.build(&st, 60);
+        // Two logical options; the active (current-state) row is `b`.
+        assert_eq!(plan.selected, Some(0));
+        assert_eq!(plan.active, Some(1));
+        // Active precedence: `*` on the active row when the cursor is off it.
+        let painted = plan.paint(60);
+        let opt_b = painted.iter().find(|l| l.contains('b')).expect("row b present");
+        assert!(opt_b.trim_start_matches("\x1b[48;5;239m").trim_start().starts_with('*') || opt_b.contains("* b"), "active row shows `*`: {opt_b:?}");
+    }
+
+    #[test]
+    fn active_marker_beats_cursor_on_same_row() {
+        let mut st = empty_state();
+        st.candidates = vec![crate::fields::Row::new("x")];
+        st.active = 0;
+        st.active_row_marker = Some(0);
+        let b = PlanBuilder { title: "T".into(), child_header: None, row_header: None };
+        // selected == active → `*` wins (per §5.1).
+        let plan = b.build(&st, 40);
+        let painted = plan.paint(40);
+        assert!(painted.iter().any(|l| l.contains("* x")), "shared row shows `*`, not `>`: {painted:?}");
     }
 
     #[test]
