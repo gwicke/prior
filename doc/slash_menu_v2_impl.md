@@ -475,13 +475,14 @@ step 2.
   `/set default_model` still route through v1 `parse_model_filter` /
   `model_selection_overlay_entries`; migrate them to the same provider
   (only the leaf/handlers differ) and delete the v1 helpers.
-- **Number-cell formatting stopgap**: the `Model` overlay currently
-  hard-codes a 2-decimal round + trailing-zero trim (`format_num_cell` /
-  `trim_trailing_zeros` in `repl.rs`) because the model table is still
-  host-rendered. When 6.7-5 moves rendering into the crate, make number
-  formatting (decimals + padding) configurable in the data spec (a
-  `num_decimals: int` / `zero_pad: bool` on `FieldSpec`, alongside the
-  existing default sort dir) rather than hard-coding in the renderer.
+- **Number-cell formatting stopgap** (resolved in 7.1 slice-1): the
+  `Model` overlay hard-coded a 2-decimal round + trailing-zero trim
+  (`format_num_cell` / `trim_trailing_zeros` in `repl.rs`) because the
+  model table was host-rendered. 7.1 slice-1 moved rendering into the
+  crate: `Value::fmt_num` rounds to 2 + trims; the host helpers are
+  deleted. The *configurable* decimals/padding (`num_decimals` /
+  `zero_pad` on `FieldSpec`) remains a future refinement (noted as
+  TODO on `fmt_num`) but is no longer a correctness stopgap.
 - **`active_row` staleness semantics**: providers set `active_row` once
   per `fetch` (= once per activation, since the engine fetches provider
   data once when a level first opens). Handlers can't change settings
@@ -522,6 +523,20 @@ host has no per-command menu logic at all.
    drops per-activation state (data cache, accept phase) and the sticky
    cursor map / traversal frames reset — matching the reopen semantics
    the old rebuild gave.
+    **Slice-1 (implemented)**: the fully-engine-backed `Model` overlay now
+    renders the engine's `RenderPlan` verbatim — the host `display_rows`
+    model arm, model `Table`/columns, and the `format_num_cell`/
+    `trim_trailing_zeros` stopgap are deleted; `ActiveOverlay::Model`
+    carries `plan: RenderPlan` and the loop paints `plan.paint()` directly.
+    Modeling number/decimals/wrapping moved into the crate (`Value::fmt_num`,
+    `PlanBuilder::build` → `render_multiline` + `fmt_num`). The model's
+    title now comes from the descriptor `child_header` ("Models") via
+    `render_plan`/`level_title` (design §12). Remaining overlay collapse is
+    incremental (per fully-engine-backed command): thinking/persona/session/
+    tree list still render via host `display_rows` because their accept
+    (`cands→SetPersona`, `names`, host `targets`, …) is host-side — porting
+    only their render would be throwaway. They follow in 7.3 with their
+    accept migration.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

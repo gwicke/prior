@@ -230,14 +230,17 @@ impl PlanBuilder {
                         crate::fields::row_field_value(r, k)
                             .map(|v| match v {
                                 crate::value::Value::Str(s) => s.clone(),
-                                crate::value::Value::Num(n) => n.to_string(),
+                                crate::value::Value::Num(n) => crate::value::fmt_num(n),
                             })
                             .unwrap_or_default(),
                     );
                 }
                 t.add_row(&cells);
             }
-            t.render(max_width.saturating_sub(2))
+            // Multi-line cells (long descriptions, model names) wrap; the
+            // host renderer splits logical rows on `\n` so each candidate
+            // stays one selectable option (matches v1's model table).
+            t.render_multiline(max_width.saturating_sub(2))
         } else {
             state
                 .candidates

@@ -48,6 +48,28 @@ impl Value {
     }
 }
 
+/// Format a number for display (design §7 / 6.7-5 follow-up): round to at
+/// most 2 decimals (for per-unit costs like price/token) and trim trailing
+/// zeros so `2.5` never renders as `2.5000000000000000`, while integers keep
+/// an integer digit (`4096000` stays whole). This is the crate-side
+/// replacement for the removed host `format_num_cell`/`trim_trailing_zeros`.
+/// TODO(number-spec): a future `num_decimals`/`zero_pad` on `FieldSpec` will
+/// make decimals configurable; 2 decimals + zero-trim is the default today.
+pub fn fmt_num(n: f64) -> String {
+    if !n.is_finite() {
+        // NaN/inf have no sensible numeric rendering; show the raw token.
+        return n.to_string();
+    }
+    let s = format!("{:.2}", n);
+    // Trim trailing zeros + point, keeping at least an integer digit.
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    if t.is_empty() || t == "-" || t == "-0" {
+        "0".to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 /// A comparison predicate for numeric field filters: `>v`, `<v`, `>=v`, `<=v`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Cmp {
@@ -150,6 +172,16 @@ mod tests {
             Some(FilterValue::Exact(Value::Str("<3.5x".into())))
         );
         assert_eq!(parse_filter_value(">"), None);    }
+
+    #[test]
+    fn fmt_num_rounds_and_trims() {
+        assert_eq!(fmt_num(2.5), "2.5");
+        assert_eq!(fmt_num(10.0), "10");
+        assert_eq!(fmt_num(0.0), "0");
+        assert_eq!(fmt_num(0.1234), "0.12");
+        assert_eq!(fmt_num(1.5), "1.5");
+        assert_eq!(fmt_num(4096000.0), "4096000");
+    }
 
     #[test]
     fn cmp_matches() {

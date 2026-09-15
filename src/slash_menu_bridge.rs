@@ -551,6 +551,9 @@ impl MenuEngine {
                     // in the engine's Query compiler.
                     *c = MenuNode::new("model")
                         .desc("select a model (provider:name); type . for filter options")
+                        // child_header = the picker title (design §12: title
+                        // from the descriptor path's child header).
+                        .child_header("Models")
                         .dynamic()
                         .leaf();
                 }
@@ -779,9 +782,20 @@ impl MenuEngine {
             };
         }
         let child_header = node.child_header.clone();
+        let title = self.level_title(&st);
+        // The title and the child header both come from the node's
+        // `child_header` for a *pinned* level (design §12: title = child
+        // header). Don't render the same text twice; only pass a child
+        // header line when it is distinct from the title (a genuine
+        // subtitle, none exist yet).
+        let subtitle = if child_header.as_deref() == Some(title.as_str()) {
+            None
+        } else {
+            child_header
+        };
         PlanBuilder {
-            title: self.level_title(&st),
-            child_header,
+            title,
+            child_header: subtitle,
             row_header: None,
         }
         .build(&st, term_width)
@@ -1143,6 +1157,13 @@ mod tests {
         let plan: RenderPlan = e.render_plan("model ", 100);
         assert!(!plan.lines.is_empty(), "model level has rows");
         assert_eq!(plan.selected, Some(0));
+        // Title from the descriptor's child header (design §12); the same
+        // text is not duplicated as a subtitle line.
+        assert_eq!(plan.title.as_deref(), Some("Models"));
+        assert!(
+            !plan.lines.iter().any(|l| l.is_header && l.text.contains("Models")),
+            "child_header/subtitle must not duplicate the title"
+        );
         // Paint path: full-width padded rows (title + rows).
         let painted = plan.paint(100);
         assert!(

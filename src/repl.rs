@@ -468,16 +468,14 @@ pub(crate) enum ActiveOverlay {
     },
 
     Model {
-        filter: ModelFilter,
-        /// Index of the currently-active model (for the `*` marker) —
-        /// the engine's `active_row_marker` (provider-declared).
-        active: Option<usize>,
-        /// Step 2: the engine's ranked/queried rows (provider order +
-        /// generic query) — the single source of truth for display +
-        /// Tab/Enter.
+        /// Phase 6.7 step 2: the engine's ranked/queried rows (provider order +
+        /// generic query) — the single source of truth for display + Tab/Enter.
         engine_rows: Vec<crate::slashdot_menu::fields::Row>,
         /// Engine-owned view cursor (Phase 6.5): the row Tab/Enter act on.
         cursor: usize,
+        /// Phase 6.7-5/7.1: the engine render plan — the display source.
+        /// The host paints it verbatim (no bespoke model table/columns emit).
+        plan: crate::slashdot_menu::render::RenderPlan,
     },
 
     /// Dotted-modifier completion for a filter menu (`/model .sort:…`).
@@ -645,30 +643,6 @@ pub(crate) enum ActiveOverlay {
     },
 }
 
-/// Format a numeric menu cell for display. Temporary stopgap for the
-/// `Model` overlay table that is not yet engine-rendered (Phase 6.7-5).
-/// The catalog costs are dollars-per-million with at most two significant
-/// decimals ("2.5", "10.0", "0.0"), so we round to two and trim trailing
-/// zeros rather than emit full `f64` precision. Once the engine owns
-/// rendering (RenderPlan, 6.7-5) this lives in the crate's generic number
-/// formatter and becomes configurable (`num_decimals` / padding).
-fn format_num_cell(n: f64) -> String {
-    format!("{:.2}", n)
-}
-
-/// Trim trailing zeros/point from a fixed-point string ("2.50" → "2.5").
-fn trim_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    let t = s.trim_end_matches('0').trim_end_matches('.');
-    // Keep at least an integer digit before the point (avoid "" from "0.").
-    if t.is_empty() || t == "-" {
-        return "0".to_string();
-    }
-    t.to_string()
-}
-
 impl ActiveOverlay {
     /// Construct the overlay from the current buffer and external state.
     /// (Legacy signature: test convenience; the live loop uses
@@ -757,11 +731,12 @@ impl ActiveOverlay {
                 // applies fuzzy terms + any `.sort:`/field modifiers.
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
+                let plan =
+                    engine.render_plan(&line, crate::output::term_width());
                 ActiveOverlay::Model {
                     engine_rows: st.candidates.clone(),
-                    active: st.active_row_marker,
                     cursor: st.active,
-                    filter: ModelFilter::default_for_coding(),
+                    plan,
                 }
             }
             "thinking" | "think" | "t" => {
@@ -1296,56 +1271,41 @@ impl ActiveOverlay {
                      opts, active, true)
                 }
             }
-            ActiveOverlay::Model { engine_rows, filter: _, active, .. } => {
+            ActiveOverlay::Model { engine_rows, plan, .. } => {
                 if engine_rows.is_empty() {
                     return ("Models  (up/down or PgUp/PgDn, Enter select, Esc back)",
                             vec!["(loading models... or no matches)".into()],
                             None, false);
                 }
-                // Plain generic table: id + provider fields as cells, with
-                // numbers rendered as-is (no currency prefix, no custom
-                // glyphs). The engine's `render.rs` does the same for
-                // dynamic levels; this only names the visible columns.
-                let cols = &[
-                    ("Model", "id"),
-                    ("Ctx", "context"),
-                    ("Coding", "coding"),
-                    ("Price in", "price_input"),
-                    ("Price out", "price_output"),
-                    ("Reason", "reasoning"),
-                ];
-                let avail = crate::output::term_width().saturating_sub(2);
-                let mut table = Table::new(&cols.iter().map(|(h, _)| *h).collect::<Vec<_>>())
-                    .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Right, Align::Right])
-                    .with_min_widths(&[12, 5, 6, 8, 8, 3])
-                    .with_priorities(&[3, 1, 1, 2, 2, 1])
-                    .set_gap(2);
-                for r in engine_rows {
-                    let text = |k: &str| -> String {
-                        match r.field_value(k) {
-                            Some(crate::slashdot_menu::value::Value::Num(n)) => {
-                                // TODO(renderplan): once the engine emits the
-                                // RenderPlan (6.7-5), number rendering moves
-                                // into the crate's table/format layer. Until
-                                // then, hard-code a 2-decimal rounding for
-                                // the per-M cost columns so "2.5" doesn't
-                                // render as "2.5000000000000000".
-                                trim_trailing_zeros(&format_num_cell(*n))
-                            }
-                            Some(crate::slashdot_menu::value::Value::Str(s)) => s.clone(),
-                            None => String::new(),
-                        }
-                    };
-                    let mut row: Vec<String> = cols.iter().map(|(_, k)| {
-                        if *k == "id" { r.id.clone() } else { text(k) }
-                    }).collect();
-                    // The id column keeps the full qualified id; the rest
-                    // come straight from the row fields.
-                    let _ = &mut row;
-                    table.add_row(&row);
+                // Phase 6.7-5/7.1: render the engine's plan verbatim. The
+                // crate's `RenderPlan` owns the model table (declared
+                // columns, number formatting, wrapping); the host no longer
+                // builds a bespoke table/columns/helpers here. Decompose the
+                // plan into the legacy `(title, opts, active, wrap)` contract:
+                //   - opts = one logical row per option (visual lines joined
+                //     with `\n`, marker-free text) so the cursor policy and
+                //     focus math count logical options; the paint arm below
+                //     restyles them with markers/BG from the plan.
+                //   - active = the plan's `*` marker (provider `active_row`).
+                //   - wrap = false (rows are pre-wrapped by the table; `\n`
+                //     separates visual lines of one logical option).
+                // The paint arm below renders the plan verbatim (bypassing
+                // overlay_lines), so the returned title is unused; return ""
+                // to keep the legacy `(&str, …)` contract.
+                let mut opts: Vec<String> = Vec::new();
+                for l in &plan.lines {
+                    if l.is_header {
+                        continue;
+                    }
+                    if let Some(o) = opts.get_mut(l.option) {
+                        o.push('\n');
+                        o.push_str(&l.text);
+                    } else {
+                        opts.push(l.text.clone());
+                    }
                 }
-                let opts = table.render_multiline(avail);
-                ("", opts, *active, false)
+                let active = plan.active;
+                ("", opts, active, false)
             }
             ActiveOverlay::Mod { rows, want_value } => {
                 if rows.is_empty() {
@@ -1492,16 +1452,13 @@ impl ActiveOverlay {
 
     fn title(&self) -> String {
         match self {
-            ActiveOverlay::Model { filter, .. } => {
-                // Step 2: the engine owns filtering; the title carries the
-                // raw typed modifiers (the old ModelFilter title_suffix
-                // summarization is gone with the v1 filter plumbing).
-                let suffix = filter.title_suffix();
-                if suffix.is_empty() {
-                    "Models".to_string()
-                } else {
-                    format!("Models [{}]", suffix)
-                }
+            ActiveOverlay::Model { plan, .. } => {
+                // Step 2: the engine owns filtering; the overlay renders the
+                // engine's plan verbatim (7.1), whose title carries the
+                // descriptor path label. The modifier-summary suffix
+                // (`sort:coding`, `price≤0.5`) is not rendered until the
+                // engine exposes parsed per-level modifiers (follow-up doc).
+                plan.title.clone().unwrap_or_default()
             }
             ActiveOverlay::SettingsVal { key, .. } => {
                 let name = crate::settings::SETTINGS
@@ -2882,6 +2839,16 @@ impl Repl {
                     // No `*` marker on the root command list (no current
                     // state there) — the engine active only seeds `sel`.
                     Self::overlay_lines(effective_title, &opts, None, sel, None, wrap)
+                }
+                ActiveOverlay::Model { plan, .. } => {
+                    // Paint the engine's plan verbatim (7.1): title (if any)
+                    // + marked/BG-styled rows with the `>` / `*` markers
+                    // resolved from the plan's own `selected`/`active`. The
+                    // host adds nothing per-variant here. `render_plan`
+                    // built content to `term_width-2`; paint pads each line
+                    // to the full terminal width (matching v1 panel).
+                    let paint = plan.paint(crate::output::term_width());
+                    paint.join("\n")
                 }
                 _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
@@ -6443,16 +6410,6 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- number-cell formatting stopgap (Phase 6.7-5 follow-up) ---
-    #[test]
-    fn number_cell_rounds_and_trims() {
-        assert_eq!(trim_trailing_zeros(&format_num_cell(2.5)), "2.5");
-        assert_eq!(trim_trailing_zeros(&format_num_cell(10.0)), "10");
-        assert_eq!(trim_trailing_zeros(&format_num_cell(0.0)), "0");
-        assert_eq!(trim_trailing_zeros(&format_num_cell(0.1234)), "0.12");
-        assert_eq!(trim_trailing_zeros(&format_num_cell(1.5)), "1.5");
-    }
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
     #[test]
