@@ -1210,19 +1210,24 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                // Generic engine-backed fallthrough (Phase 7.1): a bare
-                // command stays in the root list (pinned); a trailing-space
-                // drill into any node (listing *or* pure leaf) renders the
-                // engine's plan — candidate rows for listings, the
-                // detail/help panel for leaves like `/replay ` (the
-                // registered DetailProvider feeds `plan.detail`). No
-                // per-command host overlay.
-                if !buf.ends_with(' ') {
+                // Generic engine-backed fallthrough (Phase 7.1). Decide
+                // from the engine's *resolved state*, not the raw buffer:
+                // a leading prefix that the interpreter walked into a
+                // command level (node_path non-empty) must stay there —
+                // `/replay 5` (leaf + parameter), `/some long path with
+                // an_arg`, etc. — never fall back to the root fuzzy list.
+                // Only a genuinely bare/unresolved level (root, or a
+                // single token pinned at the root) shows the command list.
+                let line = buf.trim_start_matches('/').to_string();
+                let st = engine.interpreter.state(&line);
+                if st.node_path.is_empty() {
                     return Self::root_list_overlay(engine, buf, rest);
                 }
-                let line = buf.trim_start_matches('/').to_string();
+                // Inside a command: render the engine's plan — candidate
+                // rows for listings; the detail/help panel for a leaf
+                // (the registered DetailProvider feeds `plan.detail`).
+                // No per-command host overlay.
                 let detail = engine.detail_for(&line).unwrap_or_default();
-                let st = engine.interpreter.state(&line);
                 let plan =
                     engine.render_plan(&line, crate::output::term_width(), detail);
                 ActiveOverlay::Menu { cursor: st.active, plan }
@@ -6849,6 +6854,22 @@ mod tests {
             }
             other => panic!(
                 "expected generic Menu for '/replay ', got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+        // `/replay 5` (leaf + parameter, no trailing space): the engine
+        // has already walked into the /replay level — the menu must stay
+        // there (help still visible), never fall back to the root fuzzy
+        // list with "no matching command".
+        match model_overlay("/replay 5") {
+            ActiveOverlay::Menu { plan, .. } => {
+                assert!(
+                    !plan.detail.is_empty(),
+                    "/replay <param> keeps the help detail in view"
+                );
+            }
+            other => panic!(
+                "expected generic Menu for '/replay 5' (leaf+param), got disc {:?}",
                 other.overlay_disc()
             ),
         }
