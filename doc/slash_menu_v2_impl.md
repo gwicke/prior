@@ -595,7 +595,13 @@ host has no per-command menu logic at all.
     - **`.sort` injected into the `.` auto-complete**: `sort` is really meta
       (it names a field) but from the user's perspective it is a dot-modifier
       like any other, so it appears in the bare-`.` field list. The `.sort:`
-      value completion still completes over the *real* fields only.
+      value completion still completes over the *real* fields only. The API is
+      `Interpreter::field_options` (these are all field options).
+    - **Description column**: the `.` / `.sort:` auto-complete Description
+      column shows the field's `FieldSpec::description` when the provider
+      supplies one (the model provider reuses `MODEL_MODIFIERS` desc text),
+      else its type (`string`/`number`). It never repeats the field/display
+      text.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

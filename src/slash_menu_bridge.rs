@@ -430,12 +430,22 @@ impl ModelProvider {
     }
 
     /// Field metadata (design §7.1 / §8.1): every model field is
-    /// filterable + sortable. Prices asc, indices + context desc.
+    /// filterable + sortable. Prices asc, indices + context desc. The
+    /// description (shown in the `.` / `.sort:` auto-complete Description
+    /// column) comes from the `MODEL_MODIFIERS` table, which is the
+    /// canonical description source.
     pub fn field_meta() -> Vec<crate::slashdot_menu::provider::FieldMeta> {
         use crate::slashdot_menu::fields::{FieldSpec, SortDir};
         use crate::slashdot_menu::provider::FieldMeta;
+        // Description from MODEL_MODIFIERS (token -> desc).
+        let desc_of = |name: &str| -> Option<&'static str> {
+            crate::model_catalog::MODEL_MODIFIERS
+                .iter()
+                .find(|m| m.token == name)
+                .map(|m| m.desc)
+        };
         let f = |name: &str, num: bool, dir: SortDir| FieldMeta {
-            spec: FieldSpec::new(name, num).dir(dir),
+            spec: FieldSpec::new(name, num).dir(dir).description(desc_of(name).unwrap_or("")),
             enum_values: None,
         };
         vec![

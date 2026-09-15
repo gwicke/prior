@@ -747,14 +747,14 @@ impl ActiveOverlay {
                 let last_tok = filter.split_whitespace().last().unwrap_or("");
                 if last_tok.starts_with('.') && !last_tok.starts_with("..") {
                     let line = buf.trim_start_matches('/').to_string();
-                    let (want_value, rows) = engine.interpreter.modifier_options(&line);
+                    let (want_value, rows) = engine.interpreter.field_options(&line);
                     if !rows.is_empty() {
                         let cands: Vec<ValueCandidate> = rows
                             .into_iter()
-                            .map(|(disp, val)| ValueCandidate {
+                            .map(|(disp, val, desc)| ValueCandidate {
                                 display: disp,
                                 value: val,
-                                desc: String::new(),
+                                desc,
                             })
                             .collect();
                         return ActiveOverlay::Mod { rows: cands, want_value };

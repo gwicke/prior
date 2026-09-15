@@ -546,11 +546,13 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
 
     /// Auto-completion candidates for a trailing dotted token at the current
     /// level (design §7.1): the generic replacement for the host's
-    /// model-specific `modifier_overlay_entries`/`modifier_value_rows`.
+    /// model-specific modifier completion. These are all **field options** —
+    /// `.field` filters, `.sort` (over all fields), and string-value picks
+    /// — so the API is `field_options`.
     ///
     /// - Bare `.key` → `want_value=false`, listing the level's field names
-    ///   as `.key:` rows (all fields are filterable+sortable per §7.1; no
-    ///   special "sort" field — `sort` completes over all fields too).
+    ///   as `.key:` rows (all fields are filterable+sortable per §7.1;
+    ///   `sort` is injected so it appears as a dot-modifier too).
     /// - `.key:value` on a **string** field → `want_value=true`, listing the
     ///   distinct string values from the provider's cached rows (fuzzy
     ///   matched against the typed value); these are *suggestions* — any
@@ -558,8 +560,11 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
     /// - `.key:value` on a **number** field → no candidates (free-form);
     ///   returns an empty row set so the host hands control back to the list.
     ///
-    /// Returns `(want_value, rows)` where each row is `(display, value)`.
-    pub fn modifier_options(&mut self, line: &str) -> (bool, Vec<(String, String)>) {
+    /// Returns `(want_value, rows)` where each row is
+    /// `(display, value, description)`. The description is the field's
+    /// `FieldSpec::description` when set, else its type (`string`/`number`);
+    /// it never repeats the field/display string.
+    pub fn field_options(&mut self, line: &str) -> (bool, Vec<(String, String, String)>) {
         let st = self.state(line);
         let path_key = st.node_path.join(" ");
         let Some(result) = self.data_cache.get(&path_key).cloned() else {
@@ -592,19 +597,37 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
         // added and the space-stripped dotted token is an exact completion
         // (e.g. `.sort:coding `), the auto-complete overlay dismisses and
         // control returns to the list — there is nothing left to complete.
-        let is_exact = |rows: &[(String, String)]| {
-            trailing_space && rows.iter().any(|(_, v)| v == last)
+        // Field description for the Description column: the provider's
+        // `FieldSpec::description` when set, else the type
+        // (`string`/`number`). Never repeats the field name.
+        let field_desc = |name: &str| -> String {
+            field_space
+                .spec(name)
+                .and_then(|s| s.description.clone())
+                .unwrap_or_else(|| {
+                    field_space
+                        .spec(name)
+                        .map(|s| if s.is_number { "number" } else { "string" }.to_string())
+                        .unwrap_or_default()
+                })
+        };
+        // Exit rule (design §5.1, listing nodes): if a trailing space was
+        // added and the space-stripped dotted token is an exact completion
+        // (e.g. `.sort:coding `), the auto-complete overlay dismisses and
+        // control returns to the list — there is nothing left to complete.
+        let is_exact = |rows: &[(String, String, String)]| {
+            trailing_space && rows.iter().any(|(_, v, _)| v == last)
         };
         match dot {
             crate::grammar::DotToken::Key(name) => {
                 // Bare `.name` → list matching field names. Values complete
                 // to `.{field}:` (name + colon, ready for a value).
-                let rows: Vec<(String, String)> = field_names
+                let rows: Vec<(String, String, String)> = field_names
                     .iter()
                     .filter(|f| f.contains(name.as_str()))
                     .map(|f| {
                         let v = format!(".{}:", f);
-                        (format!("{} {}", v, f), v)
+                        (format!("{} {}", v, f), v, field_desc(f))
                     })
                     .collect();
                 if is_exact(&rows) {
@@ -617,12 +640,12 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                 // `.sort:` special-case: the sort operator's *value* is a
                 // field name (design §7.1) — complete over all fields.
                 if key == "sort" {
-                    let rows: Vec<(String, String)> = real_field_names
+                    let rows: Vec<(String, String, String)> = real_field_names
                         .iter()
                         .filter(|f| f.contains(value.as_str()))
                         .map(|f| {
                             let v = format!(".sort:{}", f);
-                            (format!("{} {}", v, f), v)
+                            (format!("{} {}", v, f), v, field_desc(f))
                         })
                         .collect();
                     if is_exact(&rows) {
@@ -640,7 +663,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                 }
                 // String field: distinct dataset values, fuzzy-matched.
                 let distinct = crate::fields::distinct_values(&result.rows, &key);
-                let rows: Vec<(String, String)> = crate::fuzzy::fuzzy_filter_bonus(
+                let rows: Vec<(String, String, String)> = crate::fuzzy::fuzzy_filter_bonus(
                     &distinct,
                     &value,
                     |s| s.clone(),
@@ -648,7 +671,9 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
                 .into_iter()
                 .map(|r| {
                     let full = format!(".{}:{}", key, r.item);
-                    (full.clone(), full)
+                    // String values: describe with the field's type (the
+                    // value isn't repeated); the value itself is the option.
+                    (full.clone(), full, "string".to_string())
                 })
                 .collect();
                 if is_exact(&rows) {
@@ -1299,8 +1324,9 @@ mod tests {
     /// host's model-specific modifier completion. Bare `.` lists field
     /// names; `.field:` on a string field lists distinct dataset values;
     /// number fields and `.sort:` complete over fields (no enum).
+    /// Descriptions show the type/provider text, never the field name.
     #[test]
-    fn modifier_options_field_names_and_value_completion() {
+    fn field_options_field_names_and_value_completion() {
         let mut i = Interpreter::new(dyn_tree()).with_provider(
             &["model"],
             Box::new(crate::provider::StaticProvider {
@@ -1311,27 +1337,33 @@ mod tests {
             }),
         );
         // Bare `.` → all field names, `want_value=false`.
-        let (want_value, rows) = i.modifier_options("model .");
+        let (want_value, rows) = i.field_options("model .");
         assert!(!want_value);
-        let names: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        let names: Vec<String> = rows.iter().map(|(_, v, _)| v.clone()).collect();
         assert!(names.contains(&".tier:".to_string()), "{:?}", names);
         assert!(names.contains(&".price:".to_string()), "{:?}", names);
         // `.sort` is injected into the field list (it is a dot-modifier to
         // the user, even though it names a field).
         assert!(names.contains(&".sort:".to_string()), "{:?}", names);
+        // String fields describe as "string"; number fields as "number".
+        let (_, rows) = i.field_options("model .");
+        let tier_desc = rows.iter().find(|(d, v, _)| v == ".tier:").map(|(_, _, d)| d.clone());
+        assert_eq!(tier_desc.as_deref(), Some("string"));
+        let price_desc = rows.iter().find(|(d, v, _)| v == ".price:").map(|(_, _, d)| d.clone());
+        assert_eq!(price_desc.as_deref(), Some("number"));
         // `.tier:` is a string field → distinct dataset values.
-        let (want_value, rows) = i.modifier_options("model .tier:");
+        let (want_value, rows) = i.field_options("model .tier:");
         assert!(want_value);
-        let vals: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        let vals: Vec<String> = rows.iter().map(|(_, v, _)| v.clone()).collect();
         assert!(vals.contains(&".tier:paid".to_string()));
         assert!(vals.contains(&".tier:free".to_string()));
         // Number field → no candidates (free-form values).
-        let (_, rows) = i.modifier_options("model .price:");
+        let (_, rows) = i.field_options("model .price:");
         assert!(rows.is_empty(), "number fields offer no completion");
         // `.sort:` completes over field names.
-        let (want_value, rows) = i.modifier_options("model .sort:");
+        let (want_value, rows) = i.field_options("model .sort:");
         assert!(want_value);
-        let vals: Vec<String> = rows.iter().map(|(_, v)| v.clone()).collect();
+        let vals: Vec<String> = rows.iter().map(|(_, v, _)| v.clone()).collect();
         assert!(vals.contains(&".sort:tier".to_string()));
         assert!(vals.contains(&".sort:price".to_string()));
     }
@@ -1340,7 +1372,7 @@ mod tests {
     /// completion dismisses the auto-complete overlay (nothing left to
     /// complete) so the filter/sort applies and control returns to the list.
     #[test]
-    fn modifier_options_exits_on_trailing_space_exact_match() {
+    fn field_options_exits_on_trailing_space_exact_match() {
         let mut i = Interpreter::new(dyn_tree()).with_provider(
             &["model"],
             Box::new(crate::provider::StaticProvider {
@@ -1351,13 +1383,13 @@ mod tests {
             }),
         );
         // `.tier:paid ` (complete 'paid' + trailing space) → exit (empty).
-        let (_, rows) = i.modifier_options("model .tier:paid ");
+        let (_, rows) = i.field_options("model .tier:paid ");
         assert!(rows.is_empty(), "exact value + space dismisses: {:?}", rows);
         // `.sort:price ` (complete field + trailing space) → exit.
-        let (_, rows) = i.modifier_options("model .sort:price ");
+        let (_, rows) = i.field_options("model .sort:price ");
         assert!(rows.is_empty(), "exact sort field + space dismisses: {:?}", rows);
         // Without the trailing space, the partial still offers completion.
-        let (_, rows) = i.modifier_options("model .sort:p");
+        let (_, rows) = i.field_options("model .sort:p");
         assert!(!rows.is_empty(), "partial still completes: {:?}", rows);
     }
 

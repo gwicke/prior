@@ -82,6 +82,11 @@ pub struct FieldSpec {
     /// Sort direction when `.sort:field` has no explicit direction
     /// (design §7.1: indices `desc`, prices `asc`).
     pub default_dir: SortDir,
+    /// Optional human description of the field, shown in the modifier
+    /// auto-complete (and `.sort:`) Description column. When absent, the
+    /// component falls back to the type ("string"/"number"); the field
+    /// name itself is never repeated as a description.
+    pub description: Option<String>,
 }
 
 impl Default for SortDir {
@@ -111,6 +116,7 @@ impl FieldSpec {
             } else {
                 SortDir::Asc
             },
+            description: None,
         }
     }
 
@@ -126,6 +132,13 @@ impl FieldSpec {
 
     pub fn dir(mut self, d: SortDir) -> Self {
         self.default_dir = d;
+        self
+    }
+
+    /// Attach a human description for the field's modifier auto-complete
+    /// and `.sort:` Description column.
+    pub fn description(mut self, d: impl Into<String>) -> Self {
+        self.description = Some(d.into());
         self
     }
 }
