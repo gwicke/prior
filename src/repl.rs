@@ -526,9 +526,16 @@ pub(crate) enum ActiveOverlay {
         lines: Vec<String>,
     },
 
-    /// Help text for the `/replay` command syntax.
-    ReplayHelp {
-        lines: Vec<String>,
+    /// Generic engine-backed menu overlay (Phase 7.1 collapse): any
+    /// command whose drilled level renders an engine [`RenderPlan`]
+    /// (candidate rows, or a detail/help panel for a pure leaf like
+    /// `/replay `). The host paints the plan verbatim and routes Tab/
+    /// Enter/Esc through the engine — no per-command overlay logic.
+    Menu {
+        /// Engine-owned view cursor (Phase 6.5): the row Tab/Enter act on.
+        cursor: usize,
+        /// The engine render plan — the display source.
+        plan: crate::slashdot_menu::render::RenderPlan,
     },
 
     Sandbox {
@@ -770,7 +777,7 @@ impl ActiveOverlay {
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let plan =
-                    engine.render_plan(&line, crate::output::term_width());
+                    engine.render_plan(&line, crate::output::term_width(), Vec::new());
                 ActiveOverlay::Model {
                     engine_rows: st.candidates.clone(),
                     cursor: st.active,
@@ -788,7 +795,7 @@ impl ActiveOverlay {
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let plan =
-                    engine.render_plan(&line, crate::output::term_width());
+                    engine.render_plan(&line, crate::output::term_width(), Vec::new());
                 ActiveOverlay::Thinking { cursor: st.active, plan }
             }
             "persona" | "personas" | "p" => {
@@ -801,7 +808,7 @@ impl ActiveOverlay {
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
                 let plan =
-                    engine.render_plan(&line, crate::output::term_width());
+                    engine.render_plan(&line, crate::output::term_width(), Vec::new());
                 ActiveOverlay::Persona { cursor: st.active, plan }
             }
             "set" | "s" => {
@@ -830,24 +837,6 @@ impl ActiveOverlay {
                 // D4 phase: first Enter shows (this arm); the phase is
                 // tracked in `stat_phase` and flipped by the Enter handler.
                 ActiveOverlay::Stat { lines }
-            }
-            "replay" => {
-                if rest.trim().is_empty() {
-                    let lines = vec![
-                        "Replay the full history of the current session.".into(),
-                        "".into(),
-                        "Optional length filters (appended after /replay):".into(),
-                        "  10      last 10 agent turns (same as 10t)".into(),
-                        "  10t     last 10 agent turns".into(),
-                        "  10l     last 10 output lines".into(),
-                        "".into(),
-                        "Examples:  /replay    /replay 5    /replay 50l".into(),
-                    ];
-                    ActiveOverlay::ReplayHelp { lines }
-                } else {
-                    // Non-empty arg → no overlay, submit directly.
-                    ActiveOverlay::None
-                }
             }
             "compact" => {
                 // v2 (R8-8): /compact is a leaf whose accept rewrites the
@@ -1221,7 +1210,22 @@ impl ActiveOverlay {
                 }
             }
             _ => {
-                Self::root_list_overlay(engine, buf, rest)
+                // Generic engine-backed fallthrough (Phase 7.1): a bare
+                // command stays in the root list (pinned); a trailing-space
+                // drill into any node (listing *or* pure leaf) renders the
+                // engine's plan — candidate rows for listings, the
+                // detail/help panel for leaves like `/replay ` (the
+                // registered DetailProvider feeds `plan.detail`). No
+                // per-command host overlay.
+                if !buf.ends_with(' ') {
+                    return Self::root_list_overlay(engine, buf, rest);
+                }
+                let line = buf.trim_start_matches('/').to_string();
+                let detail = engine.detail_for(&line).unwrap_or_default();
+                let st = engine.interpreter.state(&line);
+                let plan =
+                    engine.render_plan(&line, crate::output::term_width(), detail);
+                ActiveOverlay::Menu { cursor: st.active, plan }
             }
         }
     }
@@ -1411,9 +1415,12 @@ impl ActiveOverlay {
                 ("Session stats  (Esc clears input to close)",
                  lines.clone(), None, true)
             }
-            ActiveOverlay::ReplayHelp { lines } => {
-                ("History replay  (type a length filter or Esc to cancel)",
-                 lines.clone(), None, true)
+            ActiveOverlay::Menu { plan, .. } => {
+                // 7.1: decompose the engine's plan for the cursor/focus
+                // math (opts = one logical option per candidate; detail
+                // lines are headers, excluded).
+                let (opts, active) = Self::plan_rows(plan);
+                ("", opts, active, false)
             }
             ActiveOverlay::Sandbox { items, sub, .. } => {
                 let title = match sub {
@@ -1490,6 +1497,7 @@ impl ActiveOverlay {
             ActiveOverlay::Model { cursor, .. } => Some(*cursor),
             ActiveOverlay::Thinking { cursor, .. } => Some(*cursor),
             ActiveOverlay::Persona { cursor, .. } => Some(*cursor),
+            ActiveOverlay::Menu { cursor, .. } => Some(*cursor),
             _ => None,
         }
     }
@@ -1610,6 +1618,23 @@ impl ActiveOverlay {
                 // v2 engine owns the Tab rewrite. Phase 6.7: engine is
                 // persistent — cursor + frames live inside; `sel` is a
                 // fallback for the first frame.
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Tab,
+                );
+                if let Some(b) = r.buffer {
+                    editor.set(&format!("/{}", b));
+                }
+                let _ = r.restore_cursor;
+            }
+            ActiveOverlay::Menu { .. } => {
+                // v2 engine owns the Tab rewrite (7.1) — generic: the
+                // engine expands canonically (same path Enter uses). For
+                // `/replay ` this completes the limiter arg / stays; for a
+                // listing it pins the cursor row.
                 let buf = editor.text();
                 let line = buf.trim_start_matches('/').to_string();
                 let r = engine.step_at(
@@ -1984,7 +2009,20 @@ impl ActiveOverlay {
                                         InputAction::Submit("/new".into()),
                                     );
                                 }
-                                slash::SlashKind::Replay => editor.set("/replay "),
+                                slash::SlashKind::Replay => {
+                                    // Pure leaf: Enter submitted the canonical
+                                    // line (the same expansion Tab produces —
+                                    // with any typed limiter arg). Echo and
+                                    // submit it immediately (one key press).
+                                    let echo = format!("/{}", canon);
+                                    Repl::emit_commit(
+                                        output, editor, redraw, sel, input_row,
+                                        &echo, "", false,
+                                    );
+                                    return OverlayAction::Action(
+                                        InputAction::Submit(format!("/{}", canon)),
+                                    );
+                                }
                             }
                         }
                         return OverlayAction::Continue;
@@ -2425,13 +2463,36 @@ ActiveOverlay::Model { engine_rows, .. } => {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::ReplayHelp { .. } => {
-                let line = editor.text();
-                if !line.trim().is_empty() {
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    OverlayAction::Action(InputAction::Submit(line))
-                } else {
-                    OverlayAction::Continue
+            ActiveOverlay::Menu { .. } => {
+                // v2 engine owns the Enter flow (7.1): the engine expands
+                // canonically (same as Tab, one path) and then — for a
+                // pure leaf like `/replay` — submits immediately; for a
+                // listing it drills further. The host just applies the
+                // engine's submit/buffer result.
+                let buf = editor.text();
+                let line = buf.trim_start_matches('/').to_string();
+                let r = engine.step_at(
+                    &line,
+                    sel,
+                    slash_menu_bridge::HostKey::Enter,
+                );
+                match r.action {
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Submit(canon),
+                    ) => {
+                        let echo = format!("/{}", canon);
+                        Repl::emit_commit(
+                            output, editor, redraw, sel, input_row, &echo, "", false,
+                        );
+                        OverlayAction::Action(InputAction::Submit(format!("/{}", canon)))
+                    }
+                    crate::slashdot_menu::accept::AcceptOutcome::Continue(
+                        crate::slashdot_menu::interpreter::OverlayAction::Buffer(b),
+                    ) => {
+                        editor.set(&format!("/{}", b));
+                        OverlayAction::Continue
+                    }
+                    _ => OverlayAction::Continue,
                 }
             }
             _ => OverlayAction::Continue,
@@ -2451,7 +2512,7 @@ ActiveOverlay::Model { engine_rows, .. } => {
             | ActiveOverlay::Thinking { .. }
             | ActiveOverlay::Persona { .. }
             | ActiveOverlay::Stat { .. }
-            | ActiveOverlay::ReplayHelp { .. }
+            | ActiveOverlay::Menu { .. }
             | ActiveOverlay::Sandbox { .. } => {
                 editor.set("");
             }
@@ -2520,7 +2581,7 @@ ActiveOverlay::Model { engine_rows, .. } => {
             ActiveOverlay::SettingsVal { .. } => 6,
             ActiveOverlay::Persona { .. } => 7,
             ActiveOverlay::Stat { .. } => 8,
-            ActiveOverlay::ReplayHelp { .. } => 15,
+            ActiveOverlay::Menu { .. } => 15,
             ActiveOverlay::Sandbox { .. } => 9,
             ActiveOverlay::PathComplete { .. } => 10,
             ActiveOverlay::Session { .. } => 11,
@@ -2854,7 +2915,7 @@ impl Repl {
             let mut overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::Help => Self::render_help_overlay(),
-                ActiveOverlay::Stat { .. } | ActiveOverlay::ReplayHelp { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
+                ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
                 ActiveOverlay::SessionAction { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
@@ -2904,6 +2965,13 @@ impl Repl {
                     paint.join("\n")
                 }
                 ActiveOverlay::Thinking { plan, .. } => {
+                    let paint = plan.paint(crate::output::term_width());
+                    paint.join("\n")
+                }
+                ActiveOverlay::Menu { plan, .. } => {
+                    // v2 engine: paint the drill panel (candidate rows,
+                    // or help/detail for a pure leaf like `/replay `)
+                    // verbatim — same path as Thinking/Persona/Model.
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
@@ -6696,6 +6764,9 @@ mod tests {
             ("/session", "session"),
             ("/tree", "tree"),
             ("/sandbox", "sandbox"),
+            // Pure leaf: bare stays pinned in the root list too (generic
+            // leaf contract) — only a trailing space drills.
+            ("/replay", "replay"),
         ] {
             match model_overlay(buf) {
                 ActiveOverlay::CommandList { engine_rows, engine_active, .. } => {
@@ -6739,6 +6810,45 @@ mod tests {
             ActiveOverlay::Thinking { .. } => {}
             other => panic!(
                 "expected Thinking for '/thinking ' (drill in), got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+    }
+
+    /// Pure leaf (`/replay`) uses the generic engine-backed Menu overlay on
+    /// drill (trailing space): the detail/help panel comes from the engine's
+    /// registered ReplayDetailProvider — no host-level command overlay.
+    #[test]
+    fn from_buffer_replay_drill_uses_generic_menu_overlay() {
+        // Bare `/replay`: root list pinned (generic leaf contract).
+        match model_overlay("/replay") {
+            ActiveOverlay::CommandList { engine_active, engine_rows, .. } => {
+                assert_eq!(
+                    engine_rows.get(engine_active).map(|r| r.id.as_str()),
+                    Some("replay"),
+                    "cursor on the replay row"
+                );
+            }
+            other => panic!(
+                "expected root CommandList for bare /replay, got disc {:?}",
+                other.overlay_disc()
+            ),
+        }
+        // `/replay ` (trailing space): generic Menu overlay carrying the
+        // engine plan — the help/detail panel is engine-sourced.
+        match model_overlay("/replay ") {
+            ActiveOverlay::Menu { plan, .. } => {
+                assert!(
+                    !plan.detail.is_empty(),
+                    "drilled /replay plan carries the help detail"
+                );
+                assert!(
+                    plan.lines.is_empty(),
+                    "pure leaf has no candidate rows, only detail"
+                );
+            }
+            other => panic!(
+                "expected generic Menu for '/replay ', got disc {:?}",
                 other.overlay_disc()
             ),
         }

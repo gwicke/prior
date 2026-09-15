@@ -76,6 +76,11 @@ pub struct RenderPlan {
     /// design §5.1), resolved from `MenuState::active_row_marker`. When it
     /// equals `selected`, `*` wins on the shared row.
     pub active: Option<usize>,
+    /// Detail/banner lines (design §5.1): multi-line help text or
+    /// dynamic content rendered as non-selectable header rows between
+    /// the title and the candidate rows (e.g. `/replay` help, `/stat`
+    /// summary). Populated by the host from a registered detail provider.
+    pub detail: Vec<String>,
 }
 
 impl RenderPlan {
@@ -87,6 +92,12 @@ impl RenderPlan {
         let mut out = Vec::new();
         if let Some(title) = &self.title {
             out.push(bg_line(title, Style::PANEL.bg));
+        }
+        // Detail/banner lines (design §5.1): non-selectable header
+        // rows rendered between the title and the candidate rows —
+        // `/replay` help text, `/stat` summary, etc.
+        for d in &self.detail {
+            out.push(bg_line(d, Style::HEADER.bg));
         }
         for l in &self.lines {
             let sel = self.selected == Some(l.option);
@@ -118,6 +129,11 @@ impl RenderPlan {
 }
 
 /// Compose a [`RenderPlan`] from menu state parts.
+/// PlanBuilder: composes a [`RenderPlan`] from menu state parts.
+///
+/// Detail lines are passed in at `build` time (design §5.1) so the
+/// crate stays independent of host-provided text — the host resolves
+/// the detail provider per frame and feeds the strings in.
 pub struct PlanBuilder {
     pub title: String,
     pub child_header: Option<String>,
@@ -128,10 +144,14 @@ impl PlanBuilder {
     /// Build the plan for a menu level: title, optional child header
     /// (static `child_header`), optional per-row derived header (R8-4),
     /// then candidate rows with markers.
+    /// `detail` are non-selectable header lines rendered between the
+    /// title and the rows (design §5.1: `/replay` help, `/stat`
+    /// summary, etc.). Empty ⇒ no detail section.
     pub fn build(
         &self,
         state: &crate::interpreter::MenuState,
         max_width: usize,
+        detail: Vec<String>,
     ) -> RenderPlan {
         use crate::table::{Align, Table};
 
@@ -271,6 +291,13 @@ impl PlanBuilder {
             }
         }
 
+        // Wrap detail lines to the panel width (same as header rows) so
+        // long help text breaks cleanly inside the panel.
+        let detail = detail
+            .iter()
+            .flat_map(|d| wrap_lines(d, max_width))
+            .collect::<Vec<_>>();
+
         RenderPlan {
             title: Some(self.title.clone()),
             lines,
@@ -280,6 +307,7 @@ impl PlanBuilder {
                 Some(state.active)
             },
             active: state.active_row_marker,
+            detail,
         }
     }
 }
@@ -315,7 +343,7 @@ mod tests {
             child_header: Some("pick a model".into()),
             row_header: None,
         };
-        let plan = b.build(&empty_state(), 80);
+        let plan = b.build(&empty_state(), 80, Vec::new());
         assert_eq!(plan.title.as_deref(), Some("Models"));
         let headers = plan.lines.iter().filter(|l| l.is_header).count();
         assert_eq!(headers, 1);
@@ -339,7 +367,7 @@ mod tests {
             child_header: None,
             row_header: None,
         };
-        let plan = b.build(&empty_state(), 40);
+        let plan = b.build(&empty_state(), 40, Vec::new());
         let lines = plan.paint(40);
         // title + 2 rows (plus a leading marker column on each row)
         assert_eq!(lines.len(), 3);
@@ -375,7 +403,7 @@ mod tests {
             child_header: None,
             row_header: None,
         };
-        let plan = b.build(&st, 60);
+        let plan = b.build(&st, 60, Vec::new());
         // Two logical options; the active (current-state) row is `b`.
         assert_eq!(plan.selected, Some(0));
         assert_eq!(plan.active, Some(1));
@@ -393,7 +421,7 @@ mod tests {
         st.active_row_marker = Some(0);
         let b = PlanBuilder { title: "T".into(), child_header: None, row_header: None };
         // selected == active → `*` wins (per §5.1).
-        let plan = b.build(&st, 40);
+        let plan = b.build(&st, 40, Vec::new());
         let painted = plan.paint(40);
         assert!(painted.iter().any(|l| l.contains("* x")), "shared row shows `*`, not `>`: {painted:?}");
     }
@@ -408,7 +436,7 @@ mod tests {
             child_header: None,
             row_header: None,
         };
-        let plan = b.build(&st, 80);
+        let plan = b.build(&st, 80, Vec::new());
         assert!(plan.lines.iter().any(|l| l.is_header && l.text.contains("long detail header")));
     }
 }

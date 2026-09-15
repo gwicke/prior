@@ -82,10 +82,9 @@ pub enum OverlayAction {
     Rewrite(String),
 }
 
-/// Internal Tab outcome: plain buffer rewrite or buffer + drill (promote).
+/// Internal Tab outcome: plain canonical buffer rewrite or none.
 enum TabResult {
     Buffer(String),
-    BufferDrill(String),
     None,
 }
 
@@ -722,38 +721,21 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
 
     /// Tab acting on the host cursor row (`cursor` clamped to the view);
     /// the no-cursor variant uses the engine's default (pinned/active).
+    ///
+    /// Tab always completes to the **canonical** line with a trailing
+    /// space (one canonical expansion path) — for a listing that shows the
+    /// child menu; for a pure leaf (`/repl` → `/replay `) it pins the
+    /// full/partial match so Enter can submit the canonical line next.
     pub fn tab_at(&mut self, line: &str, cursor: usize) -> OverlayAction {
         match self.tab_inner(line, Some(cursor)) {
-            TabResult::Buffer(b) => OverlayAction::Buffer(b),
-            TabResult::BufferDrill(b) => OverlayAction::Buffer(format!("{} ", b)),
+            TabResult::Buffer(b) => OverlayAction::Buffer(format!("{} ", b.trim_end())),
             TabResult::None => OverlayAction::None,
         }
     }
 
-    /// Core of Tab: returns the rewritten buffer, optionally flagged as a
-    /// promotion (drill with trailing space).
-    /// Does the node the current selection points at have a child menu
-    /// (static children or a value child)? Such nodes promote on Tab when
-    /// the level is otherwise empty.
-    fn tab_promotes(root: &MenuNode, st: &MenuState) -> bool {
-        // Resolve the node the selection lands on: walk node_path, then
-        // the pinned selection if present.
-        let mut node = root.clone();
-        for p in &st.node_path {
-            if let Some(c) = node.child(p) {
-                node = c.clone();
-            }
-        }
-        if let Some(sel) = &st.selection {
-            if let Some(c) = node.child(sel) {
-                node = c.clone();
-            } else {
-                return false; // pinned id is a dynamic row or value: no child menu
-            }
-        }
-        !node.children.is_empty() || node.value.is_some() || node.dynamic
-    }
-
+    /// Core of Tab: returns the canonical rewritten buffer (path + the
+    /// selected id; fuzzy terms cleared per accept semantics). The
+    /// trailing space is appended by [`Interpreter::tab_at`].
     fn tab_inner(&mut self, line: &str, cursor: Option<usize>) -> TabResult {
         let mut st = self.state(line);
         // Host cursor wins: Tab/Enter act on the row the user highlighted,
@@ -774,15 +756,6 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             // Pinned/drilled level: complete the active candidate of the
             // displayed level as a pinned selection.
             parts.push(token.clone());
-        } else if st.terms.is_empty() && Self::tab_promotes(&self.root, &st) {
-            // Bare level with nothing typed at the child level (the pinned
-            // word is the level name itself, e.g. "/thinking" on a root
-            // child): Tab promotes exactly like Enter — trailing space so
-            // the child/value menu shows. The full line is node_path +
-            // the selected id (host cursor row when nothing is pinned).
-            let mut full = parts.clone();
-            full.push(token);
-            return TabResult::BufferDrill(full.join(" "));
         } else {
             // Trailing word handling:
             // - Static level: the last word is the selection-in-progress
@@ -796,44 +769,7 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             // restores them via the traversal stack (MenuEngine frames).
             parts.push(token);
         }
-        let buf = parts.join(" ");
-
-        // Promotion rule: the completed node is a listing (children, a
-        // value child, or a dynamic provider level) ⇒ drill (trailing
-        // space). Otherwise plain pin. Note: parts currently ends with the
-        // completed token; resolve its node by walking the root through
-        // `parts`.
-        let mut node = self.root.clone();
-        for p in &parts {
-            if let Some(c) = node.child(p) {
-                node = c.clone();
-            }
-        }
-        // If the walk resolved the completed token as a static child, the
-        // landed node is that child (its key == token). For a dynamic row
-        // id the walk stops at the dynamic level itself — its key is the
-        // level name, not the row id. Only a static-child completion drills.
-        let completed = parts.last().map(String::as_str).unwrap_or("");
-        let landed_on_child = node.key == completed
-            && parts.len() == st.node_path.len() + 1;
-        if !node.children.is_empty()
-            || node.value.is_some()
-            || (node.dynamic && landed_on_child)
-        {
-            // A value node is itself a listing (it presents its value set):
-            // completing the *command word* (landed_on_child) drills — e.g.
-            // `/thinking` → `thinking ` — exactly like a static listing or
-            // dynamic level. Only a completion *inside* an already-drilled
-            // value level (landed_on_child false, e.g. `thinking ` selecting
-            // `med`) pins the value token instead of drilling.
-            if node.value.is_some() && !landed_on_child {
-                TabResult::Buffer(buf)
-            } else {
-                TabResult::BufferDrill(buf)
-            }
-        } else {
-            TabResult::Buffer(buf)
-        }
+        TabResult::Buffer(parts.join(" "))
     }
 
     /// Enter: accept.
@@ -849,52 +785,79 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
     }
 
     /// Enter acting on the host cursor row (see [`Interpreter::tab_at`]).
+    ///
+    /// Enter first expands to the canonical line exactly like Tab (one
+    /// canonical expansion path), then:
+    ///   - listing node with **no argument pinned** (e.g. `/thinking`) →
+    ///     drill: show its child/value menu (trailing space);
+    ///   - leaf node with **its argument pinned** (`/thinking med`,
+    ///     `/model model-b`) or a **pure leaf** (`/repl`, `/replay`) →
+    ///     submit the canonical line immediately (one key press);
+    ///   - non-leaf listing with a row pinned (`/session s1`) → drill to
+    ///     its action menu.
     pub fn enter_at(&mut self, line: &str, cursor: usize) -> OverlayAction {
-        // Enter = Tab + trailing space for structural promotion; Tab already
-        // promotes listings (same as Enter), so delegate and reuse logic.
+        // Canonical expansion (single path) — same as Tab.
         match self.tab_at(line, cursor) {
-            OverlayAction::Buffer(b) if !line.ends_with(' ') && !b.ends_with(' ') => {
-                // Tab produced a pin (leaf or value child) — Enter adds the
-                // drill space to show the next level (per contract, Enter
-                // on a non-leaf always drills).
-                let st = self.state(line);
-                // If the completed node is a leaf → submit canonical line.
-                let mut node = self.root.clone();
-                let parts: Vec<&str> = b.trim_end().split(' ').collect();
-                for p in &parts {
-                    if let Some(c) = node.child(p) {
-                        node = c.clone();
-                    }
-                }
-                // A dynamic row's leaf-ness is the dynamic node's leaf flag.
-                if (node.is_leaf || node.dynamic) && !parts.is_empty() {
-                    return OverlayAction::Submit(b.to_string());
-                }
-                // Non-leaf pinned (e.g. value child) → Enter pins; a second
-                // Enter (drilled) submits. Match prior behavior: pin only.
-                if st.drill_in {
+            OverlayAction::Buffer(b) => {
+                let trimmed = b.trim_end();
+                if trimmed.is_empty() {
                     return OverlayAction::Buffer(b);
                 }
-                OverlayAction::Buffer(format!("{} ", b))
-            }
-            OverlayAction::Buffer(b) if line.ends_with(' ') && !b.ends_with(' ') => {
-                // Drilled level pinned a row (Tab completed the id). If the
-                // drilled level is dynamic and leaf-marked, the pin IS the
-                // commit: submit the canonical line (design §5 — Enter on a
-                // drilled leaf submits).
-                let mut node = self.root.clone();
-                for p in b.split(' ').filter(|p| !p.is_empty()) {
-                    if let Some(c) = node.child(p).cloned() {
-                        node = c;
-                    }
+                let (node, depth) = self.resolve_root_path(trimmed);
+                let pinned = trimmed.split(' ').count() > depth;
+                if node.is_listing() && !pinned {
+                    // Drill: keep the trailing space Tab added so the child
+                    // / value menu shows.
+                    OverlayAction::Buffer(b)
+                } else if node.is_leaf {
+                    // Pure leaf (`replay`) or leaf with its argument pinned
+                    // (`thinking med`, `model model-b`): submit the
+                    // canonical (trailing-space-stripped) line immediately.
+                    OverlayAction::Submit(trimmed.to_string())
+                } else {
+                    // Non-leaf listing with a row pinned: drill to the
+                    // row's action menu.
+                    OverlayAction::Buffer(b)
                 }
-                if node.dynamic && node.is_leaf {
-                    return OverlayAction::Submit(b);
-                }
-                OverlayAction::Buffer(b)
             }
+            // Tab found nothing to complete: the line is already a
+            // canonical leaf with trailing space (`/replay `, `/model
+            // model-b `). When the landed node is a leaf, submit it
+            // immediately; otherwise no-op.
+            OverlayAction::None => {
+                let trimmed = line.trim_end();
+                if trimmed.is_empty() {
+                    return OverlayAction::None;
+                }
+                let (node, _) = self.resolve_root_path(trimmed);
+                if node.is_leaf {
+                    OverlayAction::Submit(trimmed.to_string())
+                } else {
+                    OverlayAction::None
+                }
+            }
+            // `tab_at` never produces these (it only ever yields
+            // Buffer/None); keep exhaustive for future-proofing.
             other => other,
         }
+    }
+
+    /// Walk the root descriptor through a line's whitespace tokens to the
+    /// deepest resolvable static node, returning the node and its path
+    /// depth (number of static-child tokens consumed). Used to classify
+    /// the landed node and detect a pinned value/row (`depth < tokens`).
+    fn resolve_root_path(&self, line: &str) -> (MenuNode, usize) {
+        let mut node = self.root.clone();
+        let mut depth = 0usize;
+        for p in line.split(' ').filter(|p| !p.is_empty()) {
+            if let Some(c) = node.child(p) {
+                node = c.clone();
+                depth += 1;
+            } else {
+                break;
+            }
+        }
+        (node, depth)
     }
 
     /// Esc: pop one level — rewrite the buffer to the parent state.
@@ -1066,16 +1029,17 @@ mod tests {
         );
         // Selecting a value *inside* the drilled value level pins (no drill):
         // `thinking ` completes the cursor row, which seeds to the first value
-        // (`off`) when no active provider marks a current level.
+        // (`off`) when no active provider marks a current level. The trailing
+        // space is harmless — `/thinking off` ≡ `/thinking off `.
         let act_val = ix().tab("thinking ");
         assert_eq!(
             act_val,
-            OverlayAction::Buffer("thinking off".to_string())
+            OverlayAction::Buffer("thinking off ".to_string())
         );
         // terms preserved: "/tree think" → wait, root has no tree-chain here.
         let act2 = ix().tab("tree ");
         // At "tree " the drilled level shows switch/compact; active = switch.
-        assert_eq!(act2, OverlayAction::Buffer("tree switch".to_string()));
+        assert_eq!(act2, OverlayAction::Buffer("tree switch ".to_string()));
     }
 
     #[test]
@@ -1270,7 +1234,9 @@ mod tests {
         let act = i.tab("model flag");
         // Accept semantics: the id is committed, refinement terms are
         // cleared (back-navigation restores them via the traversal stack).
-        assert_eq!(act, OverlayAction::Buffer("model model-a".to_string()));
+        // Tab always appends the drill space (`/model model-a ` ≡
+        // `/model model-a`).
+        assert_eq!(act, OverlayAction::Buffer("model model-a ".to_string()));
     }
 
     #[test]
@@ -1448,7 +1414,11 @@ mod tests {
         // not the pre-filter pin/default (gpt4o).
         let st = i.state("model gpt4");
         let act = i.tab_at("model gpt4", st.active);
-        assert_eq!(act, OverlayAction::Buffer("model p:gpt4-mini".to_string()));
+        // Tab always appends the drill space (harmless on a leaf).
+        assert_eq!(
+            act,
+            OverlayAction::Buffer("model p:gpt4-mini ".to_string())
+        );
     }
 
     #[test]

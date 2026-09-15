@@ -82,6 +82,22 @@ pub struct DataResult {
     pub active_row: Option<String>,
 }
 
+/// Detail/banner provider (design §5.1): supplies non-selectable
+/// header lines rendered between the panel title and the candidate
+/// rows — content that doesn't fit the row schema but should stay
+/// in view (e.g. `/replay` command help, `/stat` session summary).
+///
+/// `fetch` is called per frame (the content is dynamic — a
+/// `/stat`-like provider re-reads live counters; a `/replay`
+/// provider reflects current limits). The returned strings are
+/// painted verbatim as non-selectable header rows.
+pub trait DetailProvider {
+    /// Detail lines to render as non-selectable header rows between
+    /// the panel title and the candidate rows. Empty ⇒ no detail
+    /// section.
+    fn fetch(&mut self) -> Vec<String>;
+}
+
 /// Outcome of a live-filter fetch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveResult {

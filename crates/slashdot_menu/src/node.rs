@@ -97,6 +97,19 @@ impl MenuNode {
         self
     }
 
+    /// Is this a **listing** node — one that presents a child menu when
+    /// drilled (trailing space)? A node is a listing when it has static
+    /// children, a value-typed child (its value set is the menu), or a
+    /// dynamic provider level (its rows are the menu). Contrast with a
+    /// *pure leaf* (has a submit handler and no children): `/replay` is a
+    /// pure leaf; `/thinking` is a leaf *and* a listing (it shows its value
+    /// set). Enter/traversal use this one predicate to decide drill vs
+    /// submit — no scattered `!children.is_empty() || value || dynamic`
+    /// checks.
+    pub fn is_listing(&self) -> bool {
+        !self.children.is_empty() || self.value.is_some() || self.dynamic
+    }
+
     /// Find a static child by exact key.
     pub fn child(&self, key: &str) -> Option<&MenuNode> {
         self.children.iter().find(|c| c.key == key)

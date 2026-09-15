@@ -80,6 +80,11 @@ pub struct MenuEngine {
     /// host keeps this engine instance across keypresses, so frames stay
     /// inside it (no host threading).
     pub frames: Vec<Frame>,
+    /// Detail providers keyed by node path (design §5.1): the
+    /// engine reads them per frame to populate `RenderPlan.detail`.
+    /// Static levels derive their detail from the node's own
+    /// handler; dynamic levels from a registered provider.
+    pub detail_providers: std::collections::HashMap<String, Box<dyn crate::slashdot_menu::provider::DetailProvider>>,
 }
 
 /// Shared application state the menu handlers read/write at call time
@@ -186,6 +191,30 @@ impl crate::slashdot_menu::provider::ActiveProvider for ThinkingActiveProvider {
     fn active(&mut self) -> Option<String> {
         let t = self.shared.current_thinking_level.borrow();
         t.clone().or_else(|| Some("off".to_string()))
+    }
+}
+
+/// Detail provider for `/replay` (design §5.1): reflects the
+/// user-facing replay limits (`10` turns, `10t` turns, `10l`
+/// lines) and command syntax. The engine drives the detail panel;
+/// agent.rs dispatches the replay itself.
+pub struct ReplayDetailProvider {
+    pub shared: Rc<MenuShared>,
+}
+
+impl crate::slashdot_menu::provider::DetailProvider for ReplayDetailProvider {
+    fn fetch(&mut self) -> Vec<String> {
+        let _ = self.shared;
+        vec![
+            "Replay the full history of the current session.".to_string(),
+            "".to_string(),
+            "Optional length limits (appended after /replay):".to_string(),
+            "  10      last 10 agent turns (same as 10t)".to_string(),
+            "  10t     last 10 agent turns".to_string(),
+            "  10l     last 10 output lines".to_string(),
+            "".to_string(),
+            "Examples:  /replay    /replay 5    /replay 50l".to_string(),
+        ]
     }
 }
 
@@ -546,21 +575,23 @@ impl MenuEngine {
             )
             .with_active_provider(
                 &["thinking"],
-                Box::new(ThinkingActiveProvider { shared: shared_rc }),
+                Box::new(ThinkingActiveProvider { shared: shared_rc.clone() }),
             );
-        MenuEngine {
+        let engine = MenuEngine {
             interpreter,
             controller,
             frames: Vec::new(),
-        }
+            detail_providers: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("replay".to_string(), Box::new(ReplayDetailProvider { shared: shared_rc.clone() }) as _);
+                m
+            },
+        };
+        engine
     }
 
     /// The static descriptor tree: one child per command (§10).
     fn root_descriptor() -> MenuNode {
-        // Root list from the static command registry (name → key without
-        // the leading slash; help → description), plus the migrated
-        // per-command sub-descriptors (§10 order; thinking first).
-        // Leaf commands: help, quit, clear, new — no args, submit directly.
         let mut children: Vec<MenuNode> = crate::slash::registry()
             .iter()
             .map(|c| {
@@ -616,18 +647,20 @@ impl MenuEngine {
                 "stat" => {
                     // §10 step 8: interstitial, no leaf (D4) — second Enter
                     // dismisses; text lives in the node property.
+                    // The detail panel (context, usage, cost, cache)
+                    // is served by a registered detail provider
+                    // (StatDetailProvider in the bridge).
                     *c = MenuNode::new("stat")
                         .desc("session stats: context window, usage, cost, cache hit")
                         .interstitial("context window, token usage, cost, cache hit rate");
                 }
                 "replay" => {
-                    // Interstitial + leaf (D4): first Enter shows the help
-                    // panel, next Enter invokes the replay.
+                    // §10 step 8: leaf whose detail panel is the help
+                    // text (rendered by the engine's detail provider).
+                    // The engine calls the registered detail provider
+                    // per frame; agent.rs dispatches the replay itself.
                     *c = MenuNode::new("replay")
-                        .desc("re-render session history")
-                        .interstitial(
-                            "replay: 10 = last 10 turns, 10t = turns, 10l = lines\n                             Examples: /replay  /replay 5  /replay 50l",
-                        )
+                        .desc("history replay; optional limits 10 (turns) 10t (turns) 10l (lines)")
                         .leaf();
                 }
                 "sandbox" => {
@@ -716,12 +749,14 @@ impl MenuEngine {
     }
 
     fn register_handlers(controller: &mut AcceptController) {
-        // /replay: leaf → the host submits the line (agent.rs handles the
-        // actual replay rendering). Signal via Done with the echo line.
-        controller.register(
-            &["replay"],
-            Box::new(|inv: &LeafInvocation| LeafResult::Done(Some(inv.line.clone()))),
-        );
+        // /replay has NO registered handler: it is a pure leaf whose Enter
+        // submits the *canonical* line (the same expansion Tab produces,
+        // with any typed limiter arg) through the generic structural submit
+        // path — identical to /clear and /new. A handler here would
+        // intercept the Submit as `Close`, hiding the canonical expansion
+        // from the host and breaking the "Enter == Tab-then-submit"
+        // contract. agent.rs dispatches the actual replay.
+        //
         // /compact (R8-8): leaf returns the rewritten /tree path; the host
         // resolves the target id (needs tree ctx) via NewPath with the
         // sentinel "<last-user>" the host replaces.
@@ -901,9 +936,12 @@ impl MenuEngine {
     /// from the descriptor path's child header, per-row derived header
     /// (R8-4), candidate rows via the table builder + declared column
     /// defs, and the `>` / `*` row markers resolved from the menu state.
+    /// Detail lines (design §5.1) come from the registered detail
+    /// provider for this level (e.g. `/replay` help, `/stat` summary);
+    /// falls back to `Vec::new` (no detail section).
     /// Phase 6.7-5: the bridge now emits the plan; the host's per-variant
     /// render arms are the remaining (Phase 7.1) cleanup.
-    pub fn render_plan(&mut self, line: &str, term_width: usize) -> RenderPlan {
+    pub fn render_plan(&mut self, line: &str, term_width: usize, detail: Vec<String>) -> RenderPlan {
         let st = self.interpreter.state(line);
         // Walk to the level's node to source its static `child_header`.
         let mut node = self.interpreter.root.clone();
@@ -930,7 +968,19 @@ impl MenuEngine {
             child_header: subtitle,
             row_header: None,
         }
-        .build(&st, term_width)
+        .build(&st, term_width, detail)
+    }
+
+    /// Read the registered detail provider for the level at
+    /// `line` (design §5.1): returns the provider's detail lines,
+    /// or `None` if the level has no detail provider (use an
+    /// empty vec in that case).
+    pub fn detail_for(&mut self, line: &str) -> Option<Vec<String>> {
+        let st = self.interpreter.state(line);
+        let path_key = st.node_path.join(" ");
+        self.detail_providers
+            .get_mut(&path_key)
+            .map(|p| p.fetch())
     }
 
     /// Display title for the level the prompt is at: the child-level's
@@ -1041,8 +1091,9 @@ mod tests {
         assert_eq!(st.selection, None);
         assert_eq!(st.candidates.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["high"]);
         let act = e.interpreter.tab("thinking h");
-        // Value child: Tab pins without drill (leaf payload).
-        assert_eq!(act, OverlayAction::Buffer("thinking high".to_string()));
+        // Value child: Tab pins with harmless trailing space (`/thinking
+        // high ` ≡ `/thinking high`).
+        assert_eq!(act, OverlayAction::Buffer("thinking high ".to_string()));
     }
 
     /// Enter on a completed level submits the canonical line; the host
@@ -1100,6 +1151,71 @@ mod tests {
     /// Revised accept semantics (design review): Tab/Enter act on the
     /// host cursor row and clear refinement state — the buffer keeps only
     /// path + committed id.
+    ///
+    /// Leaf-node accept contract (generic, not /replay-specific):
+    ///   - `/repl` + Enter → submit `/replay` immediately (single key press;
+    ///     the focused best partial match is a pure leaf → submit its
+    ///     canonical form).
+    ///   - `/repl` + Tab → `/replay ` (pins with trailing space, shows the
+    ///     detail/help panel so the user can add an optional arg).
+    ///   - listing nodes (e.g. `/thinking`) are unchanged: Enter drills to
+    ///     the child menu, never submits.
+    #[test]
+    fn leaf_enter_submits_canonical_tab_drills() {
+        let mut e = MenuEngine::new(&shared());
+        // Pure leaf (`/replay`): Enter expands canonically and submits even
+        // from a partial fuzzy match.
+        let out = e.interpreter.enter("repl");
+        assert_eq!(
+            out,
+            OverlayAction::Submit("replay".to_string()),
+            "partial leaf prefix + Enter must submit the canonical leaf"
+        );
+        // Full leaf + Enter likewise submits.
+        let out2 = e.interpreter.enter("replay");
+        assert_eq!(out2, OverlayAction::Submit("replay".to_string()));
+        // Tab pins with a trailing space (detail/help shown), no submit.
+        let tab = e.interpreter.tab("repl");
+        assert_eq!(
+            tab,
+            OverlayAction::Buffer("replay ".to_string()),
+            "Tab on a leaf pins with trailing space (drills to the help panel)"
+        );
+        // Listing (value child, /thinking): Enter still drills, never submits.
+        let t = e.interpreter.enter("thinking");
+        assert_eq!(
+            t,
+            OverlayAction::Buffer("thinking ".to_string()),
+            "listing Enter must drill, not submit"
+        );
+        let t2 = e.interpreter.tab("thinking");
+        assert_eq!(t2, OverlayAction::Buffer("thinking ".to_string()));
+        // Drilled listing seeded with a value pins and submits on Enter.
+        let t3 = e.interpreter.enter("thinking med");
+        assert_eq!(t3, OverlayAction::Submit("thinking med".to_string()));
+        // A typed limiter arg to the full leaf is preserved: `/replay 5` +
+        // Enter submits `replay 5` (the canonical line, arg intact).
+        let with_arg = e.interpreter.enter("replay 5");
+        assert_eq!(with_arg, OverlayAction::Submit("replay 5".to_string()));
+    }
+
+    /// `/repl` + Enter ≙ `/repl` + Tab + Enter: the canonical expansion
+    /// (same path, possibly injecting defaults) then submit.
+    #[test]
+    fn leaf_enter_equals_tab_then_enter() {
+        let mut e = MenuEngine::new(&shared());
+        let direct = e.interpreter.enter("repl");
+        // Tab expand → `/replay `, then Enter submits it stripped.
+        let tabbed = e.interpreter.tab("repl");
+        assert_eq!(tabbed, OverlayAction::Buffer("replay ".to_string()));
+        let after_tab = e.interpreter.enter("replay ");
+        assert_eq!(direct, after_tab, "Enter == Tab-then-Enter");
+        assert_eq!(direct, OverlayAction::Submit("replay".to_string()));
+    }
+
+    /// Revised accept semantics (design review): Tab/Enter act on the
+    /// host cursor row and clear refinement state — the buffer keeps only
+    /// path + committed id.
     #[test]
     fn tab_acts_on_host_cursor_and_clears_terms() {
         let mut e = MenuEngine::new(&shared());
@@ -1110,12 +1226,12 @@ mod tests {
         let r = e.step_at("thinking e", 0, HostKey::Tab);
         assert_eq!(
             r.buffer,
-            Some(format!("thinking {}", top_id)),
-            "Tab must honor the host cursor row"
+            Some(format!("thinking {} ", top_id)),
+            "Tab must honor the host cursor row (with drill space)"
         );
         // Out-of-range cursor falls back to the engine default row.
         let r1 = e.step_at("thinking e", 9, HostKey::Tab);
-        assert_eq!(r1.buffer, Some(format!("thinking {}", top_id)));
+        assert_eq!(r1.buffer, Some(format!("thinking {} ", top_id)));
         // Both accepts pushed frames (engine-owned) for back-navigation.
         assert_eq!(e.frames.len(), 2);
         // Esc replays the newest frame: previous filter state + cursor.
@@ -1181,10 +1297,10 @@ mod tests {
         // Filter by prefix.
         let st2 = e.interpreter.state("persona none");
         assert_eq!(st2.selection.as_deref(), Some("none"));
-        // Accept semantics: Tab pins path+id only.
+        // Accept semantics: Tab pins path+id (+ harmless drill space).
         assert_eq!(
             e.interpreter.tab("persona none"),
-            OverlayAction::Buffer("persona none".to_string())
+            OverlayAction::Buffer("persona none ".to_string())
         );
     }
 
@@ -1265,11 +1381,11 @@ mod tests {
         let act = e.interpreter.tab("thinking");
         assert_eq!(act, OverlayAction::Buffer("thinking ".to_string()));
         assert_eq!(format!("/{}", "thinking "), "/thinking ");
-        // Partial value: Tab completes, prefix intact.
+        // Partial value: Tab completes, prefix intact (+ drill space).
         let act2 = e.interpreter.tab("thinking h");
         assert_eq!(
             act2,
-            OverlayAction::Buffer("thinking high".to_string())
+            OverlayAction::Buffer("thinking high ".to_string())
         );
     }
 
@@ -1286,7 +1402,7 @@ mod tests {
         assert_eq!(st.columns.len(), 6);
         assert!(st.columns.iter().any(|c| c.header == "Price in"));
 
-        let plan: RenderPlan = e.render_plan("model ", 100);
+        let plan: RenderPlan = e.render_plan("model ", 100, Vec::new());
         assert!(!plan.lines.is_empty(), "model level has rows");
         assert_eq!(plan.selected, Some(0));
         // Title from the descriptor's child header (design §12); the same
