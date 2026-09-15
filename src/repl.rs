@@ -645,6 +645,30 @@ pub(crate) enum ActiveOverlay {
     },
 }
 
+/// Format a numeric menu cell for display. Temporary stopgap for the
+/// `Model` overlay table that is not yet engine-rendered (Phase 6.7-5).
+/// The catalog costs are dollars-per-million with at most two significant
+/// decimals ("2.5", "10.0", "0.0"), so we round to two and trim trailing
+/// zeros rather than emit full `f64` precision. Once the engine owns
+/// rendering (RenderPlan, 6.7-5) this lives in the crate's generic number
+/// formatter and becomes configurable (`num_decimals` / padding).
+fn format_num_cell(n: f64) -> String {
+    format!("{:.2}", n)
+}
+
+/// Trim trailing zeros/point from a fixed-point string ("2.50" → "2.5").
+fn trim_trailing_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let t = s.trim_end_matches('0').trim_end_matches('.');
+    // Keep at least an integer digit before the point (avoid "" from "0.").
+    if t.is_empty() || t == "-" {
+        return "0".to_string();
+    }
+    t.to_string()
+}
+
 impl ActiveOverlay {
     /// Construct the overlay from the current buffer and external state.
     /// (Legacy signature: test convenience; the live loop uses
@@ -1299,7 +1323,15 @@ impl ActiveOverlay {
                 for r in engine_rows {
                     let text = |k: &str| -> String {
                         match r.field_value(k) {
-                            Some(crate::slashdot_menu::value::Value::Num(n)) => n.to_string(),
+                            Some(crate::slashdot_menu::value::Value::Num(n)) => {
+                                // TODO(renderplan): once the engine emits the
+                                // RenderPlan (6.7-5), number rendering moves
+                                // into the crate's table/format layer. Until
+                                // then, hard-code a 2-decimal rounding for
+                                // the per-M cost columns so "2.5" doesn't
+                                // render as "2.5000000000000000".
+                                trim_trailing_zeros(&format_num_cell(*n))
+                            }
                             Some(crate::slashdot_menu::value::Value::Str(s)) => s.clone(),
                             None => String::new(),
                         }
@@ -6411,6 +6443,16 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- number-cell formatting stopgap (Phase 6.7-5 follow-up) ---
+    #[test]
+    fn number_cell_rounds_and_trims() {
+        assert_eq!(trim_trailing_zeros(&format_num_cell(2.5)), "2.5");
+        assert_eq!(trim_trailing_zeros(&format_num_cell(10.0)), "10");
+        assert_eq!(trim_trailing_zeros(&format_num_cell(0.0)), "0");
+        assert_eq!(trim_trailing_zeros(&format_num_cell(0.1234)), "0.12");
+        assert_eq!(trim_trailing_zeros(&format_num_cell(1.5)), "1.5");
+    }
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
     #[test]

@@ -467,6 +467,13 @@ step 2.
   `/set default_model` still route through v1 `parse_model_filter` /
   `model_selection_overlay_entries`; migrate them to the same provider
   (only the leaf/handlers differ) and delete the v1 helpers.
+- **Number-cell formatting stopgap**: the `Model` overlay currently
+  hard-codes a 2-decimal round + trailing-zero trim (`format_num_cell` /
+  `trim_trailing_zeros` in `repl.rs`) because the model table is still
+  host-rendered. When 6.7-5 moves rendering into the crate, make number
+  formatting (decimals + padding) configurable in the data spec (a
+  `num_decimals: int` / `zero_pad: bool` on `FieldSpec`, alongside the
+  existing default sort dir) rather than hard-coding in the renderer.
 - **`active_row` staleness semantics**: providers set `active_row` once
   per `fetch` (= once per activation, since the engine fetches provider
   data once when a level first opens). Handlers can't change settings
