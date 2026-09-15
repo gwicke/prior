@@ -424,9 +424,16 @@ fn resolve_active_selector(active: Option<&str>, rows: &[Row]) -> Option<usize> 
             {
                 idx.min(rank.rows.len().saturating_sub(1))
             }
-            // Fresh level → seed the cursor on the active row if any,
-            // else the derived pin.
-            _ => active_row_marker.unwrap_or(rank.active),
+            // Fresh level → seed the cursor on the derived pin when one is
+            // typed/pinned (the user's explicit target wins), otherwise on
+            // the active-state row (`*` marker) if any, else row 0.
+            _ => {
+                if selection.is_some() {
+                    rank.active
+                } else {
+                    active_row_marker.unwrap_or(rank.active)
+                }
+            }
         };
         let columns = self
             .data_cache

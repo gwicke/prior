@@ -491,13 +491,13 @@ pub(crate) enum ActiveOverlay {
     },
 
     Thinking {
-        /// Candidates after the engine's rank (fuzzy terms applied, active
-        /// pinned). Empty ⇒ "(no matches)".
-        rows: Vec<crate::slashdot_menu::fields::Row>,
-        /// Index of the active (current) level, for the `*` marker.
-        active: Option<usize>,
         /// Engine-owned view cursor (Phase 6.5): the row Tab/Enter act on.
         cursor: usize,
+        /// Phase 6.7-5/7.1: the engine render plan — the display source.
+        /// The host paints it verbatim. `plan.active` carries the current
+        /// thinking level `*` marker, resolved by the engine from the
+        /// registered `ThinkingActiveProvider` (design §5.1).
+        plan: crate::slashdot_menu::render::RenderPlan,
     },
 
     Settings {
@@ -684,6 +684,7 @@ impl ActiveOverlay {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
+        *shared.current_thinking_level.borrow_mut() = ctx.thinking_level.clone();
         let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &mut engine)
     }
@@ -766,16 +767,16 @@ impl ActiveOverlay {
             "thinking" | "think" | "t" => {
                 // v2 engine: descriptor tree + rank_and_pin (Phase 6 step 1).
                 // The buffer is "/thinking <terms...>"; the engine's
-                // canonical line strips the leading slash.
+                // canonical line strips the leading slash. The `*` marker
+                // (plan.active) is the current level, from the registered
+                // ThinkingActiveProvider (design §5.1) — the engine resolves
+                // it per frame; the host does not inject it here (never from
+                // the typed/pinned selection).
                 let line = buf.trim_start_matches('/').to_string();
                 let st = engine.interpreter.state(&line);
-                // `*` = the CURRENT level (pre-change state), from ctx —
-                // never from the typed/pinned selection.
-                let active = ctx
-                    .thinking_level
-                    .as_deref()
-                    .and_then(|lvl| st.candidates.iter().position(|r| r.id == lvl));
-                ActiveOverlay::Thinking { rows: st.candidates.clone(), active, cursor: st.active }
+                let plan =
+                    engine.render_plan(&line, crate::output::term_width());
+                ActiveOverlay::Thinking { cursor: st.active, plan }
             }
             "persona" | "personas" | "p" => {
                 // v2 engine (Phase 6 step 3): persona is a value child of
@@ -1336,21 +1337,16 @@ impl ActiveOverlay {
                 let opts = table.render_multiline(avail);
                 (title, opts, None, false)
             }
-            ActiveOverlay::Thinking { rows, active, .. } => {
-                let opts: Vec<String> = rows
-                    .iter()
-                    .map(|r| match &r.description {
-                        Some(d) => format!("{} — {}", r.id, d),
-                        None => r.id.clone(),
-                    })
-                    .collect();
-                if opts.is_empty() {
-                    ("Thinking levels  (up/down, Enter select, Esc back)",
-                     vec!["(no matches)".into()], *active, false)
-                } else {
-                    ("Thinking levels  (up/down, Enter select, Esc back)",
-                     opts, *active, false)
+            ActiveOverlay::Thinking { plan, .. } => {
+                if plan.lines.is_empty() {
+                    return ("Thinking levels  (up/down, Enter select, Esc back)",
+                            vec!["(no matches)".into()], None, false);
                 }
+                // 7.1: paint the engine's plan verbatim (markers/BG from
+                // `plan.active` = current thinking level). Decompose for
+                // cursor/focus math; the paint arm below restyles.
+                let (opts, active) = Self::plan_rows(plan);
+                ("", opts, active, false)
             }
             ActiveOverlay::Settings { rows, .. } => {
                 if rows.is_empty() {
@@ -2598,6 +2594,7 @@ impl Repl {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
+        *shared.current_thinking_level.borrow_mut() = ctx.thinking_level.clone();
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -2880,6 +2877,10 @@ impl Repl {
                     paint.join("\n")
                 }
                 ActiveOverlay::Persona { plan, .. } => {
+                    let paint = plan.paint(crate::output::term_width());
+                    paint.join("\n")
+                }
+                ActiveOverlay::Thinking { plan, .. } => {
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
@@ -10243,6 +10244,29 @@ mod model_v2_tests {
                 };
                 panic!("unexpected persona enter outcome, disc {disc}");
             }
+        }
+    }
+
+    /// 7.1: /thinking opens a plan-rendered value list whose `*` marker
+    /// (plan.active) reflects the current thinking level from the engine's
+    /// ThinkingActiveProvider (design §5.1). The marker resolves from the
+    /// engine; the host does not inject it.
+    #[test]
+    fn thinking_plan_active_marker() {
+        let mut ctx = model_ctx();
+        ctx.thinking_level = Some("med".into());
+        let ov = ActiveOverlay::from_buffer("/thinking ", &ctx, &test_settings(), false, &[]);
+        match &ov {
+            ActiveOverlay::Thinking { plan, .. } => {
+                assert_eq!(plan.title.as_deref(), Some("Thinking levels"));
+                let active = plan.active.expect("current thinking level must be marked");
+                let line = plan.lines.iter().find(|l| l.option == active);
+                assert!(
+                    line.map(|l| l.text.contains("med")).unwrap_or(false),
+                    "active row should be the current thinking level"
+                );
+            }
+            other => panic!("expected Thinking overlay, got disc {:?}", other.overlay_disc()),
         }
     }
 }

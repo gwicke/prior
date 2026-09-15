@@ -548,9 +548,15 @@ host has no per-command menu logic at all.
     engine resolves it against the descriptor rows per frame. This removes
     the host-side `plan.active = ctx.persona…` injection — one uniform
     active-state mechanism (same as `DataResult::active_row` for dynamic
-    levels). `thinking` will follow when its current-level source is
-    plumbed into the engine (runtime `config.thinking_level`, not yet on
-    `MenuShared`).
+    levels).
+    **Slice-3 (implemented)**: `Thinking` migrated end-to-end, identical to
+    persona. `MenuShared` gains `current_thinking_level` (a mirror of the
+    runtime `config.thinking_level`, synced by the REPL each loop); a
+    `ThinkingActiveProvider` reads it for the `*` marker; `ActiveOverlay::
+    Thinking` carries `plan: RenderPlan` and paints verbatim. Also fixed the
+    fresh-level cursor seeding in `state()`: an explicit typed/pinned
+    selection wins over the active-row marker for the seed (previously the
+    active marker overrode a pin, breaking `thinking_enter_submits`).
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer

@@ -111,6 +111,12 @@ pub struct MenuShared {
     /// per loop iteration; the `/tree` provider reads it per `fetch`.
     pub tree: Rc<RefCell<Vec<(usize, String, String, bool, bool, usize)>>>,
     pub leaf_id: Rc<RefCell<Option<String>>>,
+    /// Currently-active thinking level (design §5.1 active source for the
+    /// static `/thinking` value list). Mirrors the runtime agent
+    /// `config.thinking_level` (an `Option<String>`), kept in sync by the
+    /// REPL on every SetThinking / loop iteration; the `ThinkingActiveProvider`
+    /// reads it for the `*` marker. `None` ≈ "off".
+    pub current_thinking_level: Rc<RefCell<Option<String>>>,
 }
 
 impl MenuShared {
@@ -125,6 +131,7 @@ impl MenuShared {
             recent_models: Rc::new(RefCell::new(Vec::new())),
             tree: Rc::new(RefCell::new(Vec::new())),
             leaf_id: Rc::new(RefCell::new(None)),
+            current_thinking_level: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -139,6 +146,7 @@ impl MenuShared {
             recent_models: self.recent_models.clone(),
             tree: self.tree.clone(),
             leaf_id: self.leaf_id.clone(),
+            current_thinking_level: self.current_thinking_level.clone(),
         }
     }
 }
@@ -162,6 +170,22 @@ impl crate::slashdot_menu::provider::ActiveProvider for PersonaActiveProvider {
         } else {
             Some(p.to_string())
         }
+    }
+}
+
+/// Active-state provider over the runtime thinking level (design §5.1): the
+/// currently-in-effect level sets the `*` marker on the static `/thinking`
+/// value list. Reads the `MenuShared.current_thinking_level` mirror of the
+/// agent's runtime `config.thinking_level` — kept in sync by the REPL on
+/// every SetThinking / loop iteration. `None` ≈ "off" (no thinking).
+pub struct ThinkingActiveProvider {
+    pub shared: Rc<MenuShared>,
+}
+
+impl crate::slashdot_menu::provider::ActiveProvider for ThinkingActiveProvider {
+    fn active(&mut self) -> Option<String> {
+        let t = self.shared.current_thinking_level.borrow();
+        t.clone().or_else(|| Some("off".to_string()))
     }
 }
 
@@ -443,7 +467,11 @@ impl MenuEngine {
             .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc.clone() }))
             .with_active_provider(
                 &["persona"],
-                Box::new(PersonaActiveProvider { shared: shared_rc }),
+                Box::new(PersonaActiveProvider { shared: shared_rc.clone() }),
+            )
+            .with_active_provider(
+                &["thinking"],
+                Box::new(ThinkingActiveProvider { shared: shared_rc }),
             );
         MenuEngine {
             interpreter,
@@ -482,6 +510,7 @@ impl MenuEngine {
                 "thinking" => {
                     *c = MenuNode::new("thinking")
                         .desc("set thinking level")
+                        .child_header("Thinking levels")
                         .value(crate::slashdot_menu::node::ValueChild::Enum(vec![
                             "off".into(),
                             "low".into(),
