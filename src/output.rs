@@ -1429,6 +1429,11 @@ impl Output for ConsoleOutput {
             }
             self.note_text();
         } else {
+            if !self.ended_blank() {
+                let _ = out.write_all(b"\n");
+                self.note_lines(1);
+                self.set_blank(true);
+            }
             self.ensure_dim(false, &mut *out);
         }
         let mut parser = self.parser.lock().unwrap();
