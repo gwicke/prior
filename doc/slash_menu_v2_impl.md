@@ -285,11 +285,11 @@ exceptions.
    already returns `path=[]`, `sel=Some("model")`, the root rows with the
    pinned row as cursor). Applies to `/thinking`, `/set`, `/persona`,
    `/session`, `/tree`, `/sandbox`, `/compact` uniformly.
-2. **`active_selector` (engine)**: `DataProvider::active_selector()` (and
-   the enum/static analogue on nodes) reports the currently-in-effect id;
-   the engine resolves it to the `*` row per frame. Migrate the host's
+2. **`active_row` (engine)**: providers report the currently-in-effect id
+   in their `fetch` response (`DataResult::active_row`); the engine
+   resolves it to the `*` row per frame. Migrate the host's
    ctx-driven `active` computations (Model, Thinking, Persona, Session,
-   Tree) into providers; `MenuState` gains `active_row_marker: Option<usize>`
+   Tree) into providers; `MenuState` has `active_row_marker: Option<usize>`
    distinct from the cursor `active`; open-time cursor seeds on the marker
    row when no sticky cursor exists. Fixes "`/model ` doesn't focus the
    active model on entry" (the cursor currently seeds at the pinned/recent
@@ -389,18 +389,25 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    (`DataResult::active_row`), set inside `fetch`. No mid-menu settings
    mutation is possible (any leaf handler both terminates the menu
    invocation), so one `active_row` per activation is always correct.
-3. **Activation absorbs traversal memory + accept phase (engine +
-   bridge)**: bundle `{ cursors, frames, data_cache, accept_phase }` into
-   the opaque `Activation`. `Frame` (traversal memory) moves from the
-   host into the engine; the accept `AcceptPhase` (interstitial/confirm
-   pause) moves from the controller/`stat_phase` REPL fields into the
-   bundle. `step_at` loses the `frames: &mut Vec<Frame>` parameter;
-   `on_edit` becomes an engine method mutating the bundle's frames. The
-   host carries exactly **one opaque `Activation`** between keypresses
-   (replacing `menu_cursors` + `menu_frames` + confirm threading), via
-   the single `take_activation`/`restore_activation` pair.
-   `Activation::cursors()` remains only as the transition escape for the
-   display arms (removed in Phase 7).
+3. **Host holds one persistent engine (host + bridge; replaces the
+   rebuild ceremony)**: `read_input` constructs `MenuEngine::new(&MenuShared)`
+   **once per prompt** and keeps the instance for the whole activation —
+   no rebuild per keypress, no `Activation` serialization, no
+   `take_activation`/`restore_activation`/`take_cursors`/`restore_cursors`.
+   Cursor map, traversal frames, data cache, and accept phase all live
+   *inside* the engine; the display path calls `engine.interpreter.state(&line)`
+   on the same instance and the key path calls `engine.step_at(...)` on it.
+   - `from_buffer_cursors` stops constructing engines (root list + each
+     per-command overlay derive from the persistent engine's `state()`);
+   - `handle_tab`/`handle_enter`/`engine_esc`/`on_edit` stop constructing
+     engines — they step the shared instance; frames stay engine-owned;
+   - the host's `menu_frames`/`menu_cursors` locals, `engine_seed`/
+     `engine_arrow`/`engine_esc` restore dance, and the `Frame` bridge type
+     are all deleted (frames/cursors never leave the engine);
+   - `/stat`'s legacy `stat_phase` stays a host field only because that
+     overlay is not yet engine-backed; it disappears at Phase 7.1.
+   The `Activation` bundle + accessor pair (Phase 6.7 step 1) was the
+   rebuild-era scaffolding; it is deleted here, not extended.
 4. **Generic leaf result + confirm two-handler (engine + bridge)**:
    `LeafResult<T>` (design §9): menu-semantic variants stay engine-typed
    (close, new path/R8-8, editor handoff, interstitial pause); `T` is the
@@ -424,19 +431,18 @@ no per-frame rebuild; handlers become the sole carriers of app state.
    as plans. No host-side per-variant titles, headers, marker decisions,
    or column layouts remain for menu overlays.
 6. **Tests (persistent-engine contract)**:
-   - persistent-engine equivalence: replaying a key sequence against the
-     carried `Activation` yields identical cursor map, frames, data
-     cache, and accept phase to a single never-rebuilt engine instance
-     (the "forgot to carry X" bug class is gone);
-   - activation clears per menu close/reopen: the data cache and accept
-     phase reset; the sticky cursor map survives reopen (Phase 6.5
-     behavior);
+   - persistence: a single engine instance stepped through a key sequence
+     (drill, arrows, edit, Esc replay, Tab, Enter) maintains cursor map,
+     frames, and data cache across all steps — no host sewing required;
+   - activation lifecycle: a *new* `MenuEngine::new(&MenuShared)` per menu
+     open gives a fresh data cache + accept phase (the reopen clears
+     per-activation state like the old rebuild did);
    - handler closure reads live shared state: a settings change made by
      one handler is visible to the next frame's provider/selector without
      any rebuild;
    - model provider: `fetch` called exactly once per activation despite
-     keypresses/filter edits; `active_selector` reflects a mid-menu model
-     change immediately;
+     keypresses/filter edits; `active_row` reflects the current settings
+     (no mid-menu mutation is possible);
    - confirm two-handler flow: prep → pause → Esc cancel → re-prep →
      accept applies the payload;
    - engine purity: `cargo build -p slashdot_menu` in isolation (the
@@ -462,11 +468,11 @@ step 2.
   `model_selection_overlay_entries`; migrate them to the same provider
   (only the leaf/handlers differ) and delete the v1 helpers.
 - **`active_row` staleness semantics**: providers set `active_row` once
-  per `fetch` (= per activation, since activation == engine instance and
-  settings can't change mid-menu). When Phase 7/6.7-3 makes the engine
-  persistent, decide whether providers re-poll live cells for
-  `active_row` per frame or keep the one-per-activation snapshot —
-  currently designed as one-per-activation (correct today).
+  per `fetch` (= once per activation, since the engine fetches provider
+  data once when a level first opens). Handlers can't change settings
+  mid-menu (any leaf terminates the invocation), so one `active_row` per
+  activation is always correct; re-polling live cells per frame is not
+  needed.
 - **`model_catalog::provider_available` dimming**: the v1 table dimmed
   rows whose provider wasn't available (ANSI `\x1b[2m`). Dropped with the
   custom arm, since it was a per-row presentational computation in host
@@ -497,11 +503,10 @@ host has no per-command menu logic at all.
    view; bare-prompt path completion; `None`. The "open without trailing
    space" word list and `bare_listing_word` special cases die (uniform
    listing rule, §3/6.6-1). The REPL owns **one persistent
-   `MenuEngine`** plus its `Activation` while the menu is open; the
-   activation is dropped/cleared on close and restored on reopen. This
-   is also where the 6.7-3 take/restore ceremony ends: with the engine
-   living in the loop, the activation is simply engine-owned state
-   (no per-frame rebuild, no take/restore).
+   `MenuEngine`** per prompt (from 6.7-3); a *new* engine per menu open
+   drops per-activation state (data cache, accept phase) and the sticky
+   cursor map / traversal frames reset — matching the reopen semantics
+   the old rebuild gave.
 7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
    `handle_esc` / arrows / paging collapse to one arm:
    `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer
@@ -509,8 +514,8 @@ host has no per-command menu logic at all.
    loop (`Stay` → redraw, `Commit(line)` → submit, `Quit` → exit);
    messages printed; interstitial/editor/confirm arrive as
    `AcceptOutcome`. `cursor_sel_policy`, `engine_for`, `engine_seed`,
-   `engine_arrow`, `engine_esc`, and the `menu_cursors`/`menu_frames`
-   loop variables disappear. **Unmigrated commands ride a temporary
+   `engine_arrow`, `engine_esc` disappear (already removed in 6.7-3).
+   **Unmigrated commands ride a temporary
    shim**: their descriptor's leaf handler returns `T = Commit(line)` and
    the legacy `SlashKind` parse in the submit path stays until each
    command's handler migration (7.3).
@@ -523,11 +528,11 @@ host has no per-command menu logic at all.
    `model_overlay_entries`, …). The per-command overlay arms are already
    gone with 7.1; only the parse arms and helpers remain per command.
 7.4. **Final cleanup/audit**:
-   - drop `Activation::cursors()` (the last opaque-bundle escape);
    - delete `SlashKind` + `slash::registry()` once no parse arms remain —
      the root list renders from the root descriptor only;
    - remove dead `engine_rows` fields, `#[allow(dead_code)]` overlay
-     machinery, and any remaining take/restore ceremony;
+     machinery, and the (already removed in 6.7-3) `Activation`/take-
+     restore scaffolding;
    - audit: `slashdot_menu` builds without the parent crate; the host
      renders the engine's plan verbatim (§12) — no per-variant marker or
      cursor policy survives; `grep ActiveOverlay` shows only the four

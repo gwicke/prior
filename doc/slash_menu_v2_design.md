@@ -232,19 +232,20 @@ signal, so it does not interact with the level grammar.
   — never from the typed/pinned selection. On a fresh menu the cursor seeds
   on the active row, marked `*`.
 
-### 5.1 Active-state sourcing (`active_selector`)
+### 5.1 Active-state sourcing (`active_row`)
 
 The "active" row of every candidate list must come from a single, uniform
 mechanism inside the engine — the host never computes or renders it per
 overlay:
 
-- **`DataProvider::active_selector() -> Option<String>`**: dynamic providers
-  report the id of the row that is currently in effect (e.g. the active
-  model's `provider:name`, the current session id, the current leaf's tree
-  entry id). The engine resolves the selector to a row index in the
-  candidate set per frame and renders `*` there.
+- **`DataResult::active_row -> Option<String>`**: dynamic providers report
+  the id of the row that is currently in effect **inside their `fetch`
+  response** (e.g. the active model's `provider:name`, the current session
+  id, the current leaf's tree entry id), set from their own live data
+  source. The engine resolves the id to a row index in the candidate set
+  per frame and renders `*` there.
 - **Enum / static levels**: the same selector notion, from the node
-  descriptor (`active_selector` on the level or value child, e.g.
+  descriptor (an active value on the level or value child, e.g.
   `/thinking`'s currently-set level, `/persona`'s current persona) or from
   the provider supplying the enum rows. A level with no selector (root
   command list) renders no `*` anywhere.
@@ -491,10 +492,10 @@ terminal, transcript).
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
 | Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
 | `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
-| Active-state sourcing | Single engine mechanism (`active_selector` on providers/descriptors) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
+| Active-state sourcing | Single engine mechanism (provider `DataResult::active_row`, §5.1) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
 | Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
-| Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache) carried as opaque engine-owned data; handlers read app state at call time; no rebuild, no Arcs (§2, §12). |
+| Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
 | Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
 | Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only. App-data mutations live in handlers; no canonical-line re-parsing (§9). |
 
@@ -513,7 +514,8 @@ descriptor)`:
   level awaiting drill (the trailing-space rule, §3 — uniform, no host
   exceptions);
 - the candidate rows (ranked, filtered, sorted), including the `*`
-  active-state row resolved from `active_selector` (§5.1);
+  active-state row resolved from the provider's `DataResult::active_row`
+  (§5.1);
 - the cursor row (sticky cursor map), and Tab/Enter/Esc **decisions**:
   the new buffer text, whether to push/pop a traversal frame, and whether
   the accept is a submit (canonical line) or an intermediate state;
@@ -524,19 +526,22 @@ emits a **render plan** (level, rows with marker positions, header, title
 hint) rather than strings where possible, so the host's table renderer can
 format.
 
-**Engine lifetime — persistent, with opaque per-activation state.** The
-engine is *not* rebuilt per keypress. It is built once per menu activation
-(menu closed → menu opened) and the host carries its non-prompt-derived
-state across keypresses as **opaque data owned by the engine**: the cursor
-map, traversal frames, and the provider data cache. The UI holds this
-struct between turns but never inspects it — one accessor pair
-(`take_state`/`restore_state`) replaces the per-piece ceremony. This
-removes the rebuild's costs: provider snapshots never go stale (handlers
-read app state at call time, §2), the data cache survives frames instead of
-re-fetching per keypress, and the "forgot to carry X across the rebuild"
-bug class disappears. Persistence requires no `Arc`s: the engine reads the
-buffer at step entry and mutates nothing app-owned; handlers capture what
-they need (§2).
+**Engine lifetime — persistent, with engine-owned per-activation state.**
+The engine is *not* rebuilt per keypress. It is built once per menu
+activation (menu closed → menu opened) and the host **keeps the engine
+instance** across the keypresses of that activation — there is no
+serialization, no take/restore pair. Cursor map, traversal frames, provider
+data cache, and accept phase all live **inside the engine** for the whole
+activation; the host simply calls `step_at`/`state` on the same instance.
+This removes the rebuild's costs: provider snapshots never go stale
+(handlers read app state at call time, §2), the data cache survives frames
+instead of re-fetching per keypress, and the "forgot to carry X across the
+rebuild" bug class disappears. Persistence requires no `Arc`s: the engine
+reads the buffer at step entry and mutates nothing app-owned; handlers
+capture what they need (§2). (The `Activation` bundle and
+`take_state`/`restore_state` accessor pair were the *rebuild-era*
+scaffolding for carrying per-activation state across a rebuilt engine;
+they are deleted once the host holds the engine directly.)
 
 **The host (`repl.rs`) owns everything not derivable from the prompt:**
 
@@ -555,7 +560,7 @@ they need (§2).
 | Layer | Owns |
 | --- | --- |
 | Engine (pure) | descriptor, prompt-derived state, per-activation state (cursor/frames/cache), key decisions |
-| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`active_selector`, §5.1); perform app-data mutations directly via shared handles |
+| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`DataResult::active_row`, §5.1); perform app-data mutations directly via shared handles |
 | Host | app state itself, terminal I/O, rendering the plan, translating `LeafResult` → `InputAction` |
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
