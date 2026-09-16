@@ -121,8 +121,8 @@ ladder, traversal frames, render-plan emission. Enforced by the
 extension-trait / blanket-impl pattern:
 
 - the base trait `NodeImpl` exposes only the overridable members above;
-- the traversal lives in a separate extension trait, `traverse()` and
-  `traverse_data()` implemented once via blanket impl over `NodeImpl`;
+- the traversal lives in a separate extension trait, `node_traverse()` and
+  `node_data()` implemented once via blanket impl over `NodeImpl`;
 - host and parents call only the extension trait's entry points.
 
 ### Per-node state and the epoch
@@ -140,7 +140,7 @@ decision points, not epoch alone.
 
 The host manages epoch through a thin wrapper (e.g. `get_menu(&mut self)`):
 bumps on `/` transition, holds for the activation. The node tree receives it as
-a `traverse()` parameter. No coordinator struct.
+a `node_traverse()` parameter. No coordinator struct.
 
 ### Traversal algorithm
 
@@ -148,13 +148,16 @@ The traversal is recursive: the parent parses its level, resolves the
 selection, recurses into the selected child with updated `PathArgs`.
 
 **Listing node (children, no submit):**
-- Refresh row cache via `traverse_data()` on each child; check `Rc::ptr_eq`.
+- Refresh row cache via `node_data()` on each child; check `Rc::ptr_eq`.
 - Path exhausted, no child ID match:
   - `no key` / `MoveCursor`: return listing `MenuResult::Continue(RenderPlan, newprompt)`.
-  - `Tab`: expand focused ID, append space, push frame, call child's `traverse()`.
-  - `Enter`: as Tab, but child may `submit()` immediately if it is a leaf.
+  - `Tab`: expand focused ID, append space, push frame, call child's
+    `node_traverse()` with updated PathArgs.
+  - `Enter`: as Tab, but forward key; child may `submit()` immediately if it
+    is a leaf.
 - Child ID match:
-  - Non-empty suffix: `return child.traverse(...)`. All keys handled deeper.
+  - Non-empty suffix: `return child.node_traverse(...)` with updated PathArgs. All
+    keys handled deeper.
   - Empty suffix: handle per §5.1 Esc ladder (frame restore, filter drop, or
     parent-level re-entry).
 
@@ -165,21 +168,21 @@ selection, recurses into the selected child with updated `PathArgs`.
   (nay, pop level). Confirm dialog is a non-overridable engine service.
 - `Esc`: pop per §5.1; also cancels any confirm dialog.
 
-`traverse()` returns `MenuResult::{ Continue(Rc<RenderPlan>, newprompt),
+`node_traverse()` returns `MenuResult::{ Continue(Rc<RenderPlan>, newprompt),
 DoneSuccess, DoneError }`. `RenderPlan` wraps bulk row data in `Rc` so cursor
 movement shares unchanged content — only marker positions (`selected_row`,
 `active_rows`) re-allocate.
 
 ### Parent→child API (implementation-internal, private)
 
-`traverse(&mut self, epoch, KeyActions, PathArgs) -> MenuResult`
+`node_traverse(&mut self, epoch, KeyActions, PathArgs) -> MenuResult`
 - `KeyActions`: `Tab`, `Enter`, `Esc`, `MoveCursor(n)`. The node at the end
   of the traversal handles all logical key actions.
 - `PathArgs.suffix`: byte range into the prompt (preserves trailing
   whitespace). `PathArgs.args`: modifiers + positional args, only on leaf
   nodes.
 
-`traverse_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
+`node_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
 - Parses args from suffix, calls `data()`.
 
 ### Borrow discipline
@@ -274,10 +277,11 @@ prompt); fs-style completion is a modifier behavior (§7), not a level signal.
 Each step applies only when the next does not:
 
 1. Valid child ID, no trailing space → replay local frame (restore previous
-   prompt + filter + cursor); or drop trailing ID if no frame.
-2. Clear local frame + fuzzy terms + modifiers.
-3. Clear selection token (parent gets trailing space, list stays visible).
-4. Strip trailing space → drill out one level. Root: clear entire buffer.
+   prompt + filter); drop trailing ID from prompt and match cursor.
+   This step is applied even without `Esc`, so even when restoring from
+   prompt.
+2. Clear local frame + fuzzy terms + modifiers. Keep cursor position.
+3. Strip trailing space → drill out one level. Root: clear entire buffer.
 
 ### 5.2 Active-state sourcing
 
@@ -432,6 +436,6 @@ translation → `InputAction`. Non-slash affordances (`!shell`, path completion)
 | Node instances | Application data — `data()` / `submit()` / `prepare()`; mutations via shared handles |
 | Host | App state, terminal I/O, rendering plan, `SubmitResult` → `InputAction` |
 
-**Dispatch**: one `ActiveOverlay::Menu`. Host loop: `traverse(epoch, key)` →
+**Dispatch**: one `ActiveOverlay::Menu`. Host loop: `node_traverse(epoch, buffer)` →
 apply `MenuResult` (buffer / submit). Per-command code lives only in node
 impls, never as overlay arms.
