@@ -89,33 +89,80 @@ default) all of its traversal behavior live in one `impl NodeImpl`.
 
 Overridable members (the extension points):
 
-`data(&mut self, epoch, &PathArgs) -> DataResult(Rc<{ Vec<Row>, active_ids: Vec<String> }>) | DataError`
+`data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult | DataError`
 - The rows this node contributes to its parent's listing (static children: its key + description; dynamic: fetched data). Default: none.
-- PathArgs captures IDs from the path traversal, and is described in the
-  traverse() implementation, see further down.
-- Enable optional caching, avoid copies: Return Rc, allow parent node to check
+- `PathArgs` captures IDs and parsed arguments from the path traversal, and is described in the `traverse()` implementation, see further down.
+- Enable optional caching, avoid copies: Return `Rc<DataResponse>`, allow parent node to check
   cheaply whether anything changed using `Rc::ptr_eq`; if nothing changed in
   the input data, its own caches do not need to be re-generated either.
-  Do not cache row data unconditionally in the parent - we want uncached
+  Do not cache row data unconditionally in the parent — we want uncached
   behavior in some cases (e.g. filesystem auto complete). This should be up to
-  the data() handler implementation.
-- called by engine-supplied traverse_data(), which parses args
+  the `data()` handler implementation.
+- Called internally by the default `traverse()` body, which parses args from the path suffix.
 
-`submit(&mut self, epoch, &PathArgs) -> SubmitResult`
+`submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
 
-`prepare(&mut self, epoch, &PathArgs) -> SubmitResult`
+`prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9).
 
-`header(&mut self, PathArgs) -> Vec<String>`
+`header(&mut self, path_args: &PathArgs) -> Vec<String>`
 - Non-selectable header lines for this level (replaces v2 DetailProvider). Default: none.
-- `title()` / metadata | Static strings: description, child header, column defs, field metadata. |
+- Used for help text, dynamic information (stats, message preview, drop/token
+  counts, etc.). The engine truncates based on terminal size to provide
+  sufficient space for menu options (§6).
 
 Non-overridable (the generic machinery, enforced by construction — see
 "Encapsulation" below): path parsing/dispatch, selection validation (D2
 demotion), fuzzy rank-and-pin, the §7.1 filter/sort query engine, the
 per-node cursor cache, the Esc ladder, traversal-frame management, and the
 render-plan emission.
+
+### Core types
+
+```rust
+struct PathArgs {
+    /// IDs parsed from the traversal on the way down, ending in the current ID.
+    ids: Vec<String>,
+    /// Remaining path suffix, byte range into the prompt (preserves trailing
+    /// whitespace — matters for listing semantics).
+    suffix: std::ops::Range<usize>,
+    /// Parsed dot-modifier key-value pairs and positional args.
+    /// Only supplied to data() and submit() on leaf nodes (no children),
+    /// and only when args are present.
+    args: Option<Args>,
+}
+
+struct Args {
+    modifiers: Vec<(String, Value)>,
+    positional: Vec<String>,
+}
+
+/// Data response from a node's `data()`, wrapped in `Rc` for zero-copy
+/// sharing across the traversal and optional cheap equality checks.
+struct DataResponse {
+    rows: Vec<Row>,
+    active_ids: Vec<String>,  // empty vec = no active row (cheap, no heap)
+}
+
+struct DataError {
+    message: String,
+}
+
+type DataResult = Result<Rc<DataResponse>, DataError>;
+
+enum SubmitResult {
+    Done,                    // close the menu
+    Prepared,                // confirm flow: pause with yea/nay dialog (§9)
+    NewPath(String),         // return a new prompt path (e.g. /compact)
+    LaunchEditor,            // launch external $EDITOR
+}
+```
+
+`Rc<DataResponse>` enables zero-copy sharing between the node's cache and
+the parent's merge step; `Rc::ptr_eq` gives the parent a cheap "nothing
+changed" signal for cursor-cache preservation. The node's `data()` impl
+decides whether to return a new `Rc` or reuse a cached one.
 
 ### Per-node state and the epoch
 
@@ -131,13 +178,22 @@ Each node owns **private, local state** in its impl:
   §9), keyed as the node sees fit.
 
 All caches are invalidated by the **epoch**: a menu-invocation counter the
-root increments on every menu open and threads down the traverse chain.
+host increments on every menu open and threads down the traverse chain.
 Epoch increment ⇒ fresh per-node state, matching the v2 "new engine per
 menu open" reopen semantics (§12) without a shared context datatype. A
 multi-stage flow that must survive *within* one epoch (compaction's
 stage → Esc → re-stage → accept) keys its cache on its own decision
 points (e.g. the compaction target id — sessions are append-only trees, so
 target-id keying alone is sound), not on epoch alone.
+
+The host manages the epoch through a thin wrapper API (e.g.
+`get_menu(&mut self) -> &Menu`): the wrapper bumps the epoch when the
+input transitions from non-slash to `/` (menu open), and holds the fixed
+epoch for all subsequent navigation within that activation. When the menu
+is dismissed (empty buffer, submit, or Esc at root), the epoch is released.
+The wrapper owns the epoch counter; the node tree receives it as a
+parameter on each `traverse()` call. There is no coordinator struct —
+the wrapper is one function call on the host side.
 
 ### Encapsulation: private traversal via blanket impl
 
@@ -157,11 +213,16 @@ from path_remainder, resolves the selection, and recurses into the selected
 child with the updated PathArgs and remainder. 
 
 If the path is exhausted:
-- populate / refresh the row cache: if the node has children, call data() on
+- populate / refresh the row cache: if the node has children, call `data()` on
   each with the empty path remainder; check pointer equality
-- return a `Rc<RenderPlan>` for the selection menu (and new prompt,
-  usually unchanged) for the host to render.
-- if the node has a submit handler instead (mutually exclusive with children), 
+- return a `MenuResult::Continue(Rc<RenderPlan>, newprompt)` for the host to
+  render. The `RenderPlan` wraps its bulk row data (`text: Rc<String>`,
+  table cells) in `Rc` so that cursor movement (Tab/Enter/MoveCursor) can
+  return a new plan that shares unchanged row data with the previous frame —
+  the host re-renders only the marker positions (`selected_row`, `active_rows`)
+  without re-allocating or re-copying the full content. For a 1000-row `/tree`
+  list, cursor movement allocates only the new marker positions, not 1000 row
+  strings.
 
 If the path suffix is non-empty:
 - if the node has children, 
@@ -199,9 +260,11 @@ returning `MenuResult(
 - Only one traversal is active at a time, so no concerns about concurrent
   access.
 
-`traverse_data(&mut self, epoch, PathArgs)`
-returning ` DataResult(Rc<struct{rows: vec<row>, active_ids:vec<int}>)
-            | DataError`
+**Internal helper** (not a public API — parent nodes never call `data()`
+directly; all access is through `traverse()` for uniform parameter handling,
+caching, and possible future generic caching extensions):
+
+`traverse_data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult | DataError`
 - Parses args from suffix (if any) using generic dot modifier / positional arg
   parser; calls `data()`.
 
@@ -272,7 +335,16 @@ each with its own row source and its own submit handler**. The rules:
   submit — a static child's key-submit, a dynamic row's id-submit. One
   listing can mix e.g. a static `add` row and dynamic binding rows, each
   submitting differently. The parent keeps track of which row is owned by
-  which child, e.g. by storing a positional child ID with each received row.
+  which child by tagging each row with its owning child's index during the
+  merge step. Concretely: the default `traverse` body calls each child's
+  `traverse_data()` in declaration order, and as each child's rows are
+  appended to the merged list, the engine stores a `child_index: u16` (or
+  equivalent compact tag) alongside each row. On Tab/Enter, the engine
+  reads the tag from the cursor-row's row and dispatches to the
+  corresponding child's `submit()`. This is internal to the default
+  traversal body — not part of the `Row` struct's public API — and
+  implementations may optimize the storage (a simple offset-based scheme
+  suffices when child row counts are known).
 - **A dynamic child under a mixed level may itself carry static children**
   (the v2 "two grammar levels" encapsulation, unchanged).
 
@@ -506,7 +578,7 @@ cached rows — this generalizes the hand-written `ModelFilter` /
 | `.field:value` | Exact match on a string field (id, description, or string key-value field). |
 | `.field:>v` / `.field:<v` | Numeric comparison (retain rows with value > / < v); `>=` / `<=` likewise. Comparison filters drop rows *missing* the field. |
 | `.sort:field` | Direction defaults to the field's declared `default_dir` (§8.1), so legacy names like `.sort:coding` keep working. |
-| `.sort:>field` / `.sort:<field` | Explicit descending / ascending as a prefix; currently uses suffix, but change back to prefix to be consistent with filtering; need fuzzy search handling to ignore [<>] prefix. |
+| `.sort:>field` / `.sort:<field` | Explicit descending / ascending as a prefix. The `<>` prefix is stripped during fuzzy search, so typing `.sort:>co` still matches `coding`. |
 
 Rules:
 
@@ -616,8 +688,7 @@ distinct and each is framework-owned where it can be:
      Esc / any buffer rewrite while paused — the engine routes the cancel
      to the node, which drops its staged payload (cache management, §2).
      Re-entering the same prompt from scratch re-runs the prep.
-   - Consequence: no menu-level confirm state remains — the coordinator
-     (§12) shrinks to the root entry point + the epoch counter.
+   - Consequence: no menu-level confirm state remains in the engine.
 2. **Editor handoff** — the external `$EDITOR` review *replaces the UI
    temporarily* and is driven by the leaf handler call itself (handler returns
    "launch editor"); not an interstitial. Cancellation re-enters the prompt
@@ -625,29 +696,26 @@ distinct and each is framework-owned where it can be:
    TODO: Can this be handled purely by blocking in the prepare() handler,
    without tree traversal?
 
-**Leaf handler results** (formalized from R8-8, revised): `MenuResult`
-is generic over the host's action type. It carries:
+**Leaf handler results** (formalized from R8-8, revised): `SubmitResult`
+(§2, "Core types"). The handler returns one of:
+- `Done` — close the menu;
+- `NewPath(String)` — buffer rewrite (e.g. `/compact` →
+  `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy);
+- `Prepared` — pause for confirm (§9);
+- `LaunchEditor` — hand off to `$EDITOR`.
 
-- **Menu-semantic outcomes** the engine drives itself: close the menu,
-  **return a new path** (buffer rewrite, e.g. `/compact` →
-  `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy),
-  pause for confirm (§9), launch the editor, interstitial text;
-- a **narrow host-outcome payload** `T` the engine treats as uninterpreted
-  data — *only* the effects belonging to the REPL outer loop, not app-data
-  mutations: `flow` (stay in menu / commit line / quit), an optional
-  success/error message, and the redraw signal. App-data mutations
-  (set model, write session, update recents, trigger a background refresh)
-  are performed **by the handlers themselves** via the shared handles they
-  captured at build time — they run at accept time, after the frame's
-  engine decisions are made, so there is no re-entrancy into the engine's
-  ongoing work. The consequence: app state a handler mutates must live in
-  shared cells (single-threaded `Rc<RefCell>`), not in loop-owned
-  `&mut` borrows — an explicit app-side structuring step.
+App-data mutations (set model, write session, update recents, trigger a
+background refresh) are performed **by the handlers themselves** via the
+shared handles they captured at build time — they run at accept time,
+after the frame's engine decisions are made, so there is no re-entrancy
+into the engine's ongoing work. The consequence: app state a handler
+mutates must live in shared cells (single-threaded `Rc<RefCell>`), not in
+loop-owned `&mut` borrows — an explicit app-side structuring step.
 
 Purity comes from the crate boundary + generics (the engine compiles
-without knowing what `T` is), not from an intermediate result vocabulary;
-the host applies only what only the host *can* apply (control flow,
-terminal, transcript).
+without knowing the host's action type), not from an intermediate result
+vocabulary; the host applies only what only the host *can* apply (control
+flow, terminal, transcript).
 
 ---
 
@@ -706,7 +774,7 @@ newpath; drop current parallel menu |
 | Merged child sets | v2.5 new: one level = ordered union of child rows (static + enum + dynamic children each with own data/submit); field metadata on the parent; per-child submit dispatch (§2.1). |
 | Node sharing | Reuse a node impl by *instantiating* it per parent (e.g. `/model` and `/set default_model`); no `Rc` sharing — plain local per-node state (§2). |
 | Confirm dialog | v2.5: dialog is a not-overridable engine service; the handler owns the state machine and staged payload (`prepare` default-noop = `submit`; `SubmitResult::Prepared` pauses; `submit()` on yea) (§9). |
-| Coordinator | v2.5: shrinks to the root entry point + the epoch counter; no centralized interpreter state machine, no menu-level confirm state (§12). |
+| Coordinator | v2.5: eliminated — host manages epoch via wrapper function; no coordinator struct (§2, §12). |
 
 ---
 
@@ -720,13 +788,13 @@ dispatch) traces to fuzzy ownership boundaries. The settled division:
 generic machinery (path parsing, selection validation, rank-and-pin,
 §7.1 filter/sort query, per-node cursor caches, the Esc ladder,
 traversal frames, render-plan emission) lives in the default,
-non-overridable traversal (blanket impl, §2). The **coordinator shrinks
-to two things**: the root entry point (start a traversal from `/`) and
-the **epoch counter** (incremented per menu open, threaded down the
-traverse chain, invalidating per-node caches). There is no centralized
-interpreter state machine and no menu-level confirm state (§9 — the
-confirm flow is handler-local). Per frame the traversal produces, from
-`(line, descriptor-tree, epoch, application context)`:
+non-overridable traversal (blanket impl, §2). The **epoch is managed by
+the host** through a thin wrapper (§2, "Per-node state and the epoch"):
+the wrapper bumps the epoch on menu open and holds it for the activation;
+the node tree receives it as a parameter on each `traverse()` call. There
+is no centralized interpreter state machine and no menu-level confirm
+state (§9 — the confirm flow is handler-local). Per frame the traversal
+produces, from `(line, node-tree, epoch)`:
 
 - the resolved level (node path) and whether it is a listing or a pinned
   level awaiting drill (the trailing-space rule, §3 — uniform, no host
@@ -762,7 +830,7 @@ once the host holds the node tree directly.)
 
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
-- applying the leaf result's narrow host outcome: control flow (commit /
+- applying the submit result's narrow host outcome: control flow (commit /
   quit / stay), prompt update, redraw. All app-data mutations happen in node
   `submit()` (§9) via shared handles; the host loop applies only what the
   outer loop owns. Engine purity rests on the crate boundary + generics,
