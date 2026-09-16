@@ -175,12 +175,12 @@ decides whether to return a new `Rc` or reuse a cached one.
 
 Each node owns **private, local state** in its impl:
 
-- a **cursor cache** keyed on the level's filter state — the (index, pin,
-  terms) triple with the uniform reset-on-change rule of v2's `CursorMap`
-  (§4), so arrow movement survives buffer re-derives and typing re-targets
-  the cursor;
-- a **data cache** for one-shot fetches (§8), surviving frames of one menu
-  activation;
+- a **cursor cache**: selected ID, and per-filter state index. Arrow movement
+  survives buffer re-derives and typing re-targets the cursor;
+- a **derived data cache**, surviving frames of one menu activation; main
+  caching is in data() handlers, but when those return unchanged Rc's (pointer
+  equality), then we can reuse derived state cached internally. Minimize
+  data duplication.
 - optionally richer per-node state (e.g. a confirm flow's staged payload,
   §9), keyed as the node sees fit.
 
@@ -219,25 +219,46 @@ The traversal itself is *recursive*: a parent's default body parses its level
 from path_remainder, resolves the selection, and recurses into the selected
 child with the updated PathArgs and remainder. 
 
-If the path is exhausted:
-- populate / refresh the row cache: if the node has children, call `data()` on
-  each with the empty path remainder; check pointer equality
-- return a `MenuResult::Continue(Rc<RenderPlan>, newprompt)` for the host to
-  render. The `RenderPlan` wraps its bulk row data (`text: Rc<String>`,
-  table cells) in `Rc` so that cursor movement (Tab/Enter/MoveCursor) can
-  return a new plan that shares unchanged row data with the previous frame —
-  the host re-renders only the marker positions (`selected_row`, `active_rows`)
-  without re-allocating or re-copying the full content. For a 1000-row `/tree`
-  list, cursor movement allocates only the new marker positions, not 1000 row
-  strings.
 
-If the path suffix is non-empty:
-- if the node has children, 
-  - make sure the local child ID cache is populated / up to date (as above)
-  - parse out modifiers and positional arguments (whitespace-delimited) until
-    a valid child-supplied ID is found
-  - if child ID is found, call traverse() with updated Path on the
-    corresponding child
+Listing node (children, no submit handler):
+- populate / refresh the row cache: call `traverse_data()` on each with the
+  empty path remainder; check pointer equality - if changed, update internal
+  derived state
+- Path exhausted without child ID match: 
+  - no key: return listing view MenuResult::Continue(RenderPlan / newprompt)
+  - MoveCursor: update cursor position, return new RenderPlan
+  - tab: expand focused ID in prompt, append space, populate internal frame
+    cache, directly call child's traverse()
+  - enter: as for tab, but direct call to child might submit() right away if
+    child is leaf 
+- Child ID match:
+  - Non-empty suffix: Continue with traversal by `return traverse()` on owning
+    child.
+  - Empty suffix
+    - no key: abort traversal and handle similar as "path exhausted", except
+      for "reset to frame state and/or focus cursor" detail - see Esc ladder
+      #5.1. return listing view RenderPlan / newprompt
+    - MoveCursor: as in "without child ID match after "no key" rewrite
+    - Esc: Clear frame and filter state, leaving only own `selector`; update
+      RenderPlan
+    - Tab / Enter: as in "no child ID match"
+
+Leaf node (no children, submit handler), no key actions:
+- Display the local `header()` via RenderPlan
+- no key: just return RenderPlan
+- enter: run prepare() handler, which by default returns submit().
+- esc: pop protocol as in #5.1
+
+All RenderPlan / newprompt mentions involve a
+`MenuResult::Continue(Rc<RenderPlan>, newprompt)` for the host to render. The
+`RenderPlan` wraps its bulk row data (`text: Rc<String>`, table cells) in `Rc`
+so that cursor movement (Tab/Enter/MoveCursor) can return a new plan that
+shares unchanged row data with the previous frame — the host re-renders only
+the marker positions (`selected_row`, `active_rows`) without re-allocating or
+re-copying the full content. For a 1000-row `/tree` list, cursor movement
+allocates only the new marker positions, not 1000 row strings.
+
+### Private parent -> child call API
 
 `traverse(&mut self, epoch, KeyActions, PathArgs)`
 returning `MenuResult(
@@ -463,8 +484,9 @@ signal, so it does not interact with the level grammar.
     (clearing refinement terms, §4).
 - **Enter**:
   1. If the node has a `header()`, it is always displayed (non-modal — no
-     Enter-to-dismiss; Esc or backspace clears the menu). For `/stat`, the
-     stats text is `header()` output, not a separate interstitial phase.
+     Enter-to-dismiss; Esc or backspace backtracks the path / leaves the
+     menu). For `/stat`, the stats text is `header()` output, not a separate
+     interstitial phase.
   2. If the node has a `submit` handler, invoke it (with `prepare` semantics
      if declared).
   3. Otherwise Enter behaves like Tab-drill: append trailing space and show
@@ -534,16 +556,18 @@ overlay:
 
 ## 6. Rendering
 
-- **Panel structure**: optional header rows, non-selectable header row, selectable rows with `> ` (selected) / `* ` (active-default)
-  markers.
+- **Panel structure** (slightly adjusted from v1/v2.0): 
+  - optional header() handler rows
+  - non-selectable header column row (if any child rows)
+  - selectable rows with `> ` (selected) / `* ` (active-default) markers.
 - **Headers** (R8-4):
   - *(i)* Optional node-supplied multi-line / preformatted `header()` - can be
     used to provide help, or display dynamic information (stats, message
     preview, drop/token counts, etc.). Truncated based on terminal size to
     provide sufficient space for menu options (if any)
-  - *(ii)* when child IDs / table is present: static single-line `header` from the
-    descriptor, showing table headings; fixed position when scrolling through
-    long list
+  - *(ii)* when child IDs / table is present: static single-line table
+    headers from the descriptor, showing table headings; fixed position when
+    scrolling through long list
 - The generic UI limits the header block to the available vertical space,
   accounting for the space the menu options need (as `/tree <id>` sub-menus do
   today).
@@ -551,6 +575,9 @@ overlay:
   knobs (`headers`, `aligns`, `min_widths` priority ordering, `gap`,
   `ellipsis`, wrap-vs-ellipsis) are sufficient; nothing from the hand-built
   settings/sandbox/model tables is lost.
+  Table inclusion might become more dynamic in the future (e.g. always include
+  modifier-specified filter / sort columns, explicit `.columns:` modifier) -
+  so keep the data structures flexible for now.
 
 ---
 
@@ -568,8 +595,8 @@ A modifier is:
 | `key` | Dot token name (`.sort`, `.prompt`, `.ro`, …). |
 | value kind | `string` / `number` (float or int, permissively parsed) — only these two types. |
 | enum set | **Orthogonal** to the value kind: an optional candidate list constraining *completion* only. The interpreter never rejects an out-of-enum token — the backend validates at accept time (any prompt is valid; the action may error). |
-| completion source | `dataset-derived` (**default**): unless an enum is set, the distinct string values of the field are extracted in a preprocessing pass over the cached rows (§8.1). · `dynamic handler` (query → candidates, cached until the level changes — trailing slash for fs descent, §8) · `default value` (auto-filled on Tab alongside the selector, e.g. `.prompt` next to the `llm` selection in the compaction menu). |
-| front-end / back-end | **Front-end**: applied by the interpreter over cached rows (§7.1). **Back-end**: passed through to the data-fetch handler for live filtering (e.g. fs paths). `MODEL_MODIFIERS` metadata is the seed for this split (R8-6). |
+| completion source | `dataset-derived` (**default**): unless an enum is set, the distinct string values of the field are *lazily* extracted on first modifier use with a pass over the cached rows (§8.1). · `dynamic handler` (query → candidates, cached until the level changes — trailing slash for fs descent, §8) · `default value` (auto-filled on Tab alongside the selector, e.g. `.prompt` next to the `llm` selection in the compaction menu). |
+| front-end / back-end | **Front-end**: applied by the interpreter over cached rows (§7.1). **Back-end**: passed through to the data-fetch handler for live filtering (e.g. fs paths). The data() implementation controls caching, and determines which is used. |
 
 Value tokens may be multi-word (consume until next dot-modifier / valid id /
 end of prompt); selection tokens may not (R8-7).
