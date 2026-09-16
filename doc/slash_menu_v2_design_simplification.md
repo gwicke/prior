@@ -132,6 +132,16 @@ not how keys behave.
    map and frames anyway. If a supervisor survives, the "no interpreter"
    framing dissolves: the interpreter became the default `traverse` body +
    the coordinator.
+   - I was leaning towards having each node's default implementation own the
+     local traversal and cursor state, and clear on epoch (menu invocation
+     counter) increment (needs to be passed down the traverse chain, omitted
+     in the example). This avoids the need for a magic ctx datatype.
+     All this caching would be in the single, private node implementation - so
+     easy to test. Privacy / non-overridability of e.g. the traverse() method
+     can be ensured e.g. using the extension trait / blanked impl pattern.
+     Multi-stage processes like the compaction node are fairly easy to support
+     in this setting, with a localized implementation and principled cache
+     management.
 2. **State derivation vs. key stepping.** Today `state(line)` is called per
    frame (host re-derives everything from the buffer; the engine is
    stateless w.r.t. frames) and `step_at(line, key)` is the mutation point.
@@ -141,18 +151,26 @@ not how keys behave.
    persistent engine from 6.7-3 makes stateful long-lived nodes viable —
    but then per-node state needs reset-on-reopen semantics, which the
    engine currently owns centrally.)
+   - Yes, per-node cursor. Keyed on the filter state, remember the filtered
+     list + active ID. Reset all cache state on epoch increment.
 3. **Selection validity (D2).** The centralized `state()` demotes a trailing
    token that matches no candidate id into a fuzzy term, checked against the
    *cached row set*. In the default traverse this is replicable, but a
    per-node override (the sandbox fs-complete node, say) can silently skip
    it — the failure mode is a pin on a nonexistent id instead of a filter
    term. Centralized keeps the invariant in one audited place.
+   - Wouldn't this all be handled generically in the private node code? Both
+     are uniform / private implementations, just split up slightly
+     differently.
 4. **Borrow/mutability ergonomics.** `traverse(&mut self)` recursively over
    a tree of `Box<dyn Node>` means `&mut` dispatch into a subtree per level
    while the parent holds siblings — index-based descent or arena. The
    current interpreter sidesteps this by cloning the (cheap, `Clone`-derived)
    descriptor and holding providers in a flat map. Not a blocker, but the
    trait tree makes the engine's data structures noticeably hairier.
+   - > `&mut` dispatch into a subtree per level while the parent holds siblings
+     Where does the "while the parent holds siblings" come from? There is only
+     one traverse of the tree active at a time, correct?
 5. **What is left of the interpreter, concretely?** Grammar parse
    (`parse_level`), rank-and-pin, query compilation (§7.1), render plan
    build, cursor map, frames, accept phase. If the default `traverse` body
@@ -162,12 +180,31 @@ not how keys behave.
    needs to be stated as something other than "less machinery": is it
    extensibility (new commands = implement one trait), testability
    (per-node unit tests), or eliminating the descriptor/handler split?
+   - Agreed, the basic logic is still there - just structured differently,
+     mostly behind the scenes. I think the main strength of the trait
+     implementation side of the idea is more on the "node as one
+     understandable implementation unit" side. I think this will make the code
+     easier to follow and extend. And the trait approach can start out with a
+     very small set of extension points (data and submit being the main ones),
+     but it is not hard to later expose targeted additional extension points
+     where necessary, while keeping it all in a small and local interface.
 6. **RenderPlan in the return type.** `Continue(Option<RenderPlan>,
    Option<newprompt>)` fuses derivation and rendering into each call. The
    host still needs `MenuState` details the plan does not carry (cursor row
    for Tab/Enter focus math, `pin_lost`, level identity for cursor keys) —
    either the plan grows fields (it becomes MenuState) or there is a second
    call. Clarify.
+   - What is the tab/enter focus math about? If that is the initial focused
+     row on first enter of a menu, then I thought that would already be
+     indicated in the rows sent in the render plan?
+     My conceptual thinking of RenderPlan is more like a text version of
+     server-rendered HTML: Send the content, indicate which rows should be
+     marked / focused, send all mutations (key presses) to the server, which
+     returns a new render. The level identity part would dissolve into hittng
+     the same node. "pin lost" is also something the node itself knows best
+     about, right? Tab/enter would be node-level logic and state (for esc). So
+     the RenderPlan would be not much more than content - maybe making the
+     host layer even thinner?
 7. **Migration timing.** Steps 1–7 of the revised 7.2 (uniform key loop,
    CommandList/Model/Thinking/Persona/Mod/Session/Tree/Stat) are
    model-agnostic — they collapse host overlays onto the engine as it
@@ -176,6 +213,8 @@ not how keys behave.
    first. Adopting B (distributed traversal) mid-flight invalidates the
    interpreter's test suite (~40 table tests) — that cost needs to be
    weighed against finishing 7.2 first.
+   - How much of the test suite is prompt / key level (reusable?), and how
+     much is low level unit tests?
 
 ## Pros / Cons summary
 
@@ -201,11 +240,19 @@ not how keys behave.
   invariants (Esc up-walk + frame replay, scoped edit invalidation,
   sticky-cursor-by-path, D2 demotion, §7.1 query compile) still need a
   coordinator, so the "no interpreter" goal is likely illusory.
+  - Do you see points that would really benefit from a cental coordinator
+    here? To me, it feels like a structural tree that follows the traversal
+    makes many things easier - there are not several specialized and
+    partly-aligned tree structures mirroring the node structure.
 - Per-node overrides are unbounded escape hatches: each one can diverge
   from a centralized invariant silently (validity demotion being the
   clearest). Today's model confines per-command code to data + handlers.
+  - This depends on what is opened up, right? As mentioned before, the main
+    entry points like traverse() would be private, for sure. I would start
+    with a minimal set of customization points.
 - Recursive `&mut` dispatch over a node tree complicates the engine's data
   structures (arena/index descent) for no user-visible gain.
+  - Can you elaborate on this?
 - Fusing state derivation + key stepping + rendering into one signature
   either grows RenderPlan into MenuState or forces a second call.
 - Full-trait migration invalidates the engine's table-driven test suite
