@@ -2,7 +2,7 @@ use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx, ModelFilter};
 use crate::settings::SettingsStore;
 use crate::session::Session;
-use crate::session::repo::SessionRepo;
+use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
@@ -2587,7 +2587,7 @@ async fn handle_session_command(
 
                 let (storage, index) = if meta.cwd != cwd {
                     let repo = repo.as_ref().unwrap();
-                    match repo.fork(&meta, "", &cwd).await {
+                    match repo.fork(&meta, "", &cwd, ForkMode::FullTree).await {
                         Ok(forked_storage) => {
                             let index = match forked_storage.build_index().await {
                                 Ok(i) => i,
@@ -2687,7 +2687,7 @@ async fn handle_session_command(
                         return SessionCommandResult::Handled;
                     }
                 };
-                match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
+                match repo.as_ref().unwrap().fork(&meta, "", &cwd, ForkMode::FullTree).await {
                     Ok(new_storage) => {
                         let index = new_storage.build_index().await.unwrap_or_else(|_| {
                             let header = crate::session::SessionHeader::new(&cwd);

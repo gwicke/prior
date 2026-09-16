@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::io::AsyncWriteExt;
 
 use crate::session::types::*;
 use crate::session::storage::*;
@@ -17,6 +18,18 @@ use crate::session::storage::*;
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
+
+/// Fork mode: controls which entries are copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkMode {
+    /// Full tree fork: copy all entries byte-for-byte, only rewrite header.
+    /// Preserves all branches, compactions, labels, and the original leaf.
+    /// This is the default for `/session <id> fork`.
+    FullTree,
+    /// Active path only: copy only the linear path from root to fork_entry_id.
+    /// Used by `/tree` when forking at a specific entry.
+    ActivePath,
+}
 
 /// Repository managing multiple sessions in a directory.
 #[async_trait]
@@ -34,14 +47,17 @@ pub trait SessionRepo: Send + Sync {
     /// Delete a session file.
     async fn delete(&self, meta: &SessionMetadata) -> crate::Result<()>;
 
-    /// Fork a session from a specific entry.  Copies the header + entries up to
-    /// (and including) the fork entry into a new session file, linked via
-    /// `parentSession`.
+    /// Fork a session from a specific entry.
+    /// 
+    /// - `fork_entry_id` empty → FullTree fork (entire session, all branches)
+    /// - `fork_entry_id` set + `ForkMode::ActivePath` → path-only fork (for /tree)
+    /// - `fork_entry_id` set + `ForkMode::FullTree` → full tree + new Leaf at fork_entry_id
     async fn fork(
         &self,
         source: &SessionMetadata,
         fork_entry_id: &str,
         cwd: &Path,
+        mode: ForkMode,
     ) -> crate::Result<JsonlSessionStorage>;
 }
 
@@ -415,42 +431,94 @@ impl SessionRepo for JsonlSessionRepo {
         source: &SessionMetadata,
         fork_entry_id: &str,
         cwd: &Path,
+        mode: ForkMode,
     ) -> crate::Result<JsonlSessionStorage> {
-        // Open the source session and build its index.
-        let source_storage =
-            JsonlSessionStorage::open_or_create(source.path.clone()).await?;
-        let source_index = source_storage.build_index().await?;
-
-        // Empty fork_entry_id means "fork the entire session" (root to leaf).
-        let effective_leaf = if fork_entry_id.is_empty() {
-            source_index.leaf_id.as_deref().unwrap_or("")
-        } else {
-            fork_entry_id
-        };
-
-        // Collect entries from root to fork_entry_id (path-to-root reversed).
-        let path_to_root = source_index.get_path_to_root(effective_leaf);
-
-        // Create the new session file manually (don't use self.create() because
-        // we need to set parent_session in the header).
-        let path = self.session_file_path(cwd);
-        let new_storage = JsonlSessionStorage::open_or_create(path).await?;
-
-        let header = SessionHeader::forked(
-            cwd,
-            source.path.clone(),
-            source_index.header.provider.clone(),
-            source_index.header.model_id.clone(),
-            source_index.header.thinking_level.clone(),
-        );
-        new_storage.write_header(&header).await?;
-
-        // Write the forked entries in root→leaf order.
-        for entry in &path_to_root {
-            new_storage.append_entry(entry).await?;
+        // Read the entire source file content.
+        let source_content = tokio::fs::read_to_string(&source.path).await?;
+        let lines: Vec<&str> = source_content.lines().collect();
+        if lines.is_empty() {
+            return Err(crate::PicocodeError::Other("Source session file is empty".into()));
         }
 
-        Ok(new_storage)
+        // Parse the original header to carry forward metadata.
+        let orig_header: SessionHeader = serde_json::from_str(lines[0])?;
+
+        let new_path = self.session_file_path(cwd);
+
+        match mode {
+            ForkMode::FullTree => {
+                // Full tree fork: copy all entries byte-for-byte, only rewrite header.
+                // If fork_entry_id is set, we also append a new Leaf pointing to it.
+                let new_header = SessionHeader::forked(
+                    cwd,
+                    source.path.clone(),
+                    orig_header.provider.clone(),
+                    orig_header.model_id.clone(),
+                    orig_header.thinking_level.clone(),
+                );
+                let new_header_line = serde_json::to_string(&new_header)?;
+
+                let mut new_file = tokio::fs::File::create(&new_path).await?;
+                new_file.write_all(new_header_line.as_bytes()).await?;
+                new_file.write_all(b"\n").await?;
+
+                // Copy ALL remaining lines unchanged (includes valid leaf entry).
+                for line in &lines[1..] {
+                    if !line.trim().is_empty() {
+                        new_file.write_all(line.as_bytes()).await?;
+                        new_file.write_all(b"\n").await?;
+                    }
+                }
+
+                // If a specific fork_entry_id was given, append a new Leaf pointing to it.
+                // This makes the forked session start at that entry explicitly.
+                if !fork_entry_id.is_empty() {
+                    let leaf = SessionEntry::new_leaf(Some(fork_entry_id.to_string()), None);
+                    let leaf_line = serde_json::to_string(&leaf)?;
+                    new_file.write_all(leaf_line.as_bytes()).await?;
+                    new_file.write_all(b"\n").await?;
+                }
+
+                let new_storage = JsonlSessionStorage::open_or_create(new_path).await?;
+                Ok(new_storage)
+            }
+            ForkMode::ActivePath => {
+                // Active path only: build index and extract path-to-root.
+                let source_storage =
+                    JsonlSessionStorage::open_or_create(source.path.clone()).await?;
+                let source_index = source_storage.build_index().await?;
+
+                let effective_leaf = if fork_entry_id.is_empty() {
+                    source_index.leaf_id.as_deref().unwrap_or("")
+                } else {
+                    fork_entry_id
+                };
+
+                let path_to_root = source_index.get_path_to_root(effective_leaf);
+
+                let new_storage = JsonlSessionStorage::open_or_create(new_path).await?;
+
+                let header = SessionHeader::forked(
+                    cwd,
+                    source.path.clone(),
+                    source_index.header.provider.clone(),
+                    source_index.header.model_id.clone(),
+                    source_index.header.thinking_level.clone(),
+                );
+                new_storage.write_header(&header).await?;
+
+                // Write the forked entries in root→leaf order.
+                for entry in &path_to_root {
+                    new_storage.append_entry(entry).await?;
+                }
+
+                // Append a new Leaf pointing to the fork entry.
+                let leaf = SessionEntry::new_leaf(Some(effective_leaf.to_string()), None);
+                new_storage.append_entry(&leaf).await?;
+
+                Ok(new_storage)
+            }
+        }
     }
 }
 
@@ -714,12 +782,13 @@ mod tests {
         let sessions = repo.list(Some(cwd)).await.unwrap();
         assert_eq!(sessions.len(), 1);
 
-        // Fork from e1 (before e2, so we get only the first message)
-        let fork_storage = repo.fork(&sessions[0], "e1", cwd).await.unwrap();
+        // Fork from e1 (before e2, so we get only the first message) - ActivePath mode
+        let fork_storage = repo.fork(&sessions[0], "e1", cwd, ForkMode::ActivePath).await.unwrap();
         let fork_index = fork_storage.build_index().await.unwrap();
 
-        // Fork should have the header + e1 = 1 entry (header is separate)
-        assert_eq!(fork_index.entries.len(), 1);
+        // Fork should have the header + e1 = 1 entry (header is separate).
+        // Note: the new Leaf entry pointing to e1 is also in entries map.
+        assert_eq!(fork_index.entries.len(), 2); // e1 + Leaf
         assert!(fork_index.entries.contains_key("e1"));
 
         // Fork should have parent_session set
@@ -727,6 +796,129 @@ mod tests {
 
         let sessions_after = repo.list(Some(cwd)).await.unwrap();
         assert_eq!(sessions_after.len(), 2); // original + fork
+
+        let _ = tokio::fs::remove_dir_all(&base_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_fork_session_full_tree() {
+        let (repo, base_dir) = create_test_repo().await;
+        let cwd = Path::new("/home/test");
+
+        // Create source session with a few entries + a branch.
+        let source_storage = repo.create(cwd).await.unwrap();
+        let header = crate::session::SessionHeader::new(cwd);
+        source_storage.write_header(&header).await.unwrap();
+
+        let entry1 = SessionEntry {
+            id: "e1".into(),
+            parent_id: None,
+            timestamp: "t1".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"user","content":[]}),
+            },
+        };
+        source_storage.append_entry(&entry1).await.unwrap();
+
+        let entry2 = SessionEntry {
+            id: "e2".into(),
+            parent_id: Some("e1".into()),
+            timestamp: "t2".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"assistant","content":[]}),
+            },
+        };
+        source_storage.append_entry(&entry2).await.unwrap();
+
+        // A branch from e1
+        let entry3 = SessionEntry {
+            id: "e3".into(),
+            parent_id: Some("e1".into()),
+            timestamp: "t3".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"user","content":[]}),
+            },
+        };
+        source_storage.append_entry(&entry3).await.unwrap();
+
+        // Leaf pointing to e2 (active branch)
+        let leaf = SessionEntry::new_leaf(Some("e2".into()), Some("e1".into()));
+        source_storage.append_entry(&leaf).await.unwrap();
+
+        // Get source metadata
+        let sessions = repo.list(Some(cwd)).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+
+        // FullTree fork (empty fork_entry_id) - should preserve ALL entries including the branch
+        let fork_storage = repo.fork(&sessions[0], "", cwd, ForkMode::FullTree).await.unwrap();
+        let fork_index = fork_storage.build_index().await.unwrap();
+
+        // FullTree fork should have ALL 3 entries (e1, e2, e3) + Leaf = 4 entries
+        assert_eq!(fork_index.entries.len(), 4);
+        assert!(fork_index.entries.contains_key("e1"));
+        assert!(fork_index.entries.contains_key("e2"));
+        assert!(fork_index.entries.contains_key("e3"));
+
+        // Fork should have parent_session set
+        assert!(fork_index.header.parent_session.is_some());
+
+        // Leaf should point to e2 (same as source)
+        assert_eq!(fork_index.leaf_id, Some("e2".into()));
+
+        let sessions_after = repo.list(Some(cwd)).await.unwrap();
+        assert_eq!(sessions_after.len(), 2); // original + fork
+
+        let _ = tokio::fs::remove_dir_all(&base_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_fork_session_full_tree_with_fork_point() {
+        let (repo, base_dir) = create_test_repo().await;
+        let cwd = Path::new("/home/test");
+
+        // Create source session with a few entries.
+        let source_storage = repo.create(cwd).await.unwrap();
+        let header = crate::session::SessionHeader::new(cwd);
+        source_storage.write_header(&header).await.unwrap();
+
+        let entry1 = SessionEntry {
+            id: "e1".into(),
+            parent_id: None,
+            timestamp: "t1".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"user","content":[]}),
+            },
+        };
+        source_storage.append_entry(&entry1).await.unwrap();
+
+        let entry2 = SessionEntry {
+            id: "e2".into(),
+            parent_id: Some("e1".into()),
+            timestamp: "t2".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({"role":"assistant","content":[]}),
+            },
+        };
+        source_storage.append_entry(&entry2).await.unwrap();
+
+        // Leaf pointing to e2
+        let leaf = SessionEntry::new_leaf(Some("e2".into()), Some("e1".into()));
+        source_storage.append_entry(&leaf).await.unwrap();
+
+        let sessions = repo.list(Some(cwd)).await.unwrap();
+
+        // FullTree fork WITH a specific fork_entry_id - should preserve all entries
+        // AND add a new Leaf pointing to e1
+        let fork_storage = repo.fork(&sessions[0], "e1", cwd, ForkMode::FullTree).await.unwrap();
+        let fork_index = fork_storage.build_index().await.unwrap();
+
+        // Should have all entries + original Leaf + new Leaf = 4 entries
+        assert_eq!(fork_index.entries.len(), 4);
+        assert!(fork_index.entries.contains_key("e1"));
+        assert!(fork_index.entries.contains_key("e2"));
+
+        // Leaf should point to e1 (the fork point)
+        assert_eq!(fork_index.leaf_id, Some("e1".into()));
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
     }
