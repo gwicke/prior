@@ -535,3 +535,33 @@ parent-specific submit). Decide `Rc`-share vs. template-instantiate when
 specing the trait — it determines whether per-node cursor state can be
 shared or must be keyed by *full path* inside the node (shared node ⇒
 path-keyed cursor, template ⇒ plain local cursor).
+
+----
+
+
+> Esc must be specified as a root re-entry with the shorter buffer
+
+Yup, I sketched this in a bit more detail in a response slightly higher up, see "Yes, Esc traversing the
+node bundary back to the parent would involve". Unless I am missing something, I think no special return
+protocol is needed beyong newpath and node-local key handling.
+
+> Borrow/traversal question
+
+For the normal traversal pattern, the need to structure this in phases seems fine to me. I would think
+that most local mutation happens when the local node is at the leaf, and is listing children - so the
+pattern you modeled. And in that case, having the well-defined fetch phase seems fine. For pure
+traversals, the pattern is pretty linear.
+
+> The submit() contract grows one return value (Prepared = pause with dialog) and one callback
+(submit_resolved(yea));
+
+Another way could be to offer an overridable (default-noop) "prepare" method in the trait. Default impl
+would be just `return submit()`, but an override can add its prep phase. Would need a return protocol,
+too, as you said. That is slightly less flexible than a directly callable "confirm" method, but maybe
+easier to understand - more of the scaffolding can be generic / hidden.
+
+> One design item flagged for the reshape spec: node sharing. /set default_model reusing the model
+
+I think it would be fine to use two instances. The default model is rarely
+touched, and the model repo can cache independently, so any wins from having
+the same instance are pretty minimal.
