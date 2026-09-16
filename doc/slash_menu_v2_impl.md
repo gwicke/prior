@@ -644,41 +644,43 @@ handlers would migrate separately, which proved throwaway in practice.
    is the *direct* remaining path to the end state
    `ActiveOverlay = None | Help | PathComplete | Menu`, ordered to avoid
    rework. Status of 7.1 at this point:
-   - **Engine-backed end-to-end** (plan verbatim, keys through the engine):
-     Model, Thinking, Persona, plus the generic `Menu` fallthrough (any
-     drilled engine level: `/replay`, unknown prefixes; level-stay fix from
-     `node_path`).
+   - **Engine-backed end-to-end, now collapsed to Menu** (plan verbatim,
+     keys through the engine): Model, Thinking, Persona, root
+     CommandList, plus the generic `Menu` fallthrough (any drilled engine
+     level: `/replay`, unknown prefixes; level-stay fix from `node_path`).
+     All five variants merged into a single `Menu` variant (7.2.1–3
+     implemented).
    - **Partial** (engine candidates but host-rendered/host-cursed):
      Session list, Tree list, Sandbox subcommand list.
    - **Still fully v1**: Settings/SettingsVal, SessionAction/Confirm,
      TreeAction/SwitchAction/CompactSummary, Stat, Mod, Sandbox value phase.
-   - Overlay count today: 17 variants; target: 4.
+   - Overlay count today: 14 variants; target: 4.
 
    Remaining steps, in order:
 
-   1. **Uniform key loop for engine-backed overlays** (the real 7.2 core,
-      cheap and not throwaway): the Tab/Enter arms for CommandList, Model,
-      Thinking, Persona, and Menu are byte-identical `engine.step_at` calls.
-      Collapse them to one arm (a single "engine-backed" predicate). The
-      Enter canonical-line → `InputAction` translation (the `SlashKind`
-      ladder inside the CommandList arm) becomes *one* prefix-keyed ladder
-      in the submit path, shared by CommandList and Menu — that translation
-      is a legitimate host concern (§12 leaf-result translation), it just
-      lives in exactly one place. Fold `engine_seed`/`engine_arrow` into
-      `step_at` (`HostKey::Up`/`Down` already handled there; add an
-      explicit seed action) so the host stops poking `interpreter` directly.
-   2. **CommandList → Menu**: render the root list from the engine plan
-      verbatim (static-level rows already carry id + description; the host
-      formats nothing). Deletes the host formatting arm and the legacy
-      `cmds` field. The Enter translation ladder stays (step 1 placed it).
-   3. **Model / Thinking / Persona → Menu**: pure variant deletion once
-      1–2 land — their display/paint and key paths are identical to Menu's;
-      their Enter translations are already in the ladder.
-   4. **Mod → engine plan**: a trailing dotted token (`/model .sor`) is a
-      *synthetic level*: `state()`/`render_plan` serve its rows from the
-      existing `field_options` logic (the completion data is already
-      engine-side from slice-4; this step is render/state plumbing only).
-      Deletes the Mod overlay and its Tab/Enter/display/Esc arms.
+   1. **(done)** Uniform key loop for engine-backed overlays: collapsed
+      five identical `engine.step_at` Tab/Enter arms into one
+      `is_engine_backed()` path. Enter canonical-line → `InputAction`
+      translation uses `r.state.node_path` (root = SlashKind dispatch;
+      drilled = node_path[0]-keyed: model→SetModel, thinking→SetThinking,
+      persona→SetPersona, replay/other→Submit). `engine_seed`/`engine_arrow`
+      folded into `step_at` via `HostKey::Seed(idx)`.
+   2. **(done)** CommandList → Menu: root list renders from engine
+      `RenderPlan` verbatim. Deleted `CommandList` variant (legacy `cmds`
+      field, host-side formatting). `root_list_overlay` returns
+      `Menu { cursor, plan }`.
+   3. **(done)** Model / Thinking / Persona → Menu: deleted all three
+      variants. Their `from_buffer_cursors` arms, `display_rows`, `title`,
+      `handle_tab`, `handle_enter`, `handle_esc`, `cursor_row`,
+      `is_engine_backed`, `overlay_disc`, and paint arms all gone — the
+      generic `Menu` arm handles them identically. Net: −314 lines.
+   4. **Mod → engine plan** (deferred — needs engine plumbing):
+      a trailing dotted token (`/model .sor`) is a synthetic level;
+      `state()`/`render_plan` must serve its rows from `field_options`.
+      Requires the interpreter to detect the dotted-token case and
+      populate candidates, plus Tab/Enter to handle the modifier-rewrite
+      path (not the accept path). Mod overlay is small and self-contained;
+      deferred to a dedicated follow-up.
 
    **⟶ v2.5 reshape happens here (§3.5)** — after step 4, before the
    Session/Tree/Stat/Settings/Sandbox migrations. Steps 1–4 land on the v2
