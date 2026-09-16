@@ -1,11 +1,39 @@
-# Slash menu v2 — design
+# Slash menu v2.5 — design
 
 Derived from the brainstorm/audit in `slash_menu_v2.md` (which contains the full
 audit of the current implementation, the issue list, and the inline review that
 produced decisions D1–D8 and resolutions R8-1…R8-8). This document states the
 resolved design. Implementation staging will go into a separate plan document.
 
-Inputs referenced: `slash_menu.md` (v1 UX contract, still authoritative for
+**v2.5 revision (this document).** Forked from `slash_menu_v2_design.md` as a
+verbatim copy; the node model is revised to the trait-node / merged-child-set
+design discussed in `slash_menu_v2_design_simplification.md` (the round 1–3
+review, including verified borrow-shape analysis, is recorded there; this
+document is the distilled end state). Phases 0–7.1 of the implementation
+(`slash_menu_v2_impl.md`) already run on the v2 descriptor engine; v2.5 changes
+*where rows and handlers live*, not the prompt grammar, cursor/accept
+semantics, rendering contract, or host role split — those sections are
+inherited verbatim. Changed sections:
+
+1. **§2 (rewritten)**: nodes become trait implementations (`NodeImpl`) whose
+   default traversal is private and non-overridable and owns per-node state
+   (epoch-cached), replacing the data descriptor + centralized interpreter
+   side tables (providers/handlers registered by path string).
+2. **§2.1 (new)**: merged child sets — one level mixes static, enum/value,
+   and dynamic child nodes; each row-producing child owns its data source and
+   submit handler; the parent declares the field metadata all children
+   conform to.
+3. **§9 (confirm part)**: the confirm flow is a two-phase submit protocol —
+   the yea/nay dialog is a not-overridable engine service, the state machine
+   is handler-local — replacing v2's two-handler ConfirmPrep machinery.
+4. **§8 (binding half)**: the one-shot/live-filter split stays; providers
+   attach to nodes instead of path-keyed side tables.
+
+The prompt grammar, cursor/accept semantics, rendering, and modifier
+contracts (§3–§7) are unchanged from v2 and inherited verbatim. §1 (goals),
+§10 (per-command shapes), §11 (traceability) and §12 (role split) are
+updated where the node-model revision touches them; each changed spot says
+so explicitly. Inputs referenced: `slash_menu.md` (v1 UX contract, still authoritative for
 anything not changed here), `src/repl.rs` (`ActiveOverlay` dispatch loop),
 `src/model_catalog.rs` (`MODEL_MODIFIERS`), `src/table.rs`, sibling docs
 (`settings_menu.md`, `sandbox_menu.md`, `tree.md`).
@@ -14,12 +42,13 @@ anything not changed here), `src/repl.rs` (`ActiveOverlay` dispatch loop),
 
 ## 1. Goals and invariants
 
-1. **Data-driven.** Every slash menu is described by a *menu descriptor* (node
-   tree + handler attachments). The interpreter (generic overlay engine) derives
-   all behaviour — filtering, cursor, promotion, commit, rendering — from the
-   descriptor. Per-menu `ActiveOverlay` variants and hand-written
+1. **Node-driven.** Every slash menu is a tree of *node implementations*
+   (`NodeImpl`, §2). A single generic, non-overridable traversal (the
+   engine) derives all behaviour — filtering, cursor, promotion, commit,
+   rendering — from the nodes' rows and submit/data members. Per-menu
+   `ActiveOverlay` variants and hand-written
    `from_buffer` / `handle_tab` / `handle_enter` / `handle_esc` arms collapse
-   into generic interpreter states.
+   into generic traversal states.
 2. **The prompt is the state** (revised): the buffer determines level, filter
    state, and the *committed* selection — but the view cursor and the
    traversal memory (back-navigation, §5) live outside the buffer, alongside
@@ -40,92 +69,186 @@ of, the menu system.
 
 ---
 
-## 2. Core model: the menu descriptor
+## 2. Core model: the trait node
 
-A menu is a recursive node. One descriptor per command word; the root list
-(`/`) is itself a descriptor whose children are the other command descriptors
-(the existing `slash::registry()` content, re-expressed as nodes).
+*(Rewritten in v2.5; v2's data-descriptor model is the predecessor — the
+grammar, cursor, and key semantics it defined are unchanged.)*
 
-Each node has:
+A menu is a recursive tree of **nodes**, and a node is a *trait
+implementation*, not a data structure. One node impl per command (or per
+sub-level of a command); the root list (`/`) is itself a node whose children
+are the other command nodes (the existing `slash::registry()` content,
+re-expressed as node impls).
 
-| Field | Meaning |
+### The trait and its extension points
+
+The design principle: **the default implementation owns everything generic;
+per-node code only customizes data and submission.** A command is one
+understandable implementation unit — its rows, its submit behavior, and (by
+default) all of its traversal behavior live in one `impl NodeImpl`.
+
+Overridable members (the extension points):
+
+| Member | Role |
 | --- | --- |
-| `key` | The token that selects this node at its parent level. Space-free (R8-1). |
-| `description` | Optional single-line description; fuzzy-searched together with `key` in the parent menu. |
-| `child_header` | Optional single-line header shown when this node's child menu is active. |
-| `children` | Nested nodes (static subtree). A node is a *list level* if it has either static children, or a data handler (below). |
-| `modifiers` | Optional typed value/argument slots (§7): `key` + value kind + default + completion source + front-end/back-end flag. |
-| `data_handler` | Optional data-fetch handler (marks the level dynamic; §8). Absent ⇒ static level. |
-| `leaf_handler` | Optional accept handler (§10, first step). Absent ⇒ Enter behaves like Tab: add trailing space, drill into the child level. |
-| `confirm_handler` | Optional second-step handler on a confirm leaf (§9): invoked on the final accept, after the `leaf_handler` prep and the confirm dialog. Presence ⇒ the leaf is a confirm flow (replaces the boolean `confirm` property). |
-| `interstitial_handler` | Optional handler returning a static string, shown on Enter *before* any leaf call or drilling (§10). |
-| `confirm` | Optional stateful confirm property on a leaf (§10). |
-| `table` | Optional declarative column definition for list rendering (D6): headers, order, alignment, min-widths (priority), ellipsis vs wrap. |
+| `data(&mut self, epoch, ctx) -> Vec<Row>` | The rows this node contributes to its parent's listing (static children: its key + description; dynamic: fetched data). Default: none. |
+| `submit(&mut self, inv) -> SubmitResult` | The leaf accept behavior. Default: none (node is a listing; Enter drills). |
+| `prepare(&mut self, inv) -> SubmitResult` | *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9). |
+| `detail(&mut self) -> Vec<String>` | Non-selectable header lines for this level (v2 DetailProvider). Default: none. |
+| `title()` / metadata | Static strings: description, child header, column defs, field metadata. |
 
-Handlers attached to nodes receive as arguments: positional ids collected from
-the path, and modifier key-values (typed).
+Non-overridable (the generic machinery, enforced by construction — see
+"Encapsulation" below): path parsing/dispatch, selection validation (D2
+demotion), fuzzy rank-and-pin, the §7.1 filter/sort query engine, the
+per-node cursor cache, the Esc ladder, traversal-frame management, and the
+render-plan emission.
 
-**Handler binding (settled).** Plain closures suffice for every handler kind;
-no separate stateful-handler interface is needed:
+### Per-node state and the epoch
 
-- **Data handlers** read application state at call time via captured
-  references/closures (the engine passes only the prompt-derived inputs).
-  Because the engine is persistent (§12), closures never go stale.
-- **Leaf handlers** are plain closures; per-leaf mutable state, when needed,
-  lives in the handler instance itself (a closure capturing its own cell).
-  Leaf handlers perform app-data mutations directly through the shared
-  handles they captured (see the host-outcome split in §9) — the host
-  applies only control flow, messages, and redraw.
-- **Confirm flows** are *two handlers*, not one stateful handler (revised
-  from D5's "single stateful instance"): the `leaf_handler` performs the
-  prep step and returns a "confirm pending" result (payload it wants the
-  final accept to see); the `confirm_handler` is invoked only on the final
-  accept, receiving the prep payload. Esc/cancel simply drops the payload —
-  no surviving instance state to manage. `compact` = two closures
-  (`prep` + `commit`), each independent and testable.
+Each node owns **private, local state** in its impl:
 
-The engine's *own* contract with handlers stays narrow: data handlers get
-`fetch(modifiers)` (prompt-derived tokens only), leaf handlers get
-`LeafInvocation` (line, path, row fields) and return results. Any
-application context the handlers need is captured in the closure, never
-passed through the engine (§12).
+- a **cursor cache** keyed on the level's filter state — the (index, pin,
+  terms) triple with the uniform reset-on-change rule of v2's `CursorMap`
+  (§4), so arrow movement survives buffer re-derives and typing re-targets
+  the cursor;
+- a **data cache** for one-shot fetches (§8), surviving frames of one menu
+  activation;
+- optionally richer per-node state (e.g. a confirm flow's staged payload,
+  §9), keyed as the node sees fit.
 
-### Level classification
+All caches are invalidated by the **epoch**: a menu-invocation counter the
+root increments on every menu open and threads down the traverse chain.
+Epoch increment ⇒ fresh per-node state, matching the v2 "new engine per
+menu open" reopen semantics (§12) without a shared context datatype. A
+multi-stage flow that must survive *within* one epoch (compaction's
+stage → Esc → re-stage → accept) keys its cache on its own decision
+points (e.g. the compaction target id — sessions are append-only trees, so
+target-id keying alone is sound), not on epoch alone.
 
-- **Static level**: children are a fixed node list. Selection token = a child
-  `key` (bare word).
-- **Dynamic level**: rows come from a data handler. The selection token is a
-  row id (opaque string, no spaces, typically uid-like). A dynamic node's
-  `children` are **shared across all rows**: after a valid id, the next
-  grammar level is that single static action list (if any) — e.g. `/tree`
-  row-ids → `switch` / `compact` action level. So a dynamic node with static
-  sub-actions encapsulates *two* grammar levels; there are no per-row child
-  nodes.
+### Encapsulation: private traversal via blanket impl
 
-### Value-typed children (positional enum / number values)
+Rust has no `final` methods — a default method in the *same* trait can be
+shadowed. The non-overridability is enforced with the extension-trait /
+blanket-impl pattern:
 
-Besides plain static children (bare-word keys, each with its own handler), a
-level may carry a single **value-typed child** — a node that matches *any* of
-a defined set of values in the selection position:
+- the base trait `NodeImpl` exposes only the overridable members above;
+- the traversal machinery lives in a **separate extension trait** (or a
+  private struct each node composes), whose `traverse()` is implemented
+  **once via a blanket impl** over `NodeImpl`;
+- the host and parents call only the extension trait's entry points;
+  nothing can override the generic machinery.
 
-- **`enum` child**: declares the candidate value set (e.g. `off|low|med|high`
-  for `/thinking`). One node with one shared leaf handler — instead of N
-  static children with identical handlers.
-- **`number` child**: accepts any permissively-parsed number (int or float).
+The traversal itself is *recursive*: a parent's default body parses its
+level, resolves the selection, and recurses into the selected child with
+the path remainder (`traverse(keys, args, prefix, id, path_remainder)` —
+returning `[Continue(Option<RenderPlan>, Option<newpath>) | DoneSuccess |
+DoneError]`). Only one traversal is active at a time.
 
-Design rule: use plain static children when values need distinct behaviour or
-descriptions; use a value-typed child when values share one handler and
-differ only in payload. This reuses the modifier machinery (completion
-sources, enum sets, permissive parsing) in the selection position.
+### Borrow discipline (verified)
 
-Grammar impact is minimal: a value-typed child occupies one selection
-position (space-free token). Parse-level validity is *permissive* — any token
-is a candidate selection; the enum set is a completion aid, not a parse
-constraint. The backend validates at accept time (any prompt is valid, the
-action may error — §7). Cursoring over the candidate set rewrites the token,
-exactly like ids on dynamic levels.
+One shape rule, needed because a default trait body cannot split
+`&mut self` into disjoint fields the way a concrete struct can:
 
----
+- **Parent-state access happens only outside the child loop** — three
+  phases: own-state decisions → descend into children → own-state
+  post-processing. Interleaving (e.g. reading the parent cursor inside the
+  child loop to seed each child) does not compile (E0499: the
+  `children_mut()` borrow locks `self` for the whole loop).
+- Cross-level data flow (e.g. cursor seeding) is **passed down as
+  arguments**, never read sideways from ancestor state.
+- For pure traversals this is a linear pattern; most local mutation
+  happens when the node is the listing leaf of the traversal, which is
+  exactly the well-phased case.
+
+### Node sharing
+
+A node impl may be reused by two parents (e.g. `/model` and
+`/set default_model` both listing the catalog rows). Decision (settled in
+the simplification review): **two instances, not `Rc` sharing** — the
+default-model level is rarely touched and the catalog fetch caches
+independently, so instance-sharing wins are negligible. Consequence: each
+node's cursor state is plain local state (no path-keying inside the node);
+the parent path *is* the instance.
+
+### Level classification (merged-child-set restatement)
+
+A level is simply **a set of child nodes** (§2.1), each returning zero or more
+rows; the old static/dynamic dichotomy is gone. The differences are now
+node-internal implementation details, unobservable to the parent node. All
+child rows are concatenated by the parent. Rough node types in typical
+cardinality, ascending:
+
+- **Single-key children**: contribute one row (their `key` + description);
+  selection token = the child `key`. Any child may itself have children
+  (a sub-level), OR a leaf handler (never both).
+- **Enum children**: `enum` (candidate value set, completion aid,
+  permissive parse, backend validates) or `number`; one node, one shared
+  handler. Grammar impact unchanged (§2 of v2).
+- **Data children**: contribute fetched rows from `data()` (§8);
+  selection token = a row id. A data child with its own children shares
+  them across **all its rows**: after a valid id, the next grammar level
+  is that single action list (if any) — no per-row child nodes. The
+  parent keeps track of which row came from which child, so submit
+  dispatches to the row's owning child (§2.1).
+
+## 2.1 Merged child sets (new in v2.5)
+
+*(This is the key structural change motivating v2.5 — it is what makes
+`/set`, `/sandbox`, and `/set default_model` expressible without
+per-command interpreter logic.)*
+
+A level's listing is the **ordered concatenation of all its child nodes'
+rows**, however each child produces them:
+
+- a static child contributes its `key` + description (one row);
+- an enum/value child contributes its candidate value set (one row per
+  value);
+- a dynamic child contributes its fetched rows (one per data item) —
+  possibly many, possibly zero.
+
+So the v2 distinctions *between kinds of children at one level* dissolve:
+there is no "static OR dynamic" level anymore, only **a set of children,
+each with its own row source and its own submit handler**. The rules:
+
+- **Row uniformity** (contract, enforced loosely): all children of one
+  level return *roughly* the same fields — at least `id`, optionally
+  `description`; optionally more. Rows must render together in one
+  listing.
+- **Field metadata lives on the parent** (declared once): the parent
+  declares the column defs / field space the shared listing renders and
+  filters against. Children conform; a child may add computed fields
+  (§8.1) that other children simply leave missing (missing-value rules of
+  §7.1 apply uniformly).
+- **Ordering**: `addChild()` order determines the default merge/sort
+  order, unless the parent re-sorts.
+- **Selection & validity stay uniform**: the merged row set is the level's
+  candidate set; D2 demotion (a trailing token not matching any id is a
+  fuzzy term) checks against the *merged* set. Each child validates and
+  owns its own ids (the sketch's "own and validate their ids").
+- **Submit dispatch is per child**: the row's *owning child* handles the
+  submit — a static child's key-submit, a dynamic row's id-submit. One
+  listing can mix e.g. a static `add` row and dynamic binding rows, each
+  submitting differently.
+- **A dynamic child under a mixed level may itself carry static children**
+  (the v2 "two grammar levels" encapsulation, unchanged).
+
+### Reference shapes
+
+| Command | Shape in v2.5 |
+| --- | --- |
+| `/set` | one mixed level: static setting children (each a simple preference node with its own submit) **+** a dynamic child reusing the model-catalog rows with its own `default_model` submit. The v1 filter helpers (`MODEL_MODIFIERS`, `parse_model_filter`, `model_selection_overlay_entries`) die as a *consequence of modeling*, not cleanup. |
+| `/model` | a single dynamic child returning all catalog rows (uniform fields: id, ctx, coding, prices), field metadata declared on the level; its submit handler selects the model. |
+| `/sandbox` | one listing showing the current bindings (dynamic rows) with a static `add` child row at the top (declaration order); `add` maps to the add workflow (fs value completion via its own child node, §8). |
+| `/tree` | dynamic child (tree rows) + the shared static action level after an id (unchanged v2 shape). |
+
+### Mixed-level traversal
+
+The traversal does not change: the parent parses its level against the
+merged candidate set; a pinned selection drills into the selected child's
+level (static child ⇒ its subtree; dynamic row ⇒ the child's shared action
+level). The only new behavior is that `data()` of *several* children feeds
+one listing — the parent's default body concatenates in declaration order
+and rank-filters the merged set (one uniform mechanism).
 
 ## 3. Path grammar (per level, recursive)
 
@@ -161,6 +284,13 @@ At every level the buffer has the shape:
   the grammar decides. Leaf nodes (no children/handler) accept directly.
 - Dynamic nodes encapsulate *two* node levels when static sub-actions are
   specified, so the grammar applies at two levels.
+
+> **v2.5 note on §3 terminology.** "Static"/"dynamic" here refer to how a
+> *child* produces its rows (key vs `data()`), not to a property of the
+> level — a level is a merged child set (§2.1). The grammar rules above are
+> otherwise unchanged: a trailing token is validated against the level's
+> merged candidate set; each child's rows may or may not be there at any
+> given frame.
 
 Parsing is therefore structural, not a whitespace peek: terminators are the
 next dot-modifier, a valid id for the active level, or end-of-prompt (R8-2).
@@ -356,11 +486,11 @@ default completion source above).
 
 ## 8. Data sources (dynamic levels)
 
-Two handler kinds (R8-6):
+Two handler kinds (R8-6) — unchanged from v2; only the *binding* changes:
 
 1. **One-shot fetch** — called once per dynamic menu open; returns rows (id,
    description, optional typed key-value fields, default completion value for
-   the selection token). The interpreter does all filtering/sorting over the
+   the selection token). The engine does all filtering/sorting over the
    cached rows. Model catalog, sessions, tree snapshots, settings-derived
    candidate sets.
 2. **Live-filter fetch** — takes current modifier inputs; returns rows or a
@@ -372,9 +502,20 @@ Two handler kinds (R8-6):
    Primarily needed for modifier string value completion, esp. fs paths - but
    good to keep option open to complete positional value parameters as well.
 
-A dynamic level may also be nested under a static level (e.g.
+A data child may sit under a level with other children too (e.g.
 `/set default_model` value = model listing; `/sandbox remove` value = binding
-paths as ids).
+paths as ids). Under the merged-child-set model (§2.1) such nesting is
+just one data child of the parent level.
+
+**Binding (v2.5 change).** In v2, providers were registered on the engine
+in path-keyed side tables (`with_provider(&["model"], …)`); in v2.5 the
+row source **is the node**: a dynamic child's `data()` *is* its fetch
+(one-shot or live-filter), and its `active_row` (§5.1) is likewise
+reported by the node in its data response. No registration step, no
+stringly-keyed lookup; the accept-controller's path-based handler lookup
+collapses into node identity. The engine passes only prompt-derived
+inputs (`epoch`, parsed modifiers, query); application context is
+captured in the node impl at construction (§2, §12).
 
 ### 8.1 Row fields
 
@@ -415,14 +556,23 @@ distinct and each is framework-owned where it can be:
    Enter before any leaf call/drilling. With no leaf handler: second Enter
    dismisses (`/stat`). With a leaf handler: first Enter shows it, next Enter
    invokes the leaf (`/replay`).
-2. **Confirm (D5, revised)** — a leaf with both a `leaf_handler` and a
-   `confirm_handler` (§2). First accept invokes the prep (leaf) handler; it
-   may launch the editor, precompute, and returns a payload + confirm
-   prompt. The framework pauses; the dialog's accept invokes the
-   `confirm_handler` with the prep payload; Esc/cancel discards it.
-   Handlers are independent closures (§2) — no shared mutable instance, no
-   surviving state. Re-entering the same prompt from scratch re-runs the
-   prep (same as D5).
+2. **Confirm (v2.5: two-phase submit protocol)** — a leaf whose handler
+   needs a yea/nay step. The decomposition (settled in the simplification
+   review) replaces v2's two-handler `ConfirmPrep` machinery:
+   - The **state machine lives with the handler** (node-local, epoch/path
+     keyed per §2): `prepare()` (default-noop = `submit()`) runs the prep —
+     may launch the editor, precompute, stage the payload — then returns
+     `SubmitResult::Prepared` = "pause with the dialog as render target".
+   - The **dialog is a not-overridable engine service**: the engine renders
+     the accept/cancel dialog and routes its keystrokes/cursoring, and on
+     Enter resolves yea/nay back to the node (`submit_resolved(yea)`).
+     Zero per-node dialog logic.
+   - On yea the handler commits (e.g. runs the compaction); on nay — or on
+     Esc / any buffer rewrite while paused — the engine routes the cancel
+     to the node, which drops its staged payload (cache management, §2).
+     Re-entering the same prompt from scratch re-runs the prep.
+   - Consequence: no menu-level confirm state remains — the coordinator
+     (§12) shrinks to the root entry point + the epoch counter.
 3. **Editor handoff** — the external `$EDITOR` review *replaces the UI
    temporarily* and is driven by the leaf handler call itself (handler returns
    "launch editor"); not an interstitial. Cancellation re-enters the prompt
@@ -456,16 +606,16 @@ terminal, transcript).
 
 ## 10. Per-command target shape (summary)
 
-| Command | Shape in v2 |
+| Command | Shape in v2.5 |
 | --- | --- |
-| `/` | static root list; children = command descriptors |
-| `/model` | dynamic level (catalog, one-shot) + front-end field modifiers (§7.1; `MODEL_MODIFIERS` metadata seeds field/computed-field definitions), leaf = select model |
-| `/thinking` | static level with one `enum` positional value child (`off|low|med|high`), shared leaf = SetThinking (§2) |
+| `/` | static root list; children = command nodes |
+| `/model` | one dynamic child returning all catalog rows (§2.1); front-end field modifiers (§7.1), leaf = select model |
+| `/thinking` | one `enum` positional value child (`off|low|med|high`), shared leaf = SetThinking (§2) |
 | `/persona` | dynamic leaf with dataset/enum string value source |
-| `/set` | static level of setting children, each with typed modifier-like value machinery; `default_model` nests a dynamic model level |
-| `/sandbox` | static subcommand children (`add`/`remove`); `add` carries back-end fs modifiers (`.ro:` (default tab complete), `.rw:`); `remove` is a dynamic value menu with ids = paths |
-| `/session` | dynamic level (sessions) → static action children → confirm leaf on delete |
-| `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `llm` leaf carries `.prompt` modifier (default value) + confirm property |
+| `/set` | **mixed level (§2.1)**: static setting children, each its own simple-preference node + submit; `default_model` = dynamic child reusing the model rows with its own submit |
+| `/sandbox` | **mixed listing (§2.1)**: static `add` row (add workflow, fs value completion, §8) at the top + dynamic binding rows (remove workflow per row) |
+| `/session` | dynamic level (sessions) → static action children → confirm via two-phase submit (§9) on delete |
+| `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `llm` leaf carries `.prompt` modifier (default value) + two-phase submit confirm |
 | `/compact` | leaf that returns the rewritten path `/tree <id> compact ` |
 | `/stat` | interstitial, no leaf |
 | `/replay` | interstitial + leaf |
@@ -480,7 +630,7 @@ terminal, transcript).
 | Q2 `<…>` disambiguator | Dropped; positional ids (D2). Revised: accepts clear the filter, traversal memory restores it (§4, §5). |
 | Q3 modifier grammar | Dot-modifiers uniformly for values; children stay bare words (D3). |
 | Q4 `/stat` `/replay` | In scope via interstitial (D4). |
-| Q5 confirm | Revised: two independent handlers (prep leaf + confirm accept); prep payload passed to the confirm step, dropped on cancel (§2, §9). |
+| Q5 confirm | Revised (v2): two independent handlers (prep leaf + confirm accept). **v2.5:** two-phase submit protocol — handler-local state machine, not-overridable dialog service (§9). |
 | Q6 tables | Generalize now, low cost (D6). |
 | Q7 dataset values | Default per modifier (D7). |
 | Q8 fs completion | Dynamic completion handler within modifier value completion (D8). |
@@ -494,7 +644,7 @@ terminal, transcript).
 | R8-8 `/compact` | Leaf "return new path" rewrite (§9); no parallel hierarchy. |
 | Value types | Cut to `string` / `number` (permissive); enum is an orthogonal completion constraint, backend validates at accept (§7). |
 | Dataset-derived completion | Default for cached values; built in the preprocessing pass unless an enum is pre-defined (§7, §8.1). |
-| Static children on dynamic nodes | One static action level for *all* rows of the dynamic level; no per-row child nodes (§2, §3). |
+| No per-row child nodes | No per-row child nodes (§2, §3), but each row can come from a different child node, and the parent keeps track where each row came from. |
 | Positional enum / number values | `enum` / `number` value-typed child kinds; shared handler; permissive parse, backend validates (§2). |
 | Field filtering / sorting | `.field:value`, `.field:>v`/`<v`, `.sort:>f`/`<f` (+ per-field default direction); computed fields replace named sorts (§7.1). |
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
@@ -504,8 +654,13 @@ terminal, transcript).
 | Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
-| Handler statefulness | Plain closures everywhere; confirm = two independent handlers (prep leaf + confirm accept) with a payload, not a shared mutable instance (§2, §9). |
+| Handler statefulness | v2.5: node-local state in the impl, epoch-cached; hand-written stateful closures replaced by the trait node's private per-node state (§2). Confirm = two-phase submit with handler-local state machine (§9). |
 | Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only. App-data mutations live in handlers; no canonical-line re-parsing (§9). |
+| Node model | v2.5: nodes are trait impls (`NodeImpl`); default traversal is private/non-overridable and owns epoch-cached per-node state; providers/handlers attach to nodes, not path-keyed side tables (§2, §8). |
+| Merged child sets | v2.5 new: one level = ordered union of child rows (static + enum + dynamic children each with own data/submit); field metadata on the parent; per-child submit dispatch (§2.1). |
+| Node sharing | Reuse a node impl by *instantiating* it per parent (e.g. `/model` and `/set default_model`); no `Rc` sharing — plain local per-node state (§2). |
+| Confirm dialog | v2.5: dialog is a not-overridable engine service; the handler owns the state machine and staged payload (`prepare` default-noop = `submit`; `SubmitResult::Prepared` pauses; `submit_resolved(yea)`) (§9). |
+| Coordinator | v2.5: shrinks to the root entry point + the epoch counter; no centralized interpreter state machine, no menu-level confirm state (§12). |
 
 ---
 
@@ -514,20 +669,32 @@ terminal, transcript).
 The recurring integration friction (cursor sync, marker policy, overlay
 dispatch) traces to fuzzy ownership boundaries. The settled division:
 
-**The engine (`slashdot_menu`) owns everything derived from the prompt
-state.** Per frame it produces, from `(line, cursor map, providers,
-descriptor)`:
+**v2.5 restatement of §12's engine.** The engine is the **node tree**
+(`NodeImpl` instances, §2); there is no separate "interpreter". The
+generic machinery (path parsing, selection validation, rank-and-pin,
+§7.1 filter/sort query, per-node cursor caches, the Esc ladder,
+traversal frames, render-plan emission) lives in the default,
+non-overridable traversal (blanket impl, §2). The **coordinator shrinks
+to two things**: the root entry point (start a traversal from `/`) and
+the **epoch counter** (incremented per menu open, threaded down the
+traverse chain, invalidating per-node caches). There is no centralized
+interpreter state machine and no menu-level confirm state (§9 — the
+confirm flow is handler-local). Per frame the traversal produces, from
+`(line, descriptor-tree, epoch, application context)`:
 
 - the resolved level (node path) and whether it is a listing or a pinned
   level awaiting drill (the trailing-space rule, §3 — uniform, no host
   exceptions);
-- the candidate rows (ranked, filtered, sorted), including the `*`
-  active-state row resolved from the provider's `DataResult::active_row`
-  (§5.1);
-- the cursor row (sticky cursor map), and Tab/Enter/Esc **decisions**:
-  the new buffer text, whether to push/pop a traversal frame, and whether
-  the accept is a submit (canonical line) or an intermediate state;
-- Esc as the per-level ladder (§5.1) — pure buffer/state rewrites.
+- the candidate rows (the merged child-set rows, §2.1, ranked, filtered,
+  sorted), including the `*` active-state row resolved from the owning
+  node's data response (§5.1);
+- the cursor row (per-node cursor cache, §2), and Tab/Enter/Esc
+  **decisions**: the new buffer text, whether to push/pop a traversal
+  frame, and whether the accept is a submit (canonical line) or an
+  intermediate state;
+- Esc as the per-level ladder (§5.1) — pure buffer/state rewrites, done
+  as a **root re-entry** with the shorter buffer (never an up-recursion),
+  §2.
 
 The engine is *pure*: no terminal I/O, no picocode types, no async. It
 emits a **render plan** (level, rows with marker positions, header, title
@@ -535,47 +702,48 @@ hint) rather than strings where possible, so the host's table renderer can
 format.
 
 **Engine lifetime — persistent, with engine-owned per-activation state.**
-The engine is *not* rebuilt per keypress. It is built once per menu
-activation (menu closed → menu opened) and the host **keeps the engine
-instance** across the keypresses of that activation — there is no
-serialization, no take/restore pair. Cursor map, traversal frames, provider
-data cache, and accept phase all live **inside the engine** for the whole
-activation; the host simply calls `step_at`/`state` on the same instance.
-This removes the rebuild's costs: provider snapshots never go stale
-(handlers read app state at call time, §2), the data cache survives frames
-instead of re-fetching per keypress, and the "forgot to carry X across the
-rebuild" bug class disappears. Persistence requires no `Arc`s: the engine
-reads the buffer at step entry and mutates nothing app-owned; handlers
-capture what they need (§2). (The `Activation` bundle and
-`take_state`/`restore_state` accessor pair were the *rebuild-era*
-scaffolding for carrying per-activation state across a rebuilt engine;
-they are deleted once the host holds the engine directly.)
+The engine (the node tree) is *not* rebuilt per keypress. It is built once
+per menu activation (menu closed → menu opened) and the host **keeps the
+node tree instance** across the keypresses of that activation — there is
+no serialization, no take/restore pair. Per-node caches, cursor state, and
+any staged confirm payload live **inside the nodes** for the whole
+activation; a fresh menu open simply **bumps the epoch**, which
+invalidates them (§2). This removes the rebuild's costs: node data
+snapshots never go stale (nodes read app state at call time, §2), the
+data cache survives frames instead of re-fetching per keypress, and the
+"forgot to carry X across the rebuild" bug class disappears. Persistence
+requires no `Arc`s: the traversal reads the buffer at step entry and
+mutates nothing app-owned; nodes capture what they need (§2). (The
+`Activation` bundle and `take_state`/`restore_state` accessor pair were
+the *rebuild-era* scaffolding for carrying per-activation state across a
+rebuilt engine; they are deleted once the host holds the node tree
+directly.)
 
 **The host (`repl.rs`) owns everything not derivable from the prompt:**
 
 - application context (ReplCtx: active model/session/tree/usage) — read
-  by handlers at call time (§2), never passed through engine constructors;
+  by nodes at call time (§2), never passed through engine constructors;
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
 - applying the leaf result's narrow host outcome: control flow (commit /
-  quit / stay), messages, redraw. App-data mutations happen in handlers
-  (§9) via shared handles; the host loop applies only what the outer loop
-  owns. Engine purity rests on the crate boundary + generics, not on an
-  intermediate result vocabulary;
+  quit / stay), messages, redraw. App-data mutations happen in node
+  `submit()` (§9) via shared handles; the host loop applies only what the
+  outer loop owns. Engine purity rests on the crate boundary + generics,
+  not on an intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
 
 | Layer | Owns |
 | --- | --- |
-| Engine (pure) | descriptor, prompt-derived state, per-activation state (cursor/frames/cache), key decisions |
-| Handlers (app adapters) | all application data — read ctx at call time; supply rows *and* active state (`DataResult::active_row`, §5.1); perform app-data mutations directly via shared handles |
-| Host | app state itself, terminal I/O, rendering the plan, translating `LeafResult` → `InputAction` |
+| Engine (nodes) | the node tree + its default traversal (grammar, cursor caches, Esc ladder, frames, render plan); per-node epoch-cached state; the confirm dialog service (§9); key decisions |
+| Nodes (app adapters) | all application data — read ctx at call time; supply rows (`data()`, incl. `active_row`, §5.1) and submit behavior (`submit()`/`prepare()`, §9); perform app-data mutations directly via shared handles |
+| Host | app state itself, terminal I/O, rendering the plan, translating the submit result → `InputAction` |
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
 final state (impl Phase 7). The host's key loop is uniform: `state(line)` →
 render plan → read key → `step(line, key)` → apply result (buffer edit /
-frames / submit). Per-command code exists only in descriptors + handlers +
-leaf-result translation, never as overlay arms.
+frames / submit). Per-command code exists only in the node impls + their
+data/submit members + leaf-result translation, never as overlay arms.
 
 **Until Phase 7 completes**, legacy overlay arms may temporarily read host
 state (markers, filters), but every *new* behavior added in Phase 6.5+ must

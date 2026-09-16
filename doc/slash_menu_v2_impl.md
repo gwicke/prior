@@ -6,6 +6,19 @@ crate independence was reviewed inline; summary below). No new code-level
 detail beyond what is needed to stage and verify the work; types/signatures
 are sketched where the boundary matters.
 
+**v2.5 tracking.** Design for the post-Phase-7 node model (trait nodes +
+merged child sets, epochs, two-phase confirm) is in
+`slash_menu_v2.5_design.md`, and the design discussion/verdicts are in
+`slash_menu_v2_design_simplification.md`. This plan applies v2 up to and
+including Phase 7 (which collapses the host to the uniform engine key
+loop); Phases 0–7.1 as written here target the v2 descriptor engine. The
+v2.5 **reshape** (the descriptor tree → `NodeImpl` trait nodes with
+private default traversal, merged child sets, handlers-on-nodes, two-phase
+confirm) is a **post-Phase-7 step**, sequenced at the end of this document
+(§6) because Phase 7's host contract (plan-verbatim rendering, uniform key
+loop, leaf-result translation) is identical under both node models — none
+of Phase 0–7.1 work is throwaway.
+
 ---
 
 ## 1. Crate layout & independence
@@ -720,6 +733,80 @@ handlers would migrate separately, which proved throwaway in practice.
      v2 additions: cursor-row Tab/Enter, accept-clears-filter with Esc
      traversal-memory restore, bare-level Tab promote, `*`/`>` marker
      split, positional ids without `<…>`.
+
+---
+
+## 3.5 v2.5 reshape — the trait-node model (post-Phase-7, planned)
+
+*Design: `slash_menu_v2.5_design.md`; the motivating discussion and the
+verified borrow-shape / coordinator analysis are in
+`slash_menu_v2_design_simplification.md`. This step is **not** part of
+Phase 7 (which completes the v2 host switch on the descriptor engine). It
+is sequenced *after* Phase 7 because every Phase 0–7.1 behavior it reuses
+is model-agnostic: the host contract (plan-verbatim rendering, uniform key
+loop, leaf-result translation) and the prompt grammar / cursor / accept /
+rendering sections are identical under both node models, so none of the
+preceding work is throwaway.*
+
+### Sequencing
+
+1. **Do not start this until Phase 7 lands.** Phases 0–7.1 collapse the
+   host's 17 overlay variants to the four end-state shapes on the existing
+   descriptor engine. The reshape below then *re-plumbs* the engine internals
+   (where rows and handlers live) without touching the host.
+2. **Bundle the reshape into one step** (idea A merged-child-sets + the
+   trait-node impl together), rather than A-first-then-B: both change the
+   same interpreter seams (`child_rows` / `is_selection_at` /
+   `level_rows`). Doing A alone would re-touch those seams twice; bundled,
+   each seam is edited once and the intermediate A-without-B state never has
+   to be shippable on its own.
+
+### The reshape steps
+
+1. **Node trait + blanket-impl encapsulation** (§2): introduce `NodeImpl`
+   (overridable `data`, `submit`, `prepare`, `detail`, metadata) and the
+   extension trait whose `traverse()` is a blanket impl. The default body
+   absorbs the interpreter's path parsing, D2 demotion, rank-and-pin, §7.1
+   query engine, cursor cache, Esc ladder, and frames — as non-overridable
+   code. Follow the three-phase borrow discipline (§2): own-state decisions
+   → descend → own-state post-processing; cross-level flow is passed down,
+   never read sideways. Reopen-reset becomes an **epoch walk** (increment a
+   counter, clear caches) instead of the v2 engine-rebuild.
+2. **Merged child sets** (§2.1): `level_rows` concatenates every child's
+   rows in declaration order; the merged set feeds rank/pin/D2 uniformly;
+   submit dispatches to the row's owning child. Field metadata moves to the
+   parent. This unblocks `/set`, `/sandbox`, and `/set default_model`.
+3. **Port the provider/handler registration**: `with_provider(path, …)`,
+   `with_active_provider`, `detail_providers`, `register_handlers` all
+   become node members (the node *is* the provider/handler); delete the
+   path-keyed side tables and the accept-controller's path-based handler
+   lookup.
+4. **Two-phase submit confirm** (§9): add `prepare()` (default-noop =
+   `submit()`), `SubmitResult::Prepared` (pause with the dialog as render
+   target), and `submit_resolved(yea)`; the dialog itself is a
+   not-overridable engine service. Delete the v2 `ConfirmPrep` machinery;
+   the `AcceptController` folds its confirm state machine into node-local
+   state.
+5. **Node sharing by instantiation**: `/model` and `/set default_model`
+   each get their own model-node instance (each with its own submit);
+   plain local per-node state (no `Rc`, no path-keyed cursor).
+6. **Port the test suite**: ~45 grammar/filter/table/render unit tests are
+   free functions the default bodies call — reused unchanged. ~50
+   prompt/key-level scenario tests (state/tab/enter/esc/cursor) port
+   mechanically to the `traverse()` harness (same scenario tables, new
+   entry point); cursor-map internals tests become per-node cursor tests.
+7. **Post-audit** matches Phase 7.3's: `slashdot_menu` builds standalone;
+   the host renders the plan verbatim; `grep ActiveOverlay` shows only the
+   four variants; the v2.5 §10 reference shapes (`/set` mixed level,
+   `/sandbox` mixed listing) work end-to-end.
+
+### What is explicitly *not* in this step
+
+- The host side is untouched: no new `ActiveOverlay`, no host re-formatting,
+  no host-side per-variant logic (v2.5 design §12 keeps the uniform key loop).
+- The grammar, cursor/accept semantics, rendering, and modifier contracts are
+  unchanged (v2.5 design inherits §3–§7 verbatim).
+- Node *sharing* via `Rc` is rejected in favor of instantiation (§2.1).
 
 ---
 
