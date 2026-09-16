@@ -103,8 +103,16 @@ Overridable members (the extension points):
 `submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
 
-`prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
-- *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9).
+`prepare(&mut self, epoch: u64, path_args: &PathArgs, open_editor: &mut dyn FnMut(&str) -> io::Result<String>) -> SubmitResult`
+- *(Optional confirm hook)* default-noop = `submit()`. An override runs the
+  prep phase — may call `open_editor()` (blocks while the editor runs;
+  the host must have exited raw mode before calling `step_at` and re-enters
+  afterward), precompute, stage the payload — then returns
+  `SubmitResult::Prepared` to pause with the confirm dialog. The staged
+  payload lives in the node's own private state (§2), accessible to
+  `submit()` on the subsequent yea resolution. The editor handoff is a
+  blocking synchronous call inside `prepare()`, not a separate traverse
+  result — the engine does not need to know about `$EDITOR` at all.
 
 `header(&mut self, path_args: &PathArgs) -> Vec<String>`
 - Non-selectable header lines for this level (replaces v2 DetailProvider). Default: none.
@@ -155,7 +163,6 @@ enum SubmitResult {
     Done,                    // close the menu
     Prepared,                // confirm flow: pause with yea/nay dialog (§9)
     NewPath(String),         // return a new prompt path (e.g. /compact)
-    LaunchEditor,            // launch external $EDITOR
 }
 ```
 
@@ -455,10 +462,11 @@ signal, so it does not interact with the level grammar.
   - otherwise complete the cursor row's id into the selection slot
     (clearing refinement terms, §4).
 - **Enter**:
-  1. If the node has an `interstitial`, show it first (second Enter dismisses
-     if there is no leaf handler; otherwise the next Enter proceeds, §10).
-  2. If the node has a `leaf` handler, invoke it (with confirm semantics if
-     declared).
+  1. If the node has a `header()`, it is always displayed (non-modal — no
+     Enter-to-dismiss; Esc or backspace clears the menu). For `/stat`, the
+     stats text is `header()` output, not a separate interstitial phase.
+  2. If the node has a `submit` handler, invoke it (with `prepare` semantics
+     if declared).
   3. Otherwise Enter behaves like Tab-drill: append trailing space and show
      the child level.
 - **Esc** = back navigation with traversal memory, resolved by the
@@ -689,20 +697,21 @@ distinct and each is framework-owned where it can be:
      to the node, which drops its staged payload (cache management, §2).
      Re-entering the same prompt from scratch re-runs the prep.
    - Consequence: no menu-level confirm state remains in the engine.
-2. **Editor handoff** — the external `$EDITOR` review *replaces the UI
-   temporarily* and is driven by the leaf handler call itself (handler returns
-   "launch editor"); not an interstitial. Cancellation re-enters the prompt
-   via the existing `pending_prefill` mechanism.
-   TODO: Can this be handled purely by blocking in the prepare() handler,
-   without tree traversal?
+2. **Editor handoff** — the external `$EDITOR` review is a blocking
+   synchronous call inside `prepare()` (§2, `open_editor` callback). The
+   node's `prepare()` calls `open_editor(&staged_text)`, blocks while the
+   editor runs, stores the result in its private state, and returns
+   `SubmitResult::Prepared`. The engine then transitions to the confirm
+   dialog. No special traverse result needed; the engine never knows about
+   `$EDITOR`.
 
 **Leaf handler results** (formalized from R8-8, revised): `SubmitResult`
 (§2, "Core types"). The handler returns one of:
 - `Done` — close the menu;
 - `NewPath(String)` — buffer rewrite (e.g. `/compact` →
   `/tree <last-user-id> compact ` — pure sugar, no parallel hierarchy);
-- `Prepared` — pause for confirm (§9);
-- `LaunchEditor` — hand off to `$EDITOR`.
+- `Prepared` — pause for confirm dialog (§9); the node has staged its
+  payload in private state, and `submit()` will commit on yea.
 
 App-data mutations (set model, write session, update recents, trigger a
 background refresh) are performed **by the handlers themselves** via the
@@ -733,8 +742,8 @@ flow, terminal, transcript).
 | `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `prompt` leaf carries potentially-long prompt (default value) + two-phase submit confirm; might use display strings with unicode lines to render tree indent layout |
 | `/compact` | leaf that returns the rewritten path `/tree <id> compact ` via
 newpath; drop current parallel menu |
-| `/stat` | interstitial, no leaf |
-| `/replay` | interstitial + leaf |
+| `/stat` | `header()` returns stats text; no submit handler — Esc/backspace clears. |
+| `/replay` | `header()` returns help text; `submit()` dispatches the replay. |
 
 ---
 
@@ -745,14 +754,14 @@ newpath; drop current parallel menu |
 | Q1 surface changes | Allowed where they buy uniformity (D1). |
 | Q2 `<…>` disambiguator | Dropped; positional ids (D2). Revised: accepts clear the filter, traversal memory restores it (§4, §5). |
 | Q3 modifier grammar | Dot-modifiers uniformly for values; children stay bare words (D3). |
-| Q4 `/stat` `/replay` | In scope via interstitial (D4). |
+| Q4 `/stat` `/replay` | In scope via `header()` (stats/help text) + `submit()` where applicable (§5, §10). |
 | Q5 confirm | Revised (v2): two independent handlers (prep leaf + confirm accept). **v2.5:** two-phase submit protocol — handler-local state machine, not-overridable dialog service (§9). |
 | Q6 tables | Generalize now, low cost (D6). |
 | Q7 dataset values | Default per modifier (D7). |
 | Q8 fs completion | Dynamic completion handler within modifier value completion (D8). |
 | R8-1 spaced labels | Single-token; drop spaced display. |
 | R8-2 space vs slash | Different contexts; structural terminators; parsing unaffected. |
-| R8-3 paused accepts | Three distinct mechanisms (interstitial / confirm / editor handoff), §9. |
+| R8-3 paused accepts | Confirm via two-phase submit (§9); editor handoff via blocking `prepare()` callback; interstitial subsumed by `header()` (§5, §9). |
 | R8-5 pinned id | Revised: accepts commit the id and clear refinement; prompt state is path+id, filters ephemeral with traversal-memory restore (§4, §5). |
 | R8-6 handler kinds | One-shot vs live-filter (§8); front-end vs back-end modifiers (§7). |
 | R8-7 spaces in tokens | Selection tokens space-free; values and fuzzy terms may contain spaces (§3, §7). |
@@ -836,11 +845,7 @@ once the host holds the node tree directly.)
   outer loop owns. Engine purity rests on the crate boundary + generics,
   not on an intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
-  with an empty menu, editor handoff (`$EDITOR`).
-  TODO: Investigate if editor handoff can be implemented as something callable
-  from a node handler, rather than a special return to the loop followed by
-  re-enter. This would simplify the implementation, since edited data would
-  not need to be plumbed up and down the node tree.
+  with an empty menu.
 
 | Layer | Owns |
 | --- | --- |
