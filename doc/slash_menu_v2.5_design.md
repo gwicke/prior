@@ -98,7 +98,7 @@ Overridable members (the extension points):
   Do not cache row data unconditionally in the parent — we want uncached
   behavior in some cases (e.g. filesystem auto complete). This should be up to
   the `data()` handler implementation.
-- Called internally by the default `traverse()` body, which parses args from the path suffix.
+- Called internally by the default `traverse_data()` body, which parses args from the path suffix.
 
 `submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
@@ -203,8 +203,8 @@ blanket-impl pattern:
 
 - the base trait `NodeImpl` exposes only the overridable members above;
 - the traversal machinery lives in a **separate extension trait** (or a
-  private struct each node composes), whose `traverse()` is implemented
-  **once via a blanket impl** over `NodeImpl`;
+  private struct each node composes), whose `traverse()` and `traverse_data()`
+  is implemented **once via a blanket impl** over `NodeImpl`;
 - the host and parents call only the extension trait's entry points;
   nothing can override the generic machinery.
 
@@ -256,13 +256,13 @@ returning `MenuResult(
 - RenderPlan row content can be large, and many key interactions like
   cursoring through a long list do not actually change the content - only the
   selection state. So RenderPlan should be structured to minimize copying of
-  node-cached bulk row data (`Rc<T>` for all bulk data?).
+  node-cached bulk row data (`Rc<T>` for all bulk data).
 - Only one traversal is active at a time, so no concerns about concurrent
   access.
 
-**Internal helper** (not a public API — parent nodes never call `data()`
-directly; all access is through `traverse()` for uniform parameter handling,
-caching, and possible future generic caching extensions):
+Parent nodes never call `data()` directly; all access is through
+`traverse_data()` for uniform parameter handling, caching, and possible future
+generic caching extensions):
 
 `traverse_data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult | DataError`
 - Parses args from suffix (if any) using generic dot modifier / positional arg
