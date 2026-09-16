@@ -187,15 +187,16 @@ fn popup_scroll_does_not_duplicate_input() {
 
     // Diagnostic assertions on the mid-sequence screen (after `/`).
     if let Some(ref mid) = mid_screen {
-        let mid_slash = mid.iter().filter(|r| r.starts_with("> /")).count();
+        // The first menu item is "> help" (cursor on help, no leading slash
+        // since the prompt already shows "/"). The divider is present.
+        let mid_help = mid.iter().filter(|r| r.starts_with("> help")).count();
         let mid_div = mid.iter().filter(|r| r.starts_with("────")).count();
         eprintln!(
-            "[test] MID(after '/') input_lines={} divider_lines={}\n{:?}",
-            mid_slash, mid_div, mid
+            "[test] MID(after '/') help_count={} divider_lines={}\n{:?}",
+            mid_help, mid_div, mid
         );
-        // The input `/` line (prompt-prefixed as `> /`) must be visible exactly
-        // once, with a single divider above it (the pre-input separator).
-        assert_eq!(mid_slash, 1, "MID: expected one '> /' input line; screen={:?}", mid);
+        // The first menu entry must be visible exactly once, with a single divider above it.
+        assert_eq!(mid_help, 1, "MID: expected one '> help' menu line; screen={:?}", mid);
     }
 
     // The final input buffer is "/mo" => exactly one such line.

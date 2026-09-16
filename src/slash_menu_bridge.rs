@@ -819,6 +819,13 @@ impl MenuEngine {
                 }
                 self.interpreter.esc(line)
             }
+            HostKey::Seed(idx) => {
+                // Open-time cursor seeding: set the engine cursor directly.
+                // No buffer rewrite, no frame push, no accept action.
+                self.interpreter.set_cursor(line, idx);
+                self.interpreter.state(line);
+                OverlayAction::None
+            }
         };
         match action {
             HostKey::Enter => {
@@ -1014,6 +1021,8 @@ pub enum HostKey {
     Up,
     /// Move the engine-owned view cursor down one row.
     Down,
+    /// Open-time cursor seeding (replaces `engine_seed`).
+    Seed(usize),
 }
 
 /// Result of one engine step.
