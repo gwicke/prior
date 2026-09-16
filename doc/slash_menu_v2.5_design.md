@@ -48,14 +48,14 @@ anything not changed here), `src/repl.rs` (`ActiveOverlay` dispatch loop),
    rendering — from the nodes' rows and submit/data members. Per-menu
    `ActiveOverlay` variants and hand-written
    `from_buffer` / `handle_tab` / `handle_enter` / `handle_esc` arms collapse
-   into generic traversal states.
+   into generic node traversal states.
 2. **The prompt is the state** (revised): the buffer determines level, filter
    state, and the *committed* selection — but the view cursor and the
-   traversal memory (back-navigation, §5) live outside the buffer, alongside
-   the cached row data (§8). Rationale: the original "everything in the
-   prompt" model made cursoring rewrite the id token, which conflicts with
-   cursor-at-end refinement (§4); the revised model commits ids explicitly
-   via Tab/Enter and keeps refinement ephemeral (restored via Esc).
+   one-step per-node view parameter memory (back-navigation, §5) live outside
+   the buffer, alongside the cached row data (§8). Rationale: the original
+   "everything in the prompt" model made cursoring rewrite the id token, which
+   conflicts with cursor-at-end refinement (§4); the revised model commits ids
+   explicitly via Tab/Enter and keeps refinement ephemeral (restored via Esc).
 3. **Uniform per-level grammar.** The same token rules apply recursively at
    every level of every menu; no menu-specific parser.
 4. **Surface changes are allowed where they buy uniformity** (D1): minor
@@ -89,13 +89,27 @@ default) all of its traversal behavior live in one `impl NodeImpl`.
 
 Overridable members (the extension points):
 
-| Member | Role |
-| --- | --- |
-| `data(&mut self, epoch, ctx) -> Vec<Row>` | The rows this node contributes to its parent's listing (static children: its key + description; dynamic: fetched data). Default: none. |
-| `submit(&mut self, inv) -> SubmitResult` | The leaf accept behavior. Default: none (node is a listing; Enter drills). |
-| `prepare(&mut self, inv) -> SubmitResult` | *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9). |
-| `detail(&mut self) -> Vec<String>` | Non-selectable header lines for this level (v2 DetailProvider). Default: none. |
-| `title()` / metadata | Static strings: description, child header, column defs, field metadata. |
+`data(&mut self, epoch, &PathState) -> DataResult(Rc<{ Vec<Row>, active_ids: Vec<String> }>) | DataError`
+- The rows this node contributes to its parent's listing (static children: its key + description; dynamic: fetched data). Default: none.
+- PathState captures IDs from the path traversal, and is described in the
+  traverse() implementation, see further down.
+- Enable optional caching, avoid copies: Return Rc, allow parent node to check
+  cheaply whether anything changed using `Rc::ptr_eq`; if nothing changed in
+  the input data, its own caches do not need to be re-generated either.
+  Do not cache row data unconditionally in the parent - we want uncached
+  behavior in some cases (e.g. filesystem auto complete). This should be up to
+  the data() handler implementation.
+- called by engine-supplied traverse_data(), which parses args
+
+`submit(&mut self, epoch, &PathState) -> SubmitResult`
+- The leaf accept behavior. Default: none (node is a listing; Enter drills).
+
+`prepare(&mut self, epoch, &PathState) -> SubmitResult`
+- *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9).
+
+`header(&mut self, PathArgs) -> Vec<String>`
+- Non-selectable header lines for this level (v2 DetailProvider). Default: none.
+- `title()` / metadata | Static strings: description, child header, column defs, field metadata. |
 
 Non-overridable (the generic machinery, enforced by construction — see
 "Encapsulation" below): path parsing/dispatch, selection validation (D2
@@ -138,11 +152,57 @@ blanket-impl pattern:
 - the host and parents call only the extension trait's entry points;
   nothing can override the generic machinery.
 
-The traversal itself is *recursive*: a parent's default body parses its
-level, resolves the selection, and recurses into the selected child with
-the path remainder (`traverse(keys, args, prefix, id, path_remainder)` —
-returning `[Continue(Option<RenderPlan>, Option<newpath>) | DoneSuccess |
-DoneError]`). Only one traversal is active at a time.
+The traversal itself is *recursive*: a parent's default body parses its level
+from path_remainder, resolves the selection, and recurses into the selected
+child with the updated PathArgs and remainder. 
+
+If the path is exhausted:
+- populate / refresh the row cache: if the node has children, call data() on
+  each with the empty path remainder; check pointer equality
+- return a `Rc<RenderPlan>` for the selection menu (and new prompt,
+  usually unchanged) for the host to render.
+- if the node has a submit handler instead (mutually exclusive with children), 
+
+If the path suffix is non-empty:
+- if the node has children, 
+  - make sure the local child ID cache is populated / up to date (as above)
+  - parse out modifiers and positional arguments (whitespace-delimited) until
+    a valid child-supplied ID is found
+  - if child ID is found, call traverse() with updated Path on the
+    corresponding child
+
+`traverse(&mut self, epoch, KeyActions, PathState)`
+returning `[
+    Continue(Option<RenderPlan>, newpath) 
+    | DoneSuccess 
+    | DoneError
+]`
+- KeyActions are Tab, Enter, Esc, MoveCursor(n) (move cursor up or down n lines, +1
+  / -1 for simple key Up / Down; more for page up / down)
+  The node at the end of the traversal handles all logical key actions, and
+  eiter returns updated prompt / renderplan, or submits
+- PathState is a struct `[ids, Option<Args>, suffix]` containing
+  - vector of IDs parsed from the traversal on the way down
+    (ids), ending in the current ID
+  - a string slice of the remaining path string suffix, slicing over the full
+    prompt owned by the caller. It is important to preserve trailing
+    whitespace (matters for listing semantics, so pre-splitting on whitespace
+    would not be ideal.
+  - Option<Args>: dot modifier key-value and vec of positional args, parsed
+    generically from suffix; only supplied to data() and submit() on leaf
+    nodes (no children), and only if args are found.
+- RenderPlan row content can be large, and many key interactions like
+  cursoring through a long list do not actually change the content - only the
+  selection state. So RenderPlan should be structured to minimize copying of
+  node-cached bulk row data (`Rc<T>` for all bulk data?).
+- Only one traversal is active at a time, so no concerns about concurrent
+  access.
+
+`traverse_data(&mut self, epoch, PathState)`
+returning ` DataResult(Rc<struct{rows: vec<row>, active_ids:vec<int}>)
+            | DataError`
+- Parses args from suffix (if any) using generic dot modifier / positional arg
+  parser; calls `data()`.
 
 ### Borrow discipline (verified)
 
@@ -162,34 +222,17 @@ One shape rule, needed because a default trait body cannot split
 
 ### Node sharing
 
-A node impl may be reused by two parents (e.g. `/model` and
-`/set default_model` both listing the catalog rows). Decision (settled in
-the simplification review): **two instances, not `Rc` sharing** — the
-default-model level is rarely touched and the catalog fetch caches
-independently, so instance-sharing wins are negligible. Consequence: each
-node's cursor state is plain local state (no path-keying inside the node);
-the parent path *is* the instance.
+A node impl could in theory be reused by two parents, but e.g. `/model` and
+`/set default_model` require different "active_id" and submit handling. Share
+most of the base implementation around the model catalog interaction, but
+specialize active_id / submit.
 
 ### Level classification (merged-child-set restatement)
 
 A level is simply **a set of child nodes** (§2.1), each returning zero or more
 rows; the old static/dynamic dichotomy is gone. The differences are now
-node-internal implementation details, unobservable to the parent node. All
-child rows are concatenated by the parent. Rough node types in typical
-cardinality, ascending:
-
-- **Single-key children**: contribute one row (their `key` + description);
-  selection token = the child `key`. Any child may itself have children
-  (a sub-level), OR a leaf handler (never both).
-- **Enum children**: `enum` (candidate value set, completion aid,
-  permissive parse, backend validates) or `number`; one node, one shared
-  handler. Grammar impact unchanged (§2 of v2).
-- **Data children**: contribute fetched rows from `data()` (§8);
-  selection token = a row id. A data child with its own children shares
-  them across **all its rows**: after a valid id, the next grammar level
-  is that single action list (if any) — no per-row child nodes. The
-  parent keeps track of which row came from which child, so submit
-  dispatches to the row's owning child (§2.1).
+node-internal implementation details in data(), unobservable to the parent
+node.
 
 ## 2.1 Merged child sets (new in v2.5)
 
@@ -200,7 +243,7 @@ per-command interpreter logic.)*
 A level's listing is the **ordered concatenation of all its child nodes'
 rows**, however each child produces them:
 
-- a static child contributes its `key` + description (one row);
+- a static child contributes its `id` + optional description (one row);
 - an enum/value child contributes its candidate value set (one row per
   value);
 - a dynamic child contributes its fetched rows (one per data item) —
@@ -213,12 +256,11 @@ each with its own row source and its own submit handler**. The rules:
 - **Row uniformity** (contract, enforced loosely): all children of one
   level return *roughly* the same fields — at least `id`, optionally
   `description`; optionally more. Rows must render together in one
-  listing.
+  listing. IDs must be unique across a level.
 - **Field metadata lives on the parent** (declared once): the parent
   declares the column defs / field space the shared listing renders and
-  filters against. Children conform; a child may add computed fields
-  (§8.1) that other children simply leave missing (missing-value rules of
-  §7.1 apply uniformly).
+  filters against. Children conform; a child may add fields (§8.1) that other
+  children simply leave missing (missing-value rules of §7.1 apply uniformly).
 - **Ordering**: `addChild()` order determines the default merge/sort
   order, unless the parent re-sorts.
 - **Selection & validity stay uniform**: the merged row set is the level's
@@ -228,7 +270,8 @@ each with its own row source and its own submit handler**. The rules:
 - **Submit dispatch is per child**: the row's *owning child* handles the
   submit — a static child's key-submit, a dynamic row's id-submit. One
   listing can mix e.g. a static `add` row and dynamic binding rows, each
-  submitting differently.
+  submitting differently. The parent keeps track of which row is owned by
+  which child, e.g. by storing a positional child ID with each received row.
 - **A dynamic child under a mixed level may itself carry static children**
   (the v2 "two grammar levels" encapsulation, unchanged).
 
@@ -362,44 +405,49 @@ signal, so it does not interact with the level grammar.
   — never from the typed/pinned selection. On a fresh menu the cursor seeds
   on the active row, marked `*`.
 
-### 5.1 Active-state sourcing (`active_row`)
+### 5.1 Active-state sourcing (`active_rows`)
 
 The "active" row of every candidate list must come from a single, uniform
 mechanism inside the engine — the host never computes or renders it per
 overlay:
 
-- **`DataResult::active_row -> Option<String>`**: dynamic providers report
-  the id of the row that is currently in effect **inside their `fetch`
-  response** (e.g. the active model's `provider:name`, the current session
-  id, the current leaf's tree entry id), set from their own live data
-  source. The engine resolves the id to a row index in the candidate set
-  per frame and renders `*` there.
+- **`DataResult::active_ids -> Option<vec<String>>`**: dynamic providers
+  report the id(s) of the row(s) that are currently in effect **inside their
+  `fetch` response** (e.g. the active model's `provider:name`, the current
+  session id, the current leaf's tree entry id), set from their own live data
+  source. The engine resolves the ids to row indices in the candidate set per
+  frame and renders `*` there.
 - **Enum / static levels**: the same selector notion — an optional
   `ActiveProvider` registered on the level's node supplies just the active
   id (e.g. `/thinking`'s currently-set level, `/persona`'s current persona)
   from live app state; the engine resolves it against the descriptor-derived
-  rows exactly as `DataResult::active_row` (no host-side per-overlay marker
+  rows exactly as `DataResult::active_ids` (no host-side per-overlay marker
   injection). A level with no selector (root command list) renders no `*`
   anywhere.
-- The engine's `MenuState` exposes `active_row_marker: Option<usize>` (the
-  `*` position) separately from `active` (the cursor position). The host
+- The engine's `RenderPlan` exposes `active_rows: Option<vec<usize>>` (the
+  `*` positions) separately from `selected_row` (the cursor position). The host
   renders `*` from the first and `>` from the second with no per-variant
   logic; when both land on one row, `*` wins.
 - Open-time cursor seeding falls out of this: when a level is first
   displayed and no sticky cursor exists for it, the cursor seeds on the
-  active row if the selector resolves; otherwise row 0.
+  first active row where the selector(s) resolve; otherwise row 0.
 
 - **Esc** = a strict per-level ladder (each step applies only when the next
   does not):
-  1. Strip a trailing space (drill-out one level, cursor memory preserved
-     via traversal frames).
-  2. Replay a traversal frame (restore the previous prompt + filter state +
-     cursor) — §5 rules.
-  3. Clear the current level's fuzzy terms and modifiers (the buffer
-     rewrite reflects the level with refinement dropped).
-  4. Clear the level's selection token (leaving the parent level with a
+  1. When the prompt ends on a valid child ID but no trailing space, replay
+     the local traversal frame, if it exists (restore the previous local
+     prompt + filter state + cursor matching ID). If no frame exists, focus
+     the row matching ID (if it exists), and drop the trailing ID from the
+     prompt.
+  2. Next Esc: Clear the local frame and current level's fuzzy terms and
+     modifiers (the buffer rewrite reflects the level with refinement
+     dropped).
+  3. Clear the level's selection token / ID (leaving the parent level with a
      trailing space so the parent list stays visible).
-  5. At the root level, clear the entire buffer (v1 rule retained).
+  4. Strip a trailing space (drill-out one level, cursor memory preserved
+     via traversal frames), return newprompt. Parent level will continue at
+     1), usually in a single Esc, restoring parent view state seamlessly. At
+     the root level, clear the entire buffer (v1 rule retained).
 
 ---
 
@@ -457,7 +505,7 @@ cached rows — this generalizes the hand-written `ModelFilter` /
 | `.field:value` | Exact match on a string field (id, description, or string key-value field). |
 | `.field:>v` / `.field:<v` | Numeric comparison (retain rows with value > / < v); `>=` / `<=` likewise. Comparison filters drop rows *missing* the field. |
 | `.sort:field` | Direction defaults to the field's declared `default_dir` (§8.1), so legacy names like `.sort:coding` keep working. |
-| `.sort:field>` / `.sort:field<` | Explicit descending / ascending as a **suffix** (more ergonomic with type-ahead than a prefix: pick the field, then append the direction). |
+| `.sort:>field` / `.sort:<field` | Explicit descending / ascending as a prefix; currently uses suffix, but change back to prefix to be consistent with filtering; need fuzzy search handling to ignore [<>] prefix. |
 
 Rules:
 
@@ -510,7 +558,7 @@ just one data child of the parent level.
 **Binding (v2.5 change).** In v2, providers were registered on the engine
 in path-keyed side tables (`with_provider(&["model"], …)`); in v2.5 the
 row source **is the node**: a dynamic child's `data()` *is* its fetch
-(one-shot or live-filter), and its `active_row` (§5.1) is likewise
+(one-shot or live-filter), and its `active_rows` (§5.1) is likewise
 reported by the node in its data response. No registration step, no
 stringly-keyed lookup; the accept-controller's path-based handler lookup
 collapses into node identity. The engine passes only prompt-derived
@@ -613,10 +661,11 @@ terminal, transcript).
 | `/thinking` | one `enum` positional value child (`off|low|med|high`), shared leaf = SetThinking (§2) |
 | `/persona` | dynamic leaf with dataset/enum string value source |
 | `/set` | **mixed level (§2.1)**: static setting children, each its own simple-preference node + submit; `default_model` = dynamic child reusing the model rows with its own submit |
-| `/sandbox` | **mixed listing (§2.1)**: static `add` row (add workflow, fs value completion, §8) at the top + dynamic binding rows (remove workflow per row) |
+| `/sandbox` | **mixed listing (§2.1)**: static `add` row (add workflow, read-only / read-write children, fs value completion, §8) at the top + dynamic binding rows (remove workflow per row) |
 | `/session` | dynamic level (sessions) → static action children → confirm via two-phase submit (§9) on delete |
-| `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `llm` leaf carries `.prompt` modifier (default value) + two-phase submit confirm |
-| `/compact` | leaf that returns the rewritten path `/tree <id> compact ` |
+| `/tree` | dynamic level (tree nodes) → static action children (`switch`, `compact`); `compact` modes are single-token enum children; `prompt` leaf carries potentially-long prompt (default value) + two-phase submit confirm; might use display strings with unicode lines to render tree indent layout |
+| `/compact` | leaf that returns the rewritten path `/tree <id> compact ` via
+newpath; drop current parallel menu |
 | `/stat` | interstitial, no leaf |
 | `/replay` | interstitial + leaf |
 
@@ -650,7 +699,7 @@ terminal, transcript).
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
 | Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
 | `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
-| Active-state sourcing | Single engine mechanism (provider `DataResult::active_row`, §5.1) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
+| Active-state sourcing | Single engine mechanism (provider `DataResult::active_rows`, §5.1) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
 | Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
@@ -659,7 +708,7 @@ terminal, transcript).
 | Node model | v2.5: nodes are trait impls (`NodeImpl`); default traversal is private/non-overridable and owns epoch-cached per-node state; providers/handlers attach to nodes, not path-keyed side tables (§2, §8). |
 | Merged child sets | v2.5 new: one level = ordered union of child rows (static + enum + dynamic children each with own data/submit); field metadata on the parent; per-child submit dispatch (§2.1). |
 | Node sharing | Reuse a node impl by *instantiating* it per parent (e.g. `/model` and `/set default_model`); no `Rc` sharing — plain local per-node state (§2). |
-| Confirm dialog | v2.5: dialog is a not-overridable engine service; the handler owns the state machine and staged payload (`prepare` default-noop = `submit`; `SubmitResult::Prepared` pauses; `submit_resolved(yea)`) (§9). |
+| Confirm dialog | v2.5: dialog is a not-overridable engine service; the handler owns the state machine and staged payload (`prepare` default-noop = `submit`; `SubmitResult::Prepared` pauses; `submit()` on yea) (§9). |
 | Coordinator | v2.5: shrinks to the root entry point + the epoch counter; no centralized interpreter state machine, no menu-level confirm state (§12). |
 
 ---
@@ -701,42 +750,37 @@ emits a **render plan** (level, rows with marker positions, header, title
 hint) rather than strings where possible, so the host's table renderer can
 format.
 
-**Engine lifetime — persistent, with engine-owned per-activation state.**
-The engine (the node tree) is *not* rebuilt per keypress. It is built once
-per menu activation (menu closed → menu opened) and the host **keeps the
-node tree instance** across the keypresses of that activation — there is
-no serialization, no take/restore pair. Per-node caches, cursor state, and
-any staged confirm payload live **inside the nodes** for the whole
-activation; a fresh menu open simply **bumps the epoch**, which
-invalidates them (§2). This removes the rebuild's costs: node data
-snapshots never go stale (nodes read app state at call time, §2), the
-data cache survives frames instead of re-fetching per keypress, and the
-"forgot to carry X across the rebuild" bug class disappears. Persistence
-requires no `Arc`s: the traversal reads the buffer at step entry and
-mutates nothing app-owned; nodes capture what they need (§2). (The
-`Activation` bundle and `take_state`/`restore_state` accessor pair were
-the *rebuild-era* scaffolding for carrying per-activation state across a
-rebuilt engine; they are deleted once the host holds the node tree
-directly.)
+**Engine / node tree lifetime — persistent, with engine-owned per-activation state.**
+The engine (the node tree) is built once on app start-up. Per-node caches,
+cursor state, and any staged confirm payload live **inside the nodes**; a
+fresh menu open ("activation") **bumps the epoch**, which invalidates them
+(§2). This removes any rebuild costs. Persistence requires no `Arc`s: the
+traversal reads the buffer at step entry and mutates nothing app-owned; nodes
+capture what they need (§2). (The `Activation` bundle and
+`take_state`/`restore_state` accessor pair were the *rebuild-era* scaffolding
+for carrying per-activation state across a rebuilt engine; they are deleted
+once the host holds the node tree directly.)
 
 **The host (`repl.rs`) owns everything not derivable from the prompt:**
 
-- application context (ReplCtx: active model/session/tree/usage) — read
-  by nodes at call time (§2), never passed through engine constructors;
 - terminal I/O, table rendering (columndefs from the descriptor), row
   highlight painting, scrolling;
 - applying the leaf result's narrow host outcome: control flow (commit /
-  quit / stay), messages, redraw. App-data mutations happen in node
+  quit / stay), prompt update, redraw. All app-data mutations happen in node
   `submit()` (§9) via shared handles; the host loop applies only what the
   outer loop owns. Engine purity rests on the crate boundary + generics,
   not on an intermediate result vocabulary;
 - non-slash affordances: bare-prompt path completion, `!shell`, general Esc
   with an empty menu, editor handoff (`$EDITOR`).
+  TODO: Investigate if editor handoff can be implemented as something callable
+  from a node handler, rather than a special return to the loop followed by
+  re-enter. This would simplify the implementation, since edited data would
+  not need to be plumbed up and down the node tree.
 
 | Layer | Owns |
 | --- | --- |
-| Engine (nodes) | the node tree + its default traversal (grammar, cursor caches, Esc ladder, frames, render plan); per-node epoch-cached state; the confirm dialog service (§9); key decisions |
-| Nodes (app adapters) | all application data — read ctx at call time; supply rows (`data()`, incl. `active_row`, §5.1) and submit behavior (`submit()`/`prepare()`, §9); perform app-data mutations directly via shared handles |
+| Engine (node default impl) | the node tree + its default traversal (grammar, cursor caches, Esc ladder, frames, render plan); per-node epoch-cached state; the confirm dialog service (§9); key decisions |
+| Node instances (app adapters) | all application data — read MenuShared entries; supply rows (`data()`, incl. `active_rows`, §5.1) and submit behavior (`submit()`/`prepare()`, §9); perform app-data mutations directly via shared handles |
 | Host | app state itself, terminal I/O, rendering the plan, translating the submit result → `InputAction` |
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
