@@ -233,7 +233,7 @@ Listing node (children, no submit handler):
     child is leaf 
 - Child ID match:
   - Non-empty suffix: Continue with traversal by `return traverse()` on owning
-    child.
+    child. All keys will be handled by a deeper node.
   - Empty suffix
     - no key: abort traversal and handle similar as "path exhausted", except
       for "reset to frame state and/or focus cursor" detail - see Esc ladder
@@ -246,8 +246,12 @@ Listing node (children, no submit handler):
 Leaf node (no children, submit handler), no key actions:
 - Display the local `header()` via RenderPlan
 - no key: just return RenderPlan
-- enter: run prepare() handler, which by default returns submit().
-- esc: pop protocol as in #5.1
+- enter: run prepare() handler, which by default returns submit(). If
+  `prepared` is returned, return RenderPlan for confirmation dialog, and
+  handle subsequent key events (CursorMove, enter) by either calling
+  `submit()` if `accept` was selected, or pop one level (as with `esc`) on
+  `abort`.
+- esc: pop protocol as in #5.1. Also cancels any confirmation dialog.
 
 All RenderPlan / newprompt mentions involve a
 `MenuResult::Continue(Rc<RenderPlan>, newprompt)` for the host to render. The
@@ -350,9 +354,10 @@ each with its own row source and its own submit handler**. The rules:
   `description`; optionally more. Rows must render together in one
   listing. IDs must be unique across a level.
 - **Field metadata lives on the parent** (declared once): the parent
-  declares the column defs / field space the shared listing renders and
-  filters against. Children conform; a child may add fields (§8.1) that other
-  children simply leave missing (missing-value rules of §7.1 apply uniformly).
+  declares the column defs / field space the shared listing renders. 
+  Children *should* return the "required" fields, but a child may add fields
+  (§8.1) that other children simply leave missing (missing-value rules of §7.1
+  apply uniformly). 
 - **Ordering**: `addChild()` order determines the default merge/sort
   order, unless the parent re-sorts.
 - **Selection & validity stay uniform**: the merged row set is the level's
@@ -508,7 +513,25 @@ signal, so it does not interact with the level grammar.
   — never from the typed/pinned selection. On a fresh menu the cursor seeds
   on the active row, marked `*`.
 
-### 5.1 Active-state sourcing (`active_rows`)
+### 5.1 **Esc** = a strict per-level ladder
+
+Each step applies only when the next does not:
+  1. When the prompt ends on a valid child ID but no trailing space, replay
+     the local traversal frame, if it exists (restore the previous local
+     prompt + filter state + cursor matching ID). If no frame exists, focus
+     the row matching ID (if it exists), and drop the trailing ID from the
+     prompt.
+  2. Next Esc: Clear the local frame and current level's fuzzy terms and
+     modifiers (the buffer rewrite reflects the level with refinement
+     dropped).
+  3. Clear the level's selection token / ID (leaving the parent level with a
+     trailing space so the parent list stays visible).
+  4. Strip a trailing space (drill-out one level, cursor memory preserved
+     via traversal frames), return newprompt. Parent level will continue at
+     1), usually in a single Esc, restoring parent view state seamlessly. At
+     the root level, clear the entire buffer (v1 rule retained).
+
+### 5.2 Active-state sourcing (`active_rows`)
 
 The "active" row of every candidate list must come from a single, uniform
 mechanism inside the engine — the host never computes or renders it per
@@ -534,23 +557,6 @@ overlay:
 - Open-time cursor seeding falls out of this: when a level is first
   displayed and no sticky cursor exists for it, the cursor seeds on the
   first active row where the selector(s) resolve; otherwise row 0.
-
-- **Esc** = a strict per-level ladder (each step applies only when the next
-  does not):
-  1. When the prompt ends on a valid child ID but no trailing space, replay
-     the local traversal frame, if it exists (restore the previous local
-     prompt + filter state + cursor matching ID). If no frame exists, focus
-     the row matching ID (if it exists), and drop the trailing ID from the
-     prompt.
-  2. Next Esc: Clear the local frame and current level's fuzzy terms and
-     modifiers (the buffer rewrite reflects the level with refinement
-     dropped).
-  3. Clear the level's selection token / ID (leaving the parent level with a
-     trailing space so the parent list stays visible).
-  4. Strip a trailing space (drill-out one level, cursor memory preserved
-     via traversal frames), return newprompt. Parent level will continue at
-     1), usually in a single Esc, restoring parent view state seamlessly. At
-     the root level, clear the entire buffer (v1 rule retained).
 
 ---
 
@@ -666,7 +672,7 @@ just one data child of the parent level.
 **Binding (v2.5 change).** In v2, providers were registered on the engine
 in path-keyed side tables (`with_provider(&["model"], …)`); in v2.5 the
 row source **is the node**: a dynamic child's `data()` *is* its fetch
-(one-shot or live-filter), and its `active_rows` (§5.1) is likewise
+(one-shot or live-filter), and its `active_rows` (§5.2) is likewise
 reported by the node in its data response. No registration step, no
 stringly-keyed lookup; the accept-controller's path-based handler lookup
 collapses into node identity. The engine passes only prompt-derived
@@ -801,9 +807,9 @@ newpath; drop current parallel menu |
 | Compound filter specs | Dropped; express as separate per-field tokens (§7.1). |
 | Cursoring & accept model | *Post-v1 design review:* up/down moves the view cursor only; Tab/Enter act on the cursor row, commit path+id, clear refinement; traversal memory + scoped edit invalidation give seamless back-navigation (§4, §5). |
 | `*` marker | Always the currently-active state from application context, never the typed selection (§5). |
-| Active-state sourcing | Single engine mechanism (provider `DataResult::active_rows`, §5.1) resolved to the `*` row per frame; open-time cursor seeds on it (§5.1). |
+| Active-state sourcing | Single engine mechanism (provider `DataResult::active_rows`, §5.2) resolved to the `*` row per frame; open-time cursor seeds on it (§5.2). |
 | Listing-open rule | Uniform: pinned selection shows the *parent* list with the pinned row highlighted; only the trailing space drills (§3). |
-| Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
+| Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.2). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
 | Handler statefulness | v2.5: node-local state in the impl, epoch-cached; hand-written stateful closures replaced by the trait node's private per-node state (§2). Confirm = two-phase submit with handler-local state machine (§9). |
 | Node model | v2.5: nodes are trait impls (`NodeImpl`); default traversal is private/non-overridable and owns epoch-cached per-node state; providers/handlers attach to nodes, not path-keyed side tables (§2, §8). |
@@ -837,12 +843,12 @@ produces, from `(line, node-tree, epoch)`:
   exceptions);
 - the candidate rows (the merged child-set rows, §2.1, ranked, filtered,
   sorted), including the `*` active-state row resolved from the owning
-  node's data response (§5.1);
+  node's data response (§5.2);
 - the cursor row (per-node cursor cache, §2), and Tab/Enter/Esc
   **decisions**: the new buffer text, whether to push/pop a traversal
   frame, and whether the accept is a submit (canonical line) or an
   intermediate state;
-- Esc as the per-level ladder (§5.1) — pure buffer/state rewrites, done
+- Esc as the per-level ladder (§5.2) — pure buffer/state rewrites, done
   as a **root re-entry** with the shorter buffer (never an up-recursion),
   §2.
 
@@ -877,7 +883,7 @@ once the host holds the node tree directly.)
 | Layer | Owns |
 | --- | --- |
 | Engine (node default impl) | the node tree + its default traversal (grammar, cursor caches, Esc ladder, frames, render plan); per-node epoch-cached state; the confirm dialog service (§9); key decisions |
-| Node instances (app adapters) | all application data — read MenuShared entries; supply rows (`data()`, incl. `active_rows`, §5.1) and submit behavior (`submit()`/`prepare()`, §9); perform app-data mutations directly via shared handles |
+| Node instances (app adapters) | all application data — read MenuShared entries; supply rows (`data()`, incl. `active_rows`, §5.2) and submit behavior (`submit()`/`prepare()`, §9); perform app-data mutations directly via shared handles |
 | Host | app state itself, terminal I/O, rendering the plan, translating the submit result → `InputAction` |
 
 **Dispatch rule**: there is exactly one `ActiveOverlay::Menu` shape in the
