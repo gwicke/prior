@@ -89,9 +89,9 @@ default) all of its traversal behavior live in one `impl NodeImpl`.
 
 Overridable members (the extension points):
 
-`data(&mut self, epoch, &PathState) -> DataResult(Rc<{ Vec<Row>, active_ids: Vec<String> }>) | DataError`
+`data(&mut self, epoch, &PathArgs) -> DataResult(Rc<{ Vec<Row>, active_ids: Vec<String> }>) | DataError`
 - The rows this node contributes to its parent's listing (static children: its key + description; dynamic: fetched data). Default: none.
-- PathState captures IDs from the path traversal, and is described in the
+- PathArgs captures IDs from the path traversal, and is described in the
   traverse() implementation, see further down.
 - Enable optional caching, avoid copies: Return Rc, allow parent node to check
   cheaply whether anything changed using `Rc::ptr_eq`; if nothing changed in
@@ -101,14 +101,14 @@ Overridable members (the extension points):
   the data() handler implementation.
 - called by engine-supplied traverse_data(), which parses args
 
-`submit(&mut self, epoch, &PathState) -> SubmitResult`
+`submit(&mut self, epoch, &PathArgs) -> SubmitResult`
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
 
-`prepare(&mut self, epoch, &PathState) -> SubmitResult`
+`prepare(&mut self, epoch, &PathArgs) -> SubmitResult`
 - *(Optional confirm hook)* default-noop = `submit()`; an override adds a prep phase (§9).
 
 `header(&mut self, PathArgs) -> Vec<String>`
-- Non-selectable header lines for this level (v2 DetailProvider). Default: none.
+- Non-selectable header lines for this level (replaces v2 DetailProvider). Default: none.
 - `title()` / metadata | Static strings: description, child header, column defs, field metadata. |
 
 Non-overridable (the generic machinery, enforced by construction — see
@@ -171,24 +171,25 @@ If the path suffix is non-empty:
   - if child ID is found, call traverse() with updated Path on the
     corresponding child
 
-`traverse(&mut self, epoch, KeyActions, PathState)`
-returning `[
+`traverse(&mut self, epoch, KeyActions, PathArgs)`
+returning `MenuResult(
     Continue(Option<RenderPlan>, newpath) 
     | DoneSuccess 
     | DoneError
-]`
+)`
 - KeyActions are Tab, Enter, Esc, MoveCursor(n) (move cursor up or down n lines, +1
   / -1 for simple key Up / Down; more for page up / down)
   The node at the end of the traversal handles all logical key actions, and
   eiter returns updated prompt / renderplan, or submits
-- PathState is a struct `[ids, Option<Args>, suffix]` containing
+- PathArgs is a struct `{ vec<Str>, Option<Args>, suffix:str]` containing
   - vector of IDs parsed from the traversal on the way down
     (ids), ending in the current ID
   - a string slice of the remaining path string suffix, slicing over the full
     prompt owned by the caller. It is important to preserve trailing
     whitespace (matters for listing semantics, so pre-splitting on whitespace
     would not be ideal.
-  - Option<Args>: dot modifier key-value and vec of positional args, parsed
+  - Option<Args>: `{ modifiers: Vec<(String, Value)>, positional: Vec<String> }` 
+    dot modifier key-value and vec of positional args, parsed
     generically from suffix; only supplied to data() and submit() on leaf
     nodes (no children), and only if args are found.
 - RenderPlan row content can be large, and many key interactions like
@@ -198,7 +199,7 @@ returning `[
 - Only one traversal is active at a time, so no concerns about concurrent
   access.
 
-`traverse_data(&mut self, epoch, PathState)`
+`traverse_data(&mut self, epoch, PathArgs)`
 returning ` DataResult(Rc<struct{rows: vec<row>, active_ids:vec<int}>)
             | DataError`
 - Parses args from suffix (if any) using generic dot modifier / positional arg
@@ -453,16 +454,16 @@ overlay:
 
 ## 6. Rendering
 
-- **Panel structure** (unchanged from v1): title row, optional non-selectable
-  header rows, selectable rows with `> ` (selected) / `* ` (active-default)
+- **Panel structure**: optional header rows, non-selectable header row, selectable rows with `> ` (selected) / `* ` (active-default)
   markers.
 - **Headers** (R8-4):
-  - *(i)* static single-line `child_header` from the descriptor;
-  - *(ii)* below dynamic list levels, a per-row header derived from the
-    selected row's fields + table columndef — either the row's `description`
-    (as normally shown in the listing) or an explicit `child_description`
-    override that the data supplier may pre-format (stats, message preview,
-    drop/token counts, etc.).
+  - *(i)* Optional node-supplied multi-line / preformatted `header()` - can be
+    used to provide help, or display dynamic information (stats, message
+    preview, drop/token counts, etc.). Truncated based on terminal size to
+    provide sufficient space for menu options (if any)
+  - *(ii)* when child IDs / table is present: static single-line `header` from the
+    descriptor, showing table headings; fixed position when scrolling through
+    long list
 - The generic UI limits the header block to the available vertical space,
   accounting for the space the menu options need (as `/tree <id>` sub-menus do
   today).
@@ -595,16 +596,12 @@ value sets for modifiers without a pre-defined enum (D7).
 
 ---
 
-## 9. Accept flows: leaf, interstitial, confirm, editor handoff
+## 9. Accept flows: leaf, confirm, editor handoff
 
-The three "paused" flows (R8-3) are **not** unified into one concept; they are
+The two "paused" flows (R8-3) are **not** unified into one concept; they are
 distinct and each is framework-owned where it can be:
 
-1. **Interstitial (D4)** — plain text display owned by the framework. Shown on
-   Enter before any leaf call/drilling. With no leaf handler: second Enter
-   dismisses (`/stat`). With a leaf handler: first Enter shows it, next Enter
-   invokes the leaf (`/replay`).
-2. **Confirm (v2.5: two-phase submit protocol)** — a leaf whose handler
+1. **Confirm (v2.5: two-phase submit protocol)** — a leaf whose handler
    needs a yea/nay step. The decomposition (settled in the simplification
    review) replaces v2's two-handler `ConfirmPrep` machinery:
    - The **state machine lives with the handler** (node-local, epoch/path
@@ -621,12 +618,14 @@ distinct and each is framework-owned where it can be:
      Re-entering the same prompt from scratch re-runs the prep.
    - Consequence: no menu-level confirm state remains — the coordinator
      (§12) shrinks to the root entry point + the epoch counter.
-3. **Editor handoff** — the external `$EDITOR` review *replaces the UI
+2. **Editor handoff** — the external `$EDITOR` review *replaces the UI
    temporarily* and is driven by the leaf handler call itself (handler returns
    "launch editor"); not an interstitial. Cancellation re-enters the prompt
    via the existing `pending_prefill` mechanism.
+   TODO: Can this be handled purely by blocking in the prepare() handler,
+   without tree traversal?
 
-**Leaf handler results** (formalized from R8-8, revised): `LeafResult<T>`
+**Leaf handler results** (formalized from R8-8, revised): `MenuResult`
 is generic over the host's action type. It carries:
 
 - **Menu-semantic outcomes** the engine drives itself: close the menu,
@@ -686,7 +685,6 @@ newpath; drop current parallel menu |
 | R8-1 spaced labels | Single-token; drop spaced display. |
 | R8-2 space vs slash | Different contexts; structural terminators; parsing unaffected. |
 | R8-3 paused accepts | Three distinct mechanisms (interstitial / confirm / editor handoff), §9. |
-| R8-4 headers | Static `child_header` + per-row derived header (§6). |
 | R8-5 pinned id | Revised: accepts commit the id and clear refinement; prompt state is path+id, filters ephemeral with traversal-memory restore (§4, §5). |
 | R8-6 handler kinds | One-shot vs live-filter (§8); front-end vs back-end modifiers (§7). |
 | R8-7 spaces in tokens | Selection tokens space-free; values and fuzzy terms may contain spaces (§3, §7). |
@@ -704,7 +702,6 @@ newpath; drop current parallel menu |
 | Esc behavior | Per-level ladder: trailing space → frame replay → clear refinement → clear selection → clear buffer at root (§5.1). |
 | Engine lifetime | Persistent per activation; per-activation state (cursor/frames/cache/accept-phase) lives **inside the engine**; host keeps the engine instance across keypresses; no rebuild, no take/restore, no Arcs (§2, §12). |
 | Handler statefulness | v2.5: node-local state in the impl, epoch-cached; hand-written stateful closures replaced by the trait node's private per-node state (§2). Confirm = two-phase submit with handler-local state machine (§9). |
-| Leaf result vocabulary | Generic `LeafResult<T>`: menu-semantic outcomes engine-typed; `T` = narrow host outcome (commit/quit/message/redraw) only. App-data mutations live in handlers; no canonical-line re-parsing (§9). |
 | Node model | v2.5: nodes are trait impls (`NodeImpl`); default traversal is private/non-overridable and owns epoch-cached per-node state; providers/handlers attach to nodes, not path-keyed side tables (§2, §8). |
 | Merged child sets | v2.5 new: one level = ordered union of child rows (static + enum + dynamic children each with own data/submit); field metadata on the parent; per-child submit dispatch (§2.1). |
 | Node sharing | Reuse a node impl by *instantiating* it per parent (e.g. `/model` and `/set default_model`); no `Rc` sharing — plain local per-node state (§2). |
