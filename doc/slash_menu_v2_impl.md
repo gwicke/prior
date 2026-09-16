@@ -507,9 +507,10 @@ step 2.
 
 ### Phase 7 — the switch (host) + cleanup
 
-The host conversion happens **once, at a single switch point** — not per
-command. Before the switch, descriptors/handlers exist; after it, the
-host has no per-command menu logic at all.
+*Revised during slices 1–4*: the conversion is incremental per command
+(each lands render + accept + handlers together), not one big switch —
+the original "single switch point" framing assumed overlay arms and
+handlers would migrate separately, which proved throwaway in practice.
 
 7.1. **Overlay collapse (host)**: `ActiveOverlay` shrinks to
    `None | Help | PathComplete | Menu`, where `Menu` carries only the
@@ -523,6 +524,12 @@ host has no per-command menu logic at all.
    drops per-activation state (data cache, accept phase) and the sticky
    cursor map / traversal frames reset — matching the reopen semantics
    the old rebuild gave.
+   **Progress note (Phase 7 status)**: slices 1–4 implemented; the
+   generic `Menu` fallthrough now covers any drilled engine level
+   (`state().node_path` decides engine level vs. root list — commit
+   "menu: any resolved command prefix stays in its level"). The
+   7.1/7.2/7.3 boundaries merged; the direct remaining path is restated
+   under 7.2 below.
     **Slice-1 (implemented)**: the fully-engine-backed `Model` overlay now
     renders the engine's `RenderPlan` verbatim — the host `display_rows`
     model arm, model `Table`/columns, and the `format_num_cell`/
@@ -612,32 +619,98 @@ host has no per-command menu logic at all.
       `.sort:field>` (desc), `.sort:field<` (asc) — more ergonomic with
       type-ahead (pick the field, then append direction) than the v1 prefix
       form.
-7.2. **Uniform key loop (host)**: `handle_tab` / `handle_enter` /
-   `handle_esc` / arrows / paging collapse to one arm:
-   `engine.step_at(line, HostKey, …)` → apply the `StepResult` (buffer
-   rewrite + restore-cursor to the editor) and the `HostOutcome` to the
-   loop (`Stay` → redraw, `Commit(line)` → submit, `Quit` → exit);
-   messages printed; interstitial/editor/confirm arrive as
-   `AcceptOutcome`. `cursor_sel_policy`, `engine_for`, `engine_seed`,
-   `engine_arrow`, `engine_esc` disappear (already removed in 6.7-3).
-   **Unmigrated commands ride a temporary
-   shim**: their descriptor's leaf handler returns `T = Commit(line)` and
-   the legacy `SlashKind` parse in the submit path stays until each
-   command's handler migration (7.3).
-7.3. **Per-command handler migration (host, incremental)**: for each
-   command in §10 order: write the real leaf/confirm handler (mutating
-   `MenuShared` directly), then delete its `SlashKind` parse arm and
-   bespoke helpers (`session_overlay_entries`, `tree_overlay_entries`,
-   `sandbox_overlay_entries`, `filtered_value_candidates`,
-   `modifier_overlay_entries`, the `parse_model_filter` merge ladder,
-   `model_overlay_entries`, …). The per-command overlay arms are already
-   gone with 7.1; only the parse arms and helpers remain per command.
-7.4. **Final cleanup/audit**:
-   - delete `SlashKind` + `slash::registry()` once no parse arms remain —
-     the root list renders from the root descriptor only;
-   - remove dead `engine_rows` fields, `#[allow(dead_code)]` overlay
-     machinery, and the (already removed in 6.7-3) `Activation`/take-
-     restore scaffolding;
+7.2. **Uniform key loop + overlay collapse (host, revised)**: the original
+   7.1/7.2/7.3 boundary blurred during slices 1–4 (accept and render migrate
+   together per command — render-only ports proved throwaway). What follows
+   is the *direct* remaining path to the end state
+   `ActiveOverlay = None | Help | PathComplete | Menu`, ordered to avoid
+   rework. Status of 7.1 at this point:
+   - **Engine-backed end-to-end** (plan verbatim, keys through the engine):
+     Model, Thinking, Persona, plus the generic `Menu` fallthrough (any
+     drilled engine level: `/replay`, unknown prefixes; level-stay fix from
+     `node_path`).
+   - **Partial** (engine candidates but host-rendered/host-cursed):
+     Session list, Tree list, Sandbox subcommand list.
+   - **Still fully v1**: Settings/SettingsVal, SessionAction/Confirm,
+     TreeAction/SwitchAction/CompactSummary, Stat, Mod, Sandbox value phase.
+   - Overlay count today: 17 variants; target: 4.
+
+   Remaining steps, in order:
+
+   1. **Uniform key loop for engine-backed overlays** (the real 7.2 core,
+      cheap and not throwaway): the Tab/Enter arms for CommandList, Model,
+      Thinking, Persona, and Menu are byte-identical `engine.step_at` calls.
+      Collapse them to one arm (a single "engine-backed" predicate). The
+      Enter canonical-line → `InputAction` translation (the `SlashKind`
+      ladder inside the CommandList arm) becomes *one* prefix-keyed ladder
+      in the submit path, shared by CommandList and Menu — that translation
+      is a legitimate host concern (§12 leaf-result translation), it just
+      lives in exactly one place. Fold `engine_seed`/`engine_arrow` into
+      `step_at` (`HostKey::Up`/`Down` already handled there; add an
+      explicit seed action) so the host stops poking `interpreter` directly.
+   2. **CommandList → Menu**: render the root list from the engine plan
+      verbatim (static-level rows already carry id + description; the host
+      formats nothing). Deletes the host formatting arm and the legacy
+      `cmds` field. The Enter translation ladder stays (step 1 placed it).
+   3. **Model / Thinking / Persona → Menu**: pure variant deletion once
+      1–2 land — their display/paint and key paths are identical to Menu's;
+      their Enter translations are already in the ladder.
+   4. **Mod → engine plan**: a trailing dotted token (`/model .sor`) is a
+      *synthetic level*: `state()`/`render_plan` serve its rows from the
+      existing `field_options` logic (the completion data is already
+      engine-side from slice-4; this step is render/state plumbing only).
+      Deletes the Mod overlay and its Tab/Enter/display/Esc arms.
+   5. **Session migration**: SessionProvider rows already flow through the
+      engine. Add: pinning `<name>` drills into the descriptor's static
+      action children (resume/fork/rename/delete); the entry info panel
+      (name/turns/age/dir) becomes the level detail (DetailProvider);
+      delete confirm via the confirm two-handler (`ConfirmPrep` phase
+      already exists in `accept.rs` — tree/session were its reference
+      cases). Deletes Session, SessionAction, Confirm overlays +
+      `session_action_overlay_entries` and the entry-side helpers.
+   6. **Tree + /compact migration**: same shape — tree list plan (TreeProvider
+      rows already flow), pinned entry → `switch`/`compact` action children
+      (already in the descriptor), modes as children, `llm` leaf confirm
+      two-handler with the `.prompt` modifier; the entry header panel →
+      DetailProvider; the compact summary header (target label, context
+      tokens, drop span) → DetailProvider on the compact level. After this,
+      `/compact`'s `NewPath` rewrite lands in the generic Menu with no
+      bespoke overlay. Deletes Tree, TreeAction, SwitchAction,
+      CompactSummary + `tree_overlay_entries`, `filter_tree_options`,
+      `tree_entry_header`, `compact_summary_header`.
+   7. **Stat → DetailProvider**: the panel renders via the registered
+      StatDetailProvider (`plan.detail`, same path `/replay` uses);
+      esc = clears input, dismisses details. Deletes the Stat overlay and host
+      `stat_phase`.
+   8. **Settings migration**: a SettingsProvider (live settings cell)
+      supplies rows + current values + `active_row`; each setting's value
+      level is the existing descriptor value child; the leaf handler writes
+      via the settings cell (handler-owned state, §12). `default_model`'s
+      value level is dynamic over the ModelProvider rows (only leaf/handlers
+      differ — as noted under 6.7-2), and its `.field:`/`.sort:` completion
+      is the generic engine field logic already in place for `/model`.
+      Deletes Settings, SettingsVal + `filtered_value_candidates`,
+      `parse_model_filter`, `model_selection_overlay_entries`,
+      `MODEL_MODIFIERS`, `ReplCtx.model_filter`, and the recent-sync
+      ceremony.
+   9. **Sandbox completion**: fs live-filter DataProvider for add_ro/add_rw
+      path values; `remove` = dynamic value children over the current
+      bindings. Deletes the Sandbox overlay + `sandbox_overlay_entries`.
+   10. **Esc uniformity**: `handle_esc`'s per-variant buffer rewrites die
+       with their overlays (steps 4–9); the survivors route through
+       `engine_esc` (engine ladder) or clear the completion state
+       (PathComplete/Help).
+
+7.3. **Final cleanup/audit** (absorbs the old 7.3/7.4 split — per-command
+   handler migration happens *inside* steps 5–9 above, each command
+   completing render + accept + handlers in one slice):
+   - delete the `SlashKind` dispatch enum once the Enter translation ladder
+     no longer needs `cmd.kind` (the registry itself **stays**: it is the
+     descriptor source and help text, per §12 "per-command code exists only
+     in descriptors + handlers"); agent.rs's typed-input parse arms
+     (`/tree`, `/session`, `/replay`, …) **stay** — typed submission must
+     keep working regardless of which overlay produced the line;
+   - remove dead `engine_rows` fields, `#[allow(dead_code)]` machinery;
    - audit: `slashdot_menu` builds without the parent crate; the host
      renders the engine's plan verbatim (§12) — no per-variant marker or
      cursor policy survives; `grep ActiveOverlay` shows only the four
