@@ -123,7 +123,7 @@ enum SubmitResult {
 
 Non-overridable machinery: path parsing, selection validation (D2 demotion),
 fuzzy rank-and-pin, §7.1 filter/sort query, per-node cursor cache, Esc
-ladder, traversal frames, render-plan emission. Encapsulated by the
+restore ladder, render-plan emission. Encapsulated by the
 `NodeEntry` newtype:
 
 - the host implements `SlashDotNode` (data, submit, prepare, header);
@@ -135,9 +135,12 @@ ladder, traversal frames, render-plan emission. Encapsulated by the
 
 Each node owns private local state:
 
-- a **cursor cache**: selected ID, per-filter state index;
-- a **derived data cache**: surviving frames of one activation; reuses
-  unchanged `Rc` signals from `data()` (§8);
+- a **cursor cache**: selected row ID (+ memoized index);
+- **view state**: the level's `view_args` — the last rendered prompt
+  section, also the view cache key — and `should_restore_view_args`
+  (set on drill, consumed on restore, §5.1);
+- a **derived data cache**: one activation; reuses unchanged `Rc` signals
+  from `data()` (§8);
 - optionally richer state (e.g. confirm payload, §9).
 
 All caches invalidate on **epoch** increment: a menu-invocation counter the
@@ -151,29 +154,38 @@ so nodes can invalidate their own caches.
 
 ### Traversal algorithm
 
-The traversal is recursive: the parent parses its level, resolves the
-selection, recurses into the selected child with updated `PathArgs`.
+The traversal is recursive: the parent parses its level (dot modifiers +
+words checked against child IDs, building `Args`), recurses into the
+matched child with its unconsumed tail, or — if no child ID matched —
+renders its own listing from the parsed view args. A descending parent
+returns the child's result unmodified (pass-through, §2 "Parent→child
+API"); leaves own the newprompt.
 
 **Listing node (children, no submit):**
 - Refresh row cache via `node_data()` on each child; check `Rc::ptr_eq`.
-- Path exhausted, no child ID match:
-  - `no key` / `MoveCursor`: return listing `MenuResult::Continue(RenderPlan, newprompt)`.
-  - `Tab`: expand focused ID, append space, push frame, call child's
-    `node_traverse()` with updated PathArgs.
+- No child ID match (or child ID with trailing space):
+  - `no key` / `MoveCursor`: render listing `MenuResult::Continue(RenderPlan, prompt)`.
+    Rendering a listing that is not *exactly* one valid ID clears
+    `should_restore_view_args` (§5.1).
+  - `Tab`: replace the level's view args with the cursor row's ID and a
+    trailing space (drill), set this node's `should_restore_view_args`,
+    append the ID to `PathArgs.ids`, recurse into that child with the ID
+    as its prompt.
   - `Enter`: as Tab, but forward key; child may `submit()` immediately if it
     is a leaf.
-- Child ID match:
-  - Non-empty suffix: `return child.node_traverse(...)` with updated PathArgs. All
-    keys handled deeper.
-  - Empty suffix: handle per §5.1 Esc ladder (frame restore, filter drop, or
-    parent-level re-entry).
+- Child ID match, no trailing space:
+  - `should_restore_view_args` set (this node drilled earlier): undo the
+    drill per §5.1 — seed the cursor on the ID's row and replace the ID
+    in the prompt with this node's stored view args.
+  - Otherwise: render this node's own listing (cursor on the ID's row);
+    the child level's listing is hidden. No recursion.
 
 **Leaf node (no children, submit handler):**
 - Display `header()` via RenderPlan.
 - `Enter`: run `prepare()` → default returns `submit()`. If `Prepared`,
   render confirm dialog; subsequent `Enter` calls `submit()` (yea) or Esc
   (nay, pop level). Confirm dialog is a non-overridable engine service.
-- `Esc`: pop per §5.1; also cancels any confirm dialog.
+- `Esc`: restore ladder per §5.1; also cancels any confirm dialog.
 
 `node_traverse()` returns `MenuResult::{ Continue(Rc<RenderPlan>, newprompt),
 DoneSuccess, DoneError }`. `RenderPlan` wraps bulk row data in `Rc` so cursor
@@ -185,9 +197,14 @@ movement shares unchanged content — only marker positions (`selected_row`,
 `NodeEntry::node_traverse(&mut self, epoch, HostKey, PathArgs) -> MenuResult`
 - `HostKey`: `Tab`, `Enter`, `Esc`, `MoveCursor(n)`. The node at the end
   of the traversal handles all logical key actions.
+- `PathArgs.ids`: traversal path — the IDs drilled so far, one entry per
+  level, consumed by leaf `prepare()`/`submit()`.
 - `PathArgs.suffix`: byte range into the prompt (preserves trailing
   whitespace). `PathArgs.args`: modifiers + positional args, only on leaf
   nodes.
+- Return is **pass-through on the way up**: a parent that descended
+  returns the child's `MenuResult` unmodified. Leaves own the newprompt;
+  `NewPath` rewrites the buffer and traversal restarts at root.
 
 `NodeEntry::node_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
 - Parses args from suffix, calls `SlashDotNode::data()`.
@@ -246,9 +263,10 @@ its own row source and submit handler.
   valid id / end of prompt.
 - **Selection token**: space-free; validated against merged candidate set (D2).
   Enters only via Tab/Enter (§4, §5).
-- **Trailing space**: drill in. No trailing space = pinned, sub-menu hidden.
-  Uniform for all listing levels. Host must not keep per-command "open without
-  trailing space" lists.
+- **Trailing space**: drill in. No trailing space = sub-menu hidden (the
+  level renders its own listing, cursor on the ID; the child level below
+  is not shown). Uniform for all listing levels. Host must not keep
+  per-command "open without trailing space" lists.
 - Dynamic nodes encapsulate two grammar levels when static sub-actions exist.
 
 Parsing is structural (terminators: next dot-modifier, valid id, or end-of-
@@ -260,10 +278,13 @@ prompt); fs-style completion is a modifier behavior (§7), not a level signal.
 
 - **Cursor lives in the view; prompt holds the commit.** Up/down moves the
   view cursor only.
-- **Tab/Enter act on the cursor row.** Writes that row's id into the prompt.
-- **Accept clears refinement.** Terms and modifiers are ephemeral; cleared on
-  Tab/Enter. Traversal memory restores them.
-- **Exact match ⇒ pinned; unique fuzzy match ⇒ pinned** (one generic rule).
+- **Tab/Enter act on the cursor row.** Writes that row's id into the prompt
+  (drill, §5).
+- **Drill clears refinement.** Terms and modifiers are ephemeral; replaced
+  by the cursored ID. The pre-drill view args are remembered per node and
+  restored via §5.1 on the way back up.
+- **Exact match ⇒ selected; unique fuzzy match ⇒ selected** (one generic
+  rule).
 
 ---
 
@@ -273,29 +294,49 @@ prompt); fs-style completion is a modifier behavior (§7), not a level signal.
   complete cursor row's id.
 - **Enter**: if `submit` handler, invoke it (with `prepare` if declared);
   otherwise Tab-drill.
-- **Esc**: back navigation via §5.1 ladder.
-- **Traversal frames**: pushed on accept/drill; carry `{line, cursor, level}`.
+- **Esc**: back navigation via §5.1 restore ladder.
+- **Drill**: Tab/Enter replaces the level's view args with the cursored ID
+  + trailing space and recurses into that child; the previous view args
+  are remembered in per-node state for the §5.1 restore.
 - **Edit invalidation**: scoped to the edited level; trailing-space removal
   is navigation, not edit.
 - **`*` active marker**: always from application context, never typed selection.
 
-### 5.1 Esc ladder
+### 5.1 Restore ladder
 
-Each step applies only when the next does not:
+Each step applies only when the next does not. There is **no traversal
+stack** (that "frame" language is a hold-over from the previous
+non-recursive design): the prompt is the state; each node remembers its last
+rendered view args in `view_args` (per-node, updated whenever a listing
+of this node is rendered — drilled or not) and a `should_restore_view_args`
+boolean (set when this node drills into a child, consumed once).
 
-1. Valid child ID, no trailing space → replay local frame (restore previous
-   prompt + filter); drop trailing ID from prompt and match cursor.
-   This step is applied even without `Esc`, so even when restoring from
-   prompt.
-2. Clear local frame + fuzzy terms + modifiers. Keep cursor position.
-3. Strip trailing space → drill out one level. Root: clear entire buffer.
+1. **Restore (no key needed).** A level whose prompt section is exactly
+   one valid child ID, no trailing space, and `should_restore_view_args`
+   set, means the user drilled in (Tab/Enter) and navigated back out.
+   Undo the drill in one step:
+   - Seed the cursor on the row named by the ID (the ID becomes the
+     focused row, so the user can immediately add filter terms or
+     re-drill).
+   - Replace the ID in the prompt with this node's stored `view_args`
+     (e.g. `/model claude-4 ` → Esc → `/model sonnet`).
+   - Clear `should_restore_view_args`.
+   Without the boolean (the ID was typed by hand, e.g. `/model` letter
+   by letter), nothing is rewritten — the level renders its own listing
+   with the cursor on the ID's row; the child level's listing is hidden.
+2. **Clear refinement.** Fuzzy terms, modifiers, and selection all
+   dropped (e.g. `/model sonnet` → Esc → `/model `). Cursor position is
+   kept.
+3. **Strip trailing space** → the parent level becomes responsible for
+   the prompt again (its restore step 1 then applies on the next Esc).
+   Root: clear entire buffer.
 
 ### 5.2 Active-state sourcing
 
 The `*` row comes from a uniform mechanism — host never computes it:
 
 - Dynamic levels: `data()` returns `active_ids: Vec<String>`; engine resolves
-  to row indices per frame.
+  to row indices at render time.
 - Static/enum levels: node's `data()` supplies the active id from live app
   state; engine resolves identically.
 - `RenderPlan.active_rows: Option<Vec<usize>>` vs `selected_row` (cursor).
@@ -415,9 +456,9 @@ the host applies only control flow / terminal / transcript (§12).
 | R8-1–R8-8 | Single-token labels; structural terminators; confirm two-phase submit (R8-3 → §9); headers from node (R8-4); accept clears filter + traversal memory (R8-5); one-shot vs live-filter + front/back-end modifiers (R8-6); selection space-free, values may contain spaces (R8-7); compact as leaf-returns-path (R8-8). |
 | Node model | `SlashDotNode` trait + internal `NodeEntry` wrapper; non-overridable traversal on `NodeEntry`; epoch-cached per-node state; providers on nodes, not side tables (§2, §8). |
 | Merged child sets | Ordered union of child rows; field metadata on parent; per-child submit dispatch (§2.1). |
-| Cursoring | Up/down moves cursor only; Tab/Enter commit + clear; traversal memory + scoped invalidation (§4, §5). |
+| Cursoring | Up/down moves cursor only; Tab/Enter drill (ID + space into prompt); per-node view_args memory + §5.1 restore on the way up. |
 | `*` marker | Always from application context, never typed selection (§5.2). |
-| Esc | Per-level ladder: space → frame → refinement → selection → root clear (§5.1). |
+| Esc | Per-level restore ladder: restore (ID→cursor + view_args if drilled) → refinement → space → root clear (§5.1). |
 | Confirm | Handler-local state machine; engine dialog service (§9). |
 | Coordinator | Eliminated — host epoch wrapper (§2, §12). |
 
@@ -425,13 +466,14 @@ the host applies only control flow / terminal / transcript (§12).
 
 ## 12. Role split: engine vs. host
 
-Per frame the traversal produces, from `(line, node-tree, epoch)`:
+Per activation the traversal produces, from `(prompt, node-tree, epoch)`:
 
-- resolved level (node path) + listing/pinned state (§3);
+- resolved level (node path) + drilled/listing state (§3);
 - merged candidate rows, ranked/filtered/sorted, with `*` active-row (§5.2);
-- cursor row (per-node cache) + key decisions (buffer rewrite, frame push/pop,
+- cursor row (per-node cache) + key decisions (buffer rewrite, drill,
   submit);
-- Esc: root re-entry with shorter buffer (never up-recursion, §5.1).
+- Esc: restore ladder at the current level — ID→cursor conversion +
+  view_args restore if drilled (§5.1).
 
 **Engine / node tree**: built once at startup. Per-node caches + staged
 payload inside nodes; epoch bump invalidates on menu open. No `Arc`s needed.
@@ -441,7 +483,7 @@ translation → `InputAction`. Non-slash affordances (`!shell`, path completion)
 
 | Layer | Owns |
 | --- | --- |
-| Engine (default impl) | Node tree + traversal (grammar, cursor caches, Esc ladder, frames, render plan); confirm dialog service; key decisions |
+| Engine (default impl) | Node tree + traversal (grammar, cursor caches, Esc restore ladder, view_args state, render plan); confirm dialog service; key decisions |
 | Node instances | Application data — `data()` / `submit()` / `prepare()`; mutations via shared handles |
 | Host | App state, terminal I/O, rendering plan, `SubmitResult` → `InputAction` |
 
