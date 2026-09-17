@@ -105,7 +105,8 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("doubleword", "Qwen/Qwen3.5-4B", 128_000, 0.0, 0.0, false),
     ("llamafile", "LLaMA_CPP", 128_000, 0.0, 0.0, false),
     ("minimax", "MiniMax-M2.7", 200_000, 0.0, 0.0, false),
-    ("xiaomimimo", "mimo-v2.5-pro", 200_000, 0.0, 0.0, false),
+    ("xiaomimimo", "mimo-v2.5", 1_050_000, 0.002, 0.05, true),
+    ("xiaomimimo", "mimo-v2.5-pro", 1_050_000, 0.0, 0.0, true),
     ("zai", "glm-4.6", 128_000, 0.0, 0.0, false),
 ];
 
@@ -326,7 +327,8 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         // e.id is "openrouter:deepseek/deepseek-v4-flash" — strip the
         // "openrouter:" prefix to get the original OpenRouter API id.
         if let Some(or_id) = e.id.strip_prefix("openrouter:") {
-            if let Some((ns, model)) = or_id.split_once('/') {
+            if let Some((orprovider, model)) = or_id.split_once('/') {
+                let ns = &rig_provider(orprovider);
                 if is_known_provider(ns) && provider_available(ns) {
                     let (pc, cc, source) = direct_price(ns, model, e.prompt_cost, e.completion_cost);
                     out.push(ModelEntry {
@@ -582,7 +584,7 @@ async fn native_models(provider: &str) -> Vec<String> {
     // TODO: support env var API base + hard-coded fall-back consistently?
     let (maybeurlbase, var) = match provider {
         "deepseek" => ("https://api.deepseek.com", "DEEPSEEK_API_KEY"),
-        "xiaomi" => ("XIAOMI_MIMO_API_BASE", "XIAOMI_MIMO_API_KEY"),
+        "xiaomimimo" => ("XIAOMI_MIMO_API_BASE", "XIAOMI_MIMO_API_KEY"),
         "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY"),
         _ => return Vec::new(),
     };
@@ -617,11 +619,27 @@ async fn native_models(provider: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Translate a rig provider to an openrouter provider name, for cases where those do not align
+fn openrouter_provider(provider: &str) -> String {
+    match provider {
+        "xiaomimimo" => "xiaomi",
+        _ => provider
+    }.to_string()
+}
+
+/// Openrouter -> rig provider
+fn rig_provider(provider: &str) -> String {
+    match provider {
+        "xiaomi" => "xiaomimimo",
+        _ => provider
+    }.to_string()
+}
+
 /// Prune/extend direct entries for providers exposing `/models`, using the
 /// live id set to drop stale models and surface new ones. Best-effort.
 async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
     let debug = DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed);
-    for provider in ["deepseek", "openai", "xiaomi"] {
+    for provider in ["deepseek", "openai", "xiaomimimo"] {
         let before = entries.len();
         if !provider_available(provider) {
             if debug {
@@ -645,7 +663,7 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         let live_set: HashSet<String> = live.iter().cloned().collect();
         let retained = entries.len();
         entries.retain(|e| {
-            if e.provider == provider {
+            if e.provider == openrouter_provider(provider) {
                 // Extract model name from "provider:model" format.
                 let model = e.id.splitn(2, ':').nth(1).unwrap_or(&e.id);
                 live_set.contains(model)
@@ -657,13 +675,8 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         if debug && pruned > 0 {
             eprintln!("[debug-providers] liveness_prune: pruned {} stale entries for {}", pruned, provider);
         }
-        // Translate cases where openrouter provider does not match rig provider ID
-        let rigprovider = match provider {
-            "xiaomi" => "xiaomimimo",
-            _ => provider
-        };
         for m in live {
-            let id = format!("{}:{}", rigprovider, m);
+            let id = format!("{}:{}", provider, m);
             if !entries.iter().any(|e| e.id == id) {
                 entries.push(ModelEntry {
                     provider: provider.to_string(),
