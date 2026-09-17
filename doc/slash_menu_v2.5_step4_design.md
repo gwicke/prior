@@ -13,8 +13,8 @@ Thin wrapper. Nothing lives here but the epoch (design §2).
 eval_prompt(prompt, key):
   let result = self.root.node_traverse(self.epoch, key, prompt);
   match result {
-    NodeResult::Continue { prompt, display } =>
-      MenuResult::Continue(Rc::new(build_render_plan(&display)), prompt),
+    NodeResult::Continue { prompt, plan } =>
+      MenuResult::Continue(plan, prompt),
     NodeResult::Done(msg) => MenuResult::DoneSuccess(msg),
     NodeResult::Error(msg) => MenuResult::DoneError(msg),
   }
@@ -78,16 +78,16 @@ node_traverse(epoch, key, prompt):
   │  //           immediately if it is a leaf                      │
   │                                                                │
   │  match key:                                                    │
-  │    MoveCursor → update cursor, rebuild DisplayState            │
+  │    MoveCursor → update cursor, reuse cached lines              │
   │    Tab → complete active row, drill into child                 │
   │    Enter → same as Tab but forward key to child                │
   │    other → just display (fall through to phase 4)              │
   │                                                                │
   ├─ Phase 4: build result ────────────────────────────────────────┤
   │                                                                │
-  │  Reconstruct full prompt from path + new tail.                 │
-  │  Build DisplayState from view state.                           │
-  │  Return NodeResult::Continue { prompt, display }               │
+  │  Reconstruct full prompt from matched child + new tail.        │
+  │  Build RenderPlan from RenderCache + cursor/active markers.    │
+  │  Return NodeResult::Continue { prompt, plan }                  │
   │                                                                │
   └────────────────────────────────────────────────────────────────┘
 ```
@@ -500,14 +500,18 @@ struct NodeCache {
 //    changes.
 ```
 
-### 4.2 `DisplayState` — transient, not stored
+### 4.2 `RenderCache` — cached rendered lines
 
-DisplayState is the interface between node_traverse and the render plan
-builder. It bundles what the render plan needs from the traversal:
-rows, cursor position, active markers, title, and header text.
+```rust
+struct RenderCache {
+    lines: Vec<RenderLine>,       // cached, rebuilt only when ranked_rows change
+    columns: Vec<ColumnDef>,      // cached, rebuilt when field metadata change
+}
+```
 
-DisplayState is derived from NodeCache, but it serves as a clean
-boundary between the traversal engine and the render plan builder.
+RenderCache stores the rendered output. On cursor moves, only the
+cursor index (selected_idx) changes — the lines are reused from cache.
+On filter/rank changes, the lines are rebuilt from the new ranked_rows.
 Passing a reference to NodeCache would couple the render builder to
 the internal cache structure.
 
@@ -532,11 +536,15 @@ from the cache + current cursor/active markers.
 
 ```rust
 enum NodeResult {
-    Continue { prompt: String, display: DisplayState },
+    Continue { prompt: String, plan: Rc<RenderPlan> },
     Done(Option<String>),
     Error(String),
 }
 ```
+
+The RenderPlan is built from RenderCache + cursor/active markers.
+Wrapped in Rc so cursor moves (which only change selected_idx) share
+the same lines.
 
 ---
 
@@ -620,12 +628,13 @@ Per design §2: "Parent-state access happens only outside the child loop."
 - Active markers (design §5.2)
 
 ### 4c. Render plan
-- `DisplayState`
-- `build_render_plan()` standalone function
+- `RenderCache` with cached lines
+- `build_render_plan()` from RenderCache + cursor/active markers
 - Table layout from field_space
+- Vertical pagination (scroll_offset)
 
 ### 4d. MoveCursor
-- Update cursor, rebuild DisplayState
+- Update cursor, reuse cached lines (only change selected_idx)
 - Test end-to-end
 
 ### 4e. Tab completion + drill
@@ -655,8 +664,8 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | Data refresh | Always call data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
 | View re-derive | Only if tail changed | Skip filter+rank if cached_tail matches. |
 | MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
-| Columns | Not in DisplayState | Inferred from field_space at render time. |
-| is_leaf | Not in DisplayState | Use `children.is_empty()`. |
+| Columns | Not in RenderCache, inferred at render time | Field_space determines columns. |
+| is_leaf | Not cached | Use `children.is_empty()`. |
 | Child name lookup | Linear scan over children | 5-10 children typical, O(n) is fine. No HashMap needed. |
 | Path walk | row_index lookup per word, exit on first match | row_index rebuilt on data() refresh. O(1) per word. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
