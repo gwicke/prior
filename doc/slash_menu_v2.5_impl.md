@@ -29,6 +29,65 @@ Design deviations from step4 doc (per user clarification):
   listing drill passes `" "` as child section; matched drill passes tail.
 - Empty-ID rows: warn + skip (not debug_assert).
 
+### Deferred (not blocking, pick up as needed)
+
+**RenderPlan / rendering:**
+- No `Rc<Vec<RenderLine>>` sharing — `plan_from_cache()` rebuilds the full
+  plan on every keypress. The step4 design §4.2 describes a `RenderCache`
+  where `MoveCursor` reuses `lines` via Rc clone (only `selected` and
+  `active_rows` recomputed). Deferred until profiling shows it matters.
+- No table layout / `ColumnDef` in RenderPlan — rows render as
+  `id — description`. Table columns come when commands with structured
+  fields are ported (step 6+).
+- No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
+  but no dialog text is rendered in the plan. The confirm dialog (§9)
+  rendering is a step 7 concern.
+- `RenderPlan.title` is unused — always `None`. Will be set when commands
+  provide panel titles.
+
+**PathArgs / Args borrowing:**
+- `PathArgs` and `Args` own their data (`String`, `Vec<String>`). The
+  step4 design and user preference was `Vec<(&str, &str)>` borrowed from
+  the prompt — cheaper allocation but requires a lifetime on `PathArgs`.
+  Deferred to avoid lifetime complexity in the trait API during early
+  development; revisit when profiling shows allocation pressure.
+
+**`parse_section` vs `grammar::parse_level`:**
+- `parse_section()` (node_entry.rs) is a new single-pass left-to-right
+  algorithm. The existing `grammar::parse_level()` (right-to-left,
+  selection-candidate based) is unused by v2.5 traversal. Both remain
+  in the crate — `parse_level` is still used by the old v2.0 interpreter
+  tests. When the old interpreter is deleted, `parse_level` can be
+  removed or consolidated.
+
+**Test porting:**
+- 22 new v2.5 tests written; 26 old interpreter tests remain in the old
+  harness (test the old code path). The old tests will be replaced when
+  commands are migrated (step 6). No test was mechanically ported —
+  the new tests cover the v2.5 traversal harness independently.
+
+**Row uniformity:**
+- Only enforces non-empty `id`. The design says "at least `id` +
+  `description`" but also "optionally `description`" — currently
+  description is not checked. Could add a `warn!` for missing
+  description in debug builds.
+
+**Field space inference fallback:**
+- When `SlashDotNode::fields()` returns empty, `infer_field_space()`
+  builds a `FieldSpace` from the row data (infers number vs string from
+  first non-missing value). Works but less precise than explicit metadata.
+  Commands with known fields should override `fields()`.
+
+**Cursor / view state:**
+- `cursor_idx` is not re-derived from `cursor_id` on every
+  `MoveCursor` — it's updated in-place and kept in sync. The step4
+  design says "ID is authoritative, index is memoized" which matches,
+  but the code doesn't enforce the invariant with a debug_assert.
+- `EpochState` reset on epoch change clears `view_args` and
+  `should_restore_view_args`. Content cache (`data_rc`, `row_index`)
+  is NOT cleared — it persists across epochs (stale rows are replaced
+  on the next `refresh_data`). This is intentional but undocumented.
+
 **Next:** Step 6 (port existing commands to `SlashDotNode` — Model, Thinking,
 Persona, root list).
 
