@@ -496,45 +496,32 @@ struct RenderCache {
     lines: Rc<Vec<RenderLine>>,   // rebuilt when inputs change, Rc for zero copy
     columns: Vec<ColumnDef>,      // rebuilt when field metadata change
     term_width: usize,            // cache key: invalidate on resize
-    xxx: what is this derived from? Some kind of hash? If it does not actually
-    capture all changes, or is expensive to compute, then just clear the cache
-    of all data unconditionally.
-    Separately, The cursor and `view_args` should survive content changes -
-    move them to a dedicated section of NodeCache that is not cleared on
-    content change? Basically, have one part that depends on content, and one
-    part that does not.
-    ranked_rows_sig: usize,       // cache key: invalidate on re-rank
 }
 ```
 
-RenderCache stores the rendered output. Invalidation triggers:
-- **Cursor move**: only cursor index changes — lines reused from cache.
-- **Filter/rank change**: lines rebuilt from new ranked_rows.
-- **Terminal resize** (SIGWINCH): lines rebuilt — table column widths,
-  header truncation, and word wrapping are all width-dependent.
+Invalidation is caller-driven, not signature-based. The caller (the
+traversal loop) already knows whether it just re-ranked. It passes a
+`dirty: bool` flag to `build_render_plan()`. If dirty, the cache is
+rebuilt. If clean (cursor move only), the existing lines are reused.
+
+This avoids hashing ranked_rows (expensive, fragile) — the caller
+already has the answer. Invalidation triggers:
+- **Cursor move** (`dirty=false`): only cursor index changes — lines
+  reused from cache.
+- **Filter/rank change** (`dirty=true`): lines rebuilt from new
+  ranked_rows.
+- **Terminal resize** (`dirty=true`): lines rebuilt — table column
+  widths, header truncation, and word wrapping are all width-dependent.
   `term_width` is a cache key; compare against current width to detect
   resize.
+
+Cursor and view_args live in `NodeEntry`, NOT in RenderCache.
+NodeEntry is NOT cleared on content change — it persists across
+re-rank/re-filter. RenderCache is purely content-dependent.
 
 The cache does NOT need to track height — the host already windows
 via overlay_window(). The engine sends all ranked rows; the host
 decides which to display.
-
-Regarding caching: the main point of caching is efficient cursoring.
-For cursor moves (MoveCursor), the rendered lines don't change — only
-the cursor position (selected_idx) does. For other keys, the rows
-themselves may change (filter, rank). So the cache should store the
-rendered `Vec<RenderLine>` and only rebuild it when ranked_rows changes.
-The cursor index is passed separately.
-
-```rust
-struct RenderCache {
-    lines: Vec<RenderLine>,       // cached, rebuilt only when ranked_rows change
-    columns: Vec<ColumnDef>,      // cached, rebuilt when field metadata change
-}
-```
-
-This avoids re-rendering on every cursor move. The RenderPlan is built
-from the cache + current cursor/active markers.
 
 ### 4.3 `NodeResult` (internal)
 
@@ -547,8 +534,8 @@ enum NodeResult {
 ```
 
 The RenderPlan is built from RenderCache + cursor/active markers.
-No Rc wrapping — the host does a full redraw on every keypress anyway
-(crossterm, no double-buffering).
+RenderPlan.lines is `Rc<Vec<RenderLine>>`, shared directly from
+RenderCache — zero-copy on cursor moves.
 
 ---
 
@@ -672,7 +659,7 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | Columns | Not in RenderCache, inferred at render time | Field_space determines columns. |
 | is_leaf | Not cached | Use `children.is_empty()`. |
 | Path walk | row_index lookup per word, exit on first match | row_index rebuilt on node_data() refresh. O(1) per word. |
-| RenderCache | Cached lines + term_width key | Invalidated on re-rank or terminal resize. No Rc — host does full redraw. |
+| RenderCache | Caller-driven invalidation, Rc share | No hash: caller passes dirty flag. Cursor+view_args in NodeEntry, not cache. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
 | Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
 | Tab | Drills, never submits | Design §5: "Tab: bare level → promote; otherwise complete." |
