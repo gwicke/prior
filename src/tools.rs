@@ -130,8 +130,21 @@ pub async fn read_file(
 
 #[rig_tool(name = "write", description = "Write content to file", required(path, content))]
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
-    fs::write(get_path_with(&path, true)?, content).await?;
-    Ok("ok".into())
+    let p = get_path_with(&path, true)?;
+    fs::write(&p, &content).await?;
+    // Return a structured result similar to read_file: include the path and
+    // content preview so display_tool_result can render it with syntax
+    // highlighting and the user sees what was written.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
+    let shown = crate::path_util::relativize_path(&p, &cwd);
+    // Limit preview to first 50 lines, without line numbers (display handles formatting)
+    let preview = content.lines().take(50).collect::<Vec<_>>().join("\n");
+    Ok(serde_json::json!({
+        "path": shown,
+        "content": preview,
+        "lines": content.lines().count(),
+        "bytes": content.len(),
+    }).to_string())
 }
 
 /// A single targeted text replacement within a file.

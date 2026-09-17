@@ -1673,12 +1673,58 @@ impl Output for ConsoleOutput {
         }
 
         // Which tool produced this result (set by `display_tool_call`). Drives
-        // read-specific line-number stripping and language guessing.
+        // read/write-specific rendering and language guessing.
         let tool = self.last_tool.lock().unwrap().clone();
         let is_read = tool
             .as_ref()
             .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
             .unwrap_or(false);
+        let is_write = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("write") || n.eq_ignore_ascii_case("write_file"))
+            .unwrap_or(false);
+
+        // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
+        if is_write {
+            if let Ok(v) = serde_json::from_str::<Value>(result) {
+                if let (Some(path), Some(content), Some(total_lines)) = (
+                    v.get("path").and_then(|x| x.as_str()),
+                    v.get("content").and_then(|x| x.as_str()),
+                    v.get("lines").and_then(|x| x.as_u64()),
+                ) {
+                    // Show the path as a header with line count
+                    let color = std::io::stdout().is_terminal();
+                    let lang = guess_lang(path);
+                    let header = format!("write {} [{} lines]", path, total_lines);
+                    let header_styled = highlight_code_fg(&header, "bash", color);
+                    self.paint_panel(&header_styled, true);
+
+                    // Render the content with syntax highlighting (like read_file)
+                    let show_max = 10; // Limit preview to 10 lines (match read_file)
+                    let width = term_width();
+                    let inner = width.saturating_sub(1).max(1);
+                    let content_lines: Vec<_> = content.lines().collect();
+                    for (printed, line) in content_lines.iter().enumerate() {
+                        if printed >= show_max {
+                            break;
+                        }
+                        for wline in wrap(line, inner) {
+                            let styled = highlight_code_fg(&wline, lang, color);
+                            self.paint_panel(&styled, true);
+                        }
+                    }
+                    if content_lines.len() > show_max {
+                        self.tool_panel(
+                            &format!("... +{} lines", content_lines.len() - show_max),
+                            false,
+                            true,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
         let read_path = tool
             .as_ref()
             .and_then(|(_, a)| a.get("path"))
@@ -3024,5 +3070,33 @@ mod tests {
             "expected a blank line between the tool result and trailing text, got {:?}",
             between
         );
+    }
+
+    #[test]
+    fn write_tool_renders_content_like_read() {
+        // Write tool result should render with path header and syntax-highlighted
+        // content preview (first 10 lines), matching read_file's rendering.
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+
+        // Simulate a write tool call with structured result (as write_file returns)
+        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs", "content": "fn main() {}"}));
+        let result = r#"{"path":"./test.rs","content":"fn main() {\n    let x = 42;\n    println!(\"Hello, world! {}\", x);\n}","lines":4,"bytes":72}"#;
+        out.display_tool_result(result);
+
+        out.end_response();
+        let captured = out.end_capture_inner();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain the path header with line count
+        assert!(output.contains("write ./test.rs [4 lines]"), "missing path header with line count: {}", output);
+        // Should contain syntax-highlighted content (first 10 lines)
+        assert!(output.contains("fn main()"), "missing fn main: {}", output);
+        assert!(output.contains("let x = 42"), "missing let x = 42: {}", output);
+        assert!(output.contains("println!"), "missing println!: {}", output);
+        // Should NOT contain line numbers (unlike read_file which has them in raw result but stripped for display)
+        assert!(!output.contains("|"), "should not contain line number gutter: {}", output);
     }
 }
