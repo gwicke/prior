@@ -12,21 +12,28 @@
 //! See `doc/slash_menu_v2_design.md` in the picocode repository for the
 //! design this implements.
 
-pub mod accept;
-pub mod cursor;
-pub mod fields;
-pub mod filter;
-pub mod fuzzy;
-pub mod grammar;
-pub mod interpreter;
-pub mod node;
-pub mod node_impl;
-pub mod prompt;
-pub mod render;
-pub mod provider;
-pub mod table;
-pub mod value;
-pub mod wrap;
+// --- Public API (what the host sees) ---
+pub mod menu;
 
+// --- Internal modules (not exposed to host) ---
+pub(crate) mod node_impl;
+mod node_entry;
+mod node;
+mod provider;
+mod interpreter;
+mod cursor;
+mod fields;
+mod filter;
+mod fuzzy;
+mod grammar;
+mod prompt;
+mod render;
+mod table;
+mod value;
+mod wrap;
+mod accept;
+
+// Re-export public types for convenience.
+pub use menu::{SlashDotMenu, SlashDotHandle};
+pub use node_impl::{SlashDotNode, HostKey, MenuResult, PathArgs, Args, DataResponse, DataError, DataResult, SubmitResult};
 pub use table::{Align, Table};
-pub use node_impl::{PathArgs, Args, DataResponse, DataError, DataResult, SubmitResult, MenuResult, HostKey, NodeImpl, NodeTraversal, LeafNode};

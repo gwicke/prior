@@ -1,13 +1,13 @@
 //! Node implementation trait (v2.5 design §2).
 //!
-//! Commands are `impl NodeImpl` structs. The default blanket `node_traverse()`
-//! handles path parsing, cursor, Esc, field filtering/sorting, and merged
-//! child sets. Per-node code only provides `data()`, `submit()`, `prepare()`,
-//! and `header()`.
+//! Host applications implement `SlashDotNode` for each menu command.
+//! The engine handles all traversal, cursor, and child management internally.
 
 use crate::fields::Row;
 use crate::render::RenderPlan;
 use crate::value::Value;
+
+// --- Public types used by SlashDotNode implementors ---
 
 /// Path arguments parsed from the prompt by the generic engine (§2).
 pub struct PathArgs {
@@ -54,7 +54,7 @@ pub enum SubmitResult {
     NewPath(String),
 }
 
-/// Outcome of `traverse()` — what the host should do next.
+/// Outcome of `node_traverse()` — what the host should do next.
 pub enum MenuResult {
     /// Keep interacting. The host renders the plan and sets the prompt.
     Continue(RenderPlan, String),
@@ -73,79 +73,43 @@ pub enum HostKey {
     MoveCursor(i32),
 }
 
-/// Base trait for a menu node. Only the overridden members are required;
-/// defaults handle the common case (no data, no submit, prepare = submit,
-/// no header).
-pub trait NodeImpl {
+// --- Public trait for host implementations ---
+
+/// Host implementations of menu nodes. Each command is one `impl SlashDotNode`.
+/// The engine handles all traversal, cursor, and child management internally.
+///
+/// All methods have default implementations (no-op / empty). Override only
+/// what the node needs.
+pub trait SlashDotNode {
     /// The rows this node contributes to its parent's listing.
     /// Return `Ok(Rc<DataResponse>)` with rows + active ids; `Err` to
-    /// report an error.
-    fn data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult;
-
-    /// The leaf accept behavior. Called on Enter when this node is the
-    /// selected leaf.
-    fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult;
-
-    /// Optional confirm hook (§7 step 7a). Default: `self.submit()`.
-    /// An override runs the prep phase (may open an external editor via
-    /// a callback captured at construction), stages the payload in
-    /// private state, and returns `SubmitResult::Prepared`.
-    fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult;
-
-    /// Non-selectable header lines (replaces v2 DetailProvider).
-    /// Default: empty. The engine truncates based on terminal size.
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String>;
-}
-
-// --- Defaults ---
-
-/// Extension trait for `NodeImpl` types: provides `node_traverse()` and
-/// `node_data()` as the public API. Implemented via blanket impl over
-/// all `NodeImpl` types — the default body handles path parsing, cursor,
-/// Esc, field filtering/sorting, and merged child sets.
-pub trait NodeTraversal {
-    /// Drive one key event through this node's subtree. Returns a
-    /// `MenuResult` the host acts on.
-    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
-        -> MenuResult;
-    /// Get the data rows for this node (used by parents to build merged
-    /// child sets).
-    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
-        -> DataResult;
-}
-
-impl<T: NodeImpl> NodeTraversal for T {
-    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
-        -> MenuResult {
-        // Step 4 will fill in the full traversal body.
-        // Stub for now.
-        let _ = (epoch, key, path_args);
-        MenuResult::DoneError("not yet implemented".into())
-    }
-    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
-        -> DataResult {
-        self.data(epoch, path_args)
-    }
-}
-
-/// Default `NodeImpl`: a node with no data, no submit, and no header.
-/// Useful for testing and as a building block.
-pub struct LeafNode;
-
-impl NodeImpl for LeafNode {
+    /// report an error. Default: empty response.
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(std::rc::Rc::new(DataResponse {
             rows: Vec::new(),
             active_ids: Vec::new(),
         }))
     }
+
+    /// The leaf accept behavior. Called on Enter when this node is the
+    /// selected leaf. Default: `Done(None)`.
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         SubmitResult::Done(None)
     }
-    fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-        SubmitResult::Done(None)
+
+    /// Optional confirm hook (§7 step 7a). Default: `self.submit()`.
+    /// An override runs the prep phase (may open an external editor via
+    /// a callback captured at construction), stages the payload in
+    /// private state, and returns `SubmitResult::Prepared`.
+    fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        self.submit(epoch, path_args)
     }
+
+    /// Non-selectable header lines (replaces v2 DetailProvider).
+    /// Default: empty. The engine truncates based on terminal size.
     fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
         Vec::new()
     }
 }
+
+// --- Defaults ---

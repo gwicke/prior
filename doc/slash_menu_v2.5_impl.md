@@ -7,12 +7,13 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2):** Phases 0–7.2.1–3. Uniform key loop; Model/Thinking/Persona/
-CommandList collapsed to single `Menu` overlay. Engine owns cursor, active
-marker, Esc ladder, field filtering. Host has ~8 overlay variants remaining.
+**Done (v2.5 reshape):** Steps 1–2. `SlashDotNode` trait (all defaults),
+`NodeEntry` (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public
+API). No key/routing concept — child dispatch by row index. Root node is
+a pure container with no `data()`/`submit()`.
 
-**Next:** v2.5 reshape (§3 below), then command migrations on the reshaped
-engine (§4).
+**Next:** Step 3 (verify grammar/filter boundary — no code changes), then
+step 4 (implement `NodeEntry::node_traverse()` body).
 
 ---
 
@@ -44,7 +45,7 @@ crates/slashdot_menu/
 
 | v2 (current) | v2.5 (target) |
 | --- | --- |
-| `MenuNode` data struct + `Interpreter` central | `NodeImpl` trait impls + blanket `node_traverse()` |
+| `MenuNode` data struct + `Interpreter` central | `SlashDotNode` trait + `NodeEntry` wrapper + `SlashDotMenu`/`SlashDotHandle` |
 | Providers/handlers registered by path string | Providers/handlers on the node (`data()`, `submit()`) |
 | One child source per level | Merged child set (§2.1) |
 | `ConfirmPrep` two-handler state machine | `prepare()` → `Prepared` → engine dialog (§9) |
@@ -61,102 +62,79 @@ role split, modifier system, field filtering/sorting.
 Each step compiles and passes existing tests (adapted). Do them in order;
 each builds on the previous.
 
-### Step 1: Introduce `NodeImpl` trait + types
+### Step 1: Introduce `SlashDotNode` trait + public types + `SlashDotMenu`
 
-Define the core types from §2 of the design. This is pure additive —
-nothing is ported yet.
+Define the core types and the public API from §2 of the design. Pure
+additive — nothing is ported yet.
+
+**Public types** (used by `SlashDotNode` implementors):
+
+- `PathArgs`, `Args`, `DataResponse`, `DataError`, `DataResult`, `SubmitResult`, `MenuResult`, `HostKey`
+
+**`SlashDotNode` trait** (all methods have defaults):
 
 ```rust
-// crates/slashdot_menu/src/node_impl.rs
-
-pub struct PathArgs {
-    pub ids: Vec<String>,
-    pub suffix: std::ops::Range<usize>,
-    pub args: Option<Args>,
-}
-
-pub struct Args {
-    pub modifiers: Vec<(String, Value)>,
-    pub positional: Vec<String>,
-}
-
-pub struct DataResponse {
-    pub rows: Vec<Row>,
-    pub active_ids: Vec<String>,
-}
-
-pub struct DataError { pub message: String }
-pub type DataResult = Result<Rc<DataResponse>, DataError>;
-
-pub enum SubmitResult {
-    Done,
-    Prepared,
-    NewPath(String),
-}
-
-pub enum MenuResult {
-    Continue(Rc<RenderPlan>, String),  // render plan + new prompt
-    DoneSuccess,
-    DoneError(String),
-}
-
-pub enum HostKey {
-    Tab, Enter, Esc,
-    MoveCursor(i32),   // +1/-1 for arrows, ±N for pgup/pgdn
+pub trait SlashDotNode {
+    fn data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult { /* empty */ }
+    fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult { Done(None) }
+    fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult { self.submit(epoch, path_args) }
+    fn header(&mut self, path_args: &PathArgs) -> Vec<String> { Vec::new() }
 }
 ```
 
-Define the base trait (overridable members only):
+**`SlashDotMenu`** (owns the tree + epoch):
 
 ```rust
-pub trait NodeImpl {
-    fn data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult;
-    fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult;
-    fn prepare(&mut self, epoch: u64, path_args: &PathArgs)
-        -> SubmitResult;
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String>;
+pub struct SlashDotMenu { root: NodeEntry, epoch: u64 }
+impl SlashDotMenu {
+    pub fn new() -> Self;
+    pub fn add_child(&mut self, parent: &[&str], child: impl SlashDotNode + 'static);
+    pub fn get_handle(&mut self) -> SlashDotHandle<'_>;
 }
 ```
 
-Defaults: `data()` → empty, `submit()` → `Done`, `prepare()` →
-`self.submit(epoch, path_args)`, `header()` → empty.
+**`SlashDotHandle`** (guard-like, one per invocation):
+
+```rust
+pub struct SlashDotHandle<'a> { root: &'a mut NodeEntry, epoch: u64 }
+impl<'a> SlashDotHandle<'a> {
+    pub fn eval_prompt(&mut self, prompt: &str, key: HostKey) -> MenuResult;
+}
+```
+
+**`NodeEntry`** (internal, not exposed to host):
+
+```rust
+pub(crate) struct NodeEntry {
+    inner: Box<dyn SlashDotNode>,
+    children: Vec<NodeEntry>,
+    cursor_cache: HashMap<String, (usize, Option<String>, String)>,
+    data_cache: HashMap<String, DataResult>,
+}
+impl NodeEntry {
+    pub fn new_root() -> Self;                        // metadata-only container
+    pub fn new_child(inner: Box<dyn SlashDotNode>);   // wraps host impl
+    pub fn add_child(&mut self, parent: &[&str], child: NodeEntry);
+    pub fn node_traverse(&mut self, epoch, key, path_args) -> MenuResult;  // stub
+    pub fn node_data(&mut self, epoch, path_args) -> DataResult;          // delegates to inner
+}
+```
+
+**Module structure:**
+- `lib.rs` — `pub mod menu; pub(crate) mod node_impl; mod node_entry;` + internal modules
+- `menu.rs` — `SlashDotMenu`, `SlashDotHandle`
+- `node_impl.rs` — `SlashDotNode` trait, public types
+- `node_entry.rs` — `NodeEntry` (internal)
 
 **Verify:** `cargo build -p slashdot_menu`. No tests yet — just the types
 compile.
 
-### Step 2: Blanket impl skeleton + epoch
+### Step 2: Epoch wrapper + `SlashDotHandle`
 
-Define the extension trait with `node_traverse()` and `node_data()` as the
-public API. Implement via blanket impl over `NodeImpl`. The default body
-for `node_traverse()` starts as a stub that returns `DoneError("not yet
-ported")`.
-
-```rust
-pub trait NodeTraversal {
-    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
-        -> MenuResult;
-    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
-        -> DataResult;
-}
-
-impl<T: NodeImpl> NodeTraversal for T {
-    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
-        -> MenuResult {
-        // Stub — filled in step 4
-        MenuResult::DoneError("not yet".into())
-    }
-    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
-        -> DataResult {
-        self.data(epoch, path_args)
-    }
-}
-```
-
-The epoch wrapper on the host side: a simple counter bumped when the buffer
-transitions to `/`, held for the activation. This replaces the
-`Activation` bundle.
-
-**Verify:** `cargo build`. No test changes needed.
+Done as part of step 1 — `SlashDotMenu::get_handle()` bumps the epoch
+and returns a guard-like `SlashDotHandle` that borrows the root `NodeEntry`.
+The host calls `handle.eval_prompt(prompt, key)` — the only way to
+interact with the menu.
 
 ### Step 3: Port the grammar + filter engine as free functions
 
@@ -174,8 +152,8 @@ signatures.
 
 ### Step 4: Implement default `traverse` body
 
-This is the core step. Port the interpreter's logic into the blanket impl's
-default `node_traverse()` body, following the algorithm in §2 of the design
+This is the core step. Port the interpreter's logic into `NodeEntry`'s
+`node_traverse()` body, following the algorithm in §2 of the design
 ("Traversal algorithm").
 
 **Sub-steps:**
@@ -249,14 +227,14 @@ children of a level. This is a debug assert, not a compile-time check.
 child in one level (the `/sandbox` shape). Verify merged listing, correct
 submit dispatch, and cursor continuity across the boundary.
 
-### Step 6: Port existing commands to `NodeImpl`
+### Step 6: Port existing commands to `SlashDotNode`
 
 Migrate the already-engine-backed commands (Model, Thinking, Persona,
-root list) from descriptor+handler-registration to `NodeImpl` impls.
+root list) from descriptor+handler-registration to `SlashDotNode` impls.
 
 For each command:
 - Replace `MenuNode` + `DataProvider` + `LeafHandler` registration with an
-  `impl NodeImpl` struct.
+  `impl SlashDotNode` struct.
 - `data()` returns the rows (static list or `Rc<DataResponse>` from fetch).
 - `submit()` handles the leaf accept.
 - `header()` returns help text if any.
@@ -295,7 +273,7 @@ Esc cancel → re-prep → accept.
 
 Replace the per-keypress engine rebuild with a persistent node tree.
 
-8a. The host holds one root `NodeImpl` instance for the lifetime of the
+8a. The host holds one `SlashDotMenu` instance for the lifetime of the
 app. Per activation: bump epoch, call `root.node_traverse(epoch, key, ...)`.
 
 8b. Delete the `Activation` bundle and `take_state`/`restore_state`. Per-
@@ -313,7 +291,7 @@ Existing integration tests pass.
 ## 4. Command migrations (on the reshaped engine)
 
 Each migration replaces a bespoke `ActiveOverlay` variant + host-rendered
-`display_rows` + host-cursed accept with an `impl NodeImpl` + generic
+`display_rows` + host-cursed accept with an `impl SlashDotNode` + generic
 `Menu` rendering. The host loses one variant per step.
 
 ### Step 9: Session
@@ -403,15 +381,17 @@ Total: ~140 tests. ~45 unchanged, ~50 mechanical port, ~45 new/ported.
 
 | File | Reshape changes |
 | --- | --- |
-| `node.rs` | `MenuNode` → `NodeImpl` trait; merged child set; field metadata |
-| `interpreter.rs` | Logic moves into blanket `node_traverse()` default body; file shrinks or is deleted |
+| `node_impl.rs` | **New** — `SlashDotNode` trait + public types (`PathArgs`, `Args`, `DataResponse`, `SubmitResult`, `MenuResult`, `HostKey`) |
+| `node_entry.rs` | **New** — `NodeEntry` (internal wrapper with children, cursor cache, traversal) |
+| `menu.rs` | **New** — `SlashDotMenu`, `SlashDotHandle` (public API) |
+| `lib.rs` | `pub mod menu` + `pub(crate) mod node_impl` + re-exports |
+| `interpreter.rs` | Logic moves into `NodeEntry::node_traverse()`; file shrinks or is deleted |
 | `accept.rs` | Confirm state machine moves to node-local state; engine dialog service stays |
-| `provider.rs` | `DataProvider` trait absorbed into `NodeImpl::data()`; file shrinks |
+| `provider.rs` | `DataProvider` trait absorbed into `SlashDotNode::data()`; file shrinks |
+| `node.rs` | `MenuNode` — internal, merged child set; field metadata |
+| `cursor.rs` | Cursor cache moves to `NodeEntry`; file shrinks or is deleted |
 | `render.rs` | `Rc`'d row data in `RenderPlan`; otherwise unchanged |
-| `cursor.rs` | Cursor cache moves to per-node state; file shrinks or is deleted |
 | `grammar.rs` | Unchanged (free functions) |
 | `filter.rs` | Unchanged (free functions) |
 | `fuzzy.rs` | Unchanged |
 | `table.rs` | Unchanged |
-| `lib.rs` | New re-exports for `NodeImpl`, `NodeTraversal`, `HostKey`, etc. |
-| `node_impl.rs` | **New** — core types (`PathArgs`, `Args`, `DataResponse`, `SubmitResult`, `MenuResult`) |

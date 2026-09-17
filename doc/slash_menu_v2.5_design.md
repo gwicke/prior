@@ -15,7 +15,7 @@ document is the distilled end state). Phases 0–7.1 of the implementation
 semantics, rendering contract, or host role split — those sections are
 inherited verbatim. Changed sections:
 
-1. **§2 (rewritten)**: nodes become trait implementations (`NodeImpl`) whose
+1. **§2 (rewritten)**: nodes become trait implementations (`SlashDotNode`) whose
    default traversal is private and non-overridable and owns per-node state
    (epoch-cached), replacing the data descriptor + centralized interpreter
    side tables (providers/handlers registered by path string).
@@ -34,7 +34,7 @@ inherited verbatim. Changed sections:
 ## 1. Goals and invariants
 
 1. **Node-driven.** Every slash menu is a tree of *node implementations*
-   (`NodeImpl`, §2). A single generic, non-overridable traversal (the
+   (`SlashDotNode`, §2). A single generic, non-overridable traversal (the
    engine) derives all behaviour from the nodes' rows and submit/data
    members.
 2. **The prompt is the state** (revised): the buffer determines level, filter
@@ -68,8 +68,8 @@ command nodes.
 
 ### Extension points
 
-**The default implementation owns everything generic; per-node code only
-customizes data and submission.** A command is one `impl NodeImpl`.
+**The engine owns everything generic; per-node code only
+customizes data and submission.** A command is one `impl SlashDotNode`.
 
 `data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult | DataError`
 - The rows this node contributes to its parent's listing. Default: none.
@@ -119,17 +119,17 @@ enum SubmitResult {
 }
 ```
 
-### Encapsulation: private traversal via blanket impl
+### Encapsulation: internal `NodeEntry` wrapper
 
 Non-overridable machinery: path parsing, selection validation (D2 demotion),
 fuzzy rank-and-pin, §7.1 filter/sort query, per-node cursor cache, Esc
-ladder, traversal frames, render-plan emission. Enforced by the
-extension-trait / blanket-impl pattern:
+ladder, traversal frames, render-plan emission. Encapsulated by the
+`NodeEntry` newtype:
 
-- the base trait `NodeImpl` exposes only the overridable members above;
-- the traversal lives in a separate extension trait, `node_traverse()` and
-  `node_data()` implemented once via blanket impl over `NodeImpl`;
-- host and parents call only the extension trait's entry points.
+- the host implements `SlashDotNode` (data, submit, prepare, header);
+- `NodeEntry` wraps a `dyn SlashDotNode` and adds children, cursor cache, data cache;
+- `NodeEntry::node_traverse()` and `NodeEntry::node_data()` are internal methods on the struct;
+- the host never sees `NodeEntry` — it interacts only through `SlashDotMenu` / `SlashDotHandle`.
 
 ### Per-node state and the epoch
 
@@ -144,9 +144,10 @@ All caches invalidate on **epoch** increment: a menu-invocation counter the
 host increments on menu open. Multi-stage flows (compaction) key on their own
 decision points, not epoch alone.
 
-The host manages epoch through a thin wrapper (e.g. `get_menu(&mut self)`):
-bumps on `/` transition, holds for the activation. The node tree receives it as
-a `node_traverse()` parameter. No coordinator struct.
+The host gets a `SlashDotHandle` from `SlashDotMenu::get_handle()` (bumps epoch).
+The handle exposes `eval_prompt(prompt, key) -> MenuResult` — the only way for
+the host to interact with the menu. The epoch is passed to `SlashDotNode` methods
+so nodes can invalidate their own caches.
 
 ### Traversal algorithm
 
@@ -181,15 +182,15 @@ movement shares unchanged content — only marker positions (`selected_row`,
 
 ### Parent→child API (implementation-internal, private)
 
-`node_traverse(&mut self, epoch, KeyActions, PathArgs) -> MenuResult`
-- `KeyActions`: `Tab`, `Enter`, `Esc`, `MoveCursor(n)`. The node at the end
+`NodeEntry::node_traverse(&mut self, epoch, HostKey, PathArgs) -> MenuResult`
+- `HostKey`: `Tab`, `Enter`, `Esc`, `MoveCursor(n)`. The node at the end
   of the traversal handles all logical key actions.
 - `PathArgs.suffix`: byte range into the prompt (preserves trailing
   whitespace). `PathArgs.args`: modifiers + positional args, only on leaf
   nodes.
 
-`node_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
-- Parses args from suffix, calls `data()`.
+`NodeEntry::node_data(&mut self, epoch, PathArgs) -> DataResult | DataError`
+- Parses args from suffix, calls `SlashDotNode::data()`.
 
 ### Borrow discipline
 
@@ -412,7 +413,7 @@ the host applies only control flow / terminal / transcript (§12).
 | --- | --- |
 | Q1–Q8 | Decisions D1–D8: surface changes for uniformity; `<…>` dropped (D2); dot-modifiers (D3); stat/replay in scope (D4); tables generalized (D6); dataset completion default (D7); fs completion via modifier (D8). |
 | R8-1–R8-8 | Single-token labels; structural terminators; confirm two-phase submit (R8-3 → §9); headers from node (R8-4); accept clears filter + traversal memory (R8-5); one-shot vs live-filter + front/back-end modifiers (R8-6); selection space-free, values may contain spaces (R8-7); compact as leaf-returns-path (R8-8). |
-| Node model | Trait impls (`NodeImpl`); default traversal private; epoch-cached per-node state; providers on nodes, not side tables (§2, §8). |
+| Node model | `SlashDotNode` trait + internal `NodeEntry` wrapper; non-overridable traversal on `NodeEntry`; epoch-cached per-node state; providers on nodes, not side tables (§2, §8). |
 | Merged child sets | Ordered union of child rows; field metadata on parent; per-child submit dispatch (§2.1). |
 | Cursoring | Up/down moves cursor only; Tab/Enter commit + clear; traversal memory + scoped invalidation (§4, §5). |
 | `*` marker | Always from application context, never typed selection (§5.2). |
