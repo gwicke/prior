@@ -506,20 +506,27 @@ DisplayState is the interface between node_traverse and the render plan
 builder. It bundles what the render plan needs from the traversal:
 rows, cursor position, active markers, title, and header text.
 
+DisplayState is derived from NodeCache, but it serves as a clean
+boundary between the traversal engine and the render plan builder.
+Passing a reference to NodeCache would couple the render builder to
+the internal cache structure.
+
+Regarding caching: the main point of caching is efficient cursoring.
+For cursor moves (MoveCursor), the rendered lines don't change — only
+the cursor position (selected_idx) does. For other keys, the rows
+themselves may change (filter, rank). So the cache should store the
+rendered `Vec<RenderLine>` and only rebuild it when ranked_rows changes.
+The cursor index is passed separately.
+
 ```rust
-struct DisplayState {
-    rows: Vec<Row>,
-    cursor_idx: usize,            // looked up from cursor_id in ranked_rows
-    active_rows: Vec<usize>,      // resolved active indices (design §5.2)
-    title: String,
-    header_lines: Vec<String>,    // header() output (design §2: "Non-selectable
-                                  //   header lines, replaces v2 DetailProvider")
+struct RenderCache {
+    lines: Vec<RenderLine>,       // cached, rebuilt only when ranked_rows change
+    columns: Vec<ColumnDef>,      // cached, rebuilt when field metadata change
 }
 ```
 
-Built from ViewCache after derivation. Passed to render plan builder.
-Columns are NOT here — inferred from field_space at render time.
-is_leaf is NOT here — use `children.is_empty()`.
+This avoids re-rendering on every cursor move. The RenderPlan is built
+from the cache + current cursor/active markers.
 
 ### 4.3 `NodeResult` (internal)
 
@@ -555,6 +562,13 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, t
   // term_width (from its terminal dimensions). The engine truncates
   // headers and wraps table columns to fit. Design §6: "Headers
   // truncated to fit terminal."
+  //
+  // Vertical space: yes, we should send only the rows that fit the
+  // window. The host knows the terminal height and can tell the engine
+  // the max number of lines. The engine can then paginate (scroll) the
+  // ranked rows to only include visible ones in the RenderPlan. This
+  // keeps the RenderPlan small and the host rendering fast.
+  // The RenderPlan becomes: Vec<RenderLine> + markers + scroll offset.
   let row_texts = if let Some(space) = field_space {
     build_table_rows(&rows_rc, space, term_width)
   } else {
@@ -568,9 +582,10 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, t
   }
 
   RenderPlan {
-    lines,
+    lines,           // from RenderCache, rebuilt only when ranked_rows change
     selected: Some(display.cursor_idx),
     active_rows: display.active_rows.clone(),
+    scroll_offset: display.scroll_offset,  // for vertical pagination
   }
 }
 ```
