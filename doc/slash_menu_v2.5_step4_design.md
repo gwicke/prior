@@ -119,7 +119,7 @@ loop {
     let word = &prompt[start..pos];
 
     // Check if this word is a row ID in the merged child set
-    if let Some(&child_idx) = self.view.row_index.get(word) {
+    if let Some(&child_idx) = self.content.row_index.get(word) {
         matched_child = Some((word.to_string(), child_idx));
         break;
     }
@@ -160,8 +160,8 @@ state needed — just manipulate the prompt string.
 // build_prompt reconstructs: `... parent_id saved_filter_state`.
 
 if let Some(sel) = &selection {
-    if !trailing_space && self.view.row_index.contains_key(sel) {
-        if let Some(saved) = self.cache.saved_filter.take() {
+    if !trailing_space && self.content.row_index.contains_key(sel) {
+        if let Some(saved) = self.epoch.saved_filter.take() {
             // Frame replay: drop the row ID from the prompt, resume
             // the saved filter state.
             let new_prompt = build_prompt(&path, &saved);
@@ -210,7 +210,7 @@ if self.children.is_empty() && matches!(key, Tab | Enter) {
         SubmitResult::Done(msg) => return NodeResult::Done(msg),
         SubmitResult::Prepared => {
             // Confirm flow: show dialog, wait for next Enter
-            self.cache.confirm_pending = true;
+            self.epoch.confirm_pending = true;
             // Fall through to display (show confirm dialog)
         }
         SubmitResult::NewPath(p) => return NodeResult::Continue {
@@ -231,18 +231,22 @@ ensure_view(epoch, tail);
 
 match key {
     HostKey::MoveCursor(delta) => {
-        self.view.move_cursor(delta);
+        let n = self.content.ranked_rows.len();
+        if n > 0 {
+            self.epoch.cursor_idx = (self.epoch.cursor_idx as isize + delta as isize)
+                .rem_euclid(n as isize) as usize;
+        }
     }
 
     HostKey::Tab => {
         // Design §5: "Tab: bare level → promote (trailing space,
         // same as Enter); otherwise complete cursor row's id."
         // Tab ALWAYS drills — never submits.
-        let active_id = self.view.cursor_row_id();
-        let child_idx = self.view.row_index[active_id];
+        let active_id = self.content.ranked_rows[self.epoch.cursor_idx].id.clone();
+        let child_idx = self.content.row_index[&active_id];
 
         // Save filter state for Esc restoration
-        self.cache.saved_filter = Some(self.view.current_filter_state());
+        self.epoch.saved_filter = Some(self.content.current_filter_state());
 
         // Drill into child — Tab does NOT forward the key
         let full_prompt = build_prompt(&path, &format!("{} ", active_id));
@@ -253,10 +257,10 @@ match key {
     HostKey::Enter => {
         // Design §5: "Enter: as Tab, but forward key; child may
         // submit() immediately if it is a leaf."
-        let active_id = self.view.cursor_row_id();
-        let child_idx = self.view.row_index[active_id];
+        let active_id = self.content.ranked_rows[self.epoch.cursor_idx].id.clone();
+        let child_idx = self.content.row_index[&active_id];
 
-        self.cache.saved_filter = Some(self.view.current_filter_state());
+        self.epoch.saved_filter = Some(self.content.current_filter_state());
 
         // Drill into child — Enter FORWARDS the key
         let full_prompt = build_prompt(&path, &format!("{} ", active_id));
@@ -385,16 +389,16 @@ refresh_data(epoch):
   }
 
   if changed {
-    self.view.data_rc = new_data;
+    self.content.data_rc = new_data;
     // Build row_index lazily: iterate over data_rc, not a flat cloned Vec
-    self.view.row_index = self.view.data_rc.iter().enumerate()
+    self.content.row_index = self.content.data_rc.iter().enumerate()
         .flat_map(|(child_idx, resp)| {
             resp.rows.iter().map(move |r| (r.id.clone(), child_idx as u16))
         })
         .collect();
     // field_space comes from the parent node (design §2.1), not from
     // children's data. See §3.1 "field_space" note.
-    self.view.view_args = None;  // force re-derive
+    self.content.dirty = true;  // force re-derive on next ensure_view
   }
 ```
 
@@ -405,19 +409,20 @@ inputs change.
 
 ```
 ensure_view(epoch, view_args):
-  // Skip if nothing changed
-  if self.view.view_args == Some(view_args.to_string()) {
+  // Skip if nothing changed: view_args the same AND content not dirty
+  if !self.content.dirty && self.epoch.view_args == Some(view_args.to_string()) {
     return;  // reuse cached ranked_rows
   }
+  self.content.dirty = false;
 
   // Step 1: filter (§7.1) — iterate over raw Rc's, no flat clone
   let modifiers = parse_level(view_args, &selection_rule).modifiers;
   let filtered: Vec<Row> = if modifiers.is_empty() {
-    self.view.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect()
+    self.content.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect()
   } else {
     let space = self.parent_field_space();
     let query = compile_query(&modifiers, &space);
-    let all_rows: Vec<Row> = self.view.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect();
+    let all_rows: Vec<Row> = self.content.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect();
     apply_query(&all_rows, &query, &space)
   };
 
@@ -426,8 +431,8 @@ ensure_view(epoch, view_args):
   let terms = parse_level(view_args, &selection_rule).terms;
   let rank_result = rank_and_pin(&filtered, &terms, selection.as_deref());
 
-  self.view.ranked_rows = rank_result.rows;
-  self.view.view_args = Some(view_args.to_string());
+  self.content.ranked_rows = rank_result.rows;
+  self.epoch.view_args = Some(view_args.to_string());
 
   // Step 3: active markers (design §5.2)
   // active_ids already stored from node_data() responses
@@ -475,19 +480,63 @@ are on the same row.
 
 ### 4.1 `NodeEntry`
 
+Two caches with separate lifetimes:
+
 ```rust
 struct NodeEntry {
     inner: Box<dyn SlashDotNode>,
     children: Vec<NodeEntry>,
-    cache: NodeCache,
+    content: ContentCache,   // lifecycle A: epoch or node_data() change
+    epoch: EpochState,       // lifecycle B: epoch change only
 }
+```
 
-struct NodeCache {
-    view: ViewCache,
-    saved_filter: Option<String>,  // Esc ladder: filter state before last drill
+#### Lifecycle A — `ContentCache`
+
+Cleared on **epoch increment** OR **node_data() change** (Rc::ptr_eq
+detects no-change). Contains everything derived from node_data():
+
+```rust
+struct ContentCache {
+    merged_rows: Vec<Row>,         // from node_data() merge
+    filtered_rows: Vec<Row>,       // after fuzzy filter
+    ranked_rows: Vec<Row>,         // after ranking
+    row_index: HashMap<String, usize>, // row_id → child_index
+    render: RenderCache,           // rendered lines (§4.2)
+    dirty: bool,                   // true when node_data() changed since last ensure_view
+}
+```
+
+The render cache is a *subset* of ContentCache — rebuilt when
+ContentCache is dirty (caller-driven) or on terminal resize.
+
+#### Lifecycle B — `EpochState`
+
+Cleared **only on epoch change**. Persists across node_data() refreshes
+within the same epoch. Cursor position, Esc filter state, and
+confirm flow all survive content changes.
+
+```rust
+struct EpochState {
+    cursor_idx: usize,             // current cursor position in ranked_rows
+    view_args: Option<String>,     // user's filter/sort args from prompt — re-applied to new content
+    saved_filter: Option<String>,  // Esc ladder: filter before last drill
     confirm_pending: bool,         // confirm flow: waiting for yea/nay
 }
 ```
+
+`cursor_idx` is an index, but it is *resolved from a row ID* at
+traversal time (the cursor is identified by ID, looked up in
+row_index). This means: on node_data() change, the ID survives — we
+re-resolve the index from the new ranked_rows. If the row is gone
+(clipped by filter/rank), cursor falls back to the last valid position.
+
+`view_args` is the user's filter/sort specification from the prompt.
+On node_data() change, `view_args` persists — `ensure_view` re-derives
+ranked_rows using the same args against the new content. On user
+typing (new filter chars), `view_args` updates, triggering
+re-derivation. On cursor move, `view_args` is unchanged — skip
+re-derive.
 
 ### 4.2 `RenderCache` — cached rendered lines
 
@@ -659,7 +708,8 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | Columns | Not in RenderCache, inferred at render time | Field_space determines columns. |
 | is_leaf | Not cached | Use `children.is_empty()`. |
 | Path walk | row_index lookup per word, exit on first match | row_index rebuilt on node_data() refresh. O(1) per word. |
-| RenderCache | Caller-driven invalidation, Rc share | No hash: caller passes dirty flag. Cursor+view_args in NodeEntry, not cache. |
+| RenderCache | Caller-driven invalidation, Rc share | No hash: caller passes dirty flag. Lives inside ContentCache. |
+| Cache lifetimes | Two: ContentCache + EpochState | ContentCache cleared on epoch or node_data() change. EpochState cleared only on epoch change. Cursor+view_args+saved_filter+confirm in EpochState. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
 | Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
 | Tab | Drills, never submits | Design §5: "Tab: bare level → promote; otherwise complete." |
