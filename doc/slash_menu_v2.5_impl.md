@@ -44,7 +44,7 @@ crates/slashdot_menu/
 
 | v2 (current) | v2.5 (target) |
 | --- | --- |
-| `MenuNode` data struct + `Interpreter` central | `NodeImpl` trait impls + blanket `traverse()` |
+| `MenuNode` data struct + `Interpreter` central | `NodeImpl` trait impls + blanket `node_traverse()` |
 | Providers/handlers registered by path string | Providers/handlers on the node (`data()`, `submit()`) |
 | One child source per level | Merged child set (§2.1) |
 | `ConfirmPrep` two-handler state machine | `prepare()` → `Prepared` → engine dialog (§9) |
@@ -103,7 +103,6 @@ pub enum MenuResult {
 pub enum HostKey {
     Tab, Enter, Esc,
     MoveCursor(i32),   // +1/-1 for arrows, ±N for pgup/pgdn
-    Seed(usize),       // open-time cursor seeding
 }
 ```
 
@@ -127,26 +126,26 @@ compile.
 
 ### Step 2: Blanket impl skeleton + epoch
 
-Define the extension trait with `traverse()` and `traverse_data()` as the
+Define the extension trait with `node_traverse()` and `node_data()` as the
 public API. Implement via blanket impl over `NodeImpl`. The default body
-for `traverse()` starts as a stub that returns `DoneError("not yet
+for `node_traverse()` starts as a stub that returns `DoneError("not yet
 ported")`.
 
 ```rust
 pub trait NodeTraversal {
-    fn traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
+    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
         -> MenuResult;
-    fn traverse_data(&mut self, epoch: u64, path_args: &PathArgs)
+    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
         -> DataResult;
 }
 
 impl<T: NodeImpl> NodeTraversal for T {
-    fn traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
+    fn node_traverse(&mut self, epoch: u64, key: HostKey, path_args: &PathArgs)
         -> MenuResult {
         // Stub — filled in step 4
         MenuResult::DoneError("not yet".into())
     }
-    fn traverse_data(&mut self, epoch: u64, path_args: &PathArgs)
+    fn node_data(&mut self, epoch: u64, path_args: &PathArgs)
         -> DataResult {
         self.data(epoch, path_args)
     }
@@ -162,21 +161,21 @@ transitions to `/`, held for the activation. This replaces the
 ### Step 3: Port the grammar + filter engine as free functions
 
 The grammar tokenizer (`grammar.rs`) and filter/sort engine (`filter.rs`)
-are already free functions. They stay as-is — the default `traverse` body
+are already free functions. They stay as-is — the default `node_traverse` body
 will call them. No code changes here; just verify the boundary:
 
 - `grammar::parse_level(suffix: &str) -> (terms, modifiers, selection)`
 - `filter::apply_query(rows, query, sort) -> Vec<usize>` (ranked indices)
 - `fuzzy::rank_and_pin(candidates, terms) -> Vec<usize>` (ranked, pinned)
 
-These are called by the default `traverse` body (step 4) and by `data()`
+These are called by the default `node_traverse` body (step 4) and by `data()`
 implementations (the node's own preprocessing). Nothing changes in their
 signatures.
 
 ### Step 4: Implement default `traverse` body
 
 This is the core step. Port the interpreter's logic into the blanket impl's
-default `traverse()` body, following the algorithm in §2 of the design
+default `node_traverse()` body, following the algorithm in §2 of the design
 ("Traversal algorithm").
 
 **Sub-steps:**
@@ -192,7 +191,7 @@ directly.
 algorithm:
 - `no key` / `MoveCursor`: return `Continue(RenderPlan, prompt)`.
 - `Tab`: expand focused ID, append space, push frame, call child's
-  `traverse()`.
+  `node_traverse()`.
 - `Enter`: as Tab, but if child is leaf, call `prepare()` → handle
   `SubmitResult`.
 - `Esc`: per §5.1 ladder.
@@ -220,8 +219,8 @@ Always a root re-entry with the shortened buffer (never up-recursion).
 - `table: Option<ColumnDef>`
 
 **Tests:** Port the ~50 prompt/key-level scenario tests from
-`interpreter.rs` to the new `traverse()` harness. Same scenario tables,
-new entry point: `node.traverse(epoch, key, path_args) → MenuResult`
+`interpreter.rs` to the new `node_traverse()` harness. Same scenario tables,
+new entry point: `node.node_traverse(epoch, key, path_args) → MenuResult`
 instead of `interpreter.tab_at(line, sel)`. Cursor-map internals tests
 become per-node cursor tests.
 
@@ -230,7 +229,7 @@ become per-node cursor tests.
 Extend the default `traverse` body to concatenate rows from multiple
 children per level.
 
-5a. **Child iteration.** The default body calls `traverse_data()` on each
+5a. **Child iteration.** The default body calls `node_data()` on each
 child in declaration order, concatenating `DataResponse::rows`. Each row
 is tagged with its child index (internal `child_index: u16`, not in `Row`
 API).
@@ -271,7 +270,7 @@ Commands to port (in order):
 
 **Tests:** Existing per-command tests pass with the new harness. The
 descriptor-driven tests (`state("model")`, etc.) are replaced by
-`root.traverse(epoch, Seed(0), ...)` → check `RenderPlan`.
+`root.node_traverse(epoch, Tab, ...)` → check `RenderPlan`.
 
 ### Step 7: Two-phase submit confirm
 
@@ -297,14 +296,14 @@ Esc cancel → re-prep → accept.
 Replace the per-keypress engine rebuild with a persistent node tree.
 
 8a. The host holds one root `NodeImpl` instance for the lifetime of the
-app. Per activation: bump epoch, call `root.traverse(epoch, key, ...)`.
+app. Per activation: bump epoch, call `root.node_traverse(epoch, key, ...)`.
 
 8b. Delete the `Activation` bundle and `take_state`/`restore_state`. Per-
 activation state (cursor, frames, data cache) lives inside the nodes,
 invalidated by epoch.
 
 8c. The host's `ActiveOverlay::Menu` carries only the `RenderPlan` from the
-last `traverse()` call. The host renders it verbatim.
+last `node_traverse()` call. The host renders it verbatim.
 
 **Verify:** `cargo build -p slashdot_menu` in isolation. Host compiles.
 Existing integration tests pass.
@@ -389,7 +388,7 @@ The showcase for merged child sets:
 | Category | Count (approx) | Status |
 | --- | --- | --- |
 | Grammar / filter / fuzzy / table | ~45 | Unchanged (free functions) |
-| Prompt/key scenario (state/tab/enter/esc) | ~50 | Port to `traverse()` harness (step 4) |
+| Prompt/key scenario (state/tab/enter/esc) | ~50 | Port to `node_traverse()` harness (step 4) |
 | Per-node cursor | ~10 | New (step 4d) |
 | Mixed-level submit dispatch | ~5 | New (step 5) |
 | Confirm two-phase | ~8 | Port from `accept.rs` (step 7) |
@@ -405,7 +404,7 @@ Total: ~140 tests. ~45 unchanged, ~50 mechanical port, ~45 new/ported.
 | File | Reshape changes |
 | --- | --- |
 | `node.rs` | `MenuNode` → `NodeImpl` trait; merged child set; field metadata |
-| `interpreter.rs` | Logic moves into blanket `traverse()` default body; file shrinks or is deleted |
+| `interpreter.rs` | Logic moves into blanket `node_traverse()` default body; file shrinks or is deleted |
 | `accept.rs` | Confirm state machine moves to node-local state; engine dialog service stays |
 | `provider.rs` | `DataProvider` trait absorbed into `NodeImpl::data()`; file shrinks |
 | `render.rs` | `Rc`'d row data in `RenderPlan`; otherwise unchanged |

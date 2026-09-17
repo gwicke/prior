@@ -55,6 +55,12 @@ to, not part of, the menu system.
 
 ## 2. Core model: the trait node
 
+**Architecture: thin client.** The engine owns all menu data, cursor state,
+and tree structure. The host is a display + input forwarding layer — it
+renders the `RenderPlan` the engine produces and forwards key events back.
+Think of a web browser rendering server-generated HTML: the host never
+computes menu state, never holds cursor positions, never rebuilds the tree.
+
 A menu is a recursive tree of **nodes**, and a node is a *trait
 implementation*, not a data structure. One node impl per command (or per
 sub-level); the root list (`/`) is itself a node whose children are the other

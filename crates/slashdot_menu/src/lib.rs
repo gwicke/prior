@@ -20,6 +20,7 @@ pub mod fuzzy;
 pub mod grammar;
 pub mod interpreter;
 pub mod node;
+pub mod node_impl;
 pub mod prompt;
 pub mod render;
 pub mod provider;
@@ -28,3 +29,4 @@ pub mod value;
 pub mod wrap;
 
 pub use table::{Align, Table};
+pub use node_impl::{PathArgs, Args, DataResponse, DataError, DataResult, SubmitResult, MenuResult, HostKey, NodeImpl, NodeTraversal, LeafNode};
