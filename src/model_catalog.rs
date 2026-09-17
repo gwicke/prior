@@ -579,11 +579,16 @@ fn direct_price(
 
 /// Live ids from a provider's native `/models` endpoint (best-effort).
 async fn native_models(provider: &str) -> Vec<String> {
-    let (url, var) = match provider {
-        "deepseek" => ("https://api.deepseek.com/models", "DEEPSEEK_API_KEY"),
-        "openai" => ("https://api.openai.com/v1/models", "OPENAI_API_KEY"),
+    // TODO: support env var API base + hard-coded fall-back consistently?
+    let (maybeurlbase, var) = match provider {
+        "deepseek" => ("https://api.deepseek.com", "DEEPSEEK_API_KEY"),
+        "xiaomi" => ("XIAOMI_MIMO_API_BASE", "XIAOMI_MIMO_API_KEY"),
+        "openai" => ("https://api.openai.com/v1", "OPENAI_API_KEY"),
         _ => return Vec::new(),
     };
+    let urlbase = std::env::var(maybeurlbase).unwrap_or(maybeurlbase.to_string());
+    let url = urlbase + "/models";
+
     let Ok(key) = std::env::var(var) else {
         return Vec::new();
     };
@@ -616,7 +621,7 @@ async fn native_models(provider: &str) -> Vec<String> {
 /// live id set to drop stale models and surface new ones. Best-effort.
 async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
     let debug = DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed);
-    for provider in ["deepseek", "openai"] {
+    for provider in ["deepseek", "openai", "xiaomi"] {
         let before = entries.len();
         if !provider_available(provider) {
             if debug {
@@ -652,8 +657,13 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         if debug && pruned > 0 {
             eprintln!("[debug-providers] liveness_prune: pruned {} stale entries for {}", pruned, provider);
         }
+        // Translate cases where openrouter provider does not match rig provider ID
+        let rigprovider = match provider {
+            "xiaomi" => "xiaomimimo",
+            _ => provider
+        };
         for m in live {
-            let id = format!("{}:{}", provider, m);
+            let id = format!("{}:{}", rigprovider, m);
             if !entries.iter().any(|e| e.id == id) {
                 entries.push(ModelEntry {
                     provider: provider.to_string(),
