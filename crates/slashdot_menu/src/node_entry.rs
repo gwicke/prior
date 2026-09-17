@@ -201,7 +201,7 @@ impl NodeEntry {
                 let restore_args = parse_section(&restore_to, &self.content.row_index);
                 self.ensure_view(epoch, &restore_args, &restore_to);
                 let plan = self.build_render_plan();
-                return MenuResult::Continue(plan, restore_to);
+                return MenuResult::Continue(plan, full_prompt(&path, &restore_to));
             }
         }
 
@@ -256,8 +256,7 @@ impl NodeEntry {
                             p,
                         ),
                         SubmitResult::Prepared => {
-                            // Shouldn't happen from submit; ignore.
-                            self.build_continue(prompt_suffix)
+                            self.build_continue(path, prompt_suffix)
                         }
                     }
                 } else {
@@ -266,7 +265,7 @@ impl NodeEntry {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg),
                         SubmitResult::Prepared => {
                             self.epoch.confirm_pending = true;
-                            self.build_continue(prompt_suffix)
+                            self.build_continue(path, prompt_suffix)
                         }
                         SubmitResult::NewPath(p) => MenuResult::Continue(
                             RenderPlan::default(),
@@ -279,13 +278,13 @@ impl NodeEntry {
                 if self.epoch.confirm_pending {
                     // Cancel confirm dialog.
                     self.epoch.confirm_pending = false;
-                    self.build_continue(prompt_suffix)
+                    self.build_continue(path, prompt_suffix)
                 } else {
-                    self.handle_esc(parsed, trailing_space, prompt_suffix)
+                    self.handle_esc(path, parsed, trailing_space, prompt_suffix)
                 }
             }
-            HostKey::None => self.build_continue(prompt_suffix),
-            _ => self.build_continue(prompt_suffix),
+            HostKey::None => self.build_continue(path, prompt_suffix),
+            _ => self.build_continue(path, prompt_suffix),
         }
     }
 
@@ -323,7 +322,7 @@ impl NodeEntry {
                     }
                 }
                 let plan = self.plan_from_cache();
-                MenuResult::Continue(plan, prompt_suffix.to_string())
+                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
             HostKey::Tab => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
@@ -338,12 +337,12 @@ impl NodeEntry {
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = path.to_vec();
                 new_path.push(active_id.clone());
-                let child_section = format!("{} ", active_id);
+                // Listing drill: child gets " " (the drill indicator).
                 self.children[child_idx].node_traverse(
                     epoch,
                     HostKey::None,
                     new_path,
-                    &child_section,
+                    " ",
                 )
             }
             HostKey::Enter => {
@@ -359,21 +358,21 @@ impl NodeEntry {
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = path.to_vec();
                 new_path.push(active_id.clone());
-                let child_section = format!("{} ", active_id);
+                // Listing drill: child gets " " (the drill indicator).
                 self.children[child_idx].node_traverse(
                     epoch,
                     HostKey::Enter,
                     new_path,
-                    &child_section,
+                    " ",
                 )
             }
             HostKey::Esc => {
-                self.handle_esc(parsed, trailing_space, prompt_suffix)
+                self.handle_esc(path, parsed, trailing_space, prompt_suffix)
             }
             _ => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let plan = self.build_render_plan();
-                MenuResult::Continue(plan, prompt_suffix.to_string())
+                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
         }
     }
@@ -382,6 +381,7 @@ impl NodeEntry {
 
     fn handle_esc(
         &mut self,
+        path: &[String],
         parsed: &ParsedSection,
         trailing_space: bool,
         prompt_suffix: &str,
@@ -389,15 +389,13 @@ impl NodeEntry {
         // Step 2: clear refinement — terms, modifiers, selection dropped.
         if !parsed.positional.is_empty() || !parsed.modifiers.is_empty() || parsed.matched_child.is_some() {
             // Rewrite section to just the parent path (no terms/modifiers/selection).
-            // For root: clear to empty. For drilled: back to parent's trailing space.
-            let new_suffix = String::new();
-            return MenuResult::Continue(RenderPlan::default(), new_suffix);
+            return MenuResult::Continue(RenderPlan::default(), full_prompt(path, ""));
         }
 
         // Step 3: strip trailing space → parent becomes responsible.
         if trailing_space {
             let trimmed = prompt_suffix.trim_end().to_string();
-            return MenuResult::Continue(RenderPlan::default(), trimmed);
+            return MenuResult::Continue(RenderPlan::default(), full_prompt(path, &trimmed));
         }
 
         // Step 4: nothing left at this level → close.
@@ -444,13 +442,26 @@ impl NodeEntry {
             for (child_idx, slot) in self.content.data_rc.iter().enumerate() {
                 if let Some(resp) = slot.as_ref() {
                     for row in &resp.rows {
-                        // Debug assert on duplicate insertion (dev catches bugs).
-                        debug_assert!(
-                            !self.content.row_index.contains_key(&row.id),
-                            "duplicate row ID '{}' at child {}",
-                            row.id,
-                            child_idx
-                        );
+                        // Row uniformity (§2.1): every row must have a
+                        // non-empty id. Warn and skip in prod; debug_assert
+                        // for extra safety in dev builds.
+                        if row.id.is_empty() {
+                            eprintln!(
+                                "slashdot: skipping row with empty id at child {}",
+                                child_idx
+                            );
+                            continue;
+                        }
+                        // Debug assert on duplicate insertion (dev catches bugs);
+                        // in prod, last child wins (matches "later child
+                        // overrides" convention).
+                        if self.content.row_index.contains_key(&row.id) {
+                            eprintln!(
+                                "slashdot: duplicate row ID '{}' at child {}; \
+                                 later child wins",
+                                row.id, child_idx
+                            );
+                        }
                         self.content.row_index.insert(row.id.clone(), child_idx as u16);
                     }
                 }
@@ -478,7 +489,7 @@ impl NodeEntry {
 
         // Build field space (inferred from rows for now; §2.1 metadata
         // on parent comes in step 5).
-        let field_space = self.infer_field_space();
+        let field_space = self.field_space();
 
         // Step 1: Filter by modifiers.
         let modifier_tokens: Vec<ModifierToken> = parsed
@@ -497,7 +508,7 @@ impl NodeEntry {
 
         // Build filtered RowRef handles. Mint handles alongside their rows
         // — the (RowRef, &Row) pair means no resolution needed in the
-        // filter pass (§3.3).
+        // filter pass (§3.3). Rows with empty IDs are excluded.
         let filtered: Vec<(RowRef, &crate::fields::Row)> = self
             .content
             .data_rc
@@ -518,6 +529,7 @@ impl NodeEntry {
                         )
                     })
             })
+            .filter(|(_, row)| !row.id.is_empty())
             .filter(|(_, row)| {
                 query
                     .filters
@@ -634,8 +646,17 @@ impl NodeEntry {
 
     // --- View helpers ---
 
-    /// Infer field space from the current data_rc (step 5 replaces this
-    /// with explicit field metadata on the parent).
+    /// Build field space for this level: trait-declared fields if the
+    /// node provides them, otherwise inferred from the row data.
+    fn field_space(&self) -> FieldSpace {
+        let declared = self.inner.fields();
+        if !declared.is_empty() {
+            return FieldSpace::new(declared);
+        }
+        self.infer_field_space()
+    }
+
+    /// Infer field space from the current data_rc.
     fn infer_field_space(&self) -> FieldSpace {
         let mut names: Vec<String> = Vec::new();
         for slot in self.content.data_rc.iter().filter_map(|s| s.as_ref()) {
@@ -665,8 +686,8 @@ impl NodeEntry {
         FieldSpace::new(specs)
     }
 
-    fn build_continue(&self, prompt_suffix: &str) -> MenuResult {
-        MenuResult::Continue(RenderPlan::default(), prompt_suffix.to_string())
+    fn build_continue(&self, path: &[String], prompt_suffix: &str) -> MenuResult {
+        MenuResult::Continue(RenderPlan::default(), full_prompt(path, prompt_suffix))
     }
 
     // --- Render plan construction (§5) ---
@@ -832,6 +853,24 @@ fn build_path_args(path: &[String], parsed: &ParsedSection, suffix: &str) -> Pat
             modifiers: parsed.modifiers.clone(),
             positional: parsed.positional.clone(),
         },
+    }
+}
+
+/// Construct the full prompt for the host from the drilled path and
+/// the current level's suffix. For the root (empty path), this is
+/// just the suffix.
+fn full_prompt(path: &[String], suffix: &str) -> String {
+    if path.is_empty() {
+        suffix.to_string()
+    } else {
+        let base = path.join(" ");
+        if suffix.is_empty() {
+            base
+        } else if suffix.starts_with(' ') {
+            format!("{}{}", base, suffix)
+        } else {
+            format!("{} {}", base, suffix)
+        }
     }
 }
 
@@ -1231,6 +1270,177 @@ mod tests {
                 assert!(row_texts.iter().any(|t| t.contains("gpt4o")));
                 assert!(row_texts.iter().any(|t| t.contains("gpt4-mini")));
                 assert!(!row_texts.iter().any(|t| t.contains("opus")));
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    // --- Step 5: Merged child set tests ---
+
+    /// A leaf that records the child_index it was dispatched from.
+    struct RecordingLeaf {
+        submitted_via: std::cell::RefCell<Option<String>>,
+    }
+
+    impl RecordingLeaf {
+        fn new() -> Self {
+            RecordingLeaf {
+                submitted_via: std::cell::RefCell::new(None),
+            }
+        }
+        fn submitted_via(&self) -> Option<String> {
+            self.submitted_via.borrow().clone()
+        }
+    }
+
+    impl SlashDotNode for RecordingLeaf {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![crate::fields::Row::new("action")],
+                active_ids: Vec::new(),
+            }))
+        }
+        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            *self.submitted_via.borrow_mut() =
+                Some(path_args.ids.last().cloned().unwrap_or_default());
+            SubmitResult::Done(None)
+        }
+    }
+
+    #[test]
+    fn mixed_children_merged_listing() {
+        // Sandbox shape: static "add" child + dynamic binding rows.
+        let mut root = NodeEntry::new_root();
+
+        // Static child: returns "add" row.
+        root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
+
+        // Dynamic child: returns "bind1", "bind2" rows.
+        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
+            rows: vec![
+                crate::fields::Row::new("bind1").desc("binding one"),
+                crate::fields::Row::new("bind2").desc("binding two"),
+            ],
+        })));
+
+        root.refresh_data(ep());
+
+        // Both children's rows should appear in the listing.
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        match result {
+            MenuResult::Continue(plan, _) => {
+                let row_texts: Vec<&str> = plan.lines.iter()
+                    .filter(|l| !l.is_header)
+                    .map(|l| l.text.as_str())
+                    .collect();
+                assert!(row_texts.iter().any(|t| t.contains("add")));
+                assert!(row_texts.iter().any(|t| t.contains("bind1")));
+                assert!(row_texts.iter().any(|t| t.contains("bind2")));
+                assert_eq!(row_texts.len(), 3, "should have exactly 3 rows");
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+
+        // Verify row_index maps correctly.
+        assert_eq!(root.content.row_index.get("add"), Some(&0));
+        assert_eq!(root.content.row_index.get("bind1"), Some(&1));
+        assert_eq!(root.content.row_index.get("bind2"), Some(&1));
+    }
+
+    #[test]
+    fn mixed_children_tab_drill_dispatches_correct_child() {
+        let mut root = NodeEntry::new_root();
+        let add_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new()));
+        let bind_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new()));
+
+        // add_child returns a static "add" row.
+        let mut add_cmd = NodeEntry::new_child(Box::new(CmdNode::new("add")));
+        add_cmd.children.push(add_leaf);
+
+        // bind_child returns "bind1" row.
+        let mut bind_cmd = NodeEntry::new_child(Box::new(DynamicNode {
+            rows: vec![crate::fields::Row::new("bind1").desc("binding")],
+        }));
+        bind_cmd.children.push(bind_leaf);
+
+        root.children.push(add_cmd);
+        root.children.push(bind_cmd);
+        root.refresh_data(ep());
+
+        // Tab on "add" → drills into add_cmd → shows "action" leaf row.
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        // Move cursor to "add" (it's first) and Tab.
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "");
+        match result {
+            MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add ")),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+        // Now at "add ", the add_cmd node shows its leaf child "action".
+        // Tab into the leaf.
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ");
+        match result {
+            MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add action ")),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+        // Enter on "add action " → submit.
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ");
+        match result {
+            MenuResult::DoneSuccess(_) => {}
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mixed_children_fuzzy_filter_crosses_boundary() {
+        // Fuzzy filter should narrow across both children.
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
+        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
+            rows: vec![
+                crate::fields::Row::new("bind1").desc("binding one"),
+                crate::fields::Row::new("bind2").desc("binding two"),
+            ],
+        })));
+        root.refresh_data(ep());
+
+        // "bind" fuzzy-matches both binding rows but not "add".
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind");
+        match result {
+            MenuResult::Continue(plan, _) => {
+                let row_texts: Vec<&str> = plan.lines.iter()
+                    .filter(|l| !l.is_header)
+                    .map(|l| l.text.as_str())
+                    .collect();
+                assert!(!row_texts.iter().any(|t| t.contains("add")));
+                assert!(row_texts.iter().any(|t| t.contains("bind1")));
+                assert!(row_texts.iter().any(|t| t.contains("bind2")));
+                assert_eq!(row_texts.len(), 2);
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn empty_id_rows_skipped_with_warning() {
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
+            rows: vec![
+                crate::fields::Row::new("").desc("no id"),       // empty id
+                crate::fields::Row::new("valid").desc("has id"),
+            ],
+        })));
+        root.refresh_data(ep());
+
+        // Only "valid" should appear.
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        match result {
+            MenuResult::Continue(plan, _) => {
+                let row_texts: Vec<&str> = plan.lines.iter()
+                    .filter(|l| !l.is_header)
+                    .map(|l| l.text.as_str())
+                    .collect();
+                assert_eq!(row_texts.len(), 1);
+                assert!(row_texts[0].contains("valid"));
             }
             other => panic!("expected Continue, got {:?}", other),
         }

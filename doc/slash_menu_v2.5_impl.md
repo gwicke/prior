@@ -7,26 +7,30 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–4. `SlashDotNode` trait (all defaults),
+**Done (v2.5 reshape):** Steps 1–5. `SlashDotNode` trait (all defaults),
 `NodeEntry` (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public
-API). Step 4: full traversal algorithm — section parse (single pass, §2.1),
-data refresh (Rc::ptr_eq, §3.2), view derivation (filter → fuzzy rank →
-sort, §3.3), cursor seeding (§3.4), Esc ladder (§5.1), leaf/listing key
-dispatch (§2.3–§2.4), render plan emission (§5). 18 new tests covering
-parse, listing, drill, cursor, active markers, header, Esc, and fuzzy rank.
+API). Step 4: full traversal — section parse, data refresh (Rc::ptr_eq),
+view derivation (filter → fuzzy rank → sort), cursor, Esc ladder, leaf/listing
+dispatch, render plan. Step 5: merged child sets verified — `refresh_data`
+builds `row_index` across children; field metadata via `SlashDotNode::fields()`;
+row uniformity enforced (empty IDs warn+skip, duplicate IDs warn+last-wins);
+prompt reconstruction via `full_prompt(path, suffix)` at all return points.
+22 new tests covering parse, listing, drill, cursor, active markers, header,
+Esc, fuzzy rank, mixed children, empty ID handling.
 
 Design deviations from step4 doc (per user clarification):
-- Modifiers are single-word (no multi-word values; more ergonomic mixing).
+- Modifiers are single-word (no multi-word values).
 - Sort applied after fuzzy rank (filter → fuzzy rank → sort).
-- `Args` and `PathArgs` own their data (not borrowed from prompt); borrow
-  optimization deferred.
-- `HostKey::None` variant for Tab-drill (no key forwarded).
+- `Args` and `PathArgs` own their data (borrow deferred).
+- `HostKey::None` for Tab drill (no key forwarded).
 - Single `MenuResult` type (no separate `NodeResult`).
-- New `parse_section()` in node_entry.rs (not in grammar.rs).
+- `parse_section()` in node_entry.rs (not grammar.rs).
+- `full_prompt(path, suffix)` for host prompt reconstruction:
+  listing drill passes `" "` as child section; matched drill passes tail.
+- Empty-ID rows: warn + skip (not debug_assert).
 
-**Next:** Step 5 (merged child sets — already partially done: refresh_data
-builds row_index across children; needs field metadata on parent + submit
-dispatch via child_index).
+**Next:** Step 6 (port existing commands to `SlashDotNode` — Model, Thinking,
+Persona, root list).
 
 ---
 

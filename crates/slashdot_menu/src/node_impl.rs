@@ -119,4 +119,12 @@ pub trait SlashDotNode {
     fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
         Vec::new()
     }
+
+    /// Field metadata for this level's children's rows (§2.1 / §8.1).
+    /// Declared once on the parent; children conform. The engine uses
+    /// these specs for filter/sort. Default: no extra fields beyond the
+    /// implicit `id` and `description`.
+    fn fields(&self) -> Vec<crate::fields::FieldSpec> {
+        Vec::new()
+    }
 }
