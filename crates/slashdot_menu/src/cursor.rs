@@ -72,6 +72,70 @@ impl RankResult {
     }
 }
 
+// --- RowRef-based ranking for v2.5 ---
+
+use crate::node_entry::RowRef;
+
+/// Ranking outcome for RowRef handles.
+pub struct RankRefResult {
+    pub rows: Vec<RowRef>,
+    pub active: usize,
+    pub pinned_survived: bool,
+}
+
+/// Rank `candidates` (RowRef handles with pre-resolved Row references)
+/// against fuzzy `terms`, with an optional pinned `selection`.
+///
+/// Filter: rows that don't match fuzzy terms are dropped.
+/// Rank: surviving rows ordered best-first by fuzzy score.
+/// Pin: if `selection` is present and still in the filtered view, it
+/// becomes the active index; otherwise active defaults to 0.
+pub fn rank_row_refs(
+    candidates: &[(RowRef, &Row)],
+    terms: &str,
+    selection: Option<&str>,
+) -> RankRefResult {
+    let ranked: Vec<RowRef> = if terms.trim().is_empty() {
+        candidates.iter().map(|(rref, _)| *rref).collect()
+    } else {
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let mut scored: Vec<(i64, RowRef)> = candidates
+            .iter()
+            .filter_map(|(rref, row)| {
+                let text = match &row.description {
+                    Some(d) => format!("{} {}", row.id, d),
+                    None => row.id.clone(),
+                };
+                let score = matcher.fuzzy_match(&text, terms)?;
+                Some((score, *rref))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, rref)| rref).collect()
+    };
+
+    let pinned_idx = selection.and_then(|sel| {
+        // Find the matching candidate's RowRef, then find its position in ranked.
+        candidates
+            .iter()
+            .find(|(_, row)| row.id == sel)
+            .and_then(|(target, _)| {
+                ranked.iter().position(|r| {
+                    r.child_idx == target.child_idx && r.row_offset == target.row_offset
+                })
+            })
+    });
+    let (active, survived) = match pinned_idx {
+        Some(i) => (i, true),
+        None => (0, false),
+    };
+    RankRefResult {
+        rows: ranked,
+        active,
+        pinned_survived: survived,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -6,7 +6,7 @@
 //! - `SlashDotHandle` — guard-like; `eval_prompt` to process a prompt
 
 use crate::node_entry::NodeEntry;
-use crate::node_impl::{HostKey, MenuResult, PathArgs, SlashDotNode};
+use crate::node_impl::{HostKey, MenuResult, SlashDotNode};
 
 /// The main menu engine. Owns the node tree and epoch counter.
 /// Created empty; children added via `add_child`.
@@ -54,17 +54,7 @@ impl<'a> SlashDotHandle<'a> {
     /// Evaluate a prompt with a key event. Returns a `MenuResult` the host
     /// acts on.
     pub fn eval_prompt(&mut self, prompt: &str, key: HostKey) -> MenuResult {
-        let path_args = self.parse_prompt(prompt);
-        self.root.node_traverse(self.epoch, key, &path_args)
-    }
-
-    /// Parse a prompt into `PathArgs` — internal helper.
-    fn parse_prompt(&self, prompt: &str) -> PathArgs {
-        // Stub — step 4 will implement the full parser.
-        PathArgs {
-            ids: Vec::new(),
-            suffix: 0..0,
-            args: None,
-        }
+        self.root
+            .node_traverse(self.epoch, key, Vec::new(), prompt)
     }
 }

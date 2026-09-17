@@ -5,32 +5,43 @@
 
 use crate::fields::Row;
 use crate::render::RenderPlan;
-use crate::value::Value;
 
 // --- Public types used by SlashDotNode implementors ---
 
-/// Path arguments parsed from the prompt by the generic engine (§2).
+/// Path arguments constructed by the engine from the prompt section and
+/// passed to `SlashDotNode` trait methods.
 pub struct PathArgs {
     /// Resolved node id path so far (e.g. `["tree", "compact"]`).
     pub ids: Vec<String>,
-    /// Token range in the current level (terms/modifiers/selection/args).
-    pub suffix: std::ops::Range<usize>,
-    /// Parsed arguments from the selection + modifiers, if any.
-    pub args: Option<Args>,
+    /// The prompt section for this level.
+    pub suffix: String,
+    /// Parsed arguments from this level's section.
+    pub args: Args,
 }
 
-/// Parsed arguments from the selection and modifiers at a level.
+/// Parsed arguments from a level's section.
 pub struct Args {
-    /// Modifier values keyed by name (e.g. `("prompt", "some text")`).
-    pub modifiers: Vec<(String, Value)>,
-    /// Positional tokens (non-modifier, non-selection words).
+    /// Dot modifiers: `(key, raw_value)` pairs. Single-word values only.
+    pub modifiers: Vec<(String, String)>,
+    /// Positional tokens (non-modifier, non-selection words). These are
+    /// fuzzy search terms at listing level and positional parameters at
+    /// leaf level.
     pub positional: Vec<String>,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Args {
+            modifiers: Vec::new(),
+            positional: Vec::new(),
+        }
+    }
 }
 
 /// The rows a node contributes to its parent's listing.
 pub struct DataResponse {
     pub rows: Vec<Row>,
-    /// Ids of rows that are "currently active" (`*` marker, §5.1).
+    /// Ids of rows that are "currently active" (`*` marker, §5.2).
     pub active_ids: Vec<String>,
 }
 
@@ -55,6 +66,7 @@ pub enum SubmitResult {
 }
 
 /// Outcome of `node_traverse()` — what the host should do next.
+#[derive(Debug)]
 pub enum MenuResult {
     /// Keep interacting. The host renders the plan and sets the prompt.
     Continue(RenderPlan, String),
@@ -71,6 +83,8 @@ pub enum HostKey {
     Esc,
     /// Move cursor by delta (+1 for down, -1 for up, ±N for pgup/pgdn).
     MoveCursor(i32),
+    /// No key action — used when Tab drills but does not forward a key.
+    None,
 }
 
 // --- Public trait for host implementations ---
@@ -82,8 +96,6 @@ pub enum HostKey {
 /// what the node needs.
 pub trait SlashDotNode {
     /// The rows this node contributes to its parent's listing.
-    /// Return `Ok(Rc<DataResponse>)` with rows + active ids; `Err` to
-    /// report an error. Default: empty response.
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(std::rc::Rc::new(DataResponse {
             rows: Vec::new(),
@@ -98,9 +110,6 @@ pub trait SlashDotNode {
     }
 
     /// Optional confirm hook (§7 step 7a). Default: `self.submit()`.
-    /// An override runs the prep phase (may open an external editor via
-    /// a callback captured at construction), stages the payload in
-    /// private state, and returns `SubmitResult::Prepared`.
     fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
         self.submit(epoch, path_args)
     }
@@ -111,5 +120,3 @@ pub trait SlashDotNode {
         Vec::new()
     }
 }
-
-// --- Defaults ---
