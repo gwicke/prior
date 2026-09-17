@@ -7,8 +7,7 @@ data structures and algorithm for step 4 of the implementation plan.
 
 ## 1. Entry point: `SlashDotHandle::eval_prompt(prompt, key) -> MenuResult`
 
-Thin wrapper. Nothing lives here but the epoch (design §2: "The host gets
-a SlashDotHandle from SlashDotMenu::get_handle() (bumps epoch)").
+Thin wrapper. Nothing lives here but the epoch (design §2).
 
 ```
 eval_prompt(prompt, key):
@@ -21,16 +20,414 @@ eval_prompt(prompt, key):
   }
 ```
 
-No frame stack, no path walking. `node_traverse` does everything.
+---
+
+## 2. Traversal algorithm (the core)
+
+This is the structural logic of how keys route through the tree. The
+view state (filter, rank, cursor) is a separate concern used only when
+displaying a listing or completing a row.
+
+```
+node_traverse(epoch, key, prompt):
+  ┌─ Phase 0: path walk ──────────────────────────────────────────┐
+  │                                                                │
+  │  Scan prompt one word at a time.                               │
+  │  Try each word (except last) as child ID via child_map.        │
+  │  Collect matched IDs into path Vec.                            │
+  │  Remaining words = tail for this node.                         │
+  │                                                                │
+  ├─ Phase 1: refresh data ───────────────────────────────────────┤
+  │                                                                │
+  │  Always call data() on each child. Check Rc::ptr_eq to see     │
+  │  if anything changed. Rebuild merged_rows + row_child if so.   │
+  │                                                                │
+  ├─ Phase 2: Esc ladder ─────────────────────────────────────────┤
+  │                                                                │
+  │  if key == Esc:                                                │
+  │    // Ladder steps are checked top-down (design §5.1).         │
+  │    // No view state needed — just manipulate prompt.           │
+  │    Step 1: frame replay (structural, not Esc-specific)         │
+  │    Step 2: clear terms + modifiers                             │
+  │    Step 3: strip trailing space                                │
+  │    Step 4: clear selection, pop path                           │
+  │    Step 5: at root → close                                     │
+  │    return NodeResult with new prompt                           │
+  │                                                                │
+  ├─ Phase 3: leaf check ─────────────────────────────────────────┤
+  │                                                                │
+  │  if self.children.is_empty() && (key == Tab || key == Enter):  │
+  │    // Leaf node: call prepare/submit directly.                 │
+  │    // No view state needed.                                    │
+  │    result = inner.prepare(epoch, path_args)                    │
+  │    return Done/Continue based on SubmitResult                  │
+  │                                                                │
+  ├─ Phase 4: listing view ───────────────────────────────────────┤
+  │                                                                │
+  │  // Only needed for listing nodes (has children).              │
+  │  // Handles: display, MoveCursor, Tab/Enter completion.        │
+  │  // See §3 (view state) for details.                           │
+  │  ensure_view(epoch, tail)  // refresh + filter + rank if needed│
+  │                                                                │
+  ├─ Phase 5: handle key ─────────────────────────────────────────┤
+  │                                                                │
+  │  match key:                                                    │
+  │    MoveCursor(delta) → update cursor, rebuild DisplayState     │
+  │    Tab → complete active row's ID, drill into child            │
+  │    Enter → same as Tab (drill), or submit if leaf already      │
+  │               handled in phase 3                               │
+  │    NoKey / other → just display (fall through to phase 6)      │
+  │                                                                │
+  ├─ Phase 6: build result ───────────────────────────────────────┤
+  │                                                                │
+  │  Reconstruct full prompt from path + new tail.                 │
+  │  Build DisplayState from view state.                           │
+  │  Return NodeResult::Continue { prompt, display }               │
+  │                                                                │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+### 2.1 Path walk (phase 0)
+
+Scan one word at a time. No full split. For child lookup, use a
+`HashMap<String, usize>` built at construction time.
+
+```
+let trailing_space = prompt.ends_with(' ');
+
+let mut path: Vec<String> = Vec::new();
+let mut pos = 0;
+while pos < prompt.len() {
+    // Skip whitespace
+    while pos < prompt.len() && prompt.as_bytes()[pos] == b' ' { pos += 1; }
+    if pos >= prompt.len() { break; }
+
+    // Find end of word
+    let start = pos;
+    while pos < prompt.len() && prompt.as_bytes()[pos] != b' ' { pos += 1; }
+    let word = &prompt[start..pos];
+
+    // Don't consume the last word
+    let mut ahead = pos;
+    while ahead < prompt.len() && prompt.as_bytes()[ahead] == b' ' { ahead += 1; }
+    if ahead >= prompt.len() { break; }  // last word — stop
+
+    if word.starts_with('.') { break; }
+    if let Some(&idx) = self.child_map.get(word) {
+        path.push(word.to_string());
+        pos = ahead;  // advance past trailing spaces
+    } else {
+        break;
+    }
+}
+
+let tail = &prompt[pos..];
+```
+
+O(path_depth) time. Tail is a slice of the original prompt (zero-copy).
+
+### 2.2 Esc ladder (phase 2)
+
+Per design §5.1. Each step applies only when the next does not. No view
+state needed — just manipulate the prompt string.
+
+```
+// Step 1 (structural, design §5.1): valid child ID, no trailing space,
+// and saved_filter set → replay. This applies even without Esc.
+// Checked BEFORE the Esc-specific steps.
+if let Some(sel) = &selection {
+    if !trailing_space && self.child_map.contains_key(sel) {
+        if let Some(saved) = self.cache.saved_filter.take() {
+            // Resume filter state from before the drill.
+            let new_prompt = build_prompt(&path, &saved);
+            // Re-derive view with the restored filter state.
+            let display = self.derive_view(epoch, &saved);
+            return NodeResult::Continue { prompt: new_prompt, display };
+        }
+    }
+}
+
+// Steps 2-4: Esc-specific
+if key == Esc {
+    // Step 2: clear fuzzy terms + modifiers, keep selection + trailing space
+    if selection.is_some() && !terms.is_empty() {
+        new_tail = format!("{} ", selection);
+        return Continue(reconstruct(path, new_tail));
+    }
+
+    // Step 3: strip trailing space (drill out one level)
+    if trailing_space {
+        new_tail = tail.trim_end().to_string();
+        return Continue(reconstruct(path, new_tail));
+    }
+
+    // Step 4: clear pinned selection (back to parent)
+    if selection.is_some() {
+        path.pop();
+        return Continue(reconstruct(path, ""));
+    }
+
+    // Step 5: at root with nothing to clear → close
+    return Done(None);
+}
+```
+
+### 2.3 Leaf handling (phase 3)
+
+Leaf nodes (no children) handle Tab/Enter directly — no view state
+needed. Call `prepare()` which defaults to `submit()`.
+
+```
+if self.children.is_empty() && matches!(key, Tab | Enter) {
+    let path_args = build_path_args(&path, tail);
+    match inner.prepare(epoch, &path_args) {
+        SubmitResult::Done(msg) => return NodeResult::Done(msg),
+        SubmitResult::Prepared => {
+            // Confirm flow: show dialog, wait for next Enter
+            self.cache.confirm_pending = true;
+            // Fall through to display (show confirm dialog)
+        }
+        SubmitResult::NewPath(p) => return NodeResult::Continue {
+            prompt: p, display: empty_display()
+        },
+    }
+}
+```
+
+### 2.4 Listing view (phase 4-5)
+
+Only for listing nodes (has children). Handles display, MoveCursor,
+Tab/Enter completion. See §3 for view state details.
+
+```
+// Tab: complete active row's ID, drill into child
+if key == Tab {
+    let (active_id, child_idx) = self.view.active_row_with_child();
+    let new_tail = format!("{} ", active_id);
+
+    // Save filter state before drill (for Esc restoration)
+    self.cache.saved_filter = Some(self.view.current_modifiers());
+
+    // Drill into child
+    let full_prompt = build_prompt(&path, &new_tail);
+    return self.children[child_idx].node_traverse(epoch, key, full_prompt);
+}
+
+// Enter on a listing: same as Tab (drill in)
+if key == Enter {
+    // Same as Tab — drill into the active row's child
+    // (leaf case already handled in phase 3)
+}
+
+// MoveCursor: update cursor, rebuild display
+if let HostKey::MoveCursor(delta) = key {
+    self.view.move_cursor(delta);
+}
+```
 
 ---
 
-## 2. Per-node traversal: `NodeEntry::node_traverse(epoch, key, prompt)`
+## 3. View state (separate from traversal)
 
-Each `NodeEntry` handles one level. The prompt arrives as the **full
-prompt text**. Path walking happens inside.
+The view state handles filter, rank, cursor, and active markers. It is
+only relevant for listing nodes (has children) and only when displaying
+or completing rows.
 
-### Return type (internal)
+### 3.1 `ViewCache` — per-node view state
+
+```rust
+struct ViewCache {
+    // --- Data (rebuilt when data() returns new Rc) ---
+    merged_rows: Vec<Row>,        // flat merged from all children
+    row_child: Vec<u16>,          // parallel: row_child[i] = child index for merged_rows[i]
+    row_index: HashMap<String, u16>,  // row_id → child_index (for D2, submit)
+    field_space: Option<FieldSpace>,
+
+    // --- Derived (rebuilt when inputs change) ---
+    ranked_rows: Vec<Row>,        // filtered + ranked for display
+    ranked_child: Vec<u16>,       // parallel: child index for each ranked row
+    active_rows: Vec<usize>,      // * marker indices into ranked_rows
+
+    // --- Cursor (design §4: "cursor lives in the view") ---
+    cursor: usize,                // index into ranked_rows
+    cursor_key: Option<(Option<String>, String)>,  // (selection, terms) at cursor set time
+
+    // --- Input tracking ---
+    cached_tail: Option<String>,  // tail that produced current ranked_rows
+    data_version: u64,            // incremented when data changes
+}
+```
+
+**Why not store filtered_rows separately?** Filtering (§7.1) and ranking
+(fuzzy match) are both O(n) for typical menu sizes (10-100 rows). The
+filter loop is negligible. Storing an intermediate filtered_rows adds a
+cache field and invalidation logic for no measurable benefit. Re-filter
+from merged_rows when any input changes.
+
+**Why not store MergedRow wrapper?** The child_index is carried through
+to ranked_child (parallel Vec). No per-row wrapper needed. The HashMap
+row_index is for O(1) ID lookups (D2 demotion, submit dispatch fallback).
+
+**Why Vec<u16> for row_child/ranked_child instead of HashMap?** The
+cursor position is an index. On Tab/Enter, we need `row_child[cursor]`
+— O(1) Vec access, no hash lookup. The HashMap row_index is supplementary
+for ID-based lookups (D2 check, frame replay).
+
+### 3.2 Data refresh
+
+Always call data() on each child. Check Rc::ptr_eq to detect change.
+
+```
+refresh_data(epoch):
+  let mut changed = false;
+  let mut rows: Vec<Row> = Vec::new();
+  let mut child_idx: Vec<u16> = Vec::new();
+  let mut field_space = None;
+
+  for (i, child) in self.children.iter_mut().enumerate() {
+    let data = child.inner.data(epoch, &empty_path_args());
+    if let Ok(response) = data {
+      if prev_sig_not_eq(i, &response) { changed = true; }
+      for row in &response.rows {
+        rows.push(row.clone());
+        child_idx.push(i as u16);
+      }
+      if field_space.is_none() && !response.fields.is_empty() {
+        field_space = Some(FieldSpace::new(...));
+      }
+    }
+  }
+
+  if changed {
+    self.view.merged_rows = rows;
+    self.view.row_child = child_idx;
+    self.view.row_index = rows.iter().zip(child_idx.iter())
+        .map(|(r, ci)| (r.id.clone(), *ci))
+        .collect();
+    self.view.field_space = field_space;
+    self.view.data_version += 1;
+    // Force full re-derive (clear cached_tail)
+    self.view.cached_tail = None;
+  }
+```
+
+### 3.3 View derivation (filter + rank + cursor)
+
+Only called when displaying a listing. Re-derives from merged_rows when
+inputs change.
+
+```
+ensure_view(epoch, tail):
+  // Skip if nothing changed
+  if self.view.cached_tail == Some(tail.to_string()) {
+    return;  // reuse cached ranked_rows
+  }
+
+  // Step 1: filter (§7.1)
+  let modifiers = parse_level(tail, &selection_rule).modifiers;
+  let filtered = if modifiers.is_empty() {
+    self.view.merged_rows.clone()
+  } else {
+    let space = self.view.field_space.clone().unwrap_or_default();
+    let query = compile_query(&modifiers, &space);
+    apply_query(&self.view.merged_rows, &query, &space)
+  };
+
+  // Step 2: rank (fuzzy + pin)
+  let selection = parse_level(tail, &selection_rule).selection;
+  let terms = parse_level(tail, &selection_rule).terms;
+  let rank_result = rank_and_pin(&filtered, &terms, selection.as_deref());
+
+  // Carry child_index through ranking
+  // (rank_and_pin reorders filtered; we need to track which child each row came from)
+  // Build ranked_child by matching ranked rows back to merged_rows
+  let ranked_child = rank_result.rows.iter()
+      .map(|r| self.view.row_index[&r.id])
+      .collect();
+
+  self.view.ranked_rows = rank_result.rows;
+  self.view.ranked_child = ranked_child;
+  self.view.cached_tail = Some(tail.to_string());
+
+  // Step 3: active markers (design §5.2)
+  // Resolve data().active_ids against ranked rows
+  self.view.active_rows = resolve_active(&ranked_rows, &active_ids);
+
+  // Step 4: cursor seeding (design §4, §6.5)
+  seed_or_keep_cursor(&mut self.view, &selection, &terms);
+```
+
+### 3.4 Cursor (design §4: "cursor lives in the view")
+
+The cursor is an index into ranked_rows. It survives re-derives until
+selection or terms change (design §6.5: "sticky per-level index set by
+Up/Down survives buffer re-derives").
+
+```
+seed_or_keep_cursor(view, selection, terms):
+  match view.cursor_key {
+    Some((ref prev_sel, ref prev_terms))
+      if *prev_sel == selection && *prev_terms == terms =>
+    {
+      // Sticky: keep it, clamped
+      view.cursor = view.cursor.min(view.ranked_rows.len().saturating_sub(1));
+    }
+    _ => {
+      // Fresh: seed on selection pin, or first active row, or 0
+      view.cursor = selection
+          .and_then(|sel| view.ranked_rows.iter().position(|r| r.id == sel))
+          .or(view.active_rows.first().copied())
+          .unwrap_or(0);
+    }
+  }
+  view.cursor_key = Some((selection, terms));
+```
+
+### 3.5 Active markers (design §5.2)
+
+`data().active_ids: Vec<String>` resolved against ranked rows. Multiple
+rows may be active (e.g., multiple models currently in use). The `*`
+marker shows on active rows; `>` on the cursor row; `*` wins when both
+are on the same row.
+
+---
+
+## 4. Internal structures
+
+### 4.1 `NodeEntry`
+
+```rust
+struct NodeEntry {
+    inner: Box<dyn SlashDotNode>,
+    children: Vec<NodeEntry>,
+    child_map: HashMap<String, usize>,  // child_id → index in children
+    cache: NodeCache,
+}
+
+struct NodeCache {
+    view: ViewCache,
+    saved_filter: Option<String>,  // Esc ladder: filter state before last drill
+    confirm_pending: bool,         // confirm flow: waiting for yea/nay
+}
+```
+
+### 4.2 `DisplayState` — transient, not stored
+
+```rust
+struct DisplayState {
+    rows: Vec<Row>,
+    cursor: usize,
+    active_rows: Vec<usize>,
+    title: String,
+    detail: Vec<String>,
+}
+```
+
+Built from ViewCache after derivation. Passed to render plan builder.
+Columns are NOT here — inferred from field_space at render time.
+is_leaf is NOT here — use `children.is_empty()`.
+
+### 4.3 `NodeResult` (internal)
 
 ```rust
 enum NodeResult {
@@ -40,491 +437,26 @@ enum NodeResult {
 }
 ```
 
-### Algorithm
-
-```
-node_traverse(epoch, key, prompt):
-  ┌─ Phase 0: path walk ──────────────────────────────────────────┐
-  │                                                                │
-  │  Scan prompt one word at a time (no full split).               │
-  │  Walk children: try each word (except last) as child ID.       │
-  │  Remaining words = tail for this node.                         │
-  │                                                                │
-  ├─ Phase 1: refresh data ───────────────────────────────────────┤
-  │                                                                │
-  │  // Always call data() on children (cheap Rc::ptr_eq check).   │
-  │  // Design §2: "Return Rc<DataResponse> so the parent can      │
-  │  // check Rc::ptr_eq for cheap 'nothing changed' signals."     │
-  │  refresh_data(epoch)  // calls data() on each child            │
-  │                                                                │
-  ├─ Phase 2: derive local state ─────────────────────────────────┤
-  │                                                                │
-  │  // Only if data changed (Rc !ptr_eq) or tail changed:         │
-  │  //   1. Apply §7.1 field filter (modifiers from tail)         │
-  │  //   2. Rank by fuzzy terms + pin selection                   │
-  │  //   3. Seed or keep cursor                                   │
-  │  //   4. Resolve active markers (* rows)                       │
-  │  // Otherwise: reuse cached state.                             │
-  │                                                                │
-  ├─ Phase 2.5: frame replay (structural check) ──────────────────┤
-  │                                                                │
-  │  // Design §5.1 step 1: "applied even without Esc."            │
-  │  // When a child ID is valid with no trailing space, and       │
-  │  // saved_filter is set, replay it.                            │
-  │                                                                │
-  ├─ Phase 3: handle key ─────────────────────────────────────────┤
-  │                                                                │
-  │  match key:                                                    │
-  │    MoveCursor → update cursor (no re-derive)                   │
-  │    Tab/Enter  → complete, drill or submit                      │
-  │    Esc        → §5.1 ladder steps 2–4                          │
-  │                                                                │
-  ├─ Phase 4: build result ───────────────────────────────────────┤
-  │                                                                │
-  │  Reconstruct full prompt from path + new tail.                 │
-  │  Build DisplayState from cache.                                │
-  │  Return NodeResult::Continue { prompt, display }               │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
-```
-
 ---
 
-## 3. Internal data structures
-
-### 3.1 `NodeCache` — per-node ephemeral state
-
-```rust
-struct NodeCache {
-    // --- Data cache (design §2: "derived data cache") ---
-    last_epoch: u64,
-    /// Rc from the last data() merge. Checked with ptr_eq to detect
-    /// "nothing changed" signals (design §2).
-    data_sig: Vec<std::rc::Rc<DataResponse>>,
-    /// Merged rows with child index for submit dispatch (design §2.1:
-    /// "Internal to the traversal body, not in Row API").
-    merged_rows: Vec<MergedRow>,
-    /// Field metadata for §7.1 filter/sort (design §2.1: "Field metadata
-    /// on the parent: declared once; children conform").
-    field_space: Option<FieldSpace>,
-
-    // --- Derived state (recomputed only when inputs change) ---
-    /// Filtered rows after §7.1 field filter. Recomputed when modifiers
-    /// change. Input: merged_rows + modifiers.
-    filtered_rows: Vec<Row>,
-    /// Ranked rows after fuzzy match + pin. Recomputed when terms or
-    /// selection change. Input: filtered_rows + terms + selection.
-    ranked_rows: Vec<Row>,
-    /// Active markers: resolved from data().active_ids against ranked
-    /// rows (design §5.2). Vec because multiple rows may be active.
-    active_rows: Vec<usize>,
-    /// The modifiers string that produced the current filtered_rows.
-    /// Used to detect when filter needs re-derivation.
-    cached_modifiers: Option<String>,
-    /// The (terms, selection) that produced the current ranked_rows.
-    /// Used to detect when ranking needs re-derivation.
-    cached_rank_key: Option<(String, Option<String>)>,
-
-    // --- Cursor (design §4: "cursor lives in the view") ---
-    /// View cursor: index into ranked_rows. Moved by arrow keys.
-    /// Survives re-derives until selection/terms change (design §6.5).
-    cursor: usize,
-    /// The (selection, terms) at the time the cursor was last set.
-    /// When these change, cursor re-seeds on the derived pin/active row.
-    cursor_key: Option<(Option<String>, String)>,
-
-    // --- Esc ladder (design §5.1) ---
-    /// The modifiers string before the last drill. Set on every drill
-    /// (Tab/Enter into a child). Taken on frame replay (phase 2.5) or
-    /// Esc step 2. Named "saved_filter" to avoid confusion with
-    /// "traversal frames" in the design doc — this is per-node, not
-    /// a stack.
-    saved_filter: Option<String>,
-}
-```
-
-**What changes when:**
-
-| Input change | What to re-derive |
-|---|---|
-| `MoveCursor` | Nothing — just update cursor index, rebuild render plan from cached ranked_rows |
-| Tail modifiers changed | Filter (§7.1) → recompute filtered_rows |
-| Tail terms/selection changed | Rank (fuzzy + pin) → recompute ranked_rows |
-| Epoch changed or data() Rc changed | Full refresh: re-fetch children, re-filter, re-rank |
-
-### 3.2 `MergedRow` — child index tagging
-
-```rust
-struct MergedRow {
-    row: Row,
-    child_index: u16,  // which child produced this row (for submit dispatch)
-}
-```
-
-Design §2.1: "parent tags each row with its owning child index during
-merge (internal child_index: u16); Tab/Enter reads the tag and dispatches.
-Internal to the traversal body, not in Row API."
-
-For fast ID→child_index lookup, build a `HashMap<String, u16>` at refresh
-time from the merged rows.
-
-### 3.3 `DisplayState` — computed view (transient, not stored)
-
-```rust
-struct DisplayState {
-    rows: Vec<Row>,            // ranked rows for display
-    cursor: usize,             // view-cursor index into rows
-    active_rows: Vec<usize>,   // * marker indices (design §5.2: Vec)
-    title: String,             // from node's header() or child name
-    detail: Vec<String>,       // from header() (design §2: "Non-selectable
-                               //   header lines, replaces v2 DetailProvider")
-}
-```
-
-Columns are NOT in DisplayState. The render plan builder infers columns
-from field metadata (field_space) at render time — they're a presentation
-concern, not a traversal concern.
-
-is_leaf is NOT in DisplayState. Determined by `self.children.is_empty()`.
-
-Built from NodeCache after deriving local state. Passed to render plan
-builder. **Not stored** — recomputed per key event.
-
-### 3.4 RenderPlan: Rc wrapping (design §2)
-
-"RenderPlan wraps bulk row data in Rc so cursor movement shares unchanged
-content — only marker positions (selected_row, active_rows) re-allocate."
-
-The render plan builder should Rc-wrap the row data so MoveCursor (which
-only changes cursor position) shares the same row content.
-
----
-
-## 4. Phase 0: path walk
-
-Scan one word at a time. No full split. For child lookup, use a
-`HashMap<String, usize>` built at construction time (add_child updates it).
-
-```
-let trailing_space = prompt.ends_with(' ');
-
-let mut path: Vec<String> = Vec::new();
-let mut byte_pos = 0;
-// Walk words, trying each (except last) as child ID
-while byte_pos < prompt.len() {
-    // Skip whitespace
-    while byte_pos < prompt.len() && prompt[byte_pos..].starts_with(' ') {
-        byte_pos += 1;
-    }
-    if byte_pos >= prompt.len() { break; }
-
-    // Find end of word
-    let word_start = byte_pos;
-    while byte_pos < prompt.len() && prompt[byte_pos..] != " " {
-        byte_pos += 1;
-    }
-    let word = &prompt[word_start..byte_pos];
-
-    // Don't consume the last word (design: "never consuming the last word")
-    // Check if there's more after this word
-    let after_word = byte_pos;
-    while after_word < prompt.len() && prompt[after_word..].starts_with(' ') {
-        after_word += 1;
-    }
-    if after_word >= prompt.len() {
-        break; // this is the last word — don't consume
-    }
-
-    if word.starts_with('.') { break; }
-    if let Some(&idx) = self.child_map.get(word) {
-        path.push(word.to_string());
-        byte_pos = after_word; // skip past trailing space
-    } else {
-        break;
-    }
-}
-
-// Tail = everything after the last consumed path word
-let tail = &prompt[byte_pos..];
-```
-
-This scans in O(path_depth) time with no allocation for the path walk.
-The tail is a slice of the original prompt (zero-copy).
-
-### Child index map
-
-Built at construction time, updated on add_child:
-
-```rust
-struct NodeEntry {
-    inner: Box<dyn SlashDotNode>,
-    children: Vec<NodeEntry>,
-    child_map: HashMap<String, usize>,  // child_id → index in children
-    cache: NodeCache,
-}
-```
-
----
-
-## 5. Phase 1: refresh data
-
-Always call data() on each child. Check Rc::ptr_eq to detect "nothing
-changed" (design §2: "Return Rc<DataResponse> so the parent can check
-Rc::ptr_eq for cheap 'nothing changed' signals").
-
-```
-refresh_data(epoch):
-  self.cache.last_epoch = epoch;
-
-  let mut changed = false;
-  let mut all_rows: Vec<MergedRow> = Vec::new();
-  let mut field_space: Option<FieldSpace> = None;
-  let mut new_sigs: Vec<Rc<DataResponse>> = Vec::new();
-
-  for (i, child) in self.children.iter_mut().enumerate() {
-    let path_args = empty_path_args(); // children get empty args for data()
-    let data = child.inner.data(epoch, &path_args);
-    if let Ok(response) = data {
-      // Check if data actually changed (design §2: Rc::ptr_eq)
-      let prev_sig = self.cache.data_sig.get(i);
-      if prev_sig.map(|p| !Rc::ptr_eq(p, &response)).unwrap_or(true) {
-        changed = true;
-      }
-      new_sigs.push(response.clone());
-      for row in &response.rows {
-        all_rows.push(MergedRow { row: row.clone(), child_index: i as u16 });
-      }
-      // Merge field metadata from first child that provides it
-      if field_space.is_none() && !response.fields.is_empty() {
-        field_space = Some(FieldSpace::new(
-          response.fields.iter().map(|m| m.spec.clone()).collect()
-        ));
-      }
-    }
-  }
-
-  if field_space.is_none() {
-    field_space = infer_field_space(&all_rows);
-  }
-
-  self.cache.data_sig = new_sigs;
-  self.cache.merged_rows = all_rows;
-  self.cache.field_space = field_space;
-
-  // Build ID→child_index lookup map
-  self.cache.row_index = self.cache.merged_rows.iter()
-      .enumerate()
-      .map(|(i, mr)| (mr.row.id.clone(), mr.child_index))
-      .collect();
-
-  changed  // caller uses this to decide whether to re-derive
-```
-
-### §7.1 field filter (only if inputs changed)
-
-```
-apply_field_filter(tail):
-  let modifiers = parse_level(tail, &selection_rule).modifiers;
-  let modifiers_key = serialize_modifiers(&modifiers); // for cache comparison
-
-  if modifiers_key == self.cache.cached_modifiers {
-    return; // no change, reuse cached filtered_rows
-  }
-
-  if modifiers.is_empty() {
-    self.cache.filtered_rows = self.cache.merged_rows.iter()
-        .map(|mr| mr.row.clone()).collect();
-  } else {
-    let space = self.cache.field_space.clone().unwrap_or_default();
-    let query = compile_query(&modifiers, &space);
-    let rows: Vec<Row> = self.cache.merged_rows.iter()
-        .map(|mr| mr.row.clone()).collect();
-    self.cache.filtered_rows = apply_query(&rows, &query, &space);
-  }
-
-  self.cache.cached_modifiers = Some(modifiers_key);
-  // Force re-rank (terms/selection may apply differently to new filtered set)
-  self.cache.cached_rank_key = None;
-```
-
----
-
-## 6. Phase 2: derive local state (only if inputs changed)
-
-### 6.1 Rank (only if terms/selection changed)
-
-```
-rank(terms, selection):
-  let rank_key = (terms.clone(), selection.clone());
-  if self.cache.cached_rank_key == Some(rank_key.clone()) {
-    return; // no change, reuse cached ranked_rows
-  }
-
-  let rank_result = rank_and_pin(
-    &self.cache.filtered_rows, &terms, selection.as_deref());
-  self.cache.ranked_rows = rank_result.rows;
-  self.cache.cached_rank_key = Some(rank_key);
-```
-
-### 6.2 Cursor seeding (design §4, §6.5)
-
-```
-seed_or_keep_cursor(selection, terms):
-  match self.cache.cursor_key {
-    Some((ref prev_sel, ref prev_terms))
-      if *prev_sel == selection && *prev_terms == terms =>
-    {
-      // Sticky: keep it, clamped
-      let len = self.cache.ranked_rows.len();
-      self.cache.cursor = self.cache.cursor.min(len.saturating_sub(1));
-    }
-    _ => {
-      // Fresh: seed on selection pin, or first active row, or 0
-      let active = self.cache.active_rows.first().copied();
-      self.cache.cursor = selection
-          .and_then(|_| self.cache.ranked_rows.iter()
-              .position(|r| Some(&r.id) == selection.as_ref()))
-          .or(active)
-          .unwrap_or(0);
-    }
-  }
-  self.cache.cursor_key = Some((selection, terms));
-```
-
-### 6.3 Active markers (design §5.2)
-
-Resolves `data().active_ids: Vec<String>` against ranked rows. Multiple
-rows may be active (e.g., multiple models currently in use).
-
-```
-resolve_active_rows(active_ids: &[String]):
-  self.cache.active_rows = active_ids.iter()
-      .filter_map(|id| self.cache.ranked_rows.iter().position(|r| &r.id == id))
-      .collect();
-```
-
----
-
-## 7. Phase 2.5: frame replay (structural check)
-
-Design §5.1 step 1: "Valid child ID, no trailing space → replay local
-frame (restore previous prompt + filter); drop trailing ID from prompt
-and match cursor. **This step is applied even without Esc**, so even when
-restoring from prompt."
-
-```
-if let Some(sel) = &selection {
-    if !trailing_space && self.child_map.contains_key(sel) {
-        if let Some(saved) = self.cache.saved_filter.take() {
-            // Resume filter state from before the drill.
-            // Re-parse saved filter, re-derive display.
-            let restored_display = self.derive_display(epoch, &saved);
-            let new_prompt = build_prompt(&path, &saved);
-            return NodeResult::Continue { prompt: new_prompt, display: restored_display };
-        }
-        // No saved filter: normal — fall through to show child's listing
-        // (or Phase 3 Tab/Enter drill).
-    }
-}
-```
-
-When there IS a saved_filter and the selection matches a child without
-trailing space, we restore the filter state. When there's NO saved
-filter, we show the child's listing normally.
-
----
-
-## 8. Phase 3: key handling
-
-### 8.1 `MoveCursor(delta)`
-
-```
-let len = ranked_rows.len();
-cursor = (cursor as isize + delta).clamp(0, len - 1) as usize;
-// No re-derive. Rebuild RenderPlan from cached ranked_rows.
-```
-
-### 8.2 `Tab`
-
-```
-let active_row = ranked_rows[cursor];
-let active_id = active_row.id;
-
-// Accept semantics (design §4): fuzzy terms cleared, selection pinned.
-let new_tail = format!("{} ", active_id);
-
-// Save filter state before drill (for Esc restoration)
-self.cache.saved_filter = Some(serialize_modifiers(&current_modifiers));
-
-// If listing (has children):
-//   Look up active_id in row_index → child_index.
-//   Reconstruct full prompt: path + active_id + " "
-//   Recurse into children[child_index].node_traverse(epoch, key, full_prompt)
-//   Return child's NodeResult.
-
-// If leaf (no children):
-//   Call inner.prepare(epoch, path_args)
-//   Return Done/Prepared based on SubmitResult.
-```
-
-### 8.3 `Enter`
-
-Same as Tab, except at leaf level Enter submits directly (one key press).
-
-### 8.4 `Esc` — §5.1 ladder steps 2–4
-
-Step 1 (frame replay) is handled structurally in Phase 2.5. Esc handles
-the remaining steps:
-
-```
-// Step 2: clear fuzzy terms + modifiers, keep selection + trailing space
-if selection.is_some() && !terms.is_empty():
-    new_tail = format!("{} ", selection);
-    return Continue(reconstruct(path, new_tail));
-
-// Step 3: strip trailing space (drill out)
-if trailing_space:
-    new_tail = tail.trim_end().to_string();
-    return Continue(reconstruct(path, new_tail));
-
-// Step 4: clear pinned selection (back to parent)
-if selection.is_some():
-    path.pop();
-    return Continue(reconstruct(path, ""));
-
-// Step 5: at root with nothing to clear → close
-return Done(None);
-```
-
----
-
-## 9. Render plan construction
+## 5. Render plan construction
 
 Clean new path, independent of old `PlanBuilder`/`MenuState`.
 
-Columns are inferred from field_space at render time (not stored in
-DisplayState). The render plan builder uses the table module for
-multi-column layouts when field metadata is available.
-
 ```
 fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>) -> RenderPlan {
-  // Rc-wrap row data so MoveCursor shares unchanged content
-  // (design §2: "RenderPlan wraps bulk row data in Rc")
+  // Rc-wrap row data for MoveCursor sharing (design §2)
   let rows_rc = Rc::new(display.rows.clone());
 
   let mut lines = Vec::new();
-
-  // Title
   lines.push(RenderLine { text: display.title.clone(), ... });
 
-  // Detail / header lines (from header())
   for d in &display.detail {
     lines.push(RenderLine { text: d.clone(), style: Style::HEADER, is_header: true, ... });
   }
 
-  // Candidate rows: table layout if field metadata available, else simple
   let row_texts = if let Some(space) = field_space {
-    build_table_rows(&rows_rc, space)
+    build_table_rows(&rows_rc, space)  // table layout from field metadata
   } else {
     rows_rc.iter().map(|r| format_row(r)).collect()
   };
@@ -547,86 +479,73 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>) -
 
 ---
 
-## 10. Borrow discipline
+## 6. Borrow discipline
 
-Per design §2: "Parent-state access happens only outside the child loop
-(three phases: own-state → descend → post-processing). Cross-level data
-flow is passed down as arguments, never read sideways."
+Per design §2: "Parent-state access happens only outside the child loop."
 
-1. **Own state** (Phase 1+2): `self.cache` accessed. No child borrows.
-2. **Descend** (Phase 3): `self.children[idx].node_traverse()`. One child
-   borrowed mutably at a time.
-3. **Post-processing** (Phase 4): build from `self.cache`. No child borrows.
+1. **Own state** (phases 0-2): `self.cache` and `self.view` accessed. No child borrows.
+2. **Descend** (phase 4-5 Tab/Enter): `self.children[idx].node_traverse()`. One child at a time.
+3. **Post-processing** (phase 6): build from cache. No child borrows.
 
 ---
 
-## 11. Implementation order
+## 7. Implementation order
 
-### 4a. Internal types + render plan
-- `NodeCache`, `DisplayState`, `MergedRow`
+### 4a. Traversal skeleton
+- `NodeEntry`, `NodeCache`, `child_map`
+- Path walk (phase 0)
+- Esc ladder (phase 2) — prompt manipulation only, no view
+- Leaf handling (phase 3) — stub prepare/submit
+- Tab drill (phase 4-5) — stub view, just dispatch to child
+- `NodeResult`, `eval_prompt` wiring
+
+### 4b. View state
+- `ViewCache` with merged_rows, row_child, row_index
+- Data refresh (Rc::ptr_eq change detection)
+- Filter + rank (§7.1 + cursor::rank_and_pin)
+- Cursor seeding (design §6.5)
+- Active markers (design §5.2)
+
+### 4c. Render plan
+- `DisplayState`
 - `build_render_plan()` standalone function
-- Child index map (HashMap)
-- Stub `node_traverse`
-
-### 4b. Data refresh (Phase 1)
-- `refresh_data()`: call data() on children, check Rc::ptr_eq
-- Build merged_rows + row_index
-- Field space inference from first child's metadata
-
-### 4c. Filter + rank + cursor (Phase 2)
-- §7.1 field filter (only if modifiers changed)
-- rank_and_pin (only if terms/selection changed)
-- Cursor seeding (sticky cursor, design §6.5)
-- Active markers (Vec<usize>, design §5.2)
+- Table layout from field_space
 
 ### 4d. MoveCursor
-- Update cursor index, rebuild RenderPlan
-- Test end-to-end render plan output
+- Update cursor, rebuild DisplayState
+- Test end-to-end
 
-### 4e. Tab + Enter
-- Complete, drill, saved_filter set, leaf submit
-- Child dispatch via row_index HashMap
+### 4e. Tab completion + drill
+- Complete active row's ID, save saved_filter, recurse into child
 
 ### 4f. Esc + frame replay
-- §5.1 ladder steps 2–4
-- Phase 2.5 frame replay (structural)
+- §5.1 ladder steps 2-4
+- Phase 2.5 frame replay (structural, applies without Esc)
 - Multi-level test scenarios
 
-### 4g. `eval_prompt` wiring
-- Thin wrapper calling `root.node_traverse`
-- Convert NodeResult to MenuResult
-
-### 4h. Tests
-- Port ~50 interpreter tests to new harness
+### 4g. Tests
+- Port interpreter tests to new harness
 
 ---
 
-## 12. Migration strategy
-
-- `build_render_plan()` takes `DisplayState` + `FieldSpace`, returns `RenderPlan`.
-  No `MenuState` dependency.
-- Old `render.rs` / `PlanBuilder` untouched.
-- Deleted when all commands migrated (step 6).
-
----
-
-## 13. Key design decisions
+## 8. Key design decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| saved_filter (Esc) | Per-node `Option<String>` in NodeCache | One slot, set on drill, taken on replay |
-| saved_filter lives in | `NodeEntry`, not `eval_prompt` | `eval_prompt` is thin — only epoch |
-| Data refresh | Always call data(), Rc::ptr_eq for change detection | Design §2: "cheap nothing-changed signals" |
-| Filter re-derive | Only if modifiers changed | Avoid redundant filter application |
-| Rank re-derive | Only if terms/selection changed | Avoid redundant fuzzy matching |
-| MoveCursor | No re-derive, just cursor + render plan | Cursor lives in the view (design §4) |
-| active_rows | `Vec<usize>` | Design §5.2: multiple rows may be active |
-| Columns | Not in DisplayState, inferred at render time | Presentation concern, not traversal |
-| is_leaf | Not in DisplayState, use `children.is_empty()` | Structural property, not display |
-| Child lookup | `HashMap<String, usize>` at construction | O(1) per word, no linear scan |
-| Path walk | Scan one word at a time, no full split | Efficient, no allocation |
-| Trailing space | `prompt.ends_with(' ')` check | Preserve drill signal |
-| Render plan | Standalone function, no `MenuState` | Clean path for v2.5 |
-| MergedRow | `Row + child_index: u16`, side vector | Design §2.1: "not in Row API" |
-| Frame replay | Structural (phase 2.5), not Esc-only | Design §5.1: "applied even without Esc" |
-| Tab/Enter | Clear fuzzy terms, pin selection + space | Design §4 accept semantics |
+| Traversal vs view | Separate concerns | Traversal is structural (path walk, key dispatch, Esc). View is data (filter, rank, cursor). View only used for listing display. |
+| filtered_rows cache | None | Re-filter from merged_rows when inputs change. O(n) loop is negligible for typical menu sizes. |
+| MergedRow wrapper | None | Parallel Vec<u16> (row_child, ranked_child) carries child_index. No per-row wrapper. |
+| Child index lookup | Vec<u16> parallel to rows | Cursor is an index → O(1) Vec access. HashMap row_index supplementary for D2, frame replay. |
+| saved_filter (Esc) | Per-node `Option<String>` in NodeCache | One slot, set on drill, taken on replay. Not a stack. |
+| saved_filter lives in | `NodeEntry`, not `eval_prompt` | `eval_prompt` is thin — only epoch. |
+| Data refresh | Always call data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
+| View re-derive | Only if tail changed | Skip filter+rank if cached_tail matches. |
+| MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
+| active_rows | `Vec<usize>` | Design §5.2: multiple rows may be active. |
+| Columns | Not in DisplayState | Inferred from field_space at render time. |
+| is_leaf | Not in DisplayState | Use `children.is_empty()`. |
+| Child lookup | `HashMap<String, usize>` at construction | O(1) per word in path walk. |
+| Path walk | Scan one word at a time | No full split, zero-copy tail. |
+| Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
+| Frame replay | Structural (phase 2.5), not Esc-only | Design §5.1: "applied even without Esc." |
+| Tab/Enter | Clear fuzzy terms, pin selection + space | Design §4 accept semantics. |
