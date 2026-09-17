@@ -6,24 +6,11 @@ crate independence was reviewed inline; summary below). No new code-level
 detail beyond what is needed to stage and verify the work; types/signatures
 are sketched where the boundary matters.
 
-**v2.5 tracking.** Design for the post-Phase-7.2-4 node model (trait nodes +
-merged child sets, epochs, two-phase confirm) is in
-`slash_menu_v2.5_design.md`, and the design discussion/verdicts are in
-`slash_menu_v2_design_simplification.md`. This plan applies v2 through
-Phase 7.2 steps 1–4 (host overlay collapse on the descriptor engine —
-uniform key loop, CommandList/Model/Thinking/Persona/Mod → Menu). The
-v2.5 **reshape** (the descriptor tree → `NodeImpl` trait nodes with
-private default traversal, merged child sets, handlers-on-nodes, two-phase
-confirm) then happens **between 7.2 steps 4 and 5** (§3.5), and the
-remaining migrations (Session, Tree, Stat, Settings, Sandbox — steps 5–9)
-land on the reshaped engine. Sequencing rationale: steps 1–4 are
-model-agnostic host/engine plumbing whose work survives both node models,
-while steps 5+ need merged child sets, node-owned details, and the
-two-phase submit — building those on the v2 engine first would create the
-path-keyed side tables the reshape deletes (throwaway). The host contract
-(plan-verbatim rendering, uniform key loop, leaf-result translation) is
-identical under both node models, which is what makes the mid-sequence
-seam clean.
+**v2.5 continuation.** Phases 0–7.2 steps 1–3 are complete on the v2
+descriptor engine. The v2.5 design (trait nodes, merged child sets, epochs,
+two-phase confirm) is in `slash_menu_v2.5_design.md`; the implementation
+plan is in `slash_menu_v2.5_impl.md`. This doc is now the v2 implementation
+record; post-7.2 work moves to the v2.5 plan.
 
 ---
 
@@ -674,173 +661,14 @@ handlers would migrate separately, which proved throwaway in practice.
       `handle_tab`, `handle_enter`, `handle_esc`, `cursor_row`,
       `is_engine_backed`, `overlay_disc`, and paint arms all gone — the
       generic `Menu` arm handles them identically. Net: −314 lines.
-   4. **Mod → engine plan** (deferred — needs engine plumbing):
-      a trailing dotted token (`/model .sor`) is a synthetic level;
-      `state()`/`render_plan` must serve its rows from `field_options`.
-      Requires the interpreter to detect the dotted-token case and
-      populate candidates, plus Tab/Enter to handle the modifier-rewrite
-      path (not the accept path). Mod overlay is small and self-contained;
-      deferred to a dedicated follow-up.
+    4. **Mod → engine plan** (deferred — needs engine plumbing) and subsequent command migrations (Session, Tree, Stat, Settings, Sandbox) move to the v2.5 plan.
 
-   **⟶ v2.5 reshape happens here (§3.5)** — after step 4, before the
-   Session/Tree/Stat/Settings/Sandbox migrations. Steps 1–4 land on the v2
-   descriptor engine (host overlay count then: ~8 variants); steps 5–9
-   land on the reshaped v2.5 trait-node engine. The host contract is
-   identical across the seam.
-
-   5. **Session migration** *(lands on the reshaped engine)*:
-      pinning `<name>` drills into the action children (resume/fork/
-      rename/delete — a merged child set is not needed here, plain static
-      children suffice); the entry info panel (name/turns/age/dir) is the
-      node's `detail()`; delete confirm via the two-phase submit
-      (`prepare()` → yea/nay dialog → commit). Deletes Session,
-      SessionAction, Confirm overlays + `session_action_overlay_entries`
-      and the entry-side helpers.
-   6. **Tree + /compact migration** *(lands on the reshaped engine)*:
-      tree list plan (node `data()`), pinned entry → `switch`/`compact`
-      action children (already in the descriptor), modes as children,
-      `llm` leaf two-phase submit with the `.prompt` modifier; the entry
-      header panel → node `detail()`; the compact summary header (target
-      label, context tokens, drop span) → `detail()` on the compact
-      level. After this, `/compact`'s new-path rewrite lands in the
-      generic Menu with no bespoke overlay. Deletes Tree, TreeAction,
-      SwitchAction, CompactSummary + `tree_overlay_entries`,
-      `filter_tree_options`, `tree_entry_header`,
-      `compact_summary_header`.
-   7. **Stat → node detail** *(lands on the reshaped engine)*: the panel
-      renders via the stat node's `detail()` (same path `/replay` uses);
-      esc = clears input, dismisses details. Deletes the Stat overlay and
-      host `stat_phase`.
-   8. **Settings migration** *(the merged-child-set showcase, reshaped
-      engine)*: the `/set` level mixes static setting children + the
-      dynamic default_model child reusing the model rows (separate
-      instance, its own submit — §3.5 step 5). Each setting's leaf writes
-      via the settings cell; the model child's `.field:`/`.sort:` completion
-      is the node's field metadata (already generic). Deletes Settings,
-      SettingsVal + `filtered_value_candidates`, `parse_model_filter`,
-      `model_selection_overlay_entries`, `MODEL_MODIFIERS`,
-      `ReplCtx.model_filter`, and the recent-sync ceremony.
-   9. **Sandbox completion** *(lands on the reshaped engine)*: the
-      `/sandbox` level is one merged listing — a static `add` child at the
-      top + dynamic rows for the current bindings (delete list); the add
-      child's value is an fs live-filter node (no children, commit
-      handler). Deletes the Sandbox overlay + `sandbox_overlay_entries`.
-   10. **Esc uniformity**: `handle_esc`'s per-variant buffer rewrites die
-       with their overlays (steps 4–9); the survivors route through
-       `engine_esc` (engine ladder) or clear the completion state
-       (PathComplete/Help).
-
-7.3. **Final cleanup/audit** (the four-variant host audit; per-command
-   handler migration happens *inside* steps 5–9 above, each command
-   completing render + accept + handlers in one slice — on the reshaped
-   v2.5 engine after §3.5):
-   - delete the `SlashKind` dispatch enum once the Enter translation ladder
-     no longer needs `cmd.kind` (the registry itself **stays**: it is the
-     descriptor source and help text, per §12 "per-command code exists only
-     in descriptors + handlers"); agent.rs's typed-input parse arms
-     (`/tree`, `/session`, `/replay`, …) **stay** — typed submission must
-     keep working regardless of which overlay produced the line;
-   - remove dead `engine_rows` fields, `#[allow(dead_code)]` machinery;
-   - audit: `slashdot_menu` builds without the parent crate; the host
-     renders the engine's plan verbatim (§12) — no per-variant marker or
-     cursor policy survives; `grep ActiveOverlay` shows only the four
-     variants;
-   - verify the `slash_menu.md` acceptance checklist (v1 behaviors,
-     superseded row-by-row by the v2 design where they conflict) plus the
-     v2 additions: cursor-row Tab/Enter, accept-clears-filter with Esc
-     traversal-memory restore, bare-level Tab promote, `*`/`>` marker
-     split, positional ids without `<…>`.
-
----
-
-## 3.5 v2.5 reshape — the trait-node model (after 7.2 step 4, planned)
-
-*Design: `slash_menu_v2.5_design.md`; the motivating discussion and the
-verified borrow-shape / coordinator analysis are in
-`slash_menu_v2_design_simplification.md`. This step happens **between
-7.2 steps 4 and 5**: steps 1–4 (uniform key loop, CommandList/Model/
-Thinking/Persona/Mod → Menu) are model-agnostic host/engine plumbing whose
-work survives both node models, while steps 5+ (Session, Tree, Stat,
-Settings, Sandbox) need the merged child sets, node-owned details, and
-two-phase submit that the reshape provides — building those on the v2
-engine first would create path-keyed side tables the reshape then deletes
-(throwaway). The host contract (plan-verbatim rendering, uniform key loop,
-leaf-result translation) is identical under both node models, which is
-what makes the mid-sequence seam clean: the reshape is engine + test-port
-work only, with the host untouched and reviewable as such.*
-
-### Sequencing
-
-1. **Land 7.2 steps 1–4 first.** They collapse the host to ~8 overlay
-   variants and finish the uniform key loop + Enter translation ladder on
-   the existing descriptor engine.
-2. **Reshape (this section), then resume 7.2 at step 5** (Session) on the
-   reshaped engine. Steps 5–9 each complete a command's render + accept +
-   handlers in one slice, now using merged child sets and node-owned
-   details/handlers directly — no interim DetailProvider/confirm side
-   tables get built.
-3. **Bundle the reshape into one step** (idea A merged-child-sets + the
-   trait-node impl together), rather than A-first-then-B: both change the
-   same interpreter seams (`child_rows` / `is_selection_at` /
-   `level_rows`). Doing A alone would re-touch those seams twice; bundled,
-   each seam is edited once and the intermediate A-without-B state never has
-   to be shippable on its own.
-
-### The reshape steps
-
-1. **Node trait + blanket-impl encapsulation** (§2): introduce `NodeImpl`
-   (overridable `data`, `submit`, `prepare`, `detail`, metadata) and the
-   extension trait whose `traverse()` is a blanket impl. The default body
-   absorbs the interpreter's path parsing, D2 demotion, rank-and-pin, §7.1
-   query engine, cursor cache, Esc ladder, and frames — as non-overridable
-   code. Follow the three-phase borrow discipline (§2): own-state decisions
-   → descend → own-state post-processing; cross-level flow is passed down,
-   never read sideways. Esc is a **root re-entry with the shortened
-   buffer** (never an up-recursion). Reopen-reset becomes an **epoch walk**
-   (increment a counter, clear caches) instead of the v2 engine-rebuild;
-   multi-stage nodes (compaction) key caches on (epoch, stage id) — per
-   node policy.
-2. **Merged child sets** (§2.1): `level_rows` concatenates every child's
-   rows in declaration order; the merged set feeds rank/pin/D2 uniformly;
-   submit dispatches to the row's owning child. Field metadata moves to the
-   parent. This unblocks `/set`, `/sandbox`, and `/set default_model`.
-3. **Port the provider/handler registration**: `with_provider(path, …)`,
-   `with_active_provider`, `detail_providers`, `register_handlers` all
-   become node members (the node *is* the provider/handler); delete the
-   path-keyed side tables and the accept-controller's path-based handler
-   lookup.
-4. **Two-phase submit confirm** (§9): add `prepare()` (default-noop =
-   `submit()`), `SubmitResult::Prepared` (pause with the dialog as render
-   target), and `submit_resolved(yea)`; the dialog itself is a
-   not-overridable engine service. Delete the v2 `ConfirmPrep` machinery;
-   the `AcceptController` folds its confirm state machine into node-local
-   state.
-5. **Node sharing by instantiation**: `/model` and `/set default_model`
-   each get their own model-node instance (each with its own submit);
-   plain local per-node state (no `Rc`, no path-keyed cursor).
-6. **Port the test suite**: ~45 grammar/filter/table/render unit tests are
-   free functions the default bodies call — reused unchanged. ~50
-   prompt/key-level scenario tests (state/tab/enter/esc/cursor) port
-   mechanically to the `traverse()` harness (same scenario tables, new
-   entry point); cursor-map internals tests become per-node cursor tests.
-7. **Post-audit**: `slashdot_menu` builds standalone; the host renders the
-   plan verbatim; the engine-level invariants hold (single D2 demotion
-   point, uniform cursor reset rule, single Esc ladder). (The final
-   four-variant `ActiveOverlay` audit belongs to 7.2 step 10 / 7.3, not
-   here — the host still has the legacy Session/Tree/Settings/Sandbox/
-   Stat variants until steps 5–10 land.)
-
-### What is explicitly *not* in this step
-
-- The host side is untouched: no new `ActiveOverlay`, no host re-formatting,
-  no host-side per-variant logic (v2.5 design §12 keeps the uniform key loop).
-- The grammar, cursor/accept semantics, rendering, and modifier contracts are
-  unchanged (v2.5 design inherits §3–§7 verbatim).
-- Node *sharing* via `Rc` is rejected in favor of instantiation (§2.1).
+   **⟶ Post-7.2 steps continue in `slash_menu_v2.5_impl.md`** — the v2.5 reshape (trait nodes, merged child sets, two-phase confirm) happens between steps 3 and 4, and all remaining command migrations land on the reshaped engine.
 
 ---
 
 ## 4. Integration approach inside picocode
+
 
 - `repl.rs` keeps the *dispatch* (key events → overlay) but its per-menu
   logic is replaced by: parse buffer → interpreter call → apply result
