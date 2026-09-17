@@ -49,6 +49,17 @@ struct ContentCache {
     ranked_rows: Vec<RowRef>,
     /// True when data changed since last ensure_view.
     dirty: bool,
+    /// Cached rendered lines + active row indices. Rebuilt only when
+    /// content changes (dirty) or terminal width changes. MoveCursor
+    /// clones the Rc and only updates markers.
+    render: RenderCache,
+}
+
+struct RenderCache {
+    /// Rc-shared rendered lines — zero-cost clone on cursor moves.
+    lines: Rc<Vec<RenderLine>>,
+    /// Resolved active row indices (computed from active_ids + ranked_rows).
+    active_rows: Vec<usize>,
 }
 
 impl Default for ContentCache {
@@ -59,6 +70,10 @@ impl Default for ContentCache {
             row_index: HashMap::new(),
             ranked_rows: Vec::new(),
             dirty: true,
+            render: RenderCache {
+                lines: Rc::new(Vec::new()),
+                active_rows: Vec::new(),
+            },
         }
     }
 }
@@ -692,6 +707,8 @@ impl NodeEntry {
 
     // --- Render plan construction (§5) ---
 
+    /// Rebuild lines and cache. Called when content is dirty or on
+    /// non-cursor key events.
     fn build_render_plan(&mut self) -> RenderPlan {
         let mut lines = Vec::new();
 
@@ -730,24 +747,35 @@ impl NodeEntry {
             });
         }
 
-        // Resolve active row marker.
-        let active = self
-            .epoch
-            .cursor_id
-            .as_ref()
-            .and_then(|_cursor_id| {
-                self.content
-                    .ranked_rows
-                    .iter()
-                    .position(|r| {
-                        r.resolve(&self.content.data_rc)
-                            .map_or(false, |row| self.content.active_ids.contains(&row.id))
-                    })
-            });
+        // Resolve active row indices.
+        let active_rows: Vec<usize> = self
+            .content
+            .ranked_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.resolve(&self.content.data_rc)
+                    .map_or(false, |row| self.content.active_ids.contains(&row.id))
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let lines_rc = Rc::new(lines);
+
+        // Cache the lines and active_rows.
+        self.content.render.lines = Rc::clone(&lines_rc);
+        self.content.render.active_rows = active_rows.clone();
+
+        let active = if active_rows.is_empty() {
+            None
+        } else {
+            // Use the first active row as the primary active marker.
+            Some(active_rows[0])
+        };
 
         RenderPlan {
             title: None,
-            lines,
+            lines: lines_rc,
             selected: if self.content.ranked_rows.is_empty() {
                 None
             } else {
@@ -758,10 +786,26 @@ impl NodeEntry {
         }
     }
 
-    fn plan_from_cache(&mut self) -> RenderPlan {
-        // For cursor moves, rebuild the plan with updated cursor position.
-        // TODO: cache rendered lines for zero-copy on MoveCursor.
-        self.build_render_plan()
+    /// Cursor-move fast path: clone the cached lines Rc, only update
+    /// markers. Zero allocation for the lines themselves.
+    fn plan_from_cache(&self) -> RenderPlan {
+        let active = if self.content.render.active_rows.is_empty() {
+            None
+        } else {
+            Some(self.content.render.active_rows[0])
+        };
+
+        RenderPlan {
+            title: None,
+            lines: Rc::clone(&self.content.render.lines),
+            selected: if self.content.ranked_rows.is_empty() {
+                None
+            } else {
+                Some(self.epoch.cursor_idx)
+            },
+            active,
+            detail: Vec::new(),
+        }
     }
 }
 

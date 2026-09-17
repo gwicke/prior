@@ -66,20 +66,18 @@ impl Marker {
 }
 
 /// The complete overlay panel description.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct RenderPlan {
     pub title: Option<String>,
-    pub lines: Vec<RenderLine>,
+    /// Rc-shared lines — zero-cost clone on cursor moves.
+    pub lines: std::rc::Rc<Vec<RenderLine>>,
     /// Index of the cursor-selected logical option.
     pub selected: Option<usize>,
     /// Index of the current-state ("active") logical option (`*` marker,
-    /// design §5.1), resolved from `MenuState::active_row_marker`. When it
-    /// equals `selected`, `*` wins on the shared row.
+    /// design §5.1). When it equals `selected`, `*` wins on the shared row.
     pub active: Option<usize>,
-    /// Detail/banner lines (design §5.1): multi-line help text or
-    /// dynamic content rendered as non-selectable header rows between
-    /// the title and the candidate rows (e.g. `/replay` help, `/stat`
-    /// summary). Populated by the host from a registered detail provider.
+    /// Detail/banner lines: non-selectable header rows between
+    /// the title and the candidate rows.
     pub detail: Vec<String>,
 }
 
@@ -99,7 +97,7 @@ impl RenderPlan {
         for d in &self.detail {
             out.push(bg_line(d, Style::HEADER.bg));
         }
-        for l in &self.lines {
+        for l in self.lines.iter() {
             let sel = self.selected == Some(l.option);
             let act = self.active == Some(l.option);
             let bg = if l.is_header {
@@ -300,7 +298,7 @@ impl PlanBuilder {
 
         RenderPlan {
             title: Some(self.title.clone()),
-            lines,
+            lines: std::rc::Rc::new(lines),
             selected: if state.candidates.is_empty() {
                 None
             } else {

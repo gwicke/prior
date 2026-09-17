@@ -32,10 +32,10 @@ Design deviations from step4 doc (per user clarification):
 ### Deferred (not blocking, pick up as needed)
 
 **RenderPlan / rendering:**
-- No `Rc<Vec<RenderLine>>` sharing — `plan_from_cache()` rebuilds the full
-  plan on every keypress. The step4 design §4.2 describes a `RenderCache`
-  where `MoveCursor` reuses `lines` via Rc clone (only `selected` and
-  `active_rows` recomputed). Deferred until profiling shows it matters.
+- ~~No `Rc<Vec<RenderLine>>` sharing~~ **Done.** `RenderPlan.lines` is now
+  `Rc<Vec<RenderLine>>`. `plan_from_cache()` clones the Rc (refcount bump)
+  and only recomputes `selected`/`active` markers. `build_render_plan()`
+  stores the Rc in `ContentCache::render` for reuse.
 - No table layout / `ColumnDef` in RenderPlan — rows render as
   `id — description`. Table columns come when commands with structured
   fields are ported (step 6+).
