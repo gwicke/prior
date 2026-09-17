@@ -4761,7 +4761,7 @@ impl Repl {
                 if path.is_empty() {
                     opts.push("(type a path and press Tab to complete)".into());
                     *active = None;
-                    return Some("add_ro");
+                    return Some(if sub == "add_rw" { "add_rw" } else { "add_ro" });
                 }
                 // The last token is the one being typed; show file completions.
                 let last_token = path.split_whitespace().last().unwrap_or("");
@@ -4797,7 +4797,7 @@ impl Repl {
                     }
                 }
                 *active = None;
-                return Some("add_ro");
+                return Some(if sub == "add_rw" { "add_rw" } else { "add_ro" });
             }
             "remove" => {
                 let path = path.trim();
