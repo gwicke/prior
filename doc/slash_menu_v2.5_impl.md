@@ -7,13 +7,14 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–2. `SlashDotNode` trait (all defaults),
+**Done (v2.5 reshape):** Steps 1–3. `SlashDotNode` trait (all defaults),
 `NodeEntry` (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public
 API). No key/routing concept — child dispatch by row index. Root node is
-a pure container with no `data()`/`submit()`.
+a pure container with no `data()`/`submit()`. Step 3 verified: grammar,
+filter, and fuzzy are already free functions.
 
-**Next:** Step 3 (verify grammar/filter boundary — no code changes), then
-step 4 (implement `NodeEntry::node_traverse()` body).
+**Next:** Step 4 (implement `NodeEntry::node_traverse()` body).
+Design: `slash_menu_v2.5_step4_design.md`.
 
 ---
 
