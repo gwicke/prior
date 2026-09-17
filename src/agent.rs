@@ -4585,7 +4585,7 @@ pub struct SessionStatsInfo {
 /// Compute the `/stat` panel lines. Renders two sections:
 ///
 /// 1. **session** — display name, created/last-updated times, total session size
-///    (mirrors `/session <id>`).
+///    (mirrors `/session <id>`), estimated compacted context tokens.
 /// 2. **model**   — provider/model identifier, context-window limit, current
 ///    usage, approximate session cost, cache hit rate.
 ///
@@ -4598,6 +4598,7 @@ pub fn session_stats_lines(
     model: &str,
     usage: SessionUsage,
     session: Option<SessionStatsInfo>,
+    context_tokens: u64,
 ) -> Vec<String> {
     let entry = model_catalog::lookup(provider, model);
     let ctx_len = entry.as_ref().and_then(|e| e.context_length);
@@ -4624,6 +4625,10 @@ pub fn session_stats_lines(
             // No repo / no metadata available (e.g. in tests without a session).
             lines.push("session: (unavailable)".to_string());
         }
+    }
+    // Estimated compacted context tokens (what would be sent on next turn).
+    if context_tokens > 0 {
+        lines.push(format!("  estimated context tokens: {}", context_tokens));
     }
 
     // ── model section ───────────────────────────────────────────────────
@@ -7335,7 +7340,7 @@ mod tests {
             user_message_count: 7,
         };
         let usage = SessionUsage::default();
-        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info));
+        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info), 42_000);
 
         // The first three lines are the new "session:" section.
         assert!(
@@ -7353,6 +7358,8 @@ mod tests {
         // number of user prompts (= turns), the latter the total entries
         // (user + assistant + toolResult).
         assert_eq!(lines[2], "  size: 7 turns (14 messages)");
+        // New line: estimated context tokens
+        assert_eq!(lines[3], "  estimated context tokens: 42000");
 
         // Then the "model:" section starts on the next line, with the rest
         // of the existing context-window / usage / cost / cache rows.
@@ -7360,7 +7367,7 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("model:"))
             .expect("model section must be present");
-        assert!(model_idx >= 3, "model section must follow session section");
+        assert!(model_idx >= 4, "model section must follow session section");
         assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
         assert!(lines.iter().any(|l| l.contains("context window limit")));
     }
@@ -7374,6 +7381,7 @@ mod tests {
             "minimax/minimax-m3:free",
             SessionUsage::default(),
             None,
+            0,
         );
 
         // Without a repo / session metadata the panel still renders both

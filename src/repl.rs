@@ -694,7 +694,7 @@ impl ActiveOverlay {
                 // model section still renders cleanly.
                 let session_info = Repl::current_session_stats_info(ctx);
                 let lines = crate::agent::session_stats_lines(
-                    &ctx.provider, &ctx.model, ctx.session_usage, session_info,
+                    &ctx.provider, &ctx.model, ctx.session_usage, session_info, ctx.context_tokens,
                 );
                 ActiveOverlay::Stat { lines }
             }
