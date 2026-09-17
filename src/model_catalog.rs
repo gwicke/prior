@@ -105,7 +105,8 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("doubleword", "Qwen/Qwen3.5-4B", 128_000, 0.0, 0.0, false),
     ("llamafile", "LLaMA_CPP", 128_000, 0.0, 0.0, false),
     ("minimax", "MiniMax-M2.7", 200_000, 0.0, 0.0, false),
-    ("xiaomimimo", "mimo-v2.5-pro", 200_000, 0.0, 0.0, false),
+    ("xiaomimimo", "mimo-v2.5", 1_050_000, 0.002, 0.002, true),
+    ("xiaomimimo", "mimo-v2.5-pro", 1_050_000, 0.0, 0.0, true),
     ("zai", "glm-4.6", 128_000, 0.0, 0.0, false),
 ];
 
