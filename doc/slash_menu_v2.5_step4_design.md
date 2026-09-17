@@ -42,43 +42,40 @@ node_traverse(epoch, key, prompt):
   │  Always call data() on each child. Check Rc::ptr_eq to see     │
   │  if anything changed. Rebuild merged_rows + row_child if so.   │
   │                                                                │
-  ├─ Phase 2: Esc ladder ─────────────────────────────────────────┤
+  │  // At this point: path walk done, data refreshed.                │
+  │  // Now follow the design doc's listing node algorithm:          │
+  │  //   - Child ID match + non-empty suffix → recurse              │
+  │  //   - Child ID match + empty suffix → Esc ladder (phase 2)     │
+  │  //   - No child ID match → handle key at this level (phase 3)   │
   │                                                                │
-  │  if key == Esc:                                                │
-  │    // Ladder steps are checked top-down (design §5.1).         │
-  │    // No view state needed — just manipulate prompt.           │
-  │    Step 1: frame replay (structural, not Esc-specific)         │
-  │    Step 2: clear terms + modifiers                             │
-  │    Step 3: strip trailing space                                │
-  │    Step 4: clear selection, pop path                           │
-  │    Step 5: at root → close                                     │
-  │    return NodeResult with new prompt                           │
+  ├─ Phase 2: child dispatch ──────────────────────────────────────┤
   │                                                                │
-  ├─ Phase 3: leaf check ─────────────────────────────────────────┤
+  │  // Design doc: "Child ID match: Non-empty suffix: return       │
+  │  // child.node_traverse(...) with updated PathArgs.             │
+  │  // All keys handled deeper."                                   │
+  │  if selection matches a child && (non-empty suffix or trailing) │
+  │    if !trailing && saved_filter exists:                         │
+  │      → frame replay (§5.1 step 1)                              │
+  │    else:                                                       │
+  │      → recurse into child (all keys handled deeper)            │
   │                                                                │
-  │  if self.children.is_empty() && (key == Tab || key == Enter):  │
-  │    // Leaf node: call prepare/submit directly.                 │
-  │    // No view state needed.                                    │
-  │    result = inner.prepare(epoch, path_args)                    │
-  │    return Done/Continue based on SubmitResult                  │
+  ├─ Phase 3: handle key at this level ────────────────────────────┤
   │                                                                │
-  ├─ Phase 4: listing view ───────────────────────────────────────┤
-  │                                                                │
-  │  // Only needed for listing nodes (has children).              │
-  │  // Handles: display, MoveCursor, Tab/Enter completion.        │
-  │  // See §3 (view state) for details.                           │
-  │  ensure_view(epoch, tail)  // refresh + filter + rank if needed│
-  │                                                                │
-  ├─ Phase 5: handle key ─────────────────────────────────────────┤
+  │  // Design doc: "Path exhausted, no child ID match"            │
+  │  // Listing nodes:                                             │
+  │  //   MoveCursor → return listing Continue                     │
+  │  //   Tab → expand focused ID, append space, push frame,       │
+  │  //         call child's node_traverse()                       │
+  │  //   Enter → as Tab, but forward key; child may submit()      │
+  │  //           immediately if it is a leaf                      │
   │                                                                │
   │  match key:                                                    │
-  │    MoveCursor(delta) → update cursor, rebuild DisplayState     │
-  │    Tab → complete active row's ID, drill into child            │
-  │    Enter → same as Tab (drill), or submit if leaf already      │
-  │               handled in phase 3                               │
-  │    NoKey / other → just display (fall through to phase 6)      │
+  │    MoveCursor → update cursor, rebuild DisplayState            │
+  │    Tab → complete active row, drill into child                 │
+  │    Enter → same as Tab but forward key to child                │
+  │    other → just display (fall through to phase 4)              │
   │                                                                │
-  ├─ Phase 6: build result ───────────────────────────────────────┤
+  ├─ Phase 4: build result ────────────────────────────────────────┤
   │                                                                │
   │  Reconstruct full prompt from path + new tail.                 │
   │  Build DisplayState from view state.                           │
@@ -89,15 +86,20 @@ node_traverse(epoch, key, prompt):
 
 ### 2.1 Path walk (phase 0)
 
-Scan one word at a time. No full split. For child lookup, use a
-`HashMap<String, usize>` built at construction time.
+Scan one word at a time. Interleave child ID lookup with modifier
+parsing. Exit as soon as a child ID is found — the child handles the
+rest (recursive model, design §2: "The traversal is recursive").
+
+For child lookup, use a `HashMap<String, usize>` built at construction
+time.
 
 ```
 let trailing_space = prompt.ends_with(' ');
-
 let mut path: Vec<String> = Vec::new();
+let mut args = Args::default();
 let mut pos = 0;
-while pos < prompt.len() {
+
+loop {
     // Skip whitespace
     while pos < prompt.len() && prompt.as_bytes()[pos] == b' ' { pos += 1; }
     if pos >= prompt.len() { break; }
@@ -107,24 +109,32 @@ while pos < prompt.len() {
     while pos < prompt.len() && prompt.as_bytes()[pos] != b' ' { pos += 1; }
     let word = &prompt[start..pos];
 
-    // Don't consume the last word
-    let mut ahead = pos;
-    while ahead < prompt.len() && prompt.as_bytes()[ahead] == b' ' { ahead += 1; }
-    if ahead >= prompt.len() { break; }  // last word — stop
-
-    if word.starts_with('.') { break; }
-    if let Some(&idx) = self.child_map.get(word) {
+    // Check if this word is a child ID (design: terminate on first match)
+    if let Some(&child_idx) = self.child_map.get(word) {
+        // Found child — push the child's ID, then let the child handle
+        // the rest via recursive node_traverse().
         path.push(word.to_string());
-        pos = ahead;  // advance past trailing spaces
-    } else {
         break;
+    }
+
+    // Not a child ID — parse as dot modifier or fuzzy term
+    if let Some(dot) = parse_dot_token(word) {
+        args.push_modifier(dot);  // accumulates multi-word values
+    } else {
+        args.push_positional(word);  // fuzzy term or selection
     }
 }
 
+// Tail = everything after the last consumed path word (zero-copy slice)
 let tail = &prompt[pos..];
 ```
 
-O(path_depth) time. Tail is a slice of the original prompt (zero-copy).
+The loop terminates on the first child ID match. The remaining prompt
+(after the matched ID) is the tail for the child. The child's
+`node_traverse` will parse its own level from the tail.
+
+If no child matches, the entire remaining prompt is the tail for THIS
+node (listing view with fuzzy filter).
 
 ### 2.2 Esc ladder (phase 2)
 
@@ -194,36 +204,58 @@ if self.children.is_empty() && matches!(key, Tab | Enter) {
 }
 ```
 
-### 2.4 Listing view (phase 4-5)
+### 2.4 Key handling at this level (phase 3)
 
-Only for listing nodes (has children). Handles display, MoveCursor,
-Tab/Enter completion. See §3 for view state details.
+When no child ID matches, handle the key at this level. For listing
+nodes, this means display + cursor + Tab/Enter drill.
 
 ```
-// Tab: complete active row's ID, drill into child
-if key == Tab {
-    let (active_id, child_idx) = self.view.active_row_with_child();
-    let new_tail = format!("{} ", active_id);
+// Ensure view state is fresh (filter + rank from merged_rows)
+ensure_view(epoch, tail);
 
-    // Save filter state before drill (for Esc restoration)
-    self.cache.saved_filter = Some(self.view.current_modifiers());
+match key {
+    HostKey::MoveCursor(delta) => {
+        self.view.move_cursor(delta);
+    }
 
-    // Drill into child
-    let full_prompt = build_prompt(&path, &new_tail);
-    return self.children[child_idx].node_traverse(epoch, key, full_prompt);
-}
+    HostKey::Tab => {
+        // Design §5: "Tab: bare level → promote (trailing space,
+        // same as Enter); otherwise complete cursor row's id."
+        // Tab ALWAYS drills — never submits.
+        let active_id = self.view.cursor_row_id();
+        let child_idx = self.view.row_index[active_id];
 
-// Enter on a listing: same as Tab (drill in)
-if key == Enter {
-    // Same as Tab — drill into the active row's child
-    // (leaf case already handled in phase 3)
-}
+        // Save filter state for Esc restoration
+        self.cache.saved_filter = Some(self.view.current_filter_state());
 
-// MoveCursor: update cursor, rebuild display
-if let HostKey::MoveCursor(delta) = key {
-    self.view.move_cursor(delta);
+        // Drill into child — Tab does NOT forward the key
+        let full_prompt = build_prompt(&path, &format!("{} ", active_id));
+        return self.children[child_idx]
+            .node_traverse(epoch, key, &full_prompt);
+    }
+
+    HostKey::Enter => {
+        // Design §5: "Enter: as Tab, but forward key; child may
+        // submit() immediately if it is a leaf."
+        let active_id = self.view.cursor_row_id();
+        let child_idx = self.view.row_index[active_id];
+
+        self.cache.saved_filter = Some(self.view.current_filter_state());
+
+        // Drill into child — Enter FORWARDS the key
+        let full_prompt = build_prompt(&path, &format!("{} ", active_id));
+        return self.children[child_idx]
+            .node_traverse(epoch, key, &full_prompt);
+        // The child (if leaf) receives Enter and can call submit().
+    }
+
+    _ => {} // fall through to build result
 }
 ```
+
+Tab never submits (design §5: "Tab drills"). Enter forwards the key
+so a leaf child can receive it and call submit() (design §5: "Enter:
+as Tab, but forward key; child may submit() immediately if it is a leaf").
 
 ---
 
@@ -239,24 +271,44 @@ or completing rows.
 struct ViewCache {
     // --- Data (rebuilt when data() returns new Rc) ---
     merged_rows: Vec<Row>,        // flat merged from all children
-    row_child: Vec<u16>,          // parallel: row_child[i] = child index for merged_rows[i]
-    row_index: HashMap<String, u16>,  // row_id → child_index (for D2, submit)
-    field_space: Option<FieldSpace>,
+    row_index: HashMap<String, u16>,  // row_id → child_index (for D2, submit dispatch)
+    field_space: Option<FieldSpace>,  // field metadata for §7.1 filter/sort queries
 
     // --- Derived (rebuilt when inputs change) ---
     ranked_rows: Vec<Row>,        // filtered + ranked for display
-    ranked_child: Vec<u16>,       // parallel: child index for each ranked row
-    active_rows: Vec<usize>,      // * marker indices into ranked_rows
+    active_rows: Vec<String>,     // active IDs (design §5.2: Vec, may have multiple)
 
     // --- Cursor (design §4: "cursor lives in the view") ---
-    cursor: usize,                // index into ranked_rows
-    cursor_key: Option<(Option<String>, String)>,  // (selection, terms) at cursor set time
-
-    // --- Input tracking ---
-    cached_tail: Option<String>,  // tail that produced current ranked_rows
-    data_version: u64,            // incremented when data changes
+    cursor_id: Option<String>,    // row ID the cursor is on — survives re-rank/filter
 }
 ```
+
+**Why row_id (String) for cursor instead of index?** The cursor should
+travel with the row across re-rank/filter. An index becomes stale when
+rows are reordered. A row ID is stable. On display, look up the ID in
+ranked_rows to get the index (O(n) but n is small). On MoveCursor, move
+the index and update the ID.
+
+**Why Vec<String> for active_rows?** IDs don't change across filtering
+or sorting. Indices do. The `*` marker resolves from data().active_ids
+(Which are strings) against ranked rows at display time.
+
+**Why no row_child Vec?** The HashMap `row_index` already maps
+row_id → child_index in O(1). No need for a parallel Vec. On Tab/Enter,
+look up `row_index[cursor_row_id]`.
+
+**Why field_space?** Field metadata for §7.1 filter/sort queries. The
+filter engine needs to know which fields are strings vs numbers, their
+sort direction, etc. Comes from the first child's data() response.
+
+**Why no data_version?** Redundant. Change detection uses
+`data_sig: Vec<Rc<DataResponse>>` — compare Rc::ptr_eq per child to
+detect "nothing changed" (design §2).
+
+**Why cached_tail?** The full tail (modifiers + terms + selection) that
+produced the current ranked_rows. When the tail changes, re-derive. When
+it doesn't, reuse cached ranked_rows. This is the single cache key for
+the entire filter+rank pipeline.
 
 **Why not store filtered_rows separately?** Filtering (§7.1) and ranking
 (fuzzy match) are both O(n) for typical menu sizes (10-100 rows). The
@@ -264,14 +316,7 @@ filter loop is negligible. Storing an intermediate filtered_rows adds a
 cache field and invalidation logic for no measurable benefit. Re-filter
 from merged_rows when any input changes.
 
-**Why not store MergedRow wrapper?** The child_index is carried through
-to ranked_child (parallel Vec). No per-row wrapper needed. The HashMap
-row_index is for O(1) ID lookups (D2 demotion, submit dispatch fallback).
 
-**Why Vec<u16> for row_child/ranked_child instead of HashMap?** The
-cursor position is an index. On Tab/Enter, we need `row_child[cursor]`
-— O(1) Vec access, no hash lookup. The HashMap row_index is supplementary
-for ID-based lookups (D2 check, frame replay).
 
 ### 3.2 Data refresh
 
@@ -281,16 +326,16 @@ Always call data() on each child. Check Rc::ptr_eq to detect change.
 refresh_data(epoch):
   let mut changed = false;
   let mut rows: Vec<Row> = Vec::new();
-  let mut child_idx: Vec<u16> = Vec::new();
+  let mut new_sigs: Vec<Rc<DataResponse>> = Vec::new();
   let mut field_space = None;
 
   for (i, child) in self.children.iter_mut().enumerate() {
     let data = child.inner.data(epoch, &empty_path_args());
     if let Ok(response) = data {
       if prev_sig_not_eq(i, &response) { changed = true; }
+      new_sigs.push(response.clone());
       for row in &response.rows {
         rows.push(row.clone());
-        child_idx.push(i as u16);
       }
       if field_space.is_none() && !response.fields.is_empty() {
         field_space = Some(FieldSpace::new(...));
@@ -299,15 +344,13 @@ refresh_data(epoch):
   }
 
   if changed {
+    self.cache.data_sig = new_sigs;
     self.view.merged_rows = rows;
-    self.view.row_child = child_idx;
-    self.view.row_index = rows.iter().zip(child_idx.iter())
-        .map(|(r, ci)| (r.id.clone(), *ci))
+    self.view.row_index = rows.iter().enumerate()
+        .map(|(i, r)| (r.id.clone(), /* child_index from iteration */))
         .collect();
     self.view.field_space = field_space;
-    self.view.data_version += 1;
-    // Force full re-derive (clear cached_tail)
-    self.view.cached_tail = None;
+    self.view.cached_tail = None;  // force re-derive
   }
 ```
 
@@ -338,20 +381,12 @@ ensure_view(epoch, tail):
   let terms = parse_level(tail, &selection_rule).terms;
   let rank_result = rank_and_pin(&filtered, &terms, selection.as_deref());
 
-  // Carry child_index through ranking
-  // (rank_and_pin reorders filtered; we need to track which child each row came from)
-  // Build ranked_child by matching ranked rows back to merged_rows
-  let ranked_child = rank_result.rows.iter()
-      .map(|r| self.view.row_index[&r.id])
-      .collect();
-
   self.view.ranked_rows = rank_result.rows;
-  self.view.ranked_child = ranked_child;
   self.view.cached_tail = Some(tail.to_string());
 
   // Step 3: active markers (design §5.2)
-  // Resolve data().active_ids against ranked rows
-  self.view.active_rows = resolve_active(&ranked_rows, &active_ids);
+  // Resolve data().active_ids (strings) against ranked rows
+  self.view.active_rows = active_ids_from_data.clone();
 
   // Step 4: cursor seeding (design §4, §6.5)
   seed_or_keep_cursor(&mut self.view, &selection, &terms);
@@ -359,29 +394,28 @@ ensure_view(epoch, tail):
 
 ### 3.4 Cursor (design §4: "cursor lives in the view")
 
-The cursor is an index into ranked_rows. It survives re-derives until
-selection or terms change (design §6.5: "sticky per-level index set by
-Up/Down survives buffer re-derives").
+The cursor is a row ID, not an index. It survives re-rank and re-filter
+because the row ID stays with the row regardless of order. On display,
+look up the ID in ranked_rows to get the index.
 
 ```
 seed_or_keep_cursor(view, selection, terms):
-  match view.cursor_key {
-    Some((ref prev_sel, ref prev_terms))
-      if *prev_sel == selection && *prev_terms == terms =>
-    {
-      // Sticky: keep it, clamped
-      view.cursor = view.cursor.min(view.ranked_rows.len().saturating_sub(1));
-    }
-    _ => {
-      // Fresh: seed on selection pin, or first active row, or 0
-      view.cursor = selection
-          .and_then(|sel| view.ranked_rows.iter().position(|r| r.id == sel))
-          .or(view.active_rows.first().copied())
-          .unwrap_or(0);
-    }
+  // If cursor_id is still valid in the current ranked_rows, keep it.
+  // Otherwise, re-seed.
+  if let Some(ref id) = view.cursor_id {
+      if ranked_rows.iter().any(|r| &r.id == id) {
+          return;  // cursor still valid, keep it
+      }
   }
-  view.cursor_key = Some((selection, terms));
+
+  // Re-seed: selection pin, or first active row, or row 0
+  view.cursor_id = selection
+      .or_else(|| view.active_rows.first().cloned())
+      .or_else(|| ranked_rows.first().map(|r| r.id.clone()));
 ```
+
+MoveCursor updates both the index (for display) and the ID (for
+persistence across re-derives).
 
 ### 3.5 Active markers (design §5.2)
 
@@ -416,8 +450,8 @@ struct NodeCache {
 ```rust
 struct DisplayState {
     rows: Vec<Row>,
-    cursor: usize,
-    active_rows: Vec<usize>,
+    cursor_idx: usize,            // looked up from cursor_id in ranked_rows
+    active_rows: Vec<String>,     // active IDs (design §5.2)
     title: String,
     detail: Vec<String>,
 }
@@ -534,18 +568,19 @@ Per design §2: "Parent-state access happens only outside the child loop."
 |---|---|---|
 | Traversal vs view | Separate concerns | Traversal is structural (path walk, key dispatch, Esc). View is data (filter, rank, cursor). View only used for listing display. |
 | filtered_rows cache | None | Re-filter from merged_rows when inputs change. O(n) loop is negligible for typical menu sizes. |
-| MergedRow wrapper | None | Parallel Vec<u16> (row_child, ranked_child) carries child_index. No per-row wrapper. |
-| Child index lookup | Vec<u16> parallel to rows | Cursor is an index → O(1) Vec access. HashMap row_index supplementary for D2, frame replay. |
+| Cursor identifier | Row ID (String), not index | Survives re-rank/re-filter. Index looked up at display time. |
+| active_rows | `Vec<String>` (IDs) | Design §5.2: IDs don't change across filter/sort. Resolved to indices at display time. |
+| Child index lookup | `HashMap<String, u16>` (row_index) | O(1) by row ID. Independent of row reordering. No parallel Vec needed. |
 | saved_filter (Esc) | Per-node `Option<String>` in NodeCache | One slot, set on drill, taken on replay. Not a stack. |
 | saved_filter lives in | `NodeEntry`, not `eval_prompt` | `eval_prompt` is thin — only epoch. |
 | Data refresh | Always call data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
 | View re-derive | Only if tail changed | Skip filter+rank if cached_tail matches. |
 | MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
-| active_rows | `Vec<usize>` | Design §5.2: multiple rows may be active. |
 | Columns | Not in DisplayState | Inferred from field_space at render time. |
 | is_leaf | Not in DisplayState | Use `children.is_empty()`. |
 | Child lookup | `HashMap<String, usize>` at construction | O(1) per word in path walk. |
-| Path walk | Scan one word at a time | No full split, zero-copy tail. |
+| Path walk | Scan one word, exit on first child ID | Recursive model: each node handles one level. Interleaves modifier parsing. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
-| Frame replay | Structural (phase 2.5), not Esc-only | Design §5.1: "applied even without Esc." |
-| Tab/Enter | Clear fuzzy terms, pin selection + space | Design §4 accept semantics. |
+| Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
+| Tab | Drills, never submits | Design §5: "Tab: bare level → promote; otherwise complete." |
+| Enter | Drills + forwards key | Design §5: "Enter: as Tab, but forward key; child may submit()." |
