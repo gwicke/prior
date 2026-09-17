@@ -73,10 +73,10 @@ customizes data and submission.** A command is one `impl NodeImpl`.
 `submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - The leaf accept behavior. Default: none (node is a listing; Enter drills).
 
-`prepare(&mut self, epoch: u64, path_args: &PathArgs, open_editor: &mut dyn FnMut(&str) -> io::Result<String>) -> SubmitResult`
+`prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult`
 - Optional confirm hook; default = `submit()`. An override runs the prep
-  phase — may call `open_editor()` (blocking; host exits raw mode before
-  `step_at`), precompute, stage the payload — then returns
+  phase — may open an external editor (via a callback captured at
+  construction), precompute, stage the payload — then returns
   `SubmitResult::Prepared`. Staged payload lives in the node's private state
   (§2), accessible to `submit()` on yea.
 
@@ -368,9 +368,11 @@ values for modifiers without a pre-defined enum (D7).
    confirm dialog (non-overridable service) → `submit()` on yea. State
    machine is handler-local (node-private, §2). Cancel (Esc / buffer rewrite)
    drops staged payload.
-2. **Editor handoff**: blocking `open_editor()` inside `prepare()` (§2).
-   Stores result in private state, returns `Prepared`. Engine never knows
-   about `$EDITOR`.
+2. **Editor handoff**: the node's `prepare()` opens an external editor
+   via a callback captured at construction (the engine crate is
+   generic; the picocode-side node impl captures `open_editor` as
+   private state). Blocks, stores result, returns `Prepared`. Engine
+   never knows about `$EDITOR`.
 
 **SubmitResult**: `Done` (close), `Prepared` (pause for confirm),
 `NewPath(String)` (buffer rewrite, e.g. `/compact`).
