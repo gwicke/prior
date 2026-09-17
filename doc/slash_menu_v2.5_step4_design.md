@@ -39,7 +39,7 @@ node_traverse(epoch, key, prompt):
   │                                                                │
   ├─ Phase 1: refresh data ───────────────────────────────────────┤
   │                                                                │
-  │  Always call data() on each child. Check Rc::ptr_eq to see     │
+  │  Always call node_data() on each child. Check Rc::ptr_eq to see     │
   │  if anything changed. Rebuild merged_rows + row_child if so.   │
   │                                                                │
   │  // At this point: path walk done, data refreshed.                │
@@ -100,7 +100,7 @@ model, design §2: "The traversal is recursive").
 
 The path walk matches row IDs from the merged child set. The
 `row_index` HashMap (row_id → child_index) in ViewCache is the
-lookup. It is rebuilt on every `data()` refresh.
+lookup. It is rebuilt on every `node_data()` refresh.
 
 ```
 let trailing_space = prompt.ends_with(' ');
@@ -285,7 +285,7 @@ or completing rows.
 
 ```rust
 struct ViewCache {
-    // --- Data (rebuilt when data() returns new Rc) ---
+    // --- Data (rebuilt when node_data() returns new Rc) ---
     // Store the raw Rc<DataResponse> per child, not a flat Vec<Row>.
     // This avoids cloning rows until needed for filtering/ranking.
     // The Rc::ptr_eq check detects "nothing changed" cheaply.
@@ -296,7 +296,7 @@ struct ViewCache {
     // ranked_rows is filtered + ranked. Built lazily from data_rc via
     // iterators when the view is needed (not stored as a flat Vec).
     ranked_rows: Vec<Row>,
-    // Active IDs from data().active_ids. Resolved to indices at display
+    // Active IDs from node_data().active_ids. Resolved to indices at display
     // time by looking up in ranked_rows.
     active_ids: Vec<String>,     // design §5.2: Vec, may have multiple
 
@@ -333,7 +333,7 @@ look up cursor_id in ranked_rows. Caching the offset makes MoveCursor
 O(1). Updated when cursor_id changes or ranked_rows is rebuilt.
 
 **Why Vec<String> for active_rows?** IDs don't change across filtering
-or sorting. Indices do. The `*` marker resolves from data().active_ids
+or sorting. Indices do. The `*` marker resolves from node_data().active_ids
 (Which are strings) against ranked rows at display time.
 
 **Why no row_child Vec?** The HashMap `row_index` already maps
@@ -368,7 +368,7 @@ from merged_rows when any input changes.
 
 ### 3.2 Data refresh
 
-Always call data() on each child. Check Rc::ptr_eq to detect change.
+Always call node_data() on each child. Check Rc::ptr_eq to detect change.
 
 ```
 refresh_data(epoch):
@@ -376,7 +376,7 @@ refresh_data(epoch):
   let mut new_data: Vec<Rc<DataResponse>> = Vec::new();
 
   for (i, child) in self.children.iter_mut().enumerate() {
-    let data = child.inner.data(epoch, &empty_path_args());
+    let data = child.inner.node_data(epoch, &empty_path_args());
     if let Ok(response) = data {
       // Rc::ptr_eq check — no cloning of rows
       if prev_sig_not_eq(i, &response) { changed = true; }
@@ -430,7 +430,7 @@ ensure_view(epoch, view_args):
   self.view.view_args = Some(view_args.to_string());
 
   // Step 3: active markers (design §5.2)
-  // active_ids already stored from data() responses
+  // active_ids already stored from node_data() responses
   // (resolved to indices at display time)
 
   // Step 4: cursor seeding (design §4, §6.5)
@@ -464,7 +464,7 @@ persistence across re-derives).
 
 ### 3.5 Active markers (design §5.2)
 
-`data().active_ids: Vec<String>` resolved against ranked rows. Multiple
+`node_data().active_ids: Vec<String>` resolved against ranked rows. Multiple
 rows may be active (e.g., multiple models currently in use). The `*`
 marker shows on active rows; `>` on the cursor row; `*` wins when both
 are on the same row.
@@ -487,26 +487,22 @@ struct NodeCache {
     saved_filter: Option<String>,  // Esc ladder: filter state before last drill
     confirm_pending: bool,         // confirm flow: waiting for yea/nay
 }
-
-// Two separate lookups needed:
-//
-// 1. Child name → child index (for path walk): "model" → children[0].
-//    Structural — children don't change after construction. A linear scan
-//    over children is fine (5-10 children typical). No HashMap needed.
-//
-// 2. Row ID → child index (for submit dispatch, D2): "gpt-4" →
-//    children[0]. This is the row_index HashMap in ViewCache, rebuilt
-//    on every data() refresh. This IS a cache — invalidated when data
-//    changes.
 ```
 
 ### 4.2 `RenderCache` — cached rendered lines
 
 ```rust
 struct RenderCache {
-    lines: Vec<RenderLine>,       // cached, rebuilt when inputs change
-    columns: Vec<ColumnDef>,      // cached, rebuilt when field metadata change
+    lines: Rc<Vec<RenderLine>>,   // rebuilt when inputs change, Rc for zero copy
+    columns: Vec<ColumnDef>,      // rebuilt when field metadata change
     term_width: usize,            // cache key: invalidate on resize
+    xxx: what is this derived from? Some kind of hash? If it does not actually
+    capture all changes, or is expensive to compute, then just clear the cache
+    of all data unconditionally.
+    Separately, The cursor and `view_args` should survive content changes -
+    move them to a dedicated section of NodeCache that is not cleared on
+    content change? Basically, have one part that depends on content, and one
+    part that does not.
     ranked_rows_sig: usize,       // cache key: invalidate on re-rank
 }
 ```
@@ -601,7 +597,7 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, t
   }
 
   RenderPlan {
-    lines,           // from RenderCache, rebuilt when ranked_rows or term_width change
+    lines,           // direct Rc share from RenderCache, rebuilt when ranked_rows or term_width change
     selected: Some(cursor_idx),
     active_rows: resolved_active_rows,
   }
@@ -670,12 +666,12 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | Child index lookup | `HashMap<String, u16>` (row_index) | O(1) by row ID. Independent of row reordering. No parallel Vec needed. |
 | saved_filter (Esc) | Per-node `Option<String>` in NodeCache | One slot, set on drill, taken on replay. Not a stack. |
 | saved_filter lives in | `NodeEntry`, not `eval_prompt` | `eval_prompt` is thin — only epoch. |
-| Data refresh | Always call data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
+| Data refresh | Always call node_data(), Rc::ptr_eq | Design §2: "cheap nothing-changed signals." |
 | View re-derive | Only if tail changed | Skip filter+rank if cached_tail matches. |
 | MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
 | Columns | Not in RenderCache, inferred at render time | Field_space determines columns. |
 | is_leaf | Not cached | Use `children.is_empty()`. |
-| Path walk | row_index lookup per word, exit on first match | row_index rebuilt on data() refresh. O(1) per word. |
+| Path walk | row_index lookup per word, exit on first match | row_index rebuilt on node_data() refresh. O(1) per word. |
 | RenderCache | Cached lines + term_width key | Invalidated on re-rank or terminal resize. No Rc — host does full redraw. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
 | Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
