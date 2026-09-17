@@ -504,16 +504,24 @@ struct NodeCache {
 
 ```rust
 struct RenderCache {
-    lines: Vec<RenderLine>,       // cached, rebuilt only when ranked_rows change
+    lines: Vec<RenderLine>,       // cached, rebuilt when inputs change
     columns: Vec<ColumnDef>,      // cached, rebuilt when field metadata change
+    term_width: usize,            // cache key: invalidate on resize
+    ranked_rows_sig: usize,       // cache key: invalidate on re-rank
 }
 ```
 
-RenderCache stores the rendered output. On cursor moves, only the
-cursor index (selected_idx) changes — the lines are reused from cache.
-On filter/rank changes, the lines are rebuilt from the new ranked_rows.
-Passing a reference to NodeCache would couple the render builder to
-the internal cache structure.
+RenderCache stores the rendered output. Invalidation triggers:
+- **Cursor move**: only cursor index changes — lines reused from cache.
+- **Filter/rank change**: lines rebuilt from new ranked_rows.
+- **Terminal resize** (SIGWINCH): lines rebuilt — table column widths,
+  header truncation, and word wrapping are all width-dependent.
+  `term_width` is a cache key; compare against current width to detect
+  resize.
+
+The cache does NOT need to track height — the host already windows
+via overlay_window(). The engine sends all ranked rows; the host
+decides which to display.
 
 Regarding caching: the main point of caching is efficient cursoring.
 For cursor moves (MoveCursor), the rendered lines don't change — only
@@ -536,15 +544,15 @@ from the cache + current cursor/active markers.
 
 ```rust
 enum NodeResult {
-    Continue { prompt: String, plan: Rc<RenderPlan> },
+    Continue { prompt: String, plan: RenderPlan },
     Done(Option<String>),
     Error(String),
 }
 ```
 
 The RenderPlan is built from RenderCache + cursor/active markers.
-Wrapped in Rc so cursor moves (which only change selected_idx) share
-the same lines.
+No Rc wrapping — the host does a full redraw on every keypress anyway
+(crossterm, no double-buffering).
 
 ---
 
@@ -571,12 +579,15 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, t
   // headers and wraps table columns to fit. Design §6: "Headers
   // truncated to fit terminal."
   //
-  // Vertical space: yes, we should send only the rows that fit the
-  // window. The host knows the terminal height and can tell the engine
-  // the max number of lines. The engine can then paginate (scroll) the
-  // ranked rows to only include visible ones in the RenderPlan. This
-  // keeps the RenderPlan small and the host rendering fast.
-  // The RenderPlan becomes: Vec<RenderLine> + markers + scroll offset.
+  // Vertical pagination: the host does a FULL REWRITE on every keypress
+  // (crossterm, not ratatui — no double-buffering). The host already
+  // windows via overlay_window() (at most 2/3 terminal height). The
+  // engine could send only visible rows to reduce engine-side work
+  // (table rendering for 1000+ rows), but the host redraws everything
+  // anyway. Defer this optimization — send all ranked rows for now.
+  //
+  // If we do paginate later: send Vec<RenderLine> for visible rows +
+  // scroll_offset + total_count. The host renders what it receives.
   let row_texts = if let Some(space) = field_space {
     build_table_rows(&rows_rc, space, term_width)
   } else {
@@ -590,10 +601,9 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, t
   }
 
   RenderPlan {
-    lines,           // from RenderCache, rebuilt only when ranked_rows change
-    selected: Some(display.cursor_idx),
-    active_rows: display.active_rows.clone(),
-    scroll_offset: display.scroll_offset,  // for vertical pagination
+    lines,           // from RenderCache, rebuilt when ranked_rows or term_width change
+    selected: Some(cursor_idx),
+    active_rows: resolved_active_rows,
   }
 }
 ```
@@ -628,10 +638,9 @@ Per design §2: "Parent-state access happens only outside the child loop."
 - Active markers (design §5.2)
 
 ### 4c. Render plan
-- `RenderCache` with cached lines
+- `RenderCache` with cached lines + term_width key
 - `build_render_plan()` from RenderCache + cursor/active markers
 - Table layout from field_space
-- Vertical pagination (scroll_offset)
 
 ### 4d. MoveCursor
 - Update cursor, reuse cached lines (only change selected_idx)
@@ -666,9 +675,10 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
 | Columns | Not in RenderCache, inferred at render time | Field_space determines columns. |
 | is_leaf | Not cached | Use `children.is_empty()`. |
-| Child name lookup | Linear scan over children | 5-10 children typical, O(n) is fine. No HashMap needed. |
 | Path walk | row_index lookup per word, exit on first match | row_index rebuilt on data() refresh. O(1) per word. |
+| RenderCache | Cached lines + term_width key | Invalidated on re-rank or terminal resize. No Rc — host does full redraw. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
 | Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
 | Tab | Drills, never submits | Design §5: "Tab: bare level → promote; otherwise complete." |
 | Enter | Drills + forwards key | Design §5: "Enter: as Tab, but forward key; child may submit()." |
+| Vertical pagination | Deferred | Host already windows via overlay_window(). Send all ranked rows. |
