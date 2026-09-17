@@ -33,9 +33,9 @@ node_traverse(epoch, key, prompt):
   ┌─ Phase 0: path walk ──────────────────────────────────────────┐
   │                                                                │
   │  Scan prompt one word at a time.                               │
-  │  Try each word (except last) as child ID via child_map.        │
-  │  Collect matched IDs into path Vec.                            │
-  │  Remaining words = tail for this node.                         │
+  │  Try each word (except last) as row ID via row_index.          │
+  │  Collect matched child into matched_child.                      │
+  │  Remaining words = this node's view_args.                      │
   │                                                                │
   ├─ Phase 1: refresh data ───────────────────────────────────────┤
   │                                                                │
@@ -46,7 +46,7 @@ node_traverse(epoch, key, prompt):
   │  // Now follow the design doc's listing node algorithm:          │
   │  //   - Child ID match + non-empty suffix → recurse              │
   │  //   - Child ID match + empty suffix → Esc ladder (phase 2)     │
-  │  //   - No child ID match → handle key at this level (phase 3)   │
+  │  //   - No row ID match → handle key at this level (phase 3)   │
   │                                                                │
   ├─ Phase 2: child dispatch ──────────────────────────────────────┤
   │                                                                │
@@ -54,14 +54,14 @@ node_traverse(epoch, key, prompt):
   │  // (frame restore, filter drop, or parent-level re-entry)."              │
   │                                                                            │
   │  if selection matches a child && no trailing_space:                        │
-  │    // Child ID match + empty suffix → Esc ladder                          │
+  │    // Row ID match + empty suffix → Esc ladder                          │
   │    if saved_filter exists:                                                 │
   │      → frame replay: drop the ID from prompt, resume saved filter         │
   │    else:                                                                   │
   │      → filter drop: show child's listing (drill in, display child)        │
   │                                                                            │
   │  if selection matches a child && (non-empty suffix or trailing_space):     │
-  │    // Non-empty suffix → recurse. All keys handled deeper.                │
+  │    // Non-empty suffix after matched row ID → recurse.                │
   │    → child.node_traverse(epoch, key, remaining_prompt)                    │
   │                                                                            │
   │  // saved_filter has nothing to do with recursion. It is only about       │
@@ -69,7 +69,7 @@ node_traverse(epoch, key, prompt):
   │                                                                │
   ├─ Phase 3: handle key at this level ────────────────────────────┤
   │                                                                │
-  │  // Design doc: "Path exhausted, no child ID match"            │
+  │  // Design doc: "Path exhausted, no child ID match" (row ID)            │
   │  // Listing nodes:                                             │
   │  //   MoveCursor → return listing Continue                     │
   │  //   Tab → expand focused ID, append space, push frame,       │
@@ -94,16 +94,17 @@ node_traverse(epoch, key, prompt):
 
 ### 2.1 Path walk (phase 0)
 
-Scan one word at a time. Interleave child ID lookup with modifier
-parsing. Exit as soon as a child ID is found — the child handles the
-rest (recursive model, design §2: "The traversal is recursive").
+Scan one word at a time. Exit as soon as a row ID in the merged
+child set is found — the matched child handles the rest (recursive
+model, design §2: "The traversal is recursive").
 
-For child lookup, use a `HashMap<String, usize>` built at construction
-time.
+The path walk matches row IDs from the merged child set. The
+`row_index` HashMap (row_id → child_index) in ViewCache is the
+lookup. It is rebuilt on every `data()` refresh.
 
 ```
 let trailing_space = prompt.ends_with(' ');
-let mut path: Vec<String> = Vec::new();
+let mut matched_child: Option<(String, usize)> = None;
 let mut args = Args::default();
 let mut pos = 0;
 
@@ -117,33 +118,30 @@ loop {
     while pos < prompt.len() && prompt.as_bytes()[pos] != b' ' { pos += 1; }
     let word = &prompt[start..pos];
 
-    // Check if this word is a child ID (design: terminate on first match)
-    if let Some(&child_idx) = self.child_map.get(word) {
-        // Found child — single match, not a vector.
-        // In the recursive model, each node handles one level, so path
-        // is a single (id, child_index) pair at most.
-        child = Some((word.to_string(), child_idx));
+    // Check if this word is a row ID in the merged child set
+    if let Some(&child_idx) = self.view.row_index.get(word) {
+        matched_child = Some((word.to_string(), child_idx));
         break;
     }
 
-    // Not a child ID — parse as dot modifier or fuzzy term
+    // Not a row ID — parse as dot modifier or fuzzy term
     if let Some(dot) = parse_dot_token(word) {
-        args.push_modifier(dot);  // accumulates multi-word values
+        args.push_modifier(dot);
     } else {
-        args.push_positional(word);  // fuzzy term or selection
+        args.push_positional(word);
     }
 }
 
-// Tail = everything after the last consumed path word (zero-copy slice)
+// Tail = everything after the matched ID (zero-copy slice)
 let tail = &prompt[pos..];
 ```
 
-The loop terminates on the first child ID match. The remaining prompt
-(after the matched ID) is the tail for the child. The child's
+The loop terminates on the first row ID match. The remaining prompt
+(after the matched ID) is the tail for the matched child. The child's
 `node_traverse` will parse its own level from the tail.
 
-If no child matches, the entire remaining prompt is the tail for THIS
-node (listing view with fuzzy filter).
+If no row ID matches, the entire remaining prompt is the view_args for
+THIS node (listing view with fuzzy filter).
 
 ### 2.2 Esc ladder (phase 2)
 
@@ -151,20 +149,20 @@ Per design §5.1. Each step applies only when the next does not. No view
 state needed — just manipulate the prompt string.
 
 ```
-// Step 1 (structural, design §5.1): valid child ID, no trailing space,
+// Step 1 (structural, design §5.1): valid row ID (in merged set), no trailing space,
 // and saved_filter set → replay. This applies even without Esc.
 // Checked BEFORE the Esc-specific steps.
 
 // Context: the selection was parsed from this node's tail. The cursor
 // position is resolved from the selection against the ranked rows
 // (see §3.4 cursor seeding). If the selection names a valid child,
-// the prompt was: `... parent_id child_id` (no trailing space).
+// the prompt was: `... parent_id row_id` (no trailing space).
 // build_prompt reconstructs: `... parent_id saved_filter_state`.
 
 if let Some(sel) = &selection {
-    if !trailing_space && self.child_map.contains_key(sel) {
+    if !trailing_space && self.view.row_index.contains_key(sel) {
         if let Some(saved) = self.cache.saved_filter.take() {
-            // Frame replay: drop the child ID from the prompt, resume
+            // Frame replay: drop the row ID from the prompt, resume
             // the saved filter state.
             let new_prompt = build_prompt(&path, &saved);
             let display = self.derive_view(epoch, &saved);
@@ -224,7 +222,7 @@ if self.children.is_empty() && matches!(key, Tab | Enter) {
 
 ### 2.4 Key handling at this level (phase 3)
 
-When no child ID matches, handle the key at this level. For listing
+When no row ID matches, handle the key at this level. For listing
 nodes, this means display + cursor + Tab/Enter drill.
 
 ```
@@ -481,20 +479,25 @@ are on the same row.
 struct NodeEntry {
     inner: Box<dyn SlashDotNode>,
     children: Vec<NodeEntry>,
-    child_map: HashMap<String, usize>,  // child_id → index in children
     cache: NodeCache,
 }
-
-// child_map is derived from children at construction time. NOT
-// invalidated with the rest of the cache — children don't change
-// after construction (design §2.1: "Ordering: addChild() order").
-// It is a structural index, not a derived cache.
 
 struct NodeCache {
     view: ViewCache,
     saved_filter: Option<String>,  // Esc ladder: filter state before last drill
     confirm_pending: bool,         // confirm flow: waiting for yea/nay
 }
+
+// Two separate lookups needed:
+//
+// 1. Child name → child index (for path walk): "model" → children[0].
+//    Structural — children don't change after construction. A linear scan
+//    over children is fine (5-10 children typical). No HashMap needed.
+//
+// 2. Row ID → child index (for submit dispatch, D2): "gpt-4" →
+//    children[0]. This is the row_index HashMap in ViewCache, rebuilt
+//    on every data() refresh. This IS a cache — invalidated when data
+//    changes.
 ```
 
 ### 4.2 `DisplayState` — transient, not stored
@@ -587,7 +590,7 @@ Per design §2: "Parent-state access happens only outside the child loop."
 ## 7. Implementation order
 
 ### 4a. Traversal skeleton
-- `NodeEntry`, `NodeCache`, `child_map`
+- `NodeEntry`, `NodeCache`
 - Path walk (phase 0)
 - Esc ladder (phase 2) — prompt manipulation only, no view
 - Leaf handling (phase 3) — stub prepare/submit
@@ -639,8 +642,8 @@ Per design §2: "Parent-state access happens only outside the child loop."
 | MoveCursor | No re-derive, just cursor | Cursor lives in the view (design §4). |
 | Columns | Not in DisplayState | Inferred from field_space at render time. |
 | is_leaf | Not in DisplayState | Use `children.is_empty()`. |
-| Child lookup | `HashMap<String, usize>` at construction | O(1) per word in path walk. |
-| Path walk | Scan one word, exit on first child ID | Recursive model: each node handles one level. Interleaves modifier parsing. |
+| Child name lookup | Linear scan over children | 5-10 children typical, O(n) is fine. No HashMap needed. |
+| Path walk | row_index lookup per word, exit on first match | row_index rebuilt on data() refresh. O(1) per word. |
 | Render plan | Standalone function | No `MenuState` dependency. Clean v2.5 path. |
 | Frame replay | Structural (phase 2), not Esc-only | Design §5.1: "applied even without Esc." |
 | Tab | Drills, never submits | Design §5: "Tab: bare level → promote; otherwise complete." |
