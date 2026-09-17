@@ -50,14 +50,22 @@ node_traverse(epoch, key, prompt):
   │                                                                │
   ├─ Phase 2: child dispatch ──────────────────────────────────────┤
   │                                                                │
-  │  // Design doc: "Child ID match: Non-empty suffix: return       │
-  │  // child.node_traverse(...) with updated PathArgs.             │
-  │  // All keys handled deeper."                                   │
-  │  if selection matches a child && (non-empty suffix or trailing) │
-  │    if !trailing && saved_filter exists:                         │
-  │      → frame replay (§5.1 step 1)                              │
-  │    else:                                                       │
-  │      → recurse into child (all keys handled deeper)            │
+  │  // Design doc §5.1: "Empty suffix: handle per §5.1 Esc ladder              │
+  │  // (frame restore, filter drop, or parent-level re-entry)."              │
+  │                                                                            │
+  │  if selection matches a child && no trailing_space:                        │
+  │    // Child ID match + empty suffix → Esc ladder                          │
+  │    if saved_filter exists:                                                 │
+  │      → frame replay: drop the ID from prompt, resume saved filter         │
+  │    else:                                                                   │
+  │      → filter drop: show child's listing (drill in, display child)        │
+  │                                                                            │
+  │  if selection matches a child && (non-empty suffix or trailing_space):     │
+  │    // Non-empty suffix → recurse. All keys handled deeper.                │
+  │    → child.node_traverse(epoch, key, remaining_prompt)                    │
+  │                                                                            │
+  │  // saved_filter has nothing to do with recursion. It is only about       │
+  │  the Esc ladder (frame replay / filter state restoration).
   │                                                                │
   ├─ Phase 3: handle key at this level ────────────────────────────┤
   │                                                                │
@@ -111,9 +119,10 @@ loop {
 
     // Check if this word is a child ID (design: terminate on first match)
     if let Some(&child_idx) = self.child_map.get(word) {
-        // Found child — push the child's ID, then let the child handle
-        // the rest via recursive node_traverse().
-        path.push(word.to_string());
+        // Found child — single match, not a vector.
+        // In the recursive model, each node handles one level, so path
+        // is a single (id, child_index) pair at most.
+        child = Some((word.to_string(), child_idx));
         break;
     }
 
@@ -145,15 +154,24 @@ state needed — just manipulate the prompt string.
 // Step 1 (structural, design §5.1): valid child ID, no trailing space,
 // and saved_filter set → replay. This applies even without Esc.
 // Checked BEFORE the Esc-specific steps.
+
+// Context: the selection was parsed from this node's tail. The cursor
+// position is resolved from the selection against the ranked rows
+// (see §3.4 cursor seeding). If the selection names a valid child,
+// the prompt was: `... parent_id child_id` (no trailing space).
+// build_prompt reconstructs: `... parent_id saved_filter_state`.
+
 if let Some(sel) = &selection {
     if !trailing_space && self.child_map.contains_key(sel) {
         if let Some(saved) = self.cache.saved_filter.take() {
-            // Resume filter state from before the drill.
+            // Frame replay: drop the child ID from the prompt, resume
+            // the saved filter state.
             let new_prompt = build_prompt(&path, &saved);
-            // Re-derive view with the restored filter state.
             let display = self.derive_view(epoch, &saved);
             return NodeResult::Continue { prompt: new_prompt, display };
         }
+        // No saved filter: show the child's listing without filter
+        // state (the child was opened without a prior drill).
     }
 }
 
@@ -270,24 +288,51 @@ or completing rows.
 ```rust
 struct ViewCache {
     // --- Data (rebuilt when data() returns new Rc) ---
-    merged_rows: Vec<Row>,        // flat merged from all children
+    // Store the raw Rc<DataResponse> per child, not a flat Vec<Row>.
+    // This avoids cloning rows until needed for filtering/ranking.
+    // The Rc::ptr_eq check detects "nothing changed" cheaply.
+    data_rc: Vec<Rc<DataResponse>>,
     row_index: HashMap<String, u16>,  // row_id → child_index (for D2, submit dispatch)
-    field_space: Option<FieldSpace>,  // field metadata for §7.1 filter/sort queries
 
     // --- Derived (rebuilt when inputs change) ---
-    ranked_rows: Vec<Row>,        // filtered + ranked for display
-    active_rows: Vec<String>,     // active IDs (design §5.2: Vec, may have multiple)
+    // ranked_rows is filtered + ranked. Built lazily from data_rc via
+    // iterators when the view is needed (not stored as a flat Vec).
+    ranked_rows: Vec<Row>,
+    // Active IDs from data().active_ids. Resolved to indices at display
+    // time by looking up in ranked_rows.
+    active_ids: Vec<String>,     // design §5.2: Vec, may have multiple
 
     // --- Cursor (design §4: "cursor lives in the view") ---
-    cursor_id: Option<String>,    // row ID the cursor is on — survives re-rank/filter
+    cursor_id: Option<String>,   // row ID — survives re-rank/filter
+    // Cache the cursor offset for performance. Lists can be long
+    // (e.g. /tree 1000+ lines); cursoring through those is O(n)
+    // per MoveCursor without caching. Updated on cursor_id change
+    // or re-rank.
+    cursor_idx: usize,
 }
 ```
+
+**field_space**: In v2.5, field metadata is declared on the parent node
+(design §2.1: "Field metadata on the parent: declared once; children
+conform"). It is NOT stored in ViewCache — it is a property of the
+`NodeEntry` itself (or derived from children's `DataResponse.fields`).
+Filter/sort queries use it via the node's own method.
+
+**active_rows in RenderPlan**: The design doc says
+`RenderPlan.active_rows: Option<Vec<usize>>` (offsets). So we resolve
+active_ids → indices at display time. RenderPlan also needs the cursor
+offset, which is `cursor_idx` (cached).
 
 **Why row_id (String) for cursor instead of index?** The cursor should
 travel with the row across re-rank/filter. An index becomes stale when
 rows are reordered. A row ID is stable. On display, look up the ID in
 ranked_rows to get the index (O(n) but n is small). On MoveCursor, move
 the index and update the ID.
+
+**Why also cache cursor_idx?** Lists can be long (e.g. /tree 1000+
+lines). Cursoring through those is O(n) per MoveCursor if we always
+look up cursor_id in ranked_rows. Caching the offset makes MoveCursor
+O(1). Updated when cursor_id changes or ranked_rows is rebuilt.
 
 **Why Vec<String> for active_rows?** IDs don't change across filtering
 or sorting. Indices do. The `*` marker resolves from data().active_ids
@@ -297,18 +342,23 @@ or sorting. Indices do. The `*` marker resolves from data().active_ids
 row_id → child_index in O(1). No need for a parallel Vec. On Tab/Enter,
 look up `row_index[cursor_row_id]`.
 
-**Why field_space?** Field metadata for §7.1 filter/sort queries. The
-filter engine needs to know which fields are strings vs numbers, their
-sort direction, etc. Comes from the first child's data() response.
+**Why no field_space in ViewCache?** In v2.5, field metadata is declared
+on the parent node (design §2.1: "Field metadata on the parent: declared
+once; children conform"). It is a property of the `NodeEntry` itself
+(or inferred from children's `DataResponse.fields` at refresh time).
+Filter/sort queries use it via the node's own method — not stored
+redundantly in ViewCache.
 
 **Why no data_version?** Redundant. Change detection uses
 `data_sig: Vec<Rc<DataResponse>>` — compare Rc::ptr_eq per child to
 detect "nothing changed" (design §2).
 
-**Why cached_tail?** The full tail (modifiers + terms + selection) that
-produced the current ranked_rows. When the tail changes, re-derive. When
-it doesn't, reuse cached ranked_rows. This is the single cache key for
-the entire filter+rank pipeline.
+**Why view_args?** The full parsed arguments (modifiers + terms +
+selection) that produced the current ranked_rows. When the view_args
+change, re-derive. When they don't, reuse cached ranked_rows. This is
+the single cache key for the entire filter+rank pipeline. Named
+`view_args` to avoid confusion with "tail" in `PathArgs`, which means
+the *unconsumed* part of the prompt handled by child nodes.
 
 **Why not store filtered_rows separately?** Filtering (§7.1) and ranking
 (fuzzy match) are both O(n) for typical menu sizes (10-100 rows). The
@@ -325,32 +375,28 @@ Always call data() on each child. Check Rc::ptr_eq to detect change.
 ```
 refresh_data(epoch):
   let mut changed = false;
-  let mut rows: Vec<Row> = Vec::new();
-  let mut new_sigs: Vec<Rc<DataResponse>> = Vec::new();
-  let mut field_space = None;
+  let mut new_data: Vec<Rc<DataResponse>> = Vec::new();
 
   for (i, child) in self.children.iter_mut().enumerate() {
     let data = child.inner.data(epoch, &empty_path_args());
     if let Ok(response) = data {
+      // Rc::ptr_eq check — no cloning of rows
       if prev_sig_not_eq(i, &response) { changed = true; }
-      new_sigs.push(response.clone());
-      for row in &response.rows {
-        rows.push(row.clone());
-      }
-      if field_space.is_none() && !response.fields.is_empty() {
-        field_space = Some(FieldSpace::new(...));
-      }
+      new_data.push(response);
     }
   }
 
   if changed {
-    self.cache.data_sig = new_sigs;
-    self.view.merged_rows = rows;
-    self.view.row_index = rows.iter().enumerate()
-        .map(|(i, r)| (r.id.clone(), /* child_index from iteration */))
+    self.view.data_rc = new_data;
+    // Build row_index lazily: iterate over data_rc, not a flat cloned Vec
+    self.view.row_index = self.view.data_rc.iter().enumerate()
+        .flat_map(|(child_idx, resp)| {
+            resp.rows.iter().map(move |r| (r.id.clone(), child_idx as u16))
+        })
         .collect();
-    self.view.field_space = field_space;
-    self.view.cached_tail = None;  // force re-derive
+    // field_space comes from the parent node (design §2.1), not from
+    // children's data. See §3.1 "field_space" note.
+    self.view.view_args = None;  // force re-derive
   }
 ```
 
@@ -360,33 +406,34 @@ Only called when displaying a listing. Re-derives from merged_rows when
 inputs change.
 
 ```
-ensure_view(epoch, tail):
+ensure_view(epoch, view_args):
   // Skip if nothing changed
-  if self.view.cached_tail == Some(tail.to_string()) {
+  if self.view.view_args == Some(view_args.to_string()) {
     return;  // reuse cached ranked_rows
   }
 
-  // Step 1: filter (§7.1)
-  let modifiers = parse_level(tail, &selection_rule).modifiers;
-  let filtered = if modifiers.is_empty() {
-    self.view.merged_rows.clone()
+  // Step 1: filter (§7.1) — iterate over raw Rc's, no flat clone
+  let modifiers = parse_level(view_args, &selection_rule).modifiers;
+  let filtered: Vec<Row> = if modifiers.is_empty() {
+    self.view.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect()
   } else {
-    let space = self.view.field_space.clone().unwrap_or_default();
+    let space = self.parent_field_space();
     let query = compile_query(&modifiers, &space);
-    apply_query(&self.view.merged_rows, &query, &space)
+    let all_rows: Vec<Row> = self.view.data_rc.iter().flat_map(|rc| rc.rows.iter().cloned()).collect();
+    apply_query(&all_rows, &query, &space)
   };
 
   // Step 2: rank (fuzzy + pin)
-  let selection = parse_level(tail, &selection_rule).selection;
-  let terms = parse_level(tail, &selection_rule).terms;
+  let selection = parse_level(view_args, &selection_rule).selection;
+  let terms = parse_level(view_args, &selection_rule).terms;
   let rank_result = rank_and_pin(&filtered, &terms, selection.as_deref());
 
   self.view.ranked_rows = rank_result.rows;
-  self.view.cached_tail = Some(tail.to_string());
+  self.view.view_args = Some(view_args.to_string());
 
   // Step 3: active markers (design §5.2)
-  // Resolve data().active_ids (strings) against ranked rows
-  self.view.active_rows = active_ids_from_data.clone();
+  // active_ids already stored from data() responses
+  // (resolved to indices at display time)
 
   // Step 4: cursor seeding (design §4, §6.5)
   seed_or_keep_cursor(&mut self.view, &selection, &terms);
@@ -438,6 +485,11 @@ struct NodeEntry {
     cache: NodeCache,
 }
 
+// child_map is derived from children at construction time. NOT
+// invalidated with the rest of the cache — children don't change
+// after construction (design §2.1: "Ordering: addChild() order").
+// It is a structural index, not a derived cache.
+
 struct NodeCache {
     view: ViewCache,
     saved_filter: Option<String>,  // Esc ladder: filter state before last drill
@@ -447,13 +499,18 @@ struct NodeCache {
 
 ### 4.2 `DisplayState` — transient, not stored
 
+DisplayState is the interface between node_traverse and the render plan
+builder. It bundles what the render plan needs from the traversal:
+rows, cursor position, active markers, title, and header text.
+
 ```rust
 struct DisplayState {
     rows: Vec<Row>,
     cursor_idx: usize,            // looked up from cursor_id in ranked_rows
-    active_rows: Vec<String>,     // active IDs (design §5.2)
+    active_rows: Vec<usize>,      // resolved active indices (design §5.2)
     title: String,
-    detail: Vec<String>,
+    header_lines: Vec<String>,    // header() output (design §2: "Non-selectable
+                                  //   header lines, replaces v2 DetailProvider")
 }
 ```
 
@@ -478,19 +535,25 @@ enum NodeResult {
 Clean new path, independent of old `PlanBuilder`/`MenuState`.
 
 ```
-fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>) -> RenderPlan {
+fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>, term_width: usize) -> RenderPlan {
   // Rc-wrap row data for MoveCursor sharing (design §2)
   let rows_rc = Rc::new(display.rows.clone());
 
   let mut lines = Vec::new();
-  lines.push(RenderLine { text: display.title.clone(), ... });
-
-  for d in &display.detail {
-    lines.push(RenderLine { text: d.clone(), style: Style::HEADER, is_header: true, ... });
+  // Design §6 panel structure order:
+  //   1. header() output (help text, stats, previews)
+  //   2. table header line (if child rows have columns)
+  //   3. selectable rows with > (cursor) / * (active) markers
+  for h in &display.header_lines {
+    lines.push(RenderLine { text: h.clone(), style: Style::HEADER, is_header: true, ... });
   }
 
+  // Table width: handled in the render plan builder. The host passes
+  // term_width (from its terminal dimensions). The engine truncates
+  // headers and wraps table columns to fit. Design §6: "Headers
+  // truncated to fit terminal."
   let row_texts = if let Some(space) = field_space {
-    build_table_rows(&rows_rc, space)  // table layout from field metadata
+    build_table_rows(&rows_rc, space, term_width)
   } else {
     rows_rc.iter().map(|r| format_row(r)).collect()
   };
@@ -502,11 +565,9 @@ fn build_render_plan(display: &DisplayState, field_space: &Option<FieldSpace>) -
   }
 
   RenderPlan {
-    title: Some(display.title.clone()),
     lines,
-    selected: Some(display.cursor),
+    selected: Some(display.cursor_idx),
     active_rows: display.active_rows.clone(),
-    detail: display.detail.clone(),
   }
 }
 ```
