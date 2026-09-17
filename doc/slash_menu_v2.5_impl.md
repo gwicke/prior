@@ -113,8 +113,7 @@ Define the base trait (overridable members only):
 pub trait NodeImpl {
     fn data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult;
     fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult;
-    fn prepare(&mut self, epoch: u64, path_args: &PathArgs,
-               open_editor: &mut dyn FnMut(&str) -> io::Result<String>)
+    fn prepare(&mut self, epoch: u64, path_args: &PathArgs)
         -> SubmitResult;
     fn header(&mut self, path_args: &PathArgs) -> Vec<String>;
 }
@@ -283,16 +282,15 @@ the default `traverse` body renders it when the previous step returned
 `SubmitResult::Prepared`, routes keystrokes to the dialog, and calls
 `submit()` on yea.
 
-7b. The node's `prepare()` does the prep (may call `open_editor()`, stage
-the payload in private state). `submit()` commits using the staged
-payload.
+7b. The node's `prepare()` does the prep (may open an external editor via a
+callback captured at construction, stage the payload in private state).
+`submit()` commits using the staged payload.
 
 7c. Delete the `ConfirmState` / `ConfirmPrep` machinery from `accept.rs`.
 The node's private state replaces it.
 
 **Tests:** Port the confirm scenarios from `accept.rs`: prep → pause →
-Esc cancel → re-prep → accept. Add: editor handoff in `prepare()`
-(mock the `open_editor` callback).
+Esc cancel → re-prep → accept.
 
 ### Step 8: Host epoch wrapper + persistent engine
 
