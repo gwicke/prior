@@ -81,168 +81,118 @@ each builds on the previous.
 
 ### Step 1: Introduce `SlashDotNode` trait + public types + `SlashDotMenu`
 
-Define the core types and the public API from §2 of the design. Pure
-additive — nothing is ported yet.
+**Done.** Pure additive — nothing ported yet.
 
-**Public types** (used by `SlashDotNode` implementors):
-
-- `PathArgs`, `Args`, `DataResponse`, `DataError`, `DataResult`, `SubmitResult`, `MenuResult`, `HostKey`
-
-**`SlashDotNode` trait** (all methods have defaults):
-
-```rust
-pub trait SlashDotNode {
-    fn data(&mut self, epoch: u64, path_args: &PathArgs) -> DataResult { /* empty */ }
-    fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult { Done(None) }
-    fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult { self.submit(epoch, path_args) }
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String> { Vec::new() }
-}
-```
-
-**`SlashDotMenu`** (owns the tree + epoch):
-
-```rust
-pub struct SlashDotMenu { root: NodeEntry, epoch: u64 }
-impl SlashDotMenu {
-    pub fn new() -> Self;
-    pub fn add_child(&mut self, parent: &[&str], child: impl SlashDotNode + 'static);
-    pub fn get_handle(&mut self) -> SlashDotHandle<'_>;
-}
-```
-
-**`SlashDotHandle`** (guard-like, one per invocation):
-
-```rust
-pub struct SlashDotHandle<'a> { root: &'a mut NodeEntry, epoch: u64 }
-impl<'a> SlashDotHandle<'a> {
-    pub fn eval_prompt(&mut self, prompt: &str, key: HostKey) -> MenuResult;
-}
-```
-
-**`NodeEntry`** (internal, not exposed to host):
-
-```rust
-pub(crate) struct NodeEntry {
-    inner: Box<dyn SlashDotNode>,
-    children: Vec<NodeEntry>,
-    cursor_cache: HashMap<String, (usize, Option<String>, String)>,
-    data_cache: HashMap<String, DataResult>,
-}
-impl NodeEntry {
-    pub fn new_root() -> Self;                        // metadata-only container
-    pub fn new_child(inner: Box<dyn SlashDotNode>);   // wraps host impl
-    pub fn add_child(&mut self, parent: &[&str], child: NodeEntry);
-    pub fn node_traverse(&mut self, epoch, key, path_args) -> MenuResult;  // stub
-    pub fn node_data(&mut self, epoch, path_args) -> DataResult;          // delegates to inner
-}
-```
-
-**Module structure:**
-- `lib.rs` — `pub mod menu; pub(crate) mod node_impl; mod node_entry;` + internal modules
-- `menu.rs` — `SlashDotMenu`, `SlashDotHandle`
-- `node_impl.rs` — `SlashDotNode` trait, public types
-- `node_entry.rs` — `NodeEntry` (internal)
-
-**Verify:** `cargo build -p slashdot_menu`. No tests yet — just the types
-compile.
+- Public types: `PathArgs`, `Args`, `DataResponse`, `DataError`, `DataResult`,
+  `SubmitResult`, `MenuResult`, `HostKey`
+- `SlashDotNode` trait (all methods have defaults):
+  `data()`, `submit()`, `prepare()`, `header()`, `fields()`
+- `SlashDotMenu` (owns tree + epoch), `SlashDotHandle` (guard-like, one
+  per invocation, `eval_prompt(prompt, key) -> MenuResult`)
+- `NodeEntry` (internal wrapper): `new_root()`, `new_child()`,
+  `add_child()`, `node_traverse()`, `node_data()`
+- Module structure: `lib.rs`, `menu.rs`, `node_impl.rs`, `node_entry.rs`
 
 ### Step 2: Epoch wrapper + `SlashDotHandle`
 
-Done as part of step 1 — `SlashDotMenu::get_handle()` bumps the epoch
-and returns a guard-like `SlashDotHandle` that borrows the root `NodeEntry`.
-The host calls `handle.eval_prompt(prompt, key)` — the only way to
-interact with the menu.
+**Done** as part of step 1.
 
 ### Step 3: Port the grammar + filter engine as free functions
 
-The grammar tokenizer (`grammar.rs`) and filter/sort engine (`filter.rs`)
-are already free functions. They stay as-is — the default `node_traverse` body
-will call them. No code changes here; just verify the boundary:
-
-- `grammar::parse_level(suffix: &str) -> (terms, modifiers, selection)`
-- `filter::apply_query(rows, query, sort) -> Vec<usize>` (ranked indices)
-- `fuzzy::rank_and_pin(candidates, terms) -> Vec<usize>` (ranked, pinned)
-
-These are called by the default `node_traverse` body (step 4) and by `data()`
-implementations (the node's own preprocessing). Nothing changes in their
-signatures.
+**Done.** Grammar (`parse_level`), filter (`compile_query`, `apply_query`),
+fuzzy (`rank_and_pin`) are already free functions. The v2.5 traversal
+uses a new `parse_section()` (§2.1 single-pass) rather than `parse_level`,
+but the filter/fuzzy/sort pipeline is reused.
 
 ### Step 4: Implement default `traverse` body
 
-This is the core step. Port the interpreter's logic into `NodeEntry`'s
-`node_traverse()` body, following the algorithm in §2 of the design
-("Traversal algorithm").
+**Done.** 22 tests. The sub-steps map to implementation as follows:
 
-**Sub-steps:**
+4a. **Section parse + child dispatch.** Implemented as `parse_section()`
+in node_entry.rs — a single left-to-right word scan that classifies each
+word as dot modifier, positional (fuzzy term), or matched child ID. The
+first word matching a row ID terminates the section; everything after is
+the tail. Does NOT use `grammar::parse_level()` (different algorithm:
+new parse is left-to-right with row_index lookup, per §2.1; `parse_level`
+is right-to-left with selection candidates).
 
-4a. **Path parsing + child dispatch.** The default body calls
-`grammar::parse_level(suffix)` to get terms/modifiers/selection. For listing
-nodes (those with children), it resolves the selection against the merged
-child set (step 5) and recurses into the matching child with updated
-`PathArgs`. For leaf nodes (no children, has `submit`), it handles the key
-directly.
+4b. **Key handling at listing level.** Done:
+- `MoveCursor`: update cursor_idx/cursor_id, plan_from_cache
+- `Tab`: drill — set view_args + restore flag, recurse child with `" "`
+- `Enter`: drill — same but forward key
+- `Esc`: handle_esc (§5.1 ladder)
 
-4b. **Key handling at the listing level.** Following the design's traversal
-algorithm:
-- `no key` / `MoveCursor`: return `Continue(RenderPlan, prompt)`.
-- `Tab`: expand focused ID, append space, push frame, call child's
-  `node_traverse()`.
-- `Enter`: as Tab, but if child is leaf, call `prepare()` → handle
-  `SubmitResult`.
-- `Esc`: per §5.1 ladder.
+4c. **Key handling at leaf level.** Done:
+- `Enter`: prepare() → if Prepared, set confirm_pending; if Done, close;
+  if NewPath, rewrite
+- `Esc`: if confirm_pending, cancel; else handle_esc
+- `None`/other: build_continue (shows header)
 
-4c. **Key handling at the leaf level.**
-- `no key`: return `Continue(RenderPlan, prompt)`.
-- `Enter`: call `prepare()` (which defaults to `submit()`). If
-  `Prepared`, render confirm dialog; subsequent Enter calls
-  `submit()`, Esc cancels.
-- `Esc`: pop per §5.1.
+4d. **Cursor.** Implemented as `cursor_id: Option<String>` + `cursor_idx:
+usize` per node (in EpochState). Reset on epoch increment. `cursor_id`
+survives re-rank (re-resolved via `seed_or_keep_cursor`); `cursor_idx`
+is the O(1) display lookup. Active marker seeds cursor on first active
+row. This differs from the plan's `(epoch, terms_hash)` keying — cursor
+persists across filter changes and is re-resolved, not reset.
 
-4d. **Cursor cache.** Each node stores `{ selected_id, filter_index }`.
-Keyed on `(epoch, terms_hash)`. Reset on epoch increment or terms change.
-Cursor seeding: first active row on fresh open.
+4e. **Esc ladder.** Implemented per design §5.1 with per-node restore
+(replaces old frame stack). The ladder:
+1. **Restore trigger** (phase 3 of node_traverse): bare drilled ID with
+   `should_restore_view_args` → seed cursor on ID's row, replace section
+   with stored `view_args`, clear flag. Applies without Esc.
+2. **Clear refinement**: terms, modifiers, selection all dropped.
+3. **Strip trailing space** → parent becomes responsible.
+4. **Close** (nothing left at root).
+The "frame replay" from the old design is replaced by the per-node
+`should_restore_view_args` flag + `view_args` string — no traversal
+stack, the prompt IS the state.
 
-4e. **Esc ladder.** Port the current interpreter's Esc logic: trailing
-space → frame replay → clear terms → clear selection → root clear.
-Always a root re-entry with the shortened buffer (never up-recursion).
+4f. **Render plan.** Basic plan implemented: `header()` lines + ranked
+rows (id — description) + `selected: Option<usize>` + `active:
+Option<usize>`. No Rc-shared lines, no table layout, no `ColumnDef`
+— table rendering comes when commands are ported (step 6). The host
+already renders `RenderPlan` verbatim; columns/tables are added per-node
+as needed.
 
-4f. **RenderPlan emission.** Port from `render.rs`. The plan carries:
-- `rows: Vec<Rc<RenderLine>>` (Rc'd for zero-copy sharing)
-- `selected_row: usize`
-- `active_rows: Option<Vec<usize>>`
-- `header: Vec<String>` (from `header()` + table column headers)
-- `table: Option<ColumnDef>`
-
-**Tests:** Port the ~50 prompt/key-level scenario tests from
-`interpreter.rs` to the new `node_traverse()` harness. Same scenario tables,
-new entry point: `node.node_traverse(epoch, key, path_args) → MenuResult`
-instead of `interpreter.tab_at(line, sel)`. Cursor-map internals tests
-become per-node cursor tests.
+**Tests:** 22 new tests covering parse (6), root listing, fuzzy filter,
+bare ID, Tab drill, cursor wrapping, active markers, header, Esc close,
+Esc clear filter, epoch reset, fuzzy rank ordering, mixed children (3),
+empty ID skip. The 26 existing interpreter tests remain in the old harness
+(not yet ported — they test the old code path and will be replaced when
+commands are migrated in step 6).
 
 ### Step 5: Merged child sets
 
-Extend the default `traverse` body to concatenate rows from multiple
-children per level.
+**Done.** 4 new tests.
 
-5a. **Child iteration.** The default body calls `node_data()` on each
-child in declaration order, concatenating `DataResponse::rows`. Each row
-is tagged with its child index (internal `child_index: u16`, not in `Row`
-API).
+5a. **Child iteration.** `refresh_data()` iterates all children in
+declaration order, calls `node_data()` on each, concatenates rows. Each
+row's child origin is tracked via `RowRef { child_idx, row_offset }` in
+`ranked_rows`, and `row_index: HashMap<String, u16>` maps row ID →
+child index.
 
-5b. **Field metadata on the parent.** Add a `fields: Vec<FieldSpec>` to the
-parent node's trait (or a shared metadata struct). Children conform to
-these fields; missing values use §7.1 missing-value rules.
+5b. **Field metadata on the parent.** `SlashDotNode::fields()` trait
+method returns `Vec<FieldSpec>`. `NodeEntry::field_space()` uses
+trait-declared fields when non-empty, otherwise infers from row data.
+Children conform to the parent's declared fields; missing values use
+§7.1 missing-value rules.
 
-5c. **Submit dispatch.** On Tab/Enter, the engine reads the child index
-from the cursor row's tag and dispatches to the corresponding child's
-`submit()`.
+5c. **Submit dispatch.** On Tab/Enter, the engine looks up the cursor
+row's ID in `row_index` → gets child index → recurses into
+`self.children[child_idx].node_traverse()`. For leaf children this
+eventually reaches `prepare()`/`submit()`. Dispatch is via the recursive
+traversal, not a direct `submit()` call — consistent with the §2
+recursive design.
 
-5d. **Row uniformity.** Enforce at least `id` + `description` across all
-children of a level. This is a debug assert, not a compile-time check.
+5d. **Row uniformity.** Enforced in `refresh_data()`:
+- Empty ID: `eprintln!` warning + row skipped (both in `row_index`
+  construction and `ensure_view` filtering). Not just a debug_assert.
+- Duplicate ID: `eprintln!` warning + last child wins.
+- Description: not enforced (optional, §2.1 says "at least `id`" and
+  "optionally `description`").
 
-**Tests:** Write a mixed-level test: static `add` child + dynamic data
-child in one level (the `/sandbox` shape). Verify merged listing, correct
-submit dispatch, and cursor continuity across the boundary.
+**Tests:** Mixed children merged listing, Tab drill dispatch into correct
+child, fuzzy filter across children boundary, empty ID rows skipped.
 
 ### Step 6: Port existing commands to `SlashDotNode`
 
@@ -380,17 +330,16 @@ The showcase for merged child sets:
 
 ## 5. Test strategy
 
-| Category | Count (approx) | Status |
+| Category | Count | Status |
 | --- | --- | --- |
-| Grammar / filter / fuzzy / table | ~45 | Unchanged (free functions) |
-| Prompt/key scenario (state/tab/enter/esc) | ~50 | Port to `node_traverse()` harness (step 4) |
-| Per-node cursor | ~10 | New (step 4d) |
-| Mixed-level submit dispatch | ~5 | New (step 5) |
-| Confirm two-phase | ~8 | Port from `accept.rs` (step 7) |
-| Per-command integration | ~20 | Port per migration (steps 9–13) |
-| Epoch invalidation | ~3 | New (step 8) |
+| Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions, still passing) |
+| Accept (confirm, interstitial, editor, new-path) | 8 | Unchanged (v2.0 accept.rs) |
+| Interpreter (state/tab/enter/esc, dynamic, field_options) | 26 | Unchanged (v2.0, will be replaced in step 6) |
+| **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **22** | **New (steps 4–5)** |
 
-Total: ~140 tests. ~45 unchanged, ~50 mechanical port, ~45 new/ported.
+Total: 121 lib tests. The 26 interpreter tests test the old code path
+and will be replaced when commands are migrated (step 6). New v2.5 tests
+cover the traversal harness, not individual commands.
 
 ---
 
