@@ -6,9 +6,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
+    StaticListingNode, StaticRow,
 };
 use crate::slashdot_menu::menu::SlashDotMenu;
 
@@ -29,29 +29,6 @@ impl ThinkingState {
         Rc::new(ThinkingState {
             level: RefCell::new(initial),
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ThinkingNode — listing row for the parent (/ root list).
-// ---------------------------------------------------------------------------
-
-pub struct ThinkingNode {
-    _shared: Rc<ThinkingState>,
-}
-
-impl ThinkingNode {
-    pub fn new(shared: Rc<ThinkingState>) -> Self {
-        ThinkingNode { _shared: shared }
-    }
-}
-
-impl SlashDotNode for ThinkingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        Ok(Rc::new(DataResponse {
-            rows: vec![Row::new("thinking").desc("set thinking level")],
-            active_ids: Vec::new(),
-        }))
     }
 }
 
@@ -82,7 +59,7 @@ impl SlashDotNode for ThinkingValue {
             Vec::new()
         };
         Ok(Rc::new(DataResponse {
-            rows: vec![Row::new(&self.level).desc("")],
+            rows: vec![crate::slashdot_menu::fields::Row::new(&self.level).desc("")],
             active_ids: active,
         }))
     }
@@ -104,7 +81,10 @@ pub fn build_menu(thinking_state: &Rc<ThinkingState>) -> SlashDotMenu {
 
     // Root-level commands: each `add_child(&[], ...)` adds a child at the
     // root. The root's listing merges all children's `data()` rows.
-    menu.add_child(&[], ThinkingNode::new(thinking_state.clone()));
+    // Uses StaticListingNode — no dedicated impl needed.
+    menu.add_child(&[], StaticListingNode::new(&[
+        StaticRow::new("thinking", "set thinking level"),
+    ]));
 
     // ThinkingValue children under ThinkingNode (child index "0").
     for level in &["off", "low", "med", "high"] {

@@ -136,3 +136,104 @@ pub trait SlashDotNode {
         Vec::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// StaticListingNode — convenience impl for listing nodes with static rows.
+// ---------------------------------------------------------------------------
+
+/// A row definition for [`StaticListingNode`].
+#[derive(Debug, Clone)]
+pub struct StaticRow {
+    pub id: String,
+    pub desc: String,
+}
+
+impl StaticRow {
+    pub fn new(id: impl Into<String>, desc: impl Into<String>) -> Self {
+        StaticRow {
+            id: id.into(),
+            desc: desc.into(),
+        }
+    }
+}
+
+/// A convenience `SlashDotNode` for listing-level commands that return a
+/// fixed set of rows (no dynamic data, no submit).
+///
+/// Use this instead of writing a dedicated `impl SlashDotNode` for simple
+/// listing nodes like `/thinking`, `/persona`, or any static menu entry.
+///
+/// For active markers, pass a shared `HashSet<String>` via
+/// [`StaticListingNode::with_active`].
+///
+/// # Example
+/// ```ignore
+/// let node = StaticListingNode::new(&[
+///     StaticRow::new("thinking", "set thinking level"),
+///     StaticRow::new("model", "switch model"),
+/// ]);
+/// menu.add_child(&[], node);
+/// ```
+pub struct StaticListingNode {
+    rows: Vec<StaticRow>,
+    header_lines: Vec<String>,
+    active_ids: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    field_specs: Vec<crate::fields::FieldSpec>,
+}
+
+impl StaticListingNode {
+    /// Create from a static slice of rows.
+    pub fn new(rows: &[StaticRow]) -> Self {
+        StaticListingNode {
+            rows: rows.iter().cloned().collect(),
+            header_lines: Vec::new(),
+            active_ids: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
+            field_specs: Vec::new(),
+        }
+    }
+
+    /// Set the header lines shown above the listing.
+    pub fn with_header(mut self, header: Vec<String>) -> Self {
+        self.header_lines = header;
+        self
+    }
+
+    /// Set the active IDs (e.g. current selection). The `Rc<RefCell<...>>`
+    /// can be shared with child nodes or external state.
+    pub fn with_active(
+        mut self,
+        active: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.active_ids = active;
+        self
+    }
+
+    /// Set field metadata for filter/sort on this level's children.
+    pub fn with_fields(mut self, specs: Vec<crate::fields::FieldSpec>) -> Self {
+        self.field_specs = specs;
+        self
+    }
+}
+
+impl SlashDotNode for StaticListingNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        let rows: Vec<Row> = self
+            .rows
+            .iter()
+            .map(|r| Row::new(&r.id).desc(&r.desc))
+            .collect();
+        let active: Vec<String> = self.active_ids.borrow().iter().cloned().collect();
+        Ok(std::rc::Rc::new(DataResponse {
+            rows,
+            active_ids: active,
+        }))
+    }
+
+    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        self.header_lines.clone()
+    }
+
+    fn fields(&self) -> Vec<crate::fields::FieldSpec> {
+        self.field_specs.clone()
+    }
+}

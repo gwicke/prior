@@ -11,7 +11,7 @@ mod tests {
     use crate::slashdot_menu::fields::Row;
     use crate::slashdot_menu::node_impl::{
         DataResponse, DataResult, HostKey, MenuResult, PathArgs,
-        SlashDotNode, SubmitResult,
+        SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
     };
     use crate::slashdot_menu::menu::SlashDotMenu;
 
@@ -28,21 +28,6 @@ mod tests {
             Rc::new(TestState {
                 current_thinking_level: RefCell::new(None),
             })
-        }
-    }
-
-    /// The `/thinking` command node: returns the "thinking" row for the
-    /// parent listing.
-    struct ThinkingNode {
-        _shared: Rc<TestState>,
-    }
-
-    impl SlashDotNode for ThinkingNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
-                rows: vec![Row::new("thinking").desc("set thinking level")],
-                active_ids: Vec::new(),
-            }))
         }
     }
 
@@ -90,7 +75,10 @@ mod tests {
         let mut menu = SlashDotMenu::new();
 
         // Thinking listing node (child of root, gets index 0).
-        menu.add_child(&[], ThinkingNode { _shared: state.clone() });
+        // Uses StaticListingNode — no dedicated impl needed.
+        menu.add_child(&[], StaticListingNode::new(&[
+            StaticRow::new("thinking", "set thinking level"),
+        ]));
 
         // Enum value children under thinking (index "0" in root's children).
         for level in &["off", "low", "med", "high"] {
