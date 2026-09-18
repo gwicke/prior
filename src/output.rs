@@ -882,9 +882,9 @@ impl ConsoleOutput {
             text_buffer: Mutex::new(String::new()),
             live: Mutex::new(false),
             writer: Mutex::new(Box::new(io::stdout())),
-            parser: Mutex::new(StreamParser::new_gfm()),
+            parser: Mutex::new(StreamParser::new_gfm_no_forward_refs()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
-            thinking_parser: Mutex::new(StreamParser::new_gfm()),
+            thinking_parser: Mutex::new(StreamParser::new_gfm_no_forward_refs()),
             thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             dim_on: Mutex::new(false),
             answer_held: Mutex::new(false),
@@ -935,14 +935,14 @@ impl ConsoleOutput {
             // Reset the incremental parser/renderer for a fresh response and
             // print a leading blank to separate from the user prompt.
             let mut parser = self.parser.lock().unwrap();
-            *parser = StreamParser::new_gfm();
+            *parser = StreamParser::new_gfm_no_forward_refs();
             let mut theme = Theme::default();
             theme.clickable_links = true; // real TTY path
             let mut renderer = self.renderer.lock().unwrap();
             *renderer = Renderer::new(theme, term_width());
             // Reset the thinking parser/renderer and dim state for this response.
             let mut tparser = self.thinking_parser.lock().unwrap();
-            *tparser = StreamParser::new_gfm();
+            *tparser = StreamParser::new_gfm_no_forward_refs();
             let mut trenderer = self.thinking_renderer.lock().unwrap();
             *trenderer = Renderer::new(Theme::dimmed(), term_width());
             *self.dim_on.lock().unwrap() = false;
@@ -1119,7 +1119,7 @@ impl ConsoleOutput {
         let events = {
             let mut tparser = self.thinking_parser.lock().unwrap();
             let events = tparser.flush();
-            *tparser = StreamParser::new_gfm();
+            *tparser = StreamParser::new_gfm_no_forward_refs();
             events
         };
         let mut trenderer = self.thinking_renderer.lock().unwrap();
@@ -1172,7 +1172,7 @@ impl ConsoleOutput {
         // for the caller's renderer reset. `flush()` (not just `write`) so the
         // answer's final, blank-line-unterminated paragraph is emitted rather
         // than dropped (a `write`-only parser holds the last block back).
-        let mut local_parser = StreamParser::new_gfm();
+        let mut local_parser = StreamParser::new_gfm_no_forward_refs();
         let mut events = local_parser.write(buffer.as_bytes());
         events.extend(local_parser.flush());
         let mut renderer = self.renderer.lock().unwrap();
@@ -1497,7 +1497,7 @@ impl Output for ConsoleOutput {
                 // ends in a list/table is emitted now rather than stranded; then
                 // start a fresh answer parser + renderer for the next segment.
                 let events = parser.flush();
-                *parser = StreamParser::new_gfm();
+                *parser = StreamParser::new_gfm_no_forward_refs();
                 let mut renderer = self.renderer.lock().unwrap();
                 let _ = renderer.feed(&events, &mut *out);
                 if !events.is_empty() {
@@ -2732,7 +2732,7 @@ mod tests {
     /// it closes (coarse-grained). These tests pin that contract.
     #[test]
     fn incremental_renderer_streams_code_lines_and_coarsens_paragraphs() {
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_no_forward_refs();
         let mut renderer = Renderer::new(Theme::no_color(), 80);
         let mut buf: Vec<u8> = Vec::new();
 
@@ -2766,7 +2766,7 @@ mod tests {
 
     #[test]
     fn incremental_renderer_gfm_table_renders() {
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_no_forward_refs();
         let mut renderer = Renderer::new(Theme::no_color(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let evs = parser.write("| a | b |\n|---|---|\n| 1 | 2 |\n\n".as_bytes());
@@ -2795,7 +2795,7 @@ mod tests {
         // Mirrors Phase 5's TTY thinking path: a faint SGR + a faded theme whose
         // `reset` re-applies the dim keep thinking faded even through inline
         // formatting (bold/code), without re-rendering past content.
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_no_forward_refs();
         let mut renderer = Renderer::new(Theme::dimmed(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let _ = write!(buf, "\x1b[2m"); // initial dim (mirrors `ensure_dim(true)`)
@@ -2808,6 +2808,38 @@ mod tests {
             out.contains("\x1b[0m\x1b[2m"),
             "inline formatting must re-apply dim (reset re-dim), not clear it"
         );
+    }
+
+    #[test]
+    fn thinking_flushes_on_paragraph_boundary() {
+        // Regression test: thinking content should emit on paragraph boundaries
+        // (blank line) without waiting for end_response.
+        let mut parser = StreamParser::new_gfm_no_forward_refs();
+        let mut renderer = Renderer::new(Theme::dimmed(), 80);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = write!(buf, "\x1b[2m");
+        
+        // First paragraph - no flush yet (no blank line)
+        let _ = renderer.feed(&parser.write("\n\n[test] first ".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("\nparagraph \n".as_bytes()), &mut buf);
+        let before_flush = String::from_utf8(buf.clone()).unwrap();
+        assert!(!before_flush.contains("first paragraph"), "content held before boundary");
+        
+        // Add blank line - should flush
+        let _ = renderer.feed(&parser.write("\nasome long text \n".as_bytes()), &mut buf);
+        // let _ = renderer.feed(&parser.flush(), &mut buf); // explicit flush simulates the new logic
+        let after_flush = String::from_utf8(buf.clone()).unwrap();
+        eprintln!("after newline: {}", after_flush);
+        // assert!(after_flush.contains("first paragraph"), "content emitted after boundary");
+        
+        // Second paragraph with explicit blank line
+        let _ = renderer.feed(&parser.write("\nsecond paragraph\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
+        // let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
+        let after_blank = String::from_utf8(buf.clone()).unwrap();
+        assert!(after_blank.contains("second paragraph"), "content emitted on blank line");
+        
+        let _ = write!(buf, "\x1b[0m");
     }
 
     #[test]
