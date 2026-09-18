@@ -7,13 +7,23 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–5. `SlashDotNode` trait (all defaults),
+**Done (v2.5 reshape):** Steps 1–6. `SlashDotNode` trait (all defaults),
 `NodeEntry` (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public
 API). Step 4: full traversal — section parse, data refresh (Rc::ptr_eq),
 view derivation (filter → fuzzy rank → sort), cursor, Esc ladder, leaf/listing
 dispatch, render plan. Step 5: merged child sets verified — `refresh_data`
 builds `row_index` across children; field metadata via `SlashDotNode::fields()`;
 row uniformity enforced (empty IDs warn+skip, duplicate IDs warn+last-wins);
+prompt reconstruction via `full_prompt(path, suffix)` at all return points.
+
+Step 6: `/thinking` ported end-to-end. `ThinkingNode` + `ThinkingValue`
+`SlashDotNode` impls in `src/v25_thinking.rs` using shared
+`Rc<RefCell<Option<String>>>` state. REPL wired: persistent
+`SlashDotMenu` + `Option<SlashDotHandle>` in the input loop. Handle
+lifecycle: created when prompt starts with `/thinking`, dropped when
+it leaves. All overlay computation and key dispatch (Enter drills+submits,
+Tab drills, Esc pops, arrows move cursor) routes through `eval_prompt`.
+`ActiveOverlay::V25Menu { plan }` variant for the v2.5 engine overlay.
 prompt reconstruction via `full_prompt(path, suffix)` at all return points.
 22 new tests covering parse, listing, drill, cursor, active markers, header,
 Esc, fuzzy rank, mixed children, empty ID handling.
@@ -90,8 +100,9 @@ Design deviations from step4 doc (per user clarification):
   is NOT cleared — it persists across epochs (stale rows are replaced
   on the next `refresh_data`). This is intentional but undocumented.
 
-**Next:** Step 6 (port existing commands to `SlashDotNode` — Model, Thinking,
-Persona, root list).
+**Next:** Expand REPL handle lifecycle to all `/` commands (currently
+thinking-only). Port remaining commands: Model, Persona, root list.
+Step 7 (two-phase submit confirm). Step 8 (persistent engine cleanup).
 
 ---
 
