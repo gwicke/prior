@@ -2936,7 +2936,6 @@ impl Repl {
                                                         output, &mut editor, &redraw, sel,
                                                         &mut input_row, &echo, "", false,
                                                     );
-                                                    v25_handle = None;
                                                     return Some(InputAction::SetThinking(level));
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {

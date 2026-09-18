@@ -77,10 +77,10 @@ impl RankResult {
 use crate::node_entry::RowRef;
 
 /// Ranking outcome for RowRef handles.
-pub struct RankRefResult {
-    pub rows: Vec<RowRef>,
-    pub active: usize,
-    pub pinned_survived: bool,
+pub(crate) struct RankRefResult {
+    pub(crate) rows: Vec<RowRef>,
+    pub(crate) _active: usize,
+    pub(crate) _pinned_survived: bool,
 }
 
 /// Rank `candidates` (RowRef handles with pre-resolved Row references)
@@ -90,7 +90,7 @@ pub struct RankRefResult {
 /// Rank: surviving rows ordered best-first by fuzzy score.
 /// Pin: if `selection` is present and still in the filtered view, it
 /// becomes the active index; otherwise active defaults to 0.
-pub fn rank_row_refs(
+pub(crate) fn rank_row_refs(
     candidates: &[(RowRef, &Row)],
     terms: &str,
     selection: Option<&str>,
@@ -131,8 +131,8 @@ pub fn rank_row_refs(
     };
     RankRefResult {
         rows: ranked,
-        active,
-        pinned_survived: survived,
+        _active: active,
+        _pinned_survived: survived,
     }
 }
 
