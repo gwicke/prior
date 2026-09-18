@@ -32,7 +32,6 @@ pub mod table;
 pub mod value;
 pub mod wrap;
 pub mod accept;
-mod v25_commands;
 
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle};

@@ -1,23 +1,22 @@
-//! v2.5 command node implementations and integration tests.
+//! v2.5 command node implementations for testing the slashdot_menu engine.
 //!
-//! Each command is one `impl SlashDotNode`. The engine handles all
-//! traversal, cursor, and child management internally.
+//! These test nodes exercise the engine's traversal, cursor, drill,
+//! and submit paths without depending on the full picocode host.
 
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::fields::Row;
-    use crate::node_impl::{
+    use crate::slashdot_menu::fields::Row;
+    use crate::slashdot_menu::node_impl::{
         DataResponse, DataResult, HostKey, MenuResult, PathArgs,
         SlashDotNode, SubmitResult,
     };
-
-    use crate::menu::SlashDotMenu;
+    use crate::slashdot_menu::menu::SlashDotMenu;
 
     // -----------------------------------------------------------------------
-    // Thinking command (ported from v2.0 slash_menu_bridge)
+    // Thinking command (test fixture modeling /thinking enum)
     // -----------------------------------------------------------------------
 
     struct TestState {
@@ -145,11 +144,9 @@ mod tests {
 
     #[test]
     fn thinking_tab_drills_to_value() {
-        // Tab from "thinking " drills into the first value (off).
         let state = TestState::new();
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        // First open the thinking listing
         let r = h.eval_prompt("thinking ", HostKey::None);
         match &r {
             MenuResult::Continue(plan, _) => {
@@ -157,10 +154,8 @@ mod tests {
             }
             other => panic!("expected Continue, got {:?}", other),
         }
-        // Tab drills into first value
         match h.eval_prompt("thinking ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
-                // Leaf: no data rows (ThinkingValue has no children)
                 assert!(plan.lines.iter().filter(|l| !l.is_header).count() == 0
                     || plan.lines.iter().any(|l| l.text.contains("off")),
                     "should show leaf content, got {:?}", plan.lines);
@@ -172,7 +167,6 @@ mod tests {
 
     #[test]
     fn thinking_enter_submits() {
-        // Tab into thinking listing, Tab into first value, Enter submits.
         let state = TestState::new();
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
@@ -188,13 +182,51 @@ mod tests {
     }
 
     #[test]
+    fn thinking_enter_drills_and_submits() {
+        // Enter at the listing level should drill into the cursor row and
+        // submit immediately, without requiring a separate Tab first.
+        let state = TestState::new();
+        let mut menu = build_thinking_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("thinking ", HostKey::None);
+        match h.eval_prompt("thinking ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                assert_eq!(
+                    *state.current_thinking_level.borrow(),
+                    Some("off".to_string()),
+                    "Enter at listing should drill cursor row (off) and submit"
+                );
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thinking_enter_drills_cursor_position() {
+        let state = TestState::new();
+        let mut menu = build_thinking_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("thinking ", HostKey::None);
+        let _ = h.eval_prompt("thinking ", HostKey::MoveCursor(3));
+        match h.eval_prompt("thinking ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                assert_eq!(
+                    *state.current_thinking_level.borrow(),
+                    Some("high".to_string()),
+                    "Enter should drill cursor row (high) and submit"
+                );
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn thinking_esc_pops() {
         let state = TestState::new();
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
         let _ = h.eval_prompt("thinking ", HostKey::Tab);
-        // At "thinking off ". Esc should pop back to thinking listing.
         match h.eval_prompt("thinking off ", HostKey::Esc) {
             MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("thinking"), "should be back at thinking: {}", prompt);
@@ -256,14 +288,11 @@ mod tests {
 
     #[test]
     fn thinking_move_cursor_then_tab() {
-        // MoveCursor within same handle persists, Tab drills into that row.
         let state = TestState::new();
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
-        // Move cursor to "high" (index 3)
         let _ = h.eval_prompt("thinking ", HostKey::MoveCursor(3));
-        // Tab drills into cursor row ("high")
         match h.eval_prompt("thinking ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("high"), "should drill into high: {}", prompt);
@@ -274,7 +303,6 @@ mod tests {
 
     #[test]
     fn thinking_enter_different_value() {
-        // MoveCursor to "med", Tab to drill, Enter to submit.
         let state = TestState::new();
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();

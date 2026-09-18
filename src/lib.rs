@@ -13,6 +13,7 @@ pub mod slash_menu_bridge;
 pub mod repl;
 pub mod model_catalog;
 pub mod thinking;
+pub mod v25_commands;
 pub mod sandbox_bindings;
 pub mod settings;
 pub mod path_util;
