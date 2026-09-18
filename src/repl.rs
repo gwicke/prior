@@ -495,6 +495,14 @@ pub(crate) enum ActiveOverlay {
         plan: crate::slashdot_menu::render::RenderPlan,
     },
 
+    /// v2.5 engine overlay: carries a `RenderPlan` from the v2.5
+    /// `SlashDotHandle::eval_prompt`. All key dispatch goes through the
+    /// persistent handle — the overlay is purely a display snapshot.
+    V25Menu {
+        /// The render plan from the v2.5 engine.
+        plan: crate::slashdot_menu::render::RenderPlan,
+    },
+
     Sandbox {
         sub: Option<&'static str>,
         items: Vec<String>,
@@ -1257,6 +1265,13 @@ impl ActiveOverlay {
                 let (opts, active) = Self::plan_rows(plan);
                 ("", opts, active, false)
             }
+            ActiveOverlay::V25Menu { plan, .. } => {
+                if plan.lines.is_empty() {
+                    return ("", vec!["(no results)".into()], None, false);
+                }
+                let (opts, active) = Self::plan_rows(plan);
+                ("", opts, active, false)
+            }
             ActiveOverlay::Mod { rows, want_value } => {
                 if rows.is_empty() {
                     return ("", vec!["(no completions)".into()], None, false);
@@ -1381,6 +1396,7 @@ impl ActiveOverlay {
     pub fn cursor_row(&self) -> Option<usize> {
         match self {
             ActiveOverlay::Menu { cursor, .. } => Some(*cursor),
+            ActiveOverlay::V25Menu { plan, .. } => plan.selected,
             _ => None,
         }
     }
@@ -2287,6 +2303,7 @@ impl ActiveOverlay {
             ActiveOverlay::TreeAction { .. } => 12,
             ActiveOverlay::SwitchAction { .. } => 13,
             ActiveOverlay::CompactSummary { .. } => 14,
+            ActiveOverlay::V25Menu { .. } => 20,
         }
     }
 
@@ -2399,6 +2416,13 @@ impl Repl {
         // inside it; the host keeps the same instance across keypresses
         // (no rebuild, no take/restore, no host frames/cursors threading).
         let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
+        // v2.5 engine: persistent menu tree + guard-like handle.
+        // The menu lives for the entire prompt session; the handle is
+        // created when the prompt starts with `/` and dropped when it
+        // no longer does. All `/` dispatch goes through `eval_prompt`.
+        let thinking_state = crate::v25_thinking::ThinkingState::new(ctx.thinking_level.clone());
+        let mut v25_menu = crate::v25_thinking::build_menu(&thinking_state);
+        let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
         let mut stat_phase = false;
@@ -2544,10 +2568,33 @@ impl Repl {
                 input_row = output.cursor_row();
             }
             // --- Compute the overlay from the current buffer. ---
-            let overlay = ActiveOverlay::from_buffer_cursors(
-                &editor.text(), ctx, settings, help_view, &path_completions,
-                &mut engine,
-            );
+            let buf_text = editor.text();
+            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") {
+                // v2.5 path: route through the persistent handle.
+                // Manage handle lifecycle: create on first `/`, drop when not `/`.
+                if v25_handle.is_none() {
+                    v25_handle = Some(v25_menu.get_handle());
+                }
+                let handle = v25_handle.as_mut().unwrap();
+                let line = buf_text.trim_start_matches('/').to_string();
+                let result = handle.eval_prompt(
+                    &line,
+                    crate::slashdot_menu::node_impl::HostKey::None,
+                );
+                match result {
+                    crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
+                        ActiveOverlay::V25Menu { plan }
+                    }
+                    _ => ActiveOverlay::None,
+                }
+            } else {
+                // Drop the v25 handle when prompt leaves thinking.
+                v25_handle = None;
+                ActiveOverlay::from_buffer_cursors(
+                    &buf_text, ctx, settings, help_view, &path_completions,
+                    &mut engine,
+                )
+            };
             // Hoisted before the sel-reset so `active` (the menu's
             // default/current-state row) can drive the cursor policy below.
             let (title, raw_opts, active, wrap) = overlay.display_rows();
@@ -2645,6 +2692,10 @@ impl Repl {
                     // v2 engine: paint the drill panel (candidate rows,
                     // or help/detail for a pure leaf like `/replay `)
                     // verbatim — same path as Thinking/Persona/Model.
+                    let paint = plan.paint(crate::output::term_width());
+                    paint.join("\n")
+                }
+                ActiveOverlay::V25Menu { plan, .. } => {
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
@@ -2747,14 +2798,26 @@ impl Repl {
                                 // arrows through the engine's cursor; the
                                 // next frame's `sel` re-derives from it.
                                 if overlay.cursor_row().is_some() {
-                                    let delta = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    let action = if delta < 0 {
-                                        slash_menu_bridge::HostKey::Up
+                                    // v2.5 path: route through the persistent handle.
+                                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                        if let Some(handle) = &mut v25_handle {
+                                            let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
+                                            let line = editor.text().trim_start_matches('/').to_string();
+                                            let _ = handle.eval_prompt(
+                                                &line,
+                                                crate::slashdot_menu::node_impl::HostKey::MoveCursor(delta),
+                                            );
+                                        }
                                     } else {
-                                        slash_menu_bridge::HostKey::Down
-                                    };
-                                    let line = editor.text().trim_start_matches('/').to_string();
-                                    engine.step_at(&line, 0, action);
+                                        let delta = if key.code == KeyCode::Down { 1 } else { -1 };
+                                        let action = if delta < 0 {
+                                            slash_menu_bridge::HostKey::Up
+                                        } else {
+                                            slash_menu_bridge::HostKey::Down
+                                        };
+                                        let line = editor.text().trim_start_matches('/').to_string();
+                                        engine.step_at(&line, 0, action);
+                                    }
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
@@ -2822,9 +2885,22 @@ impl Repl {
                                 }
                             }
                             KeyCode::Tab => {
-                                overlay.handle_tab(sel, &mut editor,
-                                    &mut path_completions, &mut completion_pos,
-                                    settings, &mut engine);
+                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                    if let Some(handle) = &mut v25_handle {
+                                        let line = editor.text().trim_start_matches('/').to_string();
+                                        let result = handle.eval_prompt(
+                                            &line,
+                                            crate::slashdot_menu::node_impl::HostKey::Tab,
+                                        );
+                                        if let crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) = result {
+                                            editor.set(&format!("/{}", prompt));
+                                        }
+                                    }
+                                } else {
+                                    overlay.handle_tab(sel, &mut editor,
+                                        &mut path_completions, &mut completion_pos,
+                                        settings, &mut engine);
+                                }
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -2839,6 +2915,41 @@ impl Repl {
                                         stat_phase = true;
                                     } else {
                                         stat_phase = false;
+                                    }
+                                    // v2.5 path: route through the persistent handle.
+                                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                        if let Some(handle) = &mut v25_handle {
+                                            let line = editor.text().trim_start_matches('/').to_string();
+                                            let result = handle.eval_prompt(
+                                                &line,
+                                                crate::slashdot_menu::node_impl::HostKey::Enter,
+                                            );
+                                            match result {
+                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                                                    // Thinking submitted — extract level
+                                                    // from the prompt (e.g. "thinking off ").
+                                                    let level = editor.text()
+                                                        .trim_start_matches('/')
+                                                        .trim_start_matches("thinking")
+                                                        .trim()
+                                                        .to_string();
+                                                    let echo = format!("/thinking {}", level);
+                                                    Repl::emit_commit(
+                                                        output, &mut editor, &redraw, sel,
+                                                        &mut input_row, &echo, "", false,
+                                                    );
+                                                    v25_handle = None;
+                                                    return Some(InputAction::SetThinking(level));
+                                                }
+                                                crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
+                                                    // Drill happened — update buffer, next
+                                                    // frame re-evals.
+                                                    editor.set(&format!("/{}", prompt));
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        continue;
                                     }
                                     match overlay.handle_enter(
                                         sel, &mut editor, output, &redraw, &mut input_row,
@@ -2856,6 +2967,33 @@ impl Repl {
                                 // ladder (frame replay + esc()); legacy
                                 // overlays keep their bespoke rewrites until
                                 // they migrate.
+                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                    if let Some(handle) = &mut v25_handle {
+                                        let line = editor.text().trim_start_matches('/').to_string();
+                                        let result = handle.eval_prompt(
+                                            &line,
+                                            crate::slashdot_menu::node_impl::HostKey::Esc,
+                                        );
+                                        match result {
+                                            crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
+                                                // Esc popped a level — update buffer.
+                                                editor.set(&format!("/{}", prompt));
+                                            }
+                                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                                                // Esc at root — close overlay.
+                                                editor.set("");
+                                                v25_handle = None;
+                                            }
+                                            _ => {
+                                                editor.set("");
+                                                v25_handle = None;
+                                            }
+                                        }
+                                    } else {
+                                        editor.set("");
+                                    }
+                                    continue;
+                                }
                                 if !overlay.engine_esc(&mut editor, &mut engine) {
                                     overlay.handle_esc(&mut editor,
                                         &mut path_completions, &mut completion_pos);
