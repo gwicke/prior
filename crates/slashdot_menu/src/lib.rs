@@ -15,23 +15,23 @@
 // --- Public API (what the host sees) ---
 pub mod menu;
 
-// --- Internal modules (not exposed to host) ---
-pub(crate) mod node_impl;
-mod node_entry;
-mod node;
-mod provider;
-mod interpreter;
-mod cursor;
+// --- Internal modules (exposed to host for v2.0 bridge) ---
+pub mod node_impl;
+pub mod node_entry;
+pub mod node;
+pub mod provider;
+pub mod interpreter;
+pub mod cursor;
 pub mod fields;
-mod filter;
-mod fuzzy;
-mod grammar;
-mod prompt;
+pub mod filter;
+pub mod fuzzy;
+pub mod grammar;
+pub mod prompt;
 pub mod render;
 pub mod table;
 pub mod value;
-mod wrap;
-mod accept;
+pub mod wrap;
+pub mod accept;
 mod v25_commands;
 
 // Re-export public types for convenience.

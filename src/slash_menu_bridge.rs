@@ -1414,14 +1414,12 @@ mod tests {
         let plan: RenderPlan = e.render_plan("model ", 100, Vec::new());
         assert!(!plan.lines.is_empty(), "model level has rows");
         assert_eq!(plan.selected, Some(0));
-        // Title from the descriptor's child header (design §12); the same
-        // text is not duplicated as a subtitle line.
-        assert_eq!(plan.title.as_deref(), Some("Models"));
+        // v2.5: title removed; header() is the panel title mechanism.
         assert!(
             !plan.lines.iter().any(|l| l.is_header && l.text.contains("Models")),
-            "child_header/subtitle must not duplicate the title"
+            "child_header/subtitle must not duplicate"
         );
-        // Paint path: full-width padded rows (title + rows).
+        // Paint path: full-width padded rows (header + rows).
         let painted = plan.paint(100);
         assert!(
             painted.iter().all(|l| l.starts_with("\x1b[48;5;")),

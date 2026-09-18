@@ -618,7 +618,7 @@ impl ActiveOverlay {
     /// The loop uses the returned opts only for cursor/focus math.
     fn plan_rows(plan: &crate::slashdot_menu::render::RenderPlan) -> (Vec<String>, Option<usize>) {
         let mut opts: Vec<String> = Vec::new();
-        for l in &plan.lines {
+        for l in plan.lines.iter() {
             if l.is_header {
                 continue;
             }
@@ -629,7 +629,7 @@ impl ActiveOverlay {
                 opts.push(l.text.clone());
             }
         }
-        (opts, plan.active)
+        (opts, plan.active_rows.first().copied())
     }
 
     /// Construct the overlay from the current buffer and external state.
@@ -6454,7 +6454,7 @@ mod tests {
                     // id equals the command must be active. Verify via cursor
                     // directly (the engine is rebuilt per test call).
                     // The cursor in the Menu variant IS the active row.
-                    assert!(plan.lines.len() > 0 || plan.detail.len() > 0,
+                    assert!(plan.lines.len() > 0 || plan.lines.len() > 0,
                         "plan should have content for {buf:?}");
                     // cursor is the engine's active row for this level
                     assert!(cursor < 100, "cursor should be a valid row index, got {cursor}");
@@ -6507,7 +6507,7 @@ mod tests {
                 // and plan has content. The exact row index varies with the
                 // provider ordering but cursor should point to a valid row.
                 assert!(cursor < 100, "cursor should be a valid row index");
-                assert!(plan.lines.len() > 0 || plan.detail.len() > 0,
+                assert!(plan.lines.len() > 0 || plan.lines.len() > 0,
                     "plan should have content for /replay");
             }
             other => panic!(
@@ -6516,17 +6516,16 @@ mod tests {
             ),
         }
         // `/replay ` (trailing space): generic Menu overlay carrying the
-        // engine plan — the help/detail panel is engine-sourced.
+        // engine plan — the help/detail panel is now in header lines.
         match model_overlay("/replay ") {
             ActiveOverlay::Menu { plan, .. } => {
                 assert!(
-                    !plan.detail.is_empty(),
+                    !plan.lines.is_empty(),
                     "drilled /replay plan carries the help detail"
                 );
-                assert!(
-                    plan.lines.is_empty(),
-                    "pure leaf has no candidate rows, only detail"
-                );
+                // v2.5: no candidate rows (pure leaf), but header lines exist
+                let selectable = plan.lines.iter().filter(|l| !l.is_header).count();
+                assert_eq!(selectable, 0, "pure leaf has no selectable rows");
             }
             other => panic!(
                 "expected generic Menu for '/replay ', got disc {:?}",
@@ -6540,7 +6539,7 @@ mod tests {
         match model_overlay("/replay 5") {
             ActiveOverlay::Menu { plan, .. } => {
                 assert!(
-                    !plan.detail.is_empty(),
+                    !plan.lines.is_empty(),
                     "/replay <param> keeps the help detail in view"
                 );
             }
@@ -9883,8 +9882,8 @@ mod model_v2_tests {
         let ov = ActiveOverlay::from_buffer("/persona ", &ctx, &settings, false, &[]);
         match &ov {
             ActiveOverlay::Menu { plan, .. } => {
-                assert_eq!(plan.title.as_deref(), Some("Personas"));
-                let active = plan.active.expect("current persona must be marked");
+                // v2.5: title removed; check header lines instead
+                let active = plan.active_rows.first().copied().expect("current persona must be marked");
                 let line = plan.lines.iter().find(|l| l.option == active);
                 assert!(
                     line.map(|l| l.text.contains("academic")).unwrap_or(false),
@@ -9939,8 +9938,7 @@ mod model_v2_tests {
         let ov = ActiveOverlay::from_buffer("/thinking ", &ctx, &test_settings(), false, &[]);
         match &ov {
             ActiveOverlay::Menu { plan, .. } => {
-                assert_eq!(plan.title.as_deref(), Some("Thinking levels"));
-                let active = plan.active.expect("current thinking level must be marked");
+                let active = plan.active_rows.first().copied().expect("current thinking level must be marked");
                 let line = plan.lines.iter().find(|l| l.option == active);
                 assert!(
                     line.map(|l| l.text.contains("med")).unwrap_or(false),
