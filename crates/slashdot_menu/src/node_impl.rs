@@ -127,4 +127,12 @@ pub trait SlashDotNode {
     fn fields(&self) -> Vec<crate::fields::FieldSpec> {
         Vec::new()
     }
+
+    /// Presentation columns for table rendering (D6 / §6). When
+    /// non-empty, the engine renders rows as a table with these column
+    /// definitions (header labels, alignment, sizing). When empty,
+    /// rows render as plain `id — description` text. Default: empty.
+    fn columns(&self) -> Vec<crate::provider::ColumnDef> {
+        Vec::new()
+    }
 }

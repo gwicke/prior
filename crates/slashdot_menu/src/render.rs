@@ -66,19 +66,25 @@ impl Marker {
 }
 
 /// The complete overlay panel description.
+///
+/// v2.5 panel structure (§6):
+/// 1. `header()` lines — non-selectable, sticky
+/// 2. Table header row (if columns exist) — sticky
+/// 3. Selectable data rows — scrollable, with `>` / `*` markers
 #[derive(Debug, Clone, Default)]
 pub struct RenderPlan {
-    pub title: Option<String>,
-    /// Rc-shared lines — zero-cost clone on cursor moves.
+    /// All lines in display order: header + table header + data rows.
+    /// Rc-shared for zero-cost clone on cursor moves.
     pub lines: std::rc::Rc<Vec<RenderLine>>,
-    /// Index of the cursor-selected logical option.
+    /// Index of the cursor-selected logical option among data rows.
     pub selected: Option<usize>,
-    /// Index of the current-state ("active") logical option (`*` marker,
-    /// design §5.1). When it equals `selected`, `*` wins on the shared row.
-    pub active: Option<usize>,
-    /// Detail/banner lines: non-selectable header rows between
-    /// the title and the candidate rows.
-    pub detail: Vec<String>,
+    /// Indices of active (`*`-marked) rows (§5.2). Multiple rows may
+    /// be active (e.g. multiple models currently in use).
+    pub active_rows: Vec<usize>,
+    /// Number of non-scrollable (sticky) lines at the top of the panel.
+    /// Includes header() lines and the table header row (if present).
+    /// The host scrolls only lines `[sticky_count..]`.
+    pub sticky_count: usize,
 }
 
 impl RenderPlan {
@@ -88,18 +94,9 @@ impl RenderPlan {
         let tw = term_width.max(1);
         let bg_line = |s: &str, bg: &str| format!("{}{:<width$}{}", bg, s, Style::RESET, width = tw);
         let mut out = Vec::new();
-        if let Some(title) = &self.title {
-            out.push(bg_line(title, Style::PANEL.bg));
-        }
-        // Detail/banner lines (design §5.1): non-selectable header
-        // rows rendered between the title and the candidate rows —
-        // `/replay` help text, `/stat` summary, etc.
-        for d in &self.detail {
-            out.push(bg_line(d, Style::HEADER.bg));
-        }
         for l in self.lines.iter() {
             let sel = self.selected == Some(l.option);
-            let act = self.active == Some(l.option);
+            let act = self.active_rows.contains(&l.option);
             let bg = if l.is_header {
                 Style::HEADER.bg
             } else if sel {
@@ -289,23 +286,34 @@ impl PlanBuilder {
             }
         }
 
-        // Wrap detail lines to the panel width (same as header rows) so
-        // long help text breaks cleanly inside the panel.
-        let detail = detail
-            .iter()
-            .flat_map(|d| wrap_lines(d, max_width))
-            .collect::<Vec<_>>();
+        // Wrap detail lines as header lines (they go before the data rows).
+        for d in detail {
+            for sub in wrap_lines(&d, max_width) {
+                lines.push(RenderLine {
+                    text: sub,
+                    style: Style::HEADER,
+                    is_header: true,
+                    is_marker_row: false,
+                    option: usize::MAX,
+                });
+            }
+        }
+
+        let active_rows: Vec<usize> = if let Some(a) = state.active_row_marker {
+            vec![a]
+        } else {
+            Vec::new()
+        };
 
         RenderPlan {
-            title: Some(self.title.clone()),
             lines: std::rc::Rc::new(lines),
             selected: if state.candidates.is_empty() {
                 None
             } else {
                 Some(state.active)
             },
-            active: state.active_row_marker,
-            detail,
+            active_rows,
+            sticky_count: 0, // PlanBuilder doesn't know; host computes
         }
     }
 }
@@ -342,7 +350,7 @@ mod tests {
             row_header: None,
         };
         let plan = b.build(&empty_state(), 80, Vec::new());
-        assert_eq!(plan.title.as_deref(), Some("Models"));
+        // title field removed in v2.5 — header is the mechanism
         let headers = plan.lines.iter().filter(|l| l.is_header).count();
         assert_eq!(headers, 1);
         let rows = plan.lines.iter().filter(|l| !l.is_header).count();
@@ -367,10 +375,10 @@ mod tests {
         };
         let plan = b.build(&empty_state(), 40, Vec::new());
         let lines = plan.paint(40);
-        // title + 2 rows (plus a leading marker column on each row)
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("T"));
-        assert!(lines[1].contains("a"));
+        // v2.5: no title — just 2 data rows
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("a"));
+        assert!(lines[1].contains("b"));
     }
 
     #[test]
@@ -404,7 +412,7 @@ mod tests {
         let plan = b.build(&st, 60, Vec::new());
         // Two logical options; the active (current-state) row is `b`.
         assert_eq!(plan.selected, Some(0));
-        assert_eq!(plan.active, Some(1));
+        assert_eq!(plan.active_rows, vec![1]);
         // Active precedence: `*` on the active row when the cursor is off it.
         let painted = plan.paint(60);
         let opt_b = painted.iter().find(|l| l.contains('b')).expect("row b present");

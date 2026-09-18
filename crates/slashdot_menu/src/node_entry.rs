@@ -60,6 +60,8 @@ struct RenderCache {
     lines: Rc<Vec<RenderLine>>,
     /// Resolved active row indices (computed from active_ids + ranked_rows).
     active_rows: Vec<usize>,
+    /// Number of sticky (non-scrollable) lines at the top.
+    sticky_count: usize,
 }
 
 impl Default for ContentCache {
@@ -73,6 +75,7 @@ impl Default for ContentCache {
             render: RenderCache {
                 lines: Rc::new(Vec::new()),
                 active_rows: Vec::new(),
+                sticky_count: 0,
             },
         }
     }
@@ -711,8 +714,9 @@ impl NodeEntry {
     /// non-cursor key events.
     fn build_render_plan(&mut self) -> RenderPlan {
         let mut lines = Vec::new();
+        let mut sticky_count = 0usize;
 
-        // Header lines from the node's header() method.
+        // 1. Header lines from the node's header() method (sticky).
         let empty_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
@@ -727,24 +731,103 @@ impl NodeEntry {
                 is_marker_row: false,
                 option: usize::MAX,
             });
+            sticky_count += 1;
         }
 
-        // Selectable rows.
-        for (i, rref) in self.content.ranked_rows.iter().enumerate() {
-            let text = match rref.resolve(&self.content.data_rc) {
-                Some(row) => match &row.description {
-                    Some(d) => format!("{} — {}", row.id, d),
-                    None => row.id.clone(),
-                },
-                None => "???".to_string(),
-            };
+        // 2. Table header row (if columns declared, sticky).
+        let columns = self.inner.columns();
+        if !columns.is_empty() {
+            let header_text = columns.iter()
+                .map(|c| c.header.as_str())
+                .collect::<Vec<_>>()
+                .join("  ");
             lines.push(RenderLine {
-                text,
-                style: Style::PANEL,
-                is_header: false,
-                is_marker_row: true,
-                option: i,
+                text: header_text,
+                style: Style::HEADER,
+                is_header: true,
+                is_marker_row: false,
+                option: usize::MAX,
             });
+            sticky_count += 1;
+        }
+
+        // 3. Data rows (scrollable).
+        let term_width: usize = 80; // TODO: pass from caller
+        let field_space = self.field_space();
+        let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
+
+        if has_columns {
+            // Table rendering: resolve rows via table builder.
+            use crate::table::{Align, Table};
+            let col_field_names: Vec<String> = if !columns.is_empty() {
+                columns.iter().map(|c| {
+                    if c.field.is_empty() { "id".to_string() } else { c.field.clone() }
+                }).collect()
+            } else {
+                let mut names = vec!["id".to_string()];
+                names.extend(field_space.fields.iter().map(|f| f.name.clone()));
+                names
+            };
+            let header_labels: Vec<&str> = if !columns.is_empty() {
+                columns.iter().map(|c| c.header.as_str()).collect()
+            } else {
+                col_field_names.iter().map(|s| s.as_str()).collect()
+            };
+            let mut t = Table::new(&header_labels).set_gap(2);
+            if !columns.is_empty() {
+                let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+                let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+                let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+                t = t.with_aligns(&aligns).with_min_widths(&mins).with_priorities(&prios);
+            }
+            for rref in &self.content.ranked_rows {
+                let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
+                for k in &col_field_names {
+                    cells.push(
+                        rref.resolve(&self.content.data_rc)
+                            .and_then(|row| {
+                                row.field_display(k).or_else(|| {
+                                    crate::fields::row_field_value(row, k).map(|v| match v {
+                                        crate::value::Value::Str(s) => s,
+                                        crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                                    })
+                                })
+                            })
+                            .unwrap_or_default(),
+                    );
+                }
+                t.add_row(&cells);
+            }
+            let row_texts = t.render_multiline(term_width.saturating_sub(2));
+            for (i, text) in row_texts.iter().enumerate() {
+                for (j, sub) in text.split('\n').enumerate() {
+                    lines.push(RenderLine {
+                        text: sub.to_string(),
+                        style: Style::PANEL,
+                        is_header: false,
+                        is_marker_row: j == 0,
+                        option: i,
+                    });
+                }
+            }
+        } else {
+            // Plain text rows: id + description.
+            for (i, rref) in self.content.ranked_rows.iter().enumerate() {
+                let text = match rref.resolve(&self.content.data_rc) {
+                    Some(row) => match &row.description {
+                        Some(d) => format!("{} — {}", row.id, d),
+                        None => row.id.clone(),
+                    },
+                    None => "???".to_string(),
+                };
+                lines.push(RenderLine {
+                    text,
+                    style: Style::PANEL,
+                    is_header: false,
+                    is_marker_row: true,
+                    option: i,
+                });
+            }
         }
 
         // Resolve active row indices.
@@ -762,49 +845,41 @@ impl NodeEntry {
 
         let lines_rc = Rc::new(lines);
 
-        // Cache the lines and active_rows.
+        // Cache the lines, active_rows, and sticky_count.
         self.content.render.lines = Rc::clone(&lines_rc);
         self.content.render.active_rows = active_rows.clone();
+        self.content.render.sticky_count = sticky_count;
 
         let active = if active_rows.is_empty() {
-            None
+            Vec::new()
         } else {
-            // Use the first active row as the primary active marker.
-            Some(active_rows[0])
+            active_rows
         };
 
         RenderPlan {
-            title: None,
             lines: lines_rc,
             selected: if self.content.ranked_rows.is_empty() {
                 None
             } else {
                 Some(self.epoch.cursor_idx)
             },
-            active,
-            detail: Vec::new(),
+            active_rows: active,
+            sticky_count,
         }
     }
 
     /// Cursor-move fast path: clone the cached lines Rc, only update
     /// markers. Zero allocation for the lines themselves.
     fn plan_from_cache(&self) -> RenderPlan {
-        let active = if self.content.render.active_rows.is_empty() {
-            None
-        } else {
-            Some(self.content.render.active_rows[0])
-        };
-
         RenderPlan {
-            title: None,
             lines: Rc::clone(&self.content.render.lines),
             selected: if self.content.ranked_rows.is_empty() {
                 None
             } else {
                 Some(self.epoch.cursor_idx)
             },
-            active,
-            detail: Vec::new(),
+            active_rows: self.content.render.active_rows.clone(),
+            sticky_count: self.content.render.sticky_count,
         }
     }
 }
@@ -1125,7 +1200,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
         match result {
             MenuResult::Continue(plan, _) => {
-                assert_eq!(plan.active, Some(1));
+                assert_eq!(plan.active_rows, vec![1]);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
