@@ -266,8 +266,8 @@ impl PlanBuilder {
                 .candidates
                 .iter()
                 .map(|r| match &r.description {
-                    Some(d) => format!("{} — {}", r.id, d),
-                    None => r.id.clone(),
+                    Some(d) if !d.is_empty() => format!("{} — {}", r.id, d),
+                    _ => r.id.clone(),
                 })
                 .collect()
         };

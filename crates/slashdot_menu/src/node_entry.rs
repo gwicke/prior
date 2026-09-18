@@ -186,6 +186,7 @@ impl NodeEntry {
             self.epoch = EpochState::default();
             self.cache_epoch = epoch;
         }
+        // eprintln!("In node_traverse {}", prompt_suffix);
 
         // Phase 1: Parse section (single parse pass).
         let trailing_space = prompt_suffix.ends_with(' ');
@@ -263,6 +264,7 @@ impl NodeEntry {
     ) -> MenuResult {
         match key {
             HostKey::Enter => {
+                // eprintln!("In leaf enter");
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
                     self.epoch.confirm_pending = false;
@@ -364,6 +366,7 @@ impl NodeEntry {
                 )
             }
             HostKey::Enter => {
+                eprintln!("in listing enter");
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
                     return MenuResult::DoneError("cursor row vanished".into());
@@ -767,9 +770,9 @@ impl NodeEntry {
 
         // 3. Data rows (scrollable).
         let term_width: usize = 80; // TODO: pass from caller
-
-        if has_columns {
-            // Table rendering: resolve rows via table builder.
+        {
+            // Table rendering: always use the table builder.
+            // Default columns: id + description (implicit fields).
             use crate::table::{Align, Table};
             let col_field_names: Vec<String> = if !columns.is_empty() {
                 columns.iter().map(|c| {
@@ -778,6 +781,10 @@ impl NodeEntry {
             } else {
                 let mut names = vec!["id".to_string()];
                 names.extend(field_space.fields.iter().map(|f| f.name.clone()));
+                if names.len() == 1 {
+                    // No fields declared — default to id + description.
+                    names.push("description".to_string());
+                }
                 names
             };
             let header_labels: Vec<&str> = if !columns.is_empty() {
@@ -821,24 +828,6 @@ impl NodeEntry {
                         option: i,
                     });
                 }
-            }
-        } else {
-            // Plain text rows: id + description.
-            for (i, rref) in self.content.ranked_rows.iter().enumerate() {
-                let text = match rref.resolve(&self.content.data_rc) {
-                    Some(row) => match &row.description {
-                        Some(d) => format!("{} — {}", row.id, d),
-                        None => row.id.clone(),
-                    },
-                    None => "???".to_string(),
-                };
-                lines.push(RenderLine {
-                    text,
-                    style: Style::PANEL,
-                    is_header: false,
-                    is_marker_row: true,
-                    option: i,
-                });
             }
         }
 

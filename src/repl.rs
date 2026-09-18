@@ -2420,8 +2420,7 @@ impl Repl {
         // The menu lives for the entire prompt session; the handle is
         // created when the prompt starts with `/` and dropped when it
         // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let thinking_state = crate::v25_thinking::ThinkingState::new(ctx.thinking_level.clone());
-        let mut v25_menu = crate::v25_thinking::build_menu(&thinking_state);
+        let mut v25_menu = crate::v25_thinking::build_menu(&shared.current_thinking_level);
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
@@ -2926,13 +2925,12 @@ impl Repl {
                                             );
                                             match result {
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
-                                                    // Thinking submitted — extract level
-                                                    // from the prompt (e.g. "thinking off ").
-                                                    let level = editor.text()
-                                                        .trim_start_matches('/')
-                                                        .trim_start_matches("thinking")
-                                                        .trim()
-                                                        .to_string();
+                                                    // submit() wrote to shared.current_thinking_level;
+                                                    // read it back.
+                                                    let level = shared.current_thinking_level
+                                                        .borrow()
+                                                        .clone()
+                                                        .unwrap_or_default();
                                                     let echo = format!("/thinking {}", level);
                                                     Repl::emit_commit(
                                                         output, &mut editor, &redraw, sel,

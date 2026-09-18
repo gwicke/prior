@@ -16,29 +16,18 @@ mod tests {
     use crate::slashdot_menu::menu::SlashDotMenu;
 
     // -----------------------------------------------------------------------
-    // Thinking command (test fixture modeling /thinking enum)
+    // ThinkingValue — test fixture modeling /thinking enum values.
+    // Holds an Rc<RefCell<Option<String>>> — same pattern as the real
+    // ThinkingValue in v25_thinking.rs (shared with MenuShared).
     // -----------------------------------------------------------------------
 
-    struct TestState {
-        current_thinking_level: RefCell<Option<String>>,
-    }
-
-    impl TestState {
-        fn new() -> Rc<Self> {
-            Rc::new(TestState {
-                current_thinking_level: RefCell::new(None),
-            })
-        }
-    }
-
-    /// One of the four thinking level values (off/low/med/high).
     struct ThinkingValue {
         level: String,
-        shared: Rc<TestState>,
+        shared: Rc<RefCell<Option<String>>>,
     }
 
     impl ThinkingValue {
-        fn new(level: &str, shared: Rc<TestState>) -> Self {
+        fn new(level: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
             ThinkingValue {
                 level: level.to_string(),
                 shared,
@@ -48,21 +37,20 @@ mod tests {
 
     impl SlashDotNode for ThinkingValue {
         fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            let current = self.shared.current_thinking_level.borrow();
+            let current = self.shared.borrow();
             let active = if current.as_deref() == Some(&self.level) {
                 vec![self.level.clone()]
             } else {
                 Vec::new()
             };
             Ok(Rc::new(DataResponse {
-                rows: vec![Row::new(&self.level)],
+                rows: vec![Row::new(&self.level).desc("")],
                 active_ids: active,
             }))
         }
 
         fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-            *self.shared.current_thinking_level.borrow_mut() =
-                Some(self.level.clone());
+            *self.shared.borrow_mut() = Some(self.level.clone());
             SubmitResult::Done(None)
         }
     }
@@ -71,16 +59,15 @@ mod tests {
     // Menu construction
     // -----------------------------------------------------------------------
 
-    fn build_thinking_menu(state: &Rc<TestState>) -> SlashDotMenu {
+    fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         let mut menu = SlashDotMenu::new();
 
-        // Thinking listing node (child of root, gets index 0).
-        // Uses StaticListingNode — no dedicated impl needed.
+        // Root-level: StaticListingNode replaces a dedicated ThinkingNode impl.
         menu.add_child(&[], StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
         ]));
 
-        // Enum value children under thinking (index "0" in root's children).
+        // Enum value children under thinking (child index "0" in root's children).
         for level in &["off", "low", "med", "high"] {
             menu.add_child(
                 &["0"],
@@ -97,7 +84,7 @@ mod tests {
 
     #[test]
     fn thinking_lists_values() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         match h.eval_prompt("thinking ", HostKey::None) {
@@ -107,10 +94,10 @@ mod tests {
                     .map(|l| l.text.as_str())
                     .collect();
                 assert_eq!(row_texts.len(), 4);
-                assert!(row_texts.contains(&"off"));
-                assert!(row_texts.contains(&"low"));
-                assert!(row_texts.contains(&"med"));
-                assert!(row_texts.contains(&"high"));
+                assert!(row_texts.iter().any(|t| t.contains("off")));
+                assert!(row_texts.iter().any(|t| t.contains("low")));
+                assert!(row_texts.iter().any(|t| t.contains("med")));
+                assert!(row_texts.iter().any(|t| t.contains("high")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -118,8 +105,7 @@ mod tests {
 
     #[test]
     fn thinking_active_marker() {
-        let state = TestState::new();
-        *state.current_thinking_level.borrow_mut() = Some("med".to_string());
+        let state = Rc::new(RefCell::new(Some("med".to_string())));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         match h.eval_prompt("thinking ", HostKey::None) {
@@ -132,7 +118,7 @@ mod tests {
 
     #[test]
     fn thinking_tab_drills_to_value() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let r = h.eval_prompt("thinking ", HostKey::None);
@@ -155,7 +141,7 @@ mod tests {
 
     #[test]
     fn thinking_enter_submits() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -163,7 +149,7 @@ mod tests {
         let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
         match h.eval_prompt(&prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
-                assert_eq!(*state.current_thinking_level.borrow(), Some("off".to_string()));
+                assert_eq!(*state.borrow(), Some("off".to_string()));
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
@@ -173,14 +159,14 @@ mod tests {
     fn thinking_enter_drills_and_submits() {
         // Enter at the listing level should drill into the cursor row and
         // submit immediately, without requiring a separate Tab first.
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
         match h.eval_prompt("thinking ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(
-                    *state.current_thinking_level.borrow(),
+                    *state.borrow(),
                     Some("off".to_string()),
                     "Enter at listing should drill cursor row (off) and submit"
                 );
@@ -191,7 +177,7 @@ mod tests {
 
     #[test]
     fn thinking_enter_drills_cursor_position() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -199,7 +185,7 @@ mod tests {
         match h.eval_prompt("thinking ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(
-                    *state.current_thinking_level.borrow(),
+                    *state.borrow(),
                     Some("high".to_string()),
                     "Enter should drill cursor row (high) and submit"
                 );
@@ -210,7 +196,7 @@ mod tests {
 
     #[test]
     fn thinking_esc_pops() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -225,7 +211,7 @@ mod tests {
 
     #[test]
     fn thinking_fuzzy_filter() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         match h.eval_prompt("thinking h", HostKey::None) {
@@ -234,10 +220,10 @@ mod tests {
                     .filter(|l| !l.is_header)
                     .map(|l| l.text.as_str())
                     .collect();
-                assert!(row_texts.contains(&"high"));
-                assert!(!row_texts.contains(&"off"));
-                assert!(!row_texts.contains(&"low"));
-                assert!(!row_texts.contains(&"med"));
+                assert!(row_texts.iter().any(|t| t.contains("high")));
+                assert!(!row_texts.iter().any(|t| t.contains("off")));
+                assert!(!row_texts.iter().any(|t| t.contains("low")));
+                assert!(!row_texts.iter().any(|t| t.contains("med")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -245,7 +231,7 @@ mod tests {
 
     #[test]
     fn thinking_move_cursor() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -259,7 +245,7 @@ mod tests {
 
     #[test]
     fn root_listing_shows_thinking() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         match h.eval_prompt("", HostKey::None) {
@@ -276,7 +262,7 @@ mod tests {
 
     #[test]
     fn thinking_move_cursor_then_tab() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -291,7 +277,7 @@ mod tests {
 
     #[test]
     fn thinking_enter_different_value() {
-        let state = TestState::new();
+        let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("thinking ", HostKey::None);
@@ -301,7 +287,7 @@ mod tests {
         assert!(prompt.contains("med"), "should be med: {}", prompt);
         match h.eval_prompt(&prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
-                assert_eq!(*state.current_thinking_level.borrow(), Some("med".to_string()));
+                assert_eq!(*state.borrow(), Some("med".to_string()));
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
         }

@@ -13,36 +13,20 @@ use crate::slashdot_menu::node_impl::{
 use crate::slashdot_menu::menu::SlashDotMenu;
 
 // ---------------------------------------------------------------------------
-// Shared state: mutable reference shared between all nodes in the tree.
-// ---------------------------------------------------------------------------
-
-/// Shared state for the thinking command tree. All ThinkingNode and
-/// ThinkingValue instances hold an `Rc` to this; mutations in `submit`
-/// are visible to all subsequent `data()` calls.
-#[derive(Debug)]
-pub struct ThinkingState {
-    pub level: RefCell<Option<String>>,
-}
-
-impl ThinkingState {
-    pub fn new(initial: Option<String>) -> Rc<Self> {
-        Rc::new(ThinkingState {
-            level: RefCell::new(initial),
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ThinkingValue — one of the four enum values (off/low/med/high).
+//
+// Holds an `Rc<RefCell<Option<String>>>` that is the *same cell* the REPL
+// owns (via `MenuShared.current_thinking_level`). `submit()` writes to it;
+// the REPL reads it back after `DoneSuccess`. No parallel state.
 // ---------------------------------------------------------------------------
 
 pub struct ThinkingValue {
     level: String,
-    shared: Rc<ThinkingState>,
+    shared: Rc<RefCell<Option<String>>>,
 }
 
 impl ThinkingValue {
-    pub fn new(level: &str, shared: Rc<ThinkingState>) -> Self {
+    pub fn new(level: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
         ThinkingValue {
             level: level.to_string(),
             shared,
@@ -52,7 +36,7 @@ impl ThinkingValue {
 
 impl SlashDotNode for ThinkingValue {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let current = self.shared.level.borrow();
+        let current = self.shared.borrow();
         let active = if current.as_deref() == Some(&self.level) {
             vec![self.level.clone()]
         } else {
@@ -65,7 +49,7 @@ impl SlashDotNode for ThinkingValue {
     }
 
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-        *self.shared.level.borrow_mut() = Some(self.level.clone());
+        *self.shared.borrow_mut() = Some(self.level.clone());
         SubmitResult::Done(None)
     }
 }
@@ -76,12 +60,11 @@ impl SlashDotNode for ThinkingValue {
 
 /// Build the v2.5 `SlashDotMenu` tree. Currently only contains `/thinking`.
 /// Other commands will be added as they are ported.
-pub fn build_menu(thinking_state: &Rc<ThinkingState>) -> SlashDotMenu {
+pub fn build_menu(thinking_level: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
     let mut menu = SlashDotMenu::new();
 
     // Root-level commands: each `add_child(&[], ...)` adds a child at the
     // root. The root's listing merges all children's `data()` rows.
-    // Uses StaticListingNode — no dedicated impl needed.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("thinking", "set thinking level"),
     ]));
@@ -90,7 +73,7 @@ pub fn build_menu(thinking_state: &Rc<ThinkingState>) -> SlashDotMenu {
     for level in &["off", "low", "med", "high"] {
         menu.add_child(
             &["0"],
-            ThinkingValue::new(level, thinking_state.clone()),
+            ThinkingValue::new(level, thinking_level.clone()),
         );
     }
 
