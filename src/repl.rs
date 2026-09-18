@@ -2420,7 +2420,7 @@ impl Repl {
         // The menu lives for the entire prompt session; the handle is
         // created when the prompt starts with `/` and dropped when it
         // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let mut v25_menu = crate::v25_thinking::build_menu(&shared.current_thinking_level);
+        let mut v25_menu = crate::v25_thinking::build_menu(&shared.current_thinking_level, &shared.settings);
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
@@ -2568,7 +2568,7 @@ impl Repl {
             }
             // --- Compute the overlay from the current buffer. ---
             let buf_text = editor.text();
-            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") {
+            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") || buf_text.starts_with("/persona") {
                 // v2.5 path: route through the persistent handle.
                 // Manage handle lifecycle: create on first `/`, drop when not `/`.
                 if v25_handle.is_none() {
@@ -2925,18 +2925,36 @@ impl Repl {
                                             );
                                             match result {
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
-                                                    // submit() wrote to shared.current_thinking_level;
-                                                    // read it back.
-                                                    let level = shared.current_thinking_level
-                                                        .borrow()
-                                                        .clone()
-                                                        .unwrap_or_default();
-                                                    let echo = format!("/thinking {}", level);
-                                                    Repl::emit_commit(
-                                                        output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &echo, "", false,
-                                                    );
-                                                    return Some(InputAction::SetThinking(level));
+                                                    // The node's submit() wrote to shared state.
+                                                    // Read back based on the command prefix.
+                                                    let first_word = line.split_whitespace().next().unwrap_or("");
+                                                    match first_word {
+                                                        "thinking" => {
+                                                            let level = shared.current_thinking_level
+                                                                .borrow()
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            let echo = format!("/thinking {}", level);
+                                                            Repl::emit_commit(
+                                                                output, &mut editor, &redraw, sel,
+                                                                &mut input_row, &echo, "", false,
+                                                            );
+                                                            return Some(InputAction::SetThinking(level));
+                                                        }
+                                                        "persona" => {
+                                                            let name = shared.settings.borrow()
+                                                                .default_persona
+                                                                .clone()
+                                                                .unwrap_or_default();
+                                                            let echo = format!("/persona {}", name);
+                                                            Repl::emit_commit(
+                                                                output, &mut editor, &redraw, sel,
+                                                                &mut input_row, &echo, "", false,
+                                                            );
+                                                            return Some(InputAction::SetPersona(name));
+                                                        }
+                                                        _ => {}
+                                                    }
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
                                                     // Drill happened — update buffer, next

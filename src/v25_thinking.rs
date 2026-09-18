@@ -58,24 +58,26 @@ impl SlashDotNode for ThinkingValue {
 // Menu builder — called once at REPL startup.
 // ---------------------------------------------------------------------------
 
-/// Build the v2.5 `SlashDotMenu` tree. Currently only contains `/thinking`.
-/// Other commands will be added as they are ported.
-pub fn build_menu(thinking_level: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
+/// Build the v2.5 `SlashDotMenu` tree with all ported commands.
+pub fn build_menu(
+    thinking_level: &Rc<RefCell<Option<String>>>,
+    settings: &Rc<RefCell<crate::settings::SettingsStore>>,
+) -> SlashDotMenu {
     let mut menu = SlashDotMenu::new();
 
-    // Root-level commands: each `add_child(&[], ...)` adds a child at the
-    // root. The root's listing merges all children's `data()` rows.
+    // Thinking: StaticListingNode parent + ThinkingValue children.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("thinking", "set thinking level"),
     ]));
-
-    // ThinkingValue children under ThinkingNode (child index "0").
     for level in &["off", "low", "med", "high"] {
         menu.add_child(
             &["0"],
             ThinkingValue::new(level, thinking_level.clone()),
         );
     }
+
+    // Persona: StaticListingNode parent + PersonaValue children.
+    crate::v25_persona::add_persona_children(&mut menu, settings);
 
     menu
 }

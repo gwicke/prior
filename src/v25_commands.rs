@@ -293,3 +293,210 @@ mod tests {
         }
     }
 }
+
+// ===========================================================================
+// Persona command tests — same engine harness, tests the persona pattern.
+// ===========================================================================
+
+#[cfg(test)]
+mod persona_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::slashdot_menu::fields::Row;
+    use crate::slashdot_menu::node_impl::{
+        DataResponse, DataResult, HostKey, MenuResult, PathArgs,
+        SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
+    };
+    use crate::slashdot_menu::menu::SlashDotMenu;
+
+    /// Test-only persona value node. Uses a plain Rc<RefCell<Option<String>>>
+    /// for the persona name (mirrors SettingsStore.default_persona).
+    struct PersonaValue {
+        name: String,
+        shared: Rc<RefCell<Option<String>>>,
+    }
+
+    impl PersonaValue {
+        fn new(name: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
+            PersonaValue {
+                name: name.to_string(),
+                shared,
+            }
+        }
+    }
+
+    impl SlashDotNode for PersonaValue {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            let current = self.shared.borrow();
+            let matched = if self.name == "none" {
+                current.is_none() || current.as_deref() == Some("")
+            } else {
+                current.as_deref() == Some(&self.name)
+            };
+            let active = if matched { vec![self.name.clone()] } else { Vec::new() };
+            Ok(Rc::new(DataResponse {
+                rows: vec![Row::new(&self.name).desc("")],
+                active_ids: active,
+            }))
+        }
+
+        fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+            let val = if self.name == "none" { None } else { Some(self.name.clone()) };
+            *self.shared.borrow_mut() = val;
+            SubmitResult::Done(None)
+        }
+    }
+
+    fn build_persona_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
+        let mut menu = SlashDotMenu::new();
+        menu.add_child(&[], StaticListingNode::new(&[
+            StaticRow::new("persona", "set runtime persona"),
+        ]));
+        let names = ["architect", "strict", "security", "none"];
+        for name in &names {
+            menu.add_child(
+                &["0"],
+                PersonaValue::new(name, state.clone()),
+            );
+        }
+        menu
+    }
+
+    #[test]
+    fn persona_lists_values() {
+        let state = Rc::new(RefCell::new(None));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("persona ", HostKey::None) {
+            MenuResult::Continue(plan, _) => {
+                let row_texts: Vec<&str> = plan.lines.iter()
+                    .filter(|l| !l.is_header)
+                    .map(|l| l.text.as_str())
+                    .collect();
+                assert_eq!(row_texts.len(), 4);
+                assert!(row_texts.iter().any(|t| t.contains("architect")));
+                assert!(row_texts.iter().any(|t| t.contains("strict")));
+                assert!(row_texts.iter().any(|t| t.contains("none")));
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_active_marker() {
+        let state = Rc::new(RefCell::new(Some("strict".to_string())));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("persona ", HostKey::None) {
+            MenuResult::Continue(plan, _) => {
+                assert!(!plan.active_rows.is_empty(), "strict should have active marker");
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_active_none_when_empty() {
+        let state = Rc::new(RefCell::new(None));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("persona ", HostKey::None) {
+            MenuResult::Continue(plan, _) => {
+                assert!(!plan.active_rows.is_empty(), "none should be active when persona is None");
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_enter_submits() {
+        // With state=Some("architect"), cursor is on "architect".
+        // Tab drills into it, Enter submits.
+        let state = Rc::new(RefCell::new(Some("architect".to_string())));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("persona ", HostKey::None);
+        let _ = h.eval_prompt("persona ", HostKey::Tab);
+        match h.eval_prompt("persona architect ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                assert_eq!(*state.borrow(), Some("architect".to_string()));
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_enter_drills_and_submits() {
+        // When state is None, "none" is active → cursor defaults to "none".
+        let state = Rc::new(RefCell::new(None));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("persona ", HostKey::None);
+        match h.eval_prompt("persona ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                // "none" was active → submits None (clears persona).
+                assert_eq!(*state.borrow(), None);
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_enter_drills_active_row() {
+        // When state is "strict", cursor lands on "strict" → Enter submits it.
+        let state = Rc::new(RefCell::new(Some("strict".to_string())));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("persona ", HostKey::None);
+        match h.eval_prompt("persona ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                assert_eq!(
+                    *state.borrow(),
+                    Some("strict".to_string()),
+                    "Enter at listing should drill active row (strict) and submit"
+                );
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_none_clears() {
+        let state = Rc::new(RefCell::new(Some("strict".to_string())));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        let _ = h.eval_prompt("persona ", HostKey::None);
+        // Cursor is on "strict" (index 1). MoveCursor(+2) → "none" (index 3).
+        let _ = h.eval_prompt("persona ", HostKey::MoveCursor(2));
+        match h.eval_prompt("persona ", HostKey::Tab) {
+            MenuResult::Continue(_, prompt) => {
+                assert!(prompt.contains("none"), "should drill none: {}", prompt);
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+        match h.eval_prompt("persona none ", HostKey::Enter) {
+            MenuResult::DoneSuccess(_) => {
+                assert_eq!(*state.borrow(), None, "none should clear persona");
+            }
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persona_root_listing() {
+        let state = Rc::new(RefCell::new(None));
+        let mut menu = build_persona_menu(&state);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("", HostKey::None) {
+            MenuResult::Continue(plan, _) => {
+                let row_texts: Vec<&str> = plan.lines.iter()
+                    .filter(|l| !l.is_header)
+                    .map(|l| l.text.as_str())
+                    .collect();
+                assert!(row_texts.iter().any(|t| t.contains("persona")));
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+}

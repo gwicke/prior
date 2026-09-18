@@ -7,28 +7,39 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6. `SlashDotNode` trait (all defaults),
-`NodeEntry` (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public
-API). Step 4: full traversal — section parse, data refresh (Rc::ptr_eq),
-view derivation (filter → fuzzy rank → sort), cursor, Esc ladder, leaf/listing
-dispatch, render plan. Step 5: merged child sets verified — `refresh_data`
-builds `row_index` across children; field metadata via `SlashDotNode::fields()`;
-row uniformity enforced (empty IDs warn+skip, duplicate IDs warn+last-wins);
-prompt reconstruction via `full_prompt(path, suffix)` at all return points.
+**Done (v2.5 reshape):** Steps 1–6 partially complete.
 
-Step 6: `/thinking` ported end-to-end. `ThinkingNode` + `ThinkingValue`
-`SlashDotNode` impls in `src/v25_thinking.rs` using shared
-`Rc<RefCell<Option<String>>>` state. REPL wired: persistent
-`SlashDotMenu` + `Option<SlashDotHandle>` in the input loop. Handle
-lifecycle: created when prompt starts with `/thinking`, dropped when
-it leaves. All overlay computation and key dispatch (Enter drills+submits,
-Tab drills, Esc pops, arrows move cursor) routes through `eval_prompt`.
-`ActiveOverlay::V25Menu { plan }` variant for the v2.5 engine overlay.
-prompt reconstruction via `full_prompt(path, suffix)` at all return points.
-22 new tests covering parse, listing, drill, cursor, active markers, header,
-Esc, fuzzy rank, mixed children, empty ID handling.
+Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
+(internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
+traversal: section parse, data refresh (Rc::ptr_eq), view derivation
+(filter → fuzzy rank → sort), cursor, Esc ladder, leaf/listing dispatch,
+render plan. Merged child sets, field metadata, row uniformity.
 
-Design deviations from step4 doc (per user clarification):
+Step 6 (command porting): `/thinking` fully ported end-to-end. `/persona`
+next. Root list via `StaticListingNode`. Remaining commands deferred.
+
+**Key additions since last update:**
+- `StaticListingNode` (convenience impl in `node_impl.rs`): takes static
+  row config (id, description) in constructor. Optional header, active
+  markers (`Rc<RefCell<HashSet>>>`), field metadata. Eliminates boilerplate
+  impls for listing-level commands. Used for the root command list and the
+  `/thinking` parent node.
+- `StaticRow` helper struct for `StaticListingNode` row definitions.
+- Default table listing: all rows render via the table builder with
+  `id | description` as default columns (implicit fields via
+  `row_field_value`). Plain-text `id — description` format removed.
+- Empty-description fix: `Some("")` treated as no description (no dash
+  separator) in both `node_entry.rs` and `render.rs` render paths.
+- Shared state pattern: `ThinkingValue` writes to the same
+  `Rc<RefCell<Option<String>>>` the REPL owns (`MenuShared`), no parallel
+  state. After `DoneSuccess`, the REPL reads back from the shared cell.
+  This is the pattern for all future command nodes.
+- REPL wiring: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in the
+  input loop. Handle lifecycle: created when prompt starts with `/`, dropped
+  when it leaves. `ActiveOverlay::V25Menu { plan }` variant for v2.5
+  engine overlay. All key dispatch routes through `eval_prompt`.
+
+**Design deviations from step4 doc (per user clarification):**
 - Modifiers are single-word (no multi-word values).
 - Sort applied after fuzzy rank (filter → fuzzy rank → sort).
 - `Args` and `PathArgs` own their data (borrow deferred).
@@ -43,66 +54,47 @@ Design deviations from step4 doc (per user clarification):
 
 **RenderPlan / rendering:**
 - ~~No `Rc<Vec<RenderLine>>` sharing~~ **Done.** `RenderPlan.lines` is now
-  `Rc<Vec<RenderLine>>`. `plan_from_cache()` clones the Rc (refcount bump)
-  and only recomputes `selected`/`active_rows` markers.
-- ~~No table layout / `ColumnDef` in RenderPlan~~ **Done.** `RenderPlan`
-  aligned with v2.5 §6: no title, no detail, `active_rows: Vec<usize>`,
-  `sticky_count: usize`. Panel structure: header() → table header (if
-  columns) → data rows. `SlashDotNode::columns()` trait method for
-  explicit column definitions; falls back to field_space inference.
-  `build_render_plan` uses `Table::render_multiline` when columns exist.
+  `Rc<Vec<RenderLine>>`.
+- ~~No table layout / `ColumnDef` in RenderPlan~~ **Done.** Default table
+  with `id | description` columns. `SlashDotNode::columns()` for explicit
+  column definitions.
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
-  but no dialog text is rendered in the plan. The confirm dialog (§9)
-  rendering is a step 7 concern.
+  but no dialog text is rendered in the plan.
 - `RenderPlan.title` is unused — always `None`. Will be set when commands
   provide panel titles.
 
 **PathArgs / Args borrowing:**
-- `PathArgs` and `Args` own their data (`String`, `Vec<String>`). The
-  step4 design and user preference was `Vec<(&str, &str)>` borrowed from
-  the prompt — cheaper allocation but requires a lifetime on `PathArgs`.
-  Deferred to avoid lifetime complexity in the trait API during early
-  development; revisit when profiling shows allocation pressure.
+- Owned data. Deferred to avoid lifetime complexity in the trait API.
 
 **`parse_section` vs `grammar::parse_level`:**
-- `parse_section()` (node_entry.rs) is a new single-pass left-to-right
-  algorithm. The existing `grammar::parse_level()` (right-to-left,
-  selection-candidate based) is unused by v2.5 traversal. Both remain
-  in the crate — `parse_level` is still used by the old v2.0 interpreter
-  tests. When the old interpreter is deleted, `parse_level` can be
-  removed or consolidated.
-
-**Test porting:**
-- 22 new v2.5 tests written; 26 old interpreter tests remain in the old
-  harness (test the old code path). The old tests will be replaced when
-  commands are migrated (step 6). No test was mechanically ported —
-  the new tests cover the v2.5 traversal harness independently.
+- `parse_section()` (node_entry.rs) is the v2.5 algorithm.
+  `parse_level` remains for old v2.0 interpreter tests.
 
 **Row uniformity:**
-- Only enforces non-empty `id`. The design says "at least `id` +
-  `description`" but also "optionally `description`" — currently
-  description is not checked. Could add a `warn!` for missing
-  description in debug builds.
+- Only enforces non-empty `id`. Description optional.
 
 **Field space inference fallback:**
 - When `SlashDotNode::fields()` returns empty, `infer_field_space()`
-  builds a `FieldSpace` from the row data (infers number vs string from
-  first non-missing value). Works but less precise than explicit metadata.
-  Commands with known fields should override `fields()`.
+  builds from row data. Commands with known fields should override
+  `fields()`.
 
 **Cursor / view state:**
-- `cursor_idx` is not re-derived from `cursor_id` on every
-  `MoveCursor` — it's updated in-place and kept in sync. The step4
-  design says "ID is authoritative, index is memoized" which matches,
-  but the code doesn't enforce the invariant with a debug_assert.
-- `EpochState` reset on epoch change clears `view_args` and
-  `should_restore_view_args`. Content cache (`data_rc`, `row_index`)
-  is NOT cleared — it persists across epochs (stale rows are replaced
-  on the next `refresh_data`). This is intentional but undocumented.
+- `cursor_idx` updated in-place and kept in sync. No debug_assert
+  enforcing the ID-authoritative invariant.
 
-**Next:** Expand REPL handle lifecycle to all `/` commands (currently
-thinking-only). Port remaining commands: Model, Persona, root list.
-Step 7 (two-phase submit confirm). Step 8 (persistent engine cleanup).
+---
+
+## Next steps (revised)
+
+1. **`/persona`** — enum values like `/thinking`, active marker from
+   `MenuShared.current_persona` / settings store. Same shared-state pattern.
+2. **Root `/` list** — `StaticListingNode` children for all commands.
+   Extends the REPL handle lifecycle to all `/` prefixes.
+3. **`/model`** — dynamic rows from catalog, field modifiers, computed
+   fields. The showcase for `fields()` + merged child sets.
+4. **Step 7** — two-phase submit confirm.
+5. **Step 8** — persistent engine cleanup.
+6. **Steps 9–14** — Session, Tree, Settings, Sandbox, Stat, Final cleanup.
 
 ---
 
@@ -184,9 +176,7 @@ but the filter/fuzzy/sort pipeline is reused.
 in node_entry.rs — a single left-to-right word scan that classifies each
 word as dot modifier, positional (fuzzy term), or matched child ID. The
 first word matching a row ID terminates the section; everything after is
-the tail. Does NOT use `grammar::parse_level()` (different algorithm:
-new parse is left-to-right with row_index lookup, per §2.1; `parse_level`
-is right-to-left with selection candidates).
+the tail.
 
 4b. **Key handling at listing level.** Done:
 - `MoveCursor`: update cursor_idx/cursor_id, plan_from_cache
@@ -200,94 +190,40 @@ is right-to-left with selection candidates).
 - `Esc`: if confirm_pending, cancel; else handle_esc
 - `None`/other: build_continue (shows header)
 
-4d. **Cursor.** Implemented as `cursor_id: Option<String>` + `cursor_idx:
-usize` per node (in EpochState). Reset on epoch increment. `cursor_id`
-survives re-rank (re-resolved via `seed_or_keep_cursor`); `cursor_idx`
-is the O(1) display lookup. Active marker seeds cursor on first active
-row. This differs from the plan's `(epoch, terms_hash)` keying — cursor
-persists across filter changes and is re-resolved, not reset.
+4d. **Cursor.** `cursor_id: Option<String>` + `cursor_idx: usize` per node
+(in EpochState). Active marker seeds cursor on first active row.
 
-4e. **Esc ladder.** Implemented per design §5.1 with per-node restore
-(replaces old frame stack). The ladder:
-1. **Restore trigger** (phase 3 of node_traverse): bare drilled ID with
-   `should_restore_view_args` → seed cursor on ID's row, replace section
-   with stored `view_args`, clear flag. Applies without Esc.
-2. **Clear refinement**: terms, modifiers, selection all dropped.
-3. **Strip trailing space** → parent becomes responsible.
-4. **Close** (nothing left at root).
-The "frame replay" from the old design is replaced by the per-node
-`should_restore_view_args` flag + `view_args` string — no traversal
-stack, the prompt IS the state.
+4e. **Esc ladder.** Per-node restore with `should_restore_view_args` +
+`view_args` string — no traversal stack, the prompt IS the state.
 
-4f. **Render plan.** Basic plan implemented: `header()` lines + ranked
-rows (id — description) + `selected: Option<usize>` + `active:
-Option<usize>`. No Rc-shared lines, no table layout, no `ColumnDef`
-— table rendering comes when commands are ported (step 6). The host
-already renders `RenderPlan` verbatim; columns/tables are added per-node
-as needed.
-
-**Tests:** 22 new tests covering parse (6), root listing, fuzzy filter,
-bare ID, Tab drill, cursor wrapping, active markers, header, Esc close,
-Esc clear filter, epoch reset, fuzzy rank ordering, mixed children (3),
-empty ID skip. The 26 existing interpreter tests remain in the old harness
-(not yet ported — they test the old code path and will be replaced when
-commands are migrated in step 6).
+4f. **Render plan.** `header()` lines + ranked rows (table with
+`id | description` default columns) + `selected: Option<usize>` +
+`active_rows: Vec<usize>`.
 
 ### Step 5: Merged child sets
 
 **Done.** 4 new tests.
 
-5a. **Child iteration.** `refresh_data()` iterates all children in
-declaration order, calls `node_data()` on each, concatenates rows. Each
-row's child origin is tracked via `RowRef { child_idx, row_offset }` in
-`ranked_rows`, and `row_index: HashMap<String, u16>` maps row ID →
-child index.
-
-5b. **Field metadata on the parent.** `SlashDotNode::fields()` trait
-method returns `Vec<FieldSpec>`. `NodeEntry::field_space()` uses
-trait-declared fields when non-empty, otherwise infers from row data.
-Children conform to the parent's declared fields; missing values use
-§7.1 missing-value rules.
-
-5c. **Submit dispatch.** On Tab/Enter, the engine looks up the cursor
-row's ID in `row_index` → gets child index → recurses into
-`self.children[child_idx].node_traverse()`. For leaf children this
-eventually reaches `prepare()`/`submit()`. Dispatch is via the recursive
-traversal, not a direct `submit()` call — consistent with the §2
-recursive design.
-
-5d. **Row uniformity.** Enforced in `refresh_data()`:
-- Empty ID: `eprintln!` warning + row skipped (both in `row_index`
-  construction and `ensure_view` filtering). Not just a debug_assert.
-- Duplicate ID: `eprintln!` warning + last child wins.
-- Description: not enforced (optional, §2.1 says "at least `id`" and
-  "optionally `description`").
-
-**Tests:** Mixed children merged listing, Tab drill dispatch into correct
-child, fuzzy filter across children boundary, empty ID rows skipped.
+5a–5d. Child iteration, field metadata, submit dispatch, row uniformity.
 
 ### Step 6: Port existing commands to `SlashDotNode`
 
-Migrate the already-engine-backed commands (Model, Thinking, Persona,
-root list) from descriptor+handler-registration to `SlashDotNode` impls.
+**In progress.**
 
-For each command:
-- Replace `MenuNode` + `DataProvider` + `LeafHandler` registration with an
-  `impl SlashDotNode` struct.
-- `data()` returns the rows (static list or `Rc<DataResponse>` from fetch).
-- `submit()` handles the leaf accept.
-- `header()` returns help text if any.
-- Register the instance as a child of the root node.
+6a. ~~`/thinking`~~ **Done.** `StaticListingNode` parent + `ThinkingValue`
+leaf nodes. Shared state via `Rc<RefCell<Option<String>>>` — same cell
+`MenuShared` owns. 12 tests.
 
-Commands to port (in order):
-1. Root `/` list (static children, trivial `data()`).
-2. `/thinking` (enum value child, simplest end-to-end).
-3. `/persona` (dynamic child, active marker from `data()`).
-4. `/model` (dynamic child with field modifiers, computed fields).
+6b. **`/persona`** — **Next.** Enum values (persona names + "none"),
+active marker from settings store. Same pattern as thinking.
 
-**Tests:** Existing per-command tests pass with the new harness. The
-descriptor-driven tests (`state("model")`, etc.) are replaced by
-`root.node_traverse(epoch, Tab, ...)` → check `RenderPlan`.
+6c. **Root `/` list** — `StaticListingNode` children for all commands.
+Extends REPL handle lifecycle to all `/` prefixes.
+
+6d. **`/model`** — dynamic rows from catalog, field modifiers.
+
+**Tests:** 12 new per-command tests (thinking). Additional tests per
+command as they are ported.
 
 ### Step 7: Two-phase submit confirm
 
@@ -305,9 +241,6 @@ callback captured at construction, stage the payload in private state).
 7c. Delete the `ConfirmState` / `ConfirmPrep` machinery from `accept.rs`.
 The node's private state replaces it.
 
-**Tests:** Port the confirm scenarios from `accept.rs`: prep → pause →
-Esc cancel → re-prep → accept.
-
 ### Step 8: Host epoch wrapper + persistent engine
 
 Replace the per-keypress engine rebuild with a persistent node tree.
@@ -321,9 +254,6 @@ invalidated by epoch.
 
 8c. The host's `ActiveOverlay::Menu` carries only the `RenderPlan` from the
 last `node_traverse()` call. The host renders it verbatim.
-
-**Verify:** `cargo build -p slashdot_menu` in isolation. Host compiles.
-Existing integration tests pass.
 
 ---
 
@@ -404,14 +334,15 @@ The showcase for merged child sets:
 
 | Category | Count | Status |
 | --- | --- | --- |
-| Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions, still passing) |
+| Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions) |
 | Accept (confirm, interstitial, editor, new-path) | 8 | Unchanged (v2.0 accept.rs) |
-| Interpreter (state/tab/enter/esc, dynamic, field_options) | 26 | Unchanged (v2.0, will be replaced in step 6) |
+| Interpreter (state/tab/enter/esc, dynamic, field_options) | 26 | Unchanged (v2.0, will be replaced) |
 | **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **22** | **New (steps 4–5)** |
+| **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)** | **12** | **New (step 6a)** |
 
-Total: 121 lib tests. The 26 interpreter tests test the old code path
-and will be replaced when commands are migrated (step 6). New v2.5 tests
-cover the traversal harness, not individual commands.
+Total: 523 lib tests (including non-menu tests). The 26 interpreter tests
+test the old code path and will be replaced when commands are migrated.
+New v2.5 tests cover the traversal harness and per-command behavior.
 
 ---
 
@@ -419,8 +350,8 @@ cover the traversal harness, not individual commands.
 
 | File | Reshape changes |
 | --- | --- |
-| `node_impl.rs` | **New** — `SlashDotNode` trait + public types (`PathArgs`, `Args`, `DataResponse`, `SubmitResult`, `MenuResult`, `HostKey`) |
-| `node_entry.rs` | **New** — `NodeEntry` (internal wrapper with children, cursor cache, traversal) |
+| `node_impl.rs` | **New** — `SlashDotNode` trait + public types + `StaticListingNode` |
+| `node_entry.rs` | **New** — `NodeEntry` (internal wrapper with children, cursor, traversal) |
 | `menu.rs` | **New** — `SlashDotMenu`, `SlashDotHandle` (public API) |
 | `lib.rs` | `pub mod menu` + `pub(crate) mod node_impl` + re-exports |
 | `interpreter.rs` | Logic moves into `NodeEntry::node_traverse()`; file shrinks or is deleted |
@@ -433,3 +364,9 @@ cover the traversal harness, not individual commands.
 | `filter.rs` | Unchanged (free functions) |
 | `fuzzy.rs` | Unchanged |
 | `table.rs` | Unchanged |
+
+| Host file | Changes |
+| --- | --- |
+| `src/v25_thinking.rs` | **New** — `ThinkingValue` + `build_menu()` for `/thinking` |
+| `src/v25_commands.rs` | **New** — test-only node impls for engine harness testing |
+| `src/repl.rs` | `ActiveOverlay::V25Menu` variant, `SlashDotMenu` + handle in input loop, `eval_prompt` key dispatch |

@@ -366,7 +366,6 @@ impl NodeEntry {
                 )
             }
             HostKey::Enter => {
-                eprintln!("in listing enter");
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
                     return MenuResult::DoneError("cursor row vanished".into());
