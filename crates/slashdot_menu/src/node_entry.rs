@@ -231,9 +231,9 @@ impl NodeEntry {
         }
 
         // Listing node: matched child with non-empty tail → recurse.
+        // The key is forwarded — the child handles Tab/Enter as appropriate.
         if let Some((ref _matched_id, child_idx)) = parsed.matched_child {
             if !parsed.tail.is_empty() {
-                // Drill: recurse into the matched child with the tail.
                 path.push(_matched_id.clone());
                 return self.children[child_idx].node_traverse(
                     epoch,

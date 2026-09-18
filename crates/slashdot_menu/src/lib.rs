@@ -22,16 +22,17 @@ mod node;
 mod provider;
 mod interpreter;
 mod cursor;
-mod fields;
+pub mod fields;
 mod filter;
 mod fuzzy;
 mod grammar;
 mod prompt;
-mod render;
-mod table;
-mod value;
+pub mod render;
+pub mod table;
+pub mod value;
 mod wrap;
 mod accept;
+mod v25_commands;
 
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle};
