@@ -713,9 +713,13 @@ impl NodeEntry {
     /// Rebuild lines and cache. Called when content is dirty or on
     /// non-cursor key events.
     ///
-    /// Sticky budget: header() lines are truncated to leave room for the
-    /// table header (always kept when there's content) + at least some
-    /// data rows.
+    /// Panel structure (§6):
+    /// 1. header() lines — sticky, non-selectable
+    /// 2. Table header row (if columns + data) — sticky
+    /// 3. Data rows — scrollable, with > / * markers
+    ///
+    /// The host uses `sticky_count` to decide vertical truncation when
+    /// the terminal is too short for all sticky + data lines.
     fn build_render_plan(&mut self) -> RenderPlan {
         let mut lines = Vec::new();
         let mut sticky_count = 0usize;
@@ -727,35 +731,14 @@ impl NodeEntry {
         let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
         let has_table_header = has_columns && has_data;
 
-        // 1. Header lines from the node's header() method (sticky, truncated
-        //    to leave room for table header + data rows).
-        const MAX_STICKY: usize = 6;
-        let table_header_lines: usize = if has_table_header { 1 } else { 0 };
-        let min_data_rows: usize = if has_data { 3 } else { 0 };
-        let header_budget = MAX_STICKY.saturating_sub(table_header_lines + min_data_rows);
-
+        // 1. Header lines from the node's header() method (sticky).
         let empty_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Args::default(),
         };
         let header = self.inner.header(&empty_args);
-        let mut header_emitted = 0usize;
         for h in &header {
-            if header_emitted >= header_budget {
-                // Truncate: show ellipsis on last budget line if we dropped any.
-                if header_budget > 0 && header_emitted == header_budget {
-                    lines.push(RenderLine {
-                        text: "…".to_string(),
-                        style: Style::HEADER,
-                        is_header: true,
-                        is_marker_row: false,
-                        option: usize::MAX,
-                    });
-                    sticky_count += 1;
-                }
-                break;
-            }
             lines.push(RenderLine {
                 text: h.clone(),
                 style: Style::HEADER,
@@ -764,11 +747,9 @@ impl NodeEntry {
                 option: usize::MAX,
             });
             sticky_count += 1;
-            header_emitted += 1;
         }
 
         // 2. Table header row (if columns declared and there's data, sticky).
-        //    Always kept — never truncated.
         if has_table_header {
             let header_text = columns.iter()
                 .map(|c| c.header.as_str())
