@@ -66,7 +66,7 @@ pub fn build_menu(
         let ls = live_state.clone();
         let ls2 = live_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("thinking", "set thinking level"),
+            StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
         ]).with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
         ]).into();

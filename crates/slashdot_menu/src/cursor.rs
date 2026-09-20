@@ -99,6 +99,7 @@ pub(crate) fn rank_row_refs(
         candidates.iter().map(|(rref, _)| *rref).collect()
     } else {
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+        let ql = terms.to_lowercase();
         let mut scored: Vec<(i64, RowRef)> = candidates
             .iter()
             .filter_map(|(rref, row)| {
@@ -106,7 +107,14 @@ pub(crate) fn rank_row_refs(
                     Some(d) => format!("{} {}", row.id, d),
                     None => row.id.clone(),
                 };
-                let score = matcher.fuzzy_match(&text, terms)?;
+                let base_score = matcher.fuzzy_match(&text, terms)?;
+                // Prefix bonus: exact ID prefix matches rank above
+                // subsequence-only matches (§4: "exact token pre-selection").
+                let score = if row.id.to_lowercase().starts_with(&ql) {
+                    base_score + 10_000
+                } else {
+                    base_score
+                };
                 Some((score, *rref))
             })
             .collect();

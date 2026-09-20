@@ -86,6 +86,9 @@ pub enum HostKey {
     MoveCursor(i32),
     /// No key action — used when Tab drills but does not forward a key.
     None,
+    /// Forwarded Enter from a parent listing. Leaf nodes submit on this;
+    /// listing nodes ignore it (stops recursion).
+    MaybeSubmit,
 }
 
 // --- Public trait for host implementations ---

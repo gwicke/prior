@@ -295,7 +295,8 @@ impl NodeEntry {
         }
 
         // Listing node: matched child with non-empty tail → recurse.
-        // The key is forwarded — the child handles Tab/Enter as appropriate.
+        // Forward key as-is; the child handles Enter (drill) vs
+        // MaybeSubmit (stop recursion) at its own listing/leaf level.
         if let Some((ref _matched_id, child_idx)) = parsed.matched_child {
             if !parsed.tail.is_empty() {
                 path.push(_matched_id.clone());
@@ -327,7 +328,7 @@ impl NodeEntry {
         prompt_suffix: &str,
     ) -> MenuResult {
         match key {
-            HostKey::Enter => {
+            HostKey::Enter | HostKey::MaybeSubmit => {
                 // eprintln!("In leaf enter");
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
@@ -444,10 +445,12 @@ impl NodeEntry {
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = path.to_vec();
                 new_path.push(active_id.clone());
-                // Listing drill: child gets " " (the drill indicator).
+                // Listing drill: forward MaybeSubmit (not Enter) to stop
+                // recursion — leaf nodes submit on MaybeSubmit, listing
+                // nodes ignore it.
                 self.children[child_idx].node_traverse(
                     epoch,
-                    HostKey::Enter,
+                    HostKey::MaybeSubmit,
                     new_path,
                     " ",
                     term_width,
