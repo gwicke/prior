@@ -119,12 +119,22 @@ impl Default for EpochState {
 // --- NodeEntry ---
 
 pub(crate) struct NodeEntry {
+    /// The host-provided node implementation. **NEVER access `inner`
+    /// directly from another NodeEntry — always go through `node_data()`.
+    /// Parent nodes must not call `child.inner.data()`; they call
+    /// `child.node_data()` instead, which may augment the response
+    /// (e.g. value forwarding). The only exception is this node's own
+    /// `node_data()` implementation, which calls `self.inner.data()`. */
     inner: Box<dyn SlashDotNode>,
     children: Vec<NodeEntry>,
     content: ContentCache,
     epoch: EpochState,
     /// Last epoch this node was traversed at. Triggers EpochState reset.
     cache_epoch: u64,
+    /// When true, `node_data()` enriches own rows with active values
+    /// from children's `node_data()` responses. Exposed via
+    /// `SlashDotMenuNode::with_value_forwarding()`.
+    pub(crate) value_forwarding: bool,
 }
 
 impl NodeEntry {
@@ -144,6 +154,7 @@ impl NodeEntry {
             content: ContentCache::default(),
             epoch: EpochState::default(),
             cache_epoch: 0,
+            value_forwarding: false,
         }
     }
 
@@ -152,6 +163,69 @@ impl NodeEntry {
     pub fn add_child_entry(&mut self, child: NodeEntry) -> &mut Self {
         self.children.push(child);
         self
+    }
+
+    /// Get this node's data for its parent's listing. This is the **only**
+    /// way a parent `NodeEntry` should access a child's data — never call
+    /// `child.inner.data()` directly (see the `inner` field doc comment).
+    ///
+    /// Default: delegates to `self.inner.data()`. When `value_forwarding`
+    /// is enabled, the response is enriched with active values from
+    /// children — same cache that powers the listing view (`content.data_rc`,
+    /// populated by `refresh_data()`). `self.inner.data()` provides only the
+    /// static rows (ids/descriptions for the parent); dynamic values come
+    /// from the refreshed cache, not from `data()`.
+    fn node_data(
+        &mut self,
+        epoch: u64,
+        path_args: &PathArgs,
+    ) -> crate::node_impl::DataResult {
+        if !self.value_forwarding {
+            return self.inner.data(epoch, path_args);
+        }
+
+        // Static rows from the inner node (id + description for parent).
+        let response = self.inner.data(epoch, path_args)?;
+
+        // Populate our children's data cache — same mechanism the listing
+        // view uses. This is on `self`, never on a child.
+        self.refresh_data(epoch);
+
+        // Collect active IDs from the refreshed cache.
+        let mut all_active = Vec::new();
+        for slot in &self.content.data_rc {
+            if let Some(child_resp) = slot.as_ref() {
+                for id in &child_resp.active_ids {
+                    if !all_active.contains(id) {
+                        all_active.push(id.clone());
+                    }
+                }
+            }
+        }
+
+        if all_active.is_empty() {
+            return Ok(response);
+        }
+
+        // Inject active values as "value" field on own static rows.
+        let value_str = all_active.join(", ");
+        let enriched_rows: Vec<crate::fields::Row> = response
+            .rows
+            .iter()
+            .map(|row| {
+                let mut r = crate::fields::Row::new(row.id.clone())
+                    .desc(row.description.clone().unwrap_or_default());
+                for (k, v) in &row.fields {
+                    r = r.field(k.clone(), v.clone());
+                }
+                r = r.field("value", crate::value::Value::Str(value_str.clone()));
+                r
+            })
+            .collect();
+        Ok(std::rc::Rc::new(crate::node_impl::DataResponse {
+            rows: enriched_rows,
+            active_ids: response.active_ids.clone(),
+        }))
     }
 
     // --- Main entry point ---
@@ -418,6 +492,12 @@ impl NodeEntry {
     // --- Data refresh ---
 
     /// Refresh data from children. Returns true if any child's Rc changed.
+    ///
+    /// **IMPORTANT:** Always call `child.node_data()` — never access
+    /// `child.inner.data()` directly. `node_data()` is the only sanctioned
+    /// path for parent→child data access (design §3.2). It may augment
+    /// the response (e.g. value forwarding). Bypassing it breaks the
+    /// encapsulation that `NodeEntry` provides over `SlashDotNode`.
     fn refresh_data(&mut self, epoch: u64) -> bool {
         let mut changed = false;
         let mut new_data: Vec<Option<Rc<crate::node_impl::DataResponse>>> =
@@ -429,7 +509,7 @@ impl NodeEntry {
                 suffix: String::new(),
                 args: Args::default(),
             };
-            match child.inner.data(epoch, &path_args) {
+            match child.node_data(epoch, &path_args) {
                 Ok(response) => {
                     let same = match self.content.data_rc.get(i) {
                         Some(Some(prev)) => Rc::ptr_eq(prev, &response),

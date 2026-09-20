@@ -53,6 +53,18 @@ impl SlashDotMenuNode {
         self.0.add_child_entry(child.0);
         self
     }
+
+    /// Enable value forwarding on this node. When enabled, `node_data()`
+    /// enriches this node's rows with active values from children's
+    /// `node_data()` responses (injected as the `"value"` field).
+    ///
+    /// This is the public API for the `ActiveValueForwardingListingNode`
+    /// pattern: a listing node whose value column is populated from its
+    /// children's active IDs.
+    pub fn with_value_forwarding(mut self) -> Self {
+        self.0.value_forwarding = true;
+        self
+    }
 }
 
 impl<T: SlashDotNode + 'static> From<T> for SlashDotMenuNode {

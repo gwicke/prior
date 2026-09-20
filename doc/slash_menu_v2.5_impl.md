@@ -117,8 +117,51 @@ Root `/` list done — all `/` prefixes route through v2.5 engine.
 3. ~~**`/model`**~~ — Done.
 4. ~~**Root `/` list**~~ — Done. All `/` prefixes route through v2.5.
    `SlashDotMenuNode` API for bottom-up tree construction.
-5. **Settings** (`/set`) — Self-contained, exercises mixed static+enum
-   children. Next command to port.
+5. **Settings** (`/set`) — Next command to port. Sub-steps:
+
+   0. **Fix `node_data()` deviation.** Design §3.2 specifies
+      `NodeEntry::node_data()` as the only way parent nodes access child
+      data. Implementation calls `child.inner.data()` directly in
+      `refresh_data()`. Fix: add `node_data()` on `NodeEntry`, route
+      `refresh_data()` through it. Add protective comments on `inner`
+      and in `refresh_data()`.
+
+   1. **Value forwarding in `node_data()`.** Add `value_forwarding: bool`
+      flag on `NodeEntry`, exposed via `SlashDotMenuNode::with_value_forwarding()`.
+      When true, `node_data()` calls own `inner.data()` for rows, then
+      queries children's `node_data()` for `active_ids`, injects them as
+      `"value"` field. Generic — no closures needed.
+
+   2. **`LiveState` bundle.** Replace three separate `Rc<RefCell<...>>`
+      fields in `MenuShared` with `Rc<RefCell<LiveState>>` holding model,
+      persona, thinking_level. `/model`, `/persona`, `/thinking` read/write
+      LiveState (transient). `/set` reads/writes `SettingsStore` (persistent).
+
+   3. **Closure-parametrized nodes.** ModelNode, PersonaEnumNode,
+      ThinkingEnumNode take `active_fn: Box<dyn Fn()->String>` and
+      `submit_fn: Box<dyn FnMut(&str)->Result<(),String>>`. Two
+      instantiations: live (→ LiveState) and persistent (→ SettingsStore).
+      Shared helpers (`model_row`, `order_models`, columns, fields) reused.
+
+   4. **`/set` tree.** `set` node is `StaticListingNode` with
+      Setting|Value|Description columns. Children:
+      - Listing settings (default_model, default_persona, etc.):
+        `SlashDotMenuNode` with value_forwarding; child is the
+        parameterized command node (active from SettingsStore, persist via
+        set_value).
+      - Enum settings (security_mode, show_reasoning, reasoning_in_context):
+        value_forwarding + EnumSettingNode child.
+      - Leaf settings (tool_call_limit, etc.): `SettingLeafNode` —
+        `data()` returns row with value directly; `submit()` persists;
+        `header()` shows current value on drill.
+
+   5. **Move root menu.** `build_menu()` from `v25_thinking.rs` → new
+      `src/v25_menu.rs`. Exports `build_root_menu(live_state, settings, shared)`.
+
+   6. **REPL sync.** After DoneSuccess: LiveState → agent rebuild if
+      changed; dirty flag for `/set` (existing mechanism). Engine stays
+      generic — no `/set`-specific dispatch.
+
 6. **Stat + Replay** — Simple leaf/interstitial commands.
 7. **Sandbox** — Mixed static+dynamic children.
 8. **Session** — Dynamic listing with action children.
