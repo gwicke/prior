@@ -85,6 +85,9 @@ pub fn add_persona_children(
     // Listing node at root with header.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("persona", "set runtime persona"),
+    ]).with_columns(vec![
+        crate::slashdot_menu::ColumnDef::new("", "Persona"),
+        crate::slashdot_menu::ColumnDef::new("description", "Description"),
     ]));
 
     // Persona value children under the listing node.

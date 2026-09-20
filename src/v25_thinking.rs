@@ -68,6 +68,8 @@ pub fn build_menu(
     // Thinking: StaticListingNode parent + ThinkingValue children.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("thinking", "set thinking level"),
+    ]).with_columns(vec![
+        crate::slashdot_menu::ColumnDef::new("", "Thinking Level"),
     ]));
     for level in &["off", "low", "med", "high"] {
         menu.add_child(
