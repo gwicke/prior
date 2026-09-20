@@ -7,7 +7,8 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6 partially complete. 539 tests, 0 warnings.
+**Done (v2.5 reshape):** Steps 1–6d complete. 539 lib tests + 4
+integration tests pass, 2 integration tests ignored (unported `/set`).
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -16,9 +17,14 @@ traversal: section parse, data refresh (Rc::ptr_eq), view derivation
 render plan. Merged child sets, field metadata, row uniformity.
 
 Step 6 (command porting): `/thinking`, `/persona`, `/model` fully ported.
-Root list via `StaticListingNode`. Remaining commands deferred.
+Root `/` list done — all `/` prefixes route through v2.5 engine.
 
 **Key additions:**
+- **`SlashDotMenuNode`** (menu.rs): thin public wrapper around `NodeEntry`.
+  `root()` for the implicit root, `new(impl SlashDotNode)` for leaf nodes,
+  `add_child(SlashDotMenuNode)` to build the tree. `From<T: SlashDotNode>`
+  for implicit wrapping via `.into()`. `SlashDotMenu::from_root_node(node)`
+  replaces the old `SlashDotMenu::new()` + `add_root_child()` pattern.
 - `StaticListingNode` (convenience impl in `node_impl.rs`): takes static
   row config (id, description) in constructor. Builder methods:
   `.with_header()`, `.with_active()`, `.with_fields()`, `.with_columns()`.
@@ -27,10 +33,6 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 - `ColumnDef` re-exported from `slashdot_menu` for host convenience.
   `ColumnDef::new(field, header)` — use `"id"` for row id,
   `"description"` for description, or any custom field name.
-- `ChildBuilder` (menu.rs): opaque handle returned by
-  `SlashDotMenu::add_root_child()`. Exposes `.add_child_node()` for
-  chaining — builds the tree without exposing `NodeEntry` internals or
-  hardcoded index paths. `NodeEntry` stays `pub(crate)`.
 - Default table listing: all rows render via the table builder with
   `id | description` as default columns (implicit fields via
   `row_field_value`). No header row when `columns()` is empty.
@@ -43,10 +45,11 @@ Root list via `StaticListingNode`. Remaining commands deferred.
   shared state. `DoneSuccess` dispatches by command prefix
   (`thinking` → `SetThinking`, `persona` → `SetPersona`,
   `model`/`models` → `SetModel`).
-- REPL wiring: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in the
-  input loop. Handle lifecycle: created when prompt starts with `/thinking`,
-  `/persona`, `/model`, or other ported commands; dropped when it leaves.
-  `ActiveOverlay::V25Menu { plan }` variant for v2.5 engine overlay.
+- **REPL wiring**: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in
+  the input loop. **All `/` prefixes route through v2.5** — the old
+  `from_buffer_cursors` dispatcher is no longer on the live path (only
+  used in v2.0 tests). `ActiveOverlay::V25Menu { plan }` variant for v2.5
+  engine overlay.
 - Catalog generation counter (`model_catalog::catalog_generation()`):
   atomic `u64` bumped on each cache refresh. `ModelNode` compares it to
   its cached `Rc<DataResponse>` to skip rebuild when data is unchanged
@@ -61,6 +64,7 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 - **PageUp/PageDown**: visual-line-aware page scrolling via `page_delta()`
   helper that counts wrapped sub-lines to determine how many logical rows
   fit in the available screen height.
+- **Banner**: `picocode - type / for details` (removed `/help` mention).
 
 **Design deviations from step4 doc (per user clarification):**
 - Modifiers are single-word (no multi-word values).
@@ -110,14 +114,19 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 
 1. ~~`/thinking`~~ — Done.
 2. ~~`/persona`~~ — Done.
-3. ~~**`/model`**~~ — Done. Dynamic catalog rows, `Rc<DataResponse` caching
-   via generation counter, `ChildBuilder` API for index-free tree construction.
-4. **Root `/` list** — `StaticListingNode` children for all commands.
-   Extends the REPL handle lifecycle to all `/` prefixes. This retires
-   the v2.0 root list rendering path.
-5. **Step 7** — two-phase submit confirm.
-6. **Step 8** — persistent engine cleanup.
-7. **Steps 9–14** — Session, Tree, Settings, Sandbox, Stat, Final cleanup.
+3. ~~**`/model`**~~ — Done.
+4. ~~**Root `/` list**~~ — Done. All `/` prefixes route through v2.5.
+   `SlashDotMenuNode` API for bottom-up tree construction.
+5. **Settings** (`/set`) — Self-contained, exercises mixed static+enum
+   children. Next command to port.
+6. **Stat + Replay** — Simple leaf/interstitial commands.
+7. **Sandbox** — Mixed static+dynamic children.
+8. **Session** — Dynamic listing with action children.
+9. **Tree + compact** — Most complex: dynamic listing with nested
+   actions, confirm dialogs, `NewPath` rewrites.
+10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
+    `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
+    dead v2.0 code.
 
 ---
 
@@ -150,29 +159,30 @@ The v2.0 code lives primarily in:
   per-variant rendering/key handling
 - `interpreter.rs` — v2.0 `Interpreter` (state machine)
 
-**Recommended order for retiring v2.0:**
+**Status:** Step 1 (root `/` list) is done. All `/` now routes through v2.5;
+the `from_buffer_cursors` dispatcher is only reached by v2.0 tests.
 
-1. **Root `/` list** (step 4): Retires the root list portion of `Menu`
-   and the `from_buffer_cursors` root-list path. The REPL handle lifecycle
-   extends to all `/` prefixes.
+**Recommended order for remaining v2.0 retirement:**
 
-2. **Settings** (step 11): Self-contained, exercises mixed static+enum
+1. ~~**Root `/` list**~~ **Done.** REPL routes all `/` through v2.5.
+
+2. **Settings** (step 5): Self-contained, exercises mixed static+enum
    children. Retires `Settings`, `SettingsVal`, and the settings provider.
 
-3. **Stat + Replay** (step 13): Simple leaf/interstitial commands.
+3. **Stat + Replay** (step 6): Simple leaf/interstitial commands.
    Retires `Stat` overlay, `ReplayDetailProvider`.
 
-4. **Sandbox** (step 12): Mixed static+dynamic children. Retires
+4. **Sandbox** (step 7): Mixed static+dynamic children. Retires
    `Sandbox` overlay and `sandbox_bindings` module.
 
-5. **Session** (step 9): Dynamic listing with action children. Retires
+5. **Session** (step 8): Dynamic listing with action children. Retires
    `Session`, `SessionAction`, `Confirm` overlays and `SessionProvider`.
 
-6. **Tree + compact** (step 10): Most complex — dynamic listing with
+6. **Tree + compact** (step 9): Most complex — dynamic listing with
    nested actions, confirm dialogs, `NewPath` rewrites. Retires
    `TreeAction`, `SwitchAction`, `CompactSummary`, `TreeProvider`.
 
-7. **Final cleanup** (step 14): Remove `MenuEngine`, `PlanBuilder`,
+7. **Final cleanup** (step 10): Remove `MenuEngine`, `PlanBuilder`,
    `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
    dead v2.0 code.
 
@@ -181,24 +191,24 @@ the `V25Menu` vs `Menu` overlay variants until all commands are ported.
 
 ---
 
-## 1. Crate layout (current, pre-reshape)
+## 1. Crate layout (current, post-reshape)
 
 ```
 crates/slashdot_menu/
   src/
     lib.rs
-    node.rs          # MenuNode descriptor, FieldSpec
+    node.rs          # MenuNode descriptor, FieldSpec (v2.0 compat)
     node_impl.rs     # SlashDotNode trait, StaticListingNode, public types
     node_entry.rs    # NodeEntry (internal wrapper, traversal)
-    menu.rs          # SlashDotMenu, SlashDotHandle (public API)
+    menu.rs          # SlashDotMenuNode, SlashDotMenu, SlashDotHandle (public API)
     value.rs         # Value, ValueKind, ModifierSpec
     grammar.rs       # path tokenizer
     filter.rs        # field filters + sorting (§7.1)
     cursor.rs        # cursor cache, selection validation
-    interpreter.rs   # state machine (v2.0, being replaced)
-    accept.rs        # accept phase + confirm state
+    interpreter.rs   # v2.0 state machine (dead code on live path)
+    accept.rs        # v2.0 accept phase + confirm state
     provider.rs      # ColumnDef (DataProvider absorbed into SlashDotNode)
-    render.rs        # RenderPlan, paint()
+    render.rs        # LogicalLine, RenderPlan, paint() (v2.0 compat)
     table.rs         # Table builder (render_multiline, render_header)
     fuzzy.rs         # fuzzy ranking
     prompt.rs        # PromptBuffer trait
@@ -267,9 +277,10 @@ metadata) + `ModelNode` child (dynamic catalog rows). Rc-cached
 `DataResponse` keyed by `catalog_generation()` atomic counter. Shared
 state via `Rc<MenuShared>`. Active model marker from settings. 7 tests.
 
-6d. **Root `/` list** — `StaticListingNode` children for all commands.
-Extends REPL handle lifecycle to all `/` prefixes. Generalize
-`DoneSuccess` dispatch as more commands are added.
+6d. ~~**Root `/` list**~~ **Done.** All `/` prefixes route through v2.5.
+   `SlashDotMenuNode` API for bottom-up tree construction (`root()`,
+   `new(impl)`, `add_child(node)`, `From<T>` for `.into()`). Banner
+   updated. 2 integration tests ignored (unported `/set`).
 
 **Tests:** 12 thinking + 8 persona + 7 model = 27 command tests.
 
@@ -313,8 +324,9 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
 | **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 539 lib tests (including non-menu tests). The 26 interpreter tests
-test the old code path and will be replaced when commands are migrated.
+Total: 539 lib tests + 4 integration tests (2 ignored for unported `/set`).
+The 26 interpreter tests test the old code path and will be removed
+when v2.0 is fully retired.
 
 ---
 
@@ -324,7 +336,7 @@ test the old code path and will be replaced when commands are migrated.
 | --- | --- |
 | `node_impl.rs` | `SlashDotNode` trait + public types + `StaticListingNode` (with `with_columns()`) |
 | `node_entry.rs` | `NodeEntry` (traversal, table rendering with aligned headers) |
-| `menu.rs` | `SlashDotMenu`, `SlashDotHandle` (public API) |
+| `menu.rs` | `SlashDotMenuNode`, `SlashDotMenu`, `SlashDotHandle` (public API) |
 | `lib.rs` | Re-exports: `SlashDotNode`, `ColumnDef`, `StaticListingNode`, etc. |
 | `interpreter.rs` | Logic moves into `NodeEntry::node_traverse()`; file shrinks or is deleted |
 | `accept.rs` | Confirm state machine moves to node-local state; engine dialog service stays |
@@ -338,11 +350,12 @@ test the old code path and will be replaced when commands are migrated.
 
 | Host file | Changes |
 | --- | --- |
-| `src/v25_thinking.rs` | `ThinkingEnumNode` + `build_menu()` for `/thinking`, `/persona`, `/model` |
-| `src/v25_persona.rs` | `PersonaEnumNode` node impl (writes to `SettingsStore.default_persona`) |
-| `src/v25_model.rs` | `ModelNode` node impl (dynamic catalog rows, Rc caching, columns, fields) |
+| `src/v25_thinking.rs` | `ThinkingEnumNode` + `build_menu()` — constructs root `SlashDotMenuNode` tree with thinking, persona, model |
+| `src/v25_persona.rs` | `PersonaEnumNode` node impl + `add_persona_child()` |
+| `src/v25_model.rs` | `ModelNode` node impl + `build_model_node()` — dynamic catalog rows, Rc caching, columns, fields |
 | `src/v25_commands.rs` | Test-only node impls for engine harness testing |
-| `src/repl.rs` | `ActiveOverlay::V25Menu { plan }`, `SlashDotMenu` + handle in input loop, `eval_prompt` key dispatch, V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown), `DoneSuccess` dispatch by prefix, cursor clamping |
+| `src/repl.rs` | All `/` routes through v2.5 (`ActiveOverlay::V25Menu { plan }`). `SlashDotMenu` + handle in input loop. `eval_prompt` key dispatch. V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown). `DoneSuccess` dispatch by prefix. Cursor clamping. |
+| `src/agent.rs` | Banner: `picocode - type / for details` |
 
 ---
 
