@@ -128,6 +128,25 @@ Root `/` list done — all `/` prefixes route through v2.5 engine.
     `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
     dead v2.0 code.
 
+### Known gaps (follow-ups)
+
+**Dot modifier auto-complete:** The v2.5 engine applies `.field:value`
+filter/sort syntax correctly, but the auto-complete *discovery UI* is
+missing. In v2.0, typing `/model .` showed a popup of available field
+names (via `Interpreter::field_options()` + `ActiveOverlay::Mod`).
+Typing `/model .sort:` showed distinct string values for that field.
+This popup is now unreachable — all `/` routes through v2.5, which has
+no equivalent.
+
+Primary user: `/model` (already ported, has `fields()` metadata). Can
+be tackled as a standalone step, or as part of `/session` or `/tree`
+porting if those commands also need modifier completion.
+
+Implementation options:
+- A `HostKey` variant (e.g. `ModifierComplete`) that returns candidates.
+- A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
+- Host-side detection + engine query (like v2.0's `field_options()`).
+
 ---
 
 ## 8. Remaining v2.0 code and retirement path
