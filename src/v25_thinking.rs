@@ -21,14 +21,14 @@ use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 // ---------------------------------------------------------------------------
 
 struct ThinkingEnumNode {
-    shared: Rc<RefCell<Option<String>>>,
+    live_state: Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
 }
 
 impl SlashDotNode for ThinkingEnumNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let current = self.shared.borrow();
+        let ls = self.live_state.borrow();
         let levels = ["off", "low", "med", "high"];
-        let active = current.as_deref().unwrap_or("off").to_string();
+        let active = ls.thinking_level.as_deref().unwrap_or("off").to_string();
         let rows = levels.iter()
             .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
             .collect();
@@ -40,7 +40,7 @@ impl SlashDotNode for ThinkingEnumNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let level = path_args.ids.last().cloned().unwrap_or_default();
-        *self.shared.borrow_mut() = Some(level);
+        self.live_state.borrow_mut().thinking_level = Some(level);
         SubmitResult::Done(None)
     }
 }
@@ -51,7 +51,7 @@ impl SlashDotNode for ThinkingEnumNode {
 
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(
-    thinking_level: &Rc<RefCell<Option<String>>>,
+    live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
@@ -64,7 +64,7 @@ pub fn build_menu(
         ]).with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
         ]).into();
-        tl.add_child(ThinkingEnumNode { shared: thinking_level.clone() }.into());
+        tl.add_child(ThinkingEnumNode { live_state: live_state.clone() }.into());
         root.add_child(tl);
     }
 
@@ -76,7 +76,7 @@ pub fn build_menu(
             crate::slashdot_menu::ColumnDef::new("id", "Persona"),
             crate::slashdot_menu::ColumnDef::new("description", "Description"),
         ]).into();
-        crate::v25_persona::add_persona_child(&mut pl, settings);
+        crate::v25_persona::add_persona_child(&mut pl, live_state);
         root.add_child(pl);
     }
 

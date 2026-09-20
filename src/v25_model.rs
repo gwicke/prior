@@ -49,8 +49,8 @@ impl SlashDotNode for ModelNode {
         // Catalog changed (or first call) — rebuild rows.
         let entries = crate::model_catalog::catalog_cached();
         let active = {
-            let settings = self.shared.settings.borrow();
-            crate::repl::active_model_id(&settings)
+            let ls = self.shared.live_state.borrow();
+            if ls.model.is_empty() { None } else { Some(ls.model.clone()) }
         };
         let recent: Vec<String> = self.shared.recent_models.borrow().clone();
 
@@ -82,13 +82,8 @@ impl SlashDotNode for ModelNode {
         if qualified.is_empty() {
             return SubmitResult::Done(None);
         }
-        // Parse "provider:model" → write to settings.
-        let (provider, model) = qualified
-            .split_once(':')
-            .map(|(p, m)| (p.to_string(), m.to_string()))
-            .unwrap_or((String::new(), qualified.clone()));
-        let _ = (provider, model);
-        self.shared.settings.borrow_mut().default_model = qualified;
+        // Write to live session state (NOT persistent settings).
+        self.shared.live_state.borrow_mut().model = qualified;
         SubmitResult::Done(None)
     }
 
@@ -348,7 +343,10 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        Rc::new(crate::slash_menu_bridge::MenuShared::new(settings, None))
+        let shared = Rc::new(crate::slash_menu_bridge::MenuShared::new(settings, None));
+        // Seed live_state with the active model so data() marks it.
+        shared.live_state.borrow_mut().model = "anthropic:claude-3-5-sonnet-20241022".into();
+        shared
     }
 
     #[test]
@@ -411,7 +409,8 @@ mod tests {
             SubmitResult::Done(_) => {}
             _ => panic!("expected Done"),
         }
-        assert_eq!(shared.settings.borrow().default_model, "openai:gpt-4o");
+        // Live state, not persistent settings.
+        assert_eq!(shared.live_state.borrow().model, "openai:gpt-4o");
     }
 
     fn build_test_menu(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> crate::slashdot_menu::SlashDotMenu {
@@ -461,9 +460,9 @@ mod tests {
                             "should drill into a model entry, got: {}", prompt);
                         match eval(&mut h, &prompt, crate::slashdot_menu::node_impl::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
-                                let model = shared.settings.borrow().default_model.clone();
+                                let model = shared.live_state.borrow().model.clone();
                                 assert!(!model.is_empty(),
-                                    "settings should have a model after submit");
+                                    "live_state should have a model after submit");
                             }
                             other => panic!("expected DoneSuccess on model Enter, got {:?}", other),
                         }

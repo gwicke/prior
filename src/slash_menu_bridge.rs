@@ -88,6 +88,32 @@ pub struct MenuEngine {
 }
 
 /// Shared application state the menu handlers read/write at call time
+/// Transient session state — model, persona, thinking level. These are
+/// the *live* values for the current session, distinct from the persistent
+/// defaults in `SettingsStore`. `/model`, `/persona`, and `/thinking`
+/// read/write here; `/set` reads/writes `SettingsStore`. The REPL keeps
+/// `LiveState` in sync from `AgentConfig` on each loop iteration.
+pub struct LiveState {
+    /// Session model as `provider:model`. Empty = default.
+    pub model: String,
+    /// Session persona name. `None` = no persona.
+    pub persona: Option<String>,
+    /// Session thinking level. `None` ≈ "off".
+    pub thinking_level: Option<String>,
+}
+
+impl Default for LiveState {
+    fn default() -> Self {
+        LiveState {
+            model: String::new(),
+            persona: None,
+            thinking_level: None,
+        }
+    }
+}
+
+/// Live state bundle shared between the REPL and the menu engine.
+///
 /// (design §9/§12). Handles are **live** stores, not snapshots: handlers
 /// read and write the same underlying data the rest of the app uses. All
 /// `Rc<RefCell<…>>` (single-threaded app); `Arc` only where a background
@@ -95,10 +121,15 @@ pub struct MenuEngine {
 /// building `ReplCtx` snapshots from the same storage for its own overlay
 /// rendering.
 pub struct MenuShared {
-    /// The settings store — canonical live state the `/set` handler and
-    /// `run_interactive` both mutate. Handlers read/write directly; the
-    /// menu's providers read it per `fetch` (active model id).
+    /// The settings store — canonical persistent state the `/set` handler
+    /// and `run_interactive` both mutate. `/set` nodes read/write directly;
+    /// live commands (`/model`, `/persona`, `/thinking`) use `live_state`
+    /// instead and never touch this (except via the deferred rebuild path).
     pub settings: Rc<RefCell<crate::settings::SettingsStore>>,
+    /// Transient session state (model, persona, thinking level). Live
+    /// commands read/write here; the REPL syncs from `AgentConfig` each
+    /// loop iteration.
+    pub live_state: Rc<RefCell<LiveState>>,
     /// Session repository (if available). The `/session` listing provider
     /// calls `list_sessions_sync` on it; session mutation handlers write
     /// through it. `None` when no session store exists.
@@ -116,12 +147,6 @@ pub struct MenuShared {
     /// per loop iteration; the `/tree` provider reads it per `fetch`.
     pub tree: Rc<RefCell<Vec<(usize, String, String, bool, bool, usize)>>>,
     pub leaf_id: Rc<RefCell<Option<String>>>,
-    /// Currently-active thinking level (design §5.1 active source for the
-    /// static `/thinking` value list). Mirrors the runtime agent
-    /// `config.thinking_level` (an `Option<String>`), kept in sync by the
-    /// REPL on every SetThinking / loop iteration; the `ThinkingActiveProvider`
-    /// reads it for the `*` marker. `None` ≈ "off".
-    pub current_thinking_level: Rc<RefCell<Option<String>>>,
 }
 
 impl MenuShared {
@@ -131,12 +156,12 @@ impl MenuShared {
     ) -> Self {
         MenuShared {
             settings: Rc::new(RefCell::new(settings)),
+            live_state: Rc::new(RefCell::new(LiveState::default())),
             repo,
             current_session_id: Rc::new(RefCell::new(String::new())),
             recent_models: Rc::new(RefCell::new(Vec::new())),
             tree: Rc::new(RefCell::new(Vec::new())),
             leaf_id: Rc::new(RefCell::new(None)),
-            current_thinking_level: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -146,31 +171,30 @@ impl MenuShared {
     pub fn clone_shared(&self) -> MenuShared {
         MenuShared {
             settings: self.settings.clone(),
+            live_state: self.live_state.clone(),
             repo: self.repo.clone(),
             current_session_id: self.current_session_id.clone(),
             recent_models: self.recent_models.clone(),
             tree: self.tree.clone(),
             leaf_id: self.leaf_id.clone(),
-            current_thinking_level: self.current_thinking_level.clone(),
         }
     }
 }
 
 /// Active-state provider over the runtime persona (design §5.1): the
 /// currently-in-effect persona sets the `*` marker on the static `/persona`
-/// value list. Reads the canonical live settings store (`default_persona`),
-/// which both `/set` and the persona picker write through — no host-side
-/// per-overlay marker injection. `None` (or empty) → no row marked.
+/// value list. Reads from `live_state.persona` (transient session state),
+/// not from `SettingsStore` (persistent defaults). `None` (or empty) → no
+/// row marked.
 pub struct PersonaActiveProvider {
     pub shared: Rc<MenuShared>,
 }
 
 impl crate::slashdot_menu::provider::ActiveProvider for PersonaActiveProvider {
     fn active(&mut self) -> Option<String> {
-        let s = self.shared.settings.borrow();
-        let p = s.default_persona.as_deref()?;
+        let s = self.shared.live_state.borrow();
+        let p = s.persona.as_deref()?;
         if p.is_empty() {
-            // Empty persona = the "none" row (explicit clear).
             Some("none".to_string())
         } else {
             Some(p.to_string())
@@ -178,19 +202,16 @@ impl crate::slashdot_menu::provider::ActiveProvider for PersonaActiveProvider {
     }
 }
 
-/// Active-state provider over the runtime thinking level (design §5.1): the
-/// currently-in-effect level sets the `*` marker on the static `/thinking`
-/// value list. Reads the `MenuShared.current_thinking_level` mirror of the
-/// agent's runtime `config.thinking_level` — kept in sync by the REPL on
-/// every SetThinking / loop iteration. `None` ≈ "off" (no thinking).
+/// Active-state provider over the runtime thinking level (design §5.1):
+/// reads from `live_state.thinking_level` (transient session state).
 pub struct ThinkingActiveProvider {
     pub shared: Rc<MenuShared>,
 }
 
 impl crate::slashdot_menu::provider::ActiveProvider for ThinkingActiveProvider {
     fn active(&mut self) -> Option<String> {
-        let t = self.shared.current_thinking_level.borrow();
-        t.clone().or_else(|| Some("off".to_string()))
+        let t = self.shared.live_state.borrow();
+        t.thinking_level.clone().or_else(|| Some("off".to_string()))
     }
 }
 

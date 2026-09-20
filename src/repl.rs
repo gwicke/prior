@@ -647,7 +647,11 @@ impl ActiveOverlay {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
-        *shared.current_thinking_level.borrow_mut() = ctx.thinking_level.clone();
+        *shared.live_state.borrow_mut() = crate::slash_menu_bridge::LiveState {
+            model: format!("{}:{}", ctx.provider, ctx.model),
+            persona: ctx.persona.clone(),
+            thinking_level: ctx.thinking_level.clone(),
+        };
         let mut engine = slash_menu_bridge::MenuEngine::new(&shared);
         Self::from_buffer_cursors(buf, ctx, settings, help_view, path_completions, &mut engine)
     }
@@ -2382,7 +2386,11 @@ impl Repl {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
-        *shared.current_thinking_level.borrow_mut() = ctx.thinking_level.clone();
+        *shared.live_state.borrow_mut() = crate::slash_menu_bridge::LiveState {
+            model: format!("{}:{}", ctx.provider, ctx.model),
+            persona: ctx.persona.clone(),
+            thinking_level: ctx.thinking_level.clone(),
+        };
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -2413,7 +2421,7 @@ impl Repl {
         // no longer does. All `/` dispatch goes through `eval_prompt`.
         let mut v25_menu = {
             let shared_rc = std::rc::Rc::new(shared.clone_shared());
-            crate::v25_thinking::build_menu(&shared.current_thinking_level, &shared.settings, &shared_rc)
+            crate::v25_thinking::build_menu(&shared.live_state, &shared.settings, &shared_rc)
         };
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
@@ -3016,8 +3024,9 @@ impl Repl {
                                                     let first_word = line.split_whitespace().next().unwrap_or("");
                                                     match first_word {
                                                         "thinking" => {
-                                                            let level = shared.current_thinking_level
+                                                            let level = shared.live_state
                                                                 .borrow()
+                                                                .thinking_level
                                                                 .clone()
                                                                 .unwrap_or_default();
                                                             let echo = format!("/thinking {}", level);
@@ -3028,8 +3037,8 @@ impl Repl {
                                                             return Some(InputAction::SetThinking(level));
                                                         }
                                                         "persona" => {
-                                                            let name = shared.settings.borrow()
-                                                                .default_persona
+                                                            let name = shared.live_state.borrow()
+                                                                .persona
                                                                 .clone()
                                                                 .unwrap_or_default();
                                                             let echo = format!("/persona {}", name);
@@ -3040,8 +3049,8 @@ impl Repl {
                                                             return Some(InputAction::SetPersona(name));
                                                         }
                                                         "model" | "models" => {
-                                                            let qualified = shared.settings.borrow()
-                                                                .default_model
+                                                            let qualified = shared.live_state.borrow()
+                                                                .model
                                                                 .clone();
                                                             let (provider, model) = qualified
                                                                 .split_once(':')
@@ -10229,11 +10238,12 @@ mod model_v2_tests {
     /// submits SetPersona through the engine's accept flow.
     #[test]
     fn persona_plan_active_marker_and_enter_flow() {
-        // Marker: with a current persona in the settings store (the active
-        // source), the plan marks it `*` — no host-side injection.
+        // Marker: with a current persona in live_state (the active source),
+        // the plan marks it `*` — no host-side injection.
         let mut settings = test_settings();
         settings.default_persona = Some("academic".into());
-        let ctx = model_ctx();
+        let mut ctx = model_ctx();
+        ctx.persona = Some("academic".into());
         let ov = ActiveOverlay::from_buffer("/persona ", &ctx, &settings, false, &[]);
         match &ov {
             ActiveOverlay::Menu { plan, .. } => {
