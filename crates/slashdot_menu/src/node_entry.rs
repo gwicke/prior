@@ -94,6 +94,8 @@ struct EpochState {
     should_restore_view_args: bool,
     /// Confirm dialog pending (§9).
     confirm_pending: bool,
+    /// Terminal width for table layout (set per node_traverse call).
+    term_width: usize,
 }
 
 impl Default for EpochState {
@@ -104,6 +106,7 @@ impl Default for EpochState {
             view_args: String::new(),
             should_restore_view_args: false,
             confirm_pending: false,
+            term_width: 80,
         }
     }
 }
@@ -180,12 +183,14 @@ impl NodeEntry {
         key: HostKey,
         mut path: Vec<String>,
         prompt_suffix: &str,
+        term_width: usize,
     ) -> MenuResult {
         // Phase 0: Epoch gate — reset per-node epoch state on new activation.
         if epoch != self.cache_epoch {
             self.epoch = EpochState::default();
             self.cache_epoch = epoch;
         }
+        self.epoch.term_width = term_width;
         // eprintln!("In node_traverse {}", prompt_suffix);
 
         // Phase 1: Parse section (single parse pass).
@@ -241,6 +246,7 @@ impl NodeEntry {
                     key,
                     path,
                     &parsed.tail,
+                    term_width,
                 );
             }
             // Matched child, empty tail, no restore → bare ID render (§2.5).
@@ -248,7 +254,7 @@ impl NodeEntry {
         }
 
         // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, trailing_space, &path, prompt_suffix)
+        self.handle_listing(epoch, key, &parsed, trailing_space, &path, prompt_suffix, term_width)
     }
 
     // --- Leaf handling ---
@@ -318,6 +324,7 @@ impl NodeEntry {
         trailing_space: bool,
         path: &[String],
         prompt_suffix: &str,
+        term_width: usize,
     ) -> MenuResult {
         // View args = everything before the matched tail (or entire section).
         let view_args_clean = if parsed.matched_child.is_some() {
@@ -363,6 +370,7 @@ impl NodeEntry {
                     HostKey::None,
                     new_path,
                     " ",
+                    term_width,
                 )
             }
             HostKey::Enter => {
@@ -384,6 +392,7 @@ impl NodeEntry {
                     HostKey::Enter,
                     new_path,
                     " ",
+                    term_width,
                 )
             }
             HostKey::Esc => {
@@ -753,7 +762,7 @@ impl NodeEntry {
 
         // 2. Table header row (if columns declared and there's data, sticky).
         // 2+3. Table rendering: header + data rows.
-        let term_width: usize = 80; // TODO: pass from caller
+        let term_width: usize = self.epoch.term_width;
         {
             use crate::table::{Align, Table};
             // Column field names (what to read from each row).
@@ -1107,7 +1116,7 @@ mod tests {
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "");
@@ -1127,7 +1136,7 @@ mod tests {
     fn fuzzy_filter_at_root() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
@@ -1145,7 +1154,7 @@ mod tests {
     fn bare_id_shows_parent_listing() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", 80);
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "alpha");
@@ -1160,8 +1169,8 @@ mod tests {
     fn tab_drills_into_child() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep());
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "");
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(_, prompt) => assert_eq!(prompt, "alpha "),
             other => panic!("expected Continue, got {:?}", other),
@@ -1172,13 +1181,13 @@ mod tests {
     fn move_cursor_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
         root.refresh_data(ep());
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "");
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(1)),
             other => panic!("expected Continue, got {:?}", other),
         }
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1192,7 +1201,7 @@ mod tests {
             CmdNode::with_active("b", "b"),
         ]);
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.active_rows, vec![1]);
@@ -1205,7 +1214,7 @@ mod tests {
     fn esc_at_root_closes() {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", 80);
         assert!(matches!(result, MenuResult::DoneSuccess(None)));
     }
 
@@ -1236,7 +1245,7 @@ mod tests {
         // Give it a child so it's a listing node (not a leaf).
         root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let headers: Vec<&str> = plan.lines.iter()
@@ -1324,11 +1333,11 @@ mod tests {
     fn epoch_reset_clears_cursor() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
         root.refresh_data(ep());
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "");
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
         assert_eq!(root.epoch.cursor_idx, 1);
         // New epoch resets.
-        let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "");
+        let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", 80);
         assert_eq!(root.epoch.cursor_idx, 0);
     }
 
@@ -1345,7 +1354,7 @@ mod tests {
         })));
         root.refresh_data(ep());
         // "first" is in m1's description but not a row ID → fuzzy filter.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_count = plan.lines.iter().filter(|l| !l.is_header).count();
@@ -1354,7 +1363,7 @@ mod tests {
             other => panic!("expected Continue, got {:?}", other),
         }
         // Esc on filtered view clears to empty (root close or clear).
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first");
+        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first", 80);
         match result {
             MenuResult::Continue(_, _) | MenuResult::DoneSuccess(_) => {}
             other => panic!("expected Continue or DoneSuccess on Esc, got {:?}", other),
@@ -1374,7 +1383,7 @@ mod tests {
             ],
         })));
         root.refresh_data(ep());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
@@ -1440,7 +1449,7 @@ mod tests {
         root.refresh_data(ep());
 
         // Both children's rows should appear in the listing.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
@@ -1482,22 +1491,22 @@ mod tests {
         root.refresh_data(ep());
 
         // Tab on "add" → drills into add_cmd → shows "action" leaf row.
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         // Move cursor to "add" (it's first) and Tab.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Now at "add ", the add_cmd node shows its leaf child "action".
         // Tab into the leaf.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ");
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", 80);
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add action ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Enter on "add action " → submit.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ");
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", 80);
         match result {
             MenuResult::DoneSuccess(_) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -1518,7 +1527,7 @@ mod tests {
         root.refresh_data(ep());
 
         // "bind" fuzzy-matches both binding rows but not "add".
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
@@ -1546,7 +1555,7 @@ mod tests {
         root.refresh_data(ep());
 
         // Only "valid" should appear.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()

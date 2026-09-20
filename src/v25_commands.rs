@@ -14,6 +14,10 @@ mod tests {
     };
     use crate::slashdot_menu::menu::SlashDotMenu;
 
+    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
+        h.eval_prompt(prompt, key, 80)
+    }
+
     // -----------------------------------------------------------------------
     // ThinkingEnumNode — single node returning all four levels.
     // -----------------------------------------------------------------------
@@ -64,7 +68,7 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("thinking ", HostKey::None) {
+        match eval(&mut h, "thinking ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)
@@ -85,7 +89,7 @@ mod tests {
         let state = Rc::new(RefCell::new(Some("med".to_string())));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("thinking ", HostKey::None) {
+        match eval(&mut h, "thinking ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.active_rows.is_empty(), "med should have active marker");
             }
@@ -98,14 +102,14 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let r = h.eval_prompt("thinking ", HostKey::None);
+        let r = eval(&mut h, "thinking ", HostKey::None);
         match &r {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.lines.iter().filter(|l| !l.is_header).count(), 4);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
-        match h.eval_prompt("thinking ", HostKey::Tab) {
+        match eval(&mut h, "thinking ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
                 assert!(plan.lines.iter().filter(|l| !l.is_header).count() == 0
                     || plan.lines.iter().any(|l| l.text.contains("off")),
@@ -121,10 +125,10 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        let r = h.eval_prompt("thinking ", HostKey::Tab);
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        let r = eval(&mut h, "thinking ", HostKey::Tab);
         let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
-        match h.eval_prompt(&prompt, HostKey::Enter) {
+        match eval(&mut h, &prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(*state.borrow(), Some("off".to_string()));
             }
@@ -137,8 +141,8 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        match h.eval_prompt("thinking ", HostKey::Enter) {
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        match eval(&mut h, "thinking ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(
                     *state.borrow(),
@@ -155,9 +159,9 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        let _ = h.eval_prompt("thinking ", HostKey::MoveCursor(3));
-        match h.eval_prompt("thinking ", HostKey::Enter) {
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
+        match eval(&mut h, "thinking ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(
                     *state.borrow(),
@@ -174,9 +178,9 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        let _ = h.eval_prompt("thinking ", HostKey::Tab);
-        match h.eval_prompt("thinking off ", HostKey::Esc) {
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        let _ = eval(&mut h, "thinking ", HostKey::Tab);
+        match eval(&mut h, "thinking off ", HostKey::Esc) {
             MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("thinking"), "should be back at thinking: {}", prompt);
             }
@@ -189,7 +193,7 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("thinking h", HostKey::None) {
+        match eval(&mut h, "thinking h", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)
@@ -209,8 +213,8 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        match h.eval_prompt("thinking ", HostKey::MoveCursor(2)) {
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        match eval(&mut h, "thinking ", HostKey::MoveCursor(2)) {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.selected, Some(2));
             }
@@ -223,7 +227,7 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None) {
+        match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)
@@ -240,9 +244,9 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        let _ = h.eval_prompt("thinking ", HostKey::MoveCursor(3));
-        match h.eval_prompt("thinking ", HostKey::Tab) {
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
+        match eval(&mut h, "thinking ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("high"), "should drill into high: {}", prompt);
             }
@@ -255,12 +259,12 @@ mod tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("thinking ", HostKey::None);
-        let _ = h.eval_prompt("thinking ", HostKey::MoveCursor(2));
-        let r = h.eval_prompt("thinking ", HostKey::Tab);
+        let _ = eval(&mut h, "thinking ", HostKey::None);
+        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(2));
+        let r = eval(&mut h, "thinking ", HostKey::Tab);
         let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
         assert!(prompt.contains("med"), "should be med: {}", prompt);
-        match h.eval_prompt(&prompt, HostKey::Enter) {
+        match eval(&mut h, &prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(*state.borrow(), Some("med".to_string()));
             }
@@ -283,6 +287,10 @@ mod persona_tests {
         SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
     };
     use crate::slashdot_menu::menu::SlashDotMenu;
+
+    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
+        h.eval_prompt(prompt, key, 80)
+    }
 
     /// Single node returning all persona rows + "none".
     struct PersonaEnumNode {
@@ -331,7 +339,7 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("persona ", HostKey::None) {
+        match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)
@@ -351,7 +359,7 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(Some("strict".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("persona ", HostKey::None) {
+        match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.active_rows.is_empty(), "strict should have active marker");
             }
@@ -364,7 +372,7 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("persona ", HostKey::None) {
+        match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.active_rows.is_empty(), "none should be active when persona is None");
             }
@@ -377,9 +385,9 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(Some("architect".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("persona ", HostKey::None);
-        let _ = h.eval_prompt("persona ", HostKey::Tab);
-        match h.eval_prompt("persona architect ", HostKey::Enter) {
+        let _ = eval(&mut h, "persona ", HostKey::None);
+        let _ = eval(&mut h, "persona ", HostKey::Tab);
+        match eval(&mut h, "persona architect ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(*state.borrow(), Some("architect".to_string()));
             }
@@ -392,8 +400,8 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("persona ", HostKey::None);
-        match h.eval_prompt("persona ", HostKey::Enter) {
+        let _ = eval(&mut h, "persona ", HostKey::None);
+        match eval(&mut h, "persona ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(*state.borrow(), None);
             }
@@ -406,8 +414,8 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(Some("strict".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("persona ", HostKey::None);
-        match h.eval_prompt("persona ", HostKey::Enter) {
+        let _ = eval(&mut h, "persona ", HostKey::None);
+        match eval(&mut h, "persona ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(
                     *state.borrow(),
@@ -424,15 +432,15 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(Some("strict".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        let _ = h.eval_prompt("persona ", HostKey::None);
-        let _ = h.eval_prompt("persona ", HostKey::MoveCursor(2));
-        match h.eval_prompt("persona ", HostKey::Tab) {
+        let _ = eval(&mut h, "persona ", HostKey::None);
+        let _ = eval(&mut h, "persona ", HostKey::MoveCursor(2));
+        match eval(&mut h, "persona ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("none"), "should drill none: {}", prompt);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
-        match h.eval_prompt("persona none ", HostKey::Enter) {
+        match eval(&mut h, "persona none ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
                 assert_eq!(*state.borrow(), None, "none should clear persona");
             }
@@ -445,7 +453,7 @@ mod persona_tests {
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None) {
+        match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)

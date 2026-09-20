@@ -330,6 +330,10 @@ pub fn add_model_children(
 mod tests {
     use super::*;
 
+    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::node_impl::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
+        h.eval_prompt(prompt, key, 80)
+    }
+
     fn test_shared() -> Rc<crate::slash_menu_bridge::MenuShared> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
@@ -422,7 +426,7 @@ mod tests {
 
         let mut h = menu.get_handle();
         // Root listing: shows the "model" row.
-        match h.eval_prompt("", crate::slashdot_menu::node_impl::HostKey::None) {
+        match eval(&mut h, "", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.lines.iter()
                     .filter(|l| !l.is_header)
@@ -434,7 +438,7 @@ mod tests {
             other => panic!("expected Continue at root, got {:?}", other),
         }
         // Tab drills into the model listing.
-        match h.eval_prompt("", crate::slashdot_menu::node_impl::HostKey::Tab) {
+        match eval(&mut h, "", crate::slashdot_menu::node_impl::HostKey::Tab) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.starts_with("model"),
                     "after Tab should drill into model, got: {}", prompt);
@@ -442,14 +446,14 @@ mod tests {
             other => panic!("expected Continue after Tab drill, got {:?}", other),
         }
         // If catalog has entries, Tab again drills into a model, Enter submits.
-        let model_listing = h.eval_prompt("model ", crate::slashdot_menu::node_impl::HostKey::None);
+        let model_listing = eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None);
         if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) = model_listing {
             if plan.lines.iter().any(|l| !l.is_header) {
-                match h.eval_prompt("model ", crate::slashdot_menu::node_impl::HostKey::Tab) {
+                match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::Tab) {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                         assert!(prompt.starts_with("model "),
                             "should drill into a model entry, got: {}", prompt);
-                        match h.eval_prompt(&prompt, crate::slashdot_menu::node_impl::HostKey::Enter) {
+                        match eval(&mut h, &prompt, crate::slashdot_menu::node_impl::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
                                 let model = shared.settings.borrow().default_model.clone();
                                 assert!(!model.is_empty(),
@@ -476,14 +480,14 @@ mod tests {
 
         let mut h = menu.get_handle();
         // Unfiltered count.
-        let total = match h.eval_prompt("model ", crate::slashdot_menu::node_impl::HostKey::None) {
+        let total = match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 plan.lines.iter().filter(|l| !l.is_header).count()
             }
             other => panic!("expected Continue, got {:?}", other),
         };
         // Filtered count must be strictly less.
-        match h.eval_prompt("model deep", crate::slashdot_menu::node_impl::HostKey::None) {
+        match eval(&mut h, "model deep", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let filtered = plan.lines.iter().filter(|l| !l.is_header).count();
                 assert!(filtered < total,

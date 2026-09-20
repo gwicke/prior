@@ -2582,9 +2582,11 @@ impl Repl {
                 }
                 let handle = v25_handle.as_mut().unwrap();
                 let line = buf_text.trim_start_matches('/').to_string();
+                let tw = crate::output::term_width();
                 let result = handle.eval_prompt(
                     &line,
                     crate::slashdot_menu::node_impl::HostKey::None,
+                    tw,
                 );
                 match result {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
@@ -2827,6 +2829,7 @@ impl Repl {
                                             let _ = handle.eval_prompt(
                                                 &line,
                                                 crate::slashdot_menu::node_impl::HostKey::MoveCursor(delta),
+                                            crate::output::term_width(),
                                             );
                                         }
                                     } else {
@@ -2912,6 +2915,7 @@ impl Repl {
                                         let result = handle.eval_prompt(
                                             &line,
                                             crate::slashdot_menu::node_impl::HostKey::Tab,
+                                            crate::output::term_width(),
                                         );
                                         if let crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) = result {
                                             editor.set(&format!("/{}", prompt));
@@ -2944,6 +2948,7 @@ impl Repl {
                                             let result = handle.eval_prompt(
                                                 &line,
                                                 crate::slashdot_menu::node_impl::HostKey::Enter,
+                                            crate::output::term_width(),
                                             );
                                             match result {
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
@@ -3025,6 +3030,7 @@ impl Repl {
                                         let result = handle.eval_prompt(
                                             &line,
                                             crate::slashdot_menu::node_impl::HostKey::Esc,
+                                            crate::output::term_width(),
                                         );
                                         match result {
                                             crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {

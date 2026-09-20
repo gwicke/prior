@@ -90,10 +90,10 @@ pub struct SlashDotHandle<'a> {
 }
 
 impl<'a> SlashDotHandle<'a> {
-    /// Evaluate a prompt with a key event. Returns a `MenuResult` the host
-    /// acts on.
-    pub fn eval_prompt(&mut self, prompt: &str, key: HostKey) -> MenuResult {
+    /// Evaluate a prompt with a key event. `term_width` is the current
+    /// terminal width in columns, used for table column layout.
+    pub fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
         self.root
-            .node_traverse(self.epoch, key, Vec::new(), prompt)
+            .node_traverse(self.epoch, key, Vec::new(), prompt, term_width)
     }
 }
