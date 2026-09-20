@@ -18,13 +18,15 @@ use crate::slashdot_menu::menu::SlashDotMenuNode;
 // ---------------------------------------------------------------------------
 
 pub struct PersonaEnumNode {
-    live_state: Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
+    /// Read the current persona name (None = no persona).
+    active_fn: Box<dyn Fn() -> Option<String>>,
+    /// Write the selected persona. `Ok(())` on success.
+    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
 impl SlashDotNode for PersonaEnumNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let ls = self.live_state.borrow();
-        let current = ls.persona.as_deref().unwrap_or("");
+        let current = (self.active_fn)().unwrap_or_default();
         let mut rows = Vec::new();
         let mut active_ids = Vec::new();
         for p in crate::persona::PERSONAS.iter() {
@@ -43,9 +45,10 @@ impl SlashDotNode for PersonaEnumNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.ids.last().cloned().unwrap_or_default();
-        let val = if name == "none" { None } else { Some(name) };
-        self.live_state.borrow_mut().persona = val;
-        SubmitResult::Done(None)
+        match (self.submit_fn)(&name) {
+            Ok(()) => SubmitResult::Done(None),
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -58,5 +61,14 @@ pub fn add_persona_child(
     listing: &mut SlashDotMenuNode,
     live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
 ) {
-    listing.add_child(PersonaEnumNode { live_state: live_state.clone() }.into());
+    let ls = live_state.clone();
+    let ls2 = live_state.clone();
+    listing.add_child(PersonaEnumNode {
+        active_fn: Box::new(move || ls.borrow().persona.clone()),
+        submit_fn: Box::new(move |name| {
+            let val = if name == "none" { None } else { Some(name.to_string()) };
+            ls2.borrow_mut().persona = val;
+            Ok(())
+        }),
+    }.into());
 }

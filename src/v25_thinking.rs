@@ -21,14 +21,16 @@ use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 // ---------------------------------------------------------------------------
 
 struct ThinkingEnumNode {
-    live_state: Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
+    /// Read the current thinking level.
+    active_fn: Box<dyn Fn() -> String>,
+    /// Write the selected thinking level. `Ok(())` on success.
+    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
 impl SlashDotNode for ThinkingEnumNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let ls = self.live_state.borrow();
+        let active = (self.active_fn)();
         let levels = ["off", "low", "med", "high"];
-        let active = ls.thinking_level.as_deref().unwrap_or("off").to_string();
         let rows = levels.iter()
             .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
             .collect();
@@ -40,8 +42,10 @@ impl SlashDotNode for ThinkingEnumNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let level = path_args.ids.last().cloned().unwrap_or_default();
-        self.live_state.borrow_mut().thinking_level = Some(level);
-        SubmitResult::Done(None)
+        match (self.submit_fn)(&level) {
+            Ok(()) => SubmitResult::Done(None),
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -52,19 +56,30 @@ impl SlashDotNode for ThinkingEnumNode {
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(
     live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
-    settings: &Rc<RefCell<crate::settings::SettingsStore>>,
+    _settings: &Rc<RefCell<crate::settings::SettingsStore>>,
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
     let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
 
     // Thinking: listing + single enum node (returns all levels via data()).
     {
+        let ls = live_state.clone();
+        let ls2 = live_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
         ]).with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
         ]).into();
-        tl.add_child(ThinkingEnumNode { live_state: live_state.clone() }.into());
+        tl.add_child(ThinkingEnumNode {
+            active_fn: Box::new(move || {
+                let ls = ls.borrow();
+                ls.thinking_level.clone().unwrap_or_else(|| "off".to_string())
+            }),
+            submit_fn: Box::new(move |level| {
+                ls2.borrow_mut().thinking_level = Some(level.to_string());
+                Ok(())
+            }),
+        }.into());
         root.add_child(tl);
     }
 

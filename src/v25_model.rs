@@ -5,6 +5,7 @@
 //! counter — when the catalog hasn't refreshed, the engine's `Rc::ptr_eq`
 //! check skips the full re-derive (filter → fuzzy → sort → render).
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::slashdot_menu::fields::Row;
@@ -19,7 +20,12 @@ use crate::slashdot_menu::provider::ColumnDef;
 // ---------------------------------------------------------------------------
 
 pub struct ModelNode {
-    shared: Rc<crate::slash_menu_bridge::MenuShared>,
+    /// Read the active model id (empty string = none).
+    active_fn: Box<dyn Fn() -> String>,
+    /// Write the selected model id on submit. `Ok(())` on success.
+    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    /// Recent model ids for ordering (only for `/model`, None for `/set`).
+    recent: Option<Rc<RefCell<Vec<String>>>>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
@@ -28,9 +34,15 @@ pub struct ModelNode {
 }
 
 impl ModelNode {
-    pub fn new(shared: Rc<crate::slash_menu_bridge::MenuShared>) -> Self {
+    pub fn new(
+        active_fn: Box<dyn Fn() -> String>,
+        submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+        recent: Option<Rc<RefCell<Vec<String>>>>,
+    ) -> Self {
         ModelNode {
-            shared,
+            active_fn,
+            submit_fn,
+            recent,
             cached_response: None,
             cached_generation: u64::MAX, // force first rebuild
         }
@@ -48,11 +60,11 @@ impl SlashDotNode for ModelNode {
 
         // Catalog changed (or first call) — rebuild rows.
         let entries = crate::model_catalog::catalog_cached();
-        let active = {
-            let ls = self.shared.live_state.borrow();
-            if ls.model.is_empty() { None } else { Some(ls.model.clone()) }
-        };
-        let recent: Vec<String> = self.shared.recent_models.borrow().clone();
+        let active_id = (self.active_fn)();
+        let active = if active_id.is_empty() { None } else { Some(active_id) };
+        let recent: Vec<String> = self.recent.as_ref()
+            .map(|r| r.borrow().clone())
+            .unwrap_or_default();
 
         // Build rows in the same order as the legacy ModelProvider:
         // active first, then up to 4 recent in LRU order, then server
@@ -76,15 +88,14 @@ impl SlashDotNode for ModelNode {
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        // The model ID arrives as the last element of the path (the
-        // active_id that was drilled from the parent listing).
         let qualified = path_args.ids.last().cloned().unwrap_or_default();
         if qualified.is_empty() {
             return SubmitResult::Done(None);
         }
-        // Write to live session state (NOT persistent settings).
-        self.shared.live_state.borrow_mut().model = qualified;
-        SubmitResult::Done(None)
+        match (self.submit_fn)(&qualified) {
+            Ok(()) => SubmitResult::Done(None),
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 
     fn fields(&self) -> Vec<crate::slashdot_menu::fields::FieldSpec> {
@@ -314,7 +325,15 @@ pub fn build_model_node(
         FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
         FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
     ]).into();
-    node.add_child(ModelNode::new(Rc::clone(shared)).into());
+    // Live session model: reads from LiveState, writes to LiveState.
+    let ls = shared.live_state.clone();
+    let ls2 = shared.live_state.clone();
+    let recent = Some(shared.recent_models.clone());
+    node.add_child(ModelNode::new(
+        Box::new(move || ls.borrow().model.clone()),
+        Box::new(move |model| { ls2.borrow_mut().model = model.to_string(); Ok(()) }),
+        recent,
+    ).into());
     node
 }
 
@@ -344,15 +363,25 @@ mod tests {
             path: None,
         };
         let shared = Rc::new(crate::slash_menu_bridge::MenuShared::new(settings, None));
-        // Seed live_state with the active model so data() marks it.
         shared.live_state.borrow_mut().model = "anthropic:claude-3-5-sonnet-20241022".into();
         shared
+    }
+
+    fn test_model_node(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> ModelNode {
+        let ls = shared.live_state.clone();
+        let ls2 = shared.live_state.clone();
+        let recent = Some(shared.recent_models.clone());
+        ModelNode::new(
+            Box::new(move || ls.borrow().model.clone()),
+            Box::new(move |model| { ls2.borrow_mut().model = model.to_string(); Ok(()) }),
+            recent,
+        )
     }
 
     #[test]
     fn model_node_returns_rows() {
         let shared = test_shared();
-        let mut node = ModelNode::new(shared);
+        let mut node = test_model_node(&shared);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
@@ -365,7 +394,7 @@ mod tests {
     #[test]
     fn model_node_caches_rc() {
         let shared = test_shared();
-        let mut node = ModelNode::new(shared);
+        let mut node = test_model_node(&shared);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
@@ -380,7 +409,7 @@ mod tests {
     #[test]
     fn model_node_columns() {
         let shared = test_shared();
-        let node = ModelNode::new(shared);
+        let node = test_model_node(&shared);
         let cols = node.columns();
         assert_eq!(cols.len(), 6);
         assert!(cols.iter().any(|c| c.header == "Price in"));
@@ -389,7 +418,7 @@ mod tests {
     #[test]
     fn model_node_fields() {
         let shared = test_shared();
-        let node = ModelNode::new(shared);
+        let node = test_model_node(&shared);
         let fields = node.fields();
         assert!(fields.iter().any(|f| f.name == "context"));
         assert!(fields.iter().any(|f| f.name == "price"));
@@ -399,7 +428,7 @@ mod tests {
     #[test]
     fn model_node_submit_writes_settings() {
         let shared = test_shared();
-        let mut node = ModelNode::new(Rc::clone(&shared));
+        let mut node = test_model_node(&shared);
         let path_args = PathArgs {
             ids: vec!["model".into(), "openai:gpt-4o".into()],
             suffix: " ".into(),
@@ -419,7 +448,7 @@ mod tests {
         let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("model", "select a model"),
         ]).into();
-        ml.add_child(ModelNode::new(Rc::clone(shared)).into());
+        ml.add_child(test_model_node(shared).into());
         root.add_child(ml);
         crate::slashdot_menu::SlashDotMenu::from_root_node(root)
     }
