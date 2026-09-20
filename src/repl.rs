@@ -12,6 +12,8 @@
 //! escape-sequence emission touches the terminal.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use std::cell::RefCell;
+use std::rc::Rc;
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crate::output::{term_height, term_width, wrap, Output};
 use crate::model_catalog;
@@ -2371,6 +2373,8 @@ impl Repl {
         ctx: &ReplCtx,
         settings: &mut SettingsStore,
         dirty: &mut bool,
+        menu_submitted: &mut bool,
+        live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
         initial_row: usize,
         output: &dyn Output,
     ) -> Option<InputAction> {
@@ -2378,19 +2382,17 @@ impl Repl {
         // Build a `MenuShared` handle bundle for this activation; it shares
         // the same SettingsStore the loop / run_interactive mutate, the
         // session repo, and the current-session/tree sync mirrors.
-        let shared = MenuShared::new(
+        let mut shared = MenuShared::new(
             settings.clone(),
             ctx.repo.clone(),
         );
+        // Share the caller's LiveState Rc so menu writes are visible to
+        // run_interactive after read_input returns.
+        shared.live_state = live_state.clone();
         *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
-        *shared.live_state.borrow_mut() = crate::slash_menu_bridge::LiveState {
-            model: format!("{}:{}", ctx.provider, ctx.model),
-            persona: ctx.persona.clone(),
-            thinking_level: ctx.thinking_level.clone(),
-        };
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -3018,53 +3020,18 @@ impl Repl {
                                             crate::output::term_width(),
                                             );
                                             match result {
-                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
-                                                    // The node's submit() wrote to shared state.
-                                                    // Read back based on the command prefix.
-                                                    let first_word = line.split_whitespace().next().unwrap_or("");
-                                                    match first_word {
-                                                        "thinking" => {
-                                                            let level = shared.live_state
-                                                                .borrow()
-                                                                .thinking_level
-                                                                .clone()
-                                                                .unwrap_or_default();
-                                                            let echo = format!("/thinking {}", level);
-                                                            Repl::emit_commit(
-                                                                output, &mut editor, &redraw, sel,
-                                                                &mut input_row, &echo, "", false,
-                                                            );
-                                                            return Some(InputAction::SetThinking(level));
-                                                        }
-                                                        "persona" => {
-                                                            let name = shared.live_state.borrow()
-                                                                .persona
-                                                                .clone()
-                                                                .unwrap_or_default();
-                                                            let echo = format!("/persona {}", name);
-                                                            Repl::emit_commit(
-                                                                output, &mut editor, &redraw, sel,
-                                                                &mut input_row, &echo, "", false,
-                                                            );
-                                                            return Some(InputAction::SetPersona(name));
-                                                        }
-                                                        "model" | "models" => {
-                                                            let qualified = shared.live_state.borrow()
-                                                                .model
-                                                                .clone();
-                                                            let (provider, model) = qualified
-                                                                .split_once(':')
-                                                                .map(|(p, m)| (p.to_string(), m.to_string()))
-                                                                .unwrap_or((String::new(), qualified.clone()));
-                                                            let echo = format!("/model {}", qualified);
-                                                            Repl::emit_commit(
-                                                                output, &mut editor, &redraw, sel,
-                                                                &mut input_row, &echo, "", false,
-                                                            );
-                                                            return Some(InputAction::SetModel(provider, model));
-                                                        }
-                                                        _ => {}
+                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg) => {
+                                                    // The node's submit() wrote to LiveState.
+                                                    // Echo the committed line and signal
+                                                    // run_interactive to sync.
+                                                    Repl::emit_commit(
+                                                        output, &mut editor, &redraw, sel,
+                                                        &mut input_row, &buf_text, "", true,
+                                                    );
+                                                    if let Some(text) = msg {
+                                                        output.display_text(&text);
                                                     }
+                                                    *menu_submitted = true;
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
                                                     // Drill happened — update buffer, next

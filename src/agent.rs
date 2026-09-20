@@ -3468,6 +3468,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // prompt. `read_input` only flips this flag; the rebuild stays here so it
     // can call the async `create_agent`.
     let mut dirty = false;
+    let mut menu_submitted = false;
+    let live_state = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::slash_menu_bridge::LiveState {
+            model: format!("{}:{}", config.provider, config.model),
+            persona: config.persona_name.clone(),
+            thinking_level: config.thinking_level.clone(),
+        },
+    ));
     // Agent is created lazily on first use (or on /model, /thinking) so that
     // commands like /help work without a network round-trip.
     let mut agent: Option<Box<dyn PicoAgent>> = None;
@@ -3620,6 +3628,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                     &ctx,
                     settings,
                     &mut dirty,
+                    &mut menu_submitted,
+                    &live_state,
                     config.output.cursor_row(),
                     config.output.as_ref(),
                 )
@@ -4311,6 +4321,69 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 .display_text(&format!("Cannot apply settings: {}", e));
                             // Keep `dirty` set so the next Submit retries; `config`
                             // and the agent stay in sync (both old).
+                        }
+                    }
+                }
+                // Sync LiveState → AgentConfig after any menu submit.
+                // The v2.5 DoneSuccess handler sets `menu_submitted`; the
+                // node's submit() already wrote to LiveState.
+                if menu_submitted {
+                    menu_submitted = false;
+                    let ls = live_state.borrow();
+                    let model_changed = config.provider != ls.model.split(':').next().unwrap_or("")
+                        || config.model != ls.model.split(':').nth(1).unwrap_or("");
+                    let thinking_changed = config.thinking_level != ls.thinking_level;
+                    let persona_changed = config.persona_name != ls.persona;
+                    drop(ls);
+
+                    if model_changed || thinking_changed || persona_changed {
+                        let mut new_cfg = config.clone();
+                        {
+                            let ls = live_state.borrow();
+                            if model_changed {
+                                if let Some((p, m)) = ls.model.split_once(':') {
+                                    new_cfg.provider = p.to_string();
+                                    new_cfg.model = m.to_string();
+                                }
+                            }
+                            if thinking_changed {
+                                new_cfg.thinking_level = ls.thinking_level.clone();
+                            }
+                            if persona_changed {
+                                new_cfg.persona_name = ls.persona.clone();
+                                new_cfg.persona_prompt = ls.persona.as_ref()
+                                    .and_then(|p| crate::persona::get_persona(p));
+                            }
+                        }
+                        match create_agent(new_cfg.clone()).await {
+                            Ok(new_agent) => {
+                                agent = Some(new_agent);
+                                if model_changed {
+                                    let model_id = format!("{}:{}", new_cfg.provider, new_cfg.model);
+                                    recent_models.retain(|m| m != &model_id);
+                                    recent_models.insert(0, model_id);
+                                    save_recent_models(&recent_models);
+                                    if let Some(ref s) = session {
+                                        let _ = s.append_model_change(&new_cfg.provider, &new_cfg.model).await;
+                                    }
+                                }
+                                if thinking_changed {
+                                    if let Some(ref s) = session {
+                                        let _ = s.append_thinking_level_change(
+                                            new_cfg.thinking_level.as_deref().unwrap_or("off")
+                                        ).await;
+                                    }
+                                }
+                                config = new_cfg;
+                            }
+                            Err(e) => {
+                                let kind = if model_changed { "switch model" }
+                                           else if thinking_changed { "set thinking" }
+                                           else { "set persona" };
+                                config.output.display_text(
+                                    &format!("Cannot {}: {}", kind, e)
+                                );
+                            }
                         }
                     }
                 }
