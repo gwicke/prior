@@ -416,7 +416,7 @@ mod tests {
 
     fn build_test_menu(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
-        let mut root = SlashDotMenuNode::root();
+        let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("model", "select a model"),
         ]).into();

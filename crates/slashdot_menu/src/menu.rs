@@ -11,7 +11,7 @@
 //! ```ignore
 //! use slashdot_menu::{SlashDotMenu, SlashDotMenuNode, StaticListingNode, StaticRow};
 //!
-//! let mut root = SlashDotMenuNode::root();
+//! let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
 //! {
 //!     let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
 //!         StaticRow::new("thinking", "set thinking level"),
@@ -34,16 +34,12 @@ use crate::node_entry::NodeEntry;
 use crate::node_impl::{HostKey, MenuResult, SlashDotNode};
 
 /// A node in the menu tree. Wraps the internal `NodeEntry` with a
-/// minimal public API: `root()` for the implicit root, `new()` for
-/// leaf nodes, `add_child()` to attach children.
-pub struct SlashDotMenuNode(NodeEntry);
+/// minimal public API: `new()` to create a node, `add_child()` to
+/// attach children. Use `From<T: SlashDotNode>` (`.into()`) for
+/// convenience.
+pub struct SlashDotMenuNode(pub(crate) NodeEntry);
 
 impl SlashDotMenuNode {
-    /// Create a root node (metadata-only container, no data/submit).
-    pub fn root() -> Self {
-        SlashDotMenuNode(NodeEntry::new_root())
-    }
-
     /// Create a node from a host `SlashDotNode` impl.
     pub fn new(inner: impl SlashDotNode + 'static) -> Self {
         SlashDotMenuNode(NodeEntry::new_child(Box::new(inner)))

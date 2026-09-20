@@ -52,7 +52,7 @@ mod tests {
 
     fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
-        let mut root = SlashDotMenuNode::root();
+        let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
         ]).into();
@@ -323,7 +323,7 @@ mod persona_tests {
 
     fn build_persona_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
-        let mut root = SlashDotMenuNode::root();
+        let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
         ]).into();

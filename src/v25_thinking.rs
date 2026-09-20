@@ -55,7 +55,7 @@ pub fn build_menu(
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
-    let mut root = SlashDotMenuNode::root();
+    let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
 
     // Thinking: listing + single enum node (returns all levels via data()).
     {

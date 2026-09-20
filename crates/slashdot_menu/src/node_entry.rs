@@ -116,12 +116,6 @@ impl Default for EpochState {
 // Re-use MenuResult directly (user confirmed: single type).
 // The Continue variant carries (RenderPlan, new_prompt_string).
 
-// --- Root node (no-op) ---
-
-struct EmptyNode;
-
-impl SlashDotNode for EmptyNode {}
-
 // --- NodeEntry ---
 
 pub(crate) struct NodeEntry {
@@ -134,15 +128,12 @@ pub(crate) struct NodeEntry {
 }
 
 impl NodeEntry {
-    /// Create a root node (metadata-only container, no data/submit).
-    pub fn new_root() -> Self {
-        NodeEntry {
-            inner: Box::new(EmptyNode),
-            children: Vec::new(),
-            content: ContentCache::default(),
-            epoch: EpochState::default(),
-            cache_epoch: 0,
-        }
+    /// Create a root node: an empty listing node (no rows, no data).
+    #[cfg(test)]
+    pub(crate) fn new_root() -> Self {
+        NodeEntry::new_child(Box::new(
+            crate::node_impl::StaticListingNode::new(&[])
+        ))
     }
 
     /// Create a child node from a host `SlashDotNode` impl.
