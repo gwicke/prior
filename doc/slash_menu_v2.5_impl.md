@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6 partially complete. 538 tests, 0 warnings.
+**Done (v2.5 reshape):** Steps 1–6 partially complete. 539 tests, 0 warnings.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -44,22 +44,23 @@ Root list via `StaticListingNode`. Remaining commands deferred.
   (`thinking` → `SetThinking`, `persona` → `SetPersona`,
   `model`/`models` → `SetModel`).
 - REPL wiring: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in the
-   input loop. Handle lifecycle: created when prompt starts with `/thinking`,
-   `/persona`, `/model`, or other ported commands; dropped when it leaves.
-   `ActiveOverlay::V25Menu { plan, sticky_count }` variant for v2.5 engine
-   overlay.
+  input loop. Handle lifecycle: created when prompt starts with `/thinking`,
+  `/persona`, `/model`, or other ported commands; dropped when it leaves.
+  `ActiveOverlay::V25Menu { plan }` variant for v2.5 engine overlay.
 - Catalog generation counter (`model_catalog::catalog_generation()`):
   atomic `u64` bumped on each cache refresh. `ModelNode` compares it to
   its cached `Rc<DataResponse>` to skip rebuild when data is unchanged
   (enables engine's `Rc::ptr_eq` freshness check).
-- Sticky headers: header() lines and table header row stay fixed at the
-  top when the list scrolls. `RenderPlan.sticky_count` computed by the
-  engine; the host's overlay computation splits paint output into sticky
-  prefix + windowed scrollable body.
-- Rendering fixes: table headings aligned with data columns (rendered
-  through `Table::render_header()`). Background extends to full terminal
-  width (uses `display_width()` to compute visible length, avoiding ANSI
-  escape code inflation in padding).
+- **RenderPlan with LogicalLine**: three-section structure (`table_header`,
+  `detail`, `rows` as `Rc<Vec<LogicalLine>>`). `LogicalLine` is `String`
+  with embedded `\n` for wrapped rows. No more per-visual-line
+  `RenderLine` entries. V25Menu overlay renders directly with markers and
+  backgrounds at render time — O(visible) per keystroke.
+- **Cursor clamping**: `MoveCursor` uses `clamp` (no wrap-around). Cursor
+  stops at first/last row.
+- **PageUp/PageDown**: visual-line-aware page scrolling via `page_delta()`
+  helper that counts wrapped sub-lines to determine how many logical rows
+  fit in the available screen height.
 
 **Design deviations from step4 doc (per user clarification):**
 - Modifiers are single-word (no multi-word values).
@@ -80,10 +81,9 @@ Root list via `StaticListingNode`. Remaining commands deferred.
   custom columns via `.with_columns()`, sticky headers.
 - ~~`RenderPlan.title` is unused — always `None`~~ **Removed.** v2.5 design
   (§6) has no titles. See overlay rendering design below.
+- ~~Overlay rendering: LogicalLine, direct render path, PageUp/PageDown, cursor clamping~~ **Done.** See §7.
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-
-**Overlay rendering:** Designed but not implemented. See §7 below.
 
 **PathArgs / Args borrowing:**
 - Owned data. Deferred to avoid lifetime complexity in the trait API.
@@ -110,12 +110,74 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 
 1. ~~`/thinking`~~ — Done.
 2. ~~`/persona`~~ — Done.
-3. ~~**`/model`**~~ — Done. Dynamic catalog rows, `Rc<DataResponse` caching via generation counter, `ChildBuilder` API for index-free tree construction.
+3. ~~**`/model`**~~ — Done. Dynamic catalog rows, `Rc<DataResponse` caching
+   via generation counter, `ChildBuilder` API for index-free tree construction.
 4. **Root `/` list** — `StaticListingNode` children for all commands.
-   Extends the REPL handle lifecycle to all `/` prefixes.
+   Extends the REPL handle lifecycle to all `/` prefixes. This retires
+   the v2.0 root list rendering path.
 5. **Step 7** — two-phase submit confirm.
 6. **Step 8** — persistent engine cleanup.
 7. **Steps 9–14** — Session, Tree, Settings, Sandbox, Stat, Final cleanup.
+
+---
+
+## 8. Remaining v2.0 code and retirement path
+
+### Current v2.0 overlay variants
+
+| Variant | Used by | v2.5 replacement |
+|---|---|---|
+| `Menu` | Root list, model, tree list, session list, replay | `V25Menu` (when commands are ported) |
+| `Settings` | `/set` settings list | — (not yet ported) |
+| `SettingsVal` | `/set <key>` value picker | — (not yet ported) |
+| `Stat` | `/stat` interstitial | — (not yet ported) |
+| `Sandbox` | `/sandbox` path bindings | — (not yet ported) |
+| `Session` | `/session` session list | — (not yet ported) |
+| `SessionAction` | `/session <id>` action menu | — (not yet ported) |
+| `Confirm` | Delete confirmation | — (not yet ported) |
+| `TreeAction` | `/tree <id>` action menu | — (not yet ported) |
+| `SwitchAction` | `/tree <id> switch` | — (not yet ported) |
+| `CompactSummary` | `/tree <id> compact` summary | — (not yet ported) |
+| `Mod` | Dotted modifier completion | — (not yet ported) |
+| `PathComplete` | Tab path completion | — (not yet ported) |
+
+### Retirement path
+
+The v2.0 code lives primarily in:
+- `slash_menu_bridge.rs` — `MenuEngine`, `MenuShared`, `PlanBuilder`,
+  provider implementations (`ModelProvider`, `SessionProvider`, `TreeProvider`)
+- `repl.rs` — `ActiveOverlay::from_buffer_cursors()` (the v2.0 dispatcher),
+  per-variant rendering/key handling
+- `interpreter.rs` — v2.0 `Interpreter` (state machine)
+
+**Recommended order for retiring v2.0:**
+
+1. **Root `/` list** (step 4): Retires the root list portion of `Menu`
+   and the `from_buffer_cursors` root-list path. The REPL handle lifecycle
+   extends to all `/` prefixes.
+
+2. **Settings** (step 11): Self-contained, exercises mixed static+enum
+   children. Retires `Settings`, `SettingsVal`, and the settings provider.
+
+3. **Stat + Replay** (step 13): Simple leaf/interstitial commands.
+   Retires `Stat` overlay, `ReplayDetailProvider`.
+
+4. **Sandbox** (step 12): Mixed static+dynamic children. Retires
+   `Sandbox` overlay and `sandbox_bindings` module.
+
+5. **Session** (step 9): Dynamic listing with action children. Retires
+   `Session`, `SessionAction`, `Confirm` overlays and `SessionProvider`.
+
+6. **Tree + compact** (step 10): Most complex — dynamic listing with
+   nested actions, confirm dialogs, `NewPath` rewrites. Retires
+   `TreeAction`, `SwitchAction`, `CompactSummary`, `TreeProvider`.
+
+7. **Final cleanup** (step 14): Remove `MenuEngine`, `PlanBuilder`,
+   `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
+   dead v2.0 code.
+
+Each step is independently shippable — the old and new paths coexist via
+the `V25Menu` vs `Menu` overlay variants until all commands are ported.
 
 ---
 
@@ -246,12 +308,12 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 | Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions) |
 | Accept (confirm, interstitial, editor, new-path) | 8 | Unchanged (v2.0 accept.rs) |
 | Interpreter (state/tab/enter/esc, dynamic, field_options) | 26 | Unchanged (v2.0, will be replaced) |
-| **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **22** | **New (steps 4–5)** |
+| **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **23** | **New (steps 4–5)** |
 | **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)** | **12** | **New (step 6a)** |
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
 | **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 538 lib tests (including non-menu tests). The 26 interpreter tests
+Total: 539 lib tests (including non-menu tests). The 26 interpreter tests
 test the old code path and will be replaced when commands are migrated.
 
 ---
@@ -267,7 +329,7 @@ test the old code path and will be replaced when commands are migrated.
 | `interpreter.rs` | Logic moves into `NodeEntry::node_traverse()`; file shrinks or is deleted |
 | `accept.rs` | Confirm state machine moves to node-local state; engine dialog service stays |
 | `provider.rs` | `DataProvider` trait absorbed; `ColumnDef` remains |
-| `render.rs` | `RenderPlan` with `sticky_count`; `paint()` uses `display_width()` for correct padding |
+| `render.rs` | `LogicalLine`, `RenderPlan` (table_header/detail/rows), `paint()` for v2.0 compat |
 | `table.rs` | `display_width()` made `pub(crate)`; `render_header()` added for aligned headers |
 | `cursor.rs` | `RankRefResult` / `rank_row_refs` made `pub(crate)` |
 | `grammar.rs` | Unchanged (free functions) |
@@ -276,10 +338,11 @@ test the old code path and will be replaced when commands are migrated.
 
 | Host file | Changes |
 | --- | --- |
-| `src/v25_thinking.rs` | `ThinkingValue` + `build_menu()` for `/thinking` and `/persona` |
-| `src/v25_persona.rs` | `PersonaValue` node impl (writes to `SettingsStore.default_persona`) |
+| `src/v25_thinking.rs` | `ThinkingEnumNode` + `build_menu()` for `/thinking`, `/persona`, `/model` |
+| `src/v25_persona.rs` | `PersonaEnumNode` node impl (writes to `SettingsStore.default_persona`) |
+| `src/v25_model.rs` | `ModelNode` node impl (dynamic catalog rows, Rc caching, columns, fields) |
 | `src/v25_commands.rs` | Test-only node impls for engine harness testing |
-| `src/repl.rs` | `ActiveOverlay::V25Menu { plan, sticky_count }`, `SlashDotMenu` + handle in input loop, `eval_prompt` key dispatch, sticky header rendering, `DoneSuccess` dispatch by prefix |
+| `src/repl.rs` | `ActiveOverlay::V25Menu { plan }`, `SlashDotMenu` + handle in input loop, `eval_prompt` key dispatch, V25Menu overlay rendering (LogicalLine direct path, PageUp/PageDown), `DoneSuccess` dispatch by prefix, cursor clamping |
 
 ---
 
