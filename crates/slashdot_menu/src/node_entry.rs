@@ -88,6 +88,10 @@ struct EpochState {
     cursor_id: Option<String>,
     /// Cached cursor index (O(1) display lookup).
     cursor_idx: usize,
+    /// True when the user explicitly moved the cursor (arrow keys).
+    /// When false, cursor re-seeds from ranked_rows on view changes
+    /// (filter, sort, data refresh). When true, cursor persists.
+    cursor_user_moved: bool,
     /// Last rendered section for this node (view cache key + restore source).
     view_args: String,
     /// Set when this node drills into a child; consumed on bare-ID re-entry.
@@ -103,6 +107,7 @@ impl Default for EpochState {
         EpochState {
             cursor_id: None,
             cursor_idx: 0,
+            cursor_user_moved: false,
             view_args: String::new(),
             should_restore_view_args: false,
             confirm_pending: false,
@@ -407,6 +412,7 @@ impl NodeEntry {
                             .map(|row| row.id.clone());
                     }
                 }
+                self.epoch.cursor_user_moved = true;
                 let plan = self.plan_from_cache();
                 MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
@@ -690,16 +696,26 @@ impl NodeEntry {
     }
 
     /// Seed or keep cursor after re-derive (§3.4).
+    /// Seed or keep the cursor position.
+    ///
+    /// When `cursor_user_moved` is true (user pressed arrow keys), the
+    /// cursor persists across view changes. Otherwise, re-seed from the
+    /// top of ranked_rows (or active_ids / matched_child).
     fn seed_or_keep_cursor(&mut self, parsed: &ParsedSection) {
-        // If cursor_id is still present, keep it and refresh the index.
-        if let Some(ref id) = self.epoch.cursor_id.clone() {
-            if let Some(idx) = self.content.ranked_rows.iter().position(|r| {
-                r.resolve(&self.content.data_rc)
-                    .map_or(false, |row| row.id == *id)
-            }) {
-                self.epoch.cursor_idx = idx;
-                return;
+        // If the user explicitly moved the cursor, keep it and refresh the index.
+        if self.epoch.cursor_user_moved {
+            if let Some(ref id) = self.epoch.cursor_id.clone() {
+                if let Some(idx) = self.content.ranked_rows.iter().position(|r| {
+                    r.resolve(&self.content.data_rc)
+                        .map_or(false, |row| row.id == *id)
+                }) {
+                    self.epoch.cursor_idx = idx;
+                    return;
+                }
             }
+            // Explicit cursor dropped out of filtered set — reset so
+            // re-seed picks the new top match cleanly.
+            self.epoch.cursor_user_moved = false;
         }
 
         // Re-seed: selection (if any) → first active → row 0.
