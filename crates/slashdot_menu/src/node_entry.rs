@@ -781,9 +781,7 @@ impl NodeEntry {
             // Default columns: id + description (implicit fields).
             use crate::table::{Align, Table};
             let col_field_names: Vec<String> = if !columns.is_empty() {
-                columns.iter().map(|c| {
-                    if c.field.is_empty() { "id".to_string() } else { c.field.clone() }
-                }).collect()
+                columns.iter().map(|c| c.field.clone()).collect()
             } else {
                 let mut names = vec!["id".to_string()];
                 names.extend(field_space.fields.iter().map(|f| f.name.clone()));

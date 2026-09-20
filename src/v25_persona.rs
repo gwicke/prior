@@ -86,7 +86,7 @@ pub fn add_persona_children(
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("persona", "set runtime persona"),
     ]).with_columns(vec![
-        crate::slashdot_menu::ColumnDef::new("", "Persona"),
+        crate::slashdot_menu::ColumnDef::new("id", "Persona"),
         crate::slashdot_menu::ColumnDef::new("description", "Description"),
     ]));
 

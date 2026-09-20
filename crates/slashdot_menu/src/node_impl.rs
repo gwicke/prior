@@ -218,8 +218,8 @@ impl StaticListingNode {
 
     /// Set column definitions for table rendering. When non-empty, the
     /// table header row shows these column labels and the table renders
-    /// only these columns. `ColumnDef::new("", "Label")` renders just
-    /// the row id with the given header.
+    /// only these columns. Use `"id"` for the row id, `"description"`
+    /// for the row description, or any custom field name.
     pub fn with_columns(mut self, cols: Vec<crate::provider::ColumnDef>) -> Self {
         self.column_defs = cols;
         self

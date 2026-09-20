@@ -11,7 +11,9 @@ use crate::value::Value;
 /// the generic renderer needs no per-command column layout in host code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
-    /// Row field name to render. Empty/absent means the row `id`.
+    /// Row field name to render (e.g. "id", "description", or any custom
+    /// field). The implicit fields "id" and "description" are always
+    /// available on every row.
     pub field: String,
     /// Header label shown above the column.
     pub header: String,
