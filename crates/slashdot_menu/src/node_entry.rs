@@ -341,7 +341,7 @@ impl NodeEntry {
                 let n = self.content.ranked_rows.len();
                 if n > 0 {
                     self.epoch.cursor_idx = (self.epoch.cursor_idx as isize + delta as isize)
-                        .rem_euclid(n as isize) as usize;
+                        .clamp(0, (n - 1) as isize) as usize;
                     if let Some(rref) = self.content.ranked_rows.get(self.epoch.cursor_idx) {
                         self.epoch.cursor_id = rref
                             .resolve(&self.content.data_rc)
@@ -1167,6 +1167,27 @@ mod tests {
             other => panic!("expected Continue, got {:?}", other),
         }
         let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", 80);
+        match result {
+            MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn move_cursor_clamps_not_wraps() {
+        let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
+        root.refresh_data(ep());
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        // Move past last row: should clamp to last, not wrap to 0.
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        match result {
+            MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(2)),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+        // Move before first row: should clamp to 0, not wrap.
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),

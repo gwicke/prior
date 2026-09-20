@@ -2912,6 +2912,41 @@ impl Repl {
                                 }
                                 // else: no prev/next entry; bell is fine (or fall
                                 // through to the generic page-scroll as a fallback).
+                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                    // V25Menu: visual-line-aware page scroll through engine.
+                                    if let Some(handle) = &mut v25_handle {
+                                        let line = editor.text().trim_start_matches('/').to_string();
+                                        // Get current selected from the plan.
+                                        let cur_sel = match &overlay {
+                                            ActiveOverlay::V25Menu { plan } => plan.selected.unwrap_or(0),
+                                            _ => 0,
+                                        };
+                                        // Compute page budget (same formula as overlay rendering).
+                                        let tw = crate::output::term_width();
+                                        let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                                        let cur_h = cur_h.max(1) as usize;
+                                        let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                                        let plan_rows = match &overlay {
+                                            ActiveOverlay::V25Menu { plan } => &plan.rows,
+                                            _ => unreachable!(),
+                                        };
+                                        let header_vis = 1 + match &overlay {
+                                            ActiveOverlay::V25Menu { plan } => plan.detail.len(),
+                                            _ => 0,
+                                        };
+                                        let data_budget = max_pop.saturating_sub(header_vis).max(1);
+                                        let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
+                                        let delta = Self::page_delta(plan_rows, cur_sel, data_budget, direction);
+                                        if delta != 0 {
+                                            let _ = handle.eval_prompt(
+                                                &line,
+                                                crate::slashdot_menu::node_impl::HostKey::MoveCursor(delta),
+                                                tw,
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let page = {
                                     let (_, h) = crossterm::terminal::size().unwrap_or((80, 24));
                                     (h as usize).saturating_sub(2).max(1)
@@ -3241,6 +3276,50 @@ impl Repl {
         } else {
             sel.saturating_sub(avail / 2).min(overlay_len - avail)
         }
+    }
+
+    /// Compute the number of logical rows to skip for a page scroll,
+    /// accounting for multi-line (wrapped) rows. Returns a signed delta
+    /// (positive = down, negative = up) that moves `selected` by at most
+    /// `budget` visual lines, clamped to [0, total_rows).
+    pub fn page_delta(
+        rows: &[crate::slashdot_menu::render::LogicalLine],
+        selected: usize,
+        budget: usize,
+        direction: i32,
+    ) -> i32 {
+        let total = rows.len();
+        if total == 0 || budget == 0 {
+            return 0;
+        }
+        let mut visual_used = 0usize;
+        let mut delta = 0i32;
+        if direction > 0 {
+            // PageDown: count forward from selected+1
+            let mut i = selected + 1;
+            while i < total {
+                let h = rows[i].0.lines().count().max(1);
+                if visual_used + h > budget && delta > 0 {
+                    break;
+                }
+                visual_used += h;
+                delta += 1;
+                i += 1;
+            }
+        } else {
+            // PageUp: count backward from selected
+            let mut i = selected;
+            while i > 0 {
+                let h = rows[i - 1].0.lines().count().max(1);
+                if visual_used + h > budget && delta < 0 {
+                    break;
+                }
+                i -= 1;
+                visual_used += h;
+                delta -= 1;
+            }
+        }
+        delta
     }
 
     /// Cursor policy for buffer-derived option menus (`read_input`).
@@ -9108,6 +9187,33 @@ mod tests {
         assert_eq!(Repl::overlay_window(5, 10, 4), 0);
         // avail == 0: degenerate, clamp to 0.
         assert_eq!(Repl::overlay_window(50, 0, 49), 0);
+    }
+
+    #[test]
+    fn page_delta_skips_rows_by_visual_height() {
+        use crate::slashdot_menu::render::LogicalLine;
+        // Single-line rows: page_delta(4 budget) from row 0 down should skip 4 rows.
+        let rows: Vec<LogicalLine> = (0..10).map(|i| LogicalLine::new(format!("row {}", i))).collect();
+        assert_eq!(Repl::page_delta(&rows, 0, 4, 1), 4);
+        // PageUp from row 9 with budget 4: skip 4 rows back to row 5.
+        assert_eq!(Repl::page_delta(&rows, 9, 4, -1), -4);
+        // Clamping: PageDown from row 7 with budget 100: only 2 rows left.
+        assert_eq!(Repl::page_delta(&rows, 7, 100, 1), 2);
+        // Clamping: PageUp from row 1 with budget 100: only 1 row above.
+        assert_eq!(Repl::page_delta(&rows, 1, 100, -1), -1);
+        // Multi-line rows: a row with 3 newlines = 4 visual lines.
+        let mixed = vec![
+            LogicalLine::new("short"),
+            LogicalLine::new("line1\nline2\nline3\nline4"),
+            LogicalLine::new("short"),
+            LogicalLine::new("a\nb"),
+        ];
+        // From row 0, budget 5: row1 uses 4 lines, row2 uses 1 line = 5 total → delta 2.
+        assert_eq!(Repl::page_delta(&mixed, 0, 5, 1), 2);
+        // From row 3, budget 3: row2 has 1 line (fits), row1 has 4 lines (exceeds budget) → delta -1.
+        assert_eq!(Repl::page_delta(&mixed, 3, 3, -1), -1);
+        // Empty rows: no delta.
+        assert_eq!(Repl::page_delta(&[], 0, 10, 1), 0);
     }
 
     #[test]
