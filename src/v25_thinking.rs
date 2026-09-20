@@ -20,11 +20,11 @@ use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 // to the shared cell.
 // ---------------------------------------------------------------------------
 
-struct ThinkingEnumNode {
+pub struct ThinkingEnumNode {
     /// Read the current thinking level.
-    active_fn: Box<dyn Fn() -> String>,
+    pub active_fn: Box<dyn Fn() -> String>,
     /// Write the selected thinking level. `Ok(())` on success.
-    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
 impl SlashDotNode for ThinkingEnumNode {
@@ -56,7 +56,7 @@ impl SlashDotNode for ThinkingEnumNode {
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(
     live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
-    _settings: &Rc<RefCell<crate::settings::SettingsStore>>,
+    settings: &Rc<RefCell<crate::settings::SettingsStore>>,
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
     let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
@@ -99,6 +99,12 @@ pub fn build_menu(
     {
         let ml: SlashDotMenuNode = crate::v25_model::build_model_node(shared);
         root.add_child(ml);
+    }
+
+    // Settings (/set)
+    {
+        let sn: SlashDotMenuNode = crate::v25_set::build_set_node(settings);
+        root.add_child(sn);
     }
 
     SlashDotMenu::from_root_node(root)

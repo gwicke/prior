@@ -16,6 +16,7 @@ pub mod thinking;
 pub mod v25_thinking;
 pub mod v25_persona;
 pub mod v25_model;
+pub mod v25_set;
 pub mod v25_commands;
 pub mod sandbox_bindings;
 pub mod settings;

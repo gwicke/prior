@@ -19,9 +19,9 @@ use crate::slashdot_menu::menu::SlashDotMenuNode;
 
 pub struct PersonaEnumNode {
     /// Read the current persona name (None = no persona).
-    active_fn: Box<dyn Fn() -> Option<String>>,
+    pub active_fn: Box<dyn Fn() -> Option<String>>,
     /// Write the selected persona. `Ok(())` on success.
-    submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+    pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
 impl SlashDotNode for PersonaEnumNode {
