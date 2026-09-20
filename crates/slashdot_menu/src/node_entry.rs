@@ -730,8 +730,7 @@ impl NodeEntry {
         let has_data = !self.content.ranked_rows.is_empty();
         let columns = self.inner.columns();
         let field_space = self.field_space();
-        let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
-        let has_table_header = has_columns && has_data;
+        let has_table_header = has_data;
 
         // 1. Header lines from the node's header() method (sticky).
         let empty_args = PathArgs {
@@ -753,10 +752,17 @@ impl NodeEntry {
 
         // 2. Table header row (if columns declared and there's data, sticky).
         if has_table_header {
-            let header_text = columns.iter()
-                .map(|c| c.header.as_str())
-                .collect::<Vec<_>>()
-                .join("  ");
+            let header_labels: Vec<&str> = if !columns.is_empty() {
+                columns.iter().map(|c| c.header.as_str()).collect()
+            } else {
+                let mut names = vec!["id"];
+                names.extend(field_space.fields.iter().map(|f| f.name.as_str()));
+                if names.len() == 1 {
+                    names.push("description");
+                }
+                names
+            };
+            let header_text = header_labels.join("  ");
             lines.push(RenderLine {
                 text: header_text,
                 style: Style::HEADER,
