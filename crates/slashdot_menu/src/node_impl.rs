@@ -179,6 +179,7 @@ pub struct StaticListingNode {
     header_lines: Vec<String>,
     active_ids: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     field_specs: Vec<crate::fields::FieldSpec>,
+    column_defs: Vec<crate::provider::ColumnDef>,
 }
 
 impl StaticListingNode {
@@ -189,6 +190,7 @@ impl StaticListingNode {
             header_lines: Vec::new(),
             active_ids: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashSet::new())),
             field_specs: Vec::new(),
+            column_defs: Vec::new(),
         }
     }
 
@@ -213,6 +215,15 @@ impl StaticListingNode {
         self.field_specs = specs;
         self
     }
+
+    /// Set column definitions for table rendering. When non-empty, the
+    /// table header row shows these column labels and the table renders
+    /// only these columns. `ColumnDef::new("", "Label")` renders just
+    /// the row id with the given header.
+    pub fn with_columns(mut self, cols: Vec<crate::provider::ColumnDef>) -> Self {
+        self.column_defs = cols;
+        self
+    }
 }
 
 impl SlashDotNode for StaticListingNode {
@@ -235,5 +246,9 @@ impl SlashDotNode for StaticListingNode {
 
     fn fields(&self) -> Vec<crate::fields::FieldSpec> {
         self.field_specs.clone()
+    }
+
+    fn columns(&self) -> Vec<crate::provider::ColumnDef> {
+        self.column_defs.clone()
     }
 }

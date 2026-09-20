@@ -730,7 +730,8 @@ impl NodeEntry {
         let has_data = !self.content.ranked_rows.is_empty();
         let columns = self.inner.columns();
         let field_space = self.field_space();
-        let has_table_header = has_data;
+        let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
+        let has_table_header = has_columns && has_data;
 
         // 1. Header lines from the node's header() method (sticky).
         let empty_args = PathArgs {
