@@ -428,9 +428,7 @@ mod tests {
         // Root listing: shows the "model" row.
         match eval(&mut h, "", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("model")),
                     "root should show model row");
@@ -448,7 +446,7 @@ mod tests {
         // If catalog has entries, Tab again drills into a model, Enter submits.
         let model_listing = eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None);
         if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) = model_listing {
-            if plan.lines.iter().any(|l| !l.is_header) {
+            if !plan.rows.is_empty() {
                 match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::Tab) {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                         assert!(prompt.starts_with("model "),
@@ -482,14 +480,14 @@ mod tests {
         // Unfiltered count.
         let total = match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                plan.lines.iter().filter(|l| !l.is_header).count()
+                plan.rows.len()
             }
             other => panic!("expected Continue, got {:?}", other),
         };
         // Filtered count must be strictly less.
         match eval(&mut h, "model deep", crate::slashdot_menu::node_impl::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                let filtered = plan.lines.iter().filter(|l| !l.is_header).count();
+                let filtered = plan.rows.len();
                 assert!(filtered < total,
                     "filter 'deep' should narrow results: {} >= {}", filtered, total);
             }

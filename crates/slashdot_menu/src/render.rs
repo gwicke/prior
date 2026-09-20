@@ -1,136 +1,162 @@
-//! Render plan (design §6): plain-data description of the overlay panel.
+//! Render plan: plain-data description of the overlay panel.
 //!
-//! The crate emits a [`RenderPlan`]; the host paints it with its UI toolkit
-//! (ratatui today, anything else later). No ratatui types cross the boundary.
-//!
-//! Row styling uses plain ANSI SGR strings owned by the crate so host and
-//! crate agree on the palette without sharing UI-framework types.
+//! The crate emits a [`RenderPlan`]; the host renders it directly.
+//! Row styling (markers, backgrounds) is applied by the host at render
+//! time — the plan contains only data, not ANSI escapes.
 
-/// Style primitives (ANSI SGR sequences), crate-owned.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Style {
-    pub bg: &'static str,
-    pub fg: &'static str,
+use std::rc::Rc;
+
+/// A single logical row. May contain embedded `\n` from table wrapping.
+/// The overlay splits on `\n` at render time and applies markers only to
+/// the first sub-line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalLine(pub String);
+
+impl LogicalLine {
+    pub fn new(s: impl Into<String>) -> Self {
+        LogicalLine(s.into())
+    }
 }
 
-impl Style {
-    pub const PANEL: Style = Style {
-        bg: "\x1b[48;5;235m",
-        fg: "",
-    };
-    pub const HEADER: Style = Style {
-        bg: "\x1b[48;5;237m",
-        fg: "",
-    };
-    pub const SELECTED: Style = Style {
-        bg: "\x1b[48;5;239m",
-        fg: "\x1b[1;36m",
-    };
-    pub const RESET: &'static str = "\x1b[0m";
+/// The complete overlay panel description.
+///
+/// v2.5 panel structure (design §6):
+/// 1. `table_header` — single-line column headings (always shown, never truncated)
+/// 2. `detail` — `header()` output (truncatable from bottom on tight space)
+/// 3. `rows` — scrollable data (Rc-shared; same pointer on cursor moves)
+#[derive(Debug, Clone)]
+pub struct RenderPlan {
+    /// Table column header (e.g. "Model   Ctx   Coding   Price in").
+    /// Single line guaranteed. Changes only on terminal resize.
+    pub table_header: Option<LogicalLine>,
+    /// `header()` output: help text, stats, focused-row details.
+    /// Changes on cursor move (detail updates). Truncatable vertically.
+    pub detail: Vec<LogicalLine>,
+    /// Scrollable data rows. Rc-shared — same pointer on cursor moves.
+    pub rows: Rc<Vec<LogicalLine>>,
+    /// Index of the cursor-selected logical row among `rows`.
+    pub selected: Option<usize>,
+    /// Indices of active (`*`-marked) rows (design §5.2).
+    pub active_rows: Vec<usize>,
 }
 
-/// One rendered line with its style.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RenderLine {
-    pub text: String,
-    pub style: Style,
-    /// Non-selectable header line (BG_HEADER).
-    pub is_header: bool,
-    /// First visual line of a logical option (marker row).
-    pub is_marker_row: bool,
-    /// Index of the logical option this line belongs to.
-    pub option: usize,
+impl Default for RenderPlan {
+    fn default() -> Self {
+        RenderPlan {
+            table_header: None,
+            detail: Vec::new(),
+            rows: Rc::new(Vec::new()),
+            selected: None,
+            active_rows: Vec::new(),
+        }
+    }
+}
+
+impl RenderPlan {
+    /// Paint to ANSI text lines. Used by v2.0 overlays that haven't been
+    /// ported to the new direct-rendering path. The v25 overlay renders
+    /// directly from `LogicalLine` without calling this.
+    pub fn paint(&self, term_width: usize) -> Vec<String> {
+        let tw = term_width.max(1);
+        let mut out = Vec::new();
+
+        // Reconstruct flat line list from the three sections.
+        let mut flat: Vec<FlatLine> = Vec::new();
+
+        if let Some(ref th) = self.table_header {
+            flat.push(FlatLine {
+                text: th.0.clone(),
+                is_header: true,
+                is_marker_row: false,
+                option: usize::MAX,
+            });
+        }
+
+        for d in &self.detail {
+            for sub in d.0.split('\n') {
+                flat.push(FlatLine {
+                    text: sub.to_string(),
+                    is_header: true,
+                    is_marker_row: false,
+                    option: usize::MAX,
+                });
+            }
+        }
+
+        for (i, row) in self.rows.iter().enumerate() {
+            for (j, sub) in row.0.split('\n').enumerate() {
+                flat.push(FlatLine {
+                    text: sub.to_string(),
+                    is_header: false,
+                    is_marker_row: j == 0,
+                    option: i,
+                });
+            }
+        }
+
+        for l in &flat {
+            let sel = self.selected == Some(l.option);
+            let act = self.active_rows.contains(&l.option);
+            let bg = if l.is_header {
+                "\x1b[48;5;237m"
+            } else if sel {
+                "\x1b[48;5;239m"
+            } else {
+                "\x1b[48;5;235m"
+            };
+            let fg = if sel { "\x1b[1;36m" } else { "" };
+            let marker = if !l.is_marker_row {
+                "  "
+            } else if l.is_header {
+                "  "
+            } else if act {
+                "* "
+            } else if sel {
+                "> "
+            } else {
+                "  "
+            };
+            let content = format!("{}{}", marker, l.text);
+            let vis = crate::table::display_width(&content);
+            let pad = tw.saturating_sub(vis);
+            out.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+        }
+
+        out
+    }
+}
+
+/// Helper for `paint()` — flat line with styling metadata.
+struct FlatLine {
+    text: String,
+    is_header: bool,
+    is_marker_row: bool,
+    option: usize,
 }
 
 /// Marker for a logical option (v1 contract: `>` cursor, `*` active-state;
 /// `*` wins when both).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
-    /// Cursor-selected row: `> `.
     Cursor,
-    /// Current-state row: `* `.
     Active,
-    /// Both (cursor on the active row): `* ` wins.
     CursorActive,
-    /// Continuation / plain row: `  `.
     None,
 }
 
 impl Marker {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Marker::Cursor | Marker::None => if matches!(self, Marker::Cursor) { "> " } else { "  " },
+            Marker::Cursor | Marker::None => {
+                if matches!(self, Marker::Cursor) { "> " } else { "  " }
+            }
             Marker::Active | Marker::CursorActive => "* ",
         }
     }
 }
 
-/// The complete overlay panel description.
-///
-/// v2.5 panel structure (§6):
-/// 1. `header()` lines — non-selectable, sticky
-/// 2. Table header row (if columns exist) — sticky
-/// 3. Selectable data rows — scrollable, with `>` / `*` markers
-#[derive(Debug, Clone, Default)]
-pub struct RenderPlan {
-    /// All lines in display order: header + table header + data rows.
-    /// Rc-shared for zero-cost clone on cursor moves.
-    pub lines: std::rc::Rc<Vec<RenderLine>>,
-    /// Index of the cursor-selected logical option among data rows.
-    pub selected: Option<usize>,
-    /// Indices of active (`*`-marked) rows (§5.2). Multiple rows may
-    /// be active (e.g. multiple models currently in use).
-    pub active_rows: Vec<usize>,
-    /// Number of non-scrollable (sticky) lines at the top of the panel.
-    /// Includes header() lines and the table header row (if present).
-    /// The host scrolls only lines `[sticky_count..]`.
-    pub sticky_count: usize,
-}
+// --- v2.0 compat: PlanBuilder kept for slash_menu_bridge ---
 
-impl RenderPlan {
-    /// Paint to ANSI text lines (matching picocode's `overlay_lines` shape:
-    /// full-width padded rows, marker + content, per-line styles).
-    pub fn paint(&self, term_width: usize) -> Vec<String> {
-        let tw = term_width.max(1);
-        let mut out = Vec::new();
-        for l in self.lines.iter() {
-            let sel = self.selected == Some(l.option);
-            let act = self.active_rows.contains(&l.option);
-            let bg = if l.is_header {
-                Style::HEADER.bg
-            } else if sel {
-                Style::SELECTED.bg
-            } else {
-                Style::PANEL.bg
-            };
-            let fg = if sel { Style::SELECTED.fg } else { "" };
-            // Marker slot: `>` cursor, `*` active; `*` wins when both.
-            let marker = if !l.is_marker_row {
-                "  "
-            } else if l.is_header {
-                "  "
-            } else if act {
-                Marker::Active.as_str()
-            } else if sel {
-                Marker::Cursor.as_str()
-            } else {
-                "  "};
-            // Build content without ANSI, pad to term width, then wrap.
-            let content = format!("{}{}", marker, l.text);
-            let vis = crate::table::display_width(&content);
-            let pad = tw.saturating_sub(vis);
-            out.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), Style::RESET));
-        }
-        out
-    }
-}
-
-/// Compose a [`RenderPlan`] from menu state parts.
-/// PlanBuilder: composes a [`RenderPlan`] from menu state parts.
-///
-/// Detail lines are passed in at `build` time (design §5.1) so the
-/// crate stays independent of host-provided text — the host resolves
-/// the detail provider per frame and feeds the strings in.
 pub struct PlanBuilder {
     pub title: String,
     pub child_header: Option<String>,
@@ -138,12 +164,6 @@ pub struct PlanBuilder {
 }
 
 impl PlanBuilder {
-    /// Build the plan for a menu level: title, optional child header
-    /// (static `child_header`), optional per-row derived header (R8-4),
-    /// then candidate rows with markers.
-    /// `detail` are non-selectable header lines rendered between the
-    /// title and the rows (design §5.1: `/replay` help, `/stat`
-    /// summary, etc.). Empty ⇒ no detail section.
     pub fn build(
         &self,
         state: &crate::interpreter::MenuState,
@@ -152,24 +172,16 @@ impl PlanBuilder {
     ) -> RenderPlan {
         use crate::table::{Align, Table};
 
-        let mut lines: Vec<RenderLine> = Vec::new();
+        let mut table_header_line: Option<LogicalLine> = None;
+        let mut detail_lines: Vec<LogicalLine> = Vec::new();
+        let mut row_lines: Vec<LogicalLine> = Vec::new();
 
-        // (i) static child header (R8-4).
+        // child header → detail
         if let Some(h) = &self.child_header {
-            for sub in wrap_lines(h, max_width) {
-                lines.push(RenderLine {
-                    text: sub,
-                    style: Style::HEADER,
-                    is_header: true,
-                    is_marker_row: false,
-                    option: usize::MAX,
-                });
-            }
+            detail_lines.push(LogicalLine::new(h.clone()));
         }
 
-        // (ii) per-row derived header for dynamic levels: the selected row's
-        // description (or a child_description override, supplied via the
-        // row's fields as `child_description`).
+        // per-row derived header for dynamic levels
         if let Some(sel) = state.selected() {
             if state.drill_in {
                 if let Some(cd) = sel
@@ -177,63 +189,34 @@ impl PlanBuilder {
                     .and_then(|v| v.as_str())
                     .or(sel.description.as_deref())
                 {
-                    for sub in wrap_lines(cd, max_width) {
-                        lines.push(RenderLine {
-                            text: sub,
-                            style: Style::HEADER,
-                            is_header: true,
-                            is_marker_row: false,
-                            option: usize::MAX,
-                        });
-                    }
+                    detail_lines.push(LogicalLine::new(cd.to_string()));
                 }
             }
         }
 
-        // Candidate rows via the table builder when fields are present,
-        // otherwise a single column of ids+descriptions.
+        // Table column header
         let use_table = if !state.columns.is_empty() {
             true
         } else {
-            state
-                .candidates
-                .first()
-                .map(|r| !r.fields.is_empty())
-                .unwrap_or(false)
+            state.candidates.first().map(|r| !r.fields.is_empty()).unwrap_or(false)
         };
+
         let row_texts: Vec<String> = if use_table {
-            // Declared columns (provider presentation hints) drive the
-            // layout; fall back to the row's field order + an id "Model"
-            // column when the provider declared none.
             let colnames: Vec<String> = if state.columns.is_empty() {
                 let mut names = vec!["id".to_string()];
-                names.extend(
-                    state.candidates[0]
-                        .fields
-                        .iter()
-                        .map(|(k, _)| k.clone()),
-                );
+                names.extend(state.candidates[0].fields.iter().map(|(k, _)| k.clone()));
                 names
             } else {
-                state
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        if c.field.is_empty() {
-                            "id".to_string()
-                        } else {
-                            c.field.clone()
-                        }
-                    })
-                    .collect()
+                state.columns.iter().map(|c| {
+                    if c.field.is_empty() { "id".to_string() } else { c.field.clone() }
+                }).collect()
             };
             let headers: Vec<&str> = if state.columns.is_empty() {
                 colnames.iter().map(String::as_str).collect()
             } else {
                 state.columns.iter().map(|c| c.header.as_str()).collect()
             };
-            let mut t = Table::new(&headers)
-                .set_gap(2);
+            let mut t = Table::new(&headers).set_gap(2);
             if !state.columns.is_empty() {
                 let aligns: Vec<Align> = state.columns.iter().map(|c| c.align).collect();
                 let mins: Vec<usize> = state.columns.iter().map(|c| c.min_width).collect();
@@ -243,9 +226,6 @@ impl PlanBuilder {
             for r in &state.candidates {
                 let mut cells: Vec<String> = Vec::with_capacity(colnames.len());
                 for k in &colnames {
-                    // Display-string override wins; else render the value
-                    // (design §8.1 "display string" — sort/filter still read
-                    // the underlying value, not this).
                     cells.push(
                         r.field_display(k)
                             .or_else(|| {
@@ -259,46 +239,26 @@ impl PlanBuilder {
                 }
                 t.add_row(&cells);
             }
-            // Multi-line cells (long descriptions, model names) wrap; the
-            // host renderer splits logical rows on `\n` so each candidate
-            // stays one selectable option (matches v1's model table).
-            t.render_multiline(max_width.saturating_sub(2))
+            let rendered = t.render_multiline(max_width.saturating_sub(2));
+            // Table header
+            let header_text = t.render_header(max_width.saturating_sub(2));
+            table_header_line = Some(LogicalLine::new(header_text));
+            rendered
         } else {
-            state
-                .candidates
-                .iter()
-                .map(|r| match &r.description {
-                    Some(d) if !d.is_empty() => format!("{} — {}", r.id, d),
-                    _ => r.id.clone(),
-                })
-                .collect()
+            state.candidates.iter().map(|r| match &r.description {
+                Some(d) if !d.is_empty() => format!("{} — {}", r.id, d),
+                _ => r.id.clone(),
+            }).collect()
         };
 
-        // Logical options: one entry per candidate; multi-line rows from the
-        // table split into visual lines sharing the option index.
-        for (i, text) in row_texts.iter().enumerate() {
-            for (j, sub) in text.split('\n').enumerate() {
-                lines.push(RenderLine {
-                    text: sub.to_string(),
-                    style: Style::PANEL,
-                    is_header: false,
-                    is_marker_row: j == 0,
-                    option: i,
-                });
-            }
+        // Data rows: each row is one LogicalLine with embedded \n for wrapping
+        for text in row_texts {
+            row_lines.push(LogicalLine::new(text));
         }
 
-        // Wrap detail lines as header lines (they go before the data rows).
+        // Additional detail lines from caller (e.g. stat summary, replay help).
         for d in detail {
-            for sub in wrap_lines(&d, max_width) {
-                lines.push(RenderLine {
-                    text: sub,
-                    style: Style::HEADER,
-                    is_header: true,
-                    is_marker_row: false,
-                    option: usize::MAX,
-                });
-            }
+            detail_lines.push(LogicalLine::new(d));
         }
 
         let active_rows: Vec<usize> = if let Some(a) = state.active_row_marker {
@@ -308,20 +268,13 @@ impl PlanBuilder {
         };
 
         RenderPlan {
-            lines: std::rc::Rc::new(lines),
-            selected: if state.candidates.is_empty() {
-                None
-            } else {
-                Some(state.active)
-            },
+            table_header: table_header_line,
+            detail: detail_lines,
+            rows: Rc::new(row_lines),
+            selected: if state.candidates.is_empty() { None } else { Some(state.active) },
             active_rows,
-            sticky_count: 0, // PlanBuilder doesn't know; host computes
         }
     }
-}
-
-fn wrap_lines(s: &str, width: usize) -> Vec<String> {
-    crate::wrap::wrap(s, width.max(1))
 }
 
 #[cfg(test)]
@@ -345,18 +298,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_has_title_header_and_rows() {
+    fn plan_has_header_and_rows() {
         let b = PlanBuilder {
             title: "Models".into(),
             child_header: Some("pick a model".into()),
             row_header: None,
         };
         let plan = b.build(&empty_state(), 80, Vec::new());
-        // title field removed in v2.5 — header is the mechanism
-        let headers = plan.lines.iter().filter(|l| l.is_header).count();
-        assert_eq!(headers, 1);
-        let rows = plan.lines.iter().filter(|l| !l.is_header).count();
-        assert_eq!(rows, 2);
+        // detail has the child header
+        assert_eq!(plan.detail.len(), 1);
+        assert_eq!(plan.rows.len(), 2);
         assert_eq!(plan.selected, Some(0));
     }
 
@@ -377,7 +328,6 @@ mod tests {
         };
         let plan = b.build(&empty_state(), 40, Vec::new());
         let lines = plan.paint(40);
-        // v2.5: no title — just 2 data rows
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("a"));
         assert!(lines[1].contains("b"));
@@ -385,7 +335,7 @@ mod tests {
 
     #[test]
     fn declared_columns_drive_layout() {
-        use crate::provider::{ColumnDef, DataResult};
+        use crate::provider::ColumnDef;
         use crate::value::Value;
         let mut st = empty_state();
         st.candidates[0] = crate::fields::Row::new("a")
@@ -412,13 +362,11 @@ mod tests {
             row_header: None,
         };
         let plan = b.build(&st, 60, Vec::new());
-        // Two logical options; the active (current-state) row is `b`.
         assert_eq!(plan.selected, Some(0));
         assert_eq!(plan.active_rows, vec![1]);
-        // Active precedence: `*` on the active row when the cursor is off it.
         let painted = plan.paint(60);
         let opt_b = painted.iter().find(|l| l.contains('b')).expect("row b present");
-        assert!(opt_b.trim_start_matches("\x1b[48;5;239m").trim_start().starts_with('*') || opt_b.contains("* b"), "active row shows `*`: {opt_b:?}");
+        assert!(opt_b.contains("* b"), "active row shows `*`: {opt_b:?}");
     }
 
     #[test]
@@ -428,7 +376,6 @@ mod tests {
         st.active = 0;
         st.active_row_marker = Some(0);
         let b = PlanBuilder { title: "T".into(), child_header: None, row_header: None };
-        // selected == active → `*` wins (per §5.1).
         let plan = b.build(&st, 40, Vec::new());
         let painted = plan.paint(40);
         assert!(painted.iter().any(|l| l.contains("* x")), "shared row shows `*`, not `>`: {painted:?}");
@@ -445,6 +392,6 @@ mod tests {
             row_header: None,
         };
         let plan = b.build(&st, 80, Vec::new());
-        assert!(plan.lines.iter().any(|l| l.is_header && l.text.contains("long detail header")));
+        assert!(plan.detail.iter().any(|l| l.0.contains("long detail header")));
     }
 }

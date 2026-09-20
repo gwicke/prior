@@ -301,7 +301,7 @@ impl Table {
 
 /// Visible width of `s`, ignoring ANSI SGR escapes (so styled cells size
 /// correctly). Falls back to width 1 for control/ambiguous chars.
-pub(crate) fn display_width(s: &str) -> usize {
+pub fn display_width(s: &str) -> usize {
     let mut w = 0;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

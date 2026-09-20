@@ -501,9 +501,6 @@ pub(crate) enum ActiveOverlay {
     V25Menu {
         /// The render plan from the v2.5 engine.
         plan: crate::slashdot_menu::render::RenderPlan,
-        /// Number of leading lines (header + table header) that stay fixed
-        /// when the list scrolls. Computed from the plan.
-        sticky_count: usize,
     },
 
     Sandbox {
@@ -628,18 +625,9 @@ impl ActiveOverlay {
     /// (they are non-selectable); the caller's paint arm renders them.
     /// The loop uses the returned opts only for cursor/focus math.
     fn plan_rows(plan: &crate::slashdot_menu::render::RenderPlan) -> (Vec<String>, Option<usize>) {
-        let mut opts: Vec<String> = Vec::new();
-        for l in plan.lines.iter() {
-            if l.is_header {
-                continue;
-            }
-            if let Some(o) = opts.get_mut(l.option) {
-                o.push('\n');
-                o.push_str(&l.text);
-            } else {
-                opts.push(l.text.clone());
-            }
-        }
+        let opts: Vec<String> = plan.rows.iter()
+            .map(|l| l.0.clone())
+            .collect();
         (opts, plan.active_rows.first().copied())
     }
 
@@ -1261,7 +1249,7 @@ impl ActiveOverlay {
             }
             // Root command list rendered from engine plan (via Menu variant)
             ActiveOverlay::Menu { plan, .. } => {
-                if plan.lines.is_empty() {
+                if plan.rows.is_empty() {
                     return ("Commands  (type to filter, up/down, Tab/Enter select)",
                             vec!["(no matching command)".into()], None, false);
                 }
@@ -1269,7 +1257,7 @@ impl ActiveOverlay {
                 ("", opts, active, false)
             }
             ActiveOverlay::V25Menu { plan, .. } => {
-                if plan.lines.is_empty() {
+                if plan.rows.is_empty() {
                     return ("", vec!["(no results)".into()], None, false);
                 }
                 let (opts, active) = Self::plan_rows(plan);
@@ -2590,8 +2578,7 @@ impl Repl {
                 );
                 match result {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                        let sticky_count = plan.sticky_count;
-                        ActiveOverlay::V25Menu { plan, sticky_count }
+                        ActiveOverlay::V25Menu { plan }
                     }
                     _ => ActiveOverlay::None,
                 }
@@ -2703,24 +2690,58 @@ impl Repl {
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
-                ActiveOverlay::V25Menu { plan, sticky_count } => {
-                    let tw = crate::output::term_width();
-                    let all_lines: Vec<String> = plan.paint(tw);
-                    let total = all_lines.len();
-                    let sticky = *sticky_count;
-                    if sticky == 0 || total <= sticky {
-                        all_lines.join("\n")
-                    } else {
-                        let scrollable_total = total - sticky;
-                        let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                        let n = max_pop.saturating_sub(sticky).min(scrollable_total);
-                        let win = Self::overlay_window(scrollable_total, n, sel);
-                        let mut result: Vec<&str> = all_lines[..sticky].iter().map(|s| s.as_str()).collect();
-                        result.extend(
-                            all_lines[sticky + win..sticky + win + n].iter().map(|s| s.as_str())
-                        );
-                        result.join("\n")
+                ActiveOverlay::V25Menu { plan } => {
+                    let tw = crate::output::term_width().max(1);
+                    let mut result: Vec<String> = Vec::new();
+
+                    // 1. Table header (always shown).
+                    if let Some(ref th) = plan.table_header {
+                        result.push(Self::render_logical_line(th, tw, false, false, false));
                     }
+
+                    // 2. Detail (truncatable from bottom).
+                    let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                    let min_data = 1usize;
+                    let detail_budget = max_pop.saturating_sub(min_data).max(1);
+                    for d in plan.detail.iter().take(detail_budget) {
+                        result.push(Self::render_logical_line(d, tw, false, false, false));
+                    }
+
+                    // 3. Data rows, windowed around `selected`.
+                    let header_lines = result.len();
+                    let data_budget = max_pop.saturating_sub(header_lines).max(1);
+                    let total = plan.rows.len();
+                    if total > 0 {
+                        let sel_idx = plan.selected.unwrap_or(0);
+                        let win = if total <= data_budget {
+                            0
+                        } else {
+                            sel_idx.saturating_sub(data_budget / 2).min(total - data_budget)
+                        };
+                        for i in win..(win + data_budget).min(total) {
+                            let is_selected = plan.selected == Some(i);
+                            let is_active = plan.active_rows.contains(&i);
+                            let row = &plan.rows[i];
+                            let sub_lines: Vec<&str> = row.0.split('\n').collect();
+                            for (j, sub) in sub_lines.iter().enumerate() {
+                                let first = j == 0;
+                                let marker = if first {
+                                    if is_active { "* " }
+                                    else if is_selected { "> " }
+                                    else { "  " }
+                                } else {
+                                    "  "
+                                };
+                                let bg = if is_selected { "\x1b[48;5;239m" } else { "\x1b[48;5;235m" };
+                                let fg = if is_selected { "\x1b[1;36m" } else { "" };
+                                let content = format!("{}{}", marker, sub);
+                                let vis = crate::slashdot_menu::table::display_width(&content);
+                                let pad = tw.saturating_sub(vis);
+                                result.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+                            }
+                        }
+                    }
+                    result.join("\n")
                 }
                 _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
@@ -3183,6 +3204,35 @@ impl Repl {
         s
     }
     /// `avail` rows (≤ `overlay_len`), centered on `sel`. Returns the
+    /// Render a LogicalLine as a single ANSI-styled string. Used for
+    /// table_header and detail lines (not data rows, which are rendered
+    /// inline with markers). Splits on `\n` for multi-line logical lines.
+    pub fn render_logical_line(
+        line: &crate::slashdot_menu::render::LogicalLine,
+        tw: usize,
+        is_selected: bool,
+        is_active: bool,
+        is_header: bool,
+    ) -> String {
+        let bg = if is_header { "\x1b[48;5;237m" }
+                 else if is_selected { "\x1b[48;5;239m" }
+                 else { "\x1b[48;5;235m" };
+        let fg = if is_selected { "\x1b[1;36m" } else { "" };
+        let mut parts = Vec::new();
+        for (j, sub) in line.0.split('\n').enumerate() {
+            let marker = if j == 0 {
+                if is_active { "* " }
+                else if is_selected { "> " }
+                else { "  " }
+            } else { "  " };
+            let content = format!("{}{}", marker, sub);
+            let vis = crate::slashdot_menu::table::display_width(&content);
+            let pad = tw.saturating_sub(vis);
+            parts.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+        }
+        parts.join("\n")
+    }
+
     /// start index into the full overlay. Extracted so it can be unit-tested
     /// without a TTY.
     pub fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
@@ -6650,7 +6700,7 @@ mod tests {
                     // id equals the command must be active. Verify via cursor
                     // directly (the engine is rebuilt per test call).
                     // The cursor in the Menu variant IS the active row.
-                    assert!(plan.lines.len() > 0 || plan.lines.len() > 0,
+                    assert!(plan.rows.len() > 0 || plan.rows.len() > 0,
                         "plan should have content for {buf:?}");
                     // cursor is the engine's active row for this level
                     assert!(cursor < 100, "cursor should be a valid row index, got {cursor}");
@@ -6703,7 +6753,7 @@ mod tests {
                 // and plan has content. The exact row index varies with the
                 // provider ordering but cursor should point to a valid row.
                 assert!(cursor < 100, "cursor should be a valid row index");
-                assert!(plan.lines.len() > 0 || plan.lines.len() > 0,
+                assert!(plan.rows.len() > 0 || plan.rows.len() > 0,
                     "plan should have content for /replay");
             }
             other => panic!(
@@ -6716,11 +6766,11 @@ mod tests {
         match model_overlay("/replay ") {
             ActiveOverlay::Menu { plan, .. } => {
                 assert!(
-                    !plan.lines.is_empty(),
+                    !plan.detail.is_empty() || plan.table_header.is_some(),
                     "drilled /replay plan carries the help detail"
                 );
                 // v2.5: no candidate rows (pure leaf), but header lines exist
-                let selectable = plan.lines.iter().filter(|l| !l.is_header).count();
+                let selectable = plan.rows.len();
                 assert_eq!(selectable, 0, "pure leaf has no selectable rows");
             }
             other => panic!(
@@ -6735,7 +6785,7 @@ mod tests {
         match model_overlay("/replay 5") {
             ActiveOverlay::Menu { plan, .. } => {
                 assert!(
-                    !plan.lines.is_empty(),
+                    !plan.detail.is_empty(),
                     "/replay <param> keeps the help detail in view"
                 );
             }
@@ -9983,7 +10033,7 @@ mod model_v2_tests {
     fn model_menu_opens_with_dynamic_rows() {
         match model_ov("/model ") {
             ActiveOverlay::Menu { plan, .. } => {
-                assert!(!plan.lines.is_empty(), "engine rows empty");
+                assert!(!plan.rows.is_empty(), "engine rows empty");
             }
             other => panic!("expected Menu, got disc {:?}", other.overlay_disc()),
         }
@@ -10080,9 +10130,9 @@ mod model_v2_tests {
             ActiveOverlay::Menu { plan, .. } => {
                 // v2.5: title removed; check header lines instead
                 let active = plan.active_rows.first().copied().expect("current persona must be marked");
-                let line = plan.lines.iter().find(|l| l.option == active);
+                let line = plan.rows.get(active);
                 assert!(
-                    line.map(|l| l.text.contains("academic")).unwrap_or(false),
+                    line.map(|l| l.0.contains("academic")).unwrap_or(false),
                     "active row should be the current persona"
                 );
             }
@@ -10135,9 +10185,9 @@ mod model_v2_tests {
         match &ov {
             ActiveOverlay::Menu { plan, .. } => {
                 let active = plan.active_rows.first().copied().expect("current thinking level must be marked");
-                let line = plan.lines.iter().find(|l| l.option == active);
+                let line = plan.rows.get(active);
                 assert!(
-                    line.map(|l| l.text.contains("med")).unwrap_or(false),
+                    line.map(|l| l.0.contains("med")).unwrap_or(false),
                     "active row should be the current thinking level"
                 );
             }

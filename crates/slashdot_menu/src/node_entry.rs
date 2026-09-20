@@ -12,7 +12,7 @@ use crate::node_impl::{
     Args, HostKey, MenuResult, PathArgs, SubmitResult,
     SlashDotNode,
 };
-use crate::render::{RenderLine, RenderPlan, Style};
+use crate::render::{LogicalLine, RenderPlan};
 use crate::value::Value;
 
 // --- Handle to a row in a child's DataResponse ---
@@ -56,12 +56,12 @@ struct ContentCache {
 }
 
 struct RenderCache {
-    /// Rc-shared rendered lines — zero-cost clone on cursor moves.
-    lines: Rc<Vec<RenderLine>>,
+    /// Table column header. Single line. Changes on dirty/resize only.
+    table_header: Option<crate::render::LogicalLine>,
+    /// Scrollable data rows. Rc-shared — same pointer on cursor moves.
+    rows: std::rc::Rc<Vec<crate::render::LogicalLine>>,
     /// Resolved active row indices (computed from active_ids + ranked_rows).
     active_rows: Vec<usize>,
-    /// Number of sticky (non-scrollable) lines at the top.
-    sticky_count: usize,
 }
 
 impl Default for ContentCache {
@@ -73,9 +73,9 @@ impl Default for ContentCache {
             ranked_rows: Vec::new(),
             dirty: true,
             render: RenderCache {
-                lines: Rc::new(Vec::new()),
+                table_header: None,
+                rows: Rc::new(Vec::new()),
                 active_rows: Vec::new(),
-                sticky_count: 0,
             },
         }
     }
@@ -732,9 +732,6 @@ impl NodeEntry {
     /// The host uses `sticky_count` to decide vertical truncation when
     /// the terminal is too short for all sticky + data lines.
     fn build_render_plan(&mut self) -> RenderPlan {
-        let mut lines = Vec::new();
-        let mut sticky_count = 0usize;
-
         // Pre-compute: do we have data rows and table columns?
         let has_data = !self.content.ranked_rows.is_empty();
         let columns = self.inner.columns();
@@ -742,30 +739,23 @@ impl NodeEntry {
         let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
         let has_table_header = has_columns && has_data;
 
-        // 1. Header lines from the node's header() method (sticky).
+        // 1. Header lines from the node's header() method → detail.
         let empty_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Args::default(),
         };
         let header = self.inner.header(&empty_args);
-        for h in &header {
-            lines.push(RenderLine {
-                text: h.clone(),
-                style: Style::HEADER,
-                is_header: true,
-                is_marker_row: false,
-                option: usize::MAX,
-            });
-            sticky_count += 1;
-        }
+        let detail: Vec<LogicalLine> = header.into_iter()
+            .map(LogicalLine::new)
+            .collect();
 
-        // 2. Table header row (if columns declared and there's data, sticky).
-        // 2+3. Table rendering: header + data rows.
+        // 2. Table header + data rows.
         let term_width: usize = self.epoch.term_width;
+        let mut table_header_line: Option<LogicalLine> = None;
+        let row_lines: Vec<LogicalLine>;
         {
             use crate::table::{Align, Table};
-            // Column field names (what to read from each row).
             let col_field_names: Vec<String> = if !columns.is_empty() {
                 columns.iter().map(|c| c.field.clone()).collect()
             } else {
@@ -776,7 +766,6 @@ impl NodeEntry {
                 }
                 names
             };
-            // Header labels (what to display).
             let header_labels: Vec<&str> = if !columns.is_empty() {
                 columns.iter().map(|c| c.header.as_str()).collect()
             } else {
@@ -807,31 +796,16 @@ impl NodeEntry {
                 }
                 t.add_row(&cells);
             }
-            // Render header through the Table (aligned with data columns).
+            // Table header (single line, always one LogicalLine).
             if has_table_header {
                 let header_text = t.render_header(term_width.saturating_sub(2));
-                lines.push(RenderLine {
-                    text: header_text,
-                    style: Style::HEADER,
-                    is_header: true,
-                    is_marker_row: false,
-                    option: usize::MAX,
-                });
-                sticky_count += 1;
+                table_header_line = Some(LogicalLine::new(header_text));
             }
-            // Render data rows.
-            let row_texts = t.render_multiline(term_width.saturating_sub(2));
-            for (i, text) in row_texts.iter().enumerate() {
-                for (j, sub) in text.split('\n').enumerate() {
-                    lines.push(RenderLine {
-                        text: sub.to_string(),
-                        style: Style::PANEL,
-                        is_header: false,
-                        is_marker_row: j == 0,
-                        option: i,
-                    });
-                }
-            }
+            // Data rows: each rendered row is one LogicalLine (embedded \n for wrapping).
+            row_lines = t.render_multiline(term_width.saturating_sub(2))
+                .into_iter()
+                .map(LogicalLine::new)
+                .collect();
         }
 
         // Resolve active row indices.
@@ -847,43 +821,52 @@ impl NodeEntry {
             .map(|(i, _)| i)
             .collect();
 
-        let lines_rc = Rc::new(lines);
+        let rows_rc = Rc::new(row_lines);
 
-        // Cache the lines, active_rows, and sticky_count.
-        self.content.render.lines = Rc::clone(&lines_rc);
+        // Cache table_header, rows, and active_rows.
+        self.content.render.table_header = table_header_line.clone();
+        self.content.render.rows = Rc::clone(&rows_rc);
         self.content.render.active_rows = active_rows.clone();
-        self.content.render.sticky_count = sticky_count;
 
-        let active = if active_rows.is_empty() {
-            Vec::new()
+        let selected = if self.content.ranked_rows.is_empty() {
+            None
         } else {
-            active_rows
+            Some(self.epoch.cursor_idx)
         };
 
         RenderPlan {
-            lines: lines_rc,
-            selected: if self.content.ranked_rows.is_empty() {
-                None
-            } else {
-                Some(self.epoch.cursor_idx)
-            },
-            active_rows: active,
-            sticky_count,
+            table_header: table_header_line,
+            detail,
+            rows: rows_rc,
+            selected,
+            active_rows,
         }
     }
 
-    /// Cursor-move fast path: clone the cached lines Rc, only update
-    /// markers. Zero allocation for the lines themselves.
-    fn plan_from_cache(&self) -> RenderPlan {
+    /// Cursor-move fast path: reuse cached table_header + rows Rc,
+    /// recompute detail (may depend on focused row) and selected/active.
+    fn plan_from_cache(&mut self) -> RenderPlan {
+        let empty_args = PathArgs {
+            ids: Vec::new(),
+            suffix: String::new(),
+            args: Args::default(),
+        };
+        let detail: Vec<LogicalLine> = self.inner.header(&empty_args).into_iter()
+            .map(LogicalLine::new)
+            .collect();
+
+        let selected = if self.content.ranked_rows.is_empty() {
+            None
+        } else {
+            Some(self.epoch.cursor_idx)
+        };
+
         RenderPlan {
-            lines: Rc::clone(&self.content.render.lines),
-            selected: if self.content.ranked_rows.is_empty() {
-                None
-            } else {
-                Some(self.epoch.cursor_idx)
-            },
+            table_header: self.content.render.table_header.clone(),
+            detail,
+            rows: Rc::clone(&self.content.render.rows),
+            selected,
             active_rows: self.content.render.active_rows.clone(),
-            sticky_count: self.content.render.sticky_count,
         }
     }
 }
@@ -1120,9 +1103,7 @@ mod tests {
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "");
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("alpha")));
                 assert!(row_texts.iter().any(|t| t.contains("beta")));
@@ -1139,9 +1120,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("alpha")));
                 assert!(!row_texts.iter().any(|t| t.contains("beta")));
@@ -1158,7 +1137,7 @@ mod tests {
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "alpha");
-                let row_count = plan.lines.iter().filter(|l| !l.is_header).count();
+                let row_count = plan.rows.len();
                 assert_eq!(row_count, 2);
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -1248,9 +1227,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let headers: Vec<&str> = plan.lines.iter()
-                    .filter(|l| l.is_header)
-                    .map(|l| l.text.as_str())
+                let headers: Vec<&str> = plan.detail.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(headers.contains(&"Help text here"));
             }
@@ -1357,7 +1334,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_count = plan.lines.iter().filter(|l| !l.is_header).count();
+                let row_count = plan.rows.len();
                 assert_eq!(row_count, 1, "fuzzy 'first' should narrow to 1 row");
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -1386,9 +1363,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("gpt4o")));
                 assert!(row_texts.iter().any(|t| t.contains("gpt4-mini")));
@@ -1452,9 +1427,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("add")));
                 assert!(row_texts.iter().any(|t| t.contains("bind1")));
@@ -1530,9 +1503,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(!row_texts.iter().any(|t| t.contains("add")));
                 assert!(row_texts.iter().any(|t| t.contains("bind1")));
@@ -1558,9 +1529,7 @@ mod tests {
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert_eq!(row_texts.len(), 1);
                 assert!(row_texts[0].contains("valid"));

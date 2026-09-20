@@ -37,4 +37,5 @@ pub mod accept;
 pub use menu::{SlashDotMenu, SlashDotHandle, ChildBuilder};
 pub use node_impl::{SlashDotNode, HostKey, MenuResult, PathArgs, Args, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
 pub use provider::ColumnDef;
+pub use render::LogicalLine;
 pub use table::{Align, Table};

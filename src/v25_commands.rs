@@ -70,9 +70,7 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "thinking ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert_eq!(row_texts.len(), 4);
                 assert!(row_texts.iter().any(|t| t.contains("off")));
@@ -105,15 +103,15 @@ mod tests {
         let r = eval(&mut h, "thinking ", HostKey::None);
         match &r {
             MenuResult::Continue(plan, _) => {
-                assert_eq!(plan.lines.iter().filter(|l| !l.is_header).count(), 4);
+                assert_eq!(plan.rows.len(), 4);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
         match eval(&mut h, "thinking ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
-                assert!(plan.lines.iter().filter(|l| !l.is_header).count() == 0
-                    || plan.lines.iter().any(|l| l.text.contains("off")),
-                    "should show leaf content, got {:?}", plan.lines);
+                assert!(plan.rows.len() == 0
+                    || plan.rows.iter().any(|l| l.0.contains("off")),
+                    "should show leaf content, got {:?}", plan.rows);
                 assert!(prompt.contains("off"), "prompt should contain off: {}", prompt);
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -195,9 +193,7 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "thinking h", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("high")));
                 assert!(!row_texts.iter().any(|t| t.contains("off")));
@@ -229,9 +225,7 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("thinking")));
             }
@@ -341,9 +335,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert_eq!(row_texts.len(), 4);
                 assert!(row_texts.iter().any(|t| t.contains("architect")));
@@ -455,9 +447,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.lines.iter()
-                    .filter(|l| !l.is_header)
-                    .map(|l| l.text.as_str())
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
                 assert!(row_texts.iter().any(|t| t.contains("persona")));
             }

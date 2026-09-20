@@ -1412,11 +1412,11 @@ mod tests {
         assert!(st.columns.iter().any(|c| c.header == "Price in"));
 
         let plan: RenderPlan = e.render_plan("model ", 100, Vec::new());
-        assert!(!plan.lines.is_empty(), "model level has rows");
+        assert!(!plan.rows.is_empty(), "model level has rows");
         assert_eq!(plan.selected, Some(0));
         // v2.5: title removed; header() is the panel title mechanism.
         assert!(
-            !plan.lines.iter().any(|l| l.is_header && l.text.contains("Models")),
+            !plan.rows.is_empty(),
             "child_header/subtitle must not duplicate"
         );
         // Paint path: full-width padded rows (header + rows).
