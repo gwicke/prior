@@ -9,9 +9,8 @@ use std::rc::Rc;
 
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
-    StaticListingNode, StaticRow,
 };
-use crate::slashdot_menu::menu::SlashDotMenu;
+use crate::slashdot_menu::menu::SlashDotMenuNode;
 
 // ---------------------------------------------------------------------------
 // PersonaEnumNode — returns all persona rows from a single node.
@@ -50,19 +49,13 @@ impl SlashDotNode for PersonaEnumNode {
 }
 
 // ---------------------------------------------------------------------------
-// Menu builder — adds persona to the root menu.
+// Menu builder — adds persona child to a listing node.
 // ---------------------------------------------------------------------------
 
-/// Add `/persona` children to an existing `SlashDotMenu`.
-pub fn add_persona_children(
-    menu: &mut SlashDotMenu,
+/// Add `/persona` child to a listing `SlashDotMenuNode`.
+pub fn add_persona_child(
+    listing: &mut SlashDotMenuNode,
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
 ) {
-    menu.add_root_child(StaticListingNode::new(&[
-        StaticRow::new("persona", "set runtime persona"),
-    ]).with_columns(vec![
-        crate::slashdot_menu::ColumnDef::new("id", "Persona"),
-        crate::slashdot_menu::ColumnDef::new("description", "Description"),
-    ]))
-    .add_child_node(PersonaEnumNode { settings: settings.clone() });
+    listing.add_child(PersonaEnumNode { settings: settings.clone() }.into());
 }

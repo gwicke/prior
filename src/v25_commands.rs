@@ -51,12 +51,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
-        let mut menu = SlashDotMenu::new();
-        menu.add_root_child(StaticListingNode::new(&[
+        use crate::slashdot_menu::SlashDotMenuNode;
+        let mut root = SlashDotMenuNode::root();
+        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
-        ]))
-        .add_child_node(ThinkingEnumNode { shared: state.clone() });
-        menu
+        ]).into();
+        tl.add_child(ThinkingEnumNode { shared: state.clone() }.into());
+        root.add_child(tl);
+        SlashDotMenu::from_root_node(root)
     }
 
     // -----------------------------------------------------------------------
@@ -320,12 +322,14 @@ mod persona_tests {
     }
 
     fn build_persona_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
-        let mut menu = SlashDotMenu::new();
-        menu.add_root_child(StaticListingNode::new(&[
+        use crate::slashdot_menu::SlashDotMenuNode;
+        let mut root = SlashDotMenuNode::root();
+        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
-        ]))
-        .add_child_node(PersonaEnumNode { shared: state.clone() });
-        menu
+        ]).into();
+        pl.add_child(PersonaEnumNode { shared: state.clone() }.into());
+        root.add_child(pl);
+        SlashDotMenu::from_root_node(root)
     }
 
     #[test]

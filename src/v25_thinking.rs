@@ -10,7 +10,7 @@ use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
     StaticListingNode, StaticRow,
 };
-use crate::slashdot_menu::menu::SlashDotMenu;
+use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 
 // ---------------------------------------------------------------------------
 // ThinkingEnumNode — returns all thinking levels from a single node.
@@ -55,21 +55,36 @@ pub fn build_menu(
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
-    let mut menu = SlashDotMenu::new();
+    let mut root = SlashDotMenuNode::root();
 
     // Thinking: listing + single enum node (returns all levels via data()).
-    menu.add_root_child(StaticListingNode::new(&[
-        StaticRow::new("thinking", "set thinking level"),
-    ]).with_columns(vec![
-        crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
-    ]))
-    .add_child_node(ThinkingEnumNode { shared: thinking_level.clone() });
+    {
+        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
+            StaticRow::new("thinking", "set thinking level"),
+        ]).with_columns(vec![
+            crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
+        ]).into();
+        tl.add_child(ThinkingEnumNode { shared: thinking_level.clone() }.into());
+        root.add_child(tl);
+    }
 
     // Persona
-    crate::v25_persona::add_persona_children(&mut menu, settings);
+    {
+        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
+            StaticRow::new("persona", "set runtime persona"),
+        ]).with_columns(vec![
+            crate::slashdot_menu::ColumnDef::new("id", "Persona"),
+            crate::slashdot_menu::ColumnDef::new("description", "Description"),
+        ]).into();
+        crate::v25_persona::add_persona_child(&mut pl, settings);
+        root.add_child(pl);
+    }
 
     // Model
-    crate::v25_model::add_model_children(&mut menu, shared);
+    {
+        let ml: SlashDotMenuNode = crate::v25_model::build_model_node(shared);
+        root.add_child(ml);
+    }
 
-    menu
+    SlashDotMenu::from_root_node(root)
 }

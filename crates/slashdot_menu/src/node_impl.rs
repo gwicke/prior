@@ -169,11 +169,11 @@ impl StaticRow {
 ///
 /// # Example
 /// ```ignore
-/// let node = StaticListingNode::new(&[
+/// let node: SlashDotMenuNode = StaticListingNode::new(&[
 ///     StaticRow::new("thinking", "set thinking level"),
 ///     StaticRow::new("model", "switch model"),
-/// ]);
-/// menu.add_root_child(node).add_child_node(child);
+/// ]).into();
+/// node.add_child(child.into());
 /// ```
 pub struct StaticListingNode {
     rows: Vec<StaticRow>,

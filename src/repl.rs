@@ -2562,8 +2562,8 @@ impl Repl {
             }
             // --- Compute the overlay from the current buffer. ---
             let buf_text = editor.text();
-            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") || buf_text.starts_with("/persona") || buf_text.starts_with("/model") || buf_text.starts_with("/models") || buf_text.starts_with("/m ") || buf_text == "/m" {
-                // v2.5 path: route through the persistent handle.
+            let overlay = if buf_text.starts_with('/') {
+                // All `/` commands route through the v2.5 engine.
                 // Manage handle lifecycle: create on first `/`, drop when not `/`.
                 if v25_handle.is_none() {
                     v25_handle = Some(v25_menu.get_handle());
@@ -2582,13 +2582,16 @@ impl Repl {
                     }
                     _ => ActiveOverlay::None,
                 }
-            } else {
-                // Drop the v25 handle when prompt leaves thinking.
+            } else if !path_completions.is_empty() {
                 v25_handle = None;
-                ActiveOverlay::from_buffer_cursors(
-                    &buf_text, ctx, settings, help_view, &path_completions,
-                    &mut engine,
-                )
+                ActiveOverlay::PathComplete {
+                    completions: path_completions.to_vec(),
+                    completion_pos: None,
+                }
+            } else {
+                // Drop the v25 handle when prompt leaves `/`.
+                v25_handle = None;
+                ActiveOverlay::None
             };
             // Hoisted before the sel-reset so `active` (the menu's
             // default/current-state row) can drive the cursor policy below.

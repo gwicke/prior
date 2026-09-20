@@ -3489,7 +3489,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
             style(&config.model).blue(),
             style(format!("limit:{} yolo={}", config.tool_call_limit, config.yolo)).yellow(),
         );
-        config.output.display_plain("picocode - /menu for details.  (or type /help)");
+        config.output.display_plain("picocode - type `/` for details.");
         config.output.display_plain(&status);
     }
 

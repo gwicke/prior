@@ -2,76 +2,86 @@
 //!
 //! Host applications use:
 //! - `SlashDotNode` trait — implement for each menu command
-//! - `SlashDotMenu` — owns the node tree; `add_root_child` to build, `get_handle` to run
+//! - `SlashDotMenuNode` — wraps a node; `add_child` to build the tree
+//! - `SlashDotMenu` — owns the built tree; `get_handle` to run
 //! - `SlashDotHandle` — guard-like; `eval_prompt` to process a prompt
 //!
 //! # Building a menu tree
 //!
 //! ```ignore
-//! use slashdot_menu::{SlashDotMenu, StaticListingNode, StaticRow};
+//! use slashdot_menu::{SlashDotMenu, SlashDotMenuNode, StaticListingNode, StaticRow};
 //!
-//! let mut menu = SlashDotMenu::new();
-//! menu.add_root_child(StaticListingNode::new(&[
-//!     StaticRow::new("thinking", "set thinking level"),
-//! ]))
-//! .add_child_node(ThinkingEnumNode::new())
-//! .add_child_node(SomeOtherChild::new());
+//! let mut root = SlashDotMenuNode::root();
+//! {
+//!     let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
+//!         StaticRow::new("thinking", "set thinking level"),
+//!     ]).with_columns(vec![ColumnDef::new("id", "Level")]).into();
+//!     tl.add_child(ThinkingEnumNode::new().into());
+//!     root.add_child(tl);
+//! }
+//! {
+//!     let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
+//!         StaticRow::new("model", "select a model"),
+//!     ]).into();
+//!     ml.add_child(ModelNode::new().into());
+//!     root.add_child(ml);
+//! }
+//!
+//! let menu = SlashDotMenu::from_root_node(root);
 //! ```
 
 use crate::node_entry::NodeEntry;
 use crate::node_impl::{HostKey, MenuResult, SlashDotNode};
 
-/// Opaque handle to a freshly-added node. Exposes `add_child_node` for
-/// building subtrees without leaking `NodeEntry` internals.
-///
-/// Returned by [`SlashDotMenu::add_root_child`] and
-/// [`ChildBuilder::add_child_node`]. The lifetime is tied to the
-/// underlying mutable borrow of the menu's tree.
-pub struct ChildBuilder<'a>(&'a mut NodeEntry);
+/// A node in the menu tree. Wraps the internal `NodeEntry` with a
+/// minimal public API: `root()` for the implicit root, `new()` for
+/// leaf nodes, `add_child()` to attach children.
+pub struct SlashDotMenuNode(NodeEntry);
 
-impl<'a> ChildBuilder<'a> {
-    /// Append a child node under this node. Returns `&mut Self` for
-    /// chaining:
+impl SlashDotMenuNode {
+    /// Create a root node (metadata-only container, no data/submit).
+    pub fn root() -> Self {
+        SlashDotMenuNode(NodeEntry::new_root())
+    }
+
+    /// Create a node from a host `SlashDotNode` impl.
+    pub fn new(inner: impl SlashDotNode + 'static) -> Self {
+        SlashDotMenuNode(NodeEntry::new_child(Box::new(inner)))
+    }
+
+    /// Append a child node. Returns `&mut Self` for chaining:
     /// ```ignore
-    /// builder.add_child_node(a).add_child_node(b);
+    /// node.add_child(a).add_child(b);
     /// ```
-    pub fn add_child_node(&mut self, child: impl SlashDotNode + 'static) -> &mut Self {
-        self.0.add_child_node(child);
+    pub fn add_child(&mut self, child: SlashDotMenuNode) -> &mut Self {
+        self.0.add_child_entry(child.0);
         self
     }
 }
 
+impl<T: SlashDotNode + 'static> From<T> for SlashDotMenuNode {
+    fn from(node: T) -> Self {
+        SlashDotMenuNode::new(node)
+    }
+}
+
 /// The main menu engine. Owns the node tree and epoch counter.
-/// Created empty; children added via `add_root_child`.
-/// Lifetime: ~app lifetime (or as long as the menu is needed).
+/// Created from a root `SlashDotMenuNode`; `get_handle` to run.
 pub struct SlashDotMenu {
     root: NodeEntry,
     epoch: u64,
 }
 
 impl SlashDotMenu {
-    /// Create a new empty menu.
-    pub fn new() -> Self {
+    /// Create a menu from a pre-built root node.
+    pub fn from_root_node(root: SlashDotMenuNode) -> Self {
         SlashDotMenu {
-            root: NodeEntry::new_root(),
+            root: root.0,
             epoch: 0,
         }
     }
 
-    /// Add a child node to the root level. Returns a [`ChildBuilder`]
-    /// so the caller can add grandchildren without knowing internal types:
-    /// ```ignore
-    /// menu.add_root_child(listing)
-    ///     .add_child_node(value_a)
-    ///     .add_child_node(value_b);
-    /// ```
-    pub fn add_root_child(&mut self, child: impl SlashDotNode + 'static) -> ChildBuilder<'_> {
-        self.root.add_child_node(child);
-        ChildBuilder(self.root.last_child_mut())
-    }
-
     /// Get a handle for one menu invocation. This bumps the epoch.
-    /// Returns a guard-like handle that borrows the menu.
     pub fn get_handle(&mut self) -> SlashDotHandle<'_> {
         self.epoch += 1;
         SlashDotHandle {

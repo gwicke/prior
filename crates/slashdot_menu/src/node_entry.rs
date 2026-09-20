@@ -156,18 +156,11 @@ impl NodeEntry {
         }
     }
 
-    /// Append a child node. Returns `&mut Self` for chaining:
-    /// ```ignore
-    /// parent.add_child_node(a).add_child_node(b);
-    /// ```
-    pub fn add_child_node(&mut self, child: impl SlashDotNode + 'static) -> &mut Self {
-        self.children.push(NodeEntry::new_child(Box::new(child)));
+    /// Append a child entry (pre-built `NodeEntry`). Returns `&mut Self`
+    /// for chaining.
+    pub fn add_child_entry(&mut self, child: NodeEntry) -> &mut Self {
+        self.children.push(child);
         self
-    }
-
-    /// Mutable access to the last child (for `ChildBuilder` in menu.rs).
-    pub(crate) fn last_child_mut(&mut self) -> &mut NodeEntry {
-        self.children.last_mut().expect("add_child_node must be called first")
     }
 
     // --- Main entry point ---
@@ -985,7 +978,7 @@ fn full_prompt(path: &[String], suffix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_impl::DataResponse;
+    use crate::node_impl::{DataResponse, DataResult};
     use std::rc::Rc;
 
     /// A trivial command node: returns a fixed set of rows.

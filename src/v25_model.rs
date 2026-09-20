@@ -261,15 +261,15 @@ fn order_models(
 // Menu builder — adds model to the root menu.
 // ---------------------------------------------------------------------------
 
-/// Add `/model` children to an existing `SlashDotMenu`.
+/// Build the `/model` subtree as a `SlashDotMenuNode`.
 ///
 /// The listing node carries column definitions and field metadata;
 /// the `ModelNode` child provides dynamic catalog rows.
-pub fn add_model_children(
-    menu: &mut crate::slashdot_menu::menu::SlashDotMenu,
+pub fn build_model_node(
     shared: &Rc<crate::slash_menu_bridge::MenuShared>,
-) {
+) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::fields::{FieldSpec, SortDir};
+    use crate::slashdot_menu::menu::SlashDotMenuNode;
 
     let desc_of = |name: &str| -> &'static str {
         crate::model_catalog::MODEL_MODIFIERS
@@ -279,7 +279,7 @@ pub fn add_model_children(
             .unwrap_or("")
     };
 
-    menu.add_root_child(StaticListingNode::new(&[
+    let mut node: SlashDotMenuNode = StaticListingNode::new(&[
         StaticRow::new("model", "select a model (provider:name)"),
     ])
     .with_columns(vec![
@@ -318,8 +318,9 @@ pub fn add_model_children(
         FieldSpec::new("coding_price", true).dir(SortDir::Desc).description("coding_price"),
         FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
         FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
-    ]))
-    .add_child_node(ModelNode::new(Rc::clone(shared)));
+    ]).into();
+    node.add_child(ModelNode::new(Rc::clone(shared)).into());
+    node
 }
 
 // ---------------------------------------------------------------------------
@@ -413,16 +414,23 @@ mod tests {
         assert_eq!(shared.settings.borrow().default_model, "openai:gpt-4o");
     }
 
+    fn build_test_menu(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> crate::slashdot_menu::SlashDotMenu {
+        use crate::slashdot_menu::SlashDotMenuNode;
+        let mut root = SlashDotMenuNode::root();
+        let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
+            StaticRow::new("model", "select a model"),
+        ]).into();
+        ml.add_child(ModelNode::new(Rc::clone(shared)).into());
+        root.add_child(ml);
+        crate::slashdot_menu::SlashDotMenu::from_root_node(root)
+    }
+
     /// Full menu traversal: root listing → drill "model" → catalog rows →
     /// Tab into a catalog entry → Enter submits.
     #[test]
     fn model_full_traversal() {
         let shared = test_shared();
-        let mut menu = crate::slashdot_menu::menu::SlashDotMenu::new();
-        menu.add_root_child(StaticListingNode::new(&[
-            StaticRow::new("model", "select a model"),
-        ]))
-        .add_child_node(ModelNode::new(Rc::clone(&shared)));
+        let mut menu = build_test_menu(&shared);
 
         let mut h = menu.get_handle();
         // Root listing: shows the "model" row.
@@ -470,11 +478,7 @@ mod tests {
     #[test]
     fn model_fuzzy_filter() {
         let shared = test_shared();
-        let mut menu = crate::slashdot_menu::menu::SlashDotMenu::new();
-        menu.add_root_child(StaticListingNode::new(&[
-            StaticRow::new("model", "select a model"),
-        ]))
-        .add_child_node(ModelNode::new(Rc::clone(&shared)));
+        let mut menu = build_test_menu(&shared);
 
         let mut h = menu.get_handle();
         // Unfiltered count.
