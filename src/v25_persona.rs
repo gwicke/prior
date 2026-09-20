@@ -85,7 +85,7 @@ pub fn add_persona_children(
     // Listing node at root with header.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("persona", "set runtime persona"),
-    ]).with_header(vec!["Personas".into()]));
+    ]));
 
     // Persona value children under the listing node.
     // Names from the PERSONAS array + "none" for explicit clear.

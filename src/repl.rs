@@ -501,6 +501,9 @@ pub(crate) enum ActiveOverlay {
     V25Menu {
         /// The render plan from the v2.5 engine.
         plan: crate::slashdot_menu::render::RenderPlan,
+        /// Number of leading lines (header + table header) that stay fixed
+        /// when the list scrolls. Computed from the plan.
+        sticky_count: usize,
     },
 
     Sandbox {
@@ -2582,7 +2585,8 @@ impl Repl {
                 );
                 match result {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                        ActiveOverlay::V25Menu { plan }
+                        let sticky_count = plan.sticky_count;
+                        ActiveOverlay::V25Menu { plan, sticky_count }
                     }
                     _ => ActiveOverlay::None,
                 }
@@ -2694,9 +2698,24 @@ impl Repl {
                     let paint = plan.paint(crate::output::term_width());
                     paint.join("\n")
                 }
-                ActiveOverlay::V25Menu { plan, .. } => {
-                    let paint = plan.paint(crate::output::term_width());
-                    paint.join("\n")
+                ActiveOverlay::V25Menu { plan, sticky_count } => {
+                    let tw = crate::output::term_width();
+                    let all_lines: Vec<String> = plan.paint(tw);
+                    let total = all_lines.len();
+                    let sticky = *sticky_count;
+                    if sticky == 0 || total <= sticky {
+                        all_lines.join("\n")
+                    } else {
+                        let scrollable_total = total - sticky;
+                        let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                        let n = max_pop.saturating_sub(sticky).min(scrollable_total);
+                        let win = Self::overlay_window(scrollable_total, n, sel);
+                        let mut result: Vec<&str> = all_lines[..sticky].iter().map(|s| s.as_str()).collect();
+                        result.extend(
+                            all_lines[sticky + win..sticky + win + n].iter().map(|s| s.as_str())
+                        );
+                        result.join("\n")
+                    }
                 }
                 _ => Self::overlay_lines(effective_title, &opts, None, sel, active, wrap),
             };
