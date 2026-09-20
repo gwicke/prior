@@ -92,7 +92,6 @@ impl RenderPlan {
     /// full-width padded rows, marker + content, per-line styles).
     pub fn paint(&self, term_width: usize) -> Vec<String> {
         let tw = term_width.max(1);
-        let bg_line = |s: &str, bg: &str| format!("{}{:<width$}{}", bg, s, Style::RESET, width = tw);
         let mut out = Vec::new();
         for l in self.lines.iter() {
             let sel = self.selected == Some(l.option);
@@ -115,9 +114,12 @@ impl RenderPlan {
             } else if sel {
                 Marker::Cursor.as_str()
             } else {
-                "  "
-            };
-            out.push(bg_line(&format!("{}{}{}", fg, marker, l.text), bg));
+                "  "};
+            // Build content without ANSI, pad to term width, then wrap.
+            let content = format!("{}{}", marker, l.text);
+            let vis = crate::table::display_width(&content);
+            let pad = tw.saturating_sub(vis);
+            out.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), Style::RESET));
         }
         out
     }

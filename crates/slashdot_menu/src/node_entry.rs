@@ -752,45 +752,22 @@ impl NodeEntry {
         }
 
         // 2. Table header row (if columns declared and there's data, sticky).
-        if has_table_header {
-            let header_labels: Vec<&str> = if !columns.is_empty() {
-                columns.iter().map(|c| c.header.as_str()).collect()
-            } else {
-                let mut names = vec!["id"];
-                names.extend(field_space.fields.iter().map(|f| f.name.as_str()));
-                if names.len() == 1 {
-                    names.push("description");
-                }
-                names
-            };
-            let header_text = header_labels.join("  ");
-            lines.push(RenderLine {
-                text: header_text,
-                style: Style::HEADER,
-                is_header: true,
-                is_marker_row: false,
-                option: usize::MAX,
-            });
-            sticky_count += 1;
-        }
-
-        // 3. Data rows (scrollable).
+        // 2+3. Table rendering: header + data rows.
         let term_width: usize = 80; // TODO: pass from caller
         {
-            // Table rendering: always use the table builder.
-            // Default columns: id + description (implicit fields).
             use crate::table::{Align, Table};
+            // Column field names (what to read from each row).
             let col_field_names: Vec<String> = if !columns.is_empty() {
                 columns.iter().map(|c| c.field.clone()).collect()
             } else {
                 let mut names = vec!["id".to_string()];
                 names.extend(field_space.fields.iter().map(|f| f.name.clone()));
                 if names.len() == 1 {
-                    // No fields declared — default to id + description.
                     names.push("description".to_string());
                 }
                 names
             };
+            // Header labels (what to display).
             let header_labels: Vec<&str> = if !columns.is_empty() {
                 columns.iter().map(|c| c.header.as_str()).collect()
             } else {
@@ -821,6 +798,19 @@ impl NodeEntry {
                 }
                 t.add_row(&cells);
             }
+            // Render header through the Table (aligned with data columns).
+            if has_table_header {
+                let header_text = t.render_header(term_width.saturating_sub(2));
+                lines.push(RenderLine {
+                    text: header_text,
+                    style: Style::HEADER,
+                    is_header: true,
+                    is_marker_row: false,
+                    option: usize::MAX,
+                });
+                sticky_count += 1;
+            }
+            // Render data rows.
             let row_texts = t.render_multiline(term_width.saturating_sub(2));
             for (i, text) in row_texts.iter().enumerate() {
                 for (j, sub) in text.split('\n').enumerate() {

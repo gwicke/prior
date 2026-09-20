@@ -169,6 +169,13 @@ impl Table {
             .collect()
     }
 
+    /// Render just the header row with proper column alignment.
+    pub fn render_header(&self, max_width: usize) -> String {
+        let widths = self.layout(max_width);
+        let header_cells: Vec<String> = self.headers.iter().map(|h| h.to_uppercase()).collect();
+        self.render_row(&header_cells, &widths)
+    }
+
     /// Render a header (uppercased) + separator + data rows. For static,
     /// non-selectable summaries; do not feed the header/separator lines into a
     /// selectable overlay (they would become selectable items).
@@ -294,7 +301,7 @@ impl Table {
 
 /// Visible width of `s`, ignoring ANSI SGR escapes (so styled cells size
 /// correctly). Falls back to width 1 for control/ambiguous chars.
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     let mut w = 0;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
