@@ -25,13 +25,15 @@ use crate::slashdot_menu::menu::SlashDotMenu;
 
 pub struct PersonaValue {
     name: String,
+    desc: String,
     settings: Rc<RefCell<crate::settings::SettingsStore>>,
 }
 
 impl PersonaValue {
-    pub fn new(name: &str, settings: Rc<RefCell<crate::settings::SettingsStore>>) -> Self {
+    pub fn new(name: &str, desc: &str, settings: Rc<RefCell<crate::settings::SettingsStore>>) -> Self {
         PersonaValue {
             name: name.to_string(),
+            desc: desc.to_string(),
             settings,
         }
     }
@@ -53,7 +55,7 @@ impl SlashDotNode for PersonaValue {
             Vec::new()
         };
         Ok(Rc::new(DataResponse {
-            rows: vec![Row::new(&self.name).desc("")],
+            rows: vec![Row::new(&self.name).desc(&self.desc)],
             active_ids: active,
         }))
     }
@@ -80,23 +82,23 @@ pub fn add_persona_children(
     menu: &mut SlashDotMenu,
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
 ) {
-    // Listing node at root (next child index will be "1" after thinking at "0").
+    // Listing node at root with header.
     menu.add_child(&[], StaticListingNode::new(&[
         StaticRow::new("persona", "set runtime persona"),
-    ]));
+    ]).with_header(vec!["Personas".into()]));
 
-    // Persona value children under the listing node (index "1" in root).
+    // Persona value children under the listing node.
     // Names from the PERSONAS array + "none" for explicit clear.
-    let mut names: Vec<&str> = crate::persona::PERSONAS
+    let mut entries: Vec<(&str, &str)> = crate::persona::PERSONAS
         .iter()
-        .map(|p| p.name)
+        .map(|p| (p.name, p.description))
         .collect();
-    names.push("none");
+    entries.push(("none", "clear persona"));
 
-    for name in &names {
+    for (name, desc) in &entries {
         menu.add_child(
             &["1"],
-            PersonaValue::new(name, settings.clone()),
+            PersonaValue::new(name, desc, settings.clone()),
         );
     }
 }
