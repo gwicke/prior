@@ -78,10 +78,12 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 - ~~No `Rc<Vec<RenderLine>>` sharing~~ **Done.**
 - ~~No table layout / `ColumnDef` in RenderPlan~~ **Done.** Table headings,
   custom columns via `.with_columns()`, sticky headers.
+- ~~`RenderPlan.title` is unused — always `None`~~ **Removed.** v2.5 design
+  (§6) has no titles. See overlay rendering design below.
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-- `RenderPlan.title` is unused — always `None`. Will be set when commands
-  provide panel titles.
+
+**Overlay rendering:** Designed but not implemented. See §7 below.
 
 **PathArgs / Args borrowing:**
 - Owned data. Deferred to avoid lifetime complexity in the trait API.
@@ -278,3 +280,203 @@ test the old code path and will be replaced when commands are migrated.
 | `src/v25_persona.rs` | `PersonaValue` node impl (writes to `SettingsStore.default_persona`) |
 | `src/v25_commands.rs` | Test-only node impls for engine harness testing |
 | `src/repl.rs` | `ActiveOverlay::V25Menu { plan, sticky_count }`, `SlashDotMenu` + handle in input loop, `eval_prompt` key dispatch, sticky header rendering, `DoneSuccess` dispatch by prefix |
+
+---
+
+## 7. Overlay rendering design
+
+This section specifies how the host renders the engine's `RenderPlan` into
+the terminal overlay. It replaces the current `paint()` + `overlay_window`
+approach with a two-layer design: the engine produces pure data (`RenderPlan` +
+`LogicalLine`), and the host applies styling (cursor markers, backgrounds)
+and windowing at render time.
+
+### 7.1 Current problems
+
+1. **`paint()` is O(n) per keystroke.** Every `RenderLine` gets formatted
+   with ANSI colors, marker characters, and full-width padding — even when
+   only 20 lines are visible. A 300-row model list pays 300 format+pad
+   operations on every cursor move.
+2. **Cursor styling is baked into `paint()`.** The `>` marker and
+   `SELECTED.bg` background depend on `plan.selected`, which changes on
+   every cursor move. This defeats any attempt to cache the painted output.
+3. **Visual vs. logical line mismatch.** `build_render_plan` splits wrapped
+   rows into multiple `RenderLine` entries (one per visual sub-line, sharing
+   `option` index). But `overlay_window` treats each entry as one visual
+   row. When rows wrap, the cursor highlight lands on the wrong line and the
+   scroll window drifts.
+4. **PageUp/PageDown broken.** They mutate `sel` (a visual-line index),
+   but `plan.selected` (a logical-row index) overrides it on the next frame.
+
+### 7.2 Redesigned `RenderPlan`
+
+```rust
+/// A single logical row: may contain embedded newlines from table wrapping.
+struct LogicalLine(String);
+
+struct RenderPlan {
+    /// Table column header (e.g. "Model   Ctx   Coding   Price in").
+    /// Single line guaranteed. Changes only on terminal resize.
+    table_header: Option<LogicalLine>,
+    /// `header()` output: help text, stats, focused-row details.
+    /// Changes on cursor move (detail updates). Truncatable vertically.
+    detail: Vec<LogicalLine>,
+    /// Scrollable data rows. Rc-shared — same pointer on cursor moves.
+    rows: Rc<Vec<LogicalLine>>,
+    /// Index into `rows` for the focused row.
+    selected: Option<usize>,
+    /// Indices into `rows` for active rows (`*` marker).
+    active_rows: Vec<usize>,
+}
+```
+
+Key properties:
+
+- **`rows` is `Rc`-shared.** On cursor moves, `rows` is the same pointer
+  (`Rc::ptr_eq` is true). The overlay clones the Rc (cheap) and renders
+  only the visible window.
+- **`detail` changes on cursor move** (e.g. focused-row metadata), but
+  `rows` is untouched. The detail section is small (typically 1–5 lines)
+  and cheap to re-render.
+- **`table_header` is static** (resize-only). Always shown, never
+  truncated.
+- **`LogicalLine` is just `String`** with embedded `\n` for wrapped
+  sub-lines. No per-visual-line entries, no `option` index, no
+  `is_marker_row` flag. The `selected` index *is* the logical row index.
+- **No `paint()` on the hot path.** The engine produces data; the host
+  renders it.
+
+### 7.3 `LogicalLine` format
+
+Each `LogicalLine`'s `.0` string contains the row text with embedded `\n`
+for wrapped sub-lines. All sub-lines start with two spaces (the marker
+slot: `"> "` or `"* "` or `"  "`). The overlay replaces the first two
+spaces of the first sub-line at render time:
+
+```text
+"  gpt-4o          $2.50\n  128k context  coding:80  reasoning:no"
+ │                          │
+ └── marker slot (2 spaces) └── wrap continues, no marker
+```
+
+For wrapped rows: the first sub-line gets the marker (`>` or `*` or `  `),
+continuation sub-lines always get `"  "` regardless of selection.
+`build_render_plan` produces marker-free text; the overlay applies markers
+at render time.
+
+### 7.4 Host overlay algorithm
+
+```text
+V25Menu overlay rendering:
+
+  // 1. Render table header (always shown, single line).
+  if let Some(ref th) = plan.table_header {
+      render_line(th, HEADER.bg);
+  }
+
+  // 2. Render detail section (truncatable from bottom).
+  let detail_budget = max_detail_lines(terminal_height);
+  for line in plan.detail.iter().take(detail_budget) {
+      render_line(line, HEADER.bg);
+  }
+
+  // 3. Render visible data rows, windowed around `selected`.
+  let data_budget = remaining_height;
+  let visible_rows = window(plan.rows, plan.selected, data_budget);
+  for row in visible_rows {
+      let is_selected = row.index == plan.selected;
+      let is_active = plan.active_rows.contains(&row.index);
+
+      // Split logical line into sub-lines.
+      for (j, sub) in row.text.split('\n').enumerate() {
+          if j == 0 {
+              // First sub-line: apply marker.
+              let marker = if is_active { "* " }
+                          else if is_selected { "> " }
+                          else { "  " };
+              render_line(&marker[2..] + sub, bg_for(is_selected));
+          } else {
+              // Continuation: no marker, same bg if selected.
+              render_line(sub, bg_for(is_selected));
+          }
+      }
+  }
+```
+
+### 7.5 Scrolling / windowing with logical addressing
+
+```text
+fn window(rows: &[LogicalLine], selected: Option<usize>, budget: usize) -> Window {
+    let total = rows.len();
+    if total <= budget || budget == 0 {
+        return Window { start: 0, count: total };
+    }
+    // Center the window on the selected row.
+    let sel = selected.unwrap_or(0);
+    let start = sel.saturating_sub(budget / 2).min(total - budget);
+    Window { start, count: budget }
+}
+```
+
+The `start` and `count` index into `rows` directly (logical rows).
+The overlay then renders each logical row's sub-lines, tracking the visual
+line count to stay within `budget`. If a logical row's sub-lines overflow
+the budget, it is truncated (last sub-line replaced with `…`).
+
+### 7.6 Cursor move = O(visible)
+
+On `MoveCursor`, the engine returns a `RenderPlan` where `rows` is the
+same `Rc` (no rebuild), `selected` changed, and `detail` may have changed.
+The overlay:
+
+1. Re-renders `table_header` (1 line, O(1)).
+2. Re-renders `detail` (typically 1–5 lines, O(1)).
+3. Re-renders `budget` visible rows from `rows[start..start+count]`
+   (O(budget), typically ~20 lines).
+
+Total: ~25 format operations per cursor move, regardless of list size.
+Compare to current: 300+ operations per cursor move.
+
+### 7.7 PageUp / PageDown
+
+With logical addressing, PageUp/PageDown move `selected` by a page size
+and clamp:
+
+```text
+selected = (selected ± page_size).clamp(0, rows.len() - 1);
+```
+
+The overlay re-renders with the new `selected`. No separate page-scroll
+path — it is the same cursor move with a larger delta.
+
+### 7.8 Terminal resize
+
+On resize, `term_width` changes, which triggers a full `build_render_plan`
+rebuild (the engine's `RenderCache` invalidates on `term_width` change).
+The overlay re-renders everything — table column widths, wrapping, detail
+truncation all depend on width. This is correct and unavoidable: column
+widths change, so every line's text changes.
+
+### 7.9 Migration path
+
+1. **Add `LogicalLine`, new `RenderPlan` shape.** Keep old `RenderLine` and
+   `paint()` for non-V25Menu overlays (Settings, Tree, etc.).
+2. **Implement new overlay render path** in `repl.rs` for `V25Menu`. This
+   is host-side only — no engine changes beyond the `RenderPlan` shape.
+3. **Port `build_render_plan`** to emit `LogicalLine` (merge wrapped
+   sub-lines with `\n`).
+4. **Remove `paint()` from V25Menu path.** Old overlays still use it.
+5. **Port remaining overlays** (Settings, Tree, etc.) to `LogicalLine`
+   over time.
+
+### 7.10 Test strategy
+
+| Test | What it validates |
+|---|---|
+| Logical line wrapping | Multi-line row renders as single `LogicalLine` with `\n` |
+| Window centers on selected | `selected=50, budget=20` → window around rows 40–59 |
+| Marker on first sub-line only | Wrapped row: `>` only on first sub-line, continuation gets `"  "` |
+| Active + selected same row | `*` wins over `>` per §5.2 precedence |
+| Detail updates on cursor move | `rows` Rc unchanged, `detail` changed |
+| PageUp/PageDown | `selected ± page_size`, clamp, re-render |
+| Resize triggers rebuild | `term_width` change → new `Rc` for `rows` |
