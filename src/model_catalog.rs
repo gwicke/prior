@@ -20,8 +20,23 @@
 
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+// --- Cache generation counter ---
+// Bumped every time the catalog cache is refreshed. The v2.5 ModelNode uses
+// this to avoid rebuilding its `Rc<DataResponse>` when the underlying data
+// hasn't changed (enables the engine's `Rc::ptr_eq` freshness check).
+
+static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonically increasing generation counter. Incremented each time the
+/// catalog cache is refreshed by [`catalog`]. The v2.5 [`ModelNode`] compares
+/// this to its cached generation to decide whether to rebuild its row set.
+pub fn catalog_generation() -> u64 {
+    CATALOG_GENERATION.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostSource {
@@ -742,6 +757,7 @@ pub async fn catalog() -> Vec<ModelEntry> {
             entries: entries.clone(),
         });
     }
+    CATALOG_GENERATION.fetch_add(1, Ordering::Relaxed);
     entries
 }
 

@@ -8,7 +8,6 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::slashdot_menu::fields::Row;
     use crate::slashdot_menu::node_impl::{
         DataResponse, DataResult, HostKey, MenuResult, PathArgs,
         SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
@@ -16,41 +15,29 @@ mod tests {
     use crate::slashdot_menu::menu::SlashDotMenu;
 
     // -----------------------------------------------------------------------
-    // ThinkingValue — test fixture modeling /thinking enum values.
-    // Holds an Rc<RefCell<Option<String>>> — same pattern as the real
-    // ThinkingValue in v25_thinking.rs (shared with MenuShared).
+    // ThinkingEnumNode — single node returning all four levels.
     // -----------------------------------------------------------------------
 
-    struct ThinkingValue {
-        level: String,
+    struct ThinkingEnumNode {
         shared: Rc<RefCell<Option<String>>>,
     }
 
-    impl ThinkingValue {
-        fn new(level: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
-            ThinkingValue {
-                level: level.to_string(),
-                shared,
-            }
-        }
-    }
-
-    impl SlashDotNode for ThinkingValue {
+    impl SlashDotNode for ThinkingEnumNode {
         fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.shared.borrow();
-            let active = if current.as_deref() == Some(&self.level) {
-                vec![self.level.clone()]
-            } else {
-                Vec::new()
-            };
+            let active = current.as_deref().unwrap_or("off").to_string();
+            let rows = ["off", "low", "med", "high"].iter()
+                .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
+                .collect();
             Ok(Rc::new(DataResponse {
-                rows: vec![Row::new(&self.level).desc("")],
-                active_ids: active,
+                rows,
+                active_ids: vec![active],
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-            *self.shared.borrow_mut() = Some(self.level.clone());
+        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            let level = path_args.ids.last().cloned().unwrap_or_default();
+            *self.shared.borrow_mut() = Some(level);
             SubmitResult::Done(None)
         }
     }
@@ -61,20 +48,10 @@ mod tests {
 
     fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         let mut menu = SlashDotMenu::new();
-
-        // Root-level: StaticListingNode replaces a dedicated ThinkingNode impl.
-        menu.add_child(&[], StaticListingNode::new(&[
+        menu.add_root_child(StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
-        ]));
-
-        // Enum value children under thinking (child index "0" in root's children).
-        for level in &["off", "low", "med", "high"] {
-            menu.add_child(
-                &["0"],
-                ThinkingValue::new(level, state.clone()),
-            );
-        }
-
+        ]))
+        .add_child_node(ThinkingEnumNode { shared: state.clone() });
         menu
     }
 
@@ -157,8 +134,6 @@ mod tests {
 
     #[test]
     fn thinking_enter_drills_and_submits() {
-        // Enter at the listing level should drill into the cursor row and
-        // submit immediately, without requiring a separate Tab first.
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_thinking_menu(&state);
         let mut h = menu.get_handle();
@@ -303,46 +278,40 @@ mod persona_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::slashdot_menu::fields::Row;
     use crate::slashdot_menu::node_impl::{
         DataResponse, DataResult, HostKey, MenuResult, PathArgs,
         SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
     };
     use crate::slashdot_menu::menu::SlashDotMenu;
 
-    /// Test-only persona value node. Uses a plain Rc<RefCell<Option<String>>>
-    /// for the persona name (mirrors SettingsStore.default_persona).
-    struct PersonaValue {
-        name: String,
+    /// Single node returning all persona rows + "none".
+    struct PersonaEnumNode {
         shared: Rc<RefCell<Option<String>>>,
     }
 
-    impl PersonaValue {
-        fn new(name: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
-            PersonaValue {
-                name: name.to_string(),
-                shared,
-            }
-        }
-    }
-
-    impl SlashDotNode for PersonaValue {
+    impl SlashDotNode for PersonaEnumNode {
         fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.shared.borrow();
-            let matched = if self.name == "none" {
-                current.is_none() || current.as_deref() == Some("")
-            } else {
-                current.as_deref() == Some(&self.name)
-            };
-            let active = if matched { vec![self.name.clone()] } else { Vec::new() };
-            Ok(Rc::new(DataResponse {
-                rows: vec![Row::new(&self.name).desc("")],
-                active_ids: active,
-            }))
+            let names = ["architect", "strict", "security", "none"];
+            let mut rows = Vec::new();
+            let mut active_ids = Vec::new();
+            for name in &names {
+                rows.push(crate::slashdot_menu::fields::Row::new(*name).desc(""));
+                let matched = if *name == "none" {
+                    current.is_none() || current.as_deref() == Some("")
+                } else {
+                    current.as_deref() == Some(*name)
+                };
+                if matched {
+                    active_ids.push(name.to_string());
+                }
+            }
+            Ok(Rc::new(DataResponse { rows, active_ids }))
         }
 
-        fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-            let val = if self.name == "none" { None } else { Some(self.name.clone()) };
+        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            let name = path_args.ids.last().cloned().unwrap_or_default();
+            let val = if name == "none" { None } else { Some(name) };
             *self.shared.borrow_mut() = val;
             SubmitResult::Done(None)
         }
@@ -350,16 +319,10 @@ mod persona_tests {
 
     fn build_persona_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         let mut menu = SlashDotMenu::new();
-        menu.add_child(&[], StaticListingNode::new(&[
+        menu.add_root_child(StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
-        ]));
-        let names = ["architect", "strict", "security", "none"];
-        for name in &names {
-            menu.add_child(
-                &["0"],
-                PersonaValue::new(name, state.clone()),
-            );
-        }
+        ]))
+        .add_child_node(PersonaEnumNode { shared: state.clone() });
         menu
     }
 
@@ -411,8 +374,6 @@ mod persona_tests {
 
     #[test]
     fn persona_enter_submits() {
-        // With state=Some("architect"), cursor is on "architect".
-        // Tab drills into it, Enter submits.
         let state = Rc::new(RefCell::new(Some("architect".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
@@ -428,14 +389,12 @@ mod persona_tests {
 
     #[test]
     fn persona_enter_drills_and_submits() {
-        // When state is None, "none" is active → cursor defaults to "none".
         let state = Rc::new(RefCell::new(None));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("persona ", HostKey::None);
         match h.eval_prompt("persona ", HostKey::Enter) {
             MenuResult::DoneSuccess(_) => {
-                // "none" was active → submits None (clears persona).
                 assert_eq!(*state.borrow(), None);
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -444,7 +403,6 @@ mod persona_tests {
 
     #[test]
     fn persona_enter_drills_active_row() {
-        // When state is "strict", cursor lands on "strict" → Enter submits it.
         let state = Rc::new(RefCell::new(Some("strict".to_string())));
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
@@ -467,7 +425,6 @@ mod persona_tests {
         let mut menu = build_persona_menu(&state);
         let mut h = menu.get_handle();
         let _ = h.eval_prompt("persona ", HostKey::None);
-        // Cursor is on "strict" (index 1). MoveCursor(+2) → "none" (index 3).
         let _ = h.eval_prompt("persona ", HostKey::MoveCursor(2));
         match h.eval_prompt("persona ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {

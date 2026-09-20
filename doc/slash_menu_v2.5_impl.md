@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6 partially complete. 531 tests, 0 warnings.
+**Done (v2.5 reshape):** Steps 1–6 partially complete. 538 tests, 0 warnings.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -15,7 +15,7 @@ traversal: section parse, data refresh (Rc::ptr_eq), view derivation
 (filter → fuzzy rank → sort), cursor, Esc ladder, leaf/listing dispatch,
 render plan. Merged child sets, field metadata, row uniformity.
 
-Step 6 (command porting): `/thinking` and `/persona` fully ported.
+Step 6 (command porting): `/thinking`, `/persona`, `/model` fully ported.
 Root list via `StaticListingNode`. Remaining commands deferred.
 
 **Key additions:**
@@ -27,6 +27,10 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 - `ColumnDef` re-exported from `slashdot_menu` for host convenience.
   `ColumnDef::new(field, header)` — use `"id"` for row id,
   `"description"` for description, or any custom field name.
+- `ChildBuilder` (menu.rs): opaque handle returned by
+  `SlashDotMenu::add_root_child()`. Exposes `.add_child_node()` for
+  chaining — builds the tree without exposing `NodeEntry` internals or
+  hardcoded index paths. `NodeEntry` stays `pub(crate)`.
 - Default table listing: all rows render via the table builder with
   `id | description` as default columns (implicit fields via
   `row_field_value`). No header row when `columns()` is empty.
@@ -37,12 +41,17 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 - Shared state pattern: nodes write to the same `Rc<RefCell<...>>` the
   REPL owns (`MenuShared`). After `DoneSuccess`, the REPL reads back from
   shared state. `DoneSuccess` dispatches by command prefix
-  (`thinking` → `SetThinking`, `persona` → `SetPersona`).
+  (`thinking` → `SetThinking`, `persona` → `SetPersona`,
+  `model`/`models` → `SetModel`).
 - REPL wiring: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in the
-  input loop. Handle lifecycle: created when prompt starts with `/thinking`,
-  `/persona`, or other ported commands; dropped when it leaves.
-  `ActiveOverlay::V25Menu { plan, sticky_count }` variant for v2.5 engine
-  overlay.
+   input loop. Handle lifecycle: created when prompt starts with `/thinking`,
+   `/persona`, `/model`, or other ported commands; dropped when it leaves.
+   `ActiveOverlay::V25Menu { plan, sticky_count }` variant for v2.5 engine
+   overlay.
+- Catalog generation counter (`model_catalog::catalog_generation()`):
+  atomic `u64` bumped on each cache refresh. `ModelNode` compares it to
+  its cached `Rc<DataResponse>` to skip rebuild when data is unchanged
+  (enables engine's `Rc::ptr_eq` freshness check).
 - Sticky headers: header() lines and table header row stay fixed at the
   top when the list scrolls. `RenderPlan.sticky_count` computed by the
   engine; the host's overlay computation splits paint output into sticky
@@ -99,10 +108,9 @@ Root list via `StaticListingNode`. Remaining commands deferred.
 
 1. ~~`/thinking`~~ — Done.
 2. ~~`/persona`~~ — Done.
-3. **Root `/` list** — `StaticListingNode` children for all commands.
+3. ~~**`/model`**~~ — Done. Dynamic catalog rows, `Rc<DataResponse` caching via generation counter, `ChildBuilder` API for index-free tree construction.
+4. **Root `/` list** — `StaticListingNode` children for all commands.
    Extends the REPL handle lifecycle to all `/` prefixes.
-4. **`/model`** — dynamic rows from catalog, field modifiers, computed
-   fields. The showcase for `fields()` + merged child sets.
 5. **Step 7** — two-phase submit confirm.
 6. **Step 8** — persistent engine cleanup.
 7. **Steps 9–14** — Session, Tree, Settings, Sandbox, Stat, Final cleanup.
@@ -180,23 +188,26 @@ row uniformity.
 
 **In progress.**
 
-6a. ~~`/thinking`~~ **Done.** `StaticListingNode` parent + `ThinkingValue`
-leaf nodes. Shared state via `Rc<RefCell<Option<String>>>`. Custom table
-heading: "Thinking Level". 12 tests.
+6a. ~~`/thinking`~~ **Done.** `StaticListingNode` parent + single
+`ThinkingEnumNode` (returns all levels from `data()`). Shared state via
+`Rc<RefCell<Option<String>>>`. Custom table heading: "Thinking Level".
+12 tests.
 
-6b. ~~`/persona`~~ **Done.** `StaticListingNode` parent + `PersonaValue`
-leaf nodes. Shared state via `Rc<RefCell<SettingsStore>>` (same cell
-`MenuShared` owns). Persona descriptions from `PERSONAS` array. Custom
-table heading: "Persona | Description". 8 tests.
+6b. ~~`/persona`~~ **Done.** `StaticListingNode` parent + single
+`PersonaEnumNode` (returns all personas + "none" from `data()`). Shared
+state via `Rc<RefCell<SettingsStore>>`. Custom table heading:
+"Persona | Description". 8 tests.
 
-6c. **Root `/` list** — `StaticListingNode` children for all commands.
+6c. ~~`/model`~~ **Done.** `StaticListingNode` parent (columns + field
+metadata) + `ModelNode` child (dynamic catalog rows). Rc-cached
+`DataResponse` keyed by `catalog_generation()` atomic counter. Shared
+state via `Rc<MenuShared>`. Active model marker from settings. 7 tests.
+
+6d. **Root `/` list** — `StaticListingNode` children for all commands.
 Extends REPL handle lifecycle to all `/` prefixes. Generalize
 `DoneSuccess` dispatch as more commands are added.
 
-6d. **`/model`** — dynamic rows from catalog, field modifiers.
-
-**Tests:** 20 per-command tests (12 thinking + 8 persona). Additional
-tests per command as they are ported.
+**Tests:** 12 thinking + 8 persona + 7 model = 27 command tests.
 
 ### Step 7: Two-phase submit confirm
 
@@ -236,8 +247,9 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 | **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **22** | **New (steps 4–5)** |
 | **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)** | **12** | **New (step 6a)** |
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
+| **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 531 lib tests (including non-menu tests). The 26 interpreter tests
+Total: 538 lib tests (including non-menu tests). The 26 interpreter tests
 test the old code path and will be replaced when commands are migrated.
 
 ---

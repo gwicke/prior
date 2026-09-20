@@ -2423,7 +2423,10 @@ impl Repl {
         // The menu lives for the entire prompt session; the handle is
         // created when the prompt starts with `/` and dropped when it
         // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let mut v25_menu = crate::v25_thinking::build_menu(&shared.current_thinking_level, &shared.settings);
+        let mut v25_menu = {
+            let shared_rc = std::rc::Rc::new(shared.clone_shared());
+            crate::v25_thinking::build_menu(&shared.current_thinking_level, &shared.settings, &shared_rc)
+        };
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
@@ -2571,7 +2574,7 @@ impl Repl {
             }
             // --- Compute the overlay from the current buffer. ---
             let buf_text = editor.text();
-            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") || buf_text.starts_with("/persona") {
+            let overlay = if buf_text.starts_with("/thinking") || buf_text.starts_with("/think") || buf_text.starts_with("/persona") || buf_text.starts_with("/model") || buf_text.starts_with("/models") || buf_text.starts_with("/m ") || buf_text == "/m" {
                 // v2.5 path: route through the persistent handle.
                 // Manage handle lifecycle: create on first `/`, drop when not `/`.
                 if v25_handle.is_none() {
@@ -2971,6 +2974,21 @@ impl Repl {
                                                                 &mut input_row, &echo, "", false,
                                                             );
                                                             return Some(InputAction::SetPersona(name));
+                                                        }
+                                                        "model" | "models" => {
+                                                            let qualified = shared.settings.borrow()
+                                                                .default_model
+                                                                .clone();
+                                                            let (provider, model) = qualified
+                                                                .split_once(':')
+                                                                .map(|(p, m)| (p.to_string(), m.to_string()))
+                                                                .unwrap_or((String::new(), qualified.clone()));
+                                                            let echo = format!("/model {}", qualified);
+                                                            Repl::emit_commit(
+                                                                output, &mut editor, &redraw, sel,
+                                                                &mut input_row, &echo, "", false,
+                                                            );
+                                                            return Some(InputAction::SetModel(provider, model));
                                                         }
                                                         _ => {}
                                                     }

@@ -153,18 +153,18 @@ impl NodeEntry {
         }
     }
 
-    /// Add a child node at the root level (path `[]` = root).
-    pub fn add_child(&mut self, parent: &[&str], child: NodeEntry) {
-        if parent.is_empty() {
-            self.children.push(child);
-        } else {
-            let mut node = self;
-            for id in parent {
-                let idx: usize = id.parse().expect("parent path must be child index");
-                node = &mut node.children[idx];
-            }
-            node.children.push(child);
-        }
+    /// Append a child node. Returns `&mut Self` for chaining:
+    /// ```ignore
+    /// parent.add_child_node(a).add_child_node(b);
+    /// ```
+    pub fn add_child_node(&mut self, child: impl SlashDotNode + 'static) -> &mut Self {
+        self.children.push(NodeEntry::new_child(Box::new(child)));
+        self
+    }
+
+    /// Mutable access to the last child (for `ChildBuilder` in menu.rs).
+    pub(crate) fn last_child_mut(&mut self) -> &mut NodeEntry {
+        self.children.last_mut().expect("add_child_node must be called first")
     }
 
     // --- Main entry point ---

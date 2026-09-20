@@ -13,43 +13,34 @@ use crate::slashdot_menu::node_impl::{
 use crate::slashdot_menu::menu::SlashDotMenu;
 
 // ---------------------------------------------------------------------------
-// ThinkingValue — one of the four enum values (off/low/med/high).
+// ThinkingEnumNode — returns all thinking levels from a single node.
 //
-// Holds an `Rc<RefCell<Option<String>>>` that is the *same cell* the REPL
-// owns (via `MenuShared.current_thinking_level`). `submit()` writes to it;
-// the REPL reads it back after `DoneSuccess`. No parallel state.
+// The parent listing shows off/low/med/high as rows. On submit, the
+// selected level is read from path_args (the drilled row ID) and written
+// to the shared cell.
 // ---------------------------------------------------------------------------
 
-pub struct ThinkingValue {
-    level: String,
+struct ThinkingEnumNode {
     shared: Rc<RefCell<Option<String>>>,
 }
 
-impl ThinkingValue {
-    pub fn new(level: &str, shared: Rc<RefCell<Option<String>>>) -> Self {
-        ThinkingValue {
-            level: level.to_string(),
-            shared,
-        }
-    }
-}
-
-impl SlashDotNode for ThinkingValue {
+impl SlashDotNode for ThinkingEnumNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let current = self.shared.borrow();
-        let active = if current.as_deref() == Some(&self.level) {
-            vec![self.level.clone()]
-        } else {
-            Vec::new()
-        };
+        let levels = ["off", "low", "med", "high"];
+        let active = current.as_deref().unwrap_or("off").to_string();
+        let rows = levels.iter()
+            .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
+            .collect();
         Ok(Rc::new(DataResponse {
-            rows: vec![crate::slashdot_menu::fields::Row::new(&self.level).desc("")],
-            active_ids: active,
+            rows,
+            active_ids: vec![active],
         }))
     }
 
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-        *self.shared.borrow_mut() = Some(self.level.clone());
+    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let level = path_args.ids.last().cloned().unwrap_or_default();
+        *self.shared.borrow_mut() = Some(level);
         SubmitResult::Done(None)
     }
 }
@@ -62,24 +53,23 @@ impl SlashDotNode for ThinkingValue {
 pub fn build_menu(
     thinking_level: &Rc<RefCell<Option<String>>>,
     settings: &Rc<RefCell<crate::settings::SettingsStore>>,
+    shared: &Rc<crate::slash_menu_bridge::MenuShared>,
 ) -> SlashDotMenu {
     let mut menu = SlashDotMenu::new();
 
-    // Thinking: StaticListingNode parent + ThinkingValue children.
-    menu.add_child(&[], StaticListingNode::new(&[
+    // Thinking: listing + single enum node (returns all levels via data()).
+    menu.add_root_child(StaticListingNode::new(&[
         StaticRow::new("thinking", "set thinking level"),
     ]).with_columns(vec![
         crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
-    ]));
-    for level in &["off", "low", "med", "high"] {
-        menu.add_child(
-            &["0"],
-            ThinkingValue::new(level, thinking_level.clone()),
-        );
-    }
+    ]))
+    .add_child_node(ThinkingEnumNode { shared: thinking_level.clone() });
 
-    // Persona: StaticListingNode parent + PersonaValue children.
+    // Persona
     crate::v25_persona::add_persona_children(&mut menu, settings);
+
+    // Model
+    crate::v25_model::add_model_children(&mut menu, shared);
 
     menu
 }

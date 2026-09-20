@@ -336,7 +336,7 @@ pub struct ModelProvider {
 
 /// One model entry → engine row with the numeric fields the generic
 /// filter/sort/fuzzy logic addresses.
-fn model_row(e: &crate::model_catalog::ModelEntry) -> crate::slashdot_menu::fields::Row {
+pub(crate) fn model_row(e: &crate::model_catalog::ModelEntry) -> crate::slashdot_menu::fields::Row {
     use crate::slashdot_menu::value::Value;
     let mut r = crate::slashdot_menu::fields::Row::new(e.qualified()).desc(e.display.clone());
     if let Some(v) = e.context_length {

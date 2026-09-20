@@ -46,6 +46,7 @@ pub struct DataResponse {
 }
 
 /// Error returned by `data()` when the node cannot produce rows.
+#[derive(Debug)]
 pub struct DataError {
     pub message: String,
 }
@@ -172,7 +173,7 @@ impl StaticRow {
 ///     StaticRow::new("thinking", "set thinking level"),
 ///     StaticRow::new("model", "switch model"),
 /// ]);
-/// menu.add_child(&[], node);
+/// menu.add_root_child(node).add_child_node(child);
 /// ```
 pub struct StaticListingNode {
     rows: Vec<StaticRow>,
