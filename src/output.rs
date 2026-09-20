@@ -2826,14 +2826,13 @@ mod tests {
         assert!(!before_flush.contains("first paragraph"), "content held before boundary");
         
         // Add blank line - should flush
-        let _ = renderer.feed(&parser.write("\nasome long text \n".as_bytes()), &mut buf);
-        // let _ = renderer.feed(&parser.flush(), &mut buf); // explicit flush simulates the new logic
+        let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         let after_flush = String::from_utf8(buf.clone()).unwrap();
         eprintln!("after newline: {}", after_flush);
-        // assert!(after_flush.contains("first paragraph"), "content emitted after boundary");
+        assert!(after_flush.contains("first paragraph"), "content emitted after boundary");
         
         // Second paragraph with explicit blank line
-        let _ = renderer.feed(&parser.write("\nsecond paragraph\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("second paragraph\n".as_bytes()), &mut buf);
         let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         // let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         let after_blank = String::from_utf8(buf.clone()).unwrap();
