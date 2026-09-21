@@ -82,5 +82,10 @@ pub fn build_menu(
         }.into());
     }
 
+    // Session (/session) — dynamic listing with action children.
+    {
+        root.add_child(crate::v25_session::build_session_node(shared));
+    }
+
     SlashDotMenu::from_root_node(root)
 }
