@@ -187,9 +187,9 @@ v2.5 engine.
 
 6. **Stat + Replay** — Simple leaf/interstitial commands. **Done.**
 8. **Session** — Dynamic listing with action children:
-   slashdot/session_design.md. Steps 0–3 done (PathArgs threading +
-   node tree + AsyncOp variants + agent dispatch). Remaining:
-   v2.0 overlay removal.
+   slashdot/session_design.md. **Done** (steps 0–5). Full session
+   lifecycle: listing, resume, fork, rename, delete with confirm.
+   v2.0 session overlay code removed.
 7. **Sandbox** — Mixed static+dynamic children. WIP design:
    slashdot/sandbox_design.md
 9. **Tree + compact** — Most complex: dynamic listing with nested
