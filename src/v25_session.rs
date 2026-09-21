@@ -72,6 +72,18 @@ fn format_session_timestamp(ts: &str) -> String {
     format!("{} {}", day_label, time_part)
 }
 
+/// Compact ISO timestamp to minute resolution: "2026-09-21 20:22Z".
+fn compact_timestamp(ts: &str) -> String {
+    // "2026-09-21T20:22:30.819Z" → "2026-09-21 20:22Z"
+    if ts.len() >= 16 {
+        let date = &ts[..10];
+        let time = &ts[11..16];
+        format!("{} {}Z", date, time)
+    } else {
+        ts.to_string()
+    }
+}
+
 /// Description for a session row: `"<name> — <first_prompt>"` or just
 /// `<first_prompt>` when no name is set.
 fn session_description(meta: &crate::repl::SessionMeta) -> String {
@@ -79,10 +91,9 @@ fn session_description(meta: &crate::repl::SessionMeta) -> String {
         .first_prompt_preview
         .as_deref()
         .unwrap_or("(empty)");
-    let prompt_trunc: String = prompt.chars().take(60).collect();
     match &meta.name {
-        Some(name) if !name.is_empty() => format!("{} — {}", name, prompt_trunc),
-        _ => prompt_trunc,
+        Some(name) if !name.is_empty() => format!("{} — {}", name, prompt),
+        _ => prompt.to_string(),
     }
 }
 
@@ -293,18 +304,13 @@ impl SlashDotNode for SessionListNode {
             })
             .unwrap_or_else(|| "(none)".to_string());
         let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
-        let last_display = if last_text.len() > 120 {
-            format!("{}...", &last_text[..last_text.char_indices().nth(120).map(|(i,_)| i).unwrap_or(last_text.len())])
-        } else {
-            last_text
-        };
 
         let mut msg_table = SdTable::new(&["", ""])
             .with_aligns(&[Align::Left, Align::Left])
             .with_min_widths(&[6, 10])
             .with_priorities(&[1, 3]);
         msg_table.add_row(&["First:", &first]);
-        msg_table.add_row(&[&format!("Last ({}):", last_ts), &last_display]);
+        msg_table.add_row(&[&format!("Last {}:", compact_timestamp(last_ts)), &last_text]);
 
         // Append First/Last rows, splitting wrapped lines.
         let msg_rows = msg_table.render_multiline(tw.saturating_sub(4));

@@ -1402,12 +1402,11 @@ mod tests {
             !plan.rows.is_empty(),
             "child_header/subtitle must not duplicate"
         );
-        // Paint path: full-width padded rows (header + rows).
+        // Paint path: data rows + table header have backgrounds;
+        // detail lines (header() output) have no background.
         let painted = plan.paint(100);
-        assert!(
-            painted.iter().all(|l| l.starts_with("\x1b[48;5;")),
-            "every line carries a panel background"
-        );
+        let has_data_or_header = painted.iter().any(|l| l.starts_with("\x1b[48;5;"));
+        assert!(has_data_or_header, "rows and table header carry panel backgrounds");
     }
 
     /// The *_price ratios floor the combined price at a tiny epsilon so free

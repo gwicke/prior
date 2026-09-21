@@ -69,6 +69,7 @@ impl RenderPlan {
                 flat.push(FlatLine {
                     text: sub.to_string(),
                     is_header: true,
+                    has_bg: false,
                     is_marker_row: false,
                     option: usize::MAX,
                 });
@@ -79,6 +80,7 @@ impl RenderPlan {
             flat.push(FlatLine {
                 text: th.0.clone(),
                 is_header: true,
+                has_bg: true,
                 is_marker_row: false,
                 option: usize::MAX,
             });
@@ -89,6 +91,7 @@ impl RenderPlan {
                 flat.push(FlatLine {
                     text: sub.to_string(),
                     is_header: false,
+                    has_bg: true,
                     is_marker_row: j == 0,
                     option: i,
                 });
@@ -98,13 +101,10 @@ impl RenderPlan {
         for l in &flat {
             let sel = self.selected == Some(l.option);
             let act = self.active_rows.contains(&l.option);
-            let bg = if l.is_header {
-                "\x1b[48;5;237m"
-            } else if sel {
-                "\x1b[48;5;239m"
-            } else {
-                "\x1b[48;5;235m"
-            };
+            let bg = if !l.has_bg { "" }
+                     else if l.is_header { "\x1b[48;5;237m" }
+                     else if sel { "\x1b[48;5;239m" }
+                     else { "\x1b[48;5;235m" };
             let fg = if sel { "\x1b[1;36m" } else { "" };
             let marker = if !l.is_marker_row {
                 "  "
@@ -131,6 +131,7 @@ impl RenderPlan {
 struct FlatLine {
     text: String,
     is_header: bool,
+    has_bg: bool,
     is_marker_row: bool,
     option: usize,
 }

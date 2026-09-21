@@ -2394,15 +2394,15 @@ impl Repl {
                     let tw = crate::output::term_width().max(1);
                     let mut result: Vec<String> = Vec::new();
 
-                    // 1. Detail (header() output — sticky info, shown first).
+                    // 1. Detail (header() output — no background, stands out).
                     let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
                     let min_data = 1usize;
                     let detail_budget = max_pop.saturating_sub(min_data).max(1);
                     for d in plan.detail.iter().take(detail_budget) {
-                        result.push(Self::render_logical_line(d, tw, false, false, true));
+                        result.push(Self::render_logical_line(d, tw, false, false, false));
                     }
 
-                    // 2. Table header (column labels, below header() output).
+                    // 2. Table header (column labels, grey background).
                     if let Some(ref th) = plan.table_header {
                         result.push(Self::render_logical_line(th, tw, false, false, true));
                     }
@@ -2934,7 +2934,7 @@ impl Repl {
     ) -> String {
         let bg = if is_header { "\x1b[48;5;237m" }
                  else if is_selected { "\x1b[48;5;239m" }
-                 else { "\x1b[48;5;235m" };
+                 else { "" };
         let fg = if is_selected { "\x1b[1;36m" } else { "" };
         let mut parts = Vec::new();
         for (j, sub) in line.0.split('\n').enumerate() {
