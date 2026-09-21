@@ -4407,21 +4407,57 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 config.output.display_text("No active session to replay");
                             }
                         }
-                        crate::slash_menu_bridge::AsyncOp::Resume { session_id: _, replay_arg: _ } => {
-                            // TODO(step 5): implement resume dispatch
-                            config.output.display_text("Resume: not yet implemented");
+                        crate::slash_menu_bridge::AsyncOp::Resume { session_id, replay_arg } => {
+                            let input = if replay_arg.is_empty() {
+                                format!("/session {} resume", session_id)
+                            } else {
+                                format!("/session {} resume {}", session_id, replay_arg)
+                            };
+                            let out = config.output.clone();
+                            match handle_session_command(
+                                &input, &mut session, &mut repo, &mut config, &out, settings,
+                            ).await {
+                                SessionCommandResult::Switched { id: new_id, prefill } => {
+                                    current_session_id = new_id;
+                                    if prefill.is_some() {
+                                        pending_prefill = prefill;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
-                        crate::slash_menu_bridge::AsyncOp::Fork { session_id: _ } => {
-                            // TODO(step 5): implement fork dispatch
-                            config.output.display_text("Fork: not yet implemented");
+                        crate::slash_menu_bridge::AsyncOp::Fork { session_id } => {
+                            let input = format!("/session {} fork", session_id);
+                            let out = config.output.clone();
+                            match handle_session_command(
+                                &input, &mut session, &mut repo, &mut config, &out, settings,
+                            ).await {
+                                SessionCommandResult::Switched { id: new_id, .. } => {
+                                    current_session_id = new_id;
+                                }
+                                _ => {}
+                            }
                         }
-                        crate::slash_menu_bridge::AsyncOp::Rename { session_id: _, new_name: _ } => {
-                            // TODO(step 5): implement rename dispatch
-                            config.output.display_text("Rename: not yet implemented");
+                        crate::slash_menu_bridge::AsyncOp::Rename { session_id, new_name } => {
+                            let input = format!("/session {} rename {}", session_id, new_name);
+                            let out = config.output.clone();
+                            let _ = handle_session_command(
+                                &input, &mut session, &mut repo, &mut config, &out, settings,
+                            ).await;
                         }
-                        crate::slash_menu_bridge::AsyncOp::Delete { session_id: _ } => {
-                            // TODO(step 5): implement delete dispatch
-                            config.output.display_text("Delete: not yet implemented");
+                        crate::slash_menu_bridge::AsyncOp::Delete { session_id } => {
+                            let input = format!("/session {} delete", session_id);
+                            let out = config.output.clone();
+                            match handle_session_command(
+                                &input, &mut session, &mut repo, &mut config, &out, settings,
+                            ).await {
+                                SessionCommandResult::Deleted => {
+                                    if session.is_none() {
+                                        current_session_id.clear();
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     continue;
