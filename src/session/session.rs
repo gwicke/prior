@@ -26,6 +26,40 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::session::storage::{JsonlSessionStorage, SessionStorage};
 use crate::session::types::*;
 
+/// Rewrite the arguments of any `edit` tool call in `msg` to the canonical
+/// array form, so what is persisted (and rendered) stays pi-compatible even
+/// though the model may have emitted the block-string form. Best-effort and
+/// idempotent. Returns `Some` only when the message is an assistant message
+/// that actually carries an `edit` tool call (so the common path does not
+/// clone); otherwise `None` and the caller keeps the original.
+fn canonicalize_edit_tool_calls(msg: &Message) -> Option<Message> {
+    let Message::Assistant { id, content } = msg else {
+        return None;
+    };
+    let needs = content
+        .iter()
+        .any(|c| matches!(c, AssistantContent::ToolCall(tc) if tc.function.name == "edit"));
+    if !needs {
+        return None;
+    }
+    let content = content
+        .iter()
+        .map(|c| match c {
+            AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
+                let mut tc = tc.clone();
+                tc.function.arguments =
+                    crate::edit_blocks::canonicalize_edit_value(&tc.function.arguments);
+                AssistantContent::ToolCall(tc)
+            }
+            other => other.clone(),
+        })
+        .collect();
+    Some(Message::Assistant {
+        id: id.clone(),
+        content,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Compaction summary message (pi-compatible wrapper)
 // ---------------------------------------------------------------------------
@@ -838,6 +872,12 @@ impl Session {
     /// Converts the rig `Message` to pi's `AgentMessage` format before storage.
     pub async fn append_message(&self, msg: &Message) -> crate::Result<String> {
         self.ensure_persisted().await?;
+
+        // Canonicalize `edit` tool-call arguments before persisting: the model
+        // emits the block-string form, but the on-disk JSONL must be the
+        // canonical array so pi can read the session. No-op for other messages.
+        let canonical = canonicalize_edit_tool_calls(msg);
+        let msg: &Message = canonical.as_ref().unwrap_or(msg);
         let entry_id = uuid::Uuid::now_v7().to_string();
         let parent_id = {
             let index = self.index.lock().await;
@@ -2971,6 +3011,66 @@ mod tests {
 
         let _ = tokio::fs::remove_file(&path).await;
     }
+
+    #[tokio::test]
+    async fn test_edit_block_form_persisted_as_canonical_array() {
+        // The model emits the Aider block string; the persisted JSONL must be
+        // the canonical pi-compatible array.
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-edit-canon-test-{}",
+            std::process::id()
+        ));
+        let filename = session_filename(&chrono::Utc::now());
+        let path = dir.join(&filename);
+
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.unwrap();
+        let index = storage.build_index().await.unwrap();
+        let session = Session::new_persisted(storage, index);
+
+        let blob = "src/x.rs\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE";
+        session
+            .append_message(&Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: ToolCallId::new("tc_edit").unwrap(),
+                    provider: None,
+                    function: ToolFunction::new(
+                        "edit".into(),
+                        serde_json::json!({"path": "src/x.rs", "edits": blob}),
+                    ),
+                    signature: None,
+                    additional_params: None,
+                })],
+            })
+            .await
+            .unwrap();
+
+        let raw = tokio::fs::read_to_string(&path).await.unwrap();
+        let line = raw
+            .lines()
+            .find(|l| l.contains("\"name\":\"edit\""))
+            .expect("edit call persisted");
+        // Canonical array form (key order is not significant).
+        assert!(
+            line.contains("\"edits\":[")
+                && line.contains("\"oldText\":\"a\"")
+                && line.contains("\"newText\":\"b\""),
+            "edit args should be persisted as the canonical array, got: {line}"
+        );
+        assert!(
+            !line.contains(SEARCH_MARKER_TEST),
+            "block-string form must not be persisted: {line}"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// Local copy of the search marker so the assertion above is explicit.
+    const SEARCH_MARKER_TEST: &str = "<<<<<<< SEARCH";
 
     #[tokio::test]
     async fn test_toolname_multiple_tools() {

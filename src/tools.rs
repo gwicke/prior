@@ -169,59 +169,22 @@ pub struct EditOp {
     pub end_line: Option<EditEndLine>,
 }
 
-/// Arguments accepted by the `edit` tool.
+/// Arguments accepted by the `edit` tool, after normalization to the execution
+/// form (a resolved single-file `path` plus one or more [`EditOp`]s).
 ///
-/// Accepts two wire formats:
-/// - Single (single edit): `{path, oldText, newText, startLine?, endLine?}`
-/// - Batch: `{path, edits: [{oldText, newText, startLine?, endLine?}]}`
+/// The advertised wire format is a **flat bag of optional fields** (see
+/// [`EditFile::parameters`]); variant selection happens in
+/// [`EditArgs::from_wire`] so no `anyOf` union is ever advertised. Accepted
+/// shapes:
 ///
-/// The schema advertises both formats via `anyOf`.
-#[derive(Serialize, JsonSchema)]
+/// - single edit: `{path, oldText, newText, startLine?, endLine?}`
+/// - block edit:  `{path?, edits: "<Aider SEARCH/REPLACE blocks>", startLine?, endLine?}`
+/// - legacy batch (replay only): `{path, edits: [{oldText, newText, ...}]}`
 pub struct EditArgs {
-    /// File to edit, relative to the working directory.
+    /// File to edit (from the `path` argument, or inferred from a block header).
     pub path: String,
-    /// Either the canonical `edits` array or the legacy single-edit fields.
-    #[serde(flatten)]
-    pub variant: EditArgsVariant,
-}
-
-/// Internal enum to represent the two accepted wire formats.
-/// The `#[serde(untagged)]` attribute makes serde try each variant in order
-/// without a discriminant field, and `schemars` emits this as `anyOf` in the schema.
-#[derive(Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum EditArgsVariant {
-    /// Single format: single edit at top level (for backwards compatibility).
-    Single {
-        #[serde(rename = "oldText")]
-        old_text: String,
-        #[serde(rename = "newText")]
-        new_text: String,
-        #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
-        start_line: Option<EditStartLine>,
-        #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
-        end_line: Option<EditEndLine>,
-    },
-    /// Batch format: one or more edits in an array.
-    Batch {
-        /// One or more targeted text replacements.
-        edits: Vec<EditOp>,
-    },
-}
-
-impl EditArgs {
-    /// Get the list of edits, converting from legacy format if needed.
-    pub fn edits(&self) -> Vec<EditOp> {
-        match &self.variant {
-            EditArgsVariant::Batch { edits } => edits.clone(),
-            EditArgsVariant::Single { old_text, new_text, start_line, end_line } => vec![EditOp {
-                old_text: old_text.clone(),
-                new_text: new_text.clone(),
-                start_line: start_line.clone(),
-                end_line: end_line.clone(),
-            }],
-        }
-    }
+    /// The edits to apply, computed against the original file.
+    pub edits: Vec<EditOp>,
 }
 
 /// Cap on the JSON echoed back in an invalid-parameters error, so a bad call
@@ -229,8 +192,8 @@ impl EditArgs {
 /// can't blow up the tool message.
 const MAX_ECHOED_ARGS: usize = 400;
 
-const EDIT_ARGS_EXAMPLE: &str = r#"Single: {"path": "some/path", "oldText": "original text", "newText": "replacement text" }
-Batch: {"path": "some/path","edits": [{"oldText": "original text", "newText": "replacement text"}]}"#;
+const EDIT_ARGS_EXAMPLE: &str = r#"Single edit: {"path": "some/path", "oldText": "original text", "newText": "replacement text"}
+Multiple edits: {"path": "some/path", "edits": "<<<<<<< SEARCH\noriginal text\n=======\nreplacement text\n>>>>>>> REPLACE"}"#;
 
 /// Truncate the echoed parameter JSON to [`MAX_ECHOED_ARGS`] chars on a
 /// char boundary, appending an ellipsis when cut.
@@ -246,71 +209,112 @@ fn truncate_wire_repr(raw: &serde_json::Value) -> String {
     format!("{} …", &s[..cut])
 }
 
-/// Extract a clean, user-friendly error from serde's untagged enum mismatch.
-fn clean_error(e: &serde_json::Error) -> String {
-    let msg = e.to_string();
-    if msg.contains("data did not match any variant of untagged enum") {
-        "provided arguments don't match any accepted format".to_string()
-    } else if msg.contains("missing field `path`") {
-        "missing required field 'path'".to_string()
-    } else if msg.contains("missing field `edits`") {
-        "missing required field 'edits' (for canonical format)".to_string()
-    } else if msg.contains("missing field `oldText`") {
-        "missing required field 'oldText' (for legacy format)".to_string()
-    } else if msg.contains("missing field `newText`") {
-        "missing required field 'newText' (for legacy format)".to_string()
-    } else {
-        msg.replace("RawEditArgsVariant", "the expected format")
-            .replace("RawEditArgs", "the expected format")
-    }
-}
-
 impl EditArgs {
-    /// Parse the wire JSON, accepting both the canonical `edits` array and
-    /// the legacy top-level single-edit shape (with optional startLine/endLine).
-    /// Any other payload yields an error that echoes the received parameters
-    /// (truncated) plus the canonical shape, so the model can self-correct
-    /// in a single retry.
+    /// Build the self-correcting error: what went wrong, the accepted shapes,
+    /// and the (truncated) parameters actually received.
+    fn invalid(raw: &serde_json::Value, why: &str) -> String {
+        format!(
+            "Invalid edit tool arguments: {why}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nPlease do NOT use sed or python for editing, they lack the protections of this tool.",
+            EDIT_ARGS_EXAMPLE,
+            truncate_wire_repr(raw),
+        )
+    }
+
+    /// Parse one legacy `edits[]` entry.
+    fn op_from_value(e: &serde_json::Value) -> Option<EditOp> {
+        Some(EditOp {
+            old_text: e.get("oldText")?.as_str()?.to_string(),
+            new_text: e.get("newText")?.as_str()?.to_string(),
+            start_line: e
+                .get("startLine")
+                .and_then(|v| v.as_u64())
+                .map(crate::config::EditStartLine),
+            end_line: e
+                .get("endLine")
+                .and_then(|v| v.as_u64())
+                .map(crate::config::EditEndLine),
+        })
+    }
+
+    /// Parse the wire JSON. The `path` argument is authoritative; a filename
+    /// line inside the blocks may agree with it (or supply it when absent), but
+    /// a disagreement is a hard error (never silently write the wrong file).
+    /// `startLine`/`endLine`, when present, constrain every edit in the call.
     fn from_wire(raw: &serde_json::Value) -> Result<Self, String> {
-        // Use a temporary type without custom Deserialize to avoid recursion.
-        #[derive(serde::Deserialize)]
-        struct RawEditArgs {
-            path: String,
-            #[serde(flatten)]
-            variant: RawEditArgsVariant,
+        let obj = match raw.as_object() {
+            Some(o) => o,
+            None => return Err(Self::invalid(raw, "arguments must be a JSON object")),
+        };
+        let json_path = obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let start_line = obj
+            .get("startLine")
+            .and_then(|v| v.as_u64())
+            .map(crate::config::EditStartLine);
+        let end_line = obj
+            .get("endLine")
+            .and_then(|v| v.as_u64())
+            .map(crate::config::EditEndLine);
+
+        // Block form: `edits` is a string of Aider SEARCH/REPLACE blocks.
+        if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
+            let parsed = crate::edit_blocks::parse_blocks(text)
+                .map_err(|e| Self::invalid(raw, &format!("invalid SEARCH/REPLACE blocks: {e}")))?;
+            let (path, pairs) = crate::edit_blocks::merge_path(json_path, parsed)
+                .map_err(|e| Self::invalid(raw, &e))?;
+            let edits = pairs
+                .into_iter()
+                .map(|(old_text, new_text)| EditOp {
+                    old_text,
+                    new_text,
+                    start_line,
+                    end_line,
+                })
+                .collect();
+            return Ok(EditArgs { path, edits });
         }
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum RawEditArgsVariant {
-            Batch { edits: Vec<EditOp> },
-            Single {
-                #[serde(rename = "oldText")]
-                old_text: String,
-                #[serde(rename = "newText")]
-                new_text: String,
-                #[serde(rename = "startLine", default)]
-                start_line: Option<EditStartLine>,
-                #[serde(rename = "endLine", default)]
-                end_line: Option<EditEndLine>,
-            },
+
+        // Legacy batch form: `edits` is an array.
+        if let Some(arr) = obj.get("edits").and_then(|v| v.as_array()) {
+            let path = json_path
+                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let mut edits = Vec::with_capacity(arr.len());
+            for e in arr {
+                edits.push(Self::op_from_value(e).ok_or_else(|| {
+                    Self::invalid(raw, "each `edits[]` entry needs string 'oldText' and 'newText'")
+                })?);
+            }
+            return Ok(EditArgs {
+                path: path.to_string(),
+                edits,
+            });
         }
-        match serde_json::from_value::<RawEditArgs>(raw.clone()) {
-            Ok(raw_args) => Ok(EditArgs {
-                path: raw_args.path,
-                variant: match raw_args.variant {
-                    RawEditArgsVariant::Batch { edits } => EditArgsVariant::Batch { edits },
-                    RawEditArgsVariant::Single { old_text, new_text, start_line, end_line } => {
-                        EditArgsVariant::Single { old_text, new_text, start_line, end_line }
-                    }
-                },
-            }),
-            Err(e) => Err(format!(
-                "Invalid edit tool arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nPlease do NOT use sed or python for editing, they lack the protections of this tool.",
-                clean_error(&e),
-                EDIT_ARGS_EXAMPLE,
-                truncate_wire_repr(raw),
-            )),
+
+        // Single form: top-level oldText/newText.
+        if let (Some(o), Some(n)) = (
+            obj.get("oldText").and_then(|v| v.as_str()),
+            obj.get("newText").and_then(|v| v.as_str()),
+        ) {
+            let path = json_path
+                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            return Ok(EditArgs {
+                path: path.to_string(),
+                edits: vec![EditOp {
+                    old_text: o.to_string(),
+                    new_text: n.to_string(),
+                    start_line,
+                    end_line,
+                }],
+            });
         }
+
+        Err(Self::invalid(
+            raw,
+            "no recognizable edit arguments (expected `oldText`+`newText`, or `edits`)",
+        ))
     }
 }
 
@@ -324,10 +328,10 @@ impl<'de> Deserialize<'de> for EditArgs {
     }
 }
 
-/// Static tool facade for `edit`, mirroring what `#[rig_tool]` would emit.
-/// Hand-written instead of macro-generated so the args deserializer can
-/// accept the legacy single-edit shape without advertising it — see
-/// [`EditArgs`]. The `Bash` tool follows the same manual-impl pattern.
+/// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
+/// the args deserializer can select a variant from the raw JSON and accept the
+/// legacy shapes without advertising them — see [`EditArgs`]. The `Bash` tool
+/// follows the same manual-impl pattern.
 pub struct EditFile;
 
 impl rig_core::tool::Tool for EditFile {
@@ -338,22 +342,42 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in file using one or more targeted edits. Each edit must match unique text. Edits target the original file, not the output of previous edits.".into()
+        "Replace text in a file. For one edit use `oldText`/`newText`. For several edits in one call, put Aider-style SEARCH/REPLACE blocks in the `edits` string (single file). Each block is `<<<<<<< SEARCH` then the exact text, `=======`, the replacement, `>>>>>>> REPLACE`. Each edit must match unique text; edits are computed against the original file, not incrementally.".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
-        static SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
-            let mut schema = schemars::schema_for!(EditArgs).to_value();
-            // Providers expect an explicit `required` array even when no
-            // parameter is required (mirrors the macro-generated schema).
-            if let Some(object) = schema.as_object_mut() {
-                object
-                    .entry("required")
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            }
-            schema
-        });
-        SCHEMA.clone()
+        // A flat object of optional scalars — deliberately no `anyOf`/nested
+        // array, which weak tool-call harnesses tend to mangle (stringify).
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File to edit, relative to the working directory. Required for the single-edit form; optional for the block form when the edit text starts with a filename line."
+                },
+                "oldText": {
+                    "type": "string",
+                    "description": "Exact text to replace (single-edit form). Must be unique in the file."
+                },
+                "newText": {
+                    "type": "string",
+                    "description": "Replacement text (single-edit form)."
+                },
+                "startLine": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed first line of the search window; constrains every edit in the call."
+                },
+                "endLine": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed last line (inclusive) of the search window."
+                },
+                "edits": {
+                    "type": "string",
+                    "description": "One or more Aider-style SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `<<<<<<< SEARCH` line, exact text, `=======`, replacement, `>>>>>>> REPLACE`. Preferred over `oldText`/`newText` when making multiple edits."
+                }
+            },
+            "required": []
+        })
     }
 
     async fn call(
@@ -361,8 +385,7 @@ impl rig_core::tool::Tool for EditFile {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let edits = args.edits();
-        edit_file(args.path, edits).await
+        edit_file(args.path, args.edits).await
     }
 }
 
@@ -2771,44 +2794,100 @@ mod edit_args_wire_tests {
         assert!(msg.contains("…"), "truncation marker missing: {msg}");
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn block_form_window_restricts_every_edit() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("win.txt", "x\nkeep\nx\n").await.unwrap();
+        let blob = "win.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+
+        // Without a window, `x` is ambiguous.
+        let ambiguous = execute_edit(serde_json::json!({"path": "win.txt", "edits": blob})).await;
+        assert!(
+            ambiguous.output().render().contains("appears 2 times"),
+            "expected non-unique failure, got: {}",
+            ambiguous.output().render()
+        );
+
+        // The top-level window constrains the (single) block edit.
+        let windowed = execute_edit(serde_json::json!({
+            "path": "win.txt", "edits": blob, "startLine": 3, "endLine": 3
+        }))
+        .await;
+        assert!(windowed.is_success(), "got: {windowed:?}");
+        let after = tokio::fs::read_to_string("win.txt").await.unwrap();
+        assert_eq!(after, "x\nkeep\ny\n");
+    }
+
     // ---- Schema advertisement ----
 
     #[test]
-    fn schema_advertises_both_formats() {
+    fn schema_is_flat_with_no_anyof() {
+        // The whole point of v2: a flat bag of optional scalars, with NO
+        // `anyOf` union or nested array that weak harnesses stringify.
         let schema = EditFile.parameters();
+        assert!(schema.get("anyOf").is_none(), "schema must not use anyOf: {schema}");
+        assert!(
+            schema.get("oneOf").is_none(),
+            "schema must not use oneOf: {schema}"
+        );
+
+        let props = schema.get("properties").expect("properties present");
+        for key in ["path", "oldText", "newText", "startLine", "endLine", "edits"] {
+            assert!(props.get(key).is_some(), "missing property `{key}`: {schema}");
+        }
+        // `edits` is a *string* (the blob), not an array.
+        assert_eq!(
+            props.get("edits").and_then(|e| e.get("type")).and_then(|t| t.as_str()),
+            Some("string"),
+            "`edits` must be advertised as a string"
+        );
+
         let required = schema
             .get("required")
             .and_then(|v| v.as_array())
-            .expect("required array present")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            required.contains(&"path"),
-            "path must be required: {required:?}"
-        );
-        // The schema should advertise both formats via anyOf
-        let any_of = schema.get("anyOf").and_then(|v| v.as_array()).expect("anyOf present");
-        assert!(!any_of.is_empty(), "anyOf should not be empty");
-        // Check that the canonical format (edits array) is present
-        let has_canonical = any_of.iter().any(|v| {
-            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
-                r.iter().any(|v| v.as_str() == Some("edits"))
-            })
-        });
-        assert!(has_canonical, "canonical format with 'edits' should be present");
-        // Check that the legacy format (oldText/newText) is present
-        let has_legacy = any_of.iter().any(|v| {
-            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
-                r.iter().any(|v| v.as_str() == Some("oldText")) && r.iter().any(|v| v.as_str() == Some("newText"))
-            })
-        });
-        assert!(has_legacy, "legacy format with 'oldText'/'newText' should be present");
-        // The legacy top-level fields should NOT be at the top level properties
-        let props = schema.get("properties").unwrap();
-        assert!(props.get("edits").is_none(), "edits should not be at top level");
-        assert!(props.get("oldText").is_none());
-        assert!(props.get("newText").is_none());
+            .expect("required array present");
+        assert!(required.is_empty(), "no parameter is required: {required:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_applies_all_edits() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("blob.txt", "a\nb\nc\n").await.unwrap();
+        let blob = "blob.txt\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nc\n=======\nC\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({
+            "path": "blob.txt",
+            "edits": blob
+        }))
+        .await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("blob.txt").await.unwrap();
+        assert_eq!(after, "A\nb\nC\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_infers_path_from_header() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("infer.txt", "hello\n").await.unwrap();
+        let blob = "infer.txt\n<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({ "edits": blob })).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("infer.txt").await.unwrap();
+        assert_eq!(after, "world\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_conflicting_path_errors() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("a.txt", "x\n").await.unwrap();
+        let blob = "b.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({ "path": "a.txt", "edits": blob })).await;
+        assert!(result.is_error(), "conflicting path must fail: {result:?}");
+        let msg = result.output().render();
+        assert!(msg.contains("path mismatch"), "got: {msg}");
     }
 
     #[test]

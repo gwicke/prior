@@ -1098,6 +1098,37 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         .join("\n")
 }
 
+/// Render `edit` tool-call arguments in the model-facing block form.
+///
+/// The transcript is stored canonically (a pi-compatible `edits` array), but
+/// the model is shown the block form **consistently** so it keeps emitting the
+/// reliable shape and is not nudged back toward the array (the form weak
+/// harnesses mangle). Idempotent and allocation-light: non-`edit` calls and
+/// already-block arguments pass through unchanged.
+fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
+    messages
+        .into_iter()
+        .map(|m| match m {
+            Message::Assistant { id, content } => {
+                let content = content
+                    .into_iter()
+                    .map(|c| match c {
+                        AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
+                            let mut tc = tc;
+                            tc.function.arguments =
+                                crate::edit_blocks::array_to_blob_value(&tc.function.arguments);
+                            AssistantContent::ToolCall(tc)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                Message::Assistant { id, content }
+            }
+            other => other,
+        })
+        .collect()
+}
+
     /// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
     /// always present — minted at the provider boundary when the provider
     /// issued no id — so the old cross-provider `call_id` normalisation is
@@ -1639,44 +1670,39 @@ impl AgentHook for LoggingHook {
         event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            CompletionCallAction::Stop("cancelled by user".into())
-        } else {
-            // Build stripped history for sending to the provider and logging.
-            // The prompt is sent separately (not part of history), but we
-            // log it alongside. When `reasoning_in_context` is false,
-            // `maybe_strip_reasoning` removes reasoning blocks from the
-            // history — and the log should reflect exactly what the
-            // model sees.
-            let stripped_history = maybe_strip_reasoning(
-                event.history.iter().cloned().collect(),
-                self.reasoning_in_context,
-                &self.provider,
-                &self.model,
-            );
-
-            // `--log-messages`: capture the exact context sent to the
-            // model on this call — the full history plus the current
-            // prompt — under one turn id shared with the matching
-            // response. Logging the stripped history reflects what
-            // the provider actually receives.
-            if let Some(logger) = &self.message_logger {
-                let turn_id = logger.advance_turn();
-                for m in &stripped_history {
-                    logger.log_message("sent", m, turn_id).await;
-                }
-                logger.log_message("sent", event.prompt, turn_id).await;
-            }
-
-            // When `reasoning_in_context` is false, send the stripped
-            // history to the provider via a patch. `maybe_strip_reasoning`
-            // also handles the Anthropic-family thinking+tool_use replay
-            // contract (reasoning is force-kept on turns with tool calls),
-            // so the patch is a no-op there.
-            if !self.reasoning_in_context {
-                return CompletionCallAction::Patch(RequestPatch::new().history(stripped_history));
-            }
-            CompletionCallAction::Continue
+            return CompletionCallAction::Stop("cancelled by user".into());
         }
+        // Build the history to send: strip reasoning when configured, then
+        // render `edit` tool calls in the model-facing block form. The
+        // transcript is stored canonically (a pi-compatible array); the model is
+        // shown the block form *consistently* so it keeps emitting the reliable
+        // shape. This hook is the one place that sees the whole request history,
+        // so it covers prior and within-turn messages alike.
+        let stripped_history = maybe_strip_reasoning(
+            event.history.iter().cloned().collect(),
+            self.reasoning_in_context,
+            &self.provider,
+            &self.model,
+        );
+        let history = blob_edit_tool_calls(stripped_history);
+
+        // `--log-messages`: capture the exact context sent to the model on this
+        // call — the (stripped, block-form) history plus the current prompt —
+        // under one turn id shared with the matching response. Logging `history`
+        // reflects what the provider actually receives.
+        if let Some(logger) = &self.message_logger {
+            let turn_id = logger.advance_turn();
+            for m in &history {
+                logger.log_message("sent", m, turn_id).await;
+            }
+            logger.log_message("sent", event.prompt, turn_id).await;
+        }
+
+        // Always send via a patch: it replaces the run's history with exactly
+        // `history`. `maybe_strip_reasoning` also handles the Anthropic-family
+        // thinking+tool_use replay contract (reasoning is force-kept on turns
+        // with tool calls). Identity for every message without an `edit` call.
+        CompletionCallAction::Patch(RequestPatch::new().history(history))
     }
 
     async fn on_completion_response(
@@ -1736,8 +1762,14 @@ impl AgentHook for LoggingHook {
         if self.user_cancel.load(Ordering::SeqCst) {
             return ToolCallAction::Stop("cancelled by user".into());
         }
-        let args_json = serde_json::from_str(event.args)
+        let mut args_json = serde_json::from_str(event.args)
             .unwrap_or(serde_json::Value::String(event.args.to_string()));
+        // Canonicalize `edit` arguments to the array form for display, so
+        // `get_preview` sees the same shape it gets on replay (the parser stays
+        // out of `output.rs`). No-op for other tools / already-canonical args.
+        if event.tool_name == "edit" {
+            args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
+        }
         self.output.display_tool_call(event.tool_name, &args_json);
         ToolCallAction::Run
     }
@@ -1799,7 +1831,7 @@ Your mission is to assist the user in their development tasks by utilizing a set
 
 ### WORKFLOW & STRATEGY
 1. **Understand Before Acting**: Always start by exploring the codebase. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
-2. **Be Precise**: When editing files, use `edit` with enough context in `oldText` to ensure a unique match. You can pass multiple edits at once via the `edits` array. Avoid replacing large blocks if a small change suffices.
+2. **Be Precise**: When editing files, use `edit`. For a single change use `oldText`/`newText` with enough surrounding context to make the match unique. For multiple changes in one file, pass Aider-style SEARCH/REPLACE blocks in the `edits` string — each block is a `<<<<<<< SEARCH` line, the exact text, `=======`, the replacement, `>>>>>>> REPLACE` — with the file given by `path` (one file per call). Avoid replacing large blocks if a small change suffices.
 3. **Verify Everything**: After modifying code, verify the results. Run tests or build commands via `bash`. Read the modified file to ensure the change was applied correctly.
 4. **Tool Mastery**:
    - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
@@ -4753,6 +4785,7 @@ mod tests {
     use crate::session::storage::SessionStorage;
     use crate::SettingsStore;
     use super::{
+        blob_edit_tool_calls,
         build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir,
         find_predecessor_on_active_branch,
@@ -4764,6 +4797,47 @@ mod tests {
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
     use rig_core::message::{AssistantContent, Message, Text};
+
+    #[test]
+    fn blob_edit_tool_calls_renders_block_form_and_is_idempotent() {
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        });
+        let mk = |args: serde_json::Value| Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: rig_core::message::ToolCallId::new("t1").unwrap(),
+                provider: None,
+                function: rig_core::message::ToolFunction::new("edit".into(), args),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+
+        // Array -> block.
+        let out = blob_edit_tool_calls(vec![mk(args)]);
+        let Message::Assistant { content, .. } = &out[0] else {
+            panic!("expected assistant")
+        };
+        let AssistantContent::ToolCall(tc) = &content[0] else {
+            panic!("expected tool call")
+        };
+        let edits = tc.function.arguments.get("edits").and_then(|v| v.as_str()).unwrap();
+        assert!(edits.contains("<<<<<<< SEARCH"), "got: {edits}");
+        assert!(edits.contains("src/x.rs"), "got: {edits}");
+
+        // Idempotent: an already-block value is unchanged.
+        let already = serde_json::json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"});
+        let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
+        let Message::Assistant { content, .. } = &out2[0] else {
+            panic!("expected assistant")
+        };
+        let AssistantContent::ToolCall(tc) = &content[0] else {
+            panic!("expected tool call")
+        };
+        assert_eq!(tc.function.arguments, already);
+    }
 
     #[test]
     fn turn_persistence_counts_dispatch_not_text() {
