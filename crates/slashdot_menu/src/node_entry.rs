@@ -885,11 +885,17 @@ impl NodeEntry {
                 let header_text = t.render_header(term_width.saturating_sub(2));
                 table_header_line = Some(LogicalLine::new(header_text));
             }
-            // Data rows: each rendered row is one LogicalLine (embedded \n for wrapping).
-            row_lines = t.render_multiline(term_width.saturating_sub(2))
-                .into_iter()
-                .map(LogicalLine::new)
-                .collect();
+            // Data rows: wrapping (multi-line) or truncating (single-line + ellipsis)
+            // based on the column wrap setting.
+            let use_wrap = columns.iter().all(|c| c.wrap);
+            row_lines = if use_wrap {
+                t.render_multiline(term_width.saturating_sub(2))
+            } else {
+                t.render(term_width.saturating_sub(2))
+            }
+            .into_iter()
+            .map(LogicalLine::new)
+            .collect();
         }
 
         // Resolve active row indices.

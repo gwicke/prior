@@ -22,6 +22,10 @@ pub struct ColumnDef {
     pub min_width: usize,
     /// Shrink priority (higher = kept wider under pressure).
     pub priority: usize,
+    /// When `true` (default), long cell content wraps across multiple
+    /// visual lines. When `false`, the table uses single-line rows with
+    /// ellipsis truncation instead.
+    pub wrap: bool,
 }
 
 impl ColumnDef {
@@ -33,6 +37,7 @@ impl ColumnDef {
             align: Align::Left,
             min_width: 3,
             priority: 1,
+            wrap: true,
         }
     }
 
@@ -48,6 +53,12 @@ impl ColumnDef {
 
     pub fn prio(mut self, p: usize) -> Self {
         self.priority = p;
+        self
+    }
+
+    /// Set whether this column's content wraps (default: true).
+    pub fn wrap(mut self, w: bool) -> Self {
+        self.wrap = w;
         self
     }
 }

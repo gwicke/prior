@@ -140,15 +140,20 @@ fn find_session(
 pub fn session_listing_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
-        ColumnDef::new("description", "Description").min(20).prio(3),
+        ColumnDef::new("description", "Description")
+            .min(20)
+            .prio(3)
+            .wrap(false),
         ColumnDef::new("msgs", "Turns")
             .align(Align::Right)
             .min(5)
-            .prio(1),
+            .prio(1)
+            .wrap(false),
         ColumnDef::new("age", "Age")
             .align(Align::Right)
             .min(8)
-            .prio(1),
+            .prio(1)
+            .wrap(false),
     ]
 }
 
@@ -310,11 +315,14 @@ impl SlashDotNode for SessionListNode {
             .with_min_widths(&[6, 10])
             .with_priorities(&[1, 3]);
         msg_table.add_row(&["First:", &first]);
-        msg_table.add_row(&[&format!("Last:", ), &format!("{} {}", compact_timestamp(last_ts), last_text)]);
+        msg_table.add_row(&["Last:", &format!("{} {}", compact_timestamp(last_ts), last_text)]);
 
-        // Single-line rows with ellipsis (no wrapping).
-        for row in msg_table.render(tw.saturating_sub(4)) {
-            lines.push(format!("  {}", row));
+        // Append First/Last rows, splitting wrapped lines.
+        let msg_rows = msg_table.render_multiline(tw.saturating_sub(4));
+        for row in &msg_rows {
+            for sub in row.split('\n') {
+                lines.push(format!("  {}", sub));
+            }
         }
 
         lines
