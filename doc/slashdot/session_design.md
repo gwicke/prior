@@ -376,7 +376,7 @@ method signatures.
    Remove dead helper methods: `session_overlay_entries`,
    `session_action_overlay_entries`, `filtered_sessions`,
    `format_session_timestamp`, `relative_time`, `parse_session_path_filter`.
-   **Done** (`...`).
+   **Done** (`48b17df`).
 5. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
    guards), integration test for full traversal (listing → drill → action
    → submit).
