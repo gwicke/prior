@@ -364,7 +364,7 @@ method signatures.
 1. **Create `src/v25_session.rs` + extend `AsyncOp`**: `SessionListNode`
    with `data()` + `header()` + `columns()`, action nodes (Resume, Fork,
    Rename, Delete), and `AsyncOp` variants. Agent loop stubs.
-   **Done** (combined commit).
+   **Done** (`4c94dfb`).
 2. **Wire in `v25_menu.rs`**: build the session subtree, register in root.
 3. **Agent loop dispatch**: extend the `pending_op` match in `agent.rs`
    to handle the new `AsyncOp` variants, reusing the existing
