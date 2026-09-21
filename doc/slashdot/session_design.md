@@ -379,7 +379,10 @@ method signatures.
    **Done** (`48b17df`).
 5. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
    guards), integration test for full traversal (listing → drill → action
-   → submit).
+   → submit). **Done** (19 tests: listing, columns, traversal, submit
+   guards, path helpers, description formatting, relative time).
+
+**Done** — all implementation steps complete.
 
 ---
 
@@ -446,4 +449,3 @@ This also makes `/thinking` / `/model` / `/persona` apply immediately
 - Default filter added from `/sess`+tab: `/session .path:.` — current
   directory. Requires `prompt_rewrite_design.md`.
 - Prefill for rename (buffer manipulation from submit).
-- Path filter support (`.path:` modifier on session listing).

@@ -1122,12 +1122,17 @@ fn rig_message_to_pi(msg: &Message) -> serde_json::Value {
 
 ------
 
-## Implementation Plan — Phase 4: `/session` Command
+## Implementation Plan — Phase 4: `/session` Command ✅
 
 **Goal:** A single `/session` entry point for listing, naming, resuming, forking, and
 deleting sessions — TUI overlay only, no separate slash commands for each action.
 
 No extra confirmation messages. The input line tells the story.
+
+**Status: Complete** via the v2.5 slash menu engine (not the original v2.0 overlay
+plan). The original Phase 4 checklist items (4.1–4.7) were implemented through the
+v2.5 `SlashDotNode` tree: `SessionListNode` + action leaf nodes, `AsyncOp` dispatch,
+v2.0 session overlay removal. Design: `slashdot/session_design.md`. 19 unit tests.
 
 ### UI Flow
 
@@ -1207,38 +1212,38 @@ pub branch_messages: Vec<(String, String)>,  // (entry_id, preview) for fork
 
 ### Checklist
 
-- [ ] **4.1 Store repo in `run_interactive()`**
-  - [ ] Keep `repo: Option<JsonlSessionRepo>` alongside `session: Option<Session>`
-  - [ ] Populate `ReplCtx.sessions_list` from `repo.list(cwd)` each loop iteration
-  - [ ] Populate `ReplCtx.branch_messages` from `session.get_branch()` filtered to user messages
+**Implemented via v2.5 slash menu engine** (`slashdot/session_design.md`).
+All functional goals achieved through `SlashDotNode` tree rather than the
+original v2.0 overlay plan below.
 
-- [ ] **4.2 Add `/session` to slash registry (`slash.rs`)**
-  - [ ] `SlashKind::Session` — `/session`: manage sessions
-  - [ ] Register in `registry()` with help: "List, rename, resume, fork, or delete sessions"
-  - [ ] Add to `render_help()`
+- [x] **4.1 Store repo in `run_interactive()`**
+  - [x] Keep `repo: Option<JsonlSessionRepo>` alongside `session: Option<Session>`
+  - [x] Populate session data from `repo` via `SessionListNode::data()`
+  - [x] Session operations dispatch via `AsyncOp` enum on `MenuShared`
 
-- [ ] **4.3 Implement session list overlay (kind 10)**
-  - [ ] In `repl.rs`, detect `/session` → kind = 10
-  - [ ] Title: "Sessions  (up/down, Enter/Tab select, Esc back)"
-  - [ ] Rows: `◉` = current, `*` = active selection. Columns: timestamp, name, parent hint, turn count
-  - [ ] Sort: current session first, then by timestamp descending
-  - [ ] Show relative timestamps ("today 14:32", "yesterday", "Jul 14")
-  - [ ] Show named sessions with their name; unnamed sessions show truncated path + timestamp
-  - [ ] Tab completes the selected session's name into the buffer
-  - [ ] Enter moves to action menu (kind 11) for the selected session
+- [x] **4.2 `/session` in menu tree**
+  - [x] Registered in `v25_menu.rs` root menu as `StaticListingNode`
+  - [x] Session node + action children built in `v25_session.rs`
 
-- [ ] **4.4 Implement per-session action menu (kind 11)**
-  - [ ] Header shows session info: name, cwd, turn count, created timestamp, parent
-  - [ ] Options: resume | fork | rename | delete
-  - [ ] Resume greyed out when the session IS the current session
-  - [ ] Fork always available
-  - [ ] Delete greyed out when the session IS the current session
-  - [ ] Enter on an action translates to full-sentence input and commits:
-    - `resume` → set buffer to `/session "<name>" resume`, commit (Submit)
-    - `fork` → set buffer to `/session "<name>" fork`, commit
-    - `rename` → set buffer to `/session "<name>" rename ` (trailing space, stays in input)
-    - `delete` → set buffer to `/session "<name>" delete`, commit
-  - [ ] Tab on any action completes the full sentence into the buffer (stays in input, no commit)
+- [x] **4.3 Implement session list** (via `SessionListNode::data()`)
+  - [x] Rows: `◉` = current via `active_ids`. Columns: description, turns, age
+  - [x] Sort: current session first, then by timestamp descending
+  - [x] Relative timestamps ("3h", "2d")
+  - [x] Named sessions show name; unnamed show first prompt
+
+- [x] **4.4 Implement per-session action menu** (via `SessionListNode` children)
+  - [x] Header shows session info table + First/Last prompts
+  - [x] Options: resume | fork | rename | delete (action leaf nodes)
+  - [x] Resume hidden for current session (guard in `data()`)
+  - [x] Delete guarded for current session (error in `prepare()`)
+
+- [x] **4.5 Dispatch** (via `AsyncOp` on `MenuShared.pending_op`)
+  - [x] Agent loop handles `Resume`, `Fork`, `Rename`, `Delete` variants
+  - [x] Reuses existing `handle_session_command()` logic
+
+- [x] **4.6 Direct text input** — handled by v2.5 engine section parsing
+
+- [x] **4.7 Tests** — 19 unit tests (listing, traversal, submit, guards, helpers)
 
 - [ ] **4.5 Dispatch in `run_interactive()` (`agent.rs`)**
   - [ ] Before the `Submit` handler, check if input matches `/session` pattern
@@ -1439,6 +1444,6 @@ src/
 | ✅ 1 | Types + Storage | 30 unit, 78 pi files | Low |
 | ✅ 2 | Session Object  | 13 unit, full round-trip | Low |
 | ✅ 3 | Wire into agent loop | 267 pass, 9 agent | Medium |
-| 4 | `/session` command | Manual testing + unit | Medium |
+| ✅ 4 | `/session` command | 19 session, manual | Medium |
 | ✅ 5 | (merged into Phase 4) | — | — |
 

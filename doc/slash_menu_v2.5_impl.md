@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6e complete. 552 lib tests pass.
+**Done (v2.5 reshape):** Steps 1–6e complete. 571 lib tests pass.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -189,7 +189,9 @@ v2.5 engine.
 8. **Session** — Dynamic listing with action children:
    slashdot/session_design.md. **Done** (steps 0–5). Full session
    lifecycle: listing, resume, fork, rename, delete with confirm.
-   v2.0 session overlay code removed.
+   v2.0 session overlay code removed. 19 unit tests. Rendering
+   refinements: header() no background, compact timestamps,
+   Table wrap option for single-line listings.
 7. **Sandbox** — Mixed static+dynamic children. WIP design:
    slashdot/sandbox_design.md
 9. **Tree + compact** — Most complex: dynamic listing with nested
@@ -225,14 +227,14 @@ Implementation options:
 
 | Variant | Used by | v2.5 replacement |
 |---|---|---|
-| `Menu` | Root list, model, tree list, session list, replay | `V25Menu` (when commands are ported) |
+| `Menu` | Root list, model, tree list, replay | `V25Menu` (when commands are ported) |
 | `Settings` | `/set` settings list | — (not yet ported) |
 | `SettingsVal` | `/set <key>` value picker | — (not yet ported) |
 | `Stat` | `/stat` interstitial | — (not yet ported) |
 | `Sandbox` | `/sandbox` path bindings | — (not yet ported) |
-| `Session` | `/session` session list | — (not yet ported) |
-| `SessionAction` | `/session <id>` action menu | — (not yet ported) |
-| `Confirm` | Delete confirmation | — (not yet ported) |
+| ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
+| ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
+| ~~`Confirm`~~ | removed | **Done.** Removed (`48b17df`). |
 | `TreeAction` | `/tree <id>` action menu | — (not yet ported) |
 | `SwitchAction` | `/tree <id> switch` | — (not yet ported) |
 | `CompactSummary` | `/tree <id> compact` summary | — (not yet ported) |
@@ -464,7 +466,7 @@ Options for a cleaner design:
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
 | **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 552 lib tests + 4 integration tests (2 ignored for unported `/set`).
+Total: 571 lib tests + 4 integration tests (2 ignored for unported `/set`).
 The 26 interpreter tests test the old code path and will be removed
 when v2.0 is fully retired.
 
