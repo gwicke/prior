@@ -369,7 +369,7 @@ method signatures.
    **Done** (`98ead98`).
 3. **Agent loop dispatch**: extend the `pending_op` match in `agent.rs`
    to handle the new `AsyncOp` variants, reusing the existing
-   `handle_session_command` logic.
+   `handle_session_command` logic. **Done** (`dd41348`).
 4. **Remove v2.0 session overlay code**: strip `ActiveOverlay::Session`,
    `SessionAction`, `Confirm` and related methods from `repl.rs`.
 5. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
