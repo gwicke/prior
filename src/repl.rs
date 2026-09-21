@@ -257,6 +257,11 @@ pub enum InputAction {
     Quit,
     /// Sandbox operation: (subcommand, path, sandbox_path).
     Sandbox(String, String, String),
+    /// A v2.5 menu committed a value (wrote to shared state / pending_op).
+    /// The agent loop processes `menu_submitted` (LiveState sync) and any
+    /// `pending_op` after the match; this variant is a no-op so the
+    /// committed text is never treated as a prompt.
+    MenuDone,
 }
 
 /// Context the REPL needs to render slash overlays and to re-emit recent
@@ -3027,7 +3032,9 @@ impl Repl {
                                             );
                                             match result {
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, prompt) => {
-                                                    // The node's submit() wrote to LiveState.
+                                                    // The node's submit() wrote to shared state
+                                                    // (LiveState for `/thinking`/`/model`/…, or
+                                                    // `pending_op` for `/session`/`/replay`).
                                                     // Use the engine-provided self-documenting
                                                     // prompt (e.g. "/thinking low").
                                                     let committed = format!("/{}", prompt);
@@ -3038,16 +3045,28 @@ impl Repl {
                                                     if let Some(text) = msg {
                                                         output.display_text(&text);
                                                     }
-                                                    // Signal that MenuShared data like LiveState
-                                                    // might have changed
+                                                    // Dismiss the overlay and hand control
+                                                    // back to the agent loop, which processes
+                                                    // `menu_submitted` (LiveState sync) and any
+                                                    // `pending_op` (async dispatch) before the
+                                                    // next prompt.
                                                     *menu_submitted = true;
+                                                    return Some(InputAction::MenuDone);
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
                                                     // Drill happened — update buffer, next
                                                     // frame re-evals.
                                                     editor.set(&format!("/{}", prompt));
                                                 }
-                                                _ => {}
+                                                crate::slashdot_menu::node_impl::MenuResult::DoneError(err, prompt) => {
+                                                    let committed = format!("/{}", prompt);
+                                                    Repl::emit_commit(
+                                                        output, &mut editor, &redraw, sel,
+                                                        &mut input_row, &committed, "", true,
+                                                    );
+                                                    output.display_text(&err);
+                                                    return Some(InputAction::MenuDone);
+                                                }
                                             }
                                         }
                                         continue;

@@ -109,9 +109,9 @@ fn find_session(
 // Column definitions
 // ---------------------------------------------------------------------------
 
-/// Column definitions for the session listing table, shared by the
-/// `SessionListNode` listing and potentially future callers.
-pub fn session_columns() -> Vec<ColumnDef> {
+/// Column definitions for the parent `/session` listing (description,
+/// turns, age — no ID column since UUIDs are not useful to the user).
+pub fn session_listing_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
         ColumnDef::new("description", "Description").min(20).prio(3),
@@ -123,6 +123,15 @@ pub fn session_columns() -> Vec<ColumnDef> {
             .align(Align::Right)
             .min(8)
             .prio(1),
+    ]
+}
+
+/// Column definitions for `SessionListNode` when drilled into a session.
+/// Shows the action ID (resume/fork/rename/delete) plus description.
+pub fn session_action_columns() -> Vec<ColumnDef> {
+    vec![
+        ColumnDef::new("id", "Action").min(10).prio(3),
+        ColumnDef::new("description", "Description").min(20).prio(2),
     ]
 }
 
@@ -186,7 +195,10 @@ impl SlashDotNode for SessionListNode {
             })
             .collect();
 
-        let active_ids = if current_id.is_empty() {
+        // Only mark active if the current session is actually in the listing.
+        let active_ids = if current_id.is_empty()
+            || !sessions.iter().any(|s| s.id == current_id)
+        {
             Vec::new()
         } else {
             vec![current_id]
@@ -196,7 +208,7 @@ impl SlashDotNode for SessionListNode {
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
-        session_columns()
+        session_action_columns()
     }
 
     fn fields(&self) -> Vec<FieldSpec> {
@@ -437,7 +449,7 @@ pub fn build_session_node(
         "session",
         "list, rename, resume, fork, or delete sessions",
     )])
-    .with_columns(session_columns())
+    .with_columns(session_listing_columns())
     .with_fields(session_fields())
     .into();
 

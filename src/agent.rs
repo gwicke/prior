@@ -2069,6 +2069,7 @@ pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
 }
 
 /// Result of handling a `/session` command.
+#[derive(Debug)]
 enum SessionCommandResult {
     /// Input was not a session command (pass through).
     NotSession,
@@ -3698,6 +3699,147 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
             Some(a) => a,
             None => continue,
         };
+        // Sync LiveState → AgentConfig after any menu submit, and dispatch any
+        // async op the node's submit() requested. Runs before the action match
+        // so it fires for `MenuDone` too (v2.5 menus no longer round-trip
+        // through a Submit string).
+        if menu_submitted {
+            menu_submitted = false;
+            let ls = live_state.borrow();
+            let model_changed = config.provider != ls.model.split(':').next().unwrap_or("")
+                || config.model != ls.model.split(':').nth(1).unwrap_or("");
+            let thinking_changed = config.thinking_level != ls.thinking_level;
+            let persona_changed = config.persona_name != ls.persona;
+            drop(ls);
+
+            if model_changed || thinking_changed || persona_changed {
+                let mut new_cfg = config.clone();
+                {
+                    let ls = live_state.borrow();
+                    if model_changed {
+                        if let Some((p, m)) = ls.model.split_once(':') {
+                            new_cfg.provider = p.to_string();
+                            new_cfg.model = m.to_string();
+                        }
+                    }
+                    if thinking_changed {
+                        new_cfg.thinking_level = ls.thinking_level.clone();
+                    }
+                    if persona_changed {
+                        new_cfg.persona_name = ls.persona.clone();
+                        new_cfg.persona_prompt = ls.persona.as_ref()
+                            .and_then(|p| crate::persona::get_persona(p));
+                    }
+                }
+                match create_agent(new_cfg.clone()).await {
+                    Ok(new_agent) => {
+                        agent = Some(new_agent);
+                        if model_changed {
+                            let model_id = format!("{}:{}", new_cfg.provider, new_cfg.model);
+                            recent_models.retain(|m| m != &model_id);
+                            recent_models.insert(0, model_id);
+                            save_recent_models(&recent_models);
+                            if let Some(ref s) = session {
+                                let _ = s.append_model_change(&new_cfg.provider, &new_cfg.model).await;
+                            }
+                        }
+                        if thinking_changed {
+                            if let Some(ref s) = session {
+                                let _ = s.append_thinking_level_change(
+                                    new_cfg.thinking_level.as_deref().unwrap_or("off")
+                                ).await;
+                            }
+                        }
+                        config = new_cfg;
+                    }
+                    Err(e) => {
+                        let kind = if model_changed { "switch model" }
+                                   else if thinking_changed { "set thinking" }
+                                   else { "set persona" };
+                        config.output.display_text(
+                            &format!("Cannot {}: {}", kind, e)
+                        );
+                    }
+                }
+            }
+        }
+        // Dispatch async ops from v2.5 submit handlers.
+        if let Some(op) = pending_op.borrow_mut().take() {
+            match op {
+                crate::slash_menu_bridge::AsyncOp::Replay(arg) => {
+                    if let Some(ref s) = session {
+                        handle_replay(&arg, s, config.output.as_ref()).await;
+                    } else {
+                        config.output.display_text("No active session to replay");
+                    }
+                }
+                crate::slash_menu_bridge::AsyncOp::Resume { session_id, replay_arg } => {
+                    let input = if replay_arg.is_empty() {
+                        format!("/session {} resume", session_id)
+                    } else {
+                        format!("/session {} resume {}", session_id, replay_arg)
+                    };
+                    let out = config.output.clone();
+                    match handle_session_command(
+                        &input, &mut session, &mut repo, &mut config, &out, settings,
+                    ).await {
+                        SessionCommandResult::Switched { id: new_id, prefill } => {
+                            current_session_id = new_id;
+                            if prefill.is_some() {
+                                pending_prefill = prefill;
+                            }
+                        }
+                        SessionCommandResult::Handled => {}
+                        other => {
+                            eprintln!("[v25] resume: unexpected result {:?}", std::mem::discriminant(&other));
+                        }
+                    }
+                }
+                crate::slash_menu_bridge::AsyncOp::Fork { session_id } => {
+                    let input = format!("/session {} fork", session_id);
+                    let out = config.output.clone();
+                    match handle_session_command(
+                        &input, &mut session, &mut repo, &mut config, &out, settings,
+                    ).await {
+                        SessionCommandResult::Switched { id: new_id, .. } => {
+                            current_session_id = new_id;
+                        }
+                        SessionCommandResult::Handled => {}
+                        other => {
+                            eprintln!("[v25] fork: unexpected result {:?}", std::mem::discriminant(&other));
+                        }
+                    }
+                }
+                crate::slash_menu_bridge::AsyncOp::Rename { session_id, new_name } => {
+                    let input = format!("/session {} rename {}", session_id, new_name);
+                    let out = config.output.clone();
+                    let result = handle_session_command(
+                        &input, &mut session, &mut repo, &mut config, &out, settings,
+                    ).await;
+                    if !matches!(result, SessionCommandResult::Handled) {
+                        eprintln!("[v25] rename: unexpected result {:?}", std::mem::discriminant(&result));
+                    }
+                }
+                crate::slash_menu_bridge::AsyncOp::Delete { session_id } => {
+                    let input = format!("/session {} delete", session_id);
+                    let out = config.output.clone();
+                    match handle_session_command(
+                        &input, &mut session, &mut repo, &mut config, &out, settings,
+                    ).await {
+                        SessionCommandResult::Deleted => {
+                            if session.is_none() {
+                                current_session_id.clear();
+                            }
+                        }
+                        SessionCommandResult::Handled => {}
+                        other => {
+                            eprintln!("[v25] delete: unexpected result {:?}", std::mem::discriminant(&other));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         match action {
             InputAction::Quit => break,
             InputAction::SetModel(provider, model) => {
@@ -3818,6 +3960,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         config.output.display_plain(&msg);
                     }
                 }
+            }
+            InputAction::MenuDone => {
+                // v2.5 menu committed: the node already wrote to shared state.
+                // `menu_submitted` (LiveState sync) and `pending_op` (async
+                // dispatch) are processed after this match.
             }
             InputAction::Submit(input) => {
                 if input.is_empty() {
@@ -4333,134 +4480,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             // and the agent stay in sync (both old).
                         }
                     }
-                }
-                // Sync LiveState → AgentConfig after any menu submit.
-                // The v2.5 DoneSuccess handler sets `menu_submitted`; the
-                // node's submit() already wrote to LiveState.
-                if menu_submitted {
-                    menu_submitted = false;
-                    let ls = live_state.borrow();
-                    let model_changed = config.provider != ls.model.split(':').next().unwrap_or("")
-                        || config.model != ls.model.split(':').nth(1).unwrap_or("");
-                    let thinking_changed = config.thinking_level != ls.thinking_level;
-                    let persona_changed = config.persona_name != ls.persona;
-                    drop(ls);
-
-                    if model_changed || thinking_changed || persona_changed {
-                        let mut new_cfg = config.clone();
-                        {
-                            let ls = live_state.borrow();
-                            if model_changed {
-                                if let Some((p, m)) = ls.model.split_once(':') {
-                                    new_cfg.provider = p.to_string();
-                                    new_cfg.model = m.to_string();
-                                }
-                            }
-                            if thinking_changed {
-                                new_cfg.thinking_level = ls.thinking_level.clone();
-                            }
-                            if persona_changed {
-                                new_cfg.persona_name = ls.persona.clone();
-                                new_cfg.persona_prompt = ls.persona.as_ref()
-                                    .and_then(|p| crate::persona::get_persona(p));
-                            }
-                        }
-                        match create_agent(new_cfg.clone()).await {
-                            Ok(new_agent) => {
-                                agent = Some(new_agent);
-                                if model_changed {
-                                    let model_id = format!("{}:{}", new_cfg.provider, new_cfg.model);
-                                    recent_models.retain(|m| m != &model_id);
-                                    recent_models.insert(0, model_id);
-                                    save_recent_models(&recent_models);
-                                    if let Some(ref s) = session {
-                                        let _ = s.append_model_change(&new_cfg.provider, &new_cfg.model).await;
-                                    }
-                                }
-                                if thinking_changed {
-                                    if let Some(ref s) = session {
-                                        let _ = s.append_thinking_level_change(
-                                            new_cfg.thinking_level.as_deref().unwrap_or("off")
-                                        ).await;
-                                    }
-                                }
-                                config = new_cfg;
-                            }
-                            Err(e) => {
-                                let kind = if model_changed { "switch model" }
-                                           else if thinking_changed { "set thinking" }
-                                           else { "set persona" };
-                                config.output.display_text(
-                                    &format!("Cannot {}: {}", kind, e)
-                                );
-                            }
-                        }
-                    }
-                }
-                // Dispatch async ops from v2.5 submit handlers.
-                if let Some(op) = pending_op.borrow_mut().take() {
-                    match op {
-                        crate::slash_menu_bridge::AsyncOp::Replay(arg) => {
-                            if let Some(ref s) = session {
-                                handle_replay(&arg, s, config.output.as_ref()).await;
-                            } else {
-                                config.output.display_text("No active session to replay");
-                            }
-                        }
-                        crate::slash_menu_bridge::AsyncOp::Resume { session_id, replay_arg } => {
-                            let input = if replay_arg.is_empty() {
-                                format!("/session {} resume", session_id)
-                            } else {
-                                format!("/session {} resume {}", session_id, replay_arg)
-                            };
-                            let out = config.output.clone();
-                            match handle_session_command(
-                                &input, &mut session, &mut repo, &mut config, &out, settings,
-                            ).await {
-                                SessionCommandResult::Switched { id: new_id, prefill } => {
-                                    current_session_id = new_id;
-                                    if prefill.is_some() {
-                                        pending_prefill = prefill;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        crate::slash_menu_bridge::AsyncOp::Fork { session_id } => {
-                            let input = format!("/session {} fork", session_id);
-                            let out = config.output.clone();
-                            match handle_session_command(
-                                &input, &mut session, &mut repo, &mut config, &out, settings,
-                            ).await {
-                                SessionCommandResult::Switched { id: new_id, .. } => {
-                                    current_session_id = new_id;
-                                }
-                                _ => {}
-                            }
-                        }
-                        crate::slash_menu_bridge::AsyncOp::Rename { session_id, new_name } => {
-                            let input = format!("/session {} rename {}", session_id, new_name);
-                            let out = config.output.clone();
-                            let _ = handle_session_command(
-                                &input, &mut session, &mut repo, &mut config, &out, settings,
-                            ).await;
-                        }
-                        crate::slash_menu_bridge::AsyncOp::Delete { session_id } => {
-                            let input = format!("/session {} delete", session_id);
-                            let out = config.output.clone();
-                            match handle_session_command(
-                                &input, &mut session, &mut repo, &mut config, &out, settings,
-                            ).await {
-                                SessionCommandResult::Deleted => {
-                                    if session.is_none() {
-                                        current_session_id.clear();
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    continue;
                 }
                 // Normal prompt — create the agent lazily on first use.
                 if agent.is_none() {
