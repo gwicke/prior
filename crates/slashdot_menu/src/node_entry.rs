@@ -842,12 +842,7 @@ impl NodeEntry {
             let col_field_names: Vec<String> = if !columns.is_empty() {
                 columns.iter().map(|c| c.field.clone()).collect()
             } else {
-                let mut names = vec!["id".to_string()];
-                names.extend(field_space.fields.iter().map(|f| f.name.clone()));
-                if names.len() == 1 {
-                    names.push("description".to_string());
-                }
-                names
+                vec!["id".to_string(), "description".to_string()]
             };
             let header_labels: Vec<&str> = if !columns.is_empty() {
                 columns.iter().map(|c| c.header.as_str()).collect()
