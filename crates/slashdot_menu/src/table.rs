@@ -161,11 +161,15 @@ impl Table {
 
     /// Render data rows to `max_width` total columns. Each returned string is
     /// exactly one visual line, column-aligned and width-fitted.
+    /// Embedded `\n` in cells are replaced with spaces (single-line mode).
     pub fn render(&self, max_width: usize) -> Vec<String> {
         let widths = self.layout(max_width);
         self.rows
             .iter()
-            .map(|r| self.render_row(r, &widths))
+            .map(|r| {
+                let flat: Vec<String> = r.iter().map(|c| c.replace('\n', " ")).collect();
+                self.render_row(&flat, &widths)
+            })
             .collect()
     }
 
