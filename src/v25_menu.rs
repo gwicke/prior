@@ -87,5 +87,26 @@ pub fn build_menu(
         root.add_child(crate::v25_session::build_session_node(shared));
     }
 
+    // New (/new) — leaf node; sets AsyncOp::New.
+    {
+        root.add_child(crate::v25_new::NewNode {
+            shared: shared.clone(),
+        }.into());
+    }
+
+    // Clear (/clear) — leaf node; sets AsyncOp::Clear.
+    {
+        root.add_child(crate::v25_clear::ClearNode {
+            shared: shared.clone(),
+        }.into());
+    }
+
+    // Quit (/quit) — leaf node; sets AsyncOp::Quit.
+    {
+        root.add_child(crate::v25_quit::QuitNode {
+            shared: shared.clone(),
+        }.into());
+    }
+
     SlashDotMenu::from_root_node(root)
 }

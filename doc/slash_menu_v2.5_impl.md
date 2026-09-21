@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6e complete. 571 lib tests pass.
+**Done (v2.5 reshape):** Steps 1–6h complete. 580 lib tests pass.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -186,6 +186,9 @@ v2.5 engine.
       generic — no `/set`-specific dispatch.
 
 6. **Stat + Replay** — Simple leaf/interstitial commands. **Done.**
+6f. **Quit** — Leaf node via `AsyncOp::Quit`. **Done.** 3 tests.
+6g. **New** — Leaf node via `AsyncOp::New { name }`. **Done.** 3 tests.
+6h. **Clear** — Leaf node via `AsyncOp::Clear { name }`. **Done.** 3 tests.
 8. **Session** — Dynamic listing with action children:
    slashdot/session_design.md. **Done** (steps 0–5). Full session
    lifecycle: listing, resume, fork, rename, delete with confirm.
@@ -384,7 +387,7 @@ state via `Rc<MenuShared>`. Active model marker from settings. 7 tests.
    from `v25_thinking.rs`). `prepare()` doc comment clarified: two-phase
    commit only, not for display.
 
-**Tests:** 12 thinking + 8 persona + 7 model + 4 stat + 3 replay = 34 command tests.
+**Tests:** 12 thinking + 8 persona + 7 model + 4 stat + 3 replay + 3 quit + 3 new + 3 clear = 43 command tests.
 
 ### Step 7: Two-phase submit confirm
 

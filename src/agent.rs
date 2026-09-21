@@ -3837,6 +3837,69 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         }
                     }
                 }
+                crate::slash_menu_bridge::AsyncOp::Quit => {
+                    break;
+                }
+                crate::slash_menu_bridge::AsyncOp::New { name } => {
+                    session = None;
+                    ensure_session(
+                        &mut session,
+                        &repo,
+                        Some(config.provider.clone()),
+                        Some(config.model.clone()),
+                        config.thinking_level.clone(),
+                    ).await;
+                    current_session_id = session
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        if let Some(ref s) = session {
+                            if let Err(e) = s.set_session_name(&name).await {
+                                config
+                                    .output
+                                    .display_text(&format!("Could not name session: {}", e));
+                            } else if let Some(ref r) = repo {
+                                r.invalidate_cache();
+                            }
+                        }
+                    }
+                }
+                crate::slash_menu_bridge::AsyncOp::Clear { name } => {
+                    if let Some(ref s) = session {
+                        let id = s.get_session_id().to_string();
+                        if let Some(ref r) = repo {
+                            let cwd = std::env::current_dir().ok();
+                            let metas = r.list(cwd.as_deref()).await.unwrap_or_default();
+                            if let Some(meta) = metas.iter().find(|m| m.id == id) {
+                                let _ = r.delete(meta).await;
+                            }
+                        }
+                    }
+                    session = None;
+                    ensure_session(
+                        &mut session,
+                        &repo,
+                        Some(config.provider.clone()),
+                        Some(config.model.clone()),
+                        config.thinking_level.clone(),
+                    ).await;
+                    current_session_id = session
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        if let Some(ref s) = session {
+                            if let Err(e) = s.set_session_name(&name).await {
+                                config
+                                    .output
+                                    .display_text(&format!("Could not name session: {}", e));
+                            } else if let Some(ref r) = repo {
+                                r.invalidate_cache();
+                            }
+                        }
+                    }
+                }
             }
             continue;
         }

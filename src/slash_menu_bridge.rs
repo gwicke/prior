@@ -172,6 +172,12 @@ pub enum AsyncOp {
     Rename { session_id: String, new_name: String },
     /// Delete a session by UUID.
     Delete { session_id: String },
+    /// Quit the session (break the main loop).
+    Quit,
+    /// Start a new session, optionally named.
+    New { name: String },
+    /// Delete the current session and start fresh.
+    Clear { name: String },
 }
 
 impl MenuShared {
