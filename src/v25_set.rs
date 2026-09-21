@@ -24,7 +24,7 @@ use crate::slashdot_menu::node_impl::{
 
 struct EnumSettingNode {
     key: SettingKey,
-    values: &'static [&'static str],
+    values: &'static [(&'static str, &'static str)],
     settings: Rc<RefCell<SettingsStore>>,
 }
 
@@ -33,7 +33,7 @@ impl SlashDotNode for EnumSettingNode {
         let s = self.settings.borrow();
         let current = s.value(self.key);
         let rows = self.values.iter()
-            .map(|v| Row::new(*v).desc(""))
+            .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
         Ok(Rc::new(DataResponse {
             rows,
@@ -89,6 +89,30 @@ impl SlashDotNode for SettingLeafNode {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
         let val = self.settings.borrow().value(self.key);
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value descriptions — ported from v1.0 setting_value_candidates().
+// ---------------------------------------------------------------------------
+
+/// Return `(value, description)` pairs for enum setting values.
+fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] {
+    match key {
+        SettingKey::SecurityMode => &[
+            ("confirm", "ask before each tool call"),
+            ("yolo", "run tools without prompts"),
+        ],
+        SettingKey::ShowReasoning => &[
+            ("disabled", "show neither indicator nor reasoning text"),
+            ("indicator", "show only a Thinking… spinner"),
+            ("content", "show the reasoning text (default)"),
+        ],
+        SettingKey::ReasoningInContext => &[
+            ("true", "keep reasoning blocks in the session context"),
+            ("false", "drop reasoning from context to save tokens (default)"),
+        ],
+        _ => &[],
     }
 }
 
@@ -182,11 +206,12 @@ pub fn build_set_node(
             continue;
         }
         match meta.kind {
-            ValueKind::Enum(values) => {
+            ValueKind::Enum(_) => {
+                let descs = enum_value_descs(meta.key);
                 let settings_clone = settings.clone();
                 let child = EnumSettingNode {
                     key: meta.key,
-                    values,
+                    values: descs,
                     settings: settings_clone,
                 };
                 let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
@@ -320,9 +345,9 @@ mod tests {
         let settings = test_settings();
         let mut menu = build_test_menu(&settings);
         let mut h = menu.get_handle();
-        // Move cursor to "yolo" (Up from "confirm" position).
+        // Move cursor to "yolo" (Down from "confirm" position).
         let _ = h.eval_prompt("set security_mode ", HostKey::None, 80);
-        let _ = h.eval_prompt("set security_mode ", HostKey::MoveCursor(-1), 80);
+        let _ = h.eval_prompt("set security_mode ", HostKey::MoveCursor(1), 80);
         match h.eval_prompt("set security_mode ", HostKey::Tab, 80) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);

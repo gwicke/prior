@@ -30,9 +30,14 @@ pub struct ThinkingEnumNode {
 impl SlashDotNode for ThinkingEnumNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let active = (self.active_fn)();
-        let levels = ["off", "low", "med", "high"];
+        let levels: &[(&str, &str)] = &[
+            ("off", "no extra reasoning"),
+            ("low", "minimal reasoning"),
+            ("med", "balanced reasoning"),
+            ("high", "maximum reasoning"),
+        ];
         let rows = levels.iter()
-            .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
+            .map(|(l, d)| crate::slashdot_menu::fields::Row::new(*l).desc(*d))
             .collect();
         Ok(Rc::new(DataResponse {
             rows,
