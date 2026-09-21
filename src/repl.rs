@@ -521,44 +521,6 @@ pub(crate) enum ActiveOverlay {
         completion_pos: Option<(usize, usize)>,
     },
 
-    /// `/session` overlay: list of sessions for the current CWD, filtered by
-    /// `_filter`. `names` mirrors `opts` (1:1 before any row wrapping) so Tab/
-    /// Enter can resolve the selected session without re-querying `ctx`.
-    Session {
-        opts: Vec<String>,
-        names: Vec<String>,
-        active: Option<usize>,
-        _filter: String,
-    },
-
-    /// `/session <name> <action>` action menu for a single session.
-    SessionAction {
-        /// Display/completion name of the session (`name` or `id`).
-        session_name: String,
-        /// The session's current name (if any), for pre-filling rename.
-        current_name: Option<String>,
-        /// Whether this is the currently active session.
-        is_current: bool,
-        /// Pre-rendered info header rows (name, turns, age, parent, dir).
-        header: Vec<String>,
-        /// Action labels (resume/fork/rename/delete).
-        opts: Vec<String>,
-        active: Option<usize>,
-        _filter: String,
-    },
-
-    /// Confirmation dialog (e.g. before deleting a session).
-    Confirm {
-        /// Pre-rendered header lines (the prompt, word-wrapped).
-        header: Vec<String>,
-        /// The buffer text to submit if confirmed.
-        confirm_action: String,
-        /// Previous `session_name` to go back to on cancel/esc.
-        session_name: String,
-        opts: Vec<String>,
-        active: Option<usize>,
-    },
-
     /// `/tree` overlay: visual session entry tree.
     Tree {
         rows: Vec<String>,
@@ -912,99 +874,8 @@ impl ActiveOverlay {
                 ActiveOverlay::Sandbox { sub, items, _filter: filter }
             }
             "session" | "sessions" => {
-                let filter = rest.trim().to_string();
-
-                // Delete confirmation (unchanged v1 path): the Confirm
-                // overlay handles the two-step; the v2 confirm flow for
-                // this command lands with the accept-flow migration.
-                if !filter.is_empty() {
-                    let (name_part, after_name) = crate::agent::parse_session_name_after(&filter);
-                    if !name_part.is_empty() {
-                        let action = after_name.split_once(char::is_whitespace)
-                            .map(|(a, _)| a)
-                            .unwrap_or(&after_name);
-                        if action == "delete" || action == "delete_current" {
-                            let single = Repl::filtered_sessions(ctx, &name_part);
-                            if single.len() == 1 {
-                                let meta = &single[0];
-                                let display_name = meta.name.as_deref().unwrap_or(&meta.id);
-                                let is_current = meta.id == ctx.current_session_id;
-                                let (prompt, confirm_action) = if action == "delete_current" || is_current {
-                                    (format!("Delete the current session and start a new one? '{}' will be permanently deleted from disk.", display_name),
-                                     "/clear".to_string())
-                                } else {
-                                    (format!("Delete session '{}'? This will permanently delete it from disk.", display_name),
-                                     format!("/session {} delete", meta.id))
-                                };
-                                return ActiveOverlay::Confirm {
-                                    header: crate::output::wrap(&prompt, crate::output::term_width().saturating_sub(2)),
-                                    confirm_action,
-                                    session_name: meta.id.clone(),
-                                    opts: vec!["Cancel".into(), "Confirm".into()],
-                                    active: Some(0),
-                                };
-                            }
-                        }
-                    }
-                }
-
-                // When the filter is `<name> <action>` with a known action, strip
-                // the action and show the action menu for that session.
-                let lookup_filter = if !filter.is_empty() {
-                    let (name_part, after) = crate::agent::parse_session_name_after(&filter);
-                    let known_action = after.split_once(char::is_whitespace)
-                        .map(|(a, _)| a)
-                        .unwrap_or(&after);
-                    if !name_part.is_empty() && matches!(known_action, "resume" | "fork" | "rename" | "delete") {
-                        name_part
-                    } else {
-                        filter.clone()
-                    }
-                } else {
-                    filter.clone()
-                };
-
-                let filtered = Repl::filtered_sessions(ctx, &lookup_filter);
-                // When a filter is typed and resolves to exactly one session,
-                // jump straight to that session's action menu.
-                if !filter.is_empty() && filtered.len() == 1 {
-                    let meta = &filtered[0];
-                    let session_name = meta.id.clone();
-                    let is_current = meta.id == ctx.current_session_id;
-                    let mut header = Vec::new();
-                    let mut opts = Vec::new();
-                    let mut active = None;
-                    Repl::session_action_overlay_entries(meta, ctx, &filter, &mut header, &mut opts, &mut active);
-                    let current_name = meta.name.clone();
-                    ActiveOverlay::SessionAction { session_name, current_name, is_current, header, opts, active, _filter: filter }
-                } else {
-                    // v2 engine list (Phase 6 step 5): SessionProvider rows
-                    // from shared state; `*` on the current session. Step 2:
-                    // providers attach in `MenuEngine::new(&shared)` — no
-                    // per-arm wiring here.
-                    let (_dir_f, _fuzzy_f) = Repl::parse_session_path_filter(&filter);
-                    let line = buf.trim_start_matches('/').to_string();
-                    let st = engine.interpreter.state(&line);
-                    let opts: Vec<String> = st.candidates.iter().map(|r| {
-                        let get_str = |k: &str| r.field_value(k).and_then(|v| {
-                            if let crate::slashdot_menu::value::Value::Str(s) = v { Some(s.clone()) } else { None }
-                        });
-                        let get_num = |k: &str| r.field_value(k).and_then(|v| {
-                            if let crate::slashdot_menu::value::Value::Num(n) = v { Some(*n as usize) } else { None }
-                        });
-                        let name = get_str("name").unwrap_or_else(|| r.id.clone());
-                        let msgs = get_num("msgs").unwrap_or(0);
-                        let cwd = get_str("cwd").unwrap_or_default();
-                        let dir = cwd.rsplit('/').next().unwrap_or(&cwd).to_string();
-                        let ts = get_str("timestamp")
-                            .map(|t| Repl::format_session_timestamp(&t))
-                            .unwrap_or_default();
-                        format!("{} · {} {} · {}", name, msgs, dir, ts)
-                    }).collect();
-                    let names: Vec<String> = st.candidates.iter().map(|r| r.id.clone()).collect();
-                    let active = st.active_row_marker;
-                    ActiveOverlay::Session { opts, names, active, _filter: filter }
-                }
+                // Handled by the v2.5 engine (V25Menu overlay).
+                ActiveOverlay::None
             }
             "tree" => {
                 let filter = rest.trim().to_string();
@@ -1347,23 +1218,6 @@ impl ActiveOverlay {
                 ("Path completions  (up/down, Tab/Enter select, Esc dismiss)",
                  completions.clone(), None, false)
             }
-            ActiveOverlay::Session { opts, active, .. } => {
-                if opts.is_empty() {
-                    ("Sessions  (up/down, Tab complete, Enter select, Esc back)",
-                     vec!["(no sessions)".into()], None, false)
-                } else {
-                    ("Sessions  (up/down, Tab complete, Enter select, Esc back)",
-                     opts.clone(), *active, false)
-                }
-            }
-            ActiveOverlay::SessionAction { opts, active, .. } => {
-                ("Session actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
-            }
-            ActiveOverlay::Confirm { opts, active, .. } => {
-                ("Session actions  (up/down, Tab/Enter select, Esc back)",
-                 opts.clone(), *active, false)
-            }
             ActiveOverlay::Tree { rows, active, .. } => {
                 ("Tree  (up/down, Enter navigate, Esc back)",
                  rows.clone(), *active, false)
@@ -1571,67 +1425,6 @@ impl ActiveOverlay {
                     }
                     path_completions.clear();
                     *completion_pos = None;
-                }
-            }
-            ActiveOverlay::Session { names, .. } => {
-                if let Some(name) = names.get(sel) {
-                    editor.set(&format!("/session {}", name));
-                }
-            }
-            ActiveOverlay::SessionAction { session_name, current_name, opts, .. } => {
-                // Fill the chosen action into the buffer (stay in input).
-                if let Some(label) = opts.get(sel) {
-                    let action_str = match label.as_str() {
-                        _ if label.starts_with("resume") => "resume",
-                        "fork" => "fork",
-                        "rename" => {
-                            // Pre-fill the current name for editing if nothing typed yet.
-                            let buf = editor.text();
-                            let rest = &buf["/session".len()..].trim();
-                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
-                            let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
-                            if trailing.is_empty() {
-                                let default = current_name.clone().unwrap_or_default();
-                                if default.is_empty() {
-                                    "rename "
-                                } else {
-                                    editor.set(&format!("/session {} rename {}", session_name, default));
-                                    ""
-                                }
-                            } else {
-                                let line = format!("/session {} rename {}", session_name, trailing);
-                                editor.set(&line);
-                                ""
-                            }
-                        }
-                        "delete" => "delete",
-                        _ => "",
-                    };
-                    if !action_str.is_empty() {
-                        // Preserve any argument already typed after the action
-                        // (e.g. "10l" in "/session <id> resume 10l").
-                        let buf = editor.text();
-                        let rest = &buf["/session".len()..].trim();
-                        let (_name, after_name) = crate::agent::parse_session_name_after(rest);
-                        let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
-                        if trailing.is_empty() {
-                            editor.set(&format!("/session {} {}", session_name, action_str));
-                        } else {
-                            editor.set(&format!("/session {} {} {}", session_name, action_str.trim(), trailing));
-                        }
-                    }
-                }
-            }
-            ActiveOverlay::Confirm { session_name, opts, .. } => {
-                // Tab fills "confirm" action into buffer.
-                if let Some(label) = opts.get(sel) {
-                    let confirm_str = match label.as_str() {
-                        "Confirm" => "confirm",
-                        _ => "",
-                    };
-                    if !confirm_str.is_empty() {
-                        editor.set(&format!("/session {} confirm", session_name));
-                    }
                 }
             }
             ActiveOverlay::Tree { targets, engine_rows, .. } => {
@@ -1995,97 +1788,6 @@ impl ActiveOverlay {
                 }
                 OverlayAction::Continue
             }
-            ActiveOverlay::Session { names, .. } => {
-                if names.is_empty() {
-                    // No sessions match the filter (e.g. `/session <name> rename newname`
-                    // after the action menu selected "rename"). Submit the buffer so the
-                    // command reaches `handle_session_command` instead of doing nothing.
-                    let line = editor.text();
-                    Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                    return OverlayAction::Action(InputAction::Submit(line));
-                }
-                // Selecting a session completes its name; the next loop
-                // iteration promotes the buffer to the action menu (kind 11).
-                if let Some(name) = names.get(sel) {
-                    editor.set(&format!("/session {}", name));
-                }
-                OverlayAction::Continue
-            }
-            ActiveOverlay::SessionAction { session_name, current_name, is_current, opts, .. } => {
-                if let Some(label) = opts.get(sel) {
-                    match label.as_str() {
-                        _ if label.starts_with("resume") => {
-                            // Preserve any argument already typed after the action (e.g. "10l").
-                            let buf = editor.text();
-                            let rest = &buf["/session".len()..].trim();
-                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
-                            let after_action = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim().to_string();
-                            let line = if after_action.is_empty() {
-                                format!("/session {} resume", session_name)
-                            } else {
-                                format!("/session {} resume {}", session_name, after_action)
-                            };
-                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                            OverlayAction::Action(InputAction::Submit(line))
-                        }
-                        "fork" => {
-                            let line = format!("/session {} fork", session_name);
-                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                            OverlayAction::Action(InputAction::Submit(line))
-                        }
-                        "rename" => {
-                            // If the user already typed text after "rename", submit it.
-                            // Otherwise pre-fill the current name (if any) for editing.
-                            let buf = editor.text();
-                            let rest = &buf["/session".len()..].trim();
-                            let (_name, after_name) = crate::agent::parse_session_name_after(rest);
-                            let trailing = after_name.splitn(2, char::is_whitespace).nth(1).unwrap_or("").trim();
-                            if trailing.is_empty() {
-                                let default = current_name.clone().unwrap_or_default();
-                                let line = format!("/session {} rename {}", session_name, default);
-                                editor.set(&line);
-                                OverlayAction::Continue
-                            } else {
-                                let line = format!("/session {} rename {}", session_name, trailing);
-                                Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                                OverlayAction::Action(InputAction::Submit(line))
-                            }
-                        }
-                        "delete" => {
-                            // Set buffer to trigger confirmation overlay.
-                            // `from_buffer` will detect `<name> delete` and show Confirm.
-                            let line = if *is_current {
-                                format!("/session {} delete_current", session_name)
-                            } else {
-                                format!("/session {} delete", session_name)
-                            };
-                            editor.set(&line);
-                            OverlayAction::Continue
-                        }
-                        _ => OverlayAction::Continue,
-                    }
-                } else {
-                    OverlayAction::Continue
-                }
-            }
-            ActiveOverlay::Confirm { confirm_action, session_name, opts, .. } => {
-                if let Some(label) = opts.get(sel) {
-                    match label.as_str() {
-                        "Confirm" => {
-                            let line = confirm_action.clone();
-                            Repl::emit_commit(output, editor, redraw, sel, input_row, &line, "", false);
-                            OverlayAction::Action(InputAction::Submit(line))
-                        }
-                        _ => {
-                            // Cancel — go back to the session action menu.
-                            editor.set(&format!("/session {}", session_name));
-                            OverlayAction::Continue
-                        }
-                    }
-                } else {
-                    OverlayAction::Continue
-                }
-            }
             ActiveOverlay::Tree { targets, engine_rows, .. } => {
                 // v2 engine Enter when rows present (host cursor decides);
                 // legacy targets path unchanged.
@@ -2247,23 +1949,6 @@ impl ActiveOverlay {
                 path_completions.clear();
                 *completion_pos = None;
             }
-            ActiveOverlay::Session { .. } => {
-                // Clear the session filter (go back to bare `/session`).
-                let buf = editor.text();
-                if let Some(idx) = buf.rfind(' ') {
-                    editor.set(&buf[..idx]);
-                } else {
-                    editor.set("");
-                }
-            }
-            ActiveOverlay::SessionAction { .. } => {
-                // Go back to the session list.
-                editor.set("/session ");
-            }
-            ActiveOverlay::Confirm { session_name, .. } => {
-                // Go back to the session action menu.
-                editor.set(&format!("/session {}", session_name));
-            }
             ActiveOverlay::Tree { .. } => {
                 editor.set("");
             }
@@ -2299,9 +1984,6 @@ impl ActiveOverlay {
             ActiveOverlay::Menu { .. } => 5,
             ActiveOverlay::Sandbox { .. } => 6,
             ActiveOverlay::PathComplete { .. } => 7,
-            ActiveOverlay::Session { .. } => 8,
-            ActiveOverlay::SessionAction { .. } => 9,
-            ActiveOverlay::Confirm { .. } => 10,
             ActiveOverlay::Tree { .. } => 11,
             ActiveOverlay::TreeAction { .. } => 12,
             ActiveOverlay::SwitchAction { .. } => 13,
@@ -2678,15 +2360,9 @@ impl Repl {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::Help => Self::render_help_overlay(),
                 ActiveOverlay::Stat { .. } => Self::overlay_lines(effective_title, &opts, None, usize::MAX, None, true),
-                ActiveOverlay::SessionAction { header, .. } => {
-                    Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
-                }
                 ActiveOverlay::TreeAction { header, .. }
                 | ActiveOverlay::SwitchAction { header, .. }
                 | ActiveOverlay::CompactSummary { header, .. } => {
-                    Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
-                }
-                ActiveOverlay::Confirm { header, .. } => {
                     Self::overlay_lines(effective_title, &opts, Some(header.as_slice()), sel, active, wrap)
                 }
                 ActiveOverlay::Tree { row_bgs, .. } => {
@@ -4059,175 +3735,6 @@ impl Repl {
         (filtered, active)
     }
 
-    /// Build the `/session` overlay rows.
-    ///
-    /// Shows sessions filtered by `filter` (understands `path:/dir` prefix).
-    /// Current session is marked via the `*` marker in the 2-char prefix
-    /// area (see `overlay_lines`), so no separate ◉ column is needed.
-    /// Each row shows: session name (with first-prompt preview) · dir · turns + relative age.
-    #[allow(dead_code)] // legacy v1 path; kept until /session migrates
-    fn session_overlay_entries(
-        ctx: &ReplCtx,
-        filter: &str,
-        opts: &mut Vec<String>,
-        active: &mut Option<usize>,
-    ) {
-        let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
-
-        let avail = term_width().saturating_sub(2);
-        let mut table = Table::new(&["Session", "Dir", ""])
-            .with_aligns(&[Align::Left, Align::Left, Align::Right])
-            .with_min_widths(&[20, 10, 10])
-            .with_priorities(&[2, 2, 1])
-            .set_gap(2);
-
-        // Load sessions synchronously from disk.
-        let cwd_filter = dir_filter.as_ref()
-            .and_then(|d| if d.is_empty() { None } else { Some(std::path::Path::new(d)) });
-        let all = if let Some(ref repo) = ctx.repo {
-            repo.list_sessions_sync(cwd_filter)
-        } else {
-            Vec::new()
-        };
-
-        // Map to SessionMeta and sort.
-        let mut metas: Vec<SessionMeta> = all.into_iter()
-            .map(|m| SessionMeta {
-                id: m.id,
-                name: m.name,
-                timestamp: m.timestamp,
-                cwd: m.cwd,
-                parent_session: m.parent_session.map(|p| p.display().to_string()),
-                message_count: m.message_count,
-                user_message_count: m.user_message_count,
-                first_prompt_preview: m.first_prompt_preview,
-                last_prompt_text: m.last_prompt_text,
-                last_prompt_timestamp: m.last_prompt_timestamp,
-                path: Some(m.path),
-            })
-            .collect();
-        metas.sort_by(|a, b| {
-            let a_cur = a.id == ctx.current_session_id;
-            let b_cur = b.id == ctx.current_session_id;
-            if a_cur && !b_cur { std::cmp::Ordering::Less }
-            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-            else {
-                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
-            }
-        });
-
-        // Fuzzy-filter by name, prompt preview, id, and cwd.
-        let filtered: Vec<&SessionMeta> = if fuzzy_filter.is_empty() {
-            metas.iter().collect()
-        } else {
-            crate::fuzzy::fuzzy_filter_bonus(&metas, &fuzzy_filter, |m| {
-                let name = m.name.as_deref().unwrap_or("");
-                let preview = m.first_prompt_preview.as_deref().unwrap_or("");
-                format!("{} {} {} {}", name, preview, m.id, m.cwd)
-            })
-            .iter()
-            .map(|r| r.item)
-            .collect()
-        };
-
-        if filtered.is_empty() {
-            opts.push("(no sessions)".into());
-            *active = None;
-            return;
-        }
-
-        for meta in &filtered {
-            let name_part = meta.name.clone().unwrap_or_default();
-            let raw_preview = meta.first_prompt_preview.as_deref().unwrap_or("");
-            let preview = Self::sanitise_single_line(raw_preview);
-            let display_name = if !name_part.is_empty() && !preview.is_empty() {
-                format!("{}: {}", name_part, preview)
-            } else if !name_part.is_empty() {
-                name_part
-            } else if !preview.is_empty() {
-                preview
-            } else {
-                "(no messages)".to_string()
-            };
-            let dir_display = meta.cwd.rsplit('/')
-                .take(2)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("/");
-            let rel_ts = meta.last_prompt_timestamp.as_ref().unwrap_or(&meta.timestamp);
-            let rel = Self::relative_time(rel_ts);
-            let info = format!("{}  {}", meta.message_count, rel);
-            table.add_row(&[&display_name, &dir_display, &info]);
-        }
-
-        for row in table.render(avail) {
-            opts.push(row);
-        }
-
-        *active = filtered.iter().position(|m| m.id == ctx.current_session_id);
-    }
-
-    /// Format an ISO 8601 timestamp for display: "today 14:32", "yesterday 09:15",
-    /// or "Jul 14 11:00".
-    fn format_session_timestamp(ts: &str) -> String {
-        // Parse "2025-01-01T14:32:00.000Z" → extract date components
-        let date_part = &ts[..10]; // "2025-01-01"
-        let time_part = if ts.len() >= 16 { &ts[11..16] } else { "??:??" }; // "14:32"
-
-        // Compute relative day
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
-            .format("%Y-%m-%d").to_string();
-
-        let day_label = if date_part == today {
-            "today"
-        } else if date_part == yesterday {
-            "yesterday"
-        } else {
-            // Show "Jul 14" format
-            let month = ts.get(5..7).unwrap_or("??");
-            let day = ts.get(8..10).unwrap_or("??");
-            let month_name = match month {
-                "01" => "Jan", "02" => "Feb", "03" => "Mar", "04" => "Apr",
-                "05" => "May", "06" => "Jun", "07" => "Jul", "08" => "Aug",
-                "09" => "Sep", "10" => "Oct", "11" => "Nov", "12" => "Dec",
-                _ => month,
-            };
-            return format!("{} {} {}", month_name, day, time_part);
-        };
-
-        format!("{} {}", day_label, time_part)
-    }
-
-    /// Format a timestamp as a compact relative duration: "30s", "4m", "5h", "2d".
-    #[allow(dead_code)] // legacy v1 path; kept until /session migrates
-    fn relative_time(ts: &str) -> String {
-        let dt = chrono::DateTime::parse_from_rfc3339(ts)
-            .or_else(|_| {
-                // Try UTC-only format: "2025-01-01T14:32:00.000Z" without offset
-                chrono::DateTime::parse_from_str(
-                    &format!("{}Z", ts.trim_end_matches('Z')),
-                    "%+",
-                )
-            });
-        let Ok(dt) = dt else { return "?".to_string() };
-        let elapsed = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
-        let secs = elapsed.num_seconds().max(0);
-        if secs < 60 {
-            format!("{}s", secs)
-        } else if secs < 3600 {
-            format!("{}m", secs / 60)
-        } else if secs < 86400 {
-            format!("{}h", secs / 3600)
-        } else {
-            format!("{}d", secs / 86400)
-        }
-    }
-
     /// Collapse a string to a single visual line: replace any whitespace-run
     /// (including newlines, tabs, etc.) with a single space, so it fits cleanly
     /// in a one-line table cell.
@@ -4248,186 +3755,6 @@ impl Repl {
         // Trim leading/trailing whitespace that was collapsed.
         let trimmed = out.trim().to_string();
         if trimmed.is_empty() { String::new() } else { trimmed }
-    }
-
-    /// Build the per-session action menu overlay.
-    ///
-    /// Renders a header (using Table for width management) with session identity
-    /// info, and populates `opts` with the available actions.
-    /// Actions: resume (if not current), fork, rename, delete (always shown).
-    /// Cursor starts on resume (or fork if current) for zero-key common case.
-    fn session_action_overlay_entries(
-        meta: &SessionMeta,
-        ctx: &ReplCtx,
-        _filter: &str,
-        header: &mut Vec<String>,
-        opts: &mut Vec<String>,
-        active: &mut Option<usize>,
-    ) {
-        let is_current = meta.id == ctx.current_session_id;
-        let ts = Self::format_session_timestamp(&meta.timestamp);
-        let name = meta.name.as_deref().unwrap_or(&meta.id);
-
-        // Build a header table with session identity and metadata.
-        let avail = crate::output::term_width().saturating_sub(2);
-        let mut table = crate::table::Table::new(&["Session", "Turns/Msgs", "Age", "Parent/Dir"])
-            .with_aligns(&[
-                crate::table::Align::Left,
-                crate::table::Align::Right,
-                crate::table::Align::Right,
-                crate::table::Align::Left,
-            ])
-            .with_min_widths(&[20, 10, 11, 12])
-            .with_priorities(&[3, 1, 1, 2])
-            .set_gap(2);
-
-        let marker = if is_current { "◉ " } else { "  " };
-        let parent_display = meta.parent_session.as_ref().map(|p| {
-            format!("parent: {}", p.rsplit('/').next().unwrap_or(p))
-        }).unwrap_or_else(|| {
-            format!("dir: {}", meta.cwd.rsplit('/').next().unwrap_or(&meta.cwd))
-        });
-
-        table.add_row(&[
-            &format!("{}{}", marker, name),
-            &format!("{} / {}", meta.user_message_count, meta.message_count),
-            &ts,
-            &parent_display,
-        ]);
-
-        for row in table.render(avail) {
-            header.push(row);
-        }
-
-        // ── Extra detail rows (non-selectable, full-width) ─────────────
-        // Use a separate single-column table so the text spans the full avail width.
-        let mut detail_table = crate::table::Table::new(&[""])
-            .with_min_widths(&[10])
-            .with_priorities(&[1]);
-        {
-            let first_text = meta.first_prompt_preview.as_deref().unwrap_or("(none)");
-            detail_table.add_row(&[&format!("{}: {}", &meta.timestamp, first_text)]);
-        }
-        {
-            // Lazily load the full last prompt text only in the detail view.
-            let last_text = meta.last_prompt_text.clone()
-                .or_else(|| {
-                    let path = meta.path.as_ref()?;
-                    let detail = crate::session::repo::JsonlSessionRepo::read_metadata_detail(path)?;
-                    detail.last_prompt_text
-                })
-                .unwrap_or_else(|| "(none)".to_string());
-            let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
-            detail_table.add_row(&[&format!("{}: {}", last_ts, last_text)]);
-        }
-        for row in detail_table.render(avail) {
-            header.push(row);
-        }
-
-        // Actions (always shown; resume conditionally absent).
-        // Labels carry a hint about the optional [N[t|l]] syntax for resume.
-        if !is_current {
-            opts.push("resume  [N[t|l] replay length]".into());
-        }
-        opts.push("fork".into());
-        opts.push("rename".into());
-        opts.push("delete".into());
-
-        // Cursor starts on resume (if available) or fork.
-        *active = if is_current { Some(1) } else { Some(0) };
-    }
-
-    /// Parse a session filter, extracting an optional `path:/some/dir` prefix.
-    /// `path:.` is expanded to the current working directory.
-    /// Returns `(Some(directory) | None, remaining_filter_text)`.
-    fn parse_session_path_filter(filter: &str) -> (Option<String>, String) {
-        let trimmed = filter.trim();
-        if let Some(rest) = trimmed.strip_prefix("path:") {
-            let rest = rest.trim_start();
-            let (raw_path, after) = if let Some((path_val, after)) = rest.split_once(char::is_whitespace) {
-                (path_val, after.trim())
-            } else {
-                (rest, "")
-            };
-            let dir = if raw_path.is_empty() || raw_path == "." {
-                // Expand `.` to the current working directory.
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .filter(|s| !s.is_empty())
-            } else {
-                Some(raw_path.to_string())
-            };
-            (dir, after.to_string())
-        } else {
-            (None, trimmed.to_string())
-        }
-    }
-
-    /// Load sessions from the repo (if available) and filter by `path:` + fuzzy text.
-    /// Returns owned `Vec<SessionMeta>` — loaded fresh each call, discarded after use.
-    fn filtered_sessions(ctx: &ReplCtx, filter: &str) -> Vec<SessionMeta> {
-        let (dir_filter, fuzzy_filter) = Self::parse_session_path_filter(filter);
-
-        // Determine which CWD to pass to the sync loader:
-        // - `path:.` or `path:<explicit>` → load only that directory
-        // - bare filter (no path:) → load all
-        let cwd_filter = dir_filter.as_ref()
-            .and_then(|d| {
-                if d.is_empty() { None }
-                else { Some(std::path::Path::new(d)) }
-            });
-
-        // Load sessions synchronously from disk.
-        let all = if let Some(ref repo) = ctx.repo {
-            repo.list_sessions_sync(cwd_filter)
-        } else {
-            Vec::new()
-        };
-
-        // Map to SessionMeta.
-        let mut metas: Vec<SessionMeta> = all.into_iter()
-            .map(|m| SessionMeta {
-                id: m.id,
-                name: m.name,
-                timestamp: m.timestamp,
-                cwd: m.cwd,
-                parent_session: m.parent_session.map(|p| p.display().to_string()),
-                message_count: m.message_count,
-                user_message_count: m.user_message_count,
-                first_prompt_preview: m.first_prompt_preview,
-                last_prompt_text: m.last_prompt_text,
-                last_prompt_timestamp: m.last_prompt_timestamp,
-                path: Some(m.path),
-            })
-            .collect();
-
-        // Sort: current session first, then by last modification timestamp descending.
-        metas.sort_by(|a, b| {
-            let a_cur = a.id == ctx.current_session_id;
-            let b_cur = b.id == ctx.current_session_id;
-            if a_cur && !b_cur { std::cmp::Ordering::Less }
-            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-            else {
-                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
-            }
-        });
-
-        if fuzzy_filter.is_empty() {
-            return metas;
-        }
-
-        // Fuzzy-filter by name, prompt preview, id, and cwd.
-        crate::fuzzy::fuzzy_filter_bonus(&metas, &fuzzy_filter, |m| {
-            let name = m.name.as_deref().unwrap_or("");
-            let preview = m.first_prompt_preview.as_deref().unwrap_or("");
-            format!("{} {} {} {}", name, preview, m.id, m.cwd)
-        })
-        .into_iter()
-        .map(|r| r.item.clone())
-        .collect()
     }
 
     /// Build a [`crate::agent::SessionStatsInfo`] for the session currently

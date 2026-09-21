@@ -372,6 +372,11 @@ method signatures.
    `handle_session_command` logic. **Done** (`dd41348`).
 4. **Remove v2.0 session overlay code**: strip `ActiveOverlay::Session`,
    `SessionAction`, `Confirm` and related methods from `repl.rs`.
+   Remove `SessionProvider` from `slash_menu_bridge.rs`.
+   Remove dead helper methods: `session_overlay_entries`,
+   `session_action_overlay_entries`, `filtered_sessions`,
+   `format_session_timestamp`, `relative_time`, `parse_session_path_filter`.
+   **Done** (`...`).
 5. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
    guards), integration test for full traversal (listing → drill → action
    → submit).

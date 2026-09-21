@@ -307,72 +307,6 @@ impl crate::slashdot_menu::provider::DataProvider for TreeProvider {
     }
 }
 
-/// DataProvider over the session list (§10 step 5): rows from the live
-/// repo at `fetch` time; current-first + recency order is the provider's
-/// own (kept from v1) so the engine's default order is the v1 sort. The
-/// active-session id rides in `active_row` (provider data, not a trait
-/// call).
-pub struct SessionProvider {
-    pub shared: Rc<MenuShared>,
-}
-
-impl crate::slashdot_menu::provider::DataProvider for SessionProvider {
-    fn fetch(
-        &mut self,
-        _modifiers: &[crate::slashdot_menu::grammar::ModifierToken],
-    ) -> crate::slashdot_menu::provider::DataResult {
-        use crate::slashdot_menu::value::Value;
-        let current_id = self.shared.current_session_id.borrow().clone();
-        let active = if current_id.is_empty() { None } else { Some(current_id.clone()) };
-        // Live listing from the repo (the repo's own sync cache handles
-        // freshness); current-first + recency order is the provider's own.
-        let mut sessions: Vec<crate::repl::SessionMeta> = match &self.shared.repo {
-            Some(repo) => repo
-                .list_sessions_sync(None)
-                .into_iter()
-                .map(crate::repl::session_meta_from)
-                .collect(),
-            None => Vec::new(),
-        };
-        sessions.sort_by(|a, b| {
-            let a_cur = a.id == current_id;
-            let b_cur = b.id == current_id;
-            if a_cur && !b_cur { std::cmp::Ordering::Less }
-            else if !a_cur && b_cur { std::cmp::Ordering::Greater }
-            else {
-                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
-            }
-        });
-        let rows: Vec<crate::slashdot_menu::fields::Row> = sessions
-            .iter()
-            .map(|m| {
-                let display = m.name.clone().unwrap_or_else(|| m.id.clone());
-                let mut r = crate::slashdot_menu::fields::Row::new(m.id.clone())
-                    .desc(&display)
-                    .field("name", Value::Str(display))
-                    .field("turns", Value::Num(m.user_message_count as f64))
-                    .field("msgs", Value::Num(m.message_count as f64))
-                    .field("cwd", Value::Str(m.cwd.clone()))
-                    .field("timestamp", Value::Str(m.timestamp.clone()));
-                if m.id == current_id {
-                    r = r.field("current", Value::Str("1".into()));
-                }
-                if let Some(p) = &m.parent_session {
-                    r = r.field("parent", Value::Str(p.clone()));
-                }
-                r
-            })
-            .collect();
-        crate::slashdot_menu::provider::DataResult {
-            rows,
-            active_row: active,
-            ..Default::default()
-        }
-    }
-}
-
 /// DataProvider over the model catalog (§10 step 4). One-shot fetch over
 /// the **global catalog cache** (the live store). **The provider's own
 /// ordering is the default sort**: rows come in recency × popularity
@@ -617,7 +551,6 @@ impl MenuEngine {
         let shared_rc = Rc::new(shared.clone_shared());
         let interpreter = Interpreter::new(root)
             .with_provider(&["model"], Box::new(ModelProvider { shared: shared_rc.clone() }))
-            .with_provider(&["session"], Box::new(SessionProvider { shared: shared_rc.clone() }))
             .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc.clone() }))
             .with_active_provider(
                 &["persona"],
