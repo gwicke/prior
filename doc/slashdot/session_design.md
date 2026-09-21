@@ -366,7 +366,7 @@ method signatures.
    Rename, Delete), and `AsyncOp` variants. Agent loop stubs.
    **Done** (`4c94dfb`).
 2. **Wire in `v25_menu.rs`**: build the session subtree, register in root.
-   **Done** (`...`).
+   **Done** (`98ead98`).
 3. **Agent loop dispatch**: extend the `pending_op` match in `agent.rs`
    to handle the new `AsyncOp` variants, reusing the existing
    `handle_session_command` logic.
