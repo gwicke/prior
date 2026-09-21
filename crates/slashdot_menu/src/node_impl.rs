@@ -17,6 +17,8 @@ pub struct PathArgs {
     pub suffix: String,
     /// Parsed arguments from this level's section.
     pub args: Args,
+    /// Terminal width (columns) for layout/formatting decisions.
+    pub term_width: usize,
 }
 
 /// Parsed arguments from a level's section.

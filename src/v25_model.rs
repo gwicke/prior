@@ -374,6 +374,7 @@ mod tests {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let result = node.data(1, &path_args);
         assert!(result.is_ok(), "data() should not error");
@@ -387,6 +388,7 @@ mod tests {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let r1 = node.data(1, &path_args).unwrap();
         let r2 = node.data(1, &path_args).unwrap();
@@ -421,6 +423,7 @@ mod tests {
             ids: vec!["model".into(), "openai:gpt-4o".into()],
             suffix: " ".into(),
             args: Default::default(),
+            term_width: 80,
         };
         match node.submit(1, &path_args) {
             SubmitResult::Done(_) => {}

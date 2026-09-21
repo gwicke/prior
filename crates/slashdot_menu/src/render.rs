@@ -21,8 +21,8 @@ impl LogicalLine {
 /// The complete overlay panel description.
 ///
 /// v2.5 panel structure (design §6):
-/// 1. `table_header` — single-line column headings (always shown, never truncated)
-/// 2. `detail` — `header()` output (truncatable from bottom on tight space)
+/// 1. `detail` — `header()` output (truncatable from bottom on tight space)
+/// 2. `table_header` — single-line column headings (always shown, never truncated)
 /// 3. `rows` — scrollable data (Rc-shared; same pointer on cursor moves)
 #[derive(Debug, Clone)]
 pub struct RenderPlan {
@@ -63,15 +63,7 @@ impl RenderPlan {
         // Reconstruct flat line list from the three sections.
         let mut flat: Vec<FlatLine> = Vec::new();
 
-        if let Some(ref th) = self.table_header {
-            flat.push(FlatLine {
-                text: th.0.clone(),
-                is_header: true,
-                is_marker_row: false,
-                option: usize::MAX,
-            });
-        }
-
+        // detail (header() output) comes first, then table header.
         for d in &self.detail {
             for sub in d.0.split('\n') {
                 flat.push(FlatLine {
@@ -81,6 +73,15 @@ impl RenderPlan {
                     option: usize::MAX,
                 });
             }
+        }
+
+        if let Some(ref th) = self.table_header {
+            flat.push(FlatLine {
+                text: th.0.clone(),
+                is_header: true,
+                is_marker_row: false,
+                option: usize::MAX,
+            });
         }
 
         for (i, row) in self.rows.iter().enumerate() {

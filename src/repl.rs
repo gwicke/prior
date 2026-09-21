@@ -2394,17 +2394,17 @@ impl Repl {
                     let tw = crate::output::term_width().max(1);
                     let mut result: Vec<String> = Vec::new();
 
-                    // 1. Table header (always shown).
-                    if let Some(ref th) = plan.table_header {
-                        result.push(Self::render_logical_line(th, tw, false, false, false));
-                    }
-
-                    // 2. Detail (truncatable from bottom).
+                    // 1. Detail (header() output — sticky info, shown first).
                     let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
                     let min_data = 1usize;
                     let detail_budget = max_pop.saturating_sub(min_data).max(1);
                     for d in plan.detail.iter().take(detail_budget) {
                         result.push(Self::render_logical_line(d, tw, false, false, true));
+                    }
+
+                    // 2. Table header (column labels, below header() output).
+                    if let Some(ref th) = plan.table_header {
+                        result.push(Self::render_logical_line(th, tw, false, false, true));
                     }
 
                     // 3. Data rows, windowed around `selected`.

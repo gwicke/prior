@@ -338,7 +338,7 @@ impl NodeEntry {
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
                     self.epoch.confirm_pending = false;
-                    let path_args = build_path_args(path, parsed, prompt_suffix);
+                    let path_args = build_path_args(path, parsed, prompt_suffix, self.epoch.term_width);
                     match self.inner.submit(epoch, &path_args) {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
                         SubmitResult::NewPath(p) => MenuResult::Continue(
@@ -350,7 +350,7 @@ impl NodeEntry {
                         }
                     }
                 } else {
-                    let path_args = build_path_args(path, parsed, prompt_suffix);
+                    let path_args = build_path_args(path, parsed, prompt_suffix, self.epoch.term_width);
                     match self.inner.prepare(epoch, &path_args) {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
                         SubmitResult::Prepared => {
@@ -521,6 +521,7 @@ impl NodeEntry {
                 ids: path.to_vec(),
                 suffix: suffix.to_string(),
                 args: Args::default(),
+                term_width: self.epoch.term_width,
             };
             match child.node_data(epoch, &path_args) {
                 Ok(response) => {
@@ -813,7 +814,7 @@ impl NodeEntry {
     ///
     /// Panel structure (§6):
     /// 1. header() lines — sticky, non-selectable
-    /// 2. Table header row (if columns + data) — sticky
+    /// 2. Table header row (if columns + data) — sticky, below header()
     /// 3. Data rows — scrollable, with > / * markers
     ///
     /// The host uses `sticky_count` to decide vertical truncation when
@@ -831,6 +832,7 @@ impl NodeEntry {
             ids: path.to_vec(),
             suffix: suffix.to_string(),
             args: Args::default(),
+            term_width: self.epoch.term_width,
         };
         let header = self.inner.header(&path_args);
         let detail: Vec<LogicalLine> = header.into_iter()
@@ -932,6 +934,7 @@ impl NodeEntry {
             ids: path.to_vec(),
             suffix: suffix.to_string(),
             args: Args::default(),
+            term_width: self.epoch.term_width,
         };
         let detail: Vec<LogicalLine> = self.inner.header(&path_args).into_iter()
             .map(LogicalLine::new)
@@ -1033,7 +1036,7 @@ fn parse_section(section: &str, row_index: &HashMap<String, u16>) -> ParsedSecti
 }
 
 /// Build PathArgs for a leaf node's prepare/submit call.
-fn build_path_args(path: &[String], parsed: &ParsedSection, suffix: &str) -> PathArgs {
+fn build_path_args(path: &[String], parsed: &ParsedSection, suffix: &str, term_width: usize) -> PathArgs {
     PathArgs {
         ids: path.to_vec(),
         suffix: suffix.to_string(),
@@ -1041,6 +1044,7 @@ fn build_path_args(path: &[String], parsed: &ParsedSection, suffix: &str) -> Pat
             modifiers: parsed.modifiers.clone(),
             positional: parsed.positional.clone(),
         },
+        term_width,
     }
 }
 

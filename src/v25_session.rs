@@ -256,24 +256,32 @@ impl SlashDotNode for SessionListNode {
                 )
             });
 
-        let mut lines = Vec::new();
+        let tw = path_args.term_width.max(1);
 
-        // Summary line.
-        lines.push(format!(
-            "{}{} | {} turns, {} msgs | {} | {}",
-            marker,
-            name,
-            meta.user_message_count,
-            meta.message_count,
-            ts,
-            parent_display,
-        ));
+        // --- Summary as a wrapping table ---
+        let summary_text = format!(
+            "{}{}",
+            marker, name,
+        );
+        use crate::slashdot_menu::table::{Align, Table as SdTable};
+        let mut info_table = SdTable::new(&["Session", "Turns", "Msgs", "Age", ""])
+            .with_aligns(&[Align::Left, Align::Right, Align::Right, Align::Right, Align::Left])
+            .with_min_widths(&[20, 5, 5, 5, 10]);
+        info_table.add_row(&[
+            &summary_text,
+            &meta.user_message_count.to_string(),
+            &meta.message_count.to_string(),
+            &ts,
+            &parent_display,
+        ]);
+        let mut lines: Vec<String> = info_table
+            .render_multiline(tw.saturating_sub(2))
+            .into_iter()
+            .flat_map(|row| row.split('\n').map(|s| s.to_string()).collect::<Vec<_>>())
+            .collect();
 
-        // Detail: first prompt.
-        let first = meta.first_prompt_preview.as_deref().unwrap_or("(none)");
-        lines.push(format!("First: {}", first));
-
-        // Detail: last prompt (lazily loaded).
+        // --- First / Last as a two-column wrapping table ---
+        let first = meta.first_prompt_preview.as_deref().unwrap_or("(none)").to_string();
         let last_text = meta
             .last_prompt_text
             .clone()
@@ -285,7 +293,26 @@ impl SlashDotNode for SessionListNode {
             })
             .unwrap_or_else(|| "(none)".to_string());
         let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
-        lines.push(format!("Last:  {}: {}", last_ts, last_text));
+        let last_display = if last_text.len() > 120 {
+            format!("{}...", &last_text[..last_text.char_indices().nth(120).map(|(i,_)| i).unwrap_or(last_text.len())])
+        } else {
+            last_text
+        };
+
+        let mut msg_table = SdTable::new(&["", ""])
+            .with_aligns(&[Align::Left, Align::Left])
+            .with_min_widths(&[6, 10])
+            .with_priorities(&[1, 3]);
+        msg_table.add_row(&["First:", &first]);
+        msg_table.add_row(&[&format!("Last ({}):", last_ts), &last_display]);
+
+        // Append First/Last rows, splitting wrapped lines.
+        let msg_rows = msg_table.render_multiline(tw.saturating_sub(4));
+        for row in &msg_rows {
+            for sub in row.split('\n') {
+                lines.push(format!("  {}", sub));
+            }
+        }
 
         lines
     }
@@ -650,6 +677,7 @@ mod tests {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let result = node.data(1, &path_args).unwrap();
         assert!(
@@ -667,6 +695,7 @@ mod tests {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let result = node.data(1, &path_args).unwrap();
         assert_eq!(result.rows.len(), 1);
@@ -682,6 +711,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "resume".into()],
             suffix: " 10t ".to_string(),
             args: Default::default(),
+            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -702,6 +732,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "fork".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -721,6 +752,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: " my-name ".to_string(),
             args: Default::default(),
+            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -741,6 +773,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: "  ".to_string(),
             args: Default::default(),
+            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -761,6 +794,7 @@ mod tests {
             ids: vec!["session".into(), "test-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let result = node.prepare(1, &path_args);
         match result {
@@ -780,6 +814,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let result = node.prepare(1, &path_args);
         assert!(
@@ -796,6 +831,7 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -837,6 +873,7 @@ mod tests {
             ids: vec!["session".into(), "uuid-1".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         assert_eq!(drilled_session_id(&listing), Some("uuid-1"));
         assert_eq!(action_session_id(&listing), Some("session"));
@@ -845,6 +882,7 @@ mod tests {
             ids: vec!["session".into(), "uuid-1".into(), "resume".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         assert_eq!(drilled_session_id(&action), Some("resume"));
         assert_eq!(action_session_id(&action), Some("uuid-1"));
@@ -854,12 +892,14 @@ mod tests {
             ids: vec!["session".into()],
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         assert_eq!(action_session_id(&short), None);
         let empty = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
+            term_width: 80,
         };
         assert_eq!(action_session_id(&empty), None);
         assert_eq!(drilled_session_id(&empty), None);
