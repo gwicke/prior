@@ -164,6 +164,14 @@ pub struct MenuShared {
 pub enum AsyncOp {
     /// Run `/replay` with the given argument (e.g. `""`, `"5t"`, `"10l"`).
     Replay(String),
+    /// Resume a session by UUID, optionally replay the last N turns.
+    Resume { session_id: String, replay_arg: String },
+    /// Fork a session by UUID into a new session in the current directory.
+    Fork { session_id: String },
+    /// Rename a session (empty new_name clears the name).
+    Rename { session_id: String, new_name: String },
+    /// Delete a session by UUID.
+    Delete { session_id: String },
 }
 
 impl MenuShared {

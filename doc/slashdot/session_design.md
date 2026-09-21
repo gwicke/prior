@@ -361,20 +361,17 @@ method signatures.
 0. **Traversal context in NodeEntry**: thread path + suffix through
    `refresh_data`, `build_render_plan`, `plan_from_cache`. (Prerequisite
    for steps 1–2.) **Done** (`2df0332`).
-1. **Create `src/v25_session.rs`**: `SessionListNode` with `data()` +
-   `header()` + `columns()`. Session listing with repo reads.
-2. **Create action nodes**: `SessionResumeNode`, `SessionForkNode`,
-   `SessionRenameNode`, `SessionDeleteNode` — each with `data()`, `submit()`,
-   `header()`. `SessionDeleteNode` adds `prepare()`.
-3. **Extend `AsyncOp`** in `slash_menu_bridge.rs`: add Resume, Fork,
-   Rename, Delete variants.
-4. **Wire in `v25_menu.rs`**: build the session subtree, register in root.
-5. **Agent loop dispatch**: extend the `pending_op` match in `agent.rs`
+1. **Create `src/v25_session.rs` + extend `AsyncOp`**: `SessionListNode`
+   with `data()` + `header()` + `columns()`, action nodes (Resume, Fork,
+   Rename, Delete), and `AsyncOp` variants. Agent loop stubs.
+   **Done** (combined commit).
+2. **Wire in `v25_menu.rs`**: build the session subtree, register in root.
+3. **Agent loop dispatch**: extend the `pending_op` match in `agent.rs`
    to handle the new `AsyncOp` variants, reusing the existing
    `handle_session_command` logic.
-6. **Remove v2.0 session overlay code**: strip `ActiveOverlay::Session`,
+4. **Remove v2.0 session overlay code**: strip `ActiveOverlay::Session`,
    `SessionAction`, `Confirm` and related methods from `repl.rs`.
-7. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
+5. **Tests**: unit tests for each node (`data()`, `submit()`, `header()`,
    guards), integration test for full traversal (listing → drill → action
    → submit).
 

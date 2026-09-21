@@ -4407,6 +4407,22 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 config.output.display_text("No active session to replay");
                             }
                         }
+                        crate::slash_menu_bridge::AsyncOp::Resume { session_id: _, replay_arg: _ } => {
+                            // TODO(step 5): implement resume dispatch
+                            config.output.display_text("Resume: not yet implemented");
+                        }
+                        crate::slash_menu_bridge::AsyncOp::Fork { session_id: _ } => {
+                            // TODO(step 5): implement fork dispatch
+                            config.output.display_text("Fork: not yet implemented");
+                        }
+                        crate::slash_menu_bridge::AsyncOp::Rename { session_id: _, new_name: _ } => {
+                            // TODO(step 5): implement rename dispatch
+                            config.output.display_text("Rename: not yet implemented");
+                        }
+                        crate::slash_menu_bridge::AsyncOp::Delete { session_id: _ } => {
+                            // TODO(step 5): implement delete dispatch
+                            config.output.display_text("Delete: not yet implemented");
+                        }
                     }
                     continue;
                 }

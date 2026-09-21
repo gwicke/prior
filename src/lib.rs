@@ -21,6 +21,7 @@ pub mod v25_set;
 pub mod v25_commands;
 pub mod v25_stat;
 pub mod v25_replay;
+pub mod v25_session;
 pub mod sandbox_bindings;
 pub mod settings;
 pub mod path_util;
