@@ -86,11 +86,26 @@ fn session_description(meta: &crate::repl::SessionMeta) -> String {
     }
 }
 
-/// Resolve the session UUID from `path_args.ids`. When drilled into
-/// `SessionListNode`, the UUID is the last element of `ids` (the row
-/// that was selected in the parent listing).
+/// Resolve the session UUID from `path_args.ids` in the *listing* context
+/// (path `["session", "<uuid>"]`): the UUID is the last element. Used by
+/// `SessionListNode::header()` and by the action nodes' `data()`, which the
+/// parent calls with the parent's path (per the v2.5 traversal: `refresh_data`
+/// passes the parent's path down to children).
 fn drilled_session_id(path_args: &PathArgs) -> Option<&str> {
     path_args.ids.last().map(|s| s.as_str())
+}
+
+/// Resolve the session UUID from `path_args.ids` in an *action node's own*
+/// context (path `["session", "<uuid>", "<action>"]`): the UUID is the
+/// second-to-last element. Used by action `header()` / `submit()` /
+/// `prepare()`, which receive the node's own path (own ID included).
+fn action_session_id(path_args: &PathArgs) -> Option<&str> {
+    let ids = &path_args.ids;
+    if ids.len() >= 2 {
+        ids.get(ids.len() - 2).map(|s| s.as_str())
+    } else {
+        None
+    }
 }
 
 /// Find session metadata by UUID from the repo.
@@ -314,7 +329,7 @@ impl SlashDotNode for SessionResumeNode {
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let session_id = drilled_session_id(path_args)
+        let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         let replay_arg = path_args.suffix.trim().to_string();
@@ -345,7 +360,7 @@ impl SlashDotNode for SessionForkNode {
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let session_id = drilled_session_id(path_args)
+        let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Fork { session_id });
@@ -367,7 +382,7 @@ impl SlashDotNode for SessionRenameNode {
     }
 
     fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
-        let current_name = drilled_session_id(path_args)
+        let current_name = action_session_id(path_args)
             .and_then(|sid| find_session(&self.shared, sid))
             .and_then(|m| m.name)
             .unwrap_or_else(|| "(unnamed)".to_string());
@@ -379,7 +394,7 @@ impl SlashDotNode for SessionRenameNode {
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let session_id = drilled_session_id(path_args)
+        let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         let new_name = path_args.suffix.trim().to_string();
@@ -411,7 +426,7 @@ impl SlashDotNode for SessionDeleteNode {
 
     fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         // Guard: cannot delete the current session.
-        if let Some(sid) = drilled_session_id(path_args) {
+        if let Some(sid) = action_session_id(path_args) {
             if sid == self.shared.current_session_id.borrow().as_str() {
                 return SubmitResult::Done(Some(
                     "Cannot delete the current session.".to_string(),
@@ -422,7 +437,7 @@ impl SlashDotNode for SessionDeleteNode {
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let session_id = drilled_session_id(path_args)
+        let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Delete { session_id });
@@ -476,28 +491,119 @@ mod tests {
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{HostKey, MenuResult, StaticListingNode};
 
+    fn test_settings() -> crate::settings::SettingsStore {
+        crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_thinking_level: String::new(),
+            show_reasoning: String::new(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            path: None,
+        }
+    }
+
     fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(
-            crate::settings::SettingsStore {
-                default_model: String::new(),
-                security_mode: String::new(),
-                tool_call_limit: 0,
-                default_persona: None,
-                default_thinking_level: String::new(),
-                show_reasoning: String::new(),
-                reasoning_in_context: false,
-                session_resume_replay_turns: 0,
-                llm_compact_prompt: String::new(),
-                path: None,
-            },
-            None,
-        ))
+        Rc::new(MenuShared::new(test_settings(), None))
     }
 
     fn build_session_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_session_node(shared));
         SlashDotMenu::from_root_node(root)
+    }
+
+    /// Write a minimal session `.jsonl` (header + one user message) into a
+    /// fresh temp repo, returning `(shared, uuid, temp_dir)`.
+    fn temp_repo_with_session() -> (Rc<MenuShared>, String, std::path::PathBuf) {
+        use crate::session::types::{encode_cwd, session_filename, SessionHeader};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("v25-session-test-{nanos}"));
+        let cwd = std::path::Path::new("/tmp/v25-cwd");
+        let dir = base.join(encode_cwd(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let header = SessionHeader::new(cwd);
+        let uuid = header.id.clone();
+        let path = dir.join(session_filename(&chrono::Utc::now()));
+        let user_entry = serde_json::json!({
+            "id": "e1",
+            "timestamp": "2025-01-01T00:00:00.000Z",
+            "type": "message",
+            "message": {"role": "user", "content": [{"type": "text", "text": "hello world"}]},
+        });
+        let leaf = serde_json::json!({
+            "id": "leaf1",
+            "timestamp": "2025-01-01T00:00:01.000Z",
+            "type": "leaf",
+            "targetId": "e1",
+        });
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&user_entry).unwrap(),
+            serde_json::to_string(&leaf).unwrap(),
+        );
+        std::fs::write(&path, contents).unwrap();
+
+        let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+        let shared = Rc::new(MenuShared::new(test_settings(), Some(repo)));
+        (shared, uuid, base)
+    }
+
+    /// End-to-end traversal: `/session ` listing → drill into the session →
+    /// drill into `resume` → Enter → `submit()` sets an `AsyncOp::Resume`
+    /// carrying the drilled UUID (not the action name).
+    #[test]
+    fn session_resume_full_traversal_sets_op_with_uuid() {
+        let (shared, uuid, base) = temp_repo_with_session();
+        // Not the current session, so resume is visible.
+        *shared.current_session_id.borrow_mut() = String::new();
+
+        let mut menu = build_session_menu(&shared);
+        let mut handle = menu.get_handle();
+
+        // 1. Parent listing shows the session row.
+        let listing = handle.eval_prompt("session ", HostKey::None, 80);
+        match &listing {
+            MenuResult::Continue(plan, _) => {
+                assert!(
+                    !plan.rows.is_empty(),
+                    "session listing should have the temp session"
+                );
+            }
+            other => panic!("expected Continue at listing, got {:?}", std::mem::discriminant(other)),
+        }
+
+        // 2. Drill into the session (bare-id entry with trailing space).
+        let line = format!("session {} ", uuid);
+        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        assert!(matches!(r, MenuResult::Continue(_, _)), "drill into session");
+
+        // 3. Drill into `resume`.
+        let line = format!("session {} resume ", uuid);
+        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        assert!(matches!(r, MenuResult::Continue(_, _)), "drill into resume");
+
+        // 4. Enter → submit.
+        let _ = handle.eval_prompt(&line, HostKey::Enter, 80);
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::Resume { session_id, .. }) => {
+                assert_eq!(session_id, &uuid, "resume op must carry the session UUID");
+            }
+            other => panic!("expected AsyncOp::Resume, got {:?}", other),
+        }
+        drop(op);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -539,8 +645,9 @@ mod tests {
         let shared = make_shared();
         *shared.current_session_id.borrow_mut() = "test-uuid".to_string();
         let mut node = SessionResumeNode { shared: shared.clone() };
+        // data() is called from the parent's context: path = ["session", uuid].
         let path_args = PathArgs {
-            ids: vec!["test-uuid".to_string()],
+            ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -557,7 +664,7 @@ mod tests {
         *shared.current_session_id.borrow_mut() = "other-uuid".to_string();
         let mut node = SessionResumeNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["test-uuid".to_string()],
+            ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -570,8 +677,9 @@ mod tests {
     fn session_resume_submit_sets_async_op() {
         let shared = make_shared();
         let mut node = SessionResumeNode { shared: shared.clone() };
+        // submit() sees the node's own path: ["session", uuid, "resume"].
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "resume".into()],
             suffix: " 10t ".to_string(),
             args: Default::default(),
         };
@@ -591,7 +699,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionForkNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "fork".into()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -610,7 +718,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionRenameNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: " my-name ".to_string(),
             args: Default::default(),
         };
@@ -630,7 +738,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionRenameNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: "  ".to_string(),
             args: Default::default(),
         };
@@ -650,7 +758,7 @@ mod tests {
         *shared.current_session_id.borrow_mut() = "test-uuid".to_string();
         let mut node = SessionDeleteNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["test-uuid".to_string()],
+            ids: vec!["session".into(), "test-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -669,7 +777,7 @@ mod tests {
         *shared.current_session_id.borrow_mut() = "other-uuid".to_string();
         let mut node = SessionDeleteNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -685,7 +793,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionDeleteNode { shared: shared.clone() };
         let path_args = PathArgs {
-            ids: vec!["some-uuid".to_string()],
+            ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -718,6 +826,43 @@ mod tests {
         let ts = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
         let age = relative_time(&ts);
         assert_eq!(age, "5d");
+    }
+
+    /// Path-semantics contract: `drilled_session_id` takes the LAST element
+    /// (listing/parent context), `action_session_id` takes the second-to-last
+    /// (an action node's own context, where the last element is the action).
+    #[test]
+    fn path_id_helpers_pick_the_right_element() {
+        let listing = PathArgs {
+            ids: vec!["session".into(), "uuid-1".into()],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        assert_eq!(drilled_session_id(&listing), Some("uuid-1"));
+        assert_eq!(action_session_id(&listing), Some("session"));
+
+        let action = PathArgs {
+            ids: vec!["session".into(), "uuid-1".into(), "resume".into()],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        assert_eq!(drilled_session_id(&action), Some("resume"));
+        assert_eq!(action_session_id(&action), Some("uuid-1"));
+
+        // Degenerate: too short for an action path.
+        let short = PathArgs {
+            ids: vec!["session".into()],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        assert_eq!(action_session_id(&short), None);
+        let empty = PathArgs {
+            ids: Vec::new(),
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        assert_eq!(action_session_id(&empty), None);
+        assert_eq!(drilled_session_id(&empty), None);
     }
 
     #[test]
