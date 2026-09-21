@@ -310,14 +310,11 @@ impl SlashDotNode for SessionListNode {
             .with_min_widths(&[6, 10])
             .with_priorities(&[1, 3]);
         msg_table.add_row(&["First:", &first]);
-        msg_table.add_row(&[&format!("Last {}:", compact_timestamp(last_ts)), &last_text]);
+        msg_table.add_row(&[&format!("Last:", ), &format!("{} {}", compact_timestamp(last_ts), last_text)]);
 
-        // Append First/Last rows, splitting wrapped lines.
-        let msg_rows = msg_table.render_multiline(tw.saturating_sub(4));
-        for row in &msg_rows {
-            for sub in row.split('\n') {
-                lines.push(format!("  {}", sub));
-            }
+        // Single-line rows with ellipsis (no wrapping).
+        for row in msg_table.render(tw.saturating_sub(4)) {
+            lines.push(format!("  {}", row));
         }
 
         lines
