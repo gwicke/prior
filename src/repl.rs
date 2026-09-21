@@ -2723,7 +2723,7 @@ impl Repl {
                     let min_data = 1usize;
                     let detail_budget = max_pop.saturating_sub(min_data).max(1);
                     for d in plan.detail.iter().take(detail_budget) {
-                        result.push(Self::render_logical_line(d, tw, false, false, false));
+                        result.push(Self::render_logical_line(d, tw, false, false, true));
                     }
 
                     // 3. Data rows, windowed around `selected`.

@@ -114,8 +114,7 @@ fn find_session(
 pub fn session_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
-        ColumnDef::new("id", "Session").min(10).prio(3),
-        ColumnDef::new("description", "Description").min(20).prio(2),
+        ColumnDef::new("description", "Description").min(20).prio(3),
         ColumnDef::new("msgs", "Turns")
             .align(Align::Right)
             .min(5)
