@@ -194,7 +194,7 @@ impl NodeEntry {
 
         // Populate our children's data cache — same mechanism the listing
         // view uses. This is on `self`, never on a child.
-        self.refresh_data(epoch);
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
 
         // Collect active IDs from the refreshed cache.
         let mut all_active = Vec::new();
@@ -261,7 +261,7 @@ impl NodeEntry {
         let parsed = parse_section(prompt_suffix, &self.content.row_index);
 
         // Phase 2: Refresh data from children.
-        let refresh_err = self.refresh_data(epoch);
+        let refresh_err = self.refresh_data(epoch, &path, prompt_suffix);
         // If refresh rebuilt row_index, re-parse since IDs may have changed.
         // (Only matters on first call of a new epoch when row_index was
         // stale, or when dynamic data changes between calls.)
@@ -287,7 +287,7 @@ impl NodeEntry {
                 // Build view from restored section.
                 let restore_args = parse_section(&restore_to, &self.content.row_index);
                 self.ensure_view(epoch, &restore_args, &restore_to);
-                let plan = self.build_render_plan();
+                let plan = self.build_render_plan(&path, &restore_to);
                 return MenuResult::Continue(plan, full_prompt(&path, &restore_to));
             }
         }
@@ -375,7 +375,7 @@ impl NodeEntry {
             }
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
-                let plan = self.plan_from_cache();
+                let plan = self.plan_from_cache(path, prompt_suffix);
                 MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
             _ => self.build_continue(path, prompt_suffix),
@@ -417,7 +417,7 @@ impl NodeEntry {
                     }
                 }
                 self.epoch.cursor_user_moved = true;
-                let plan = self.plan_from_cache();
+                let plan = self.plan_from_cache(path, prompt_suffix);
                 MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
             HostKey::Tab => {
@@ -471,7 +471,7 @@ impl NodeEntry {
             }
             _ => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
-                let plan = self.build_render_plan();
+                let plan = self.build_render_plan(path, prompt_suffix);
                 MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
             }
         }
@@ -511,15 +511,15 @@ impl NodeEntry {
     /// path for parent→child data access (design §3.2). It may augment
     /// the response (e.g. value forwarding). Bypassing it breaks the
     /// encapsulation that `NodeEntry` provides over `SlashDotNode`.
-    fn refresh_data(&mut self, epoch: u64) -> bool {
+    fn refresh_data(&mut self, epoch: u64, path: &[String], suffix: &str) -> bool {
         let mut changed = false;
         let mut new_data: Vec<Option<Rc<crate::node_impl::DataResponse>>> =
             Vec::with_capacity(self.children.len());
 
         for (i, child) in self.children.iter_mut().enumerate() {
             let path_args = PathArgs {
-                ids: Vec::new(),
-                suffix: String::new(),
+                ids: path.to_vec(),
+                suffix: suffix.to_string(),
                 args: Args::default(),
             };
             match child.node_data(epoch, &path_args) {
@@ -818,7 +818,7 @@ impl NodeEntry {
     ///
     /// The host uses `sticky_count` to decide vertical truncation when
     /// the terminal is too short for all sticky + data lines.
-    fn build_render_plan(&mut self) -> RenderPlan {
+    fn build_render_plan(&mut self, path: &[String], suffix: &str) -> RenderPlan {
         // Pre-compute: do we have data rows and table columns?
         let has_data = !self.content.ranked_rows.is_empty();
         let columns = self.inner.columns();
@@ -827,12 +827,12 @@ impl NodeEntry {
         let has_table_header = has_columns && has_data;
 
         // 1. Header lines from the node's header() method → detail.
-        let empty_args = PathArgs {
-            ids: Vec::new(),
-            suffix: String::new(),
+        let path_args = PathArgs {
+            ids: path.to_vec(),
+            suffix: suffix.to_string(),
             args: Args::default(),
         };
-        let header = self.inner.header(&empty_args);
+        let header = self.inner.header(&path_args);
         let detail: Vec<LogicalLine> = header.into_iter()
             .map(LogicalLine::new)
             .collect();
@@ -927,13 +927,13 @@ impl NodeEntry {
 
     /// Cursor-move fast path: reuse cached table_header + rows Rc,
     /// recompute detail (may depend on focused row) and selected/active.
-    fn plan_from_cache(&mut self) -> RenderPlan {
-        let empty_args = PathArgs {
-            ids: Vec::new(),
-            suffix: String::new(),
+    fn plan_from_cache(&mut self, path: &[String], suffix: &str) -> RenderPlan {
+        let path_args = PathArgs {
+            ids: path.to_vec(),
+            suffix: suffix.to_string(),
             args: Args::default(),
         };
-        let detail: Vec<LogicalLine> = self.inner.header(&empty_args).into_iter()
+        let detail: Vec<LogicalLine> = self.inner.header(&path_args).into_iter()
             .map(LogicalLine::new)
             .collect();
 
@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, prompt) => {
@@ -1198,7 +1198,7 @@ mod tests {
     #[test]
     fn fuzzy_filter_at_root() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", 80);
         match result {
             MenuResult::Continue(plan, _) => {
@@ -1214,7 +1214,7 @@ mod tests {
     #[test]
     fn bare_id_shows_parent_listing() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", 80);
         match result {
             MenuResult::Continue(plan, prompt) => {
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn tab_drills_into_child() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
         match result {
@@ -1241,7 +1241,7 @@ mod tests {
     #[test]
     fn move_cursor_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
         match result {
@@ -1258,7 +1258,7 @@ mod tests {
     #[test]
     fn move_cursor_clamps_not_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         // Move past last row: should clamp to last, not wrap to 0.
         let _ = root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", 80);
@@ -1282,7 +1282,7 @@ mod tests {
             CmdNode::new("a"),
             CmdNode::with_active("b", "b"),
         ]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
@@ -1295,7 +1295,7 @@ mod tests {
     #[test]
     fn esc_at_root_closes() {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", 80);
         assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
     }
@@ -1326,7 +1326,7 @@ mod tests {
         }));
         // Give it a child so it's a listing node (not a leaf).
         root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         match result {
             MenuResult::Continue(plan, _) => {
@@ -1412,7 +1412,7 @@ mod tests {
     #[test]
     fn epoch_reset_clears_cursor() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
         let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
         assert_eq!(root.epoch.cursor_idx, 1);
@@ -1432,7 +1432,7 @@ mod tests {
                 crate::fields::Row::new("m2").desc("second option"),
             ],
         })));
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         // "first" is in m1's description but not a row ID → fuzzy filter.
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", 80);
         match result {
@@ -1462,7 +1462,7 @@ mod tests {
                 crate::fields::Row::new("p:gpt4-mini").desc("GPT-4 mini fast"),
             ],
         })));
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", 80);
         match result {
             MenuResult::Continue(plan, _) => {
@@ -1524,7 +1524,7 @@ mod tests {
             ],
         })));
 
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
 
         // Both children's rows should appear in the listing.
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
@@ -1564,7 +1564,7 @@ mod tests {
 
         root.children.push(add_cmd);
         root.children.push(bind_cmd);
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
 
         // Tab on "add" → drills into add_cmd → shows "action" leaf row.
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
@@ -1600,7 +1600,7 @@ mod tests {
                 crate::fields::Row::new("bind2").desc("binding two"),
             ],
         })));
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
 
         // "bind" fuzzy-matches both binding rows but not "add".
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", 80);
@@ -1626,7 +1626,7 @@ mod tests {
                 crate::fields::Row::new("valid").desc("has id"),
             ],
         })));
-        root.refresh_data(ep());
+        root.refresh_data(ep(), &[], "");
 
         // Only "valid" should appear.
         let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);

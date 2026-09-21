@@ -185,9 +185,11 @@ v2.5 engine.
       changed; dirty flag for `/set` (existing mechanism). Engine stays
       generic — no `/set`-specific dispatch.
 
-6. **Stat + Replay** — Simple leaf/interstitial commands.
-7. **Sandbox** — Mixed static+dynamic children.
-8. **Session** — Dynamic listing with action children.
+6. **Stat + Replay** — Simple leaf/interstitial commands. **Done.**
+8. **Session** — Dynamic listing with action children:
+   slashdot/session_design.md
+7. **Sandbox** — Mixed static+dynamic children. WIP design:
+   slashdot/sandbox_design.md
 9. **Tree + compact** — Most complex: dynamic listing with nested
    actions, confirm dialogs, `NewPath` rewrites.
 10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
