@@ -649,6 +649,7 @@ impl ActiveOverlay {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
+        *shared.session_usage.borrow_mut() = ctx.session_usage;
         *shared.live_state.borrow_mut() = crate::slash_menu_bridge::LiveState {
             model: format!("{}:{}", ctx.provider, ctx.model),
             persona: ctx.persona.clone(),
@@ -2374,6 +2375,7 @@ impl Repl {
         settings: &mut SettingsStore,
         dirty: &mut bool,
         menu_submitted: &mut bool,
+        pending_op: &Rc<RefCell<Option<crate::slash_menu_bridge::AsyncOp>>>,
         live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
         initial_row: usize,
         output: &dyn Output,
@@ -2393,6 +2395,10 @@ impl Repl {
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
         *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
+        *shared.session_usage.borrow_mut() = ctx.session_usage;
+        // Share the pending_op cell with the caller so async ops are
+        // visible after read_input returns.
+        shared.pending_op = pending_op.clone();
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -2423,7 +2429,7 @@ impl Repl {
         // no longer does. All `/` dispatch goes through `eval_prompt`.
         let mut v25_menu = {
             let shared_rc = std::rc::Rc::new(shared.clone_shared());
-            crate::v25_thinking::build_menu(&shared.live_state, &shared.settings, &shared_rc)
+            crate::v25_menu::build_menu(&shared.live_state, &shared.settings, &shared_rc)
         };
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
@@ -3032,6 +3038,8 @@ impl Repl {
                                                     if let Some(text) = msg {
                                                         output.display_text(&text);
                                                     }
+                                                    // Signal that MenuShared data like LiveState
+                                                    // might have changed
                                                     *menu_submitted = true;
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {

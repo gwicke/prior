@@ -2448,6 +2448,61 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
     }
 }
 
+/// Execute a `/replay` command: re-render session history.
+///
+/// Called from both the agent's submit handler and the v2.5 `ReplayNode`
+/// (via `block_on`).
+pub(crate) async fn handle_replay(
+    arg: &str,
+    session: &crate::session::Session,
+    output: &dyn Output,
+) {
+    let branch = session.get_branch().await;
+    let units = build_replay_units(&branch);
+    let total = count_turns(&units);
+    if arg.ends_with('l') {
+        let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
+        if n > 0 {
+            if total == 0 {
+                output.display_text("Session is empty");
+            } else {
+                output.begin_capture();
+                output.display_separator();
+                replay_units(output, &units, 0);
+                let bytes = output.end_capture();
+                let captured = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = captured.lines().collect();
+                let start = lines.len().saturating_sub(n);
+                use std::io::Write as _;
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                for line in &lines[start..] {
+                    let _ = writeln!(handle, "{}", line);
+                }
+                let _ = handle.flush();
+            }
+        } else {
+            if total > 0 {
+                output.display_separator();
+            }
+            replay_units(output, &units, 0);
+        }
+    } else {
+        let (count, _is_lines) = if arg.is_empty() {
+            (0, false)
+        } else {
+            parse_replay_len_arg(arg, 0)
+        };
+        if total == 0 {
+            output.display_text("Session is empty");
+        } else {
+            let count = if count == 0 { total } else { count.min(total) };
+            output.display_separator();
+            replay_last_turns(output, &units, count);
+        }
+    }
+}
+
 /// Build the `/model <provider>:<model_id>` prefill to surface the model
 /// the resumed session was last using. Looks at the active leaf→root
 /// branch first (a `ModelChange` entry is authoritative for mid-session
@@ -3469,6 +3524,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // can call the async `create_agent`.
     let mut dirty = false;
     let mut menu_submitted = false;
+    let pending_op: std::rc::Rc<std::cell::RefCell<Option<crate::slash_menu_bridge::AsyncOp>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let live_state = std::rc::Rc::new(std::cell::RefCell::new(
         crate::slash_menu_bridge::LiveState {
             model: format!("{}:{}", config.provider, config.model),
@@ -3629,6 +3686,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                     settings,
                     &mut dirty,
                     &mut menu_submitted,
+                    &pending_op,
                     &live_state,
                     config.output.cursor_row(),
                     config.output.as_ref(),
@@ -4239,55 +4297,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 if input == "/replay" || input.starts_with("/replay ") {
                     if let Some(ref s) = session {
                         let arg = input["/replay".len()..].trim();
-                        let branch = s.get_branch().await;
-                        let units = build_replay_units(&branch);
-                        let total = count_turns(&units);
-                        if arg.ends_with('l') {
-                            // Line-based limit: capture full replay (with full ANSI
-                            // rendering) via a Vec<u8> writer, then display only the
-                            // last N lines.
-                            let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
-                            if n > 0 {
-                                if total == 0 {
-                                    config.output.display_text("Session is empty");
-                                } else {
-                                    config.output.begin_capture();
-                                    config.output.display_separator();
-                                    replay_units(config.output.as_ref(), &units, 0);
-                                    let bytes = config.output.end_capture();
-                                    let captured = String::from_utf8_lossy(&bytes);
-                                    let lines: Vec<&str> = captured.lines().collect();
-                                    let start = lines.len().saturating_sub(n);
-                                    use std::io::Write as _;
-                                    let stdout = std::io::stdout();
-                                    let mut handle = stdout.lock();
-                                    for line in &lines[start..] {
-                                        let _ = writeln!(handle, "{}", line);
-                                    }
-                                    let _ = handle.flush();
-                                }
-                            } else {
-                                // `0l` — replay all (same as bare `/replay`).
-                                if total > 0 {
-                                    config.output.display_separator();
-                                }
-                                replay_units(config.output.as_ref(), &units, 0);
-                            }
-                        } else {
-                            // Turn-based limit: N or Nt (or no arg).  Empty arg means all.
-                            let (count, _is_lines) = if arg.is_empty() {
-                                (0, false)
-                            } else {
-                                parse_replay_len_arg(arg, 0)
-                            };
-                            if total == 0 {
-                                config.output.display_text("Session is empty");
-                            } else {
-                                let count = if count == 0 { total } else { count.min(total) };
-                                config.output.display_separator();
-                                replay_last_turns(config.output.as_ref(), &units, count);
-                            }
-                        }
+                        handle_replay(arg, s, config.output.as_ref()).await;
                     } else {
                         config.output.display_text("No active session to replay");
                     }
@@ -4386,6 +4396,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             }
                         }
                     }
+                }
+                // Dispatch async ops from v2.5 submit handlers.
+                if let Some(op) = pending_op.borrow_mut().take() {
+                    match op {
+                        crate::slash_menu_bridge::AsyncOp::Replay(arg) => {
+                            if let Some(ref s) = session {
+                                handle_replay(&arg, s, config.output.as_ref()).await;
+                            } else {
+                                config.output.display_text("No active session to replay");
+                            }
+                        }
+                    }
+                    continue;
                 }
                 // Normal prompt — create the agent lazily on first use.
                 if agent.is_none() {

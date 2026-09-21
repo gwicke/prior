@@ -423,11 +423,11 @@ impl NodeEntry {
             HostKey::Tab => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return MenuResult::DoneError("cursor row vanished".into(), full_prompt(path, prompt_suffix));
+                    return self.build_continue(path, prompt_suffix);
                 };
                 let child_idx = match self.content.row_index.get(&active_id) {
                     Some(&idx) => idx as usize,
-                    None => return MenuResult::DoneError("cursor row not in index".into(), full_prompt(path, prompt_suffix)),
+                    None => return self.build_continue(path, prompt_suffix),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
@@ -445,11 +445,11 @@ impl NodeEntry {
             HostKey::Enter => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return MenuResult::DoneError("cursor row vanished".into(), full_prompt(path, prompt_suffix));
+                    return self.build_continue(path, prompt_suffix);
                 };
                 let child_idx = match self.content.row_index.get(&active_id) {
                     Some(&idx) => idx as usize,
-                    None => return MenuResult::DoneError("cursor row not in index".into(), full_prompt(path, prompt_suffix)),
+                    None => return self.build_continue(path, prompt_suffix),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
@@ -1297,7 +1297,7 @@ mod tests {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
         root.refresh_data(ep());
         let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", 80);
-        assert!(matches!(result, MenuResult::DoneSuccess(None)));
+        assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
     }
 
     /// A root-like node with children AND a header.

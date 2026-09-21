@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6d complete. 545 lib tests pass.
+**Done (v2.5 reshape):** Steps 1–6e complete. 552 lib tests pass.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -367,7 +367,18 @@ state via `Rc<MenuShared>`. Active model marker from settings. 7 tests.
    `new(impl)`, `add_child(node)`, `From<T>` for `.into()`). Banner
    updated. 2 integration tests ignored (unported `/set`).
 
-**Tests:** 12 thinking + 8 persona + 7 model = 27 command tests.
+6e. **`/stat` and `/replay`** — **Done.** Both are leaf nodes directly
+   under root (no listing wrapper). `data()` returns the row for the root
+   listing. `header()` renders info when drilled. `/stat` uses `NewPath("")`
+   to close on submit. `/replay` sets `AsyncOp::Replay` on `MenuShared`;
+   the agent loop dispatches `handle_replay()` in its async context.
+   `handle_replay` extracted from the agent's match arm into a standalone
+   `pub(crate) async fn` reused by both paths. `session_usage` added to
+   `MenuShared`. `v25_menu.rs` module for the root menu builder (moved
+   from `v25_thinking.rs`). `prepare()` doc comment clarified: two-phase
+   commit only, not for display.
+
+**Tests:** 12 thinking + 8 persona + 7 model + 4 stat + 3 replay = 34 command tests.
 
 ### Step 7: Two-phase submit confirm
 
@@ -389,11 +400,51 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 
 ### Step 12: Sandbox
 
-### Step 13: Stat + Replay
+### Step 13: Session
 
-### Step 14: Final cleanup
+### Step 14: Tree + `/compact`
+
+### Step 15: Final cleanup
 
 (See previous versions for detailed per-step specs.)
+
+---
+
+## 5a. Follow-up: global app state and async (post-migration)
+
+The v2.5 migration exposed two architectural debt items that should be
+addressed after all commands are ported:
+
+### Shared state: `MenuShared` ad-hoc syncing
+
+`MenuShared` is a grab-bag of `Rc<RefCell<…>>` cells that the REPL
+populates on every `read_input` call (session_usage, current_session_id,
+tree, leaf_id, pending_op).  Each new command adds another field and
+another sync line.  Longer term, there should be a single app-global
+state object — `AppState` or similar — that both the REPL and the menu
+nodes reference directly, eliminating the per-field syncing.
+
+### Async operations from sync `submit()`
+
+`submit()` is `&mut self` (sync, single-threaded).  Commands that need
+async context (e.g. `/replay` which calls `session.get_branch().await`)
+cannot call async code from `submit()`.  Current workaround:
+`AsyncOp` enum on `MenuShared` that the agent loop dispatches after
+`DoneSuccess`.  This works but adds indirection.
+
+Options for a cleaner design:
+- **`AppState` holds the session directly** (Session's internals are
+  already `Arc`-wrapped, so it can be shared via `Rc<RefCell>`).
+  `submit()` borrows the session reference; the engine can expose a
+  `block_on` helper for sync-to-async bridging.
+- **`submit()` returns a richer type** (e.g. `SubmitResult::Run(AsyncOp)`)
+  that the engine propagates to the host.  The host decides how to
+  execute — currently impossible because `MenuResult` carries
+  `DonePayload` which is not generic (trait object constraint).
+- **Move async logic into the host entirely** — nodes return plain
+  `Done(None)` and the host detects which command ran (by prompt
+  prefix) and dispatches the async work itself.  Simple but loses
+  the "node owns its behavior" property.
 
 ---
 
@@ -409,7 +460,7 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
 | **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 539 lib tests + 4 integration tests (2 ignored for unported `/set`).
+Total: 552 lib tests + 4 integration tests (2 ignored for unported `/set`).
 The 26 interpreter tests test the old code path and will be removed
 when v2.0 is fully retired.
 
@@ -641,3 +692,68 @@ widths change, so every line's text changes.
 | Detail updates on cursor move | `rows` Rc unchanged, `detail` changed |
 | PageUp/PageDown | `selected ± page_size`, clamp, re-render |
 | Resize triggers rebuild | `term_width` change → new `Rc` for `rows` |
+
+---
+
+## 8. Design notes: mistakes and lessons (step 6e)
+
+### Wrong turn: StaticListingNode wrapper for `/stat` and `/replay`
+
+Initially, `/stat` and `/replay` were wrapped in `StaticListingNode`
+children under the root listing (root → listing → leaf).  This was
+wrong and wasted a navigation level.  The mistake came from applying
+the pattern used by `/thinking`, `/persona`, and `/model` — which
+genuinely need a listing → enum/child hierarchy — to commands that
+are simple leaves.
+
+The correct pattern: a leaf node directly under root, where `data()`
+returns the row for the root listing and `header()` renders detail
+when drilled.  The v2.0 code should have been the hint: both `/stat`
+and `/replay` were interstitial/leaf nodes with no child rows.
+
+### Wrong turn: `prepare()` for showing header
+
+The first attempt used `prepare() → Prepared` to show `header()` on
+the first Enter, then `submit()` on the second.  This misuses the
+two-phase commit mechanism (§7 step 7a), which is for confirm dialogs
+and edit/accept workflows, not for display.  The `prepare()` doc
+comment was updated to warn against this.
+
+The correct approach: the engine already shows `header()` via
+`plan_from_cache()` when a leaf is visited with `HostKey::None`.
+For `/stat`, `submit()` returning `NewPath(String::new())` closes the
+menu.  For `/replay`, `submit()` sets `AsyncOp::Replay` and the agent
+loop dispatches it.
+
+### Wrong turn: `pending_submit` as a raw string
+
+The first implementation used `pending_submit: Rc<RefCell<Option<String>>>`
+on `MenuShared`.  This was ad-hoc and untyped.  Replaced with a proper
+`AsyncOp` enum that carries the operation and its arguments.  This makes
+the contract explicit: `MenuShared.pending_op` is the channel for async
+operations that `submit()` cannot execute directly.
+
+### Guidance: when to use listing vs leaf
+
+- **Leaf directly under root**: the command has no sub-rows to select.
+  `data()` returns the row for the root listing.  `header()` shows
+  detail when drilled.  Examples: `/stat`, `/replay`, `/new`, `/clear`.
+- **Listing under root** with children: the command has selectable
+  rows (options, entries, settings).  The listing node provides rows;
+  children handle selection.  Examples: `/thinking`, `/persona`,
+  `/model`, `/set`.
+- **Listing under root** with no children but custom header: the
+  command shows a dynamic table or info panel.  Examples: `/session`
+  (will need a listing to show session rows).
+
+### Guidance: when to use `prepare()` vs not
+
+- **`prepare()`**: only for genuine two-phase workflows where the
+  first Enter stages/arms and the second Enter commits.  Examples:
+  confirm dialogs, edit-then-accept patterns.
+- **Not for display**: if you need to show `header()` before the
+  action, just drill into the leaf normally (`HostKey::None` shows
+  the plan with header).  The REPL already handles this flow.
+- **Not for "first Enter shows, second Enter submits"**: use
+  `NewPath` to re-enter the leaf (as `/stat` does), or accept that
+  the leaf is shown on drill and Enter acts immediately.

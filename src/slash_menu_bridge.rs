@@ -147,6 +147,23 @@ pub struct MenuShared {
     /// per loop iteration; the `/tree` provider reads it per `fetch`.
     pub tree: Rc<RefCell<Vec<(usize, String, String, bool, bool, usize)>>>,
     pub leaf_id: Rc<RefCell<Option<String>>>,
+    /// Session token usage snapshot (set per `read_input` call from the
+    /// agent's `session_usage()`). Used by `/stat` to display context
+    /// window and cost info.
+    pub session_usage: Rc<RefCell<crate::agent::SessionUsage>>,
+    /// Async operation requested by a submit handler.  The agent loop
+    /// checks this after each `DoneSuccess` and executes it in its own
+    /// async context (the node cannot call `block_on` from inside a
+    /// tokio runtime).
+    pub pending_op: Rc<RefCell<Option<AsyncOp>>>,
+}
+
+/// Operations that a node can request but cannot execute itself (because
+/// `submit()` is sync and may run inside a tokio context).
+#[derive(Debug, Clone)]
+pub enum AsyncOp {
+    /// Run `/replay` with the given argument (e.g. `""`, `"5t"`, `"10l"`).
+    Replay(String),
 }
 
 impl MenuShared {
@@ -162,6 +179,8 @@ impl MenuShared {
             recent_models: Rc::new(RefCell::new(Vec::new())),
             tree: Rc::new(RefCell::new(Vec::new())),
             leaf_id: Rc::new(RefCell::new(None)),
+            session_usage: Rc::new(RefCell::new(crate::agent::SessionUsage::default())),
+            pending_op: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -177,6 +196,8 @@ impl MenuShared {
             recent_models: self.recent_models.clone(),
             tree: self.tree.clone(),
             leaf_id: self.leaf_id.clone(),
+            session_usage: self.session_usage.clone(),
+            pending_op: self.pending_op.clone(),
         }
     }
 }

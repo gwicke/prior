@@ -99,7 +99,11 @@ pub enum HostKey {
 /// All methods have default implementations (no-op / empty). Override only
 /// what the node needs.
 pub trait SlashDotNode {
-    /// The rows this node contributes to its parent's listing.
+    /// The rows this node contributes to its parent's listing.  *All* leaf
+    /// nodes need to implement this, and should return one or more rows with an `id` and
+    /// `description`. 
+    /// Handled automatically for `StaticListingNode`, so higher levels of the hierarchy which have
+    /// leaf nodes as children.
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(std::rc::Rc::new(DataResponse {
             rows: Vec::new(),
@@ -113,7 +117,15 @@ pub trait SlashDotNode {
         SubmitResult::Done(None)
     }
 
-    /// Optional confirm hook (§7 step 7a). Default: `self.submit()`.
+    /// Optional confirm / two-phase-commit hook. Called on the **first**
+    /// Enter; if it returns `Prepared`, the engine sets `confirm_pending`
+    /// and the **second** Enter calls `submit()` instead.
+    ///
+    /// **Default:** delegates straight to `submit()` (single-phase).
+    ///
+    /// Override **only** for genuine two-phase workflows (commit/prepare →
+    /// edit/accept, or confirm dialogs).  Do **not** override just to
+    /// show a header — use `header()` for that.
     fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
         self.submit(epoch, path_args)
     }
