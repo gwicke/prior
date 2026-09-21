@@ -329,7 +329,7 @@ mod tests {
                 assert!(prompt.contains("security_mode"),
                     "should drill into a value, got: {}", prompt);
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {
-                    crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                    crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         // The active value was resubmitted (confirm).
                         assert_eq!(settings.borrow().security_mode, "confirm");
                     }
@@ -352,7 +352,7 @@ mod tests {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {
-                    crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                    crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         assert_eq!(settings.borrow().security_mode, "yolo");
                     }
                     other => panic!("expected DoneSuccess, got {:?}", other),
@@ -369,7 +369,7 @@ mod tests {
         let mut h = menu.get_handle();
         // Type a value for tool_call_limit directly.
         match h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80) {
-            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                 assert_eq!(settings.borrow().tool_call_limit, 42);
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -383,7 +383,7 @@ mod tests {
         let mut h = menu.get_handle();
         // Invalid value for tool_call_limit.
         match h.eval_prompt("set tool_call_limit 0", HostKey::Enter, 80) {
-            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg) => {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, _) => {
                 assert!(msg.unwrap_or_default().contains("greater than 0"),
                     "should show validation error");
                 assert_eq!(settings.borrow().tool_call_limit, 50);

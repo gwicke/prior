@@ -71,10 +71,10 @@ pub enum SubmitResult {
 pub enum MenuResult {
     /// Keep interacting. The host renders the plan and sets the prompt.
     Continue(RenderPlan, String),
-    /// Menu done; close the overlay. Optional message to print.
-    DoneSuccess(Option<String>),
-    /// Error; close the overlay and show the message.
-    DoneError(String),
+    /// Menu done; close the overlay. (message, self-documenting prompt).
+    DoneSuccess(Option<String>, String),
+    /// Error; close the overlay. (message, self-documenting prompt).
+    DoneError(String, String),
 }
 
 /// Simplified key events the host sends to the engine.

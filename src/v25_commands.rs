@@ -129,7 +129,7 @@ mod tests {
         let r = eval(&mut h, "thinking ", HostKey::Tab);
         let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
         match eval(&mut h, &prompt, HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), Some("off".to_string()));
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -143,7 +143,7 @@ mod tests {
         let mut h = menu.get_handle();
         let _ = eval(&mut h, "thinking ", HostKey::None);
         match eval(&mut h, "thinking ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(
                     *state.borrow(),
                     Some("off".to_string()),
@@ -162,7 +162,7 @@ mod tests {
         let _ = eval(&mut h, "thinking ", HostKey::None);
         let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
         match eval(&mut h, "thinking ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(
                     *state.borrow(),
                     Some("high".to_string()),
@@ -261,7 +261,7 @@ mod tests {
         let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
         assert!(prompt.contains("med"), "should be med: {}", prompt);
         match eval(&mut h, &prompt, HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), Some("med".to_string()));
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -384,7 +384,7 @@ mod persona_tests {
         let _ = eval(&mut h, "persona ", HostKey::None);
         let _ = eval(&mut h, "persona ", HostKey::Tab);
         match eval(&mut h, "persona architect ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), Some("architect".to_string()));
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -398,7 +398,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         let _ = eval(&mut h, "persona ", HostKey::None);
         match eval(&mut h, "persona ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), None);
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -412,7 +412,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         let _ = eval(&mut h, "persona ", HostKey::None);
         match eval(&mut h, "persona ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(
                     *state.borrow(),
                     Some("strict".to_string()),
@@ -437,7 +437,7 @@ mod persona_tests {
             other => panic!("expected Continue, got {:?}", other),
         }
         match eval(&mut h, "persona none ", HostKey::Enter) {
-            MenuResult::DoneSuccess(_) => {
+            MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), None, "none should clear persona");
             }
             other => panic!("expected DoneSuccess, got {:?}", other),

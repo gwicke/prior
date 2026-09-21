@@ -3020,13 +3020,14 @@ impl Repl {
                                             crate::output::term_width(),
                                             );
                                             match result {
-                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg) => {
+                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, prompt) => {
                                                     // The node's submit() wrote to LiveState.
-                                                    // Echo the committed line and signal
-                                                    // run_interactive to sync.
+                                                    // Use the engine-provided self-documenting
+                                                    // prompt (e.g. "/thinking low").
+                                                    let committed = format!("/{}", prompt);
                                                     Repl::emit_commit(
                                                         output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &buf_text, "", true,
+                                                        &mut input_row, &committed, "", true,
                                                     );
                                                     if let Some(text) = msg {
                                                         output.display_text(&text);
@@ -3072,7 +3073,7 @@ impl Repl {
                                                 // Esc popped a level — update buffer.
                                                 editor.set(&format!("/{}", prompt));
                                             }
-                                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_, _) => {
                                                 // Esc at root — close overlay.
                                                 editor.set("");
                                                 v25_handle = None;

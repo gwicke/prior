@@ -74,6 +74,7 @@ pub fn build_menu(
             StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
         ]).with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
+            crate::slashdot_menu::ColumnDef::new("description", "Description"),
         ]).into();
         tl.add_child(ThinkingEnumNode {
             active_fn: Box::new(move || {

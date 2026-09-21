@@ -476,7 +476,7 @@ mod tests {
                         assert!(prompt.starts_with("model "),
                             "should drill into a model entry, got: {}", prompt);
                         match eval(&mut h, &prompt, crate::slashdot_menu::node_impl::HostKey::Enter) {
-                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_) => {
+                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                                 let model = shared.live_state.borrow().model.clone();
                                 assert!(!model.is_empty(),
                                     "live_state should have a model after submit");

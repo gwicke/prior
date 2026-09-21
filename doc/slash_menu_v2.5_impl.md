@@ -7,8 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6d complete. 539 lib tests + 4
-integration tests pass, 2 integration tests ignored (unported `/set`).
+**Done (v2.5 reshape):** Steps 1–6d complete. 545 lib tests pass.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -17,7 +16,9 @@ traversal: section parse, data refresh (Rc::ptr_eq), view derivation
 render plan. Merged child sets, field metadata, row uniformity.
 
 Step 6 (command porting): `/thinking`, `/persona`, `/model` fully ported.
-Root `/` list done — all `/` prefixes route through v2.5 engine.
+`/set` fully ported with value-forwarding wrappers, EnumSettingNode,
+SettingLeafNode. Root `/` list done — all `/` prefixes route through
+v2.5 engine.
 
 **Key additions:**
 - **`SlashDotMenuNode`** (menu.rs): thin public wrapper around `NodeEntry`.
@@ -45,11 +46,33 @@ Root `/` list done — all `/` prefixes route through v2.5 engine.
   shared state. `DoneSuccess` dispatches by command prefix
   (`thinking` → `SetThinking`, `persona` → `SetPersona`,
   `model`/`models` → `SetModel`).
+- **Closure-parametrized nodes**: `ThinkingEnumNode`, `PersonaEnumNode`,
+  `ModelNode` take boxed closures for active/submit, parameterized by
+  `Rc<RefCell<SettingsStore>>` or `Rc<RefCell<LiveState>>`. Enables
+  `/set` to reuse the same node types with different state sources.
+- **`/set` tree**: `build_set_node()` constructs the settings subtree.
+  Value-forwarding wrappers for listing/enum settings (model, persona,
+  thinking, security_mode, show_reasoning, reasoning_in_context).
+  Direct `SettingLeafNode` children for int/freetext settings
+  (tool_call_limit, session_resume_replay_turns, llm_compact_prompt).
+  `EnumSettingNode` for enum option lists. `SettingLeafNode` returns
+  `NewPath` on empty suffix to keep menu open and show header.
 - **REPL wiring**: persistent `SlashDotMenu` + `Option<SlashDotHandle>` in
   the input loop. **All `/` prefixes route through v2.5** — the old
   `from_buffer_cursors` dispatcher is no longer on the live path (only
   used in v2.0 tests). `ActiveOverlay::V25Menu { plan }` variant for v2.5
   engine overlay.
+- **Fuzzy ranking prefix bonus**: `rank_row_refs` gives +10_000 bonus to
+  rows whose ID starts with the query (matching v1.0's
+  `fuzzy_filter_bonus`). Ensures exact prefix matches rank above
+  subsequence-only matches.
+- **`HostKey::MaybeSubmit`**: listing Enter drills and forwards MaybeSubmit
+  to child; leaf submits on MaybeSubmit; listing ignores MaybeSubmit.
+  Prevents Enter from drilling through multiple listing levels.
+- **Cursor follows filter rank**: `cursor_user_moved` flag tracks explicit
+  arrow-key navigation. When false (menu entry, typing), cursor re-seeds
+  from ranked_rows top. When true, cursor persists through filtering.
+  Resets when cursor row drops out of filtered set.
 - Catalog generation counter (`model_catalog::catalog_generation()`):
   atomic `u64` bumped on each cache refresh. `ModelNode` compares it to
   its cached `Rc<DataResponse>` to skip rebuild when data is unchanged

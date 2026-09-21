@@ -340,7 +340,7 @@ impl NodeEntry {
                     self.epoch.confirm_pending = false;
                     let path_args = build_path_args(path, parsed, prompt_suffix);
                     match self.inner.submit(epoch, &path_args) {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg),
+                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
                         SubmitResult::NewPath(p) => MenuResult::Continue(
                             RenderPlan::default(),
                             p,
@@ -352,7 +352,7 @@ impl NodeEntry {
                 } else {
                     let path_args = build_path_args(path, parsed, prompt_suffix);
                     match self.inner.prepare(epoch, &path_args) {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg),
+                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
                         SubmitResult::Prepared => {
                             self.epoch.confirm_pending = true;
                             self.build_continue(path, prompt_suffix)
@@ -423,11 +423,11 @@ impl NodeEntry {
             HostKey::Tab => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return MenuResult::DoneError("cursor row vanished".into());
+                    return MenuResult::DoneError("cursor row vanished".into(), full_prompt(path, prompt_suffix));
                 };
                 let child_idx = match self.content.row_index.get(&active_id) {
                     Some(&idx) => idx as usize,
-                    None => return MenuResult::DoneError("cursor row not in index".into()),
+                    None => return MenuResult::DoneError("cursor row not in index".into(), full_prompt(path, prompt_suffix)),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
@@ -445,11 +445,11 @@ impl NodeEntry {
             HostKey::Enter => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return MenuResult::DoneError("cursor row vanished".into());
+                    return MenuResult::DoneError("cursor row vanished".into(), full_prompt(path, prompt_suffix));
                 };
                 let child_idx = match self.content.row_index.get(&active_id) {
                     Some(&idx) => idx as usize,
-                    None => return MenuResult::DoneError("cursor row not in index".into()),
+                    None => return MenuResult::DoneError("cursor row not in index".into(), full_prompt(path, prompt_suffix)),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
@@ -499,7 +499,7 @@ impl NodeEntry {
         }
 
         // Step 4: nothing left at this level → close.
-        MenuResult::DoneSuccess(None)
+        MenuResult::DoneSuccess(None, full_prompt(path, prompt_suffix))
     }
 
     // --- Data refresh ---
@@ -1445,7 +1445,7 @@ mod tests {
         // Esc on filtered view clears to empty (root close or clear).
         let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first", 80);
         match result {
-            MenuResult::Continue(_, _) | MenuResult::DoneSuccess(_) => {}
+            MenuResult::Continue(_, _) | MenuResult::DoneSuccess(..) => {}
             other => panic!("expected Continue or DoneSuccess on Esc, got {:?}", other),
         }
     }
@@ -1584,7 +1584,7 @@ mod tests {
         // Enter on "add action " → submit.
         let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", 80);
         match result {
-            MenuResult::DoneSuccess(_) => {}
+            MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
     }
