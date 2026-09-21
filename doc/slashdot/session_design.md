@@ -378,6 +378,45 @@ method signatures.
 
 ---
 
+## Findings / changes during implementation
+
+### Menu submit flow (found during manual testing)
+
+The agent loop originally dispatched `pending_op` **inside** the
+`InputAction::Submit` arm, and the v2.5 `DoneSuccess` handler committed
+the command text and then `continue`d inside `read_input` (staying in the
+overlay). Net effect: a menu action's `submit()` set `pending_op`, but the
+op was never dispatched — resume/replay silently did nothing.
+
+Fix (commit `b747728`):
+
+- `read_input` returns a new `InputAction::MenuDone` on `DoneSuccess` /
+  `DoneError`, dismissing the overlay.
+- The agent loop runs the `menu_submitted` LiveState sync **and** the
+  `pending_op` dispatch **before** the `action` match, so they fire for
+  `MenuDone` as well.
+- The duplicated sync/dispatch block inside the `Submit` arm was removed.
+
+This also makes `/thinking` / `/model` / `/persona` apply immediately
+(previously they relied on a later `read_input` return to sync LiveState).
+
+### Listing vs action columns
+
+`session_columns()` was used for both the parent `/session` listing and
+`SessionListNode`'s drilled action list. Split into:
+
+- `session_listing_columns()` — parent listing, no `id` column (UUIDs not
+  useful).
+- `session_action_columns()` — `SessionListNode` drilled, `id` (Action) +
+  description.
+
+### Active marker
+
+`SessionListNode::data()` marks the current session active via
+`active_ids`, but only when that session actually appears in the listing.
+
+---
+
 ## Later refinements
 
 - Default filter added from `/sess`+tab: `/session .path:.` — current
