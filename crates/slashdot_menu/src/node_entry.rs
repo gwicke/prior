@@ -373,7 +373,11 @@ impl NodeEntry {
                     self.handle_esc(path, parsed, trailing_space, prompt_suffix)
                 }
             }
-            HostKey::None => self.build_continue(path, prompt_suffix),
+            HostKey::None => {
+                // Tab-drill or bare entry: show header/listing.
+                let plan = self.plan_from_cache();
+                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
+            }
             _ => self.build_continue(path, prompt_suffix),
         }
     }

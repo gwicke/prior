@@ -75,9 +75,9 @@ impl SlashDotNode for SettingLeafNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let val = path_args.suffix.trim();
         if val.is_empty() {
-            // No value typed — show the current value as a message.
-            let current = self.settings.borrow().value(self.key);
-            return SubmitResult::Done(Some(format!("current: {}", current)));
+            // Return NewPath to re-enter the leaf and show header().
+            let path = path_args.ids.join(" ");
+            return SubmitResult::NewPath(format!("{} ", path));
         }
         match self.settings.borrow_mut().set_value(self.key, val) {
             Ok(()) => SubmitResult::Done(None),
