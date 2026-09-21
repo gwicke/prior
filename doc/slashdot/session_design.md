@@ -360,7 +360,7 @@ method signatures.
 
 0. **Traversal context in NodeEntry**: thread path + suffix through
    `refresh_data`, `build_render_plan`, `plan_from_cache`. (Prerequisite
-   for steps 1–2.)
+   for steps 1–2.) **Done** (`2df0332`).
 1. **Create `src/v25_session.rs`**: `SessionListNode` with `data()` +
    `header()` + `columns()`. Session listing with repo reads.
 2. **Create action nodes**: `SessionResumeNode`, `SessionForkNode`,
