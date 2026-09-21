@@ -380,6 +380,25 @@ method signatures.
 
 ## Findings / changes during implementation
 
+### Action-node path semantics (found during manual testing)
+
+An action node's own path is `["session", "<uuid>", "<action>"]`, so the
+session UUID is the **second-to-last** element — `ids.last()` returns the
+action name ("resume", …), which caused `Session not found: resume`.
+
+Two contexts, two helpers:
+
+- `drilled_session_id()` = `ids.last()`. Used by `SessionListNode::header()`
+  and by action `data()` — the latter because `refresh_data` calls a child's
+  `data()` with the *parent's* path (`["session", "<uuid>"]`).
+- `action_session_id()` = `ids[len-2]`. Used by action `header()` /
+  `submit()` / `prepare()` — these receive the node's own path.
+
+Locked in by `path_id_helpers_pick_the_right_element` and the end-to-end
+`session_resume_full_traversal_sets_op_with_uuid` (builds a real temp repo,
+drills session → resume through the engine, asserts the `AsyncOp` carries
+the UUID).
+
 ### Menu submit flow (found during manual testing)
 
 The agent loop originally dispatched `pending_op` **inside** the
