@@ -125,7 +125,7 @@ pub fn build_set_node(
         );
         let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("default_model", "Default model as provider:model (used for new sessions)"),
-        ]).into();
+        ]).with_columns(crate::v25_model::model_columns()).into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);

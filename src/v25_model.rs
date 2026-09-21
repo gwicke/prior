@@ -126,30 +126,7 @@ impl SlashDotNode for ModelNode {
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
-        use crate::slashdot_menu::table::Align;
-        vec![
-            ColumnDef::new("id", "Model").min(12).prio(3),
-            ColumnDef::new("context", "Ctx")
-                .align(Align::Right)
-                .min(5)
-                .prio(1),
-            ColumnDef::new("coding", "Coding")
-                .align(Align::Right)
-                .min(6)
-                .prio(1),
-            ColumnDef::new("price_input", "Price in")
-                .align(Align::Right)
-                .min(8)
-                .prio(2),
-            ColumnDef::new("price_output", "Price out")
-                .align(Align::Right)
-                .min(8)
-                .prio(2),
-            ColumnDef::new("reasoning", "Reason")
-                .align(Align::Right)
-                .min(3)
-                .prio(1),
-        ]
+        model_columns()
     }
 }
 
@@ -264,6 +241,39 @@ fn order_models(
 }
 
 // ---------------------------------------------------------------------------
+// Shared column definitions.
+// ---------------------------------------------------------------------------
+
+/// Column definitions for the model catalog table, shared by
+/// `/model` and `/set default_model`.
+pub fn model_columns() -> Vec<ColumnDef> {
+    use crate::slashdot_menu::table::Align;
+    vec![
+        ColumnDef::new("id", "Model").min(12).prio(3),
+        ColumnDef::new("context", "Ctx")
+            .align(Align::Right)
+            .min(5)
+            .prio(1),
+        ColumnDef::new("coding", "Coding")
+            .align(Align::Right)
+            .min(6)
+            .prio(1),
+        ColumnDef::new("price_input", "Price in")
+            .align(Align::Right)
+            .min(8)
+            .prio(2),
+        ColumnDef::new("price_output", "Price out")
+            .align(Align::Right)
+            .min(8)
+            .prio(2),
+        ColumnDef::new("reasoning", "Reason")
+            .align(Align::Right)
+            .min(3)
+            .prio(1),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // Menu builder — adds model to the root menu.
 // ---------------------------------------------------------------------------
 
@@ -288,29 +298,7 @@ pub fn build_model_node(
     let mut node: SlashDotMenuNode = StaticListingNode::new(&[
         StaticRow::new("model", "select a model (provider:name)"),
     ])
-    .with_columns(vec![
-        ColumnDef::new("id", "Model").min(12).prio(3),
-        ColumnDef::new("context", "Ctx")
-            .align(crate::slashdot_menu::table::Align::Right)
-            .min(5)
-            .prio(1),
-        ColumnDef::new("coding", "Coding")
-            .align(crate::slashdot_menu::table::Align::Right)
-            .min(6)
-            .prio(1),
-        ColumnDef::new("price_input", "Price in")
-            .align(crate::slashdot_menu::table::Align::Right)
-            .min(8)
-            .prio(2),
-        ColumnDef::new("price_output", "Price out")
-            .align(crate::slashdot_menu::table::Align::Right)
-            .min(8)
-            .prio(2),
-        ColumnDef::new("reasoning", "Reason")
-            .align(crate::slashdot_menu::table::Align::Right)
-            .min(3)
-            .prio(1),
-    ])
+    .with_columns(model_columns())
     .with_fields(vec![
         FieldSpec::new("context", true).dir(SortDir::Asc).description(desc_of("context")),
         FieldSpec::new("price_input", true).dir(SortDir::Asc).description(desc_of("price_input")),
