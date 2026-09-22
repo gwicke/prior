@@ -254,7 +254,18 @@ impl NodeEntry {
             self.cache_epoch = epoch;
         }
         self.epoch.term_width = term_width;
-        // eprintln!("In node_traverse {}", prompt_suffix);
+
+        // Phase 0.5: Drill rewrite — if the parent drilled into us
+        // (DrillEnter / DrillTab), let the node optionally rewrite the
+        // prompt and restart from root.
+        if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
+            if let Some(new_prompt) = self.inner.drill_rewrite(&path, prompt_suffix, &key) {
+                return MenuResult::Continue(
+                    RenderPlan::default(),
+                    new_prompt,
+                );
+            }
+        }
 
         // Phase 1: Parse section (single parse pass).
         let trailing_space = prompt_suffix.ends_with(' ');
@@ -301,7 +312,7 @@ impl NodeEntry {
 
         // Listing node: matched child with non-empty tail → recurse.
         // Forward key as-is; the child handles Enter (drill) vs
-        // MaybeSubmit (stop recursion) at its own listing/leaf level.
+        // DrillEnter/DrillTab (stop recursion) at its own listing/leaf level.
         if let Some((ref _matched_id, child_idx)) = parsed.matched_child {
             if !parsed.tail.is_empty() {
                 path.push(_matched_id.clone());
@@ -333,7 +344,7 @@ impl NodeEntry {
         prompt_suffix: &str,
     ) -> MenuResult {
         match key {
-            HostKey::Enter | HostKey::MaybeSubmit => {
+            HostKey::Enter | HostKey::DrillEnter => {
                 // eprintln!("In leaf enter");
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
@@ -433,10 +444,10 @@ impl NodeEntry {
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = path.to_vec();
                 new_path.push(active_id.clone());
-                // Listing drill: child gets " " (the drill indicator).
+                // Listing drill: forward DrillTab to child.
                 self.children[child_idx].node_traverse(
                     epoch,
-                    HostKey::None,
+                    HostKey::DrillTab,
                     new_path,
                     " ",
                     term_width,
@@ -455,12 +466,12 @@ impl NodeEntry {
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = path.to_vec();
                 new_path.push(active_id.clone());
-                // Listing drill: forward MaybeSubmit (not Enter) to stop
-                // recursion — leaf nodes submit on MaybeSubmit, listing
-                // nodes ignore it.
+                // Listing drill: forward DrillEnter to child — leaf
+                // nodes submit on DrillEnter (unless drill_rewrite
+                // intercepts), listing nodes ignore it.
                 self.children[child_idx].node_traverse(
                     epoch,
-                    HostKey::MaybeSubmit,
+                    HostKey::DrillEnter,
                     new_path,
                     " ",
                     term_width,
@@ -1649,6 +1660,108 @@ mod tests {
                 assert!(row_texts[0].contains("valid"));
             }
             other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    /// A leaf node that implements `drill_rewrite` to pre-fill a value.
+    struct RewriteLeaf {
+        prefill: String,
+    }
+
+    impl SlashDotNode for RewriteLeaf {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![crate::fields::Row::new("rename").desc("rename session")],
+                active_ids: Vec::new(),
+            }))
+        }
+
+        fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+            vec!["rename header".into()]
+        }
+
+        fn drill_rewrite(
+            &mut self,
+            _path: &[String],
+            _prompt_suffix: &str,
+            _key: &HostKey,
+        ) -> Option<String> {
+            Some(format!("abc rename {}", self.prefill))
+        }
+    }
+
+    /// Build: root → [RewriteLeaf("rename")] as a single child.
+    /// Root's Enter drill will send DrillEnter to the leaf.
+    fn rewrite_root(prefill: &str) -> NodeEntry {
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(
+            RewriteLeaf { prefill: prefill.to_string() },
+        )));
+        root
+    }
+
+    #[test]
+    fn drill_rewrite_fires_on_drill_enter() {
+        let mut root = rewrite_root("MySession");
+        root.refresh_data(ep(), &[], "");
+        // User presses Enter at root listing → drills into "rename" leaf
+        // with DrillEnter → leaf's drill_rewrite fires.
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", 80);
+        match result {
+            MenuResult::Continue(plan, prompt) => {
+                assert!(plan.rows.is_empty(), "rewrite returns empty plan");
+                assert_eq!(prompt, "abc rename MySession");
+            }
+            other => panic!("expected Continue with rewrite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drill_rewrite_fires_on_drill_tab() {
+        let mut root = rewrite_root("TabFill");
+        root.refresh_data(ep(), &[], "");
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
+        match result {
+            MenuResult::Continue(plan, prompt) => {
+                assert!(plan.rows.is_empty());
+                assert_eq!(prompt, "abc rename TabFill");
+            }
+            other => panic!("expected Continue with rewrite, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drill_rewrite_does_not_fire_on_manual_enter() {
+        let mut root = rewrite_root("MySession");
+        root.refresh_data(ep(), &[], "");
+        // User types "rename " and presses Enter — suffix routes through
+        // node recursion with HostKey::Enter (not DrillEnter).
+        // drill_rewrite should NOT fire; leaf submits normally.
+        let result = root.node_traverse(
+            ep(), HostKey::Enter,
+            Vec::new(),
+            "rename ", 80,
+        );
+        match result {
+            MenuResult::DoneSuccess(_, _) => {
+                // Leaf submitted without drill_rewrite intercepting.
+            }
+            other => panic!("expected DoneSuccess (normal submit), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn drill_rewrite_none_falls_through_to_normal_submit() {
+        // Node without drill_rewrite (default None) → DrillEnter falls
+        // through to normal leaf submit.
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(LeafNode::new())));
+        root.refresh_data(ep(), &[], "");
+        // User presses Enter at root → drills into leaf with DrillEnter.
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", 80);
+        match result {
+            MenuResult::DoneSuccess(_, _) => { /* leaf submitted */ }
+            other => panic!("expected DoneSuccess, got {:?}", other),
         }
     }
 }

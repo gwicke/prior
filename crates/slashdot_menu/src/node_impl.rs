@@ -17,6 +17,7 @@ pub struct PathArgs {
     pub suffix: String,
     /// Parsed arguments from this level's section.
     pub args: Args,
+    // TODO: Drop this - it does not belong in PathArgs!
     /// Terminal width (columns) for layout/formatting decisions.
     pub term_width: usize,
 }
@@ -88,9 +89,13 @@ pub enum HostKey {
     MoveCursor(i32),
     /// No key action — used when Tab drills but does not forward a key.
     None,
-    /// Forwarded Enter from a parent listing. Leaf nodes submit on this;
-    /// listing nodes ignore it (stops recursion).
-    MaybeSubmit,
+    /// Drilled into from a parent listing via Enter. Leaf nodes submit
+    /// on this (unless `drill_rewrite` intercepts); listing nodes
+    /// ignore it (stops recursion).
+    DrillEnter,
+    /// Drilled into from a parent listing via Tab. Listing and leaf
+    /// nodes can use this to trigger `drill_rewrite`.
+    DrillTab,
 }
 
 // --- Public trait for host implementations ---
@@ -152,6 +157,31 @@ pub trait SlashDotNode {
     /// rows render as plain `id — description` text. Default: empty.
     fn columns(&self) -> Vec<crate::provider::ColumnDef> {
         Vec::new()
+    }
+
+    /// Optional prompt rewrite on drill. Called when a parent listing
+    /// drills into this node (user presses Tab or Enter on a parent
+    /// selection).
+    ///
+    /// Returns `Some(new_full_prompt)` to replace the current prompt
+    /// and restart traversal from root, or `None` for default behavior
+    /// (listing: show listing; leaf: submit on Enter drill).
+    ///
+    /// `path` is the node's position in the tree (e.g. `["compact"]`).
+    /// `prompt_suffix` is the raw prompt section after the parent's
+    /// matched ID.
+    ///
+    /// `&mut self` provides full access to shared state (e.g.
+    /// `MenuShared` for session tree queries, settings for pre-fills).
+    ///
+    /// **Default:** `None` — no rewrite.
+    fn drill_rewrite(
+        &mut self,
+        _path: &[String],
+        _prompt_suffix: &str,
+        _key: &HostKey,
+    ) -> Option<String> {
+        None
     }
 }
 
