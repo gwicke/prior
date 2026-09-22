@@ -2717,7 +2717,7 @@ impl Repl {
                                                     let committed = format!("/{}", prompt);
                                                     Repl::emit_commit(
                                                         output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &committed, "", true,
+                                                        &mut input_row, &committed, "", false,
                                                     );
                                                     if let Some(text) = msg {
                                                         output.display_text(&text);
@@ -2739,7 +2739,7 @@ impl Repl {
                                                     let committed = format!("/{}", prompt);
                                                     Repl::emit_commit(
                                                         output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &committed, "", true,
+                                                        &mut input_row, &committed, "", false,
                                                     );
                                                     output.display_text(&err);
                                                     return Some(InputAction::MenuDone);
