@@ -464,13 +464,6 @@ had a single top-level `startLine`/`endLine` window that constrained *every*
 block equally, so you could not aim two structurally-identical replacements at
 two different regions.
 
-The new text
-
-Only if telemetry shows demand (e.g. count runs of consecutive single-file
-`edit` calls targeting different paths as a proxy for wanting one call).
-
-### Changes beyond Phase 1
-=======
 ### Grammar
 
 A block's header line may carry a trailing line anchor:
@@ -481,8 +474,52 @@ some/path.rs:120
 The original text
 =======
 The new text
-=======
-The new text
+>>>>>>> REPLACE
+```
+
+### Semantics
+
+- **Anchor, not window.** A lone line number does not restrict the search; the
+  whole file is always searched. It **disambiguates**: when `oldText` occurs
+  more than once, the occurrence whose start line is nearest the anchor wins.
+- **Tolerance.** Nearest-match is accepted only within
+  `(context_lines / 3).min(4)` lines — a bare single-line SEARCH stays exact and
+  three context lines allow ±1. A globally unique match ignores the anchor.
+- **One anchor source per shape (B).** Single edit: the `path` argument
+  (`path:LINE` suffix or `startLine`). Blob: **only** `path:LINE` block headers;
+  a top-level `startLine`/`path:LINE` is stripped and ignored, so a stray
+  call-wide anchor cannot silently aim an unrelated block.
+- **Transient.** Anchors are not persisted (the canonical array has no line) and
+  not rendered in the model-facing blob.
+- **No end line.** The `oldText` end is implied by its length; see *No
+  `endLine`*.
+
+### Teaching the syntax
+
+When the model did *not* anchor, the success string echoes where each block
+matched — `Replaced 1 block(s) in ./src/foo.rs (matched at ./src/foo.rs:132)` —
+so the `path:LINE` idiom appears in the very transcript it imitates. It is a
+picocode-authored string (deterministic, stored), never a rewrite of the
+model's own arguments. The ambiguity error teaches the same syntax more
+pointedly.
+
+### No `endLine`
+
+`endLine` was **dropped** rather than kept alongside the anchor. With it, the
+field had two meanings — "first line of an exact byte window" when `endLine` was
+set, "nearest-match anchor" when it was not — a comprehension tax selected by a
+sibling field's presence. The window's only unique power was targeting a *far*
+occurrence that was nonetheless the sole match in a broad range; in practice you
+anchor *on* the target or add context instead. Crucially it did **not** remove the
+anchor's one real hazard — a silent wrong-pick, which is inherent to nearest-match
+and survives either way. Dropping it is a strict simplification (one anchor
+concept, no window code), and its cost is *loud*: a legacy call relying on a wide
+window now fails as out-of-tolerance and can simply be retried. Since anchors are
+transient, there is no session or pi-format migration.
+
+---
+
+## Phase 2 — multi-file (gated)
 
 Only if telemetry shows demand (e.g. count runs of consecutive single-file
 `edit` calls targeting different paths as a proxy for wanting one call).
@@ -522,8 +559,10 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
 - **`startLine` semantics**: an **anchor** (near-line hint), not a search
   window; never persisted, never served to the model.
 - **`endLine`**: **dropped** (see *No `endLine`*).
-- **Anchor source is per shape (B)**: single edit → top-level `startLine`; blob
-  → `path:LINE` headers only (top-level `startLine` ignored).
+- **Anchor source is per shape (B)**: single edit → the `path` argument
+  (`path:LINE` suffix or `startLine`, which must agree if both are given); blob
+  → `path:LINE` headers only (a top-level `startLine`/`path:LINE` is stripped
+  and ignored).
 - **Path normalization** for the conflict check: reuse
   `path_util::resolve_normalized` (resolve both sides against cwd, then
   compare).
@@ -534,7 +573,15 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
 - **Per-block anchor**: a header may be `path:LINE`, supplying that block's
   nearest-match hint (see *Per-block line anchors*); transient (not persisted,
   not rendered).
+- **`path:LINE` on the `path` argument**: accepted in every shape; the suffix is
+  always peeled off before path resolution. It is an anchor only for the single
+  edit (alias of `startLine`, must agree); in the blob form it is stripped and
+  ignored.
 - **Tolerance**: `(context_lines / 3).min(4)`; unique matches ignore it.
+- **Success-string hint**: when no edit anchored, the result echoes each match
+  location (`Replaced N block(s) in ./f (matched at ./f:LINE)`) to teach the
+  syntax by example — a picocode-authored, deterministic string, never a rewrite
+  of the model's own args.
 
 ## Implementation status (Phase 1 — done)
 
@@ -575,7 +622,12 @@ legacy-normalize (`session`), history blobification (`agent`). Full suite green.
 - `src/config.rs`: `EditEndLine` removed.
 - `src/output.rs`: `endLine` read dropped.
 - `src/agent.rs`: system prompt documents the `path:LINE` anchor.
+- `src/tools.rs`: `path:LINE` on the `path` argument (honored for a single edit;
+  stripped-and-ignored in the blob form); the success string echoes match
+  locations when unanchored.
 
 New tests: nearest-duplicate pick, within/out-of-tolerance, unique-ignores
 anchor, tie-is-ambiguous, tolerance scaling, header anchor capture,
-`split_line_anchor` forms, top-level `startLine` ignored in blob form. Green.
+`split_line_anchor` forms, top-level `startLine` ignored in blob form,
+`path:LINE` single-edit anchor + conflict, suffix stripped in blob form,
+success-string location hint. Green.

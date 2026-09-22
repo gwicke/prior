@@ -339,20 +339,37 @@ impl EditArgs {
     /// line inside the blocks may agree with it (or supply it when absent), but
     /// a disagreement is a hard error (never silently write the wrong file).
     ///
-    /// Anchors are **per shape, never mixed**: the single-edit form takes the
-    /// top-level `startLine`; the blob form takes anchors *only* from
-    /// `path:LINE` headers, and ignores a top-level `startLine` (a stray
-    /// call-wide anchor must not silently aim an unrelated block).
+    /// The `path` argument also accepts the `file:LINE` idiom; the trailing
+    /// `:LINE` is peeled off before path resolution in **every** shape (so
+    /// `f.rs:12` resolves to `f.rs`, not a nonexistent file named `f.rs:12`).
+    ///
+    /// Anchors are **per shape, never mixed**:
+    ///
+    /// - single edit: anchors come from `path:LINE` and/or `startLine` (they
+    ///   must agree if both are present);
+    /// - blob form: anchors come *only* from each block's `path:LINE` header —
+    ///   the top-level `startLine` and any `path:LINE` are ignored, so a stray
+    ///   call-wide anchor cannot silently aim an unrelated block.
     fn from_wire(raw: &serde_json::Value) -> Result<Self, String> {
         let obj = match raw.as_object() {
             Some(o) => o,
             None => return Err(Self::invalid(raw, "arguments must be a JSON object")),
         };
-        let json_path = obj
+        let raw_path = obj
             .get("path")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        // Peel a `file:LINE` suffix off the `path` argument; the path part is
+        // what resolves to a file.
+        let (json_path, path_anchor): (Option<String>, Option<u64>) = match raw_path {
+            Some(p) => {
+                let (path, anchor) = crate::edit_blocks::split_line_anchor(p);
+                (Some(path), anchor)
+            }
+            None => (None, None),
+        };
+        let json_path = json_path.as_deref();
         let start_line = obj
             .get("startLine")
             .and_then(|v| v.as_u64())
@@ -392,19 +409,35 @@ impl EditArgs {
             });
         }
 
-        // Single form: top-level oldText/newText.
+        // Single form: top-level oldText/newText. Both `path:LINE` and
+        // `startLine` may anchor it; if both are present they must agree.
         if let (Some(o), Some(n)) = (
             obj.get("oldText").and_then(|v| v.as_str()),
             obj.get("newText").and_then(|v| v.as_str()),
         ) {
             let path = json_path
                 .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let anchor = match (start_line, path_anchor) {
+                (Some(s), Some(p)) if s.0 != p => {
+                    return Err(Self::invalid(
+                        raw,
+                        &format!(
+                            "the `path` argument anchors line {p} but `startLine` is {}; \
+                             they must agree",
+                            s.0
+                        ),
+                    ));
+                }
+                (Some(s), _) => Some(s),
+                (None, Some(p)) => Some(crate::config::EditStartLine(p)),
+                (None, None) => None,
+            };
             return Ok(EditArgs {
                 path: path.to_string(),
                 edits: vec![EditOp {
                     old_text: o.to_string(),
                     new_text: n.to_string(),
-                    start_line,
+                    start_line: anchor,
                 }],
             });
         }
@@ -451,11 +484,11 @@ impl rig_core::tool::Tool for EditFile {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File to edit, relative to the working directory. Required for the single-edit form; optional for the block form when the edit text starts with a filename line. A header line may be written `path:LINE` (e.g. `src/foo.rs:120`) to anchor that block near a 1-indexed line."
+                    "description": "File to edit, relative to the working directory. Required for the single-edit form; optional for the block form when the edit text starts with a filename line. It accepts the `file:LINE` idiom (e.g. `src/foo.rs:120`): for a single edit the suffix is an anchor; in the block form only the path part is used (per-block anchors live on the block headers)."
                 },
                 "oldText": {
                     "type": "string",
-                    "description": "Exact text to replace (single-edit form). Must occur exactly once in the file, or pair with `startLine`."
+                    "description": "Exact text to replace (single-edit form). Must occur exactly once in the file, or pair with `startLine`/a `path:LINE` suffix."
                 },
                 "newText": {
                     "type": "string",
@@ -463,7 +496,7 @@ impl rig_core::tool::Tool for EditFile {
                 },
                 "startLine": {
                     "type": "integer",
-                    "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. Ignored in the block form — use a `path:LINE` header there instead."
+                    "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. A `path:LINE` suffix is an equivalent alias; if both are given they must agree. Ignored in the block form — use a `path:LINE` block header there instead."
                 },
                 "edits": {
                     "type": "string",
@@ -651,6 +684,14 @@ pub async fn edit_file(
         replacements.push((abs_start, abs_end, edit.new_text.clone()));
     }
 
+    // Match line of each edit, from the *original* text (the offsets target it;
+    // computing after the edits below would shift the numbers). Used to teach
+    // the `path:LINE` anchor by example when the model didn't supply one.
+    let matched_lines: Vec<usize> = resolved
+        .iter()
+        .map(|off| crate::edit_match::count_lines(&text[..*off]) + 1)
+        .collect();
+
     // Sort by start position descending so we can apply from end to start
     replacements.sort_by(|a, b| b.0.cmp(&a.0));
     let mut result = text;
@@ -666,10 +707,33 @@ pub async fn edit_file(
     // outside cwd — see `path_util::relativize_path`.
     let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
     let shown = relativize_path(&p, &cwd);
+    // When no anchor was supplied, echo where each block actually matched. The
+    // `path:LINE` idiom shown here is the same anchor syntax the blob form
+    // accepts, so the model learns it from its own transcript. Only shown when
+    // *no* edit anchored (`matched_lines` then lines up with `edits`); if the
+    // model already anchored, it needs no reminder.
+    let matched_note = if edits.iter().any(|e| e.start_line.is_some()) {
+        String::new()
+    } else {
+        match matched_lines.as_slice() {
+            [] => String::new(),
+            [l] => format!(" (matched at {shown}:{l})"),
+            lines if lines.len() <= 3 => {
+                let list = lines
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" (matched lines {list})")
+            }
+            lines => format!(" (matched {} lines)", lines.len()),
+        }
+    };
     Ok(format!(
-        "Replaced {} block(s) in {}",
+        "Replaced {} block(s) in {}{}",
         edits.len(),
-        shown
+        shown,
+        matched_note
     ))
 }
 
@@ -2920,6 +2984,104 @@ mod edit_args_wire_tests {
         let result = execute_edit(serde_json::json!({"path": "win2.txt", "edits": blob})).await;
         assert!(result.is_success(), "got: {result:?}");
         assert_eq!(tokio::fs::read_to_string("win2.txt").await.unwrap(), "x\nkeep\ny\n");
+    }
+
+    // ---- `path:LINE` on the JSON `path` argument ----
+
+    #[tokio::test]
+    #[serial]
+    async fn path_argument_line_suffix_anchors_single_edit() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("pa.txt", "x\nkeep\nx\n").await.unwrap();
+        // `path` carries the anchor, so it also proves the suffix is stripped:
+        // the file resolves to `pa.txt`, not a literal `pa.txt:3`.
+        let result = execute_edit(serde_json::json!({
+            "path": "pa.txt:3", "oldText": "x", "newText": "y"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("pa.txt").await.unwrap(),
+            "x\nkeep\ny\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn path_argument_line_and_startline_must_agree() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let result = execute_edit(serde_json::json!({
+            "path": "pf.txt:3", "oldText": "x", "newText": "y", "startLine": 5
+        }))
+        .await;
+        assert!(result.is_error(), "conflict must fail: {result:?}");
+        assert!(
+            result.output().render().contains("must agree"),
+            "got: {}",
+            result.output().render()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn blob_form_path_line_suffix_is_stripped_but_not_an_anchor() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("pb.txt", "x\nkeep\nx\n").await.unwrap();
+        // In blob form the `path` suffix is only stripped (file resolves), NOT
+        // used as an anchor — repeated text stays ambiguous and fails loudly
+        // rather than silently aiming an unrelated block.
+        let result = execute_edit(serde_json::json!({
+            "path": "pb.txt:3",
+            "edits": "pb.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(
+            result.output().render().contains("appears 2 times"),
+            "got: {}",
+            result.output().render()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("pb.txt").await.unwrap(),
+            "x\nkeep\nx\n",
+        );
+    }
+
+    // ---- Success-string match location (imitation hint) ----
+
+    #[tokio::test]
+    #[serial]
+    async fn success_string_reports_match_location_when_unanchored() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("m.txt", "a\nb\nc\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "m.txt", "edits": "m.txt\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        // The match sits on line 2; the result teaches the `path:LINE` idiom.
+        assert!(
+            result.output().render().contains("(matched at ./m.txt:2)"),
+            "got: {}",
+            result.output().render()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn success_string_omits_location_when_anchored() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("ma.txt", "x\nkeep\nx\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "ma.txt", "edits": "ma.txt:3\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        // The model already anchored — no teaching hint needed.
+        assert!(
+            !result.output().render().contains("matched"),
+            "anchored call must not add a location hint: {}",
+            result.output().render()
+        );
     }
 
     // ---- Per-block line anchors (`path:LINE` headers) ----

@@ -113,7 +113,9 @@ fn header_candidate(line: &str) -> Option<String> {
 /// Windows drive path (`C:\foo\bar.rs`) is left intact — the anchor is taken
 /// from the *rightmost* `:digits` group. A line number of `0` is not a valid
 /// 1-based anchor and is treated as part of the path.
-fn split_line_anchor(token: &str) -> (String, Option<u64>) {
+///
+/// Shared by the blob header parser and the `path` argument parser.
+pub fn split_line_anchor(token: &str) -> (String, Option<u64>) {
     fn digits(s: &str) -> Option<u64> {
         if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
             s.parse::<u64>().ok().filter(|n| *n >= 1)
