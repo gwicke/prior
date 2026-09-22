@@ -545,7 +545,9 @@ impl SlashDotNode for TreeListNode {
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
-        tree_listing_columns()
+        // Empty = default id + description rendering for child rows
+        // (switch, compact, etc.).
+        Vec::new()
     }
 
     fn fields(&self) -> Vec<FieldSpec> {
