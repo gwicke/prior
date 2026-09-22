@@ -115,6 +115,9 @@ fn session_path_display(meta: &crate::repl::SessionMeta) -> String {
             let home_path = std::path::Path::new(&home);
             let rel = crate::path_util::relativize_path(session_cwd, home_path);
             if !rel.starts_with('/') {
+                if rel == "." {
+                    return "~".to_string();
+                }
                 let stripped = rel.strip_prefix("./").unwrap_or(&rel);
                 return format!("~/{stripped}");
             }
