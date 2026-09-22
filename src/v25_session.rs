@@ -249,6 +249,17 @@ impl SlashDotNode for SessionListNode {
         Ok(Rc::new(DataResponse { rows, active_ids }))
     }
 
+    fn drill_rewrite(
+        &mut self,
+        _path: &[String],
+        _prompt_suffix: &str,
+        _key: &crate::slashdot_menu::HostKey,
+    ) -> Option<String> {
+        // On drill, add a default path filter to show only sessions
+        // relevant to the current working directory.
+        Some("session .path:.".to_string())
+    }
+
     fn columns(&self) -> Vec<ColumnDef> {
         session_action_columns()
     }
@@ -440,6 +451,23 @@ impl SlashDotNode for SessionRenameNode {
             "Leave empty to clear the name.".to_string(),
             format!("Current name: {}", current_name),
         ]
+    }
+
+    fn drill_rewrite(
+        &mut self,
+        path: &[String],
+        _prompt_suffix: &str,
+        _key: &crate::slashdot_menu::HostKey,
+    ) -> Option<String> {
+        // Pre-fill the current session name. path is
+        // ["session", "<uuid>", "rename"].
+        let sid = path.get(1).map(|s| s.as_str()).unwrap_or_default();
+        let current_name = find_session(&self.shared, sid)
+            .and_then(|m| m.name)
+            .unwrap_or_default();
+        // Rebuild the full prompt: "session <uuid> rename <name>"
+        let prefix = path.join(" ");
+        Some(format!("{} {}", prefix, current_name))
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -982,5 +1010,28 @@ mod tests {
         };
         let desc = session_description(&meta);
         assert_eq!(desc, "(empty)");
+    }
+
+    // --- drill_rewrite tests ---
+
+    #[test]
+    fn session_list_drill_rewrite_adds_path_filter() {
+        use crate::slashdot_menu::node_impl::SlashDotNode;
+        let shared = make_shared();
+        let mut node = SessionListNode { shared: shared.clone() };
+        let path = vec!["session".to_string()];
+        let result = node.drill_rewrite(&path, " ", &HostKey::DrillTab);
+        assert_eq!(result, Some("session .path:.".to_string()));
+    }
+
+    #[test]
+    fn session_rename_drill_rewrite_prefills_name() {
+        use crate::slashdot_menu::node_impl::SlashDotNode;
+        // No repo → find_session returns None → empty name.
+        let shared = make_shared();
+        let mut node = SessionRenameNode { shared: shared.clone() };
+        let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
+        let result = node.drill_rewrite(&path, " ", &HostKey::DrillEnter);
+        assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

@@ -90,6 +90,18 @@ impl SlashDotNode for SettingLeafNode {
         let val = self.settings.borrow().value(self.key);
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
     }
+
+    fn drill_rewrite(
+        &mut self,
+        path: &[String],
+        _prompt_suffix: &str,
+        _key: &crate::slashdot_menu::HostKey,
+    ) -> Option<String> {
+        // Pre-fill the current value. path is ["set", "<setting-name>"].
+        let val = self.settings.borrow().value(self.key);
+        let prefix = path.join(" ");
+        Some(format!("{} {}", prefix, val))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,5 +402,18 @@ mod tests {
             }
             other => panic!("expected DoneSuccess with error, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn setting_leaf_drill_rewrite_prefills_value() {
+        use crate::slashdot_menu::node_impl::SlashDotNode;
+        let settings = test_settings();
+        let mut node = SettingLeafNode {
+            key: SettingKey::ToolCallLimit,
+            settings: settings.clone(),
+        };
+        let path = vec!["set".to_string(), "tool_call_limit".to_string()];
+        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        assert_eq!(result, Some("set tool_call_limit 50".to_string()));
     }
 }

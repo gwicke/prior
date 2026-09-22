@@ -645,6 +645,52 @@ impl SlashDotNode for TreeSwitchNode {
 }
 
 // ---------------------------------------------------------------------------
+// CompactNode (root-level /compact shortcut)
+// ---------------------------------------------------------------------------
+
+/// Root-level `/compact` leaf node. On drill, looks up the current
+/// session leaf (message ID) and redirects to `/tree <id> compact `
+/// so the compact modes are listed.
+pub struct CompactNode {
+    pub shared: Rc<MenuShared>,
+}
+
+impl SlashDotNode for CompactNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("compact").desc("summarize conversation up to the current point")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        vec![
+            "Compact: summarize entries before the current point.".into(),
+            "Redirects to /tree <id> compact.".into(),
+        ]
+    }
+
+    fn drill_rewrite(
+        &mut self,
+        _path: &[String],
+        _prompt_suffix: &str,
+        _key: &crate::slashdot_menu::HostKey,
+    ) -> Option<String> {
+        // Look up the current session leaf ID and redirect.
+        let leaf_id = self.shared.leaf_id.borrow().clone()?;
+        Some(format!("tree {} compact ", leaf_id))
+    }
+
+    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+        // Enter (without drill) should also redirect — treat as drill.
+        match self.shared.leaf_id.borrow().clone() {
+            Some(leaf_id) => SubmitResult::NewPath(format!("tree {} compact ", leaf_id)),
+            None => SubmitResult::Done(Some("No active session leaf to compact.".to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TreeCompactManualNode
 // ---------------------------------------------------------------------------
 
@@ -772,6 +818,18 @@ impl SlashDotNode for TreeCompactPromptNode {
                 format!("  {}", prompt),
             ]
         }
+    }
+
+    fn drill_rewrite(
+        &mut self,
+        path: &[String],
+        _prompt_suffix: &str,
+        _key: &crate::slashdot_menu::HostKey,
+    ) -> Option<String> {
+        // Pre-fill the default compaction prompt.
+        // path is ["tree", "<id>", "compact", "prompt"].
+        let prefix = path.join(" ");
+        Some(format!("{} {}", prefix, "Summarize the conversation up to this point."))
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -1882,5 +1940,39 @@ mod tests {
         let a_indent = a_desc.len() - a_desc.trim_start().len();
         assert_eq!(u1_indent, 0, "user should have indent 0: {:?}", u1_desc);
         assert_eq!(a_indent, 2, "assistant should have indent 2 after tool chain: {:?}", a_desc);
+    }
+
+    // --- drill_rewrite tests ---
+
+    #[test]
+    fn compact_node_drill_rewrite_redirects_to_tree() {
+        let shared = make_shared();
+        *shared.leaf_id.borrow_mut() = Some("msg-42".into());
+        let mut node = CompactNode { shared: shared.clone() };
+        let path = vec!["compact".to_string()];
+        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        assert_eq!(result, Some("tree msg-42 compact ".to_string()));
+    }
+
+    #[test]
+    fn compact_node_no_leaf_returns_none() {
+        let shared = make_shared();
+        // leaf_id is None (no session).
+        let mut node = CompactNode { shared: shared.clone() };
+        let path = vec!["compact".to_string()];
+        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn compact_prompt_drill_rewrite_fills_default() {
+        let shared = make_shared();
+        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let path = vec!["tree".to_string(), "msg-1".to_string(),
+                        "compact".to_string(), "prompt".to_string()];
+        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        assert_eq!(result, Some(
+            "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
+        ));
     }
 }

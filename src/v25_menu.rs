@@ -101,6 +101,13 @@ pub fn build_menu(
         }.into());
     }
 
+    // Compact (/compact) — leaf node; redirects to /tree <id> compact.
+    {
+        root.add_child(crate::v25_tree::CompactNode {
+            shared: shared.clone(),
+        }.into());
+    }
+
     // Tree (/tree) — dynamic listing with action children.
     {
         root.add_child(crate::v25_tree::build_tree_node(shared));
