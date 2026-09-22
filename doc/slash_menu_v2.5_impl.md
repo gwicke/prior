@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 598 lib tests pass.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 606 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full

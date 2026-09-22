@@ -242,9 +242,11 @@ impl PlanBuilder {
                 t.add_row(&cells);
             }
             let rendered = t.render_multiline(max_width.saturating_sub(2));
-            // Table header
-            let header_text = t.render_header(max_width.saturating_sub(2));
-            table_header_line = Some(LogicalLine::new(header_text));
+            // Table header — only if at least one column has a label.
+            if state.columns.iter().any(|c| !c.header.is_empty()) {
+                let header_text = t.render_header(max_width.saturating_sub(2));
+                table_header_line = Some(LogicalLine::new(header_text));
+            }
             rendered
         } else {
             state.candidates.iter().map(|r| match &r.description {

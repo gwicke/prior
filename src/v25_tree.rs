@@ -148,27 +148,14 @@ fn collect_active_path(
 }
 
 // ---------------------------------------------------------------------------
-// Tree flattening (port of Repl::flatten_turns)
+// Tree flattening
 // ---------------------------------------------------------------------------
 
-#[derive(PartialEq)]
-enum TurnKind {
-    User,
-    Assistant,
-    Boundary,
-}
-
-fn turn_kind(entry: &SessionEntry) -> TurnKind {
-    match &entry.content {
-        SessionEntryContent::Message { message } => {
-            match message.get("role").and_then(|r| r.as_str()) {
-                Some("user") => TurnKind::User,
-                Some("assistant") => TurnKind::Assistant,
-                _ => TurnKind::Boundary,
-            }
-        }
-        _ => TurnKind::Boundary,
-    }
+/// True if this entry is a visible assistant message (for indent rule).
+fn is_assistant(entry: &SessionEntry) -> bool {
+    matches!(&entry.content,
+        SessionEntryContent::Message { message }
+        if message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
 }
 
 /// One row in the flattened tree.
@@ -284,33 +271,14 @@ fn flatten_turns(
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
-    in_turn: &mut bool,
     out: &mut Vec<FlatRow>,
 ) {
     for node in nodes {
-        let kind = turn_kind(&node.entry);
         let label =
             entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
-        let row_indent = match kind {
-            TurnKind::User => {
-                *in_turn = true;
-                indent
-            }
-            TurnKind::Assistant => {
-                if *in_turn {
-                    indent + 2
-                } else {
-                    indent
-                }
-            }
-            TurnKind::Boundary => {
-                *in_turn = false;
-                indent
-            }
-        };
-
         if label.is_empty() {
+            // Meta entry: skip visual row but still descend.
             let child_branch_depth = if node.children.len() > 1 {
                 branch_depth + 1
             } else {
@@ -323,11 +291,15 @@ fn flatten_turns(
                 leaf_id,
                 active_path,
                 labels,
-                in_turn,
                 out,
             );
             continue;
         }
+
+        // Indent rule: assistant → +2, everything else (user,
+        // compaction, model change) → base indent.  Branch forks
+        // add +4 via child_indent below.
+        let row_indent = if is_assistant(&node.entry) { indent + 2 } else { indent };
 
         let is_active = active_path.contains(&node.entry.id);
         let is_current = leaf_id == Some(node.entry.id.as_str());
@@ -364,7 +336,6 @@ fn flatten_turns(
             leaf_id,
             active_path,
             labels,
-            in_turn,
             out,
         );
     }
@@ -401,7 +372,8 @@ fn entry_display_label_ext(
 
 /// Column definitions for the `/tree` listing.
 pub fn tree_listing_columns() -> Vec<ColumnDef> {
-    vec![ColumnDef::new("description", "Description").min(20).prio(3).wrap(false)]
+    // Empty label suppresses the table header row (no "DESCRIPTION" line).
+    vec![ColumnDef::new("description", "").min(20).prio(3).wrap(false)]
 }
 
 /// Field metadata for the tree listing.
@@ -517,7 +489,6 @@ impl SlashDotNode for TreeListNode {
 
         let labels = build_label_map(&tree_rc);
         let mut flat = Vec::new();
-        let mut in_turn = false;
         flatten_turns(
             &tree_rc,
             0,
@@ -525,7 +496,6 @@ impl SlashDotNode for TreeListNode {
             leaf.as_deref(),
             &active_path,
             &labels,
-            &mut in_turn,
             &mut flat,
         );
 
@@ -1412,5 +1382,481 @@ mod tests {
         let header = node.header(&path_args);
         assert!(header.iter().any(|l| l.contains("default")),
             "header should mention default: {:?}", header);
+    }
+
+    // --- Indentation ---
+
+    #[test]
+    fn linear_session_indent_user_assistant() {
+        // Linear tree: u1 → a1 → u2 → a2 → u3 → a3
+        // Expected: user=0, assistant=2, user=0, assistant=2, ...
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply 1"),
+                vec![node(
+                    make_entry("u2", Some("a1"), "user", "second"),
+                    vec![node(
+                        make_entry("a2", Some("u2"), "assistant", "reply 2"),
+                        vec![node(
+                            make_entry("u3", Some("a2"), "user", "third"),
+                            vec![node(
+                                make_entry("a3", Some("u3"), "assistant", "reply 3"),
+                                vec![],
+                            )],
+                        )],
+                    )],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+        assert_eq!(resp.rows.len(), 6, "should have 6 visible entries");
+
+        let mut flat = Vec::new();
+        for row in resp.rows.iter() {
+            let desc = row.description.clone().unwrap_or_default();
+            let indent = desc.len() - desc.trim_start().len();
+            flat.push((row.id.clone(), indent));
+        }
+
+        // u1=0, a1=2, u2=0, a2=2, u3=0, a3=2
+        let expected = vec![
+            ("u1", 0),
+            ("a1", 2),
+            ("u2", 0),
+            ("a2", 2),
+            ("u3", 0),
+            ("a3", 2),
+        ];
+        assert_eq!(flat.len(), expected.len());
+        for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
+            assert_eq!(flat[i].0, *exp_id, "row {} id", i);
+            assert_eq!(flat[i].1, *exp_indent,
+                "row {} ({}) indent: expected {}, got {}",
+                i, exp_id, exp_indent, flat[i].1);
+        }
+    }
+
+    #[test]
+    fn linear_session_indent_render_plan() {
+        // Verify the full render plan preserves indent spacing.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "hello"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "world"),
+                vec![],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut menu = build_tree_menu(&shared);
+        let mut handle = menu.get_handle();
+        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        match result {
+            MenuResult::Continue(plan, _) => {
+                assert_eq!(plan.rows.len(), 2);
+                let u1_text = &plan.rows[0].0;
+                let a1_text = &plan.rows[1].0;
+                let u1_indent = u1_text.len() - u1_text.trim_start().len();
+                let a1_indent = a1_text.len() - a1_text.trim_start().len();
+                assert_eq!(u1_indent, 0, "user row should have no indent: {:?}", u1_text);
+                assert_eq!(a1_indent, 2, "assistant row should have 2-space indent: {:?}", a1_text);
+            }
+            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn linear_session_indent_render_plan_long() {
+        // 6-entry linear tree through the full render pipeline.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first message"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "first reply"),
+                vec![node(
+                    make_entry("u2", Some("a1"), "user", "second message"),
+                    vec![node(
+                        make_entry("a2", Some("u2"), "assistant", "second reply"),
+                        vec![node(
+                            make_entry("u3", Some("a2"), "user", "third message"),
+                            vec![node(
+                                make_entry("a3", Some("u3"), "assistant", "third reply"),
+                                vec![],
+                            )],
+                        )],
+                    )],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut menu = build_tree_menu(&shared);
+        let mut handle = menu.get_handle();
+        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        match result {
+            MenuResult::Continue(plan, _) => {
+                assert_eq!(plan.rows.len(), 6);
+                let expected = vec![
+                    ("u1", 0),
+                    ("a1", 2),
+                    ("u2", 0),
+                    ("a2", 2),
+                    ("u3", 0),
+                    ("a3", 2),
+                ];
+                for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
+                    let text = &plan.rows[i].0;
+                    let indent = text.len() - text.trim_start().len();
+                    assert_eq!(indent, *exp_indent,
+                        "row {} ({}) indent wrong in rendered output: {:?}",
+                        i, exp_id, text);
+                }
+            }
+            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn indent_survives_table_render() {
+        // Check that leading-space indent survives through the Table
+        // rendering pipeline used by build_render_plan.
+        use crate::slashdot_menu::table::{Table, Align};
+
+        let cells = vec![
+            "hello",           // indent 0
+            "  world",         // indent 2
+            "    model",       // indent 4
+        ];
+        let mut t = Table::new(&[""])
+            .with_aligns(&[Align::Left])
+            .with_min_widths(&[20])
+            .with_priorities(&[3])
+            .set_gap(2);
+        for c in &cells {
+            t.add_row(&[c.to_string()]);
+        }
+        let rendered = t.render(80);
+        assert_eq!(rendered.len(), 3);
+        for (i, (cell, line)) in cells.iter().zip(rendered.iter()).enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let expected_indent = cell.len() - cell.trim_start().len();
+            assert_eq!(indent, expected_indent,
+                "row {} cell={:?} rendered={:?}: indent lost in table render",
+                i, cell, line);
+        }
+    }
+
+    #[test]
+    fn debug_cell_text_from_build_render_plan() {
+        // Dump the actual cell text that build_render_plan feeds to the table.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply1"),
+                vec![node(
+                    make_entry("u2", Some("a1"), "user", "second"),
+                    vec![node(
+                        make_entry("a2", Some("u2"), "assistant", "reply2"),
+                        vec![],
+                    )],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec!["tree".into()],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+        eprintln!("=== DataResponse rows ===");
+        for (i, row) in resp.rows.iter().enumerate() {
+            let desc = row.description.clone().unwrap_or_default();
+            let indent = desc.len() - desc.trim_start().len();
+            eprintln!("  row {}: id={:?} indent={} desc={:?}", i, row.id, indent, desc);
+        }
+    }
+
+    #[test]
+    fn tree_with_model_changes_indent_render() {
+        // Realistic tree: user/assistant turns with model changes at the end.
+        // u1 → a1 → u2 → a2 → mc1 → mc2, mc3, mc4
+        let mc2 = SessionTreeNode {
+            entry: SessionEntry {
+                id: "mc2".into(),
+                parent_id: Some("mc1".into()),
+                timestamp: "2025-01-01T00:00:01.000Z".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "openai".into(),
+                    model_id: "gpt-4o".into(),
+                },
+            },
+            children: vec![],
+            label: None,
+        };
+        let mc3 = SessionTreeNode {
+            entry: SessionEntry {
+                id: "mc3".into(),
+                parent_id: Some("mc1".into()),
+                timestamp: "2025-01-01T00:00:02.000Z".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-3".into(),
+                },
+            },
+            children: vec![],
+            label: None,
+        };
+        let mc4 = SessionTreeNode {
+            entry: SessionEntry {
+                id: "mc4".into(),
+                parent_id: Some("mc1".into()),
+                timestamp: "2025-01-01T00:00:03.000Z".into(),
+                content: SessionEntryContent::ModelChange {
+                    provider: "openai".into(),
+                    model_id: "gpt-4o".into(),
+                },
+            },
+            children: vec![],
+            label: None,
+        };
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply1"),
+                vec![node(
+                    make_entry("u2", Some("a1"), "user", "second"),
+                    vec![node(
+                        make_entry("a2", Some("u2"), "assistant", "reply2"),
+                        vec![SessionTreeNode {
+                            entry: SessionEntry {
+                                id: "mc1".into(),
+                                parent_id: Some("a2".into()),
+                                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                                content: SessionEntryContent::ModelChange {
+                                    provider: "openai".into(),
+                                    model_id: "gpt-4o".into(),
+                                },
+                            },
+                            children: vec![mc2, mc3, mc4],
+                            label: None,
+                        }],
+                    )],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut menu = build_tree_menu(&shared);
+        let mut handle = menu.get_handle();
+        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        match result {
+            MenuResult::Continue(plan, _) => {
+                // Print for debugging
+                for (i, row) in plan.rows.iter().enumerate() {
+                    let indent = row.0.len() - row.0.trim_start().len();
+                    eprintln!("  row {}: indent={} {:?}", i, indent, row.0);
+                }
+                assert_eq!(plan.rows.len(), 8);
+                let expected = vec![
+                    ("u1", 0),
+                    ("a1", 2),
+                    ("u2", 0),
+                    ("a2", 2),
+                    ("mc1", 0),  // model change: Boundary at base
+                    ("mc2", 4),  // branch: mc1 has 3 children → indent+4
+                    ("mc3", 4),
+                    ("mc4", 4),
+                ];
+                for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
+                    let text = &plan.rows[i].0;
+                    let indent = text.len() - text.trim_start().len();
+                    assert_eq!(indent, *exp_indent,
+                        "row {} ({}) indent wrong: {:?}", i, exp_id, text);
+                }
+            }
+            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn linear_session_with_model_change_indent() {
+        // u1 → a1 → mc1 (model change) → u2 → a2
+        // mc1 is a Boundary: indent=0, in_turn=false
+        // u2 is User: indent=0, in_turn=true
+        // a2 is Assistant: indent=2 (in_turn)
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply 1"),
+                vec![SessionTreeNode {
+                    entry: SessionEntry {
+                        id: "mc1".into(),
+                        parent_id: Some("a1".into()),
+                        timestamp: "2025-01-01T00:00:00.000Z".into(),
+                        content: SessionEntryContent::ModelChange {
+                            provider: "openai".into(),
+                            model_id: "gpt-4o".into(),
+                        },
+                    },
+                    children: vec![node(
+                        make_entry("u2", Some("mc1"), "user", "second"),
+                        vec![node(
+                            make_entry("a2", Some("u2"), "assistant", "reply 2"),
+                            vec![],
+                        )],
+                    )],
+                    label: None,
+                }],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+
+        let mut flat = Vec::new();
+        for row in resp.rows.iter() {
+            let desc = row.description.clone().unwrap_or_default();
+            let indent = desc.len() - desc.trim_start().len();
+            flat.push((row.id.clone(), indent));
+        }
+
+        let expected = vec![
+            ("u1", 0),   // user
+            ("a1", 2),   // assistant (+2)
+            ("mc1", 0),  // model change: back to base
+            ("u2", 0),   // user: base indent
+            ("a2", 2),   // assistant (+2)
+        ];
+        assert_eq!(flat.len(), expected.len(),
+            "rows: {:?}", flat.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+        for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
+            assert_eq!(flat[i].0, *exp_id, "row {} id", i);
+            assert_eq!(flat[i].1, *exp_indent,
+                "row {} ({}) indent: expected {}, got {}",
+                i, exp_id, exp_indent, flat[i].1);
+        }
+    }
+
+    #[test]
+    fn assistant_after_tool_result_chain_gets_indent() {
+        // Real-world pattern: user → [assistant(tool_call) → toolResult] × N → assistant(text)
+        // The invisible entries must NOT break the turn grouping so the
+        // visible assistant gets +2 indent.
+        let tree = vec![SessionTreeNode {
+            entry: make_entry("u1", None, "user", "Please critique"),
+            children: vec![
+                // First assistant segment: tool-call-only (invisible)
+                SessionTreeNode {
+                    entry: SessionEntry {
+                        id: "a_tool1".into(),
+                        parent_id: Some("u1".into()),
+                        timestamp: "2025-01-01T00:00:00.000Z".into(),
+                        content: SessionEntryContent::Message {
+                            message: serde_json::json!({
+                                "role": "assistant",
+                                "content": [{"type": "tool_use", "name": "bash", "input": {}}]
+                            }),
+                        },
+                    },
+                    children: vec![
+                        // Tool result (invisible)
+                        SessionTreeNode {
+                            entry: SessionEntry {
+                                id: "tr1".into(),
+                                parent_id: Some("a_tool1".into()),
+                                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                                content: SessionEntryContent::Message {
+                                    message: serde_json::json!({
+                                        "role": "toolResult",
+                                        "content": [{"type": "text", "text": "result1"}]
+                                    }),
+                                },
+                            },
+                            children: vec![
+                                // Second assistant segment: tool-call-only (invisible)
+                                SessionTreeNode {
+                                    entry: SessionEntry {
+                                        id: "a_tool2".into(),
+                                        parent_id: Some("tr1".into()),
+                                        timestamp: "2025-01-01T00:00:00.000Z".into(),
+                                        content: SessionEntryContent::Message {
+                                            message: serde_json::json!({
+                                                "role": "assistant",
+                                                "content": [{"type": "tool_use", "name": "bash", "input": {}}]
+                                            }),
+                                        },
+                                    },
+                                    children: vec![
+                                        // Tool result (invisible)
+                                        SessionTreeNode {
+                                            entry: SessionEntry {
+                                                id: "tr2".into(),
+                                                parent_id: Some("a_tool2".into()),
+                                                timestamp: "2025-01-01T00:00:00.000Z".into(),
+                                                content: SessionEntryContent::Message {
+                                                    message: serde_json::json!({
+                                                        "role": "toolResult",
+                                                        "content": [{"type": "text", "text": "result2"}]
+                                                    }),
+                                                },
+                                            },
+                                            children: vec![
+                                                // Final assistant text (VISIBLE)
+                                                SessionTreeNode {
+                                                    entry: make_entry(
+                                                        "a_text",
+                                                        Some("tr2"),
+                                                        "assistant",
+                                                        "Now I have a comprehensive understanding",
+                                                    ),
+                                                    children: vec![],
+                                                    label: None,
+                                                },
+                                            ],
+                                            label: None,
+                                        },
+                                    ],
+                                    label: None,
+                                },
+                            ],
+                            label: None,
+                        },
+                    ],
+                    label: None,
+                },
+            ],
+            label: None,
+        }];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+        // Only 2 visible rows: user + assistant
+        assert_eq!(resp.rows.len(), 2, "should have 2 visible entries");
+        let u1_desc = resp.rows[0].description.clone().unwrap_or_default();
+        let a_desc = resp.rows[1].description.clone().unwrap_or_default();
+        let u1_indent = u1_desc.len() - u1_desc.trim_start().len();
+        let a_indent = a_desc.len() - a_desc.trim_start().len();
+        assert_eq!(u1_indent, 0, "user should have indent 0: {:?}", u1_desc);
+        assert_eq!(a_indent, 2, "assistant should have indent 2 after tool chain: {:?}", a_desc);
     }
 }

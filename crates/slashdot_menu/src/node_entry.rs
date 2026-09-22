@@ -825,7 +825,8 @@ impl NodeEntry {
         let columns = self.inner.columns();
         let field_space = self.field_space();
         let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
-        let has_table_header = has_columns && has_data;
+        let has_table_header = has_columns && has_data
+            && columns.iter().any(|c| !c.header.is_empty());
 
         // 1. Header lines from the node's header() method → detail.
         let path_args = PathArgs {
