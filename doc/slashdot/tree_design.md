@@ -200,17 +200,13 @@ message and the visible assistant text do not break the +2 indent.
 
 ## Deferred / follow-ups
 
-### Active entry cursor
-**Done.** `active_ids` now searches the full tree via `find_entry()`
-(iterative DFS) instead of only root-level entries.
-
 ### `switch --summarize`
 Summarize abandoned branch when switching. Same compaction logic,
 different span (old leaf → common ancestor).
 
 ### `/compact` root shortcut
 Rewrites to `/tree <last-user> compact`. Deferred until
-`doc/slashdot/prompt_rewrite_design.md`.
+./prompt_rewrite_design.md.
 
 ### Double separator on AsyncOp submit
 **Done.** `emit_commit` now passes `sep: false` for both `DoneSuccess`
