@@ -2426,16 +2426,13 @@ impl Repl {
                         result.push(Self::render_logical_line(th, tw, false, false, true));
                     }
 
-                    // 3. Data rows, windowed around `selected`.
+                    // 3. Data rows, windowed around `selected` (visual-line-aware).
                     let total = plan.rows.len();
                     if total > 0 {
                         let sel_idx = plan.selected.unwrap_or(0);
-                        let win = if total <= data_budget {
-                            0
-                        } else {
-                            sel_idx.saturating_sub(data_budget / 2).min(total - data_budget)
-                        };
-                        for i in win..(win + data_budget).min(total) {
+                        let (win_start, win_count) =
+                            Self::visual_row_window(&plan.rows, sel_idx, data_budget);
+                        for i in win_start..(win_start + win_count).min(total) {
                             let is_selected = plan.selected == Some(i);
                             let is_active = plan.active_rows.contains(&i);
                             let row = &plan.rows[i];
@@ -3012,6 +3009,54 @@ impl Repl {
         };
 
         (detail_budget, rows_budget)
+    }
+
+    /// Compute the window of row indices to render, accounting for multi-line
+    /// `LogicalLine` rows.  Returns `(start, count)` — the first row index and
+    /// how many logical rows to render.  `budget` is in visual lines.
+    pub fn visual_row_window(
+        rows: &[crate::slashdot_menu::render::LogicalLine],
+        selected: usize,
+        budget: usize,
+    ) -> (usize, usize) {
+        let total = rows.len();
+        if total == 0 || budget == 0 {
+            return (0, 0);
+        }
+        let heights: Vec<usize> = rows.iter()
+            .map(|r| r.0.split('\n').count().max(1))
+            .collect();
+        let total_vis: usize = heights.iter().sum();
+        if total_vis <= budget {
+            return (0, total);
+        }
+        let sel = selected.min(total - 1);
+        let half = budget / 2;
+
+        // Walk backward from sel, using at most half the budget for rows above.
+        let mut start = sel;
+        let mut vis = heights[sel]; // always include the selected row
+        while start > 0 && vis + heights[start - 1] <= half {
+            start -= 1;
+            vis += heights[start];
+        }
+
+        // Walk forward from start, filling the full budget.
+        let mut count = 0;
+        let mut vis_total = 0;
+        for i in start..total {
+            if vis_total + heights[i] > budget {
+                break;
+            }
+            vis_total += heights[i];
+            count += 1;
+        }
+        // At least the selected row (may exceed budget if it's very tall).
+        if count == 0 {
+            count = 1;
+        }
+
+        (start, count)
     }
 
     /// start index into the full overlay. Extracted so it can be unit-tested
@@ -9541,6 +9586,73 @@ mod tests {
         let (d, r) = Repl::compute_space_budget(6, 1, 10, 10, 3);
         assert_eq!(d, 2);
         assert_eq!(r, 3, "min_rows enforced");
+    }
+
+    // --- visual_row_window tests ---
+
+    #[test]
+    fn vw_single_line_rows() {
+        use crate::slashdot_menu::render::LogicalLine;
+        let rows: Vec<LogicalLine> = (0..10)
+            .map(|i| LogicalLine::new(format!("row {}", i)))
+            .collect();
+        // Budget 4: all single-line, window centered on sel=5.
+        let (s, c) = Repl::visual_row_window(&rows, 5, 4);
+        assert_eq!(c, 4);
+        assert!(s <= 5 && s + c > 5, "selected must be in window");
+    }
+
+    #[test]
+    fn vw_multi_line_row_centered() {
+        use crate::slashdot_menu::render::LogicalLine;
+        // row2 is 3 lines tall, budget=4.
+        let rows = vec![
+            LogicalLine::new("a"),
+            LogicalLine::new("b"),
+            LogicalLine::new("x\ny\nz"),  // 3 visual lines
+            LogicalLine::new("c"),
+            LogicalLine::new("d"),
+        ];
+        let (s, c) = Repl::visual_row_window(&rows, 2, 4);
+        // Can fit: row2 (3 lines) + one 1-line row = 4 lines.
+        assert!(s <= 2 && s + c > 2, "selected must be in window");
+        let vis: usize = rows[s..s + c].iter()
+            .map(|r| r.0.split('\n').count())
+            .sum();
+        assert!(vis <= 4, "window must fit budget: got {}", vis);
+    }
+
+    #[test]
+    fn vw_all_fit() {
+        use crate::slashdot_menu::render::LogicalLine;
+        let rows = vec![
+            LogicalLine::new("a"),
+            LogicalLine::new("b"),
+            LogicalLine::new("c"),
+        ];
+        // Budget is large enough for all rows.
+        let (s, c) = Repl::visual_row_window(&rows, 0, 100);
+        assert_eq!(s, 0);
+        assert_eq!(c, 3);
+    }
+
+    #[test]
+    fn vw_very_tall_row_always_shown() {
+        use crate::slashdot_menu::render::LogicalLine;
+        // Single row taller than budget.
+        let rows = vec![LogicalLine::new("a\nb\nc\nd\ne")];
+        let (s, c) = Repl::visual_row_window(&rows, 0, 2);
+        assert_eq!(s, 0);
+        assert_eq!(c, 1, "tall row is always included");
+    }
+
+    #[test]
+    fn vw_empty_rows() {
+        use crate::slashdot_menu::render::LogicalLine;
+        let rows: Vec<LogicalLine> = vec![];
+        let (s, c) = Repl::visual_row_window(&rows, 0, 10);
+        assert_eq!(s, 0);
+        assert_eq!(c, 0);
     }
 }
 
