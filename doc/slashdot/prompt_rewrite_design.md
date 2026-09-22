@@ -133,6 +133,13 @@ listing the user drilled from.
 
 ## Implementation notes
 
+### Status
+
+**Core infrastructure done.** `DrillEnter`/`DrillTab` keys, `drill_rewrite`
+trait method (Phase 0.5), and `handle_leaf` integration are implemented
+and tested (4 tests). Individual command `drill_rewrite` implementations
+are pending (see roll-out below).
+
 ### StaticListingNode stays simple
 
 `StaticListingNode` keeps its default `drill_rewrite` (returns `None`).

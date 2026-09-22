@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 620 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 622 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing. `drill_rewrite` for prompt pre-fill/redirect on drill.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -105,10 +105,6 @@ v2.5 engine.
 **RenderPlan / rendering:**
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-- ~~Scrolling / cursoring with wrapped multi-line logical lines is broken — cursor drifts once scrolling starts~~ **Done.** `visual_row_window()` uses cumulative visual heights.
-
-**PathArgs / Args borrowing:**
-- Owned data. Deferred to avoid lifetime complexity in the trait API.
 
 **Row uniformity:**
 - Only enforces non-empty `id`. Description optional.
@@ -128,6 +124,13 @@ v2.5 engine.
 **Prompt rewrite support**
 - WIP design doc: slashdot/prompt_rewrite_design.md
 
+**Avoid drill-submit where args are expected**
+- Some nodes like `/session <id> rename` expect a parameter - a name in this
+  case. When enter-drilling from the `/tree <id> ` action listing, the rename
+  is auto-submitted with no name. Provide a clear way for submit() to only
+  trigger when a genuine local Enter is received, not when MaybeSubmit is sent
+  from a parent drill.
+
 **Dot modifier auto-complete:** The v2.5 engine applies `.field:value`
 filter/sort syntax correctly, but the auto-complete *discovery UI* is
 missing. In v2.0, typing `/model .` showed a popup of available field
@@ -144,6 +147,9 @@ Implementation options:
 - A `HostKey` variant (e.g. `ModifierComplete`) that returns candidates.
 - A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
 - Host-side detection + engine query (like v2.0's `field_options()`).
+
+**PathArgs / Args borrowing:**
+- Owned data. Deferred to avoid lifetime complexity in the trait API.
 
 ---
 
