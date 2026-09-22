@@ -101,6 +101,11 @@ pub fn build_menu(
         }.into());
     }
 
+    // Tree (/tree) — dynamic listing with action children.
+    {
+        root.add_child(crate::v25_tree::build_tree_node(shared));
+    }
+
     // Quit (/quit) — leaf node; sets AsyncOp::Quit.
     {
         root.add_child(crate::v25_quit::QuitNode {

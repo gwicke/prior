@@ -141,11 +141,11 @@ pub struct MenuShared {
     /// recency boost source. `run_interactive` keeps this in sync with its
     /// `recent_models` local on every SetModel.
     pub recent_models: Rc<RefCell<Vec<String>>>,
-    /// Synchronous mirror of the async session tree (v1
-    /// `flatten_tree_nodes` tuples) + current leaf id. The async `Session`
-    /// only mutates between agent turns, so the REPL refreshes this once
-    /// per loop iteration; the `/tree` provider reads it per `fetch`.
-    pub tree: Rc<RefCell<Vec<(usize, String, String, bool, bool, usize)>>>,
+    /// The session entry tree (source of truth for /tree listing).
+    /// Immutable between rebuilds; shared via Rc with ReplCtx.
+    /// REPL writes once per prompt cycle; `data()` reads many times.
+    /// Inner Rc enables `ptr_eq` caching in TreeListNode.
+    pub raw_tree: Rc<RefCell<Rc<Vec<crate::session::SessionTreeNode>>>>,
     pub leaf_id: Rc<RefCell<Option<String>>>,
     /// Session token usage snapshot (set per `read_input` call from the
     /// agent's `session_usage()`). Used by `/stat` to display context
@@ -178,6 +178,8 @@ pub enum AsyncOp {
     New { name: String },
     /// Delete the current session and start fresh.
     Clear { name: String },
+    /// Move the session leaf pointer to the given entry.
+    TreeSwitch { target_id: String },
 }
 
 impl MenuShared {
@@ -191,7 +193,7 @@ impl MenuShared {
             repo,
             current_session_id: Rc::new(RefCell::new(String::new())),
             recent_models: Rc::new(RefCell::new(Vec::new())),
-            tree: Rc::new(RefCell::new(Vec::new())),
+            raw_tree: Rc::new(RefCell::new(Rc::new(Vec::new()))),
             leaf_id: Rc::new(RefCell::new(None)),
             session_usage: Rc::new(RefCell::new(crate::agent::SessionUsage::default())),
             pending_op: Rc::new(RefCell::new(None)),
@@ -208,7 +210,7 @@ impl MenuShared {
             repo: self.repo.clone(),
             current_session_id: self.current_session_id.clone(),
             recent_models: self.recent_models.clone(),
-            tree: self.tree.clone(),
+            raw_tree: self.raw_tree.clone(),
             leaf_id: self.leaf_id.clone(),
             session_usage: self.session_usage.clone(),
             pending_op: self.pending_op.clone(),
@@ -275,43 +277,7 @@ impl crate::slashdot_menu::provider::DetailProvider for ReplayDetailProvider {
 }
 
 /// DataProvider over the session tree entries (§10 step 6): rows from the
-/// shared flattened-tree snapshot, in provider order.
-pub struct TreeProvider {
-    pub shared: Rc<MenuShared>,
-}
 
-impl crate::slashdot_menu::provider::DataProvider for TreeProvider {
-    fn fetch(
-        &mut self,
-        _modifiers: &[crate::slashdot_menu::grammar::ModifierToken],
-    ) -> crate::slashdot_menu::provider::DataResult {
-        use crate::slashdot_menu::value::Value;
-        let leaf_id = self.shared.leaf_id.borrow().clone();
-        let entries = self.shared.tree.borrow().clone();
-        let rows: Vec<crate::slashdot_menu::fields::Row> = entries
-            .iter()
-            .map(|(indent, label, id, on_path, is_current, branch_depth)| {
-                let mut r = crate::slashdot_menu::fields::Row::new(id.clone())
-                    .desc(label.clone())
-                    .field("label", Value::Str(label.clone()))
-                    .field("indent", Value::Num(*indent as f64))
-                    .field("branch_depth", Value::Num(*branch_depth as f64));
-                if *on_path {
-                    r = r.field("on_path", Value::Str("1".into()));
-                }
-                if *is_current {
-                    r = r.field("leaf", Value::Str("1".into()));
-                }
-                r
-            })
-            .collect();
-        crate::slashdot_menu::provider::DataResult {
-            rows,
-            active_row: leaf_id,
-            ..Default::default()
-        }
-    }
-}
 
 /// DataProvider over the model catalog (§10 step 4). One-shot fetch over
 /// the **global catalog cache** (the live store). **The provider's own
@@ -557,7 +523,6 @@ impl MenuEngine {
         let shared_rc = Rc::new(shared.clone_shared());
         let interpreter = Interpreter::new(root)
             .with_provider(&["model"], Box::new(ModelProvider { shared: shared_rc.clone() }))
-            .with_provider(&["tree"], Box::new(TreeProvider { shared: shared_rc.clone() }))
             .with_active_provider(
                 &["persona"],
                 Box::new(PersonaActiveProvider { shared: shared_rc.clone() }),

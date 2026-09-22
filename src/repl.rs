@@ -286,7 +286,8 @@ pub struct ReplCtx {
     /// for user messages in the current session's branch.
     pub branch_messages: Vec<(String, String)>,
     /// Pre-built session entry tree (empty if no session), used by `/tree`.
-    pub tree: Vec<SessionTreeNode>,
+    /// Shared via Rc with MenuShared — no deep clone on sync.
+    pub tree: std::rc::Rc<Vec<SessionTreeNode>>,
     /// Current leaf entry ID (for highlighting in the tree).
     pub leaf_id: Option<String>,
     /// Estimated tokens of the current (compaction-scoped) context. Shown in
@@ -614,7 +615,7 @@ impl ActiveOverlay {
         let shared = MenuShared::new(settings.clone(), ctx.repo.clone());
         *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
-        *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
+        *shared.raw_tree.borrow_mut() = ctx.tree.clone();
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
         *shared.session_usage.borrow_mut() = ctx.session_usage;
         *shared.live_state.borrow_mut() = crate::slash_menu_bridge::LiveState {
@@ -2080,7 +2081,7 @@ impl Repl {
         shared.live_state = live_state.clone();
         *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
         *shared.recent_models.borrow_mut() = ctx.recent.clone();
-        *shared.tree.borrow_mut() = Repl::flatten_all_tree(ctx);
+        *shared.raw_tree.borrow_mut() = ctx.tree.clone();
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
         *shared.session_usage.borrow_mut() = ctx.session_usage;
         // Share the pending_op cell with the caller so async ops are
@@ -5975,7 +5976,7 @@ mod tests {
         };
         let root = mk("root-entry", "user");
         let leaf = mk("leaf-entry", "assistant");
-        let tree = vec![crate::session::SessionTreeNode {
+        let tree = std::rc::Rc::new(vec![crate::session::SessionTreeNode {
             entry: root,
             children: vec![crate::session::SessionTreeNode {
                 entry: leaf,
@@ -5983,7 +5984,7 @@ mod tests {
                 label: None,
             }],
             label: None,
-        }];
+        }]);
         ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -6418,11 +6419,11 @@ mod tests {
             },
         };
         // Build a fresh ctx whose root entry carries the multi-line body.
-        let tree = vec![crate::session::SessionTreeNode {
+        let tree = std::rc::Rc::new(vec![crate::session::SessionTreeNode {
             entry,
             children: vec![],
             label: None,
-        }];
+        }]);
         let ctx = ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -6482,11 +6483,11 @@ mod tests {
                 }),
             },
         };
-        let tree = vec![crate::session::SessionTreeNode {
+        let tree = std::rc::Rc::new(vec![crate::session::SessionTreeNode {
             entry,
             children: vec![],
             label: None,
-        }];
+        }]);
         let ctx = ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -6674,10 +6675,10 @@ mod tests {
         let u2 = mk_message("u2", "user", Some("a1"));
         let a1 = mk_message("a1", "assistant", Some("u1"));
         let u1 = mk_message("u1", "user", None);
-        let tree = vec![node(
+        let tree = std::rc::Rc::new(vec![node(
             u1,
             vec![node(a1, vec![node(u2, vec![node(a2, vec![])])])],
-        )];
+        )]);
         assert_eq!(
             Repl::last_user_message_id_on_active_branch(&tree, "a2"),
             Some("u2".to_string())
@@ -6691,10 +6692,10 @@ mod tests {
         let u2 = mk_message("u2", "user", Some("a1"));
         let a1 = mk_message("a1", "assistant", Some("u1"));
         let u1 = mk_message("u1", "user", None);
-        let tree = vec![node(
+        let tree = std::rc::Rc::new(vec![node(
             u1,
             vec![node(a1, vec![node(u2, vec![])])],
-        )];
+        )]);
         assert_eq!(
             Repl::last_user_message_id_on_active_branch(&tree, "u2"),
             Some("u2".to_string())
@@ -6705,7 +6706,7 @@ mod tests {
     fn last_user_message_id_returns_root_when_only_user() {
         // Single user message, no assistant response yet.
         let u1 = mk_message("u1", "user", None);
-        let tree = vec![node(u1, vec![])];
+        let tree = std::rc::Rc::new(vec![node(u1, vec![])]);
         assert_eq!(
             Repl::last_user_message_id_on_active_branch(&tree, "u1"),
             Some("u1".to_string())
@@ -6724,7 +6725,7 @@ mod tests {
                 thinking_level: "low".to_string(),
             },
         };
-        let tree = vec![node(t, vec![])];
+        let tree = std::rc::Rc::new(vec![node(t, vec![])]);
         assert_eq!(
             Repl::last_user_message_id_on_active_branch(&tree, "t1"),
             None
@@ -6738,10 +6739,10 @@ mod tests {
         let u2 = mk_message("u2", "user", Some("c1"));
         let c1 = mk_compaction("c1", Some("u1"));
         let u1 = mk_message("u1", "user", None);
-        let tree = vec![node(
+        let tree = std::rc::Rc::new(vec![node(
             u1,
             vec![node(c1, vec![node(u2, vec![])])],
-        )];
+        )]);
         assert_eq!(
             Repl::last_user_message_id_on_active_branch(&tree, "u2"),
             Some("u2".to_string())
@@ -6764,13 +6765,13 @@ mod tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![node(
+            tree: std::rc::Rc::new(vec![node(
                 mk_message("u1", "user", None),
                 vec![node(
                     mk_message("a1", "assistant", Some("u1")),
                     vec![node(mk_message("u2", "user", Some("a1")), vec![])],
                 )],
-            )],
+            )]),
             leaf_id: Some("u2".into()), // mid-turn: leaf IS a user message
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
@@ -6814,7 +6815,7 @@ mod tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![node(
+            tree: std::rc::Rc::new(vec![node(
                 mk_message("u1", "user", None),
                 vec![node(
                     mk_message("a1", "assistant", Some("u1")),
@@ -6822,7 +6823,7 @@ mod tests {
                         node(mk_message("a2", "assistant", Some("u2")), vec![]),
                     ])],
                 )],
-            )],
+            )]),
             leaf_id: Some("a2".into()),
             context_tokens: 1234,
             model_filter: ModelFilter::default_for_coding(),
@@ -6865,7 +6866,7 @@ mod tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![],
+            tree: std::rc::Rc::new(vec![]),
             leaf_id: None,
             context_tokens: 0,
             model_filter: ModelFilter::default_for_coding(),
@@ -7018,7 +7019,7 @@ mod tests {
                 ),
             ),
         );
-        let tree = vec![chain];
+        let tree = std::rc::Rc::new(vec![chain]);
 
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
@@ -7050,10 +7051,10 @@ mod tests {
             assistant_with_tools("a0", Some("m0"), None, Some("read")),
             tool_result("t0", Some("a0")),
         );
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "prompt"),
             attach(with_call, tree_entry("m1", Some("t0"), "assistant", "done")),
-        )];
+        )]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
         let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
@@ -7070,13 +7071,13 @@ mod tests {
         // map must resolve it across the whole tree (regression: a subtree-
         // only search always missed it and showed "(kept entry not on
         // visible path)").
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "kept prompt"),
             attach(
                 tree_entry("a0", Some("m0"), "assistant", "old answer"),
                 compaction("c1", Some("a0"), "m0"), // keeps m0 (the root)
             ),
-        )];
+        )]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("c1"), &std::collections::HashSet::new(), &mut out);
         let labels: Vec<String> = out.iter().map(|(_, l, _, _, _, _)| l.clone()).collect();
@@ -7111,7 +7112,7 @@ mod tests {
             children: vec![b1, b2],
             label: None,
         };
-        let tree = vec![attach(tree_entry("m0", None, "user", "prompt"), fork)];
+        let tree = std::rc::Rc::new(vec![attach(tree_entry("m0", None, "user", "prompt"), fork)]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
         let branch_rows: Vec<usize> = out
@@ -7193,13 +7194,13 @@ mod tests {
             children: vec![tree_entry("m1", Some("mc"), "user", "after switch")],
             label: None,
         };
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "first prompt"),
             attach(
                 tree_entry("a0", Some("m0"), "assistant", "first answer"),
                 mc,
             ),
-        )];
+        )]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m1"), &std::collections::HashSet::new(), &mut out);
         let indents: Vec<usize> = out.iter().map(|(i, _, _, _, _, _)| *i).collect();
@@ -7441,10 +7442,10 @@ mod tests {
             children: vec![b1, b2],
             label: None,
         };
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "first prompt"),
             fork,
-        )];
+        )]);
         let mut rows = Vec::new();
         let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
         let mut targets = Vec::new();
@@ -7508,10 +7509,10 @@ mod tests {
             children: vec![b1, b2],
             label: None,
         };
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "prompt"),
             fork,
-        )];
+        )]);
         let mut rows = Vec::new();
         let mut row_bgs: Vec<Option<&'static str>> = Vec::new();
         let mut targets = Vec::new();
@@ -7573,7 +7574,7 @@ mod tests {
                 ),
             ),
         );
-        let tree = vec![chain];
+        let tree = std::rc::Rc::new(vec![chain]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, None, &std::collections::HashSet::new(), &mut out);
         let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
@@ -7598,10 +7599,10 @@ mod tests {
             children: vec![b1, b2],
             label: None,
         };
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "prompt"),
             fork,
-        )];
+        )]);
         let mut out = Vec::new();
         Repl::flatten_tree_nodes(&tree, 0, Some("m2"), &std::collections::HashSet::new(), &mut out);
         let depths: Vec<usize> = out.iter().map(|(_, _, _, _, _, d)| *d).collect();
@@ -7615,7 +7616,7 @@ mod tests {
         // Regression: a real session with a compaction entry must
         // surface the compaction as a visible row in the `/tree` LIST
         // overlay (not just the per-id action menu).
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "kept prompt"),
             attach(
                 tree_entry("a0", Some("m0"), "assistant", "old answer"),
@@ -7624,7 +7625,7 @@ mod tests {
                     tree_entry("m1", Some("c1"), "user", "after compaction"),
                 ),
             ),
-        )];
+        )]);
         let ctx = ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -7699,13 +7700,13 @@ mod tests {
         // just ran /compact and the leaf is the resulting Compaction
         // node, with no post-compaction children. The compaction must
         // still show up and be marked as the active row.
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "kept prompt"),
             attach(
                 tree_entry("a0", Some("m0"), "assistant", "old answer"),
                 compaction("c1", Some("a0"), "m0"),
             ),
-        )];
+        )]);
         let ctx = ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -7754,7 +7755,7 @@ mod tests {
         // real-life shape after a /compact + a few follow-up turns).
         // The user reports this shape drops the compaction AND the
         // post-compaction content; verify all of it shows.
-        let tree = vec![attach(
+        let tree = std::rc::Rc::new(vec![attach(
             tree_entry("m0", None, "user", "first prompt"),
             attach(
                 tree_entry("a0", Some("m0"), "assistant", "first answer"),
@@ -7769,7 +7770,7 @@ mod tests {
                     ),
                 ),
             ),
-        )];
+        )]);
         let ctx = ReplCtx {
             provider: "p".into(),
             model: "m".into(),
@@ -7985,7 +7986,7 @@ mod tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![],
+            tree: std::rc::Rc::new(vec![]),
             leaf_id: None,
             context_tokens: 0,
             model_filter: ModelFilter::default_for_coding(),
@@ -8056,7 +8057,7 @@ mod tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![],
+            tree: std::rc::Rc::new(vec![]),
             leaf_id: None,
             context_tokens: 0,
             model_filter: ModelFilter::default_for_coding(),
@@ -9442,7 +9443,7 @@ mod model_v2_tests {
             repo: None,
             current_session_id: "s".into(),
             branch_messages: vec![],
-            tree: vec![],
+            tree: std::rc::Rc::new(vec![]),
             leaf_id: None,
             context_tokens: 0,
             model_filter: ModelFilter::default_for_coding(),

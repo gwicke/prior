@@ -1962,7 +1962,7 @@ async fn build_session_ctx(
 ) -> (
     Vec<crate::repl::SessionMeta>,
     Vec<(String, String)>,
-    Vec<crate::session::SessionTreeNode>,
+    std::rc::Rc<Vec<crate::session::SessionTreeNode>>,
     Option<String>,
     u64,
 ) {
@@ -2003,9 +2003,9 @@ async fn build_session_ctx(
                 .await
                 .map(|c| estimate_context_tokens(&c.messages))
                 .unwrap_or(0);
-            (tree, leaf_id, context_tokens)
+            (std::rc::Rc::new(tree), leaf_id, context_tokens)
         }
-        None => (Vec::new(), None, 0),
+        None => (std::rc::Rc::new(Vec::new()), None, 0),
     };
 
     (sessions, branch_messages, tree, leaf_id, context_tokens)
@@ -3839,6 +3839,14 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 }
                 crate::slash_menu_bridge::AsyncOp::Quit => {
                     break;
+                }
+                crate::slash_menu_bridge::AsyncOp::TreeSwitch { target_id } => {
+                    if let Some(ref s) = session {
+                        let old_leaf_id = s.get_leaf_id().await;
+                        if old_leaf_id.as_deref() != Some(target_id.as_str()) {
+                            let _ = s.move_leaf(Some(target_id.clone())).await;
+                        }
+                    }
                 }
                 crate::slash_menu_bridge::AsyncOp::New { name } => {
                     session = None;
