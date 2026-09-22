@@ -132,17 +132,23 @@ fn collect_active_path(
     leaf_id: &str,
     out: &mut HashSet<String>,
 ) {
-    for node in nodes {
-        if node.entry.id == leaf_id {
-            out.insert(node.entry.id.clone());
-            return;
-        }
-        let _child_found = false;
-        collect_active_path(&node.children, leaf_id, out);
-        if !out.is_empty() {
-            // We descended into a child that contains the leaf.
-            out.insert(node.entry.id.clone());
-            return;
+    // Iterative DFS: walk the tree to find leaf_id, then record the
+    // path from root to leaf.  Uses an explicit stack so deep linear
+    // sessions (1000s of entries) don't overflow the call stack.
+    let mut stack: Vec<(&[SessionTreeNode], Vec<String>)> = Vec::new();
+    stack.push((nodes, Vec::new()));
+    while let Some((current, mut path)) = stack.pop() {
+        for node in current {
+            if node.entry.id == leaf_id {
+                path.push(node.entry.id.clone());
+                for id in &path {
+                    out.insert(id.clone());
+                }
+                return;
+            }
+            let mut child_path = path.clone();
+            child_path.push(node.entry.id.clone());
+            stack.push((&node.children, child_path));
         }
     }
 }
@@ -156,6 +162,24 @@ fn is_assistant(entry: &SessionEntry) -> bool {
     matches!(&entry.content,
         SessionEntryContent::Message { message }
         if message.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+}
+
+/// Find a node by entry ID. Iterative DFS to avoid stack overflow.
+fn find_entry<'a>(
+    nodes: &'a [SessionTreeNode],
+    id: &str,
+) -> Option<&'a SessionTreeNode> {
+    let mut stack: Vec<&'a [SessionTreeNode]> = Vec::new();
+    stack.push(nodes);
+    while let Some(current) = stack.pop() {
+        for n in current {
+            if n.entry.id == id {
+                return Some(n);
+            }
+            stack.push(&n.children);
+        }
+    }
+    None
 }
 
 /// One row in the flattened tree.
@@ -178,19 +202,18 @@ struct FlatRow {
 /// reference ancestors).
 fn build_label_map(nodes: &[SessionTreeNode]) -> HashMap<String, String> {
     let mut labels = HashMap::new();
-    fn walk(
-        nodes: &[SessionTreeNode],
-        labels: &mut HashMap<String, String>,
-    ) {
-        for n in nodes {
+    // Iterative DFS.
+    let mut stack: Vec<&[SessionTreeNode]> = Vec::new();
+    stack.push(nodes);
+    while let Some(current) = stack.pop() {
+        for n in current {
             let t = entry_display_label(&n.entry, n.label.as_deref());
             if !t.is_empty() {
                 labels.insert(n.entry.id.clone(), t);
             }
-            walk(&n.children, labels);
+            stack.push(&n.children);
         }
     }
-    walk(nodes, &mut labels);
     labels
 }
 
@@ -273,33 +296,33 @@ fn flatten_turns(
     labels: &HashMap<String, String>,
     out: &mut Vec<FlatRow>,
 ) {
-    for node in nodes {
+    // Iterative DFS to avoid stack overflow on deep linear sessions.
+    // Push root nodes in reverse so the first sibling is processed first.
+    let mut stack: Vec<(&SessionTreeNode, usize, usize)> = Vec::new();
+    for node in nodes.iter().rev() {
+        stack.push((node, indent, branch_depth));
+    }
+
+    while let Some((node, cur_indent, cur_bd)) = stack.pop() {
         let label =
             entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
+        // Children indent/branch_depth: visible multi-child nodes get +4
+        // indent and +1 branch_depth; everything else keeps current level.
+        let is_branch = node.children.len() > 1;
+        let child_indent = if is_branch { cur_indent + 4 } else { cur_indent };
+        let child_bd = if is_branch { cur_bd + 1 } else { cur_bd };
+
         if label.is_empty() {
-            // Meta entry: skip visual row but still descend.
-            let child_branch_depth = if node.children.len() > 1 {
-                branch_depth + 1
-            } else {
-                branch_depth
-            };
-            flatten_turns(
-                &node.children,
-                indent,
-                child_branch_depth,
-                leaf_id,
-                active_path,
-                labels,
-                out,
-            );
+            // Meta entry: skip visual row but descend into children.
+            for child in node.children.iter().rev() {
+                stack.push((child, cur_indent, child_bd));
+            }
             continue;
         }
 
-        // Indent rule: assistant → +2, everything else (user,
-        // compaction, model change) → base indent.  Branch forks
-        // add +4 via child_indent below.
-        let row_indent = if is_assistant(&node.entry) { indent + 2 } else { indent };
+        // Indent rule: assistant → +2, everything else → base indent.
+        let row_indent = if is_assistant(&node.entry) { cur_indent + 2 } else { cur_indent };
 
         let is_active = active_path.contains(&node.entry.id);
         let is_current = leaf_id == Some(node.entry.id.as_str());
@@ -309,35 +332,20 @@ fn flatten_turns(
 
         out.push(FlatRow {
             indent: row_indent,
-            label: label.clone(),
+            label,
             entry_id: node.entry.id.clone(),
             on_active_path: is_active,
             is_current,
-            branch_depth,
+            branch_depth: cur_bd,
             full_text,
             role,
             timestamp,
         });
 
-        let child_indent = if node.children.len() > 1 {
-            indent + 4
-        } else {
-            indent
-        };
-        let child_branch_depth = if node.children.len() > 1 {
-            branch_depth + 1
-        } else {
-            branch_depth
-        };
-        flatten_turns(
-            &node.children,
-            child_indent,
-            child_branch_depth,
-            leaf_id,
-            active_path,
-            labels,
-            out,
-        );
+        // Push children in reverse so first child is processed first.
+        for child in node.children.iter().rev() {
+            stack.push((child, child_indent, child_bd));
+        }
     }
 }
 
@@ -518,7 +526,7 @@ impl SlashDotNode for TreeListNode {
 
         let active_ids = leaf
             .as_ref()
-            .filter(|l| tree_rc.iter().any(|n| n.entry.id == **l))
+            .filter(|l| find_entry(&tree_rc, l).is_some())
             .cloned()
             .map(|l| vec![l])
             .unwrap_or_default();
@@ -556,21 +564,6 @@ impl SlashDotNode for TreeListNode {
         // Find the entry in the raw tree for full details.
         let tree_borrow = self.shared.raw_tree.borrow();
         let tree: &[SessionTreeNode] = &tree_borrow;
-
-        fn find_entry<'a>(
-            nodes: &'a [SessionTreeNode],
-            id: &str,
-        ) -> Option<&'a SessionTreeNode> {
-            for n in nodes {
-                if n.entry.id == id {
-                    return Some(n);
-                }
-                if let Some(found) = find_entry(&n.children, id) {
-                    return Some(found);
-                }
-            }
-            None
-        }
 
         let Some(node) = find_entry(tree, entry_id) else {
             return vec![format!("Entry not found: {}", entry_id)];
@@ -1180,23 +1173,52 @@ mod tests {
 
     #[test]
     fn active_entry_marked() {
+        // Leaf is a root-level sibling — active_ids must contain it.
         let tree = vec![
             node(make_entry("u1", None, "user", "first"), vec![]),
             node(make_entry("u2", None, "user", "second"), vec![]),
         ];
         let shared = shared_with_tree(tree);
         *shared.leaf_id.borrow_mut() = Some("u2".into());
-        let mut menu = build_tree_menu(&shared);
-        let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
-        match result {
-            MenuResult::Continue(plan, _) => {
-                assert!(plan.rows.len() == 2);
-                // The plan's active_ids should contain u2.
-                // (active_ids is used by the rendering layer to mark the row.)
-            }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
-        }
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+        assert_eq!(resp.active_ids, vec!["u2".to_string()],
+            "active_ids should contain the leaf entry");
+    }
+
+    #[test]
+    fn active_entry_marked_deep() {
+        // Leaf is deep in the tree (not root-level) — active_ids must
+        // still find it. This was broken when active_ids only checked
+        // root-level entries via tree_rc.iter().
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply"),
+                vec![node(
+                    make_entry("u2", Some("a1"), "user", "second"),
+                    vec![],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        *shared.leaf_id.borrow_mut() = Some("u2".into());
+        let mut tree_node = TreeListNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let resp = tree_node.data(0, &path_args).unwrap();
+        assert_eq!(resp.active_ids, vec!["u2".to_string()],
+            "active_ids should find leaf deep in tree");
     }
 
     // --- Compact: mode submit tests ---
