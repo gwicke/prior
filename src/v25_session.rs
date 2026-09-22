@@ -185,6 +185,43 @@ pub fn session_fields() -> Vec<FieldSpec> {
 }
 
 // ---------------------------------------------------------------------------
+// SessionListingNode — parent listing node for /session
+// ---------------------------------------------------------------------------
+
+/// Parent listing node for `/session`. Provides the static "session" row,
+/// column definitions, field metadata, and `drill_rewrite` (adds default
+/// `.path:.` filter on drill). `SessionListNode` is its dynamic child.
+pub struct SessionListingNode;
+
+impl SlashDotNode for SessionListingNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("session")
+                .desc("list, rename, resume, fork, or delete sessions")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    fn columns(&self) -> Vec<ColumnDef> {
+        session_listing_columns()
+    }
+
+    fn fields(&self) -> Vec<FieldSpec> {
+        session_fields()
+    }
+
+    fn drill_rewrite(
+        &mut self,
+        _path: &[String],
+        _prompt_suffix: &str,
+    ) -> Option<String> {
+        // On drill, add a default path filter to show only sessions
+        // relevant to the current working directory.
+        Some("session .path:.".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SessionListNode
 // ---------------------------------------------------------------------------
 
@@ -247,17 +284,6 @@ impl SlashDotNode for SessionListNode {
         };
 
         Ok(Rc::new(DataResponse { rows, active_ids }))
-    }
-
-    fn drill_rewrite(
-        &mut self,
-        _path: &[String],
-        _prompt_suffix: &str,
-        _key: &crate::slashdot_menu::HostKey,
-    ) -> Option<String> {
-        // On drill, add a default path filter to show only sessions
-        // relevant to the current working directory.
-        Some("session .path:.".to_string())
     }
 
     fn columns(&self) -> Vec<ColumnDef> {
@@ -457,7 +483,6 @@ impl SlashDotNode for SessionRenameNode {
         &mut self,
         path: &[String],
         _prompt_suffix: &str,
-        _key: &crate::slashdot_menu::HostKey,
     ) -> Option<String> {
         // Pre-fill the current session name. path is
         // ["session", "<uuid>", "rename"].
@@ -528,22 +553,15 @@ impl SlashDotNode for SessionDeleteNode {
 
 /// Build the `/session` subtree as a `SlashDotMenuNode`.
 ///
-/// The listing node carries column definitions and field metadata;
-/// `SessionListNode` provides dynamic session rows; its static children
-/// are the action nodes.
+/// `SessionListingNode` provides the static "session" row, columns,
+/// fields, and `drill_rewrite`. `SessionListNode` (its child) provides
+/// dynamic session rows; action nodes are grandchildren.
 pub fn build_session_node(
     shared: &Rc<MenuShared>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
-    use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
 
-    let mut listing: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "session",
-        "list, rename, resume, fork, or delete sessions",
-    )])
-    .with_columns(session_listing_columns())
-    .with_fields(session_fields())
-    .into();
+    let mut listing: SlashDotMenuNode = SessionListingNode.into();
 
     let mut session_node: SlashDotMenuNode =
         SessionListNode { shared: shared.clone() }.into();
@@ -1017,10 +1035,9 @@ mod tests {
     #[test]
     fn session_list_drill_rewrite_adds_path_filter() {
         use crate::slashdot_menu::node_impl::SlashDotNode;
-        let shared = make_shared();
-        let mut node = SessionListNode { shared: shared.clone() };
+        let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
-        let result = node.drill_rewrite(&path, " ", &HostKey::DrillTab);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, Some("session .path:.".to_string()));
     }
 
@@ -1031,7 +1048,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionRenameNode { shared: shared.clone() };
         let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
-        let result = node.drill_rewrite(&path, " ", &HostKey::DrillEnter);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

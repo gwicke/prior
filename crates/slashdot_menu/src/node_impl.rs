@@ -179,7 +179,6 @@ pub trait SlashDotNode {
         &mut self,
         _path: &[String],
         _prompt_suffix: &str,
-        _key: &HostKey,
     ) -> Option<String> {
         None
     }

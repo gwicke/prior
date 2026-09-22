@@ -674,7 +674,6 @@ impl SlashDotNode for CompactNode {
         &mut self,
         _path: &[String],
         _prompt_suffix: &str,
-        _key: &crate::slashdot_menu::HostKey,
     ) -> Option<String> {
         // Look up the current session leaf ID and redirect.
         let leaf_id = self.shared.leaf_id.borrow().clone()?;
@@ -824,7 +823,6 @@ impl SlashDotNode for TreeCompactPromptNode {
         &mut self,
         path: &[String],
         _prompt_suffix: &str,
-        _key: &crate::slashdot_menu::HostKey,
     ) -> Option<String> {
         // Pre-fill the default compaction prompt.
         // path is ["tree", "<id>", "compact", "prompt"].
@@ -1950,7 +1948,7 @@ mod tests {
         *shared.leaf_id.borrow_mut() = Some("msg-42".into());
         let mut node = CompactNode { shared: shared.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
     }
 
@@ -1960,7 +1958,7 @@ mod tests {
         // leaf_id is None (no session).
         let mut node = CompactNode { shared: shared.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, None);
     }
 
@@ -1970,7 +1968,7 @@ mod tests {
         let mut node = TreeCompactPromptNode::new(shared.clone());
         let path = vec!["tree".to_string(), "msg-1".to_string(),
                         "compact".to_string(), "prompt".to_string()];
-        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, Some(
             "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
         ));

@@ -95,7 +95,6 @@ impl SlashDotNode for SettingLeafNode {
         &mut self,
         path: &[String],
         _prompt_suffix: &str,
-        _key: &crate::slashdot_menu::HostKey,
     ) -> Option<String> {
         // Pre-fill the current value. path is ["set", "<setting-name>"].
         let val = self.settings.borrow().value(self.key);
@@ -413,7 +412,7 @@ mod tests {
             settings: settings.clone(),
         };
         let path = vec!["set".to_string(), "tool_call_limit".to_string()];
-        let result = node.drill_rewrite(&path, " ", &crate::slashdot_menu::HostKey::DrillTab);
+        let result = node.drill_rewrite(&path, " ");
         assert_eq!(result, Some("set tool_call_limit 50".to_string()));
     }
 }

@@ -259,7 +259,7 @@ impl NodeEntry {
         // (DrillEnter / DrillTab), let the node optionally rewrite the
         // prompt and restart from root.
         if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
-            if let Some(new_prompt) = self.inner.drill_rewrite(&path, prompt_suffix, &key) {
+            if let Some(new_prompt) = self.inner.drill_rewrite(&path, prompt_suffix) {
                 return MenuResult::Continue(
                     RenderPlan::default(),
                     new_prompt,
@@ -1684,7 +1684,6 @@ mod tests {
             &mut self,
             _path: &[String],
             _prompt_suffix: &str,
-            _key: &HostKey,
         ) -> Option<String> {
             Some(format!("abc rename {}", self.prefill))
         }
