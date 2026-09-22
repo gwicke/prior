@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 622 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing. `drill_rewrite` for prompt pre-fill/redirect on drill.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 628 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing. `drill_rewrite` for prompt pre-fill/redirect on drill (all 5 use cases).
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -118,9 +118,6 @@ v2.5 engine.
 - `cursor_idx` updated in-place and kept in sync. No debug_assert
   enforcing the ID-authoritative invariant.
 
-**State and async review**
-- Consider better designs for app state access and async execution
-
 **Prompt rewrite support**
 - WIP design doc: slashdot/prompt_rewrite_design.md
 
@@ -148,8 +145,14 @@ Implementation options:
 - A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
 - Host-side detection + engine query (like v2.0's `field_options()`).
 
-**PathArgs / Args borrowing:**
-- Owned data. Deferred to avoid lifetime complexity in the trait API.
+**PathArgs / Args cleanup**
+- Clean up unrelated data (e.g. term_width)
+- Try to make it cheaper / less copying with refs. Deferred to avoid lifetime
+  complexity in the trait API.
+
+**State and async review**
+- Consider better designs for app state access and async execution
+- slashdot/state_and_async.md
 
 ---
 

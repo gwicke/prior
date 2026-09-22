@@ -135,10 +135,19 @@ listing the user drilled from.
 
 ### Status
 
-**Core infrastructure done.** `DrillEnter`/`DrillTab` keys, `drill_rewrite`
-trait method (Phase 0.5), and `handle_leaf` integration are implemented
-and tested (4 tests). Individual command `drill_rewrite` implementations
-are pending (see roll-out below).
+**All 5 use cases implemented.** Core infrastructure (`DrillEnter`/`DrillTab`,
+`drill_rewrite` Phase 0.5) plus all command implementations:
+
+| Command | Status | Test |
+|---------|--------|------|
+| `/session ` + Tab → `.path:.` | Done | `session_list_drill_rewrite_adds_path_filter` |
+| `/set tool_call_limit` + Tab → prefill value | Done | `setting_leaf_drill_rewrite_prefills_value` |
+| `/compact ` + Tab → `/tree <id> compact ` | Done | `compact_node_drill_rewrite_redirects_to_tree` |
+| `/tree <id> compact prompt` + Tab → prefill default | Done | `compact_prompt_drill_rewrite_fills_default` |
+| `/session <id> rename` + Enter → prefill name | Done | `session_rename_drill_rewrite_prefills_name` |
+
+Engine tests: 4 (fires on drill, doesn't fire on manual, None falls through).
+Total: 628 lib tests.
 
 ### StaticListingNode stays simple
 
@@ -165,18 +174,15 @@ implementation.
 
 ## Application roll-out
 
-Suggested order by complexity:
+All complete. Implementation order was by complexity:
 
-1. **Simple leaf pre-fills** (`/set tool_call_limit`, `/tree <id> compact prompt`,
-   `/session <id> rename`): Leaf nodes implement `drill_rewrite`, return
-   pre-filled prompt. Straightforward.
+1. ~~**Simple leaf pre-fills**~~ **Done.** `/set tool_call_limit`,
+   `/tree <id> compact prompt`, `/session <id> rename`.
 
-2. **Listing filter** (`/session ` + Tab → `.path:.`): Session listing
-   implements `drill_rewrite`, returns prompt with default filter.
+2. ~~**Listing filter**~~ **Done.** `/session ` → `.path:.`.
 
-3. **Cross-command redirect** (`/compact` → `/tree <id> compact`):
-   Compact listing implements `drill_rewrite`, queries session tree
-   via shared state, returns full prompt under `/tree`.
+3. ~~**Cross-command redirect**~~ **Done.** `/compact` → `/tree <id> compact `
+   (new `CompactNode` root leaf, registered in `build_menu`).
 
 ---
 
@@ -184,6 +190,9 @@ Suggested order by complexity:
 
 | File | Change |
 |------|--------|
-| `node_impl.rs` | Rename `MaybeSubmit` → `DrillEnter`, add `DrillTab`. Add `SlashDotNode::drill_rewrite()` default method. Add `PathArgs::full_prompt()`. |
-| `node_entry.rs` | Phase 0.5 in `node_traverse`: check drill key, call `drill_rewrite`, early return. Update `handle_listing` Tab/Enter to send Drill keys. Update `handle_leaf` DrillEnter branch. |
-| Host commands | Implement `drill_rewrite` on nodes that need it. |
+| `crates/slashdot_menu/src/node_impl.rs` | Rename `MaybeSubmit` → `DrillEnter`, add `DrillTab`. Add `SlashDotNode::drill_rewrite()` default method. |
+| `crates/slashdot_menu/src/node_entry.rs` | Phase 0.5 in `node_traverse`: check drill key, call `drill_rewrite`, early return. Update `handle_listing` Tab/Enter to send Drill keys. Update `handle_leaf` DrillEnter branch. |
+| `src/v25_session.rs` | `SessionListNode::drill_rewrite` → `.path:.` filter. `SessionRenameNode::drill_rewrite` → prefill name. |
+| `src/v25_set.rs` | `SettingLeafNode::drill_rewrite` → prefill current value. |
+| `src/v25_tree.rs` | `CompactNode` (new root leaf): drill → `/tree <id> compact `, submit → NewPath redirect. `TreeCompactPromptNode::drill_rewrite` → prefill default prompt. |
+| `src/v25_menu.rs` | Register `CompactNode` in root menu. |
