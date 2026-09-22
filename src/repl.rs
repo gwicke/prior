@@ -3051,6 +3051,22 @@ impl Repl {
             vis_total += heights[i];
             count += 1;
         }
+
+        // If we hit the end of the list before filling the budget,
+        // extend backward to use remaining space (avoids empty gap
+        // below the window when selected is near the end).
+        if start > 0 && vis_total < budget {
+            while start > 0 {
+                let h = heights[start - 1];
+                if vis_total + h > budget {
+                    break;
+                }
+                start -= 1;
+                vis_total += h;
+                count += 1;
+            }
+        }
+
         // At least the selected row (may exceed budget if it's very tall).
         if count == 0 {
             count = 1;
@@ -9653,6 +9669,31 @@ mod tests {
         let (s, c) = Repl::visual_row_window(&rows, 0, 10);
         assert_eq!(s, 0);
         assert_eq!(c, 0);
+    }
+
+    #[test]
+    fn vw_selected_near_end_fills_downward() {
+        use crate::slashdot_menu::render::LogicalLine;
+        // 100 single-line rows, selected at end, budget=20.
+        // Window should extend backward to fill all 20 lines.
+        let rows: Vec<LogicalLine> = (0..100)
+            .map(|i| LogicalLine::new(format!("row {}", i)))
+            .collect();
+        let (s, c) = Repl::visual_row_window(&rows, 99, 20);
+        assert_eq!(c, 20, "must use full budget");
+        assert_eq!(s, 80, "window starts 20 rows before end");
+        assert!(s <= 99 && s + c > 99, "selected in window");
+    }
+
+    #[test]
+    fn vw_selected_near_start_fills_forward() {
+        use crate::slashdot_menu::render::LogicalLine;
+        let rows: Vec<LogicalLine> = (0..100)
+            .map(|i| LogicalLine::new(format!("row {}", i)))
+            .collect();
+        let (s, c) = Repl::visual_row_window(&rows, 0, 20);
+        assert_eq!(c, 20, "must use full budget");
+        assert_eq!(s, 0, "starts at 0");
     }
 }
 
