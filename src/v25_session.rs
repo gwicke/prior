@@ -584,7 +584,8 @@ pub fn build_session_node(
 mod tests {
     use super::*;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-    use crate::slashdot_menu::node_impl::{HostKey, MenuResult, StaticListingNode};
+    use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode};
+    use crate::slashdot_menu::HostKey;
 
     fn test_settings() -> crate::settings::SettingsStore {
         crate::settings::SettingsStore {

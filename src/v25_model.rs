@@ -333,7 +333,7 @@ pub fn build_model_node(
 mod tests {
     use super::*;
 
-    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::node_impl::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
+    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
         h.eval_prompt(prompt, key, 80)
     }
 
@@ -453,7 +453,7 @@ mod tests {
 
         let mut h = menu.get_handle();
         // Root listing: shows the "model" row.
-        match eval(&mut h, "", crate::slashdot_menu::node_impl::HostKey::None) {
+        match eval(&mut h, "", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
@@ -463,7 +463,7 @@ mod tests {
             other => panic!("expected Continue at root, got {:?}", other),
         }
         // Tab drills into the model listing.
-        match eval(&mut h, "", crate::slashdot_menu::node_impl::HostKey::Tab) {
+        match eval(&mut h, "", crate::slashdot_menu::HostKey::Tab) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.starts_with("model"),
                     "after Tab should drill into model, got: {}", prompt);
@@ -471,14 +471,14 @@ mod tests {
             other => panic!("expected Continue after Tab drill, got {:?}", other),
         }
         // If catalog has entries, Tab again drills into a model, Enter submits.
-        let model_listing = eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None);
+        let model_listing = eval(&mut h, "model ", crate::slashdot_menu::HostKey::None);
         if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) = model_listing {
             if !plan.rows.is_empty() {
-                match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::Tab) {
+                match eval(&mut h, "model ", crate::slashdot_menu::HostKey::Tab) {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                         assert!(prompt.starts_with("model "),
                             "should drill into a model entry, got: {}", prompt);
-                        match eval(&mut h, &prompt, crate::slashdot_menu::node_impl::HostKey::Enter) {
+                        match eval(&mut h, &prompt, crate::slashdot_menu::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                                 let model = shared.live_state.borrow().model.clone();
                                 assert!(!model.is_empty(),
@@ -501,14 +501,14 @@ mod tests {
 
         let mut h = menu.get_handle();
         // Unfiltered count.
-        let total = match eval(&mut h, "model ", crate::slashdot_menu::node_impl::HostKey::None) {
+        let total = match eval(&mut h, "model ", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 plan.rows.len()
             }
             other => panic!("expected Continue, got {:?}", other),
         };
         // Filtered count must be strictly less.
-        match eval(&mut h, "model deep", crate::slashdot_menu::node_impl::HostKey::None) {
+        match eval(&mut h, "model deep", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let filtered = plan.rows.len();
                 assert!(filtered < total,

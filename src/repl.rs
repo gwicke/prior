@@ -2277,7 +2277,7 @@ impl Repl {
                 let tw = crate::output::term_width();
                 let result = handle.eval_prompt(
                     &line,
-                    crate::slashdot_menu::node_impl::HostKey::None,
+                    crate::slashdot_menu::HostKey::None,
                     tw,
                 );
                 match result {
@@ -2563,7 +2563,7 @@ impl Repl {
                                             let line = editor.text().trim_start_matches('/').to_string();
                                             let _ = handle.eval_prompt(
                                                 &line,
-                                                crate::slashdot_menu::node_impl::HostKey::MoveCursor(delta),
+                                                crate::slashdot_menu::HostKey::MoveCursor(delta),
                                             crate::output::term_width(),
                                             );
                                         }
@@ -2658,7 +2658,7 @@ impl Repl {
                                         if delta != 0 {
                                             let _ = handle.eval_prompt(
                                                 &line,
-                                                crate::slashdot_menu::node_impl::HostKey::MoveCursor(delta),
+                                                crate::slashdot_menu::HostKey::MoveCursor(delta),
                                                 tw,
                                             );
                                         }
@@ -2688,7 +2688,7 @@ impl Repl {
                                         let line = editor.text().trim_start_matches('/').to_string();
                                         let result = handle.eval_prompt(
                                             &line,
-                                            crate::slashdot_menu::node_impl::HostKey::Tab,
+                                            crate::slashdot_menu::HostKey::Tab,
                                             crate::output::term_width(),
                                         );
                                         if let crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) = result {
@@ -2721,7 +2721,7 @@ impl Repl {
                                             let line = editor.text().trim_start_matches('/').to_string();
                                             let result = handle.eval_prompt(
                                                 &line,
-                                                crate::slashdot_menu::node_impl::HostKey::Enter,
+                                                crate::slashdot_menu::HostKey::Enter,
                                             crate::output::term_width(),
                                             );
                                             match result {
@@ -2786,7 +2786,7 @@ impl Repl {
                                         let line = editor.text().trim_start_matches('/').to_string();
                                         let result = handle.eval_prompt(
                                             &line,
-                                            crate::slashdot_menu::node_impl::HostKey::Esc,
+                                            crate::slashdot_menu::HostKey::Esc,
                                             crate::output::term_width(),
                                         );
                                         match result {

@@ -907,8 +907,9 @@ mod tests {
     use crate::slash_menu_bridge::MenuShared;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
-        HostKey, MenuResult, PathArgs, StaticListingNode,
+        MenuResult, PathArgs, StaticListingNode,
     };
+    use crate::slashdot_menu::HostKey;
     use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 
     fn test_settings() -> crate::settings::SettingsStore {

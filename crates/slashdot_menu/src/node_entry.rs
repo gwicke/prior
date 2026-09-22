@@ -9,11 +9,29 @@ use crate::fields::{row_field_value, FieldSpace};
 use crate::filter::compile_query;
 use crate::grammar::{parse_dot_token, ModifierToken};
 use crate::node_impl::{
-    Args, HostKey, MenuResult, PathArgs, SubmitResult,
+    Args, MenuResult, PathArgs, SubmitResult,
     SlashDotNode,
 };
 use crate::render::{LogicalLine, RenderPlan};
 use crate::value::Value;
+
+/// Simplified key events the host sends to the engine.
+pub enum HostKey {
+    Tab,
+    Enter,
+    Esc,
+    /// Move cursor by delta (+1 for down, -1 for up, ±N for pgup/pgdn).
+    MoveCursor(i32),
+    /// No key action — used when Tab drills but does not forward a key.
+    None,
+    /// Drilled into from a parent listing via Enter. Leaf nodes submit
+    /// on this (unless `drill_rewrite` intercepts); listing nodes
+    /// ignore it (stops recursion).
+    DrillEnter,
+    /// Drilled into from a parent listing via Tab. Listing and leaf
+    /// nodes can use this to trigger `drill_rewrite`.
+    DrillTab,
+}
 
 // --- Handle to a row in a child's DataResponse ---
 

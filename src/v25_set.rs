@@ -256,7 +256,7 @@ pub fn build_set_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slashdot_menu::node_impl::HostKey;
+    use crate::slashdot_menu::HostKey;
 
     fn test_settings() -> Rc<RefCell<SettingsStore>> {
         Rc::new(RefCell::new(SettingsStore {

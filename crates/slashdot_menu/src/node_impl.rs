@@ -80,24 +80,6 @@ pub enum MenuResult {
     DoneError(String, String),
 }
 
-/// Simplified key events the host sends to the engine.
-pub enum HostKey {
-    Tab,
-    Enter,
-    Esc,
-    /// Move cursor by delta (+1 for down, -1 for up, ±N for pgup/pgdn).
-    MoveCursor(i32),
-    /// No key action — used when Tab drills but does not forward a key.
-    None,
-    /// Drilled into from a parent listing via Enter. Leaf nodes submit
-    /// on this (unless `drill_rewrite` intercepts); listing nodes
-    /// ignore it (stops recursion).
-    DrillEnter,
-    /// Drilled into from a parent listing via Tab. Listing and leaf
-    /// nodes can use this to trigger `drill_rewrite`.
-    DrillTab,
-}
-
 // --- Public trait for host implementations ---
 
 /// Host implementations of menu nodes. Each command is one `impl SlashDotNode`.
@@ -204,14 +186,14 @@ impl StaticRow {
     }
 }
 
-/// A convenience `SlashDotNode` for listing-level commands that return a
-/// fixed set of rows (no dynamic data, no submit).
+/// A convenience `SlashDotNode` for purely static listing-level commands that return a fixed set of
+/// rows (no dynamic rows, no active ids, no submit, no dynamic behavior).
 ///
-/// Use this instead of writing a dedicated `impl SlashDotNode` for simple
-/// listing nodes like `/thinking`, `/persona`, or any static menu entry.
-///
-/// For active markers, pass a shared `HashSet<String>` via
-/// [`StaticListingNode::with_active`].
+/// Use this instead of writing a dedicated `impl SlashDotNode` for pure static listing nodes like
+/// `/thinking`, `/persona`. However, if you feel like extending this, you probably want to
+/// implement your own simple SlashDotNode instead. Every SlashDotNode impl that has children gets
+/// full listing functionality from the engine for free; there is nothing special about
+/// StaticListingNode when it comes to listings.
 ///
 /// # Example
 /// ```ignore
@@ -244,16 +226,6 @@ impl StaticListingNode {
     /// Set the header lines shown above the listing.
     pub fn with_header(mut self, header: Vec<String>) -> Self {
         self.header_lines = header;
-        self
-    }
-
-    /// Set the active IDs (e.g. current selection). The `Rc<RefCell<...>>`
-    /// can be shared with child nodes or external state.
-    pub fn with_active(
-        mut self,
-        active: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
-    ) -> Self {
-        self.active_ids = active;
         self
     }
 

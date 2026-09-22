@@ -31,7 +31,8 @@
 //! ```
 
 use crate::node_entry::NodeEntry;
-use crate::node_impl::{HostKey, MenuResult, SlashDotNode};
+use crate::node_entry::HostKey;
+use crate::node_impl::{MenuResult, SlashDotNode};
 
 /// A node in the menu tree. Wraps the internal `NodeEntry` with a
 /// minimal public API: `new()` to create a node, `add_child()` to

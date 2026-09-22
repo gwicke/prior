@@ -71,8 +71,9 @@ mod tests {
     use crate::slash_menu_bridge::MenuShared;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
-        HostKey, MenuResult, StaticListingNode,
+        MenuResult, StaticListingNode,
     };
+    use crate::slashdot_menu::HostKey;
 
     fn make_shared() -> Rc<MenuShared> {
         Rc::new(MenuShared::new(
