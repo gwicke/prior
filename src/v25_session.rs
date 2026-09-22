@@ -97,6 +97,20 @@ fn session_description(meta: &crate::repl::SessionMeta) -> String {
     }
 }
 
+/// Relative path display for the session cwd, shown in the listing.
+/// Returns the session's working directory relative to the current
+/// working directory, or the basename if no relative path can be computed.
+fn session_path_display(meta: &crate::repl::SessionMeta) -> String {
+    let session_cwd = std::path::Path::new(&meta.cwd);
+    match std::env::current_dir() {
+        Ok(now) => crate::path_util::relativize_path(session_cwd, &now),
+        Err(_) => session_cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| meta.cwd.clone()),
+    }
+}
+
 /// Resolve the session UUID from `path_args.ids` in the *listing* context
 /// (path `["session", "<uuid>"]`): the UUID is the last element. Used by
 /// `SessionListNode::header()` and by the action nodes' `data()`, which the
@@ -136,13 +150,17 @@ fn find_session(
 // ---------------------------------------------------------------------------
 
 /// Column definitions for the parent `/session` listing (description,
-/// turns, age — no ID column since UUIDs are not useful to the user).
+/// path, turns, age — no ID column since UUIDs are not useful to the user).
 pub fn session_listing_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
         ColumnDef::new("description", "Description")
             .min(20)
             .prio(3)
+            .wrap(false),
+        ColumnDef::new("path", "Path")
+            .min(10)
+            .prio(2)
             .wrap(false),
         ColumnDef::new("msgs", "Turns")
             .align(Align::Right)
@@ -169,6 +187,7 @@ pub fn session_action_columns() -> Vec<ColumnDef> {
 /// Field metadata for the session listing.
 pub fn session_fields() -> Vec<FieldSpec> {
     vec![
+        FieldSpec::new("path", false),
         FieldSpec::new("msgs", true),
         FieldSpec::new("age", true),
     ]
@@ -219,6 +238,7 @@ impl SlashDotNode for SessionListNode {
                 let desc = session_description(m);
                 Row::new(m.id.clone())
                     .desc(&desc)
+                    .field("path", Value::Str(session_path_display(m)))
                     .field("msgs", Value::Num(m.user_message_count as f64))
                     .field("age", Value::Str(relative_time(
                         m.last_prompt_timestamp.as_ref().unwrap_or(&m.timestamp),
