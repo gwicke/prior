@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 606 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 607 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -102,14 +102,6 @@ v2.5 engine.
 
 ### Deferred (not blocking, pick up as needed)
 
-**Double separator on AsyncOp submit:**
-`DoneSuccess` calls `emit_commit` with `sep: true`, then the next
-loop iteration calls `display_separator()` again — two blank lines
-between the committed command and the next prompt. Common to all
-`DoneSuccess` paths (thinking, model, switch, etc.). Fix: either
-suppress the agent loop separator after `MenuDone`, or pass `sep: false`
-in the `DoneSuccess` handler.
-
 **RenderPlan / rendering:**
 - ~~No `Rc<Vec<RenderLine>>` sharing~~ **Done.**
 - ~~No table layout / `ColumnDef` in RenderPlan~~ **Done.** Table headings,
@@ -119,11 +111,16 @@ in the `DoneSuccess` handler.
 - ~~Overlay rendering: LogicalLine, direct render path, PageUp/PageDown, cursor clamping~~ **Done.** See §7.
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-- Scrolling / cursoring with wrapped multi-line logical lines is broken -
+- Scrolling / cursoring with wrapped multi-line logical lines is broken —
   cursor drifts once scrolling starts
 - Vertical space separation between header() and listing menu is not handled
-  well when vertical space is tight. Should enforce ratio and and minimum
+  well when vertical space is tight. Should enforce ratio and minimum
   number of listing rows visible (say 3).
+
+**Tree action children columns:**
+`TreeListNode::columns()` was returning `tree_listing_columns()` (description
+only, no header), which suppressed the id column for switch/compact children.
+Fixed: returns `Vec::new()` for default id + description rendering.
 
 **PathArgs / Args borrowing:**
 - Owned data. Deferred to avoid lifetime complexity in the trait API.

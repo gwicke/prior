@@ -2,8 +2,18 @@
 
 ## Status
 
-**Phases 1–2 complete.** 606 lib tests pass. `/tree` listing, switch, and
+**Phases 1–2 complete.** 607 lib tests pass. `/tree` listing, switch, and
 compact (manual/text-only/prompt) are fully wired through the v2.5 engine.
+
+**Recent fixes:**
+- Active entry cursor: `active_ids` now searches full tree (was only
+  checking root-level entries). New `active_entry_marked_deep` test.
+- Iterative DFS: all tree-walking functions (`flatten_turns`,
+  `collect_active_path`, `build_label_map`, `find_entry`) converted to
+  explicit stacks. Linear sessions with 1000+ entries no longer risk
+  stack overflow.
+- Duplicate separator on commit fixed (see `doc/slash_menu_v2.5_impl.md`).
+- Action children (switch, compact) now display id + description columns.
 
 ---
 
@@ -174,10 +184,10 @@ the header when all column labels are empty.
 
 ---
 
-## Tests (26 tree tests)
+## Tests (27 tree tests)
 
-Phase 1: listing, caching, header, switch, active entry, model change
-prefix, empty entry hidden, linear indent, render plan indent.
+Phase 1: listing, caching, header, switch, active entry (root + deep),
+model change prefix, empty entry hidden, linear indent, render plan indent.
 
 Phase 2: compact submit (manual/text-only/prompt), full traversal,
 headers, empty suffix, model change branch indent.
@@ -191,8 +201,8 @@ message and the visible assistant text do not break the +2 indent.
 ## Deferred / follow-ups
 
 ### Active entry cursor
-v1 places the cursor on the leaf entry; v2.5 defaults to row 0.
-Needs `active_ids` wired to the correct entry position.
+**Done.** `active_ids` now searches the full tree via `find_entry()`
+(iterative DFS) instead of only root-level entries.
 
 ### `switch --summarize`
 Summarize abandoned branch when switching. Same compaction logic,
@@ -203,9 +213,8 @@ Rewrites to `/tree <last-user> compact`. Deferred until
 `doc/slashdot/prompt_rewrite_design.md`.
 
 ### Double separator on AsyncOp submit
-`DoneSuccess` calls `emit_commit` with `sep: true`, then the next
-loop iteration calls `display_separator()` again. Common to all
-`DoneSuccess` paths. See `doc/slash_menu_v2.5_impl.md` deferred section.
+**Done.** `emit_commit` now passes `sep: false` for both `DoneSuccess`
+and `DoneError`. The next prompt draws its own separator.
 
 ### Editor integration in compact prepare()
 `prepare()` opens `$EDITOR` for manual/text-only draft editing.
@@ -217,3 +226,7 @@ is sufficient for now.
 
 ### Scroll/cursor drift with wrapped multi-line logical lines
 Documented in `doc/slash_menu_v2.5_impl.md` deferred section.
+
+### Iterative DFS for deep sessions
+**Done.** All tree-walking functions use explicit stacks instead of
+recursion. Linear sessions with 1000+ entries are safe.
