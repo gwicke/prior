@@ -57,17 +57,34 @@ impl std::fmt::Display for ParseError {
 
 /// Whether a line is one of the three structural markers (trimmed comparison,
 /// so trailing whitespace from the model does not defeat detection).
+///
+/// For SEARCH only, be lenient with a single hallucinated closing bracket/brace
+/// (`>`, `]`, `}`, `)`) that some models emit — e.g. `<<<<<<< SEARCH>`
+/// or `<<<<<<< SEARCH]`. The prefix must match exactly; only a single such
+/// char is allowed and nothing else may follow. REPLACE and DIVIDER remain
+/// strict.
 fn marker_of(line: &str) -> Option<&'static str> {
     let t = line.trim();
-    if t == SEARCH_MARKER {
-        Some(SEARCH_MARKER)
-    } else if t == DIVIDER {
-        Some(DIVIDER)
-    } else if t == REPLACE_MARKER {
-        Some(REPLACE_MARKER)
-    } else {
-        None
+    // Lenient SEARCH marker: exact `<<<<<<< SEARCH` or with exactly one
+    // trailing char from the set `>]})`.
+    if t.starts_with(SEARCH_MARKER) {
+        let after = &t[SEARCH_MARKER.len()..];
+        if after.is_empty() {
+            return Some(SEARCH_MARKER);
+        }
+        if after.chars().count() == 1
+            && matches!(after.chars().next(), Some('>') | Some(']') | Some('}') | Some(')'))
+        {
+            return Some(SEARCH_MARKER);
+        }
     }
+    if t == DIVIDER {
+        return Some(DIVIDER);
+    }
+    if t == REPLACE_MARKER {
+        return Some(REPLACE_MARKER);
+    }
+    None
 }
 
 /// Strip a single surrounding triple-backtick fence, if present.
@@ -475,6 +492,45 @@ mod tests {
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.edits[0].start_line, Some(7));
         assert_eq!(p.edits[1].start_line, None);
+    }
+
+    #[test]
+    fn lenient_search_marker_accepts_trailing_bracket() {
+        // The model occasionally hallucinates a closing bracket/brace after
+        // SEARCH (e.g. `<<<<<<< SEARCH>` or `<<<<<<< SEARCH]`). Be lenient
+        // for SEARCH only — the prefix must match exactly, only one char from
+        // the set `>]})` is allowed, and nothing else may follow.
+        let text = "src/foo.py\n<<<<<<< SEARCH>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
+        assert_eq!(p.edits, vec![plain("old", "new")]);
+
+        let text2 = "src/foo.py\n<<<<<<< SEARCH]\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p2 = parse_blocks(text2).unwrap();
+        assert_eq!(p2.edits, vec![plain("old", "new")]);
+
+        let text3 = "src/foo.py\n<<<<<<< SEARCH}\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p3 = parse_blocks(text3).unwrap();
+        assert_eq!(p3.edits, vec![plain("old", "new")]);
+
+        let text4 = "src/foo.py\n<<<<<<< SEARCH)\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p4 = parse_blocks(text4).unwrap();
+        assert_eq!(p4.edits, vec![plain("old", "new")]);
+    }
+
+    #[test]
+    fn lenient_search_marker_rejects_extra_chars() {
+        // Two chars, or a char outside the allowed set, must NOT be accepted.
+        assert!(parse_blocks("<<<<<<< SEARCH>>\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+        assert!(parse_blocks("<<<<<<< SEARCHX\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+        assert!(parse_blocks("<<<<<<< SEARCH ]\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+    }
+
+    #[test]
+    fn lenient_only_for_search_not_replace() {
+        // The closing marker must remain exact — no leniency for REPLACE.
+        assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE>").is_err());
+        assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE]").is_err());
     }
 
     #[test]
