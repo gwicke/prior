@@ -2,7 +2,7 @@
 
 ## Status
 
-**Phases 1–2 complete.** 607 lib tests pass. `/tree` listing, switch, and
+**Phases 1–2 complete.** 615 lib tests pass. `/tree` listing, switch, and
 compact (manual/text-only/prompt) are fully wired through the v2.5 engine.
 
 **Recent fixes:**
@@ -216,17 +216,21 @@ Rewrites to `/tree <last-user> compact`. Deferred until
 **Done.** `emit_commit` now passes `sep: false` for both `DoneSuccess`
 and `DoneError`. The next prompt draws its own separator.
 
-### Editor integration in compact prepare()
+### Revisit editor integration in compact prepare()
 `prepare()` opens `$EDITOR` for manual/text-only draft editing.
 Requires session access from the node (currently deferred to agent loop).
+This works, so this is low priority.
 
 ### Box-drawing characters
 Branch visualization with box-drawing. Deferred — simple indentation
 is sufficient for now.
 
-### Scroll/cursor drift with wrapped multi-line logical lines
-Documented in `doc/slash_menu_v2.5_impl.md` deferred section.
-
 ### Iterative DFS for deep sessions
 **Done.** All tree-walking functions use explicit stacks instead of
 recursion. Linear sessions with 1000+ entries are safe.
+
+### Vertical space allocation (detail vs rows)
+**Done.** `compute_space_budget()` enforces 50:50 ratio when both
+overflow, surplus flows to the other side, and minimum 3 rows are
+always visible. Detail visual-line accounting correctly handles
+wrapped LogicalLine items.

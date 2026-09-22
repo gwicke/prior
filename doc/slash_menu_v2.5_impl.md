@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 607 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 615 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -113,9 +113,6 @@ v2.5 engine.
   but no dialog text is rendered in the plan.
 - Scrolling / cursoring with wrapped multi-line logical lines is broken —
   cursor drifts once scrolling starts
-- Vertical space separation between header() and listing menu is not handled
-  well when vertical space is tight. Should enforce ratio and minimum
-  number of listing rows visible (say 3).
 
 **Tree action children columns:**
 `TreeListNode::columns()` was returning `tree_listing_columns()` (description
