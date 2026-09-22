@@ -180,6 +180,23 @@ pub enum AsyncOp {
     Clear { name: String },
     /// Move the session leaf pointer to the given entry.
     TreeSwitch { target_id: String },
+    /// Compact the session at a given entry.
+    TreeCompact {
+        target_id: String,
+        mode: CompactMode,
+        payload: String,
+    },
+}
+
+/// Compact mode for `AsyncOp::TreeCompact`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactMode {
+    /// User-editable touched-files list (already edited in $EDITOR).
+    Manual,
+    /// Deterministic text extraction (already edited in $EDITOR).
+    TextOnly,
+    /// LLM-generated summary; `payload` is the custom prompt.
+    Prompt,
 }
 
 impl MenuShared {

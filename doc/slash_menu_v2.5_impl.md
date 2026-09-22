@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phase 1 complete. 590 lib tests pass.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 598 lib tests pass.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -253,9 +253,9 @@ Implementation options:
 | ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`Confirm`~~ | removed | **Done.** Removed (`48b17df`). |
-| `TreeAction` | `/tree <id>` action menu | — (not yet ported) |
-| `SwitchAction` | `/tree <id> switch` | — (not yet ported) |
-| `CompactSummary` | `/tree <id> compact` summary | — (not yet ported) |
+| ~~`TreeAction`~~ | `/tree <id>` action menu | **Done.** Ported to v2.5 `TreeListNode` + action children. |
+| ~~`SwitchAction`~~ | `/tree <id> switch` | **Done.** `TreeSwitchNode` → `AsyncOp::TreeSwitch`. |
+| ~~`CompactSummary`~~ | `/tree <id> compact` summary | **Done.** Three compact nodes → `AsyncOp::TreeCompact`. |
 | `Mod` | Dotted modifier completion | — (not yet ported) |
 | `PathComplete` | Tab path completion | — (not yet ported) |
 

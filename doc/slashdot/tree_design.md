@@ -380,16 +380,21 @@ Indentation follows the existing v1 convention:
 7. Tests: listing rows, caching behavior, header content, switch submit,
    full traversal, active entry marking
 
-### Phase 2: Compact (all three modes)
+### Phase 2: Compact (all three modes) ✅
 
-1. Implement `CompactMode` enum in agent.rs
-2. Add `AsyncOp::TreeCompact` handler in agent.rs (port from existing
+1. ✅ `CompactMode` enum in `slash_menu_bridge.rs` (Manual, TextOnly, Prompt)
+2. ✅ `AsyncOp::TreeCompact` handler in agent.rs (ported from existing
    `/tree <id> compact` handler)
-3. Implement `TreeCompactManualNode` (prepare with blocking editor, submit)
-4. Implement `TreeCompactTextNode` (prepare with blocking editor, submit)
-5. Implement `TreeCompactPromptNode` (submit with suffix, LLM in handler)
-6. Tests: each compact mode end-to-end, editor flow, confirm flow,
-   cancel (Esc during confirm), no-session error, unknown-entry error
+3. ✅ `TreeCompactManualNode` (submit sets AsyncOp::TreeCompact)
+4. ✅ `TreeCompactTextNode` (submit sets AsyncOp::TreeCompact)
+5. ✅ `TreeCompactPromptNode` (submit reads suffix as prompt)
+6. ✅ 8 tests: submit for each mode, full traversal, header content,
+   empty suffix
+
+**Note:** Editor integration (`prepare()` opens `$EDITOR`) is deferred —
+the nodes are single-phase (prepare delegates to submit). The agent loop
+handler does the full compaction flow (validation, agent build, review
+gate, `run_compaction()`).
 
 ---
 

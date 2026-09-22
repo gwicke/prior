@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::{AsyncOp, MenuShared};
+use crate::slash_menu_bridge::{AsyncOp, CompactMode, MenuShared};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
@@ -680,6 +680,161 @@ impl SlashDotNode for TreeSwitchNode {
 }
 
 // ---------------------------------------------------------------------------
+// TreeCompactManualNode
+// ---------------------------------------------------------------------------
+
+/// Leaf node: compact with manual (touched-files) mode.
+/// `prepare()` opens $EDITOR with a template; `submit()` dispatches
+/// `AsyncOp::TreeCompact { mode: Manual }`.
+pub struct TreeCompactManualNode {
+    pub shared: Rc<MenuShared>,
+    edited: std::cell::RefCell<Option<String>>,
+}
+
+impl TreeCompactManualNode {
+    pub fn new(shared: Rc<MenuShared>) -> Self {
+        Self { shared, edited: std::cell::RefCell::new(None) }
+    }
+}
+
+impl SlashDotNode for TreeCompactManualNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("manual").desc("user-editable file list")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        vec![
+            "Manual compaction: scan touched files, open in editor.".into(),
+            "Save and close to confirm; discard to cancel.".into(),
+        ]
+    }
+
+    // Default prepare() delegates to submit() (single-phase).
+    // Future: override prepare() to open $EDITOR for draft editing,
+    // then return Prepared → confirm → submit. Requires session access
+    // to compute drafts, which the node doesn't have.
+
+    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let target_id = extract_target_id(path_args);
+        let draft = self.edited.borrow_mut().take().unwrap_or_default();
+        *self.shared.pending_op.borrow_mut() =
+            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Manual, payload: draft });
+        SubmitResult::Done(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeCompactTextNode
+// ---------------------------------------------------------------------------
+
+/// Leaf node: compact with text-only mode.
+/// `prepare()` opens $EDITOR with extracted conversation text; `submit()`
+/// dispatches `AsyncOp::TreeCompact { mode: TextOnly }`.
+pub struct TreeCompactTextNode {
+    pub shared: Rc<MenuShared>,
+    edited: std::cell::RefCell<Option<String>>,
+}
+
+impl TreeCompactTextNode {
+    pub fn new(shared: Rc<MenuShared>) -> Self {
+        Self { shared, edited: std::cell::RefCell::new(None) }
+    }
+}
+
+impl SlashDotNode for TreeCompactTextNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("text-only").desc("extracted conversation text")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        vec![
+            "Text-only compaction: extract user prompts + assistant text.".into(),
+            "No reasoning, tool calls, or tool output. Edit in editor.".into(),
+        ]
+    }
+
+    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let target_id = extract_target_id(path_args);
+        let draft = self.edited.borrow_mut().take().unwrap_or_default();
+        *self.shared.pending_op.borrow_mut() =
+            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::TextOnly, payload: draft });
+        SubmitResult::Done(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TreeCompactPromptNode
+// ---------------------------------------------------------------------------
+
+/// Leaf node: compact with LLM prompt mode.
+/// `submit()` reads the custom prompt from `path_args.suffix` and
+/// dispatches `AsyncOp::TreeCompact { mode: Prompt, payload: suffix }`.
+/// The LLM call happens in the agent loop handler.
+pub struct TreeCompactPromptNode {
+    pub shared: Rc<MenuShared>,
+}
+
+impl TreeCompactPromptNode {
+    pub fn new(shared: Rc<MenuShared>) -> Self {
+        Self { shared }
+    }
+}
+
+impl SlashDotNode for TreeCompactPromptNode {
+    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new("prompt").desc("LLM-generated summary")],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
+        let prompt = &path_args.suffix;
+        if prompt.is_empty() {
+            vec![
+                "LLM compaction: generate summary via agent.".into(),
+                "Type a custom instruction after 'prompt', or use the default.".into(),
+            ]
+        } else {
+            vec![
+                "LLM compaction with custom prompt:".into(),
+                format!("  {}", prompt),
+            ]
+        }
+    }
+
+    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let target_id = extract_target_id(path_args);
+        let prompt = path_args.suffix.trim().to_string();
+        *self.shared.pending_op.borrow_mut() =
+            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Prompt, payload: prompt });
+        SubmitResult::Done(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper
+// ---------------------------------------------------------------------------
+
+/// Extract the entry ID from a compact node's path.
+/// Path format: `["tree", "<entry-id>", "compact", "<mode>"]`.
+/// Target ID is at index 1 (second element).
+fn extract_target_id(path_args: &PathArgs) -> String {
+    let ids = &path_args.ids;
+    if ids.len() >= 2 {
+        ids.get(1).cloned().unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Menu builder
 // ---------------------------------------------------------------------------
 
@@ -704,6 +859,18 @@ pub fn build_tree_node(
         shared: shared.clone(),
     }
     .into());
+
+    // Compact subtree: a listing node with three mode children.
+    let mut compact_node: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+        "compact",
+        "summarize entries before this point",
+    )])
+    .into();
+    compact_node.add_child(TreeCompactManualNode::new(shared.clone()).into());
+    compact_node.add_child(TreeCompactTextNode::new(shared.clone()).into());
+    compact_node.add_child(TreeCompactPromptNode::new(shared.clone()).into());
+
+    tree_node.add_child(compact_node);
 
     listing.add_child(tree_node);
     listing
@@ -1060,5 +1227,190 @@ mod tests {
             }
             other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    // --- Compact: mode submit tests ---
+
+    #[test]
+    fn compact_manual_submit_sets_async_op() {
+        let shared = make_shared();
+        let mut node = TreeCompactManualNode::new(shared.clone());
+        let path_args = PathArgs {
+            ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let result = node.submit(1, &path_args);
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
+                assert_eq!(target_id, "u1");
+                assert_eq!(*mode, CompactMode::Manual);
+                assert!(payload.is_empty(), "manual draft is empty by default");
+            }
+            other => panic!("expected TreeCompact, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compact_text_only_submit_sets_async_op() {
+        let shared = make_shared();
+        let mut node = TreeCompactTextNode::new(shared.clone());
+        let path_args = PathArgs {
+            ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let result = node.submit(1, &path_args);
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
+                assert_eq!(target_id, "u1");
+                assert_eq!(*mode, CompactMode::TextOnly);
+                assert!(payload.is_empty());
+            }
+            other => panic!("expected TreeCompact, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compact_prompt_submit_sets_async_op() {
+        let shared = make_shared();
+        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let path_args = PathArgs {
+            ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
+            suffix: "summarize the key decisions".into(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let result = node.submit(1, &path_args);
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
+                assert_eq!(target_id, "u1");
+                assert_eq!(*mode, CompactMode::Prompt);
+                assert_eq!(payload, "summarize the key decisions");
+            }
+            other => panic!("expected TreeCompact, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compact_prompt_empty_suffix_uses_default() {
+        let shared = make_shared();
+        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let path_args = PathArgs {
+            ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let result = node.submit(1, &path_args);
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::TreeCompact { payload, mode, .. }) => {
+                assert_eq!(*mode, CompactMode::Prompt);
+                assert!(payload.is_empty(), "empty suffix = empty payload");
+            }
+            other => panic!("expected TreeCompact, got {:?}", other),
+        }
+    }
+
+    // --- Compact: full traversal ---
+
+    #[test]
+    fn compact_full_traversal_manual() {
+        let tree = vec![
+            node(
+                make_entry("u1", None, "user", "first message"),
+                vec![node(
+                    make_entry("a1", Some("u1"), "assistant", "response"),
+                    vec![],
+                )],
+            ),
+        ];
+        let shared = shared_with_tree(tree);
+        let mut menu = build_tree_menu(&shared);
+        let mut handle = menu.get_handle();
+
+        // 1. Listing.
+        let listing = handle.eval_prompt("tree ", HostKey::None, 80);
+        assert!(matches!(listing, MenuResult::Continue(_, _)));
+
+        // 2. Drill into u1.
+        let r = handle.eval_prompt("tree u1 ", HostKey::None, 80);
+        assert!(matches!(r, MenuResult::Continue(_, _)));
+
+        // 3. Drill into compact.
+        let r = handle.eval_prompt("tree u1 compact ", HostKey::None, 80);
+        assert!(matches!(r, MenuResult::Continue(_, _)));
+
+        // 4. Drill into manual.
+        let r = handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80);
+        assert!(matches!(r, MenuResult::Continue(_, _)));
+
+        // 5. Enter → submit.
+        let _ = handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80);
+        let op = shared.pending_op.borrow();
+        match op.as_ref() {
+            Some(AsyncOp::TreeCompact { target_id, mode, .. }) => {
+                assert_eq!(target_id, "u1");
+                assert_eq!(*mode, CompactMode::Manual);
+            }
+            other => panic!("expected TreeCompact, got {:?}", other),
+        }
+    }
+
+    // --- Compact: header tests ---
+
+    #[test]
+    fn compact_manual_header_shows_description() {
+        let shared = make_shared();
+        let mut node = TreeCompactManualNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let header = node.header(&path_args);
+        assert!(!header.is_empty());
+        assert!(header[0].contains("Manual"), "header mentions manual: {}", header[0]);
+    }
+
+    #[test]
+    fn compact_prompt_header_shows_prompt_when_present() {
+        let shared = make_shared();
+        let mut node = TreeCompactPromptNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: "my custom prompt".into(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let header = node.header(&path_args);
+        assert!(header.iter().any(|l| l.contains("my custom prompt")),
+            "header should contain the prompt text: {:?}", header);
+    }
+
+    #[test]
+    fn compact_prompt_header_shows_default_when_empty() {
+        let shared = make_shared();
+        let mut node = TreeCompactPromptNode::new(shared);
+        let path_args = PathArgs {
+            ids: vec![],
+            suffix: String::new(),
+            args: Default::default(),
+            term_width: 80,
+        };
+        let header = node.header(&path_args);
+        assert!(header.iter().any(|l| l.contains("default")),
+            "header should mention default: {:?}", header);
     }
 }

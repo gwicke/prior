@@ -3848,6 +3848,101 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         }
                     }
                 }
+                crate::slash_menu_bridge::AsyncOp::TreeCompact {
+                    target_id, mode, payload,
+                } => {
+                    let Some(ref s) = session else {
+                        config.output.display_text("Cannot compact: no active session");
+                        continue;
+                    };
+                    if s.get_entry(&target_id).await.is_none() {
+                        config.output.display_text(&format!(
+                            "Cannot compact: unknown tree entry {}",
+                            &target_id[..target_id.len().min(12)],
+                        ));
+                        continue;
+                    }
+                    let tokens_before = match s.build_context().await {
+                        Ok(ctx) => estimate_context_tokens(&ctx.messages),
+                        Err(_) => 0,
+                    };
+                    let resolved_mode = match mode {
+                        crate::slash_menu_bridge::CompactMode::Manual => {
+                            CompactSummaryMode::Manual
+                        }
+                        crate::slash_menu_bridge::CompactMode::TextOnly => {
+                            CompactSummaryMode::TextOnly
+                        }
+                        crate::slash_menu_bridge::CompactMode::Prompt => {
+                            CompactSummaryMode::Llm
+                        }
+                    };
+                    // LLM mode needs a live agent.
+                    if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
+                        match create_agent(config.clone()).await {
+                            Ok(a) => agent = Some(a),
+                            Err(e) => {
+                                config.output.display_text(
+                                    &format!("Cannot start agent: {}", e),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    // LLM mode early-out: refuse if nothing to compact.
+                    if resolved_mode == CompactSummaryMode::Llm {
+                        let current_leaf = s.get_leaf_id().await;
+                        if let Some(leaf) = current_leaf.as_deref() {
+                            let index = s.index().lock().await;
+                            if find_predecessor_on_active_branch(&index, &target_id)
+                                .as_deref()
+                                == Some(leaf)
+                            {
+                                config.output.display_text(
+                                    "Cannot compact: nothing before the current position",
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let review: Option<CompactionSummaryReview> =
+                        if let Some(g) = &guard {
+                            let g = g.clone();
+                            let out = config.output.clone();
+                            Some(Box::new(move |draft: &str| {
+                                crate::repl::review_compaction_summary(
+                                    &g, out.as_ref(), draft,
+                                )
+                            }))
+                        } else {
+                            None
+                        };
+                    match run_compaction(
+                        s,
+                        &agent,
+                        settings,
+                        CompactionTarget::AtPoint {
+                            target_id: target_id.clone(),
+                            tokens_before,
+                        },
+                        resolved_mode,
+                        &payload,
+                        config.output.as_ref(),
+                        review,
+                        &config.user_cancel,
+                        &config.cancel_notify,
+                    )
+                    .await
+                    {
+                        CompactionResult::Done => {}
+                        CompactionResult::Cancelled => {
+                            // User cancelled at the review step.
+                        }
+                        CompactionResult::Err(msg) => {
+                            config.output.display_text(&msg);
+                        }
+                    }
+                }
                 crate::slash_menu_bridge::AsyncOp::New { name } => {
                     session = None;
                     ensure_session(
