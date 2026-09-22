@@ -7,7 +7,7 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 ## Status
 
-**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 615 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows.
+**Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 620 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing.
 
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
@@ -103,21 +103,9 @@ v2.5 engine.
 ### Deferred (not blocking, pick up as needed)
 
 **RenderPlan / rendering:**
-- ~~No `Rc<Vec<RenderLine>>` sharing~~ **Done.**
-- ~~No table layout / `ColumnDef` in RenderPlan~~ **Done.** Table headings,
-  custom columns via `.with_columns()`, sticky headers.
-- ~~`RenderPlan.title` is unused — always `None`~~ **Removed.** v2.5 design
-  (§6) has no titles. See overlay rendering design below.
-- ~~Overlay rendering: LogicalLine, direct render path, PageUp/PageDown, cursor clamping~~ **Done.** See §7.
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-- Scrolling / cursoring with wrapped multi-line logical lines is broken —
-  cursor drifts once scrolling starts
-
-**Tree action children columns:**
-`TreeListNode::columns()` was returning `tree_listing_columns()` (description
-only, no header), which suppressed the id column for switch/compact children.
-Fixed: returns `Vec::new()` for default id + description rendering.
+- ~~Scrolling / cursoring with wrapped multi-line logical lines is broken — cursor drifts once scrolling starts~~ **Done.** `visual_row_window()` uses cumulative visual heights.
 
 **PathArgs / Args borrowing:**
 - Owned data. Deferred to avoid lifetime complexity in the trait API.
@@ -139,6 +127,23 @@ Fixed: returns `Vec::new()` for default id + description rendering.
 
 **Prompt rewrite support**
 - WIP design doc: slashdot/prompt_rewrite_design.md
+
+**Dot modifier auto-complete:** The v2.5 engine applies `.field:value`
+filter/sort syntax correctly, but the auto-complete *discovery UI* is
+missing. In v2.0, typing `/model .` showed a popup of available field
+names (via `Interpreter::field_options()` + `ActiveOverlay::Mod`).
+Typing `/model .sort:` showed distinct string values for that field.
+This popup is now unreachable — all `/` routes through v2.5, which has
+no equivalent.
+
+Primary user: `/model` (already ported, has `fields()` metadata). Can
+be tackled as a standalone step, or as part of `/session` or `/tree`
+porting if those commands also need modifier completion.
+
+Implementation options:
+- A `HostKey` variant (e.g. `ModifierComplete`) that returns candidates.
+- A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
+- Host-side detection + engine query (like v2.0's `field_options()`).
 
 ---
 
@@ -211,25 +216,6 @@ Fixed: returns `Vec::new()` for default id + description rendering.
 10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
     `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
     dead v2.0 code.
-
-### Known gaps (follow-ups)
-
-**Dot modifier auto-complete:** The v2.5 engine applies `.field:value`
-filter/sort syntax correctly, but the auto-complete *discovery UI* is
-missing. In v2.0, typing `/model .` showed a popup of available field
-names (via `Interpreter::field_options()` + `ActiveOverlay::Mod`).
-Typing `/model .sort:` showed distinct string values for that field.
-This popup is now unreachable — all `/` routes through v2.5, which has
-no equivalent.
-
-Primary user: `/model` (already ported, has `fields()` metadata). Can
-be tackled as a standalone step, or as part of `/session` or `/tree`
-porting if those commands also need modifier completion.
-
-Implementation options:
-- A `HostKey` variant (e.g. `ModifierComplete`) that returns candidates.
-- A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
-- Host-side detection + engine query (like v2.0's `field_options()`).
 
 ---
 

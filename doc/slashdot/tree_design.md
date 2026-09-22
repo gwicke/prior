@@ -2,7 +2,7 @@
 
 ## Status
 
-**Phases 1–2 complete.** 615 lib tests pass. `/tree` listing, switch, and
+**Phases 1–2 complete.** 620 lib tests pass. `/tree` listing, switch, and
 compact (manual/text-only/prompt) are fully wired through the v2.5 engine.
 
 **Recent fixes:**
@@ -234,3 +234,7 @@ recursion. Linear sessions with 1000+ entries are safe.
 overflow, surplus flows to the other side, and minimum 3 rows are
 always visible. Detail visual-line accounting correctly handles
 wrapped LogicalLine items.
+
+### Visual-line-aware row windowing
+**Done.** `visual_row_window()` computes window (start, count) using
+cumulative visual heights so wrapped multi-line rows scroll correctly.
