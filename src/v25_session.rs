@@ -98,36 +98,8 @@ fn session_description(meta: &crate::repl::SessionMeta) -> String {
 }
 
 /// Relative path display for the session cwd, shown in the listing.
-/// Tries cwd-relative first, then HOME-relative, then basename.
 fn session_path_display(meta: &crate::repl::SessionMeta) -> String {
-    let session_cwd = std::path::Path::new(&meta.cwd);
-    let abspath = session_cwd.to_string_lossy();
-    if abspath.starts_with('/') {
-        // Try cwd-relative.
-        if let Ok(now) = std::env::current_dir() {
-            let rel = crate::path_util::relativize_path(session_cwd, &now);
-            if !rel.starts_with('/') {
-                return rel;
-            }
-        }
-        // Try HOME-relative.
-        if let Ok(home) = std::env::var("HOME") {
-            let home_path = std::path::Path::new(&home);
-            let rel = crate::path_util::relativize_path(session_cwd, home_path);
-            if !rel.starts_with('/') {
-                if rel == "." {
-                    return "~".to_string();
-                }
-                let stripped = rel.strip_prefix("./").unwrap_or(&rel);
-                return format!("~/{stripped}");
-            }
-        }
-    }
-    // Fallback: basename.
-    session_cwd
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| meta.cwd.clone())
+    crate::path_util::relativize_for_display(std::path::Path::new(&meta.cwd))
 }
 
 /// Resolve the session UUID from `path_args.ids` in the *listing* context

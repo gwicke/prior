@@ -138,6 +138,41 @@ pub fn relativize_path(path: &Path, cwd: &Path) -> String {
     path_str.into_owned()
 }
 
+/// Render `path` for human-readable display: cwd-relative, then
+/// `~/`-relative, then basename.
+///
+/// 1. If `path` is under cwd (per [`relativize_path`]), return that.
+/// 2. If `path` is under `$HOME`, return `~/...`.
+/// 3. Otherwise return the basename.
+pub fn relativize_for_display(path: &Path) -> String {
+    let abspath = path.as_os_str().to_string_lossy();
+    if abspath.starts_with('/') {
+        // Try cwd-relative.
+        if let Ok(now) = std::env::current_dir() {
+            let rel = relativize_path(path, &now);
+            if !rel.starts_with('/') {
+                return rel;
+            }
+        }
+        // Try HOME-relative.
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = Path::new(&home);
+            let rel = relativize_path(path, home_path);
+            if !rel.starts_with('/') {
+                if rel == "." {
+                    return "~".to_string();
+                }
+                let stripped = rel.strip_prefix("./").unwrap_or(&rel);
+                return format!("~/{stripped}");
+            }
+        }
+    }
+    // Fallback: basename.
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 #[cfg(test)]
 mod relativize_tests {
     use super::*;
