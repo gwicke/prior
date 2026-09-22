@@ -699,7 +699,6 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                             old_text: e.get("oldText")?.as_str()?.to_string(),
                             new_text: e.get("newText")?.as_str()?.to_string(),
                             start_line: e.get("startLine").and_then(|v| v.as_u64()).map(crate::config::EditStartLine),
-                            end_line: e.get("endLine").and_then(|v| v.as_u64()).map(crate::config::EditEndLine),
                         })
                     })
                     .collect()
@@ -709,7 +708,6 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                     old_text: old.to_string(),
                     new_text: new.to_string(),
                     start_line: None,
-                    end_line: None,
                 }]
             } else {
                 vec![]
@@ -720,7 +718,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 // Old format: old/new fields.
                 let old = get_str("old").unwrap_or("");
                 let new_str = get_str("new").unwrap_or("");
-                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None, end_line: None }])
+                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None }])
             };
             let mut s = format!("edit {}", path);
             if let Some(r) = range {
@@ -2501,7 +2499,6 @@ mod tests {
             old_text: old_text.clone(),
             new_text: new_text.clone(),
             start_line: None,
-            end_line: None,
         }];
         let (_range, diff) = edit_preview(path.to_str().unwrap(), &edits);
 

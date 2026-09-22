@@ -47,8 +47,7 @@ optional** — no `anyOf`, no nested arrays:
   "path":      "string?",   // single-edit variant OR anchor for the text variant
   "oldText":   "string?",
   "newText":   "string?",
-  "startLine": "integer?",  // optional search window (both variants)
-  "endLine":   "integer?",
+  "startLine": "integer?",  // single-edit anchor line (near-line hint)
   "edits":     "string?"    // Aider SEARCH/REPLACE blocks (Phase 1: one file)
 }
 ```
@@ -57,16 +56,17 @@ Variant selection stays server-side in `EditArgs::from_wire` (which already
 inspects the raw `Value`), so the advertised schema is a plain bag of optional
 scalars. Accepted shapes:
 
-1. **Single (OpenAI-style, unchanged):** `{path, oldText, newText, startLine?, endLine?}`.
-2. **Text blocks (new):** `{path?, edits:"<aider blob>", startLine?, endLine?}` — Phase 1 single file.
+1. **Single (OpenAI-style):** `{path, oldText, newText, startLine?}`.
+2. **Text blocks:** `{path?, edits:"<aider blob>"}` — Phase 1 single file; a
+   block's anchor is a `path:LINE` header, not the top-level `startLine`.
 3. **Legacy array (not advertised):** `{path, edits:[...]}` — accepted only so
    old persisted sessions / replayed calls still parse.
 
-`startLine`/`endLine` (1-indexed, inclusive) are an **optional search window**.
-When set, the same window constrains **every** edit in the call, whether it came
-from the single variant or from the blob (all sub-edits share one window). They
-are a matching aid against ambiguity; they are **not persisted** (the canonical
-array and the blob both omit them) and **not served to the model**.
+`startLine` (1-indexed) is an **anchor**, not a search window — see *Per-block
+line anchors* below for the semantics, the per-block header form, shape (B), and
+why there is **no `endLine`**. It is a matching aid against ambiguity; it is
+**not persisted** (the canonical array and the blob both omit it) and **not
+served to the model**.
 
 Example:
 
@@ -193,6 +193,30 @@ Two different "echoes" are worth separating:
 
 Net: success/error is sufficient, no echo is required, and the transcript args
 may be normalized freely.
+
+### Echo on *invalid* input: elide content, keep structure
+
+The one place raw args *are* echoed is the self-correcting error for
+**unparseable input** (`EditArgs::invalid`), which shows the received
+parameters so the model can see what it sent. A naive byte-prefix truncation is
+the wrong tool there: it chops a blob mid-content and routinely hides the very
+marker lines that explain the failure.
+
+So the echo is **structure-preserving** (`truncate_wire_repr` → `elide_value` →
+`elide_string`): every long string field has only its *structural* lines kept —
+the `<<<<<<<` / `=======` / `>>>>>>>` markers, matched by **prefix** so a
+hallucinated `<<<<<<< SEARCH>` still shows — plus one line of context on each
+side, with each run of elided lines collapsed to `… (N lines elided) …`. Content
+is bulk, and the model already has it; the marker *shape* is what diagnoses the
+error. A long string with no markers at all degrades to a plain prefix, and
+short fields (a `path`, a short `oldText`) pass through verbatim. The whole
+echo is still bounded by `MAX_ECHOED_ARGS`.
+
+Example:
+
+```
+{"edits":"<<<<<<< SEARCH\nold line 0\n… (38 lines elided) …\nold line 39\n=======\n…\n>>>>>>> REPLACE","path":"src/foo.rs"}
+```
 
 ### The normalization win
 
@@ -361,8 +385,9 @@ What it takes:
    (non-`edit` calls and already-blob args pass through). Blob layout: the path
    as a header line above the first block, then one
    `<<<<<<< SEARCH\n<old>\n=======\n<new>\n>>>>>>> REPLACE` per block, blocks
-   separated by a blank line. `startLine`/`endLine` are not part of the blob.
-   The path is used as stored (the model's own spelling).
+   separated by a blank line. The anchor is not part of the blob, so the
+   rendered header is a bare path (no `:LINE`). The path is used as stored (the
+   model's own spelling).
 3. Call `normalize_edit_args` at the persist + display + `build_index` sites;
    call `edit_args_to_model_form` in `on_completion_call`. Execution keeps using
    `EditArgs::from_wire` (ingress).
@@ -427,7 +452,37 @@ Risks / trade-offs:
 
 ---
 
-## Phase 2 — multi-file (gated)
+## Per-block line anchors (`path:LINE`)
+
+*Implemented.*
+
+### Why
+
+Batching makes it cheap to fix the same pattern in many places in one file —
+but the same pattern is, by definition, **ambiguous**: the existing tool only
+had a single top-level `startLine`/`endLine` window that constrained *every*
+block equally, so you could not aim two structurally-identical replacements at
+two different regions.
+
+The new text
+
+Only if telemetry shows demand (e.g. count runs of consecutive single-file
+`edit` calls targeting different paths as a proxy for wanting one call).
+
+### Changes beyond Phase 1
+=======
+### Grammar
+
+A block's header line may carry a trailing line anchor:
+
+```
+some/path.rs:120
+<<<<<<< SEARCH
+The original text
+=======
+The new text
+=======
+The new text
 
 Only if telemetry shows demand (e.g. count runs of consecutive single-file
 `edit` calls targeting different paths as a proxy for wanting one call).
@@ -464,16 +519,22 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
 ## Decisions
 
 - **Field name**: `edits` (a string).
-- **`startLine`/`endLine`**: kept; when set they constrain every edit in the
-  call (single and blob variants, one shared window). Not persisted, not served
-  to the model.
+- **`startLine` semantics**: an **anchor** (near-line hint), not a search
+  window; never persisted, never served to the model.
+- **`endLine`**: **dropped** (see *No `endLine`*).
+- **Anchor source is per shape (B)**: single edit → top-level `startLine`; blob
+  → `path:LINE` headers only (top-level `startLine` ignored).
 - **Path normalization** for the conflict check: reuse
   `path_util::resolve_normalized` (resolve both sides against cwd, then
   compare).
 - **Blob rendering**: the path appears once, as a header line above the first
-  block (matching the Aider example). The text path may also be omitted entirely
-  by the model (the `path` argument then supplies it); it is only *required* when
-  `path` is absent.
+  block (matching the Aider example), with no `:LINE` suffix. The text path may
+  also be omitted entirely by the model (the `path` argument then supplies it);
+  it is only *required* when `path` is absent.
+- **Per-block anchor**: a header may be `path:LINE`, supplying that block's
+  nearest-match hint (see *Per-block line anchors*); transient (not persisted,
+  not rendered).
+- **Tolerance**: `(context_lines / 3).min(4)`; unique matches ignore it.
 
 ## Implementation status (Phase 1 — done)
 
@@ -482,7 +543,7 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
   (→ blob). Unit-tested.
 - `src/tools.rs`: `EditArgs` reduced to `{path, edits: Vec<EditOp>}` with a
   manual `Deserialize` (`from_wire`) selecting the variant from the raw JSON;
-  hand-written flat `parameters()` (no `anyOf`); `EditOp` unchanged.
+  hand-written flat `parameters()` (no `anyOf`).
 - `src/session/storage.rs`: the `edit` normalizer branch now delegates to
   `edit_blocks::canonicalize_edit_value` (covers block string, `old`/`new`,
   `oldText`/`newText`, array).
@@ -496,5 +557,25 @@ Only if telemetry shows demand (e.g. count runs of consecutive single-file
 - `src/output.rs`: **unchanged** (the parser stays out).
 
 New tests: block parse/merge round-trips (`edit_blocks`), flat-schema shape,
-block-form apply/infer/conflict/window (`tools`), persisted-canonical and
+block-form apply/infer/conflict (`tools`), persisted-canonical and
 legacy-normalize (`session`), history blobification (`agent`). Full suite green.
+
+## Implementation status (anchors — done)
+
+- `src/edit_blocks.rs`: `ParsedEdit` carries a per-block `start_line`;
+  `split_line_anchor` peels a trailing `:LINE`/`:LINE:COL`; `merge_path` and
+  `render_blob` speak `ParsedEdit`.
+- `src/tools.rs`: `anchor_tolerance`; `edit_file` enumerates occurrences and
+  resolves nearest-within-tolerance (no more byte windows); `from_wire` takes
+  the anchor per shape (B); `parameters()` documents the anchor and drops
+  `endLine`; `EditOp.end_line` removed.
+- `src/edit_match.rs`: `diagnose` simplified to whole-file; `non_unique`
+  suggests the `path:LINE` header; `anchor_out_of_tolerance` /
+  `anchor_ambiguous` added.
+- `src/config.rs`: `EditEndLine` removed.
+- `src/output.rs`: `endLine` read dropped.
+- `src/agent.rs`: system prompt documents the `path:LINE` anchor.
+
+New tests: nearest-duplicate pick, within/out-of-tolerance, unique-ignores
+anchor, tie-is-ambiguous, tolerance scaling, header anchor capture,
+`split_line_anchor` forms, top-level `startLine` ignored in blob form. Green.

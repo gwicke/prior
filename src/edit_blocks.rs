@@ -23,6 +23,16 @@ pub const DIVIDER: &str = "=======";
 /// Closing marker of a REPLACE region.
 pub const REPLACE_MARKER: &str = ">>>>>>> REPLACE";
 
+/// One parsed SEARCH/REPLACE block.
+#[derive(Debug, PartialEq, Clone)]
+pub struct ParsedEdit {
+    pub old_text: String,
+    pub new_text: String,
+    /// 1-based line the block's header anchored to (`path:LINE`), if any. Used
+    /// as a nearest-match hint by the backend; never persisted or rendered.
+    pub start_line: Option<u64>,
+}
+
 /// Result of parsing a blob.
 #[derive(Debug, PartialEq)]
 pub struct ParsedBlocks {
@@ -31,8 +41,8 @@ pub struct ParsedBlocks {
     pub path: Option<String>,
     /// True when two blocks carry *differing* header paths (multi-file attempt).
     pub multi_file: bool,
-    /// `(old_text, new_text)` in text order.
-    pub edits: Vec<(String, String)>,
+    /// Parsed blocks in text order.
+    pub edits: Vec<ParsedEdit>,
 }
 
 /// A blob parse failure. Rendered into the tool's self-correcting error.
@@ -94,14 +104,49 @@ fn header_candidate(line: &str) -> Option<String> {
     Some(t.to_string())
 }
 
-/// Parse a blob into `(old, new)` blocks plus the inferred path.
+/// Split a header token into `(path, optional 1-based line anchor)`.
+///
+/// Recognizes the `file:LINE` idiom (as used by compiler diagnostics, stack
+/// traces, and `grep -n`), and tolerates the `file:LINE:COL` form by ignoring
+/// the column. The suffix is only peeled off when it is a trailing `:` followed
+/// by **only ASCII digits**, so a colon-bearing filename (`weird:name.rs`) or a
+/// Windows drive path (`C:\foo\bar.rs`) is left intact — the anchor is taken
+/// from the *rightmost* `:digits` group. A line number of `0` is not a valid
+/// 1-based anchor and is treated as part of the path.
+fn split_line_anchor(token: &str) -> (String, Option<u64>) {
+    fn digits(s: &str) -> Option<u64> {
+        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+            s.parse::<u64>().ok().filter(|n| *n >= 1)
+        } else {
+            None
+        }
+    }
+
+    if let Some(idx) = token.rfind(':') {
+        let (head, tail) = (&token[..idx], &token[idx + 1..]);
+        if let Some(n) = digits(tail) {
+            // `path:LINE:COL` — the trailing group is a column; prefer the
+            // preceding numeric group as the line.
+            if let Some(idx2) = head.rfind(':') {
+                if let Some(line) = digits(&head[idx2 + 1..]) {
+                    return (head[..idx2].to_string(), Some(line));
+                }
+            }
+            return (head.to_string(), Some(n));
+        }
+    }
+    (token.to_string(), None)
+}
+
+/// Parse a blob into [`ParsedEdit`] blocks plus the inferred path.
 ///
 /// Recognizes blocks whose markers each occupy their own (trimmed) line. The
 /// line immediately preceding a `<<<<<<< SEARCH` is treated as an optional
-/// filename header when it is a single whitespace-free token.
+/// filename header when it is a single whitespace-free token; a trailing
+/// `:LINE` on that header supplies the block's line anchor.
 pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     let lines = strip_fence(text);
-    let mut edits: Vec<(String, String)> = Vec::new();
+    let mut edits: Vec<ParsedEdit> = Vec::new();
     let mut distinct_headers: Vec<String> = Vec::new();
     let mut saw_any_header = false;
 
@@ -113,11 +158,16 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
 
         // Optional header = the immediately preceding line, if it is a path.
+        // A `path:LINE` suffix supplies this block's anchor; the path part is
+        // what participates in the (per-file) agreement check.
+        let mut header_anchor: Option<u64> = None;
         if i > 0 {
             if let Some(h) = header_candidate(&lines[i - 1]) {
+                let (path_part, anchor) = split_line_anchor(&h);
                 saw_any_header = true;
-                if !distinct_headers.iter().any(|d| same_path(d, &h)) {
-                    distinct_headers.push(h);
+                header_anchor = anchor;
+                if !distinct_headers.iter().any(|d| same_path(d, &path_part)) {
+                    distinct_headers.push(path_part);
                 }
             }
         }
@@ -155,7 +205,11 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             ));
         }
         let new_text = replace_lines.join("\n");
-        edits.push((old_text, new_text));
+        edits.push(ParsedEdit {
+            old_text,
+            new_text,
+            start_line: header_anchor,
+        });
 
         i = k + 1;
     }
@@ -203,7 +257,7 @@ fn same_path(a: &str, b: &str) -> bool {
 pub fn merge_path(
     json_path: Option<&str>,
     parsed: ParsedBlocks,
-) -> Result<(String, Vec<(String, String)>), String> {
+) -> Result<(String, Vec<ParsedEdit>), String> {
     if parsed.multi_file {
         return Err(
             "multi-file edits are not supported in this form; make one `edit` call per file"
@@ -232,24 +286,25 @@ pub fn merge_path(
 }
 
 /// Render block pairs as a blob, with the path as a header line above the
-/// first block (Aider-style). `startLine`/`endLine` are not represented.
-pub fn render_blob(path: &str, edits: &[(String, String)]) -> String {
+/// first block (Aider-style). Anchors (`startLine`/`endLine`) are a transient
+/// matching aid and are not represented.
+pub fn render_blob(path: &str, edits: &[ParsedEdit]) -> String {
     let mut out = String::new();
     if !path.is_empty() {
         out.push_str(path);
         out.push('\n');
     }
-    for (i, (old, new)) in edits.iter().enumerate() {
+    for (i, e) in edits.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         out.push_str(SEARCH_MARKER);
         out.push('\n');
-        out.push_str(old);
+        out.push_str(&e.old_text);
         out.push('\n');
         out.push_str(DIVIDER);
         out.push('\n');
-        out.push_str(new);
+        out.push_str(&e.new_text);
         out.push('\n');
         out.push_str(REPLACE_MARKER);
         out.push('\n');
@@ -261,12 +316,14 @@ pub fn render_blob(path: &str, edits: &[(String, String)]) -> String {
     out
 }
 
-/// Build the canonical `edits` array value from block pairs.
-fn edits_to_value(pairs: &[(String, String)]) -> Value {
+/// Build the canonical `edits` array value from parsed blocks. Anchors are
+/// transient and deliberately omitted (the canonical array is the persisted,
+/// pi-compatible form).
+fn edits_to_value(edits: &[ParsedEdit]) -> Value {
     Value::Array(
-        pairs
+        edits
             .iter()
-            .map(|(o, n)| json!({ "oldText": o, "newText": n }))
+            .map(|e| json!({ "oldText": e.old_text, "newText": e.new_text }))
             .collect(),
     )
 }
@@ -339,28 +396,38 @@ pub fn array_to_blob_value(args: &Value) -> Value {
         return args.clone();
     };
     let path = obj.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let pairs: Vec<(String, String)> = edits
+    let parsed: Vec<ParsedEdit> = edits
         .iter()
-        .map(|e| {
-            (
-                e.get("oldText")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                e.get("newText")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-            )
+        .map(|e| ParsedEdit {
+            old_text: e
+                .get("oldText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            new_text: e
+                .get("newText")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            start_line: None,
         })
         .collect();
-    let blob = render_blob(path, &pairs);
+    let blob = render_blob(path, &parsed);
     json!({ "path": path, "edits": blob })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block with no anchor, for terse comparisons.
+    fn plain(old: &str, new: &str) -> ParsedEdit {
+        ParsedEdit {
+            old_text: old.to_string(),
+            new_text: new.to_string(),
+            start_line: None,
+        }
+    }
 
     #[test]
     fn parses_single_block_with_path() {
@@ -370,11 +437,9 @@ mod tests {
         assert!(!p.multi_file);
         assert_eq!(
             p.edits,
-            vec![(
-                "def foo():\n    return 1".to_string(),
-                "def foo():\n    return 2".to_string()
-            )]
+            vec![plain("def foo():\n    return 1", "def foo():\n    return 2")]
         );
+        assert_eq!(p.edits[0].start_line, None);
     }
 
     #[test]
@@ -385,8 +450,60 @@ mod tests {
         assert!(!p.multi_file);
         assert_eq!(
             p.edits,
-            vec![("a".into(), "A".into()), ("b".into(), "B".into())]
+            vec![plain("a", "A"), plain("b", "B")]
         );
+    }
+
+    #[test]
+    fn header_line_anchor_is_captured_per_block() {
+        // `path:LINE` on a header supplies that block's anchor; differing
+        // anchors on the same file do NOT count as a multi-file attempt.
+        let text = "src/foo.py:10\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\nsrc/foo.py:42\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
+        assert!(!p.multi_file);
+        assert_eq!(p.edits.len(), 2);
+        assert_eq!(p.edits[0].start_line, Some(10));
+        assert_eq!(p.edits[1].start_line, Some(42));
+    }
+
+    #[test]
+    fn header_line_anchor_only_on_first_block() {
+        let text = "src/foo.py:7\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits[0].start_line, Some(7));
+        assert_eq!(p.edits[1].start_line, None);
+    }
+
+    #[test]
+    fn split_line_anchor_forms() {
+        assert_eq!(split_line_anchor("a/b.rs"), ("a/b.rs".into(), None));
+        assert_eq!(
+            split_line_anchor("a/b.rs:100"),
+            ("a/b.rs".into(), Some(100))
+        );
+        // `line:col` — column ignored.
+        assert_eq!(
+            split_line_anchor("a/b.rs:100:5"),
+            ("a/b.rs".into(), Some(100))
+        );
+        // Colon-bearing filename is left intact.
+        assert_eq!(
+            split_line_anchor("weird:name.rs"),
+            ("weird:name.rs".into(), None)
+        );
+        // Windows drive path preserved; trailing anchor still split.
+        assert_eq!(
+            split_line_anchor("C:\\foo\\bar.rs"),
+            ("C:\\foo\\bar.rs".into(), None)
+        );
+        assert_eq!(
+            split_line_anchor("C:\\foo\\bar.rs:12"),
+            ("C:\\foo\\bar.rs".into(), Some(12))
+        );
+        // Non-numeric / zero suffixes are not anchors.
+        assert_eq!(split_line_anchor("a.rs:x"), ("a.rs:x".into(), None));
+        assert_eq!(split_line_anchor("a.rs:0"), ("a.rs:0".into(), None));
     }
 
     #[test]
@@ -402,7 +519,7 @@ mod tests {
         let text = "```\nsrc/x.rs\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(p.edits, vec![("a".into(), "b".into())]);
+        assert_eq!(p.edits, vec![plain("a", "b")]);
     }
 
     #[test]
@@ -411,7 +528,7 @@ mod tests {
         let p = parse_blocks(text).unwrap();
         // The immediate predecessor of SEARCH is blank → no header.
         assert_eq!(p.path, None);
-        assert_eq!(p.edits, vec![("a".into(), "b".into())]);
+        assert_eq!(p.edits, vec![plain("a", "b")]);
     }
 
     #[test]
@@ -432,47 +549,35 @@ mod tests {
         assert!(parse_blocks(text).is_err());
     }
 
+    fn one_block(path: Option<&str>) -> ParsedBlocks {
+        ParsedBlocks {
+            path: path.map(str::to_string),
+            multi_file: false,
+            edits: vec![plain("a", "b")],
+        }
+    }
+
     #[test]
     fn merge_path_infers_from_header() {
-        let p = ParsedBlocks {
-            path: Some("src/x.rs".into()),
-            multi_file: false,
-            edits: vec![("a".into(), "b".into())],
-        };
-        let (path, edits) = merge_path(None, p).unwrap();
+        let (path, edits) = merge_path(None, one_block(Some("src/x.rs"))).unwrap();
         assert_eq!(path, "src/x.rs");
-        assert_eq!(edits, vec![("a".into(), "b".into())]);
+        assert_eq!(edits, vec![plain("a", "b")]);
     }
 
     #[test]
     fn merge_path_rejects_conflict() {
-        let p = ParsedBlocks {
-            path: Some("b.rs".into()),
-            multi_file: false,
-            edits: vec![("a".into(), "b".into())],
-        };
-        assert!(merge_path(Some("a.rs"), p).is_err());
+        assert!(merge_path(Some("a.rs"), one_block(Some("b.rs"))).is_err());
     }
 
     #[test]
     fn merge_path_accepts_equivalent_spellings() {
-        let p = ParsedBlocks {
-            path: Some("src/x.rs".into()),
-            multi_file: false,
-            edits: vec![("a".into(), "b".into())],
-        };
         // `./src/x.rs` and `src/x.rs` normalize equal.
-        assert!(merge_path(Some("./src/x.rs"), p).is_ok());
+        assert!(merge_path(Some("./src/x.rs"), one_block(Some("src/x.rs"))).is_ok());
     }
 
     #[test]
     fn merge_path_requires_a_path() {
-        let p = ParsedBlocks {
-            path: None,
-            multi_file: false,
-            edits: vec![("a".into(), "b".into())],
-        };
-        assert!(merge_path(None, p).is_err());
+        assert!(merge_path(None, one_block(None)).is_err());
     }
 
     #[test]
@@ -515,10 +620,7 @@ mod tests {
         let text = blob.get("edits").and_then(|x| x.as_str()).unwrap();
         let parsed = parse_blocks(text).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(
-            parsed.edits,
-            vec![("a".into(), "b".into()), ("c".into(), "d".into())]
-        );
+        assert_eq!(parsed.edits, vec![plain("a", "b"), plain("c", "d")]);
     }
 
     #[test]
@@ -530,10 +632,7 @@ mod tests {
 
     #[test]
     fn render_blob_multiline_round_trips() {
-        let edits = vec![(
-            "fn a() {\n    x\n}".to_string(),
-            "fn a() {\n    y\n}".to_string(),
-        )];
+        let edits = vec![plain("fn a() {\n    x\n}", "fn a() {\n    y\n}")];
         let blob = render_blob("src/m.rs", &edits);
         let parsed = parse_blocks(&blob).unwrap();
         assert_eq!(parsed.edits, edits);
