@@ -2395,12 +2395,30 @@ impl Repl {
                     let tw = crate::output::term_width().max(1);
                     let mut result: Vec<String> = Vec::new();
 
-                    // 1. Detail (header() output — no background, stands out).
+                    // --- Space allocation ---
+                    // `cur_h` is the full terminal height; 2/3 is the overlay budget.
                     let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                    let min_data = 1usize;
-                    let detail_budget = max_pop.saturating_sub(min_data).max(1);
-                    for d in plan.detail.iter().take(detail_budget) {
+                    let table_header_lines = if plan.table_header.is_some() { 1 } else { 0 };
+                    let min_rows = 3usize;
+
+                    // Count visual lines each detail item occupies (LogicalLine
+                    // may contain embedded \n for wrapped sub-lines).
+                    let detail_visual: Vec<usize> = plan.detail.iter()
+                        .map(|d| d.0.split('\n').count())
+                        .collect();
+                    let total_detail_vis: usize = detail_visual.iter().sum();
+                    let total_rows = plan.rows.len();
+
+                    let (detail_budget, data_budget) =
+                        Self::compute_space_budget(max_pop, table_header_lines,
+                            total_detail_vis, total_rows, min_rows);
+
+                    // 1. Detail (header() output — no background, stands out).
+                    let mut detail_vis_used = 0usize;
+                    for (d, &vis) in plan.detail.iter().zip(&detail_visual) {
+                        if detail_vis_used + vis > detail_budget { break; }
                         result.push(Self::render_logical_line(d, tw, false, false, false));
+                        detail_vis_used += vis;
                     }
 
                     // 2. Table header (column labels, grey background).
@@ -2409,8 +2427,6 @@ impl Repl {
                     }
 
                     // 3. Data rows, windowed around `selected`.
-                    let header_lines = result.len();
-                    let data_budget = max_pop.saturating_sub(header_lines).max(1);
                     let total = plan.rows.len();
                     if total > 0 {
                         let sel_idx = plan.selected.unwrap_or(0);
@@ -2627,15 +2643,19 @@ impl Repl {
                                         let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
                                         let cur_h = cur_h.max(1) as usize;
                                         let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                                        let plan_rows = match &overlay {
-                                            ActiveOverlay::V25Menu { plan } => &plan.rows,
+                                        let (plan_rows, detail_vis, th_lines) = match &overlay {
+                                            ActiveOverlay::V25Menu { plan } => {
+                                                let dv: usize = plan.detail.iter()
+                                                    .map(|d| d.0.split('\n').count())
+                                                    .sum();
+                                                (&plan.rows, dv, if plan.table_header.is_some() { 1 } else { 0 })
+                                            }
                                             _ => unreachable!(),
                                         };
-                                        let header_vis = 1 + match &overlay {
-                                            ActiveOverlay::V25Menu { plan } => plan.detail.len(),
-                                            _ => 0,
-                                        };
-                                        let data_budget = max_pop.saturating_sub(header_vis).max(1);
+                                        let (_, data_budget) = Self::compute_space_budget(
+                                            max_pop, th_lines, detail_vis,
+                                            plan_rows.len(), 3,
+                                        );
                                         let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
                                         let delta = Self::page_delta(plan_rows, cur_sel, data_budget, direction);
                                         if delta != 0 {
@@ -2950,6 +2970,48 @@ impl Repl {
             parts.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
         }
         parts.join("\n")
+    }
+
+    /// Compute vertical space budgets for detail and data rows within the
+    /// overlay. Returns `(detail_budget, rows_budget)` in visual lines.
+    ///
+    /// When both sections overflow, they split available space 50:50.
+    /// If one section fits in its half, the other gets the surplus.
+    /// Rows always get at least `min_rows` (capped at `total_rows`).
+    pub fn compute_space_budget(
+        overlay_budget: usize,   // total overlay lines (e.g. 2/3 terminal)
+        table_header_lines: usize,
+        total_detail_vis: usize, // visual lines all detail items consume
+        total_rows: usize,
+        min_rows: usize,
+    ) -> (usize, usize) {
+        let available = overlay_budget.saturating_sub(table_header_lines);
+        let half = available / 2;
+        let min_rows_guaranteed = min_rows.min(total_rows);
+
+        // When rows overflow their half, detail is capped at half so rows
+        // are not starved.  When rows fit, detail may use up to
+        // `available - min_rows` (the surplus flows from rows' unused half).
+        let detail_limit = if total_rows > half {
+            // Both overflow (or rows do): detail capped at half.
+            half
+        } else {
+            // Rows fit: detail may use their unused half.
+            available.saturating_sub(min_rows_guaranteed)
+        };
+        let detail_budget = total_detail_vis.min(detail_limit);
+
+        // Rows get the remaining space, at least `min_rows_guaranteed`.
+        // When rows fit in their half, cap at total_rows (the renderer
+        // shows `min(total, budget)` anyway, but a tighter budget is
+        // clearer for callers).
+        let rows_budget = if total_rows > half {
+            available.saturating_sub(detail_budget).max(min_rows_guaranteed)
+        } else {
+            total_rows
+        };
+
+        (detail_budget, rows_budget)
     }
 
     /// start index into the full overlay. Extracted so it can be unit-tested
@@ -9404,6 +9466,81 @@ mod tests {
             let result = super::edit_in_editor("hello");
             assert!(result.is_err(), "nonexistent command must return error");
         });
+    }
+
+    // --- compute_space_budget tests ---
+
+    #[test]
+    fn budget_both_fit() {
+        // Both detail (5 vis lines) and rows (3) fit in overlay.
+        // overlay_budget=20, table_header=1, available=19, half=9.
+        let (d, r) = Repl::compute_space_budget(20, 1, 5, 3, 3);
+        assert_eq!(d, 5, "detail gets what it needs");
+        assert_eq!(r, 3, "rows get what they need");
+    }
+
+    #[test]
+    fn budget_both_overflow_50_50() {
+        // Detail has 30 vis lines, rows has 30. available=39, half=19.
+        // Both overflow: detail capped at 19, rows get 20.
+        let (d, r) = Repl::compute_space_budget(40, 1, 30, 30, 3);
+        assert_eq!(d, 19);
+        assert_eq!(r, 20);
+    }
+
+    #[test]
+    fn budget_detail_overflows_rows_dont() {
+        // Detail has 20 vis lines, rows has 2. available=19, half=9.
+        // Rows fit (2 < 9), min_rows_guaranteed=min(3,2)=2.
+        // detail gets available - 2 = 17.
+        let (d, r) = Repl::compute_space_budget(20, 1, 20, 2, 3);
+        assert_eq!(d, 17, "detail uses rows' surplus");
+        assert_eq!(r, 2, "rows capped at total_rows");
+    }
+
+    #[test]
+    fn budget_rows_overflow_detail_doesnt() {
+        // Detail has 3 vis lines, rows has 30. available=19, half=9.
+        // Detail fits (3 < 9): detail gets 3, rows get 16.
+        let (d, r) = Repl::compute_space_budget(20, 1, 3, 30, 3);
+        assert_eq!(d, 3, "detail gets what it needs");
+        assert_eq!(r, 16, "rows get the rest");
+    }
+
+    #[test]
+    fn budget_min_rows_enforced_even_when_detail_wants_more() {
+        // Detail wants all 20 lines, rows have 2 (less than min_rows=3).
+        // min_rows_guaranteed = min(3, 2) = 2.
+        // available = 19. detail_limit = 19 - 2 = 17. detail = min(20, 17) = 17.
+        // rows = max(19 - 17, 2) = 2.
+        let (d, r) = Repl::compute_space_budget(20, 1, 20, 2, 3);
+        assert_eq!(d, 17);
+        assert_eq!(r, 2, "rows capped at total_rows");
+    }
+
+    #[test]
+    fn budget_no_rows() {
+        // No rows: all space goes to detail.
+        let (d, r) = Repl::compute_space_budget(20, 1, 15, 0, 3);
+        assert_eq!(d, 15);
+        assert_eq!(r, 0, "no rows to allocate");
+    }
+
+    #[test]
+    fn budget_no_table_header() {
+        // No table header: available = overlay_budget.
+        let (d, r) = Repl::compute_space_budget(18, 0, 5, 5, 3);
+        assert_eq!(d, 5);
+        assert_eq!(r, 5);
+    }
+
+    #[test]
+    fn budget_small_terminal() {
+        // Tiny terminal: overlay_budget=6, table_header=1, available=5.
+        // Both overflow: half=2, detail=2, rows=3.
+        let (d, r) = Repl::compute_space_budget(6, 1, 10, 10, 3);
+        assert_eq!(d, 2);
+        assert_eq!(r, 3, "min_rows enforced");
     }
 }
 
