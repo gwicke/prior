@@ -109,12 +109,29 @@ pub struct SlashDotHandle<'a> {
 }
 
 impl<'a> SlashDotHandle<'a> {
-    /// Evaluate a prompt with a key event. `term_width` is the current
-    /// terminal width in columns; it is packaged into a [`RenderContext`]
-    /// and threaded through the traversal by reference.
+    /// Evaluate a prompt with a key event, cursor at the end of the
+    /// prompt (the common case: tests and end-of-line interaction).
+    /// `term_width` is the current terminal width in columns; it is
+    /// packaged into a [`RenderContext`] and threaded through the
+    /// traversal by reference.
     pub fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
+        self.eval_prompt_with_cursor(prompt, key, term_width, prompt.len())
+    }
+
+    /// Like [`eval_prompt`](Self::eval_prompt) with an explicit cursor
+    /// (byte offset into `prompt`). v1 only supports end-of-line
+    /// completion — the resolved level suppresses completion when the
+    /// cursor is not at the end of its section, so a mid-line cursor
+    /// can never complete a different word than the user edits.
+    pub fn eval_prompt_with_cursor(
+        &mut self,
+        prompt: &str,
+        key: HostKey,
+        term_width: usize,
+        cursor_pos: usize,
+    ) -> MenuResult {
         let render_ctx = RenderContext { term_width };
         self.root
-            .node_traverse(self.epoch, key, Vec::new(), prompt, &render_ctx)
+            .node_traverse_at(self.epoch, key, Vec::new(), prompt, cursor_pos, &render_ctx)
     }
 }

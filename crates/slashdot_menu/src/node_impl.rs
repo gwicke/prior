@@ -12,7 +12,7 @@ use std::ops::Range;
 /// Rendering context threaded down `node_traverse` by reference. Carries
 /// display metrics the node needs for layout; not related to paths or
 /// path args (an app-level context may be added alongside later).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderContext {
     /// Terminal width (columns) for layout/formatting decisions.
     pub term_width: usize,
@@ -25,21 +25,11 @@ pub struct PathArgs {
     pub ids: Vec<String>,
     /// The prompt section for this level.
     pub suffix: String,
-    /// Parsed arguments from this level's section.
-    pub args: Args,
-}
-
-/// Parsed arguments from a level's section, as byte ranges indexing into
-/// [`PathArgs::suffix`] (no string copies).
-#[derive(Debug, Default)]
-pub struct Args {
-    /// Dot modifiers as `(key, value)` byte-range pairs into `suffix`.
-    /// A bare `.key` yields an empty value range.
-    pub modifiers: Vec<(Range<usize>, Range<usize>)>,
-    /// Positional tokens (non-modifier, non-selection words) as byte
-    /// ranges into `suffix`. Fuzzy search terms at listing level and
-    /// positional parameters at leaf level.
-    pub positional: Vec<Range<usize>>,
+    /// Flat word ranges into `suffix` — every non-ID token, with no
+    /// modifier/positional distinction at parse time (the view code
+    /// classifies dot words against the level's field space; leaves
+    /// see raw words, e.g. `./src`, `.gitignore`).
+    pub args: Vec<Range<usize>>,
 }
 
 impl PathArgs {
@@ -48,27 +38,53 @@ impl PathArgs {
         PathArgs {
             ids,
             suffix: suffix.into(),
-            args: Args::default(),
+            args: Vec::new(),
         }
     }
 
-    /// Positional args as string slices into `suffix`.
-    pub fn positional(&self) -> impl Iterator<Item = &str> + '_ {
+    /// Flat word slices into `suffix` (all non-ID tokens, pre-
+    /// classification).
+    pub fn args(&self) -> impl Iterator<Item = &str> + '_ {
         self.args
-            .positional
             .iter()
             .map(move |r| &self.suffix[r.clone()])
     }
 
-    /// Dot-modifier `(key, value)` pairs as string slices into `suffix`.
-    /// The value is empty for a bare `.key`.
-    pub fn modifiers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
-        self.args.modifiers.iter().map(move |(k, v)| {
-            (
-                &self.suffix[k.clone()],
-                &self.suffix[v.clone()],
-            )
-        })
+    /// The space-delimited word directly before `cursor` (byte offset
+    /// into `suffix`), as the range `start..cursor`. `None` when the
+    /// cursor sits at the section start or right after a space — i.e.
+    /// no word is *directly* before the cursor. Same space-delimited
+    /// rule as `parse_section`.
+    pub fn word_before(&self, cursor: usize) -> Option<Range<usize>> {
+        let cursor = cursor.min(self.suffix.len());
+        if cursor == 0 {
+            return None;
+        }
+        let bytes = self.suffix.as_bytes();
+        if bytes[cursor - 1] == b' ' {
+            return None;
+        }
+        let mut start = cursor;
+        while start > 0 && bytes[start - 1] != b' ' {
+            start -= 1;
+        }
+        Some(start..cursor)
+    }
+
+    /// The committed parameters: every word except the one containing
+    /// the in-flight word (`word_before(cursor)`); all words when there
+    /// is no in-flight word. Handlers branch on position (e.g. sandbox
+    /// src vs dst arg) off this.
+    pub fn committed(&self, cursor: usize) -> impl Iterator<Item = &str> + '_ {
+        let skip = self.word_before(cursor).and_then(|w| {
+            let start = w.start;
+            self.args.iter().position(|r| r.contains(&start))
+        });
+        self.args
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| Some(*i) != skip)
+            .map(move |(_, r)| &self.suffix[r.clone()])
     }
 
     /// The full prompt for the host: `ids` joined, then `suffix`.
@@ -113,6 +129,13 @@ pub struct DataError {
 
 /// Result type for `data()`.
 pub type DataResult = Result<std::rc::Rc<DataResponse>, DataError>;
+
+/// Completion payload (implicit-open auto-complete): candidate rows +
+/// optional dialog column labels for (id, description).
+pub struct CompletionRows {
+    pub rows: Vec<Row>,
+    pub labels: Option<(String, String)>,
+}
 
 /// Outcome of `submit()` / `prepare()`.
 pub enum SubmitResult {
@@ -187,6 +210,26 @@ pub trait SlashDotNode {
         Vec::new()
     }
 
+    /// Parameter auto-completion for **leaf** nodes (implicit-open,
+    /// stateless — doc/slashdot/arg_and_modifier_autocomplete.md).
+    /// Return the candidate rows for the word directly before
+    /// `cursor_pos`; an empty vec = nothing to complete (no dialog).
+    /// `labels` overrides the dialog column headers (default
+    /// `("Value", "Description")` for leaves). Cache the `Rc` until the
+    /// response changes — the engine skips its view re-derive on
+    /// `Rc::ptr_eq`. Default: empty (the common case; every node is
+    /// called on every passive frame).
+    fn complete_parameter(
+        &mut self,
+        _args: &PathArgs,
+        _cursor_pos: usize,
+    ) -> Result<std::rc::Rc<CompletionRows>, DataError> {
+        Ok(std::rc::Rc::new(CompletionRows {
+            rows: Vec::new(),
+            labels: None,
+        }))
+    }
+
     /// Field metadata for this level's children's rows (§2.1 / §8.1).
     /// Declared once on the parent; children conform. The engine uses
     /// these specs for filter/sort. Default: no extra fields beyond the
@@ -219,6 +262,42 @@ pub trait SlashDotNode {
     /// **Default:** `None` — no rewrite.
     fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_before_end_and_boundaries() {
+        let mut pa = PathArgs::new(vec![], "sandbox add ro /home/gab");
+        pa.args = vec![0..7, 8..11, 12..14, 15..24];
+        // End of word: the whole last word.
+        assert_eq!(pa.word_before(24), Some(15..24));
+        // Mid-word: prefix only.
+        assert_eq!(pa.word_before(18), Some(15..18));
+        // Right after a space (or at start): no word directly before.
+        assert_eq!(pa.word_before(15), None);
+        assert_eq!(pa.word_before(0), None);
+        // Trailing space: dismissed (no in-flight word).
+        let mut pb = PathArgs::new(vec![], "ro ");
+        pb.args = vec![0..2];
+        assert_eq!(pb.word_before(3), None);
+    }
+
+    #[test]
+    fn committed_excludes_only_the_in_flight_word() {
+        let mut pa = PathArgs::new(vec![], "a b c");
+        pa.args = vec![0..1, 2..3, 4..5];
+        assert_eq!(pa.committed(5).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(pa.committed(1).collect::<Vec<_>>(), vec!["b", "c"]);
+        // Mid-word edit: the whole containing word is in flight.
+        assert_eq!(pa.committed(2 - 1).collect::<Vec<_>>(), vec!["b", "c"]);
+        // No in-flight word: everything is committed.
+        let mut pb = PathArgs::new(vec![], "a b ");
+        pb.args = vec![0..1, 2..3];
+        assert_eq!(pb.committed(4).collect::<Vec<_>>(), vec!["a", "b"]);
     }
 }
 

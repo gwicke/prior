@@ -141,32 +141,46 @@ v2.5 engine.
 **Prompt rewrite support - DONE**
 - Finalized design doc: slashdot/prompt_rewrite_design.md
 
-**Avoid drill-submit where args are expected**
+**Avoid drill-submit where args are expected / `SubmitResult::Error`**
 - Some nodes like `/session <id> rename` expect a parameter - a name in this
   case. When enter-drilling from the `/tree <id> ` action listing, the rename
   is auto-submitted with no name. Provide a clear way for submit() to only
   trigger when a genuine local Enter is received, not when MaybeSubmit is sent
   from a parent drill.
   Plan in ./slashdot/arg_and_modifier_autocomplete.md
+- Decided companion (see that doc's main body): a new
+  `SubmitResult::Error(String)` variant → engine returns `Continue` (menu
+  stays open) with NodeEntry rendering the message at the top of detail as
+  `[ERROR]: …`. Today `SubmitResult` has no stay-open-with-error outcome
+  (`Done` closes, `Prepared` confirms, `NewPath` rewrites), so Enter on a
+  param leaf with missing/invalid args — sandbox: nonexistent path — can
+  only close the menu, which is wrong for an inline-edit failure.
+  - Same surfacing slot as the (landed) completion `Err` line, but must be
+    *stored* on `EpochState.error`: a completion `Err` re-derives every
+    passive frame, while a submit error happens once, on the Enter key.
+    Cleared when the level's prompt section changes.
+  - Drill-arrival alternative: `drill_rewrite` pre-fill of an example path
+    also suppresses DrillEnter-submit (the rewrite runs before dispatch).
+  - Not yet implemented: audit the `handle_leaf` submit mapping
+    (`Done`/`Prepared`/`NewPath` → add `Error` → `Continue` + epoch slot)
+    and add the guard tests alongside the sandbox port (design-plan step 7).
 
-**Dot modifier auto-complete - IN PROGRESS** 
-Final design: slashdot/arg_and_modifier_autocomplete.md
-The v2.5 engine applies `.field:value`
-filter/sort syntax correctly, but the auto-complete *discovery UI* is
-missing. In v2.0, typing `/model .` showed a popup of available field
-names (via `Interpreter::field_options()` + `ActiveOverlay::Mod`).
-Typing `/model .sort:` showed distinct string values for that field.
-This popup is now unreachable — all `/` routes through v2.5, which has
-no equivalent.
-
-Primary user: `/model` (already ported, has `fields()` metadata). Can
-be tackled as a standalone step, or as part of `/session` or `/tree`
-porting if those commands also need modifier completion.
-
-Implementation options:
-- A `HostKey` variant (e.g. `ModifierComplete`) that returns candidates.
-- A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
-- Host-side detection + engine query (like v2.0's `field_options()`).
+**Dot modifier auto-complete - DONE**
+Final design + implementation plan: slashdot/arg_and_modifier_autocomplete.md
+(steps 1–6 implemented — v2.0's `field_options()` popup is reachable
+again, at every listing level, not just `/model`).
+- Landed: flat `PathArgs.args` + view-side `split_modifiers` (invalid-key
+  dot words → fuzzy terms); `cursor_pos` threading with the EOL-only guard
+  (`eval_prompt_with_cursor`); view extraction (`view.rs` — `RowView` /
+  `Rc<ViewRows>`, content-vs-presentation cut); the implicit-open,
+  stateless dialog — listing default completion (key/value modes over the
+  field space, dataset-derived string values per design D7), leaf
+  `SlashDotNode::complete_parameter` (Rc-cached, optional `labels`),
+  Tab expansion with same-turn re-run + trailing-space convenience,
+  completion `Err` → `[ERROR]` line in detail, confirm-pending precedence,
+  Enter/Esc bypass. 33 new crate tests (159 total in `slashdot_menu`).
+- Remaining from the design plan: step 7 (sandbox leaf wiring) — picks up
+  with the `/sandbox` port; plus the `SubmitResult::Error` item above.
 
 **PathArgs / Args cleanup - DONE**
 - Clean up unrelated data (e.g. term_width)

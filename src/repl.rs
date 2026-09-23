@@ -2273,12 +2273,11 @@ impl Repl {
                     v25_handle = Some(v25_menu.get_handle());
                 }
                 let handle = v25_handle.as_mut().unwrap();
-                let line = buf_text.trim_start_matches('/').to_string();
-                let tw = crate::output::term_width();
-                let result = handle.eval_prompt(
-                    &line,
+                let result = Self::v25_eval(
+                    handle,
+                    &buf_text,
+                    editor.cursor,
                     crate::slashdot_menu::HostKey::None,
-                    tw,
                 );
                 match result {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
@@ -2560,11 +2559,11 @@ impl Repl {
                                     if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                         if let Some(handle) = &mut v25_handle {
                                             let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                            let line = editor.text().trim_start_matches('/').to_string();
-                                            let _ = handle.eval_prompt(
-                                                &line,
+                                            let _ = Self::v25_eval(
+                                                handle,
+                                                &editor.text(),
+                                                editor.cursor,
                                                 crate::slashdot_menu::HostKey::MoveCursor(delta),
-                                            crate::output::term_width(),
                                             );
                                         }
                                     } else {
@@ -2629,14 +2628,12 @@ impl Repl {
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                     // V25Menu: visual-line-aware page scroll through engine.
                                     if let Some(handle) = &mut v25_handle {
-                                        let line = editor.text().trim_start_matches('/').to_string();
                                         // Get current selected from the plan.
                                         let cur_sel = match &overlay {
                                             ActiveOverlay::V25Menu { plan } => plan.selected.unwrap_or(0),
                                             _ => 0,
                                         };
                                         // Compute page budget (same formula as overlay rendering).
-                                        let tw = crate::output::term_width();
                                         let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
                                         let cur_h = cur_h.max(1) as usize;
                                         let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
@@ -2656,10 +2653,11 @@ impl Repl {
                                         let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
                                         let delta = Self::page_delta(plan_rows, cur_sel, data_budget, direction);
                                         if delta != 0 {
-                                            let _ = handle.eval_prompt(
-                                                &line,
+                                            let _ = Self::v25_eval(
+                                                handle,
+                                                &editor.text(),
+                                                editor.cursor,
                                                 crate::slashdot_menu::HostKey::MoveCursor(delta),
-                                                tw,
                                             );
                                         }
                                     }
@@ -2685,11 +2683,11 @@ impl Repl {
                             KeyCode::Tab => {
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                     if let Some(handle) = &mut v25_handle {
-                                        let line = editor.text().trim_start_matches('/').to_string();
-                                        let result = handle.eval_prompt(
-                                            &line,
+                                        let result = Self::v25_eval(
+                                            handle,
+                                            &editor.text(),
+                                            editor.cursor,
                                             crate::slashdot_menu::HostKey::Tab,
-                                            crate::output::term_width(),
                                         );
                                         if let crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) = result {
                                             editor.set(&format!("/{}", prompt));
@@ -2718,11 +2716,11 @@ impl Repl {
                                     // v2.5 path: route through the persistent handle.
                                     if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                         if let Some(handle) = &mut v25_handle {
-                                            let line = editor.text().trim_start_matches('/').to_string();
-                                            let result = handle.eval_prompt(
-                                                &line,
+                                            let result = Self::v25_eval(
+                                                handle,
+                                                &editor.text(),
+                                                editor.cursor,
                                                 crate::slashdot_menu::HostKey::Enter,
-                                            crate::output::term_width(),
                                             );
                                             match result {
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, prompt) => {
@@ -2783,11 +2781,11 @@ impl Repl {
                                 // they migrate.
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                     if let Some(handle) = &mut v25_handle {
-                                        let line = editor.text().trim_start_matches('/').to_string();
-                                        let result = handle.eval_prompt(
-                                            &line,
+                                        let result = Self::v25_eval(
+                                            handle,
+                                            &editor.text(),
+                                            editor.cursor,
                                             crate::slashdot_menu::HostKey::Esc,
-                                            crate::output::term_width(),
                                         );
                                         match result {
                                             crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
@@ -3155,6 +3153,27 @@ impl Repl {
     /// *list* seeds on the leaf row when it opens but must not yank the
     /// cursor as the user types a fuzzy search term, whereas the tree action
     /// sub-menus seed and follow.
+    /// Evaluate the v2.5 menu with the editor's real cursor: char index
+    /// → byte offset into the slash-stripped line. v1 completion is
+    /// end-of-line only — a mid-line cursor simply suppresses it (the
+    /// engine's EOL guard), which avoids completing a different word
+    /// than the user is editing.
+    fn v25_eval(
+        handle: &mut crate::slashdot_menu::SlashDotHandle<'_>,
+        buf: &str,
+        cursor_char: usize,
+        key: crate::slashdot_menu::HostKey,
+    ) -> crate::slashdot_menu::node_impl::MenuResult {
+        let line = buf.trim_start_matches('/');
+        let byte_in_buf = buf
+            .char_indices()
+            .nth(cursor_char)
+            .map(|(b, _)| b)
+            .unwrap_or(buf.len());
+        let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
+        handle.eval_prompt_with_cursor(line, key, crate::output::term_width(), cursor)
+    }
+
     fn cursor_sel_policy(
         active: Option<usize>,
         disc_changed: bool,

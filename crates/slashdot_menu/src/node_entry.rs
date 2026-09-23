@@ -5,18 +5,20 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::fields::{row_field_value, FieldSpace};
+use crate::fields::{row_field_value, FieldSpace, Row};
 use crate::filter::compile_query;
-use crate::grammar::ModifierToken;
 use crate::node_impl::{
-    MenuResult, PathArgs, RenderContext, SubmitResult,
+    CompletionRows, DataError, MenuResult, PathArgs, RenderContext, SubmitResult,
     SlashDotNode,
 };
+use crate::provider::ColumnDef;
 use crate::render::{LogicalLine, RenderPlan};
 use crate::value::Value;
+use crate::view::{RowView, ViewPlan, ViewRequest, ViewRows};
 use std::ops::Range;
 
 /// Simplified key events the host sends to the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostKey {
     Tab,
     Enter,
@@ -46,41 +48,29 @@ pub(crate) struct RowRef {
 }
 
 impl RowRef {
-    /// Resolve the handle against the data_rc snapshot. Returns `None` on
+    /// Resolve the handle against the slot snapshot. Returns `None` on
     /// a stale/foreign handle (§3.6: degrade/skip, never unwrap).
-    fn resolve<'a>(&self, data: &'a [Option<Rc<crate::node_impl::DataResponse>>]) -> Option<&'a crate::fields::Row> {
+    pub(crate) fn resolve<'a>(&self, data: &'a [Option<Rc<crate::node_impl::DataResponse>>]) -> Option<&'a crate::fields::Row> {
         let resp = data.get(self.child_idx as usize)?.as_ref()?;
         resp.rows.get(self.row_offset as usize)
     }
 }
 
-// --- Content cache (data-derived) ---
+// --- Content cache (content side: slots, dispatch index, pipeline memo) ---
 
 struct ContentCache {
-    /// Per-child data responses, parallel to self.children.
+    /// Per-child data responses (slots), parallel to self.children.
     /// On DataError, slot is None (stale rows kept).
     data_rc: Vec<Option<Rc<crate::node_impl::DataResponse>>>,
     /// Rows marked active by any child (§5.2). HashSet for O(1) lookup.
     active_ids: HashSet<String>,
     /// Row ID → child index. Rebuilt when any child's Rc changes.
     row_index: HashMap<String, u16>,
-    /// Ranked row handles. Rebuilt on dirty or view_args change.
-    ranked_rows: Vec<RowRef>,
-    /// True when data changed since last ensure_view.
-    dirty: bool,
-    /// Cached rendered lines + active row indices. Rebuilt only when
-    /// content changes (dirty) or terminal width changes. MoveCursor
-    /// clones the Rc and only updates markers.
-    render: RenderCache,
-}
-
-struct RenderCache {
-    /// Table column header. Single line. Changes on dirty/resize only.
-    table_header: Option<crate::render::LogicalLine>,
-    /// Scrollable data rows. Rc-shared — same pointer on cursor moves.
-    rows: std::rc::Rc<Vec<crate::render::LogicalLine>>,
-    /// Resolved active row indices (computed from active_ids + ranked_rows).
-    active_rows: Vec<usize>,
+    /// True when slots changed since the rows pipeline last ran.
+    slots_dirty: bool,
+    /// Rows-pipeline memo: key (`suffix.trim_end()`) + output.
+    last_key: String,
+    view_rows: Option<Rc<ViewRows>>,
 }
 
 impl Default for ContentCache {
@@ -89,13 +79,9 @@ impl Default for ContentCache {
             data_rc: Vec::new(),
             active_ids: HashSet::new(),
             row_index: HashMap::new(),
-            ranked_rows: Vec::new(),
-            dirty: true,
-            render: RenderCache {
-                table_header: None,
-                rows: Rc::new(Vec::new()),
-                active_rows: Vec::new(),
-            },
+            slots_dirty: true,
+            last_key: String::new(),
+            view_rows: None,
         }
     }
 }
@@ -103,15 +89,9 @@ impl Default for ContentCache {
 // --- Epoch state (user-intent, reset on new activation) ---
 
 struct EpochState {
-    /// Cursor row ID (survives re-rank). Resolved to index lazily.
-    cursor_id: Option<String>,
-    /// Cached cursor index (O(1) display lookup).
-    cursor_idx: usize,
-    /// True when the user explicitly moved the cursor (arrow keys).
-    /// When false, cursor re-seeds from ranked_rows on view changes
-    /// (filter, sort, data refresh). When true, cursor persists.
-    cursor_user_moved: bool,
-    /// Last rendered section for this node (view cache key + restore source).
+    /// Last rendered section for this node — the §5.1 restore source
+    /// (traversal memory; kept in sync with the rows-pipeline key).
+    /// Cursor state lives in `RowView` (per-view, view.rs).
     view_args: String,
     /// Set when this node drills into a child; consumed on bare-ID re-entry.
     should_restore_view_args: bool,
@@ -122,9 +102,6 @@ struct EpochState {
 impl Default for EpochState {
     fn default() -> Self {
         EpochState {
-            cursor_id: None,
-            cursor_idx: 0,
-            cursor_user_moved: false,
             view_args: String::new(),
             should_restore_view_args: false,
             confirm_pending: false,
@@ -156,6 +133,18 @@ pub(crate) struct NodeEntry {
     /// from children's `node_data()` responses. Exposed via
     /// `SlashDotMenuNode::with_value_forwarding()`.
     pub(crate) value_forwarding: bool,
+    /// Presentation side: cursor + row-line cache + plan assembly (view.rs).
+    view: RowView,
+    /// Completion dialog view — the second RowView instance (exclusive
+    /// view: candidates fully replace rows while the dialog is up).
+    completion_view: RowView,
+    /// Per-frame completion `Err` scratch: set while handling a key,
+    /// read by `view_plan` for the `[ERROR]` detail line, never
+    /// survives the key.
+    frame_error: Option<String>,
+    /// Completer-response → ViewRows wrap memo (ptr_eq passthrough for
+    /// handler-cached responses).
+    completion_wrap: Option<(Rc<CompletionRows>, Rc<ViewRows>)>,
 }
 
 impl NodeEntry {
@@ -176,6 +165,10 @@ impl NodeEntry {
             epoch: EpochState::default(),
             cache_epoch: 0,
             value_forwarding: false,
+            view: RowView::new(),
+            completion_view: RowView::new(),
+            frame_error: None,
+            completion_wrap: None,
         }
     }
 
@@ -251,7 +244,8 @@ impl NodeEntry {
 
     // --- Main entry point ---
 
-    /// Drive one key event through this node's subtree.
+    /// Drive one key event through this node's subtree, cursor at the
+    /// end of the section (the common case: tests and EOL interaction).
     ///
     /// `path` is the accumulated drill IDs (passed by value for cheap clone
     /// on drill). `prompt_suffix` is this node's section of the prompt
@@ -265,11 +259,35 @@ impl NodeEntry {
         prompt_suffix: &str,
         render_ctx: &RenderContext,
     ) -> MenuResult {
+        let cursor_pos = prompt_suffix.len();
+        self.node_traverse_at(epoch, key, path, prompt_suffix, cursor_pos, render_ctx)
+    }
+
+    /// Like [`node_traverse`](Self::node_traverse) with an explicit
+    /// cursor (byte offset into this level's `prompt_suffix`). v1 only
+    /// supports end-of-line completion: the resolved level suppresses
+    /// completion unless `cursor_pos == prompt_suffix.len()`, so a
+    /// mid-line cursor can never complete a different word than the
+    /// user edits.
+    pub fn node_traverse_at(
+        &mut self,
+        epoch: u64,
+        key: HostKey,
+        path: Vec<String>,
+        prompt_suffix: &str,
+        cursor_pos: usize,
+        render_ctx: &RenderContext,
+    ) -> MenuResult {
         // Phase 0: Epoch gate — reset per-node epoch state on new activation.
         if epoch != self.cache_epoch {
             self.epoch = EpochState::default();
             self.cache_epoch = epoch;
+            self.view.reset();
+            self.completion_view.reset();
         }
+
+        // Per-frame completion-error scratch (never survives the key).
+        self.frame_error = None;
 
         // Materialize this level's PathArgs by value: `ids` moved in,
         // `suffix` copied once. Everything downstream borrows this local.
@@ -300,21 +318,21 @@ impl NodeEntry {
                 && !trailing_space
                 && self.epoch.should_restore_view_args
             {
-                // Undo the drill: seed cursor on the matched ID's row,
-                // replace the bare ID with stored view_args.
+                // Undo the drill: rebuild the restored view and pin the
+                // cursor onto the matched ID's row (§5.1). The rows
+                // memo hits (same key as at drill time), so the pin
+                // alone moves the cursor — restore stays cheap.
                 let matched_word = parsed.path_args.suffix[id_range.clone()].to_string();
                 let restore_to = self.epoch.view_args.clone();
                 self.epoch.should_restore_view_args = false;
-                self.epoch.cursor_id = Some(matched_word.clone());
-                self.seed_cursor_idx_on_id(&matched_word);
-                // Build view from restored section.
                 let restore_args = parse_section(
                     PathArgs::new(parsed.path_args.ids.clone(), restore_to.clone()),
                     &self.content.row_index,
                 );
-                self.ensure_view(epoch, &restore_args, &restore_to);
-                let plan = self.build_render_plan(&restore_args.path_args, render_ctx);
-                return MenuResult::Continue(plan, restore_args.path_args.full_prompt());
+                let rows = self.ensure_rows(&restore_args.path_args);
+                let out =
+                    self.view_plan(&restore_args, Some(&matched_word), rows, None, render_ctx);
+                return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
             }
         }
 
@@ -322,7 +340,7 @@ impl NodeEntry {
 
         // Leaf node (no children).
         if self.children.is_empty() {
-            return self.handle_leaf(epoch, key, &parsed, render_ctx);
+            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx);
         }
 
         // Listing node: matched child with non-empty tail → recurse.
@@ -336,11 +354,16 @@ impl NodeEntry {
                 let mut child_path = parsed.path_args.ids.clone();
                 child_path.push(parsed.path_args.suffix[id_range.clone()].to_string());
                 let child_suffix = &parsed.path_args.suffix[parsed.tail.clone()];
-                return self.children[parsed.child_idx].node_traverse(
+                // Cursor is suffix-relative at each level: the child's
+                // section starts at `tail.start`. Saturating — a cursor
+                // above the tail leaves the child's completion inert.
+                let child_cursor = cursor_pos.saturating_sub(parsed.tail.start);
+                return self.children[parsed.child_idx].node_traverse_at(
                     epoch,
                     key,
                     child_path,
                     child_suffix,
+                    child_cursor,
                     render_ctx,
                 );
             }
@@ -349,7 +372,7 @@ impl NodeEntry {
         }
 
         // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, render_ctx)
+        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx)
     }
 
     // --- Leaf handling ---
@@ -359,9 +382,23 @@ impl NodeEntry {
         epoch: u64,
         key: HostKey,
         parsed: &ParsedSection,
+        cursor_pos: usize,
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let pa = &parsed.path_args;
+        // Completion: passive frames + cursor moves + Tab. Enter/Esc/
+        // Drill* bypass entirely (submit raw word / ladder / drill
+        // semantics); the confirm dialog has highest precedence.
+        if !self.epoch.confirm_pending
+            && matches!(
+                key,
+                HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
+            )
+        {
+            if let Some(m) = self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+                return m;
+            }
+        }
         match key {
             HostKey::Enter | HostKey::DrillEnter => {
                 if self.epoch.confirm_pending {
@@ -400,8 +437,9 @@ impl NodeEntry {
             }
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
-                let plan = self.plan_from_cache(pa, render_ctx);
-                MenuResult::Continue(plan, pa.full_prompt())
+                let rows = self.ensure_rows(&parsed.path_args);
+                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                MenuResult::Continue(out.plan, pa.full_prompt())
             }
             _ => Self::build_continue(pa),
         }
@@ -414,6 +452,7 @@ impl NodeEntry {
         epoch: u64,
         key: HostKey,
         parsed: &ParsedSection,
+        cursor_pos: usize,
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let pa = &parsed.path_args;
@@ -421,36 +460,40 @@ impl NodeEntry {
         // section when unmatched — `tail.start` is then the suffix end).
         let view_args_clean = pa.suffix[..parsed.tail.start].trim_end().to_string();
 
+        // Completion first: while the dialog is up it owns the passive
+        // render, cursor moves, and Tab (exclusive view); Enter/Esc/
+        // Drill* bypass to the surrounding context.
+        if !self.epoch.confirm_pending
+            && matches!(
+                key,
+                HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
+            )
+        {
+            if let Some(m) = self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+                return m;
+            }
+        }
+
         match key {
             HostKey::MoveCursor(delta) => {
-                self.ensure_view(epoch, parsed, &view_args_clean);
-                let n = self.content.ranked_rows.len();
-                if n > 0 {
-                    self.epoch.cursor_idx = (self.epoch.cursor_idx as isize + delta as isize)
-                        .clamp(0, (n - 1) as isize) as usize;
-                    if let Some(rref) = self.content.ranked_rows.get(self.epoch.cursor_idx) {
-                        self.epoch.cursor_id = rref
-                            .resolve(&self.content.data_rc)
-                            .map(|row| row.id.clone());
-                    }
-                }
-                self.epoch.cursor_user_moved = true;
-                let plan = self.plan_from_cache(pa, render_ctx);
-                MenuResult::Continue(plan, pa.full_prompt())
+                let rows = self.ensure_rows(&parsed.path_args);
+                let out = self.view_plan(parsed, None, rows, Some(delta), render_ctx);
+                MenuResult::Continue(out.plan, pa.full_prompt())
             }
             HostKey::Tab | HostKey::Enter => {
-                self.ensure_view(epoch, parsed, &view_args_clean);
-                let Some(active_id) = self.cursor_id_or_fallback() else {
+                let rows = self.ensure_rows(&parsed.path_args);
+                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                let Some(row) = out.cursor_row else {
                     return Self::build_continue(pa);
                 };
-                let child_idx = match self.content.row_index.get(&active_id) {
+                let child_idx = match self.content.row_index.get(&row.id) {
                     Some(&idx) => idx as usize,
                     None => return Self::build_continue(pa),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
                 let mut new_path = pa.ids.clone();
-                new_path.push(active_id);
+                new_path.push(row.id);
                 // Listing drill: Tab forwards DrillTab, Enter forwards
                 // DrillEnter — leaf nodes submit on DrillEnter (unless
                 // drill_rewrite intercepts), listing nodes ignore both.
@@ -469,9 +512,9 @@ impl NodeEntry {
             }
             HostKey::Esc => Self::handle_esc(parsed),
             _ => {
-                self.ensure_view(epoch, parsed, &view_args_clean);
-                let plan = self.build_render_plan(pa, render_ctx);
-                MenuResult::Continue(plan, pa.full_prompt())
+                let rows = self.ensure_rows(&parsed.path_args);
+                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                MenuResult::Continue(out.plan, pa.full_prompt())
             }
         }
     }
@@ -481,10 +524,7 @@ impl NodeEntry {
     fn handle_esc(parsed: &ParsedSection) -> MenuResult {
         let pa = &parsed.path_args;
         // Step 2: clear refinement — terms, modifiers, selection dropped.
-        if !pa.args.positional.is_empty()
-            || !pa.args.modifiers.is_empty()
-            || parsed.matched()
-        {
+        if !pa.args.is_empty() || parsed.matched() {
             // Rewrite section to just the parent path (no terms/modifiers/selection).
             return MenuResult::Continue(RenderPlan::default(), pa.prompt_with(""));
         }
@@ -576,33 +616,43 @@ impl NodeEntry {
                     self.content.active_ids.insert(id.clone());
                 }
             }
-            self.content.dirty = true;
+            self.content.slots_dirty = true;
         }
 
         changed
     }
 
-    // --- View derivation (filter → fuzzy rank → sort) ---
+    // --- Rows pipeline (content side) + view plan ---
 
-    fn ensure_view(&mut self, _epoch: u64, parsed: &ParsedSection, view_args_str: &str) {
-        if !self.content.dirty && self.epoch.view_args == view_args_str {
-            return;
+    /// Rows pipeline: memoized filter → fuzzy rank → sort over the flat
+    /// args, minting a **fresh** `Rc<ViewRows>` whenever it runs — fresh
+    /// even if content is equal (reconcile cadence must match today's
+    /// derive cadence; `ptr_eq` is that signal). Key = `suffix.trim_end()`
+    /// straight off `&PathArgs` — equivalent to today's
+    /// `suffix[..tail.start].trim_end()` because the pipeline only runs
+    /// at `handle_listing`-reachable frames where the tail is empty.
+    fn ensure_rows(&mut self, path_args: &PathArgs) -> Rc<ViewRows> {
+        let key = path_args.suffix.trim_end().to_string();
+        // Traversal memory: §5.1 restore source — written exactly where
+        // today's ensure_view wrote it (every pipeline touch).
+        self.epoch.view_args = key.clone();
+        if !self.content.slots_dirty && self.content.last_key == key {
+            if let Some(rows) = &self.content.view_rows {
+                return Rc::clone(rows);
+            }
         }
-        self.content.dirty = false;
 
-        // Build field space (inferred from rows for now; §2.1 metadata
-        // on parent comes in step 5).
+        // Build field space (declared `fields()` else inferred from rows).
         let field_space = self.field_space();
 
-        // Step 1: Filter by modifiers (sliced from suffix via ranges).
-        let modifier_tokens: Vec<ModifierToken> = parsed
-            .path_args
-            .modifiers()
-            .map(|(k, v)| ModifierToken {
-                key: k.to_string(),
-                value: v.to_string(),
-            })
-            .collect();
+        // Filter by modifiers — extracted from the flat args against
+        // this level's field space (valid keys only; every other dot
+        // word stays a fuzzy term).
+        let (modifier_tokens, fuzzy_terms) = crate::filter::split_modifiers(
+            &path_args.args,
+            &path_args.suffix,
+            &field_space,
+        );
         let query = if modifier_tokens.is_empty() {
             crate::filter::Query::default()
         } else {
@@ -645,21 +695,332 @@ impl NodeEntry {
             })
             .collect();
 
-        // Step 2: Fuzzy rank by positional terms.
-        let terms = parsed.path_args.positional().collect::<Vec<_>>().join(" ");
+        // Fuzzy rank by the remaining flat words.
+        let terms = fuzzy_terms.join(" ");
         let mut ranked: Vec<RowRef> = crate::cursor::rank_row_refs(&filtered, &terms, None)
             .rows;
 
-        // Step 3: Apply explicit sort (overrides fuzzy rank order).
+        // Apply explicit sort (overrides fuzzy rank order).
         if let Some((ref sort_field, sort_dir)) = query.sort {
             self.sort_row_refs(&mut ranked, sort_field, sort_dir);
         }
 
-        self.content.ranked_rows = ranked;
-        self.epoch.view_args = view_args_str.to_owned();
+        let rows = Rc::new(ViewRows::new(
+            self.content.data_rc.clone(),
+            ranked,
+            self.content.active_ids.clone(),
+        ));
+        self.content.slots_dirty = false;
+        self.content.last_key = key;
+        self.content.view_rows = Some(Rc::clone(&rows));
+        rows
+    }
 
-        // Step 4: Seed / keep cursor (§3.4).
-        self.seed_or_keep_cursor(parsed);
+    /// Build this level's `ViewRequest` (detail from `header()`,
+    /// columns, seed from the parsed matched id) and run the view.
+    /// `pin` is the §5.1 restore cursor force; `cursor_delta` covers
+    /// MoveCursor / page keys. Drill arms call this too and discard
+    /// the returned plan (one `header()` + assembly on an unchanged
+    /// view — rows Rc reused).
+    fn view_plan(
+        &mut self,
+        parsed: &ParsedSection,
+        pin: Option<&str>,
+        rows: Rc<ViewRows>,
+        cursor_delta: Option<i32>,
+        render_ctx: &RenderContext,
+    ) -> ViewPlan {
+        let path_args = &parsed.path_args;
+        let seed: Option<String> = parsed
+            .matched_id
+            .as_ref()
+            .map(|r| path_args.suffix[r.clone()].to_string());
+        let columns = self.inner.columns();
+        let mut detail: Vec<LogicalLine> = Vec::new();
+        if let Some(msg) = &self.frame_error {
+            detail.push(LogicalLine::new(format!("[ERROR]: {msg}")));
+        }
+        detail.extend(
+            self.inner
+                .header(path_args, render_ctx)
+                .into_iter()
+                .map(LogicalLine::new),
+        );
+        self.view.plan(
+            rows,
+            &ViewRequest {
+                columns: &columns,
+                detail,
+                seed_id: seed.as_deref(),
+                pin,
+                cursor_delta,
+                render_ctx: *render_ctx,
+            },
+        )
+    }
+
+    // --- Completion (dialog) ---
+
+    /// One completion evaluation for this frame. Returns `Some(result)`
+    /// when the dialog owns the frame (render / cursor move / Tab
+    /// expansion); `None` falls through to the normal path. Listing
+    /// levels use the internal `default_complete`; leaves use the
+    /// `SlashDotNode::complete_parameter` trait method (empty by
+    /// default). v1 guards: cursor at the end of this level's section,
+    /// and a word directly before it (a space dismisses — nothing to
+    /// complete).
+    fn completion_pass(
+        &mut self,
+        parsed: &ParsedSection,
+        cursor_pos: usize,
+        key: HostKey,
+        render_ctx: &RenderContext,
+    ) -> Option<MenuResult> {
+        let pa = &parsed.path_args;
+        if cursor_pos != pa.suffix.len() {
+            self.completion_view.reset();
+            return None;
+        }
+        let word_range = match pa.word_before(cursor_pos) {
+            Some(w) => w,
+            None => {
+                self.completion_view.reset();
+                return None;
+            }
+        };
+        let result = if self.children.is_empty() {
+            self.inner.complete_parameter(pa, cursor_pos)
+        } else {
+            self.default_complete(parsed, cursor_pos)
+        };
+        let rc = match result {
+            Ok(rc) => rc,
+            Err(e) => {
+                // No dialog; surface via the per-frame scratch on the
+                // normal (listing/leaf) detail line this frame.
+                self.frame_error = Some(e.message);
+                self.completion_view.reset();
+                return None;
+            }
+        };
+        if rc.rows.is_empty() {
+            self.completion_view.reset();
+            return None;
+        }
+        // Wrap the completer response — memoized on the response ptr so
+        // a handler-cached Rc passes through unchanged (no reconcile;
+        // dialog cursor survives).
+        let wrap = self.wrap_completion(&rc);
+        let (l1, l2) = rc.labels.clone().unwrap_or_else(|| {
+            if self.children.is_empty() {
+                ("Value".to_string(), "Description".to_string())
+            } else {
+                ("Modifier".to_string(), "Description".to_string())
+            }
+        });
+        let columns = vec![
+            ColumnDef::new("id", l1.as_str()),
+            ColumnDef::new("description", l2.as_str()),
+        ];
+        let detail: Vec<LogicalLine> = self
+            .inner
+            .header(pa, render_ctx)
+            .into_iter()
+            .map(LogicalLine::new)
+            .collect();
+        let cursor_delta = match key {
+            HostKey::MoveCursor(d) => Some(d),
+            _ => None,
+        };
+        let out = self.completion_view.plan(
+            wrap,
+            &ViewRequest {
+                columns: &columns,
+                detail,
+                seed_id: None,
+                pin: None,
+                cursor_delta,
+                render_ctx: *render_ctx,
+            },
+        );
+        match key {
+            HostKey::Tab => {
+                // In-place expansion: replace the word before cursor
+                // with the cursor row's id (no trailing space written
+                // directly), re-run completion on the expanded word in
+                // the same turn — non-empty keeps the dialog going
+                // (directory drilling / key→value progression);
+                // empty/Err (final or exact) appends a trailing space
+                // as a convenience (which also dismisses).
+                let row = out.cursor_row?;
+                let mut new_suffix = pa.suffix.clone();
+                new_suffix.replace_range(word_range.clone(), &row.id);
+                let cursor2 = word_range.start + row.id.len();
+                let reparsed = parse_section(
+                    PathArgs::new(pa.ids.clone(), new_suffix.clone()),
+                    &self.content.row_index,
+                );
+                let rerun = if self.children.is_empty() {
+                    self.inner.complete_parameter(&reparsed.path_args, cursor2)
+                } else {
+                    self.default_complete(&reparsed, cursor2)
+                };
+                if !matches!(&rerun, Ok(r) if !r.rows.is_empty()) {
+                    new_suffix.push(' ');
+                }
+                Some(MenuResult::Continue(
+                    RenderPlan::default(),
+                    reparsed.path_args.prompt_with(&new_suffix),
+                ))
+            }
+            // None / MoveCursor: dialog render (delta applied inside).
+            _ => Some(MenuResult::Continue(out.plan, pa.full_prompt())),
+        }
+    }
+
+    /// Mints the single-slot `ViewRows` for a completer response,
+    /// memoized on the response ptr.
+    fn wrap_completion(&mut self, rc: &Rc<CompletionRows>) -> Rc<ViewRows> {
+        if let Some((prev, view)) = &self.completion_wrap {
+            if Rc::ptr_eq(prev, rc) {
+                return Rc::clone(view);
+            }
+        }
+        let resp = Rc::new(crate::node_impl::DataResponse {
+            rows: rc.rows.clone(),
+            active_ids: Vec::new(),
+        });
+        let n = resp.rows.len();
+        let view = Rc::new(ViewRows::new(
+            vec![Some(resp)],
+            (0..n as u32)
+                .map(|i| RowRef {
+                    child_idx: 0,
+                    row_offset: i,
+                })
+                .collect(),
+            HashSet::new(),
+        ));
+        self.completion_wrap = Some((Rc::clone(rc), Rc::clone(&view)));
+        view
+    }
+
+    /// Listing completion — port of v2.0 `Interpreter::field_options`
+    /// over flat args + merged rows (doc: NodeEntry default
+    /// completion). An empty `Ok` is the "nothing to complete" signal
+    /// (gate miss, no matches, or every match exact).
+    fn default_complete(
+        &self,
+        parsed: &ParsedSection,
+        cursor_pos: usize,
+    ) -> Result<Rc<CompletionRows>, DataError> {
+        let pa = &parsed.path_args;
+        let empty = || {
+            Ok(Rc::new(CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+            }))
+        };
+        // Word + gate: dot-prefixed, not `..`.
+        let Some(word_range) = pa.word_before(cursor_pos) else {
+            return empty();
+        };
+        let word = &pa.suffix[word_range];
+        if !word.starts_with('.') || word.starts_with("..") {
+            return empty();
+        }
+        let field_space = self.field_space();
+        // Description format (v2.0 field_options): type, or
+        // "<desc>; <order>, <type>"; `sort` keeps its standing text.
+        let field_desc = |name: &str| -> String {
+            if name == "sort" {
+                return "sort field, append `>` or `<` for direction; string".to_string();
+            }
+            let Some(spec) = field_space.spec(name) else {
+                return String::new();
+            };
+            let ty = if spec.is_number { "number" } else { "string" };
+            match &spec.description {
+                Some(d) if !d.is_empty() => {
+                    let order = match spec.default_dir {
+                        crate::fields::SortDir::Asc => "min",
+                        crate::fields::SortDir::Desc => "max",
+                    };
+                    format!("{}; {}, {}", d, order, ty)
+                }
+                _ => ty.to_string(),
+            }
+        };
+        let finish = |rows: Vec<Row>| -> Result<Rc<CompletionRows>, DataError> {
+            if rows.is_empty() || rows.iter().all(|r| r.id == word) {
+                return empty();
+            }
+            Ok(Rc::new(CompletionRows { rows, labels: None }))
+        };
+        let body = &word[1..];
+        match body.find(':') {
+            None => {
+                // Key mode: field names containing the typed prefix;
+                // `sort` injected so it shows up like any modifier key.
+                let prefix = body;
+                let mut names: Vec<String> = field_space
+                    .names(true)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if !names.iter().any(|n| n == "sort") {
+                    names.push("sort".to_string());
+                }
+                let rows = names
+                    .iter()
+                    .filter(|k| k.contains(prefix))
+                    .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
+                    .collect();
+                finish(rows)
+            }
+            Some(c) => {
+                let key = &body[..c];
+                let value = &body[c + 1..];
+                // `.sort:` → field names as values (contains filter).
+                if key == "sort" {
+                    let rows = field_space
+                        .names(true)
+                        .into_iter()
+                        .filter(|f| f.contains(value))
+                        .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
+                        .collect();
+                    return finish(rows);
+                }
+                // Unknown key → no dialog (word stays positional).
+                let Some(spec) = field_space.spec(key) else {
+                    return empty();
+                };
+                // Numbers are free-form; non-filterable fields can't be
+                // filtered at all — no completion either.
+                if spec.is_number || !spec.filterable {
+                    return empty();
+                }
+                // Dataset-derived string values (design D7): distinct,
+                // non-empty, first-seen over the full merged row set
+                // (the dataset, not the filtered view), fuzzy-matched
+                // against the typed prefix (empty prefix → all).
+                let mut values: Vec<String> = Vec::new();
+                for slot in self.content.data_rc.iter().flatten() {
+                    for row in &slot.rows {
+                        if let Some(Value::Str(s)) = row_field_value(row, key) {
+                            if !s.is_empty() && !values.contains(&s) {
+                                values.push(s);
+                            }
+                        }
+                    }
+                }
+                let rows = crate::fuzzy::fuzzy_filter_bonus(&values, value, |s| s.clone())
+                    .into_iter()
+                    .map(|h| Row::new(format!(".{}:{}", key, h.item)).desc("string"))
+                    .collect();
+                finish(rows)
+            }
+        }
     }
 
     /// Sort ranked_rows by a field value. Missing-field rows go last.
@@ -694,67 +1055,6 @@ impl NodeEntry {
         }
         *rows = present.into_iter().map(|(_, rref)| rref).collect();
         rows.extend(missing);
-    }
-
-    /// Seed or keep cursor after re-derive (§3.4).
-    /// Seed or keep the cursor position.
-    ///
-    /// When `cursor_user_moved` is true (user pressed arrow keys), the
-    /// cursor persists across view changes. Otherwise, re-seed from the
-    /// top of ranked_rows (or active_ids / matched_child).
-    fn seed_or_keep_cursor(&mut self, parsed: &ParsedSection) {
-        // If the user explicitly moved the cursor, keep it and refresh the index.
-        if self.epoch.cursor_user_moved {
-            if let Some(ref id) = self.epoch.cursor_id.clone() {
-                if let Some(idx) = self.content.ranked_rows.iter().position(|r| {
-                    r.resolve(&self.content.data_rc)
-                        .map_or(false, |row| row.id == *id)
-                }) {
-                    self.epoch.cursor_idx = idx;
-                    return;
-                }
-            }
-            // Explicit cursor dropped out of filtered set — reset so
-            // re-seed picks the new top match cleanly.
-            self.epoch.cursor_user_moved = false;
-        }
-
-        // Re-seed: selection (if any) → first active → row 0.
-        self.epoch.cursor_id = parsed
-            .matched_id
-            .as_ref()
-            .map(|r| parsed.path_args.suffix[r.clone()].to_string())
-            .or_else(|| self.content.active_ids.iter().next().cloned())
-            .or_else(|| {
-                self.content
-                    .ranked_rows
-                    .first()
-                    .and_then(|r| r.resolve(&self.content.data_rc))
-                    .map(|row| row.id.clone())
-            });
-        self.epoch.cursor_idx = 0;
-        // Re-resolve the new cursor_id to an index.
-        if let Some(ref id) = self.epoch.cursor_id.clone() {
-            self.seed_cursor_idx_on_id(id);
-        }
-    }
-
-    /// Set cursor_idx to the position of the given ID in ranked_rows.
-    fn seed_cursor_idx_on_id(&mut self, id: &str) {
-        if let Some(idx) = self.content.ranked_rows.iter().position(|r| {
-            r.resolve(&self.content.data_rc)
-                .map_or(false, |row| row.id == id)
-        }) {
-            self.epoch.cursor_idx = idx;
-        }
-    }
-
-    fn cursor_id_or_fallback(&self) -> Option<String> {
-        self.content
-            .ranked_rows
-            .get(self.epoch.cursor_idx)
-            .and_then(|r| r.resolve(&self.content.data_rc))
-            .map(|row| row.id.clone())
     }
 
     // --- View helpers ---
@@ -803,148 +1103,7 @@ impl NodeEntry {
         MenuResult::Continue(RenderPlan::default(), path_args.full_prompt())
     }
 
-    // --- Render plan construction (§5) ---
 
-    /// Rebuild lines and cache. Called when content is dirty or on
-    /// non-cursor key events.
-    ///
-    /// Panel structure (§6):
-    /// 1. header() lines — sticky, non-selectable
-    /// 2. Table header row (if columns + data) — sticky, below header()
-    /// 3. Data rows — scrollable, with > / * markers
-    ///
-    /// The host uses `sticky_count` to decide vertical truncation when
-    /// the terminal is too short for all sticky + data lines.
-    fn build_render_plan(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> RenderPlan {
-        // Pre-compute: do we have data rows and table columns?
-        let has_data = !self.content.ranked_rows.is_empty();
-        let columns = self.inner.columns();
-        let field_space = self.field_space();
-        let has_columns = !columns.is_empty() || !field_space.fields.is_empty();
-        let has_table_header = has_columns && has_data
-            && columns.iter().any(|c| !c.header.is_empty());
-
-        // 1. Header lines from the node's header() method → detail.
-        let header = self.inner.header(path_args, render_ctx);
-        let detail: Vec<LogicalLine> = header.into_iter()
-            .map(LogicalLine::new)
-            .collect();
-
-        // 2. Table header + data rows.
-        let term_width: usize = render_ctx.term_width;
-        let mut table_header_line: Option<LogicalLine> = None;
-        let row_lines: Vec<LogicalLine>;
-        {
-            use crate::table::{Align, Table};
-            let col_field_names: Vec<String> = if !columns.is_empty() {
-                columns.iter().map(|c| c.field.clone()).collect()
-            } else {
-                vec!["id".to_string(), "description".to_string()]
-            };
-            let header_labels: Vec<&str> = if !columns.is_empty() {
-                columns.iter().map(|c| c.header.as_str()).collect()
-            } else {
-                col_field_names.iter().map(|s| s.as_str()).collect()
-            };
-            let mut t = Table::new(&header_labels).set_gap(2);
-            if !columns.is_empty() {
-                let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
-                let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
-                let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-                t = t.with_aligns(&aligns).with_min_widths(&mins).with_priorities(&prios);
-            }
-            for rref in &self.content.ranked_rows {
-                let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
-                for k in &col_field_names {
-                    cells.push(
-                        rref.resolve(&self.content.data_rc)
-                            .and_then(|row| {
-                                row.field_display(k).or_else(|| {
-                                    crate::fields::row_field_value(row, k).map(|v| match v {
-                                        crate::value::Value::Str(s) => s,
-                                        crate::value::Value::Num(n) => crate::value::fmt_num(n),
-                                    })
-                                })
-                            })
-                            .unwrap_or_default(),
-                    );
-                }
-                t.add_row(&cells);
-            }
-            // Table header (single line, always one LogicalLine).
-            if has_table_header {
-                let header_text = t.render_header(term_width.saturating_sub(2));
-                table_header_line = Some(LogicalLine::new(header_text));
-            }
-            // Data rows: wrapping (multi-line) or truncating (single-line + ellipsis)
-            // based on the column wrap setting.
-            let use_wrap = columns.iter().all(|c| c.wrap);
-            row_lines = if use_wrap {
-                t.render_multiline(term_width.saturating_sub(2))
-            } else {
-                t.render(term_width.saturating_sub(2))
-            }
-            .into_iter()
-            .map(LogicalLine::new)
-            .collect();
-        }
-
-        // Resolve active row indices.
-        let active_rows: Vec<usize> = self
-            .content
-            .ranked_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| {
-                r.resolve(&self.content.data_rc)
-                    .map_or(false, |row| self.content.active_ids.contains(&row.id))
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        let rows_rc = Rc::new(row_lines);
-
-        // Cache table_header, rows, and active_rows.
-        self.content.render.table_header = table_header_line.clone();
-        self.content.render.rows = Rc::clone(&rows_rc);
-        self.content.render.active_rows = active_rows.clone();
-
-        let selected = if self.content.ranked_rows.is_empty() {
-            None
-        } else {
-            Some(self.epoch.cursor_idx)
-        };
-
-        RenderPlan {
-            table_header: table_header_line,
-            detail,
-            rows: rows_rc,
-            selected,
-            active_rows,
-        }
-    }
-
-    /// Cursor-move fast path: reuse cached table_header + rows Rc,
-    /// recompute detail (may depend on focused row) and selected/active.
-    fn plan_from_cache(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> RenderPlan {
-        let detail: Vec<LogicalLine> = self.inner.header(path_args, render_ctx).into_iter()
-            .map(LogicalLine::new)
-            .collect();
-
-        let selected = if self.content.ranked_rows.is_empty() {
-            None
-        } else {
-            Some(self.epoch.cursor_idx)
-        };
-
-        RenderPlan {
-            table_header: self.content.render.table_header.clone(),
-            detail,
-            rows: Rc::clone(&self.content.render.rows),
-            selected,
-            active_rows: self.content.render.active_rows.clone(),
-        }
-    }
 }
 
 // --- Section parsing (single parse pass, §2.1) ---
@@ -979,10 +1138,12 @@ impl ParsedSection {
 
 /// Parse a prompt section one word at a time (single pass, §2.1).
 ///
-/// Fills `path_args.args` with byte ranges into `path_args.suffix`:
-/// - `.key:value` / `.key` → modifier ranges (no string copies)
+/// Fills `path_args.args` with flat word ranges into `path_args.suffix`
+/// (no modifier/positional split at parse time, no string copies):
 /// - word in `row_index` → matched child (section terminates)
-/// - otherwise → positional (fuzzy term) range
+/// - otherwise → flat word (the view code later classifies dot words
+///   against the level's field space; the rest are fuzzy terms / leaf
+///   parameters)
 ///
 /// The first word matching a row ID terminates the section; `tail`
 /// covers everything after it (including the leading space).
@@ -1018,26 +1179,10 @@ fn parse_section(
             break;
         }
 
-        // Dot modifier: `.key` or `.key:value` (first colon splits).
-        // Classified by range arithmetic over the word — no allocations
-        // (grammar.rs serves the v2.0 interpreter only).
-        if word.as_bytes()[0] == b'.' {
-            match word.find(':') {
-                Some(c) => {
-                    // c is relative to `word`; shift to absolute offsets.
-                    path_args.args.modifiers.push((
-                        start + 1..start + c,
-                        start + c + 1..pos,
-                    ));
-                }
-                None => {
-                    // Bare `.key` — empty value range at the word end.
-                    path_args.args.modifiers.push((start + 1..pos, pos..pos));
-                }
-            }
-        } else {
-            path_args.args.positional.push(start..pos);
-        }
+        // Flat word — no modifier/positional split at parse time; the
+        // view code classifies dot words against the level's field
+        // space (arg_and_modifier_autocomplete.md).
+        path_args.args.push(start..pos);
     }
 
     ParsedSection {
@@ -1053,7 +1198,7 @@ fn parse_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node_impl::{DataResponse, DataResult};
+    use crate::node_impl::{CompletionRows, DataError, DataResponse, DataResult};
     use std::rc::Rc;
 
     /// A trivial command node: returns a fixed set of rows.
@@ -1111,7 +1256,7 @@ mod tests {
         fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() = Some(
                 path_args
-                    .positional()
+                    .args()
                     .next()
                     .unwrap_or_default()
                     .to_string(),
@@ -1343,17 +1488,29 @@ mod tests {
         parse_section(PathArgs::new(Vec::new(), section), row_index)
     }
 
-    /// Modifier (key, value) pairs as owned strings.
+    /// Field space for the classification tests (plus implicit
+    /// id/description and the injected `sort`).
+    fn test_space() -> FieldSpace {
+        FieldSpace::new(vec![
+            crate::fields::FieldSpec::new("tier", false),
+            crate::fields::FieldSpec::new("price", true),
+        ])
+    }
+
+    /// Modifier (key, value) pairs — view-side classification of the
+    /// flat args (split_modifiers), as owned strings.
     fn mods(p: &ParsedSection) -> Vec<(String, String)> {
-        p.path_args
-            .modifiers()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+        crate::filter::split_modifiers(&p.path_args.args, &p.path_args.suffix, &test_space())
+            .0
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
             .collect()
     }
 
-    /// Positional tokens as owned strings.
+    /// Flat word tokens as owned strings (all non-ID words,
+    /// pre-classification).
     fn pos(p: &ParsedSection) -> Vec<String> {
-        p.path_args.positional().map(str::to_string).collect()
+        p.path_args.args().map(str::to_string).collect()
     }
 
     /// The matched child ID as an owned string.
@@ -1394,11 +1551,24 @@ mod tests {
     fn parse_positional_and_modifier_interleave() {
         let ri = HashMap::new();
         let p = parse("fuzzy .sort:price more", &ri);
-        assert_eq!(pos(&p), vec!["fuzzy", "more"]);
+        // Flat args keep every word — classification happens later.
+        assert_eq!(pos(&p), vec!["fuzzy", ".sort:price", "more"]);
         assert_eq!(
             mods(&p),
             vec![("sort".to_string(), "price".to_string())]
         );
+    }
+
+    #[test]
+    fn parse_keeps_dot_words_flat() {
+        let ri = HashMap::new();
+        let p = parse(".sort:price ./src .gitignore", &ri);
+        assert_eq!(
+            pos(&p),
+            vec![".sort:price", "./src", ".gitignore"]
+        );
+        // Only `.sort:price` classifies as a modifier for this space.
+        assert_eq!(mods(&p).len(), 1);
     }
 
     #[test]
@@ -1436,6 +1606,7 @@ mod tests {
     fn bare_dot_modifier() {
         let ri = HashMap::new();
         let p = parse(".sort", &ri);
+        assert_eq!(pos(&p), vec![".sort"]);
         assert_eq!(mods(&p), vec![("sort".to_string(), String::new())]);
     }
 
@@ -1447,10 +1618,10 @@ mod tests {
         root.refresh_data(ep(), &[], "");
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx());
-        assert_eq!(root.epoch.cursor_idx, 1);
+        assert_eq!(root.view.cursor_idx, 1);
         // New epoch resets.
         let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", &rctx());
-        assert_eq!(root.epoch.cursor_idx, 0);
+        assert_eq!(root.view.cursor_idx, 0);
     }
 
     // --- Esc clears filter ---
@@ -1771,6 +1942,443 @@ mod tests {
         match result {
             MenuResult::DoneSuccess(_, _) => { /* leaf submitted */ }
             other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    // --- Completion (implicit-open dialog; steps 4–6) ---
+
+    /// Listing node whose rows carry typed fields (inferred field space:
+    /// id, description, tier: string, price: number + injected sort).
+    struct FieldedNode;
+
+    impl SlashDotNode for FieldedNode {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![
+                    Row::new("m1")
+                        .desc("alpha model")
+                        .field("tier", Value::Str("free".into()))
+                        .field("price", Value::Num(0.0)),
+                    Row::new("m2")
+                        .desc("beta model")
+                        .field("tier", Value::Str("paid".into()))
+                        .field("price", Value::Num(3.0)),
+                    Row::new("m3")
+                        .desc("gamma model")
+                        .field("tier", Value::Str("free".into()))
+                        .field("price", Value::Num(1.0)),
+                ],
+                active_ids: Vec::new(),
+            }))
+        }
+    }
+
+    fn fielded_root() -> NodeEntry {
+        let mut root = NodeEntry::new_root();
+        root.children
+            .push(NodeEntry::new_child(Box::new(FieldedNode)));
+        root
+    }
+
+    /// Rendered row texts from a Continue result.
+    fn rows_of(result: MenuResult) -> Vec<String> {
+        match result {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn completion_key_mode_lists_field_names() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), ".t", &rctx());
+        let dialog = match &result {
+            MenuResult::Continue(plan, _) => {
+                // Dialog discriminator: candidates render with the fixed
+                // Modifier/Description columns (listing has none).
+                plan.table_header.is_some()
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(dialog, "dot word must open the dialog");
+        let rows = rows_of(result);
+        assert!(rows.iter().any(|r| r.contains(".tier:")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains(".sort:")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains(".description:")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains(".id:")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains(".price:")), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_bare_dot_lists_every_key() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".",
+            &rctx(),
+        ));
+        for k in [".id:", ".description:", ".tier:", ".price:", ".sort:"] {
+            assert!(rows.iter().any(|r| r.contains(k)), "missing {k}: {rows:?}");
+        }
+        assert_eq!(rows.len(), 5, "{rows:?}");
+    }
+
+    #[test]
+    fn completion_ignores_plain_words() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "m1",
+            &rctx(),
+        ));
+        // No dialog: the normal fuzzy listing renders.
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_value_mode_string_field() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".tier:fr",
+            &rctx(),
+        ));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains(".tier:free"), "{rows:?}");
+
+        // Empty prefix: every distinct value (dataset-derived, D7).
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".tier:",
+            &rctx(),
+        ));
+        assert!(rows.iter().any(|r| r.contains(".tier:free")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains(".tier:paid")), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_exact_match_closes_dialog() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        // `.tier:free` is an exact unique match → no dialog; the normal
+        // listing renders (filtered by the modifier to m1/m3).
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".tier:free",
+            &rctx(),
+        ));
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("m3")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("m2")), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_number_and_unknown_keys_stay_inert() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        for suffix in [".price:1", ".nope:x", "..", "./src"] {
+            let rows = rows_of(root.node_traverse(
+                ep(),
+                HostKey::None,
+                Vec::new(),
+                suffix,
+                &rctx(),
+            ));
+            assert!(
+                !rows.iter().any(|r| r.starts_with('.')),
+                "{suffix}: dialog must stay down: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_invalid_key_fuzzy_narrows_listing() {
+        // The accepted behavior delta: an invalid-key dot word is a
+        // fuzzy term, not a silently-ignored modifier.
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".srot:price",
+            &rctx(),
+        ));
+        assert!(rows.is_empty(), "fuzzy '.srot:price' matches nothing: {rows:?}");
+    }
+
+    #[test]
+    fn completion_mid_cursor_suppressed() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        // v1: cursor mid-line → completion suppressed (EOL guard), even
+        // though the word under the cursor would otherwise complete.
+        let result = root.node_traverse_at(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".tier:fr",
+            3,
+            &rctx(),
+        );
+        let rows = rows_of(result);
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_space_dismisses() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".tier:free ",
+            &rctx(),
+        ));
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_dialog_cursor_moves_and_persists() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        let sel_of = |root: &mut NodeEntry, key: HostKey| match root.node_traverse(
+            ep(),
+            key,
+            Vec::new(),
+            ".t",
+            &rctx(),
+        ) {
+            MenuResult::Continue(plan, _) => plan.selected,
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert_eq!(sel_of(&mut root, HostKey::None), Some(0));
+        assert_eq!(sel_of(&mut root, HostKey::MoveCursor(1)), Some(1));
+        // Passive re-render keeps the moved cursor (keep-id reconcile,
+        // even though the default completer mints a fresh Rc per call).
+        assert_eq!(sel_of(&mut root, HostKey::None), Some(1));
+        // Dismiss (space): dialog down, listing cursor untouched.
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".t ",
+            &rctx(),
+        ));
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+    }
+
+    #[test]
+    fn completion_tab_expands_key_and_progresses_to_values() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        // `.so` → single non-exact match `.sort:`.
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".so",
+            &rctx(),
+        ));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains(".sort:"), "{rows:?}");
+        // Tab: in-place expansion, NO trailing space — the same-turn
+        // re-run lands in value mode (non-empty) and keeps going.
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx());
+        match result {
+            MenuResult::Continue(_, prompt) => assert_eq!(prompt, ".sort:"),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn completion_tab_final_value_appends_trailing_space() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        // `.tier:fr` → Tab expands to `.tier:free`; the same-turn
+        // re-run is an exact/final match (empty) → trailing space.
+        let result = root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            ".tier:fr",
+            &rctx(),
+        );
+        match result {
+            MenuResult::Continue(_, prompt) => assert_eq!(prompt, ".tier:free "),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn completion_confirm_pending_suppresses_dialog() {
+        let mut root = fielded_root();
+        root.refresh_data(ep(), &[], "");
+        // Init epoch state at this epoch.
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        root.epoch.confirm_pending = true;
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".t",
+            &rctx(),
+        ));
+        assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
+    }
+
+    /// Leaf with fs-style completion + shared submit recorder.
+    struct PathLeaf {
+        last_submit: Rc<std::cell::RefCell<Option<String>>>,
+        err: Option<String>,
+        rows: Vec<Row>,
+    }
+
+    impl PathLeaf {
+        fn new() -> Self {
+            PathLeaf {
+                last_submit: Rc::new(std::cell::RefCell::new(None)),
+                err: None,
+                rows: vec![
+                    Row::new("/home/x/proj").desc("dir"),
+                    Row::new("/home/x/pub").desc("dir"),
+                ],
+            }
+        }
+    }
+
+    impl SlashDotNode for PathLeaf {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![Row::new("pathpick").desc("pick a path")],
+                active_ids: Vec::new(),
+            }))
+        }
+
+        fn complete_parameter(
+            &mut self,
+            _args: &PathArgs,
+            _cursor_pos: usize,
+        ) -> Result<Rc<CompletionRows>, DataError> {
+            if let Some(m) = &self.err {
+                return Err(DataError { message: m.clone() });
+            }
+            Ok(Rc::new(CompletionRows {
+                rows: self.rows.clone(),
+                labels: None,
+            }))
+        }
+
+        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            *self.last_submit.borrow_mut() =
+                Some(path_args.args().next().unwrap_or_default().to_string());
+            SubmitResult::Done(None)
+        }
+    }
+
+    fn leaf_root() -> (NodeEntry, Rc<std::cell::RefCell<Option<String>>>) {
+        let mut root = NodeEntry::new_root();
+        let leaf = PathLeaf::new();
+        let rec = Rc::clone(&leaf.last_submit);
+        root.children.push(NodeEntry::new_child(Box::new(leaf)));
+        root.refresh_data(ep(), &[], "");
+        (root, rec)
+    }
+
+    #[test]
+    fn leaf_completion_dialog_and_enter_bypasses_to_submit() {
+        let (mut root, rec) = leaf_root();
+        // Resolved INTO the leaf (matched id + tail): trait completion.
+        let result = root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "pathpick /h",
+            &rctx(),
+        );
+        match &result {
+            MenuResult::Continue(plan, _) => {
+                assert!(plan.table_header.is_some(), "dialog columns expected");
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+        let rows = rows_of(result);
+        assert!(rows.iter().any(|r| r.contains("/home/x/proj")), "{rows:?}");
+
+        // Enter bypasses the dialog entirely: submits the RAW word.
+        let result = root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "pathpick /h",
+            &rctx(),
+        );
+        match result {
+            MenuResult::DoneSuccess(_, _) => {}
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+        assert_eq!(rec.borrow().as_deref(), Some("/h"));
+    }
+
+    #[test]
+    fn leaf_completion_error_surfaces_in_detail() {
+        let mut root = NodeEntry::new_root();
+        let mut leaf = PathLeaf::new();
+        leaf.err = Some("boom".to_string());
+        root.children.push(NodeEntry::new_child(Box::new(leaf)));
+        root.refresh_data(ep(), &[], "");
+        let result = root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "pathpick /h",
+            &rctx(),
+        );
+        match result {
+            MenuResult::Continue(plan, _) => {
+                assert_eq!(plan.detail.len(), 1, "{:?}", plan.detail);
+                assert!(plan.detail[0].0.contains("[ERROR]: boom"), "{:?}", plan.detail[0]);
+                assert!(plan.rows.is_empty(), "no dialog on Err: {:?}", plan.rows);
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leaf_no_word_no_dialog() {
+        let (mut root, _rec) = leaf_root();
+        // Trailing space (just drilled in): no word directly before the
+        // cursor → nothing to complete; the leaf header renders instead.
+        let result = root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "pathpick /h ",
+            &rctx(),
+        );
+        match result {
+            MenuResult::Continue(plan, _) => {
+                assert!(plan.rows.is_empty(), "{:?}", plan.rows);
+                assert!(plan.table_header.is_none());
+            }
+            other => panic!("expected Continue, got {:?}", other),
         }
     }
 }

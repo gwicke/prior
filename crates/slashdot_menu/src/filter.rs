@@ -86,6 +86,47 @@ pub fn compile_query(tokens: &[ModifierToken], space: &FieldSpace) -> Query {
     q
 }
 
+/// Classify flat word ranges into view modifiers vs fuzzy terms
+/// (arg_and_modifier_autocomplete.md): a dot word is a modifier iff its
+/// key — up to the first `:` — is a valid field for this level
+/// (`space.names(true)`, which always includes `id`/`description`, plus
+/// the injected `sort` pseudo-field). Everything else — plain words,
+/// `..`, path-ish `./x`, unknown keys like `.srot:price` — stays a
+/// fuzzy term. For *valid* keys the produced tokens are byte-identical
+/// to the old parse-time classification.
+pub fn split_modifiers<'a>(
+    words: &[std::ops::Range<usize>],
+    suffix: &'a str,
+    space: &FieldSpace,
+) -> (Vec<ModifierToken>, Vec<&'a str>) {
+    let names = space.names(true);
+    let valid = |key: &str| key == "sort" || names.iter().any(|n| *n == key);
+    let mut mods = Vec::new();
+    let mut terms = Vec::new();
+    for r in words {
+        let w = &suffix[r.clone()];
+        // `.` alone and `..` fall out naturally: their "keys" (`""`,
+        // `"."`) are never valid field names.
+        let Some(body) = w.strip_prefix('.') else {
+            terms.push(w);
+            continue;
+        };
+        let (key, value) = match body.find(':') {
+            Some(c) => (&body[..c], &body[c + 1..]),
+            None => (body, ""),
+        };
+        if valid(key) {
+            mods.push(ModifierToken {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
+        } else {
+            terms.push(w);
+        }
+    }
+    (mods, terms)
+}
+
 /// Parse `.sort:field` (field's `default_dir`) / `.sort:field>` (descending)
 /// / `.sort:field<` (ascending). Direction is a **suffix** (more ergonomic
 /// with type-ahead — the user can type the field first then append `>`/`<`)
@@ -315,5 +356,72 @@ mod tests {
         );
         assert!(parse_sort_spec("", &space()).is_none());
         assert!(parse_sort_spec("<", &space()).is_none());
+    }
+
+    // --- split_modifiers (flat args → view classification) ---
+
+    /// Word ranges for a single-space-separated test suffix.
+    fn flat(suffix: &str) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut start = None;
+        for (i, b) in suffix.bytes().enumerate() {
+            if b == b' ' {
+                if let Some(s) = start {
+                    out.push(s..i);
+                    start = None;
+                }
+            } else if start.is_none() {
+                start = Some(i);
+            }
+        }
+        if let Some(s) = start {
+            out.push(s..suffix.len());
+        }
+        out
+    }
+
+    #[test]
+    fn split_modifiers_valid_keys_become_modifiers() {
+        let s = ".sort:price .tier:free fuzzy";
+        let (m, t) = split_modifiers(&flat(s), s, &space());
+        let got: Vec<(&str, &str)> = m.iter().map(|t| (t.key.as_str(), t.value.as_str())).collect();
+        assert_eq!(got, vec![("sort", "price"), ("tier", "free")]);
+        assert_eq!(t, vec!["fuzzy"]);
+    }
+
+    #[test]
+    fn split_modifiers_bare_keys_yield_empty_value() {
+        let s = ".sort .tier";
+        let (m, t) = split_modifiers(&flat(s), s, &space());
+        let got: Vec<(&str, &str)> = m.iter().map(|t| (t.key.as_str(), t.value.as_str())).collect();
+        assert_eq!(got, vec![("sort", ""), ("tier", "")]);
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn split_modifiers_invalid_dot_words_stay_terms() {
+        // The accepted behavior delta: invalid-key dot words are fuzzy
+        // terms (before: silently-ignored modifiers).
+        let s = ".srot:price .. ./src .gitignore .";
+        let (m, t) = split_modifiers(&flat(s), s, &space());
+        assert!(m.is_empty(), "no invalid dot word may become a modifier");
+        assert_eq!(t, vec![".srot:price", "..", "./src", ".gitignore", "."]);
+    }
+
+    #[test]
+    fn split_modifiers_implicit_id_and_description_are_valid() {
+        let s = ".id:m1 .description:x .backend:y";
+        let (m, t) = split_modifiers(&flat(s), s, &space());
+        let got: Vec<&str> = m.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(got, vec!["id", "description"]);
+        assert_eq!(t, vec![".backend:y"]);
+    }
+
+    #[test]
+    fn split_modifiers_value_splits_on_first_colon_only() {
+        let s = ".tier:a:b";
+        let (m, _) = split_modifiers(&flat(s), s, &space());
+        assert_eq!(m[0].key, "tier");
+        assert_eq!(m[0].value, "a:b");
     }
 }
