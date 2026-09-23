@@ -87,7 +87,9 @@ pub(crate) struct RankRefResult {
 /// against fuzzy `terms`, with an optional pinned `selection`.
 ///
 /// Filter: rows that don't match fuzzy terms are dropped.
-/// Rank: surviving rows ordered best-first by fuzzy score.
+/// Rank: via [`crate::fuzzy::rank_candidates`] — id-prefix matches first
+/// (shortest id, then lexicographic) for predictable drill order, then
+/// remaining fuzzy matches by score (§4: "exact token pre-selection").
 /// Pin: if `selection` is present and still in the filtered view, it
 /// becomes the active index; otherwise active defaults to 0.
 pub(crate) fn rank_row_refs(
@@ -95,32 +97,18 @@ pub(crate) fn rank_row_refs(
     terms: &str,
     selection: Option<&str>,
 ) -> RankRefResult {
-    let ranked: Vec<RowRef> = if terms.trim().is_empty() {
-        candidates.iter().map(|(rref, _)| *rref).collect()
-    } else {
-        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
-        let ql = terms.to_lowercase();
-        let mut scored: Vec<(i64, RowRef)> = candidates
-            .iter()
-            .filter_map(|(rref, row)| {
-                let text = match &row.description {
-                    Some(d) => format!("{} {}", row.id, d),
-                    None => row.id.clone(),
-                };
-                let base_score = matcher.fuzzy_match(&text, terms)?;
-                // Prefix bonus: exact ID prefix matches rank above
-                // subsequence-only matches (§4: "exact token pre-selection").
-                let score = if row.id.to_lowercase().starts_with(&ql) {
-                    base_score + 10_000
-                } else {
-                    base_score
-                };
-                Some((score, *rref))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().map(|(_, rref)| rref).collect()
-    };
+    let ranked: Vec<RowRef> = crate::fuzzy::rank_candidates(
+        candidates,
+        terms,
+        |(_, row)| row.id.clone(),
+        |(_, row)| match &row.description {
+            Some(d) => format!("{} {}", row.id, d),
+            None => row.id.clone(),
+        },
+    )
+    .into_iter()
+    .map(|(rref, _)| *rref)
+    .collect();
 
     let pinned_idx = selection.and_then(|sel| {
         // Find the matching candidate's RowRef, then find its position in ranked.
@@ -211,5 +199,32 @@ mod tests {
         let r = rank_and_pin(&rows(), "zzz", None);
         assert!(r.rows.is_empty());
         assert_eq!(r.active, 0);
+    }
+
+    #[test]
+    fn rank_row_refs_prefix_ids_shortest_first() {
+        // Predictable drill order: id-prefix matches first, shortest id
+        // first — regardless of input order or fuzzy score noise.
+        let long = Row::new("model_xtra_long").desc("long model");
+        let fuzzy_only = Row::new("alphabet").desc("modular parts");
+        let short = Row::new("model").desc("short model");
+        let mid = Row::new("models").desc("plural model");
+        let mk = |off: u32| RowRef {
+            child_idx: 0,
+            row_offset: off,
+        };
+        let candidates = vec![
+            (mk(0), &long),
+            (mk(1), &fuzzy_only),
+            (mk(2), &short),
+            (mk(3), &mid),
+        ];
+        let ranked = rank_row_refs(&candidates, "mod", None).rows;
+        let order: Vec<u32> = ranked.iter().map(|r| r.row_offset).collect();
+        assert_eq!(
+            order,
+            vec![2, 3, 0, 1],
+            "model, models, model_xtra_long, then the fuzzy-only match"
+        );
     }
 }

@@ -215,10 +215,12 @@ pub trait SlashDotNode {
     /// Return the candidate rows for the word directly before
     /// `cursor_pos`; an empty vec = nothing to complete (no dialog).
     /// `labels` overrides the dialog column headers (default
-    /// `("Value", "Description")` for leaves). Cache the `Rc` until the
-    /// response changes — the engine skips its view re-derive on
-    /// `Rc::ptr_eq`. Default: empty (the common case; every node is
-    /// called on every passive frame).
+    /// `("Value", "Description")` for leaves). Sort candidates with
+    /// `fuzzy::rank_candidates` (prefix matches shortest-first, then
+    /// fuzzy) before returning, so dialogs order predictably. Cache the
+    /// `Rc` until the response changes — the engine skips its view
+    /// re-derive on `Rc::ptr_eq`. Default: empty (the common case;
+    /// every node is called on every passive frame).
     fn complete_parameter(
         &mut self,
         _args: &PathArgs,

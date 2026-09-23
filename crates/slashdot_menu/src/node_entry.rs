@@ -971,11 +971,15 @@ impl NodeEntry {
                 if !names.iter().any(|n| n == "sort") {
                     names.push("sort".to_string());
                 }
-                let rows = names
-                    .iter()
-                    .filter(|k| k.contains(prefix))
-                    .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
-                    .collect();
+                let rows = crate::fuzzy::rank_candidates(
+                    &names,
+                    prefix,
+                    |k| k.clone(),
+                    |k| k.clone(),
+                )
+                .into_iter()
+                .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
+                .collect();
                 finish(rows)
             }
             Some(c) => {
@@ -983,12 +987,16 @@ impl NodeEntry {
                 let value = &body[c + 1..];
                 // `.sort:` → field names as values (contains filter).
                 if key == "sort" {
-                    let rows = field_space
-                        .names(true)
-                        .into_iter()
-                        .filter(|f| f.contains(value))
-                        .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
-                        .collect();
+                    let names = field_space.names(true);
+                    let rows = crate::fuzzy::rank_candidates(
+                        &names,
+                        value,
+                        |f| f.to_string(),
+                        |f| f.to_string(),
+                    )
+                    .into_iter()
+                    .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
+                    .collect();
                     return finish(rows);
                 }
                 // Unknown key → no dialog (word stays positional).
@@ -1014,10 +1022,15 @@ impl NodeEntry {
                         }
                     }
                 }
-                let rows = crate::fuzzy::fuzzy_filter_bonus(&values, value, |s| s.clone())
-                    .into_iter()
-                    .map(|h| Row::new(format!(".{}:{}", key, h.item)).desc("string"))
-                    .collect();
+                let rows = crate::fuzzy::rank_candidates(
+                    &values,
+                    value,
+                    |s| s.clone(),
+                    |s| s.clone(),
+                )
+                .into_iter()
+                .map(|v| Row::new(format!(".{}:{}", key, v)).desc("string"))
+                .collect();
                 finish(rows)
             }
         }
@@ -2189,7 +2202,8 @@ mod tests {
     fn completion_tab_expands_key_and_progresses_to_values() {
         let mut root = fielded_root();
         root.refresh_data(ep(), &[], "");
-        // `.so` → single non-exact match `.sort:`.
+        // `.so` → prefix match `.sort:` ranked first; `.description:`
+        // (subsequence s…o) follows in the fuzzy tier.
         let rows = rows_of(root.node_traverse(
             ep(),
             HostKey::None,
@@ -2197,8 +2211,8 @@ mod tests {
             ".so",
             &rctx(),
         ));
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].contains(".sort:"), "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains(".sort:"), "prefix must rank first: {rows:?}");
         // Tab: in-place expansion, NO trailing space — the same-turn
         // re-run lands in value mode (non-empty) and keeps going.
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx());
@@ -2380,5 +2394,93 @@ mod tests {
             }
             other => panic!("expected Continue, got {:?}", other),
         }
+    }
+
+    /// Listing whose row fields are declared in deliberately shuffled
+    /// order — key-mode ranking (inferred at the root level) must
+    /// ignore field order and rank prefix/length first.
+    struct RankedFieldsNode;
+
+    impl SlashDotNode for RankedFieldsNode {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![Row::new("run")
+                    .field("price_input", Value::Num(1.0))
+                    .field("reasoning", Value::Str("chain".into()))
+                    .field("price_output", Value::Num(2.0))
+                    .field("price", Value::Num(3.0))],
+                active_ids: Vec::new(),
+            }))
+        }
+    }
+
+    /// First whitespace token of a rendered row (= the row id).
+    fn first_tok(rows: &[String]) -> Vec<&str> {
+        rows.iter()
+            .map(|r| r.split_whitespace().next().unwrap_or(""))
+            .collect()
+    }
+
+    #[test]
+    fn completion_key_mode_ranks_prefix_by_length() {
+        let mut root = NodeEntry::new_root();
+        root.children
+            .push(NodeEntry::new_child(Box::new(RankedFieldsNode)));
+        root.refresh_data(ep(), &[], "");
+        // `.pri` → prefix tier, shortest first, ignoring declaration
+        // order: price, price_input, price_output.
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".pri",
+            &rctx(),
+        ));
+        assert_eq!(
+            first_tok(&rows),
+            vec![".price:", ".price_input:", ".price_output:"],
+            "{rows:?}"
+        );
+        // `.so` → prefix `.sort:` first, fuzzy tier after.
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".so",
+            &rctx(),
+        ));
+        let ids = first_tok(&rows);
+        assert_eq!(ids[0], ".sort:", "prefix must rank first: {ids:?}");
+        assert!(ids.contains(&".reasoning:"), "fuzzy tier: {ids:?}");
+        assert!(ids.contains(&".description:"), "fuzzy tier: {ids:?}");
+    }
+
+    #[test]
+    fn listing_ranks_prefix_ids_shortest_first() {
+        // Predictable drill order for listings: id-prefix matches first,
+        // shortest id first, fuzzy-only matches after.
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
+            rows: vec![
+                Row::new("model_xtra_long").desc("long"),
+                Row::new("alphabet").desc("modular parts"),
+                Row::new("model").desc("short"),
+                Row::new("models").desc("plural"),
+            ],
+        })));
+        root.refresh_data(ep(), &[], "");
+        let rows = rows_of(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "mod",
+            &rctx(),
+        ));
+        let ids = first_tok(&rows);
+        assert_eq!(
+            ids,
+            vec!["model", "models", "model_xtra_long", "alphabet"],
+            "{ids:?}"
+        );
     }
 }

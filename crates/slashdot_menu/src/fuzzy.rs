@@ -38,6 +38,59 @@ pub fn fuzzy_filter_bonus<'a, T>(
     fuzzy_filter_impl(items, query, to_text, true)
 }
 
+/// Rank `items` against `query` with the shared predictability rule —
+/// used by listing drill order (`cursor::rank_row_refs`), the default
+/// modifier completer, and leaf `complete_parameter` implementations:
+///
+/// 1. **Prefix matches first**: `prefix_of(item)` starts with `query`
+///    (case-insensitive) — ordered shortest prefix first, then
+///    lexicographic. `.pri` → `price`, `price_input`, `price_output`;
+///    `.so` → `.sort:` ranks before `.reasoning:`.
+/// 2. **Then fuzzy (subsequence) matches** on `text_of(item)` — ordered
+///    by fuzzy score, then shortest prefix, then lexicographic.
+/// 3. Non-matches are dropped. An empty/whitespace query returns every
+///    item in input order (addChild order for listings, declaration
+///    order for field completions) — nothing to rank against.
+///
+/// Input order breaks any remaining tie, so the output is fully
+/// deterministic.
+pub fn rank_candidates<'a, T>(
+    items: &'a [T],
+    query: &str,
+    prefix_of: impl Fn(&T) -> String,
+    text_of: impl Fn(&T) -> String,
+) -> Vec<&'a T> {
+    if query.trim().is_empty() {
+        return items.iter().collect();
+    }
+    let ql = query.to_lowercase();
+    let matcher = SkimMatcherV2::default();
+    // (tier, prefix_len, prefix, score, input_idx, item) — tier 0 =
+    // prefix match, tier 1 = fuzzy-only match.
+    let mut classified: Vec<(u8, usize, String, i64, usize, &'a T)> = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let prefix = prefix_of(item);
+        let pl = prefix.to_lowercase();
+        if pl.starts_with(&ql) {
+            classified.push((0, pl.len(), pl, 0, idx, item));
+        } else if let Some(score) = matcher.fuzzy_match(&text_of(item), query) {
+            classified.push((1, pl.len(), pl, score, idx, item));
+        }
+    }
+    classified.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| match a.0 {
+                // Prefix tier: shortest first, then lexicographic.
+                0 => a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)),
+                // Fuzzy tier: best score first, then shortest, then alpha.
+                _ => b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)),
+            })
+            // Input order breaks remaining ties (deterministic).
+            .then_with(|| a.4.cmp(&b.4))
+    });
+    classified.into_iter().map(|(_, _, _, _, _, item)| item).collect()
+}
+
 fn fuzzy_filter_impl<'a, T>(
     items: &'a [T],
     query: &str,
@@ -113,5 +166,65 @@ mod tests {
         let items = ["/model"];
         let r = fuzzy_filter(&items, "zzzq", |s| s.to_string());
         assert!(r.is_empty());
+    }
+
+    // --- rank_candidates (shared completion/drill predictability) ---
+
+    fn rc_items() -> Vec<String> {
+        vec![
+            "reasoning".to_string(),
+            "price_output".to_string(),
+            "show_reasoning".to_string(),
+            "price".to_string(),
+            "price_input".to_string(),
+            "sort".to_string(),
+        ]
+    }
+
+    fn rc_rank(items: &[String], query: &str) -> Vec<String> {
+        rank_candidates(items, query, |s| s.clone(), |s| s.clone())
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn rank_candidates_prefix_tier_beats_fuzzy_tier() {
+        // `.so` → `.sort:` (prefix) before fuzzy matches like `reasoning`.
+        let items = rc_items();
+        let got = rc_rank(&items, "so");
+        assert_eq!(got[0], "sort", "{got:?}");
+        assert!(got.contains(&"reasoning".to_string()), "{got:?}");
+        assert!(got.contains(&"show_reasoning".to_string()), "{got:?}");
+    }
+
+    #[test]
+    fn rank_candidates_shorter_prefix_first() {
+        // `.pri` → price, price_input, price_output — length order,
+        // regardless of input order.
+        let items = rc_items();
+        assert_eq!(
+            rc_rank(&items, "pri"),
+            vec!["price", "price_input", "price_output"]
+        );
+    }
+
+    #[test]
+    fn rank_candidates_empty_query_keeps_input_order() {
+        let items = rc_items();
+        assert_eq!(rc_rank(&items, ""), items);
+        assert_eq!(rc_rank(&items, "  "), items);
+    }
+
+    #[test]
+    fn rank_candidates_drops_non_matches_case_insensitively() {
+        let items = rc_items();
+        assert!(rc_rank(&items, "zzz").is_empty());
+        // Case-insensitive prefix.
+        assert_eq!(rc_rank(&items, "SO")[0], "sort");
+        // No tier-2 match for "pri" outside the price family (e.g. no
+        // subsequence hits in `reasoning`/`sort`) — output is exactly
+        // the three prefix matches.
+        assert_eq!(rc_rank(&items, "pri").len(), 3);
     }
 }
