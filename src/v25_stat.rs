@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use crate::slash_menu_bridge::MenuShared;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult,
 };
 
 pub struct StatNode {
@@ -22,7 +23,11 @@ impl SlashDotNode for StatNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         let shared = &self.shared;
         let ls = shared.live_state.borrow();
         // Parse provider:model from LiveState.

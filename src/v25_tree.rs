@@ -14,7 +14,8 @@ use crate::slash_menu_bridge::{AsyncOp, CompactMode, MenuShared};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult,
 };
 use crate::slashdot_menu::provider::ColumnDef;
 
@@ -554,7 +555,7 @@ impl SlashDotNode for TreeListNode {
         tree_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
+    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(entry_id) = Self::drilled_entry_id(path_args) else {
             return vec!["Select a tree entry, then choose an action.".to_string()];
         };
@@ -574,7 +575,7 @@ impl SlashDotNode for TreeListNode {
         let entry = &node.entry;
         let role = entry_role(entry);
         let ts = &entry.timestamp;
-        let tw = path_args.term_width.max(1).saturating_sub(2);
+        let tw = render_ctx.term_width.max(1).saturating_sub(2);
         let lines: Vec<String> = match &entry.content {
             SessionEntryContent::Message { message: _ } => {
                 let full = entry_full_text(entry);
@@ -619,7 +620,11 @@ impl SlashDotNode for TreeSwitchNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Move the session leaf to this entry.".to_string(),
             "The next prompt continues from this point.".to_string(),
@@ -663,18 +668,18 @@ impl SlashDotNode for CompactNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Compact: summarize entries before the current point.".into(),
             "Redirects to /tree <id> compact.".into(),
         ]
     }
 
-    fn drill_rewrite(
-        &mut self,
-        _path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
+    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // Look up the current session leaf ID and redirect.
         let leaf_id = self.shared.leaf_id.borrow().clone()?;
         Some(format!("tree {} compact ", leaf_id))
@@ -715,7 +720,11 @@ impl SlashDotNode for TreeCompactManualNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Manual compaction: scan touched files, open in editor.".into(),
             "Save and close to confirm; discard to cancel.".into(),
@@ -762,7 +771,11 @@ impl SlashDotNode for TreeCompactTextNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Text-only compaction: extract user prompts + assistant text.".into(),
             "No reasoning, tool calls, or tool output. Edit in editor.".into(),
@@ -804,7 +817,7 @@ impl SlashDotNode for TreeCompactPromptNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
+    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let prompt = &path_args.suffix;
         if prompt.is_empty() {
             vec![
@@ -819,15 +832,10 @@ impl SlashDotNode for TreeCompactPromptNode {
         }
     }
 
-    fn drill_rewrite(
-        &mut self,
-        path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
+    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the default compaction prompt.
-        // path is ["tree", "<id>", "compact", "prompt"].
-        let prefix = path.join(" ");
-        Some(format!("{} {}", prefix, "Summarize the conversation up to this point."))
+        // ids are ["tree", "<id>", "compact", "prompt"].
+        Some(path_args.prompt_with("Summarize the conversation up to this point."))
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -1030,7 +1038,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
 
         let r1 = tree_node.data(1, &path_args).unwrap();
@@ -1052,7 +1059,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
 
         let r1 = tree_node.data(1, &path_args).unwrap();
@@ -1085,13 +1091,12 @@ mod tests {
             ids: vec!["tree".into(), "u1".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
 
         // Trigger data() first to populate the cache.
         let _ = tree_node.data(0, &path_args);
 
-        let header = tree_node.header(&path_args);
+        let header = tree_node.header(&path_args, &RenderContext { term_width: 80 });
         let joined = header.join("\n");
         assert!(joined.contains("hello"), "header should contain message text: {}", joined);
         assert!(joined.contains("world"), "header should contain full text: {}", joined);
@@ -1109,7 +1114,6 @@ mod tests {
             ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = tree_node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -1244,7 +1248,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
@@ -1273,7 +1276,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
@@ -1290,7 +1292,6 @@ mod tests {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
@@ -1313,7 +1314,6 @@ mod tests {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
@@ -1336,7 +1336,6 @@ mod tests {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: "summarize the key decisions".into(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
@@ -1359,7 +1358,6 @@ mod tests {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
@@ -1428,9 +1426,8 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
-        let header = node.header(&path_args);
+        let header = node.header(&path_args, &RenderContext { term_width: 80 });
         assert!(!header.is_empty());
         assert!(header[0].contains("Manual"), "header mentions manual: {}", header[0]);
     }
@@ -1443,9 +1440,8 @@ mod tests {
             ids: vec![],
             suffix: "my custom prompt".into(),
             args: Default::default(),
-            term_width: 80,
         };
-        let header = node.header(&path_args);
+        let header = node.header(&path_args, &RenderContext { term_width: 80 });
         assert!(header.iter().any(|l| l.contains("my custom prompt")),
             "header should contain the prompt text: {:?}", header);
     }
@@ -1458,9 +1454,8 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
-        let header = node.header(&path_args);
+        let header = node.header(&path_args, &RenderContext { term_width: 80 });
         assert!(header.iter().any(|l| l.contains("default")),
             "header should mention default: {:?}", header);
     }
@@ -1496,7 +1491,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
         assert_eq!(resp.rows.len(), 6, "should have 6 visible entries");
@@ -1655,7 +1649,6 @@ mod tests {
             ids: vec!["tree".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
         eprintln!("=== DataResponse rows ===");
@@ -1804,7 +1797,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
 
@@ -1928,7 +1920,6 @@ mod tests {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let resp = tree_node.data(0, &path_args).unwrap();
         // Only 2 visible rows: user + assistant
@@ -1949,7 +1940,7 @@ mod tests {
         *shared.leaf_id.borrow_mut() = Some("msg-42".into());
         let mut node = CompactNode { shared: shared.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
     }
 
@@ -1959,7 +1950,7 @@ mod tests {
         // leaf_id is None (no session).
         let mut node = CompactNode { shared: shared.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, None);
     }
 
@@ -1969,7 +1960,7 @@ mod tests {
         let mut node = TreeCompactPromptNode::new(shared.clone());
         let path = vec!["tree".to_string(), "msg-1".to_string(),
                         "compact".to_string(), "prompt".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some(
             "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
         ));

@@ -5,8 +5,18 @@
 
 use crate::fields::Row;
 use crate::render::RenderPlan;
+use std::ops::Range;
 
 // --- Public types used by SlashDotNode implementors ---
+
+/// Rendering context threaded down `node_traverse` by reference. Carries
+/// display metrics the node needs for layout; not related to paths or
+/// path args (an app-level context may be added alongside later).
+#[derive(Debug, Clone, Copy)]
+pub struct RenderContext {
+    /// Terminal width (columns) for layout/formatting decisions.
+    pub term_width: usize,
+}
 
 /// Path arguments constructed by the engine from the prompt section and
 /// passed to `SlashDotNode` trait methods.
@@ -17,26 +27,73 @@ pub struct PathArgs {
     pub suffix: String,
     /// Parsed arguments from this level's section.
     pub args: Args,
-    // TODO: Drop this - it does not belong in PathArgs!
-    /// Terminal width (columns) for layout/formatting decisions.
-    pub term_width: usize,
 }
 
-/// Parsed arguments from a level's section.
+/// Parsed arguments from a level's section, as byte ranges indexing into
+/// [`PathArgs::suffix`] (no string copies).
+#[derive(Debug, Default)]
 pub struct Args {
-    /// Dot modifiers: `(key, raw_value)` pairs. Single-word values only.
-    pub modifiers: Vec<(String, String)>,
-    /// Positional tokens (non-modifier, non-selection words). These are
-    /// fuzzy search terms at listing level and positional parameters at
-    /// leaf level.
-    pub positional: Vec<String>,
+    /// Dot modifiers as `(key, value)` byte-range pairs into `suffix`.
+    /// A bare `.key` yields an empty value range.
+    pub modifiers: Vec<(Range<usize>, Range<usize>)>,
+    /// Positional tokens (non-modifier, non-selection words) as byte
+    /// ranges into `suffix`. Fuzzy search terms at listing level and
+    /// positional parameters at leaf level.
+    pub positional: Vec<Range<usize>>,
 }
 
-impl Default for Args {
-    fn default() -> Self {
-        Args {
-            modifiers: Vec::new(),
-            positional: Vec::new(),
+impl PathArgs {
+    /// Convenience constructor (mainly for tests / manual construction).
+    pub fn new(ids: Vec<String>, suffix: impl Into<String>) -> Self {
+        PathArgs {
+            ids,
+            suffix: suffix.into(),
+            args: Args::default(),
+        }
+    }
+
+    /// Positional args as string slices into `suffix`.
+    pub fn positional(&self) -> impl Iterator<Item = &str> + '_ {
+        self.args
+            .positional
+            .iter()
+            .map(move |r| &self.suffix[r.clone()])
+    }
+
+    /// Dot-modifier `(key, value)` pairs as string slices into `suffix`.
+    /// The value is empty for a bare `.key`.
+    pub fn modifiers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.args.modifiers.iter().map(move |(k, v)| {
+            (
+                &self.suffix[k.clone()],
+                &self.suffix[v.clone()],
+            )
+        })
+    }
+
+    /// The full prompt for the host: `ids` joined, then `suffix`.
+    ///
+    /// Mirrors the old free `full_prompt()` — an empty suffix yields the
+    /// joined ids alone; a suffix starting with a space is concatenated
+    /// directly (the space comes from the drill), otherwise a separator
+    /// space is inserted.
+    pub fn full_prompt(&self) -> String {
+        self.prompt_with(&self.suffix)
+    }
+
+    /// Like [`full_prompt`](Self::full_prompt) but with a replacement
+    /// suffix (Esc rewrites, leaf value rewrites, etc.).
+    pub fn prompt_with(&self, suffix: &str) -> String {
+        if self.ids.is_empty() {
+            return suffix.to_string();
+        }
+        let base = self.ids.join(" ");
+        if suffix.is_empty() {
+            base
+        } else if suffix.starts_with(' ') {
+            format!("{}{}", base, suffix)
+        } else {
+            format!("{} {}", base, suffix)
         }
     }
 }
@@ -121,7 +178,12 @@ pub trait SlashDotNode {
 
     /// Non-selectable header lines (replaces v2 DetailProvider).
     /// Default: empty. The engine truncates based on terminal size.
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    /// `render_ctx` carries display metrics (terminal width) for layout.
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         Vec::new()
     }
 
@@ -143,25 +205,19 @@ pub trait SlashDotNode {
 
     /// Optional prompt rewrite on drill. Called when a parent listing
     /// drills into this node (user presses Tab or Enter on a parent
-    /// selection).
+    /// selection), before data refresh and parse.
     ///
     /// Returns `Some(new_full_prompt)` to replace the current prompt
     /// and restart traversal from root, or `None` for default behavior
     /// (listing: show listing; leaf: submit on Enter drill).
-    ///
-    /// `path` is the node's position in the tree (e.g. `["compact"]`).
-    /// `prompt_suffix` is the raw prompt section after the parent's
-    /// matched ID.
+    /// Use [`PathArgs::full_prompt`] / [`PathArgs::prompt_with`] to
+    /// build the rewritten prompt from `path_args.ids`.
     ///
     /// `&mut self` provides full access to shared state (e.g.
     /// `MenuShared` for session tree queries, settings for pre-fills).
     ///
     /// **Default:** `None` — no rewrite.
-    fn drill_rewrite(
-        &mut self,
-        _path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
+    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         None
     }
 }
@@ -259,7 +315,11 @@ impl SlashDotNode for StaticListingNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         self.header_lines.clone()
     }
 

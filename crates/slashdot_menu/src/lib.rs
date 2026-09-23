@@ -36,7 +36,7 @@ pub mod accept;
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle, SlashDotMenuNode};
 pub use node_entry::HostKey;
-pub use node_impl::{SlashDotNode, MenuResult, PathArgs, Args, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
+pub use node_impl::{SlashDotNode, MenuResult, PathArgs, Args, RenderContext, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
 pub use provider::ColumnDef;
 pub use render::LogicalLine;
 pub use table::{Align, Table};

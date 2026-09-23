@@ -32,7 +32,7 @@
 
 use crate::node_entry::NodeEntry;
 use crate::node_entry::HostKey;
-use crate::node_impl::{MenuResult, SlashDotNode};
+use crate::node_impl::{MenuResult, RenderContext, SlashDotNode};
 
 /// A node in the menu tree. Wraps the internal `NodeEntry` with a
 /// minimal public API: `new()` to create a node, `add_child()` to
@@ -110,9 +110,11 @@ pub struct SlashDotHandle<'a> {
 
 impl<'a> SlashDotHandle<'a> {
     /// Evaluate a prompt with a key event. `term_width` is the current
-    /// terminal width in columns, used for table column layout.
+    /// terminal width in columns; it is packaged into a [`RenderContext`]
+    /// and threaded through the traversal by reference.
     pub fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
+        let render_ctx = RenderContext { term_width };
         self.root
-            .node_traverse(self.epoch, key, Vec::new(), prompt, term_width)
+            .node_traverse(self.epoch, key, Vec::new(), prompt, &render_ctx)
     }
 }

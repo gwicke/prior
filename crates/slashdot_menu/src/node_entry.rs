@@ -7,13 +7,14 @@ use std::rc::Rc;
 
 use crate::fields::{row_field_value, FieldSpace};
 use crate::filter::compile_query;
-use crate::grammar::{parse_dot_token, ModifierToken};
+use crate::grammar::ModifierToken;
 use crate::node_impl::{
-    Args, MenuResult, PathArgs, SubmitResult,
+    MenuResult, PathArgs, RenderContext, SubmitResult,
     SlashDotNode,
 };
 use crate::render::{LogicalLine, RenderPlan};
 use crate::value::Value;
+use std::ops::Range;
 
 /// Simplified key events the host sends to the engine.
 pub enum HostKey {
@@ -116,8 +117,6 @@ struct EpochState {
     should_restore_view_args: bool,
     /// Confirm dialog pending (§9).
     confirm_pending: bool,
-    /// Terminal width for table layout (set per node_traverse call).
-    term_width: usize,
 }
 
 impl Default for EpochState {
@@ -129,7 +128,6 @@ impl Default for EpochState {
             view_args: String::new(),
             should_restore_view_args: false,
             confirm_pending: false,
-            term_width: 80,
         }
     }
 }
@@ -258,66 +256,65 @@ impl NodeEntry {
     /// `path` is the accumulated drill IDs (passed by value for cheap clone
     /// on drill). `prompt_suffix` is this node's section of the prompt
     /// (everything after the parent's matched ID, or the full prompt at root).
+    /// `render_ctx` carries display metrics (threaded by reference).
     pub fn node_traverse(
         &mut self,
         epoch: u64,
         key: HostKey,
-        mut path: Vec<String>,
+        path: Vec<String>,
         prompt_suffix: &str,
-        term_width: usize,
+        render_ctx: &RenderContext,
     ) -> MenuResult {
         // Phase 0: Epoch gate — reset per-node epoch state on new activation.
         if epoch != self.cache_epoch {
             self.epoch = EpochState::default();
             self.cache_epoch = epoch;
         }
-        self.epoch.term_width = term_width;
+
+        // Materialize this level's PathArgs by value: `ids` moved in,
+        // `suffix` copied once. Everything downstream borrows this local.
+        let path_args = PathArgs::new(path, prompt_suffix);
 
         // Phase 0.5: Drill rewrite — if the parent drilled into us
         // (DrillEnter / DrillTab), let the node optionally rewrite the
-        // prompt and restart from root.
+        // prompt and restart from root. Runs before refresh: at drill
+        // time the suffix is " " and needs no row data.
         if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
-            if let Some(new_prompt) = self.inner.drill_rewrite(&path, prompt_suffix) {
-                return MenuResult::Continue(
-                    RenderPlan::default(),
-                    new_prompt,
-                );
+            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args) {
+                return MenuResult::Continue(RenderPlan::default(), new_prompt);
             }
         }
 
-        // Phase 1: Parse section (single parse pass).
-        let trailing_space = prompt_suffix.ends_with(' ');
-        let parsed = parse_section(prompt_suffix, &self.content.row_index);
+        // Phase 1: Refresh data from children — `row_index` is fresh
+        // for the single parse pass below (no re-parse needed).
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
 
-        // Phase 2: Refresh data from children.
-        let refresh_err = self.refresh_data(epoch, &path, prompt_suffix);
-        // If refresh rebuilt row_index, re-parse since IDs may have changed.
-        // (Only matters on first call of a new epoch when row_index was
-        // stale, or when dynamic data changes between calls.)
-        let parsed = if refresh_err {
-            parse_section(prompt_suffix, &self.content.row_index)
-        } else {
-            parsed
-        };
+        // Phase 2: Parse section — fills `path_args.args` with byte
+        // ranges into its own suffix; wraps it for dispatch.
+        let parsed = parse_section(path_args, &self.content.row_index);
+        let trailing_space = parsed.path_args.suffix.ends_with(' ');
 
         // Phase 3: Restore trigger (§5.1 step 1 — applies without Esc).
-        if let Some((ref matched_id, _child_idx)) = parsed.matched_child {
+        if let Some(ref id_range) = parsed.matched_id {
             if parsed.tail.is_empty()
                 && !trailing_space
                 && self.epoch.should_restore_view_args
             {
                 // Undo the drill: seed cursor on the matched ID's row,
                 // replace the bare ID with stored view_args.
+                let matched_word = parsed.path_args.suffix[id_range.clone()].to_string();
                 let restore_to = self.epoch.view_args.clone();
                 self.epoch.should_restore_view_args = false;
-                // Seed cursor on the matched ID row.
-                self.epoch.cursor_id = Some(matched_id.clone());
-                self.seed_cursor_idx_on_id(matched_id);
+                self.epoch.cursor_id = Some(matched_word.clone());
+                self.seed_cursor_idx_on_id(&matched_word);
                 // Build view from restored section.
-                let restore_args = parse_section(&restore_to, &self.content.row_index);
+                let restore_args = parse_section(
+                    PathArgs::new(parsed.path_args.ids.clone(), restore_to.clone()),
+                    &self.content.row_index,
+                );
                 self.ensure_view(epoch, &restore_args, &restore_to);
-                let plan = self.build_render_plan(&path, &restore_to);
-                return MenuResult::Continue(plan, full_prompt(&path, &restore_to));
+                let plan = self.build_render_plan(&restore_args.path_args, render_ctx);
+                return MenuResult::Continue(plan, restore_args.path_args.full_prompt());
             }
         }
 
@@ -325,21 +322,26 @@ impl NodeEntry {
 
         // Leaf node (no children).
         if self.children.is_empty() {
-            return self.handle_leaf(epoch, key, &parsed, trailing_space, &path, prompt_suffix);
+            return self.handle_leaf(epoch, key, &parsed, render_ctx);
         }
 
         // Listing node: matched child with non-empty tail → recurse.
         // Forward key as-is; the child handles Enter (drill) vs
         // DrillEnter/DrillTab (stop recursion) at its own listing/leaf level.
-        if let Some((ref _matched_id, child_idx)) = parsed.matched_child {
+        if let Some(ref id_range) = parsed.matched_id {
             if !parsed.tail.is_empty() {
-                path.push(_matched_id.clone());
-                return self.children[child_idx].node_traverse(
+                // The child gets a fresh `path` vector (parent ids +
+                // matched ID, both by value) and borrows the tail slice
+                // out of this level's suffix — no string copy for the tail.
+                let mut child_path = parsed.path_args.ids.clone();
+                child_path.push(parsed.path_args.suffix[id_range.clone()].to_string());
+                let child_suffix = &parsed.path_args.suffix[parsed.tail.clone()];
+                return self.children[parsed.child_idx].node_traverse(
                     epoch,
                     key,
-                    path,
-                    &parsed.tail,
-                    term_width,
+                    child_path,
+                    child_suffix,
+                    render_ctx,
                 );
             }
             // Matched child, empty tail, no restore → bare ID render (§2.5).
@@ -347,7 +349,7 @@ impl NodeEntry {
         }
 
         // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, trailing_space, &path, prompt_suffix, term_width)
+        self.handle_listing(epoch, key, &parsed, render_ctx)
     }
 
     // --- Leaf handling ---
@@ -357,34 +359,28 @@ impl NodeEntry {
         epoch: u64,
         key: HostKey,
         parsed: &ParsedSection,
-        trailing_space: bool,
-        path: &[String],
-        prompt_suffix: &str,
+        render_ctx: &RenderContext,
     ) -> MenuResult {
+        let pa = &parsed.path_args;
         match key {
             HostKey::Enter | HostKey::DrillEnter => {
-                // eprintln!("In leaf enter");
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
                     self.epoch.confirm_pending = false;
-                    let path_args = build_path_args(path, parsed, prompt_suffix, self.epoch.term_width);
-                    match self.inner.submit(epoch, &path_args) {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
+                    match self.inner.submit(epoch, pa) {
+                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::NewPath(p) => MenuResult::Continue(
                             RenderPlan::default(),
                             p,
                         ),
-                        SubmitResult::Prepared => {
-                            self.build_continue(path, prompt_suffix)
-                        }
+                        SubmitResult::Prepared => Self::build_continue(pa),
                     }
                 } else {
-                    let path_args = build_path_args(path, parsed, prompt_suffix, self.epoch.term_width);
-                    match self.inner.prepare(epoch, &path_args) {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, full_prompt(path, prompt_suffix)),
+                    match self.inner.prepare(epoch, pa) {
+                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::Prepared => {
                             self.epoch.confirm_pending = true;
-                            self.build_continue(path, prompt_suffix)
+                            Self::build_continue(pa)
                         }
                         SubmitResult::NewPath(p) => MenuResult::Continue(
                             RenderPlan::default(),
@@ -397,17 +393,17 @@ impl NodeEntry {
                 if self.epoch.confirm_pending {
                     // Cancel confirm dialog.
                     self.epoch.confirm_pending = false;
-                    self.build_continue(path, prompt_suffix)
+                    Self::build_continue(pa)
                 } else {
-                    self.handle_esc(path, parsed, trailing_space, prompt_suffix)
+                    Self::handle_esc(parsed)
                 }
             }
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
-                let plan = self.plan_from_cache(path, prompt_suffix);
-                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
+                let plan = self.plan_from_cache(pa, render_ctx);
+                MenuResult::Continue(plan, pa.full_prompt())
             }
-            _ => self.build_continue(path, prompt_suffix),
+            _ => Self::build_continue(pa),
         }
     }
 
@@ -418,19 +414,12 @@ impl NodeEntry {
         epoch: u64,
         key: HostKey,
         parsed: &ParsedSection,
-        trailing_space: bool,
-        path: &[String],
-        prompt_suffix: &str,
-        term_width: usize,
+        render_ctx: &RenderContext,
     ) -> MenuResult {
-        // View args = everything before the matched tail (or entire section).
-        let view_args_clean = if parsed.matched_child.is_some() {
-            prompt_suffix[..prompt_suffix.len() - parsed.tail.len()]
-                .trim_end()
-                .to_string()
-        } else {
-            prompt_suffix.trim_end().to_string()
-        };
+        let pa = &parsed.path_args;
+        // View args = everything before the matched tail (or entire
+        // section when unmatched — `tail.start` is then the suffix end).
+        let view_args_clean = pa.suffix[..parsed.tail.start].trim_end().to_string();
 
         match key {
             HostKey::MoveCursor(delta) => {
@@ -446,89 +435,68 @@ impl NodeEntry {
                     }
                 }
                 self.epoch.cursor_user_moved = true;
-                let plan = self.plan_from_cache(path, prompt_suffix);
-                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
+                let plan = self.plan_from_cache(pa, render_ctx);
+                MenuResult::Continue(plan, pa.full_prompt())
             }
-            HostKey::Tab => {
+            HostKey::Tab | HostKey::Enter => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
                 let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return self.build_continue(path, prompt_suffix);
+                    return Self::build_continue(pa);
                 };
                 let child_idx = match self.content.row_index.get(&active_id) {
                     Some(&idx) => idx as usize,
-                    None => return self.build_continue(path, prompt_suffix),
+                    None => return Self::build_continue(pa),
                 };
                 self.epoch.view_args = view_args_clean;
                 self.epoch.should_restore_view_args = true;
-                let mut new_path = path.to_vec();
-                new_path.push(active_id.clone());
-                // Listing drill: forward DrillTab to child.
+                let mut new_path = pa.ids.clone();
+                new_path.push(active_id);
+                // Listing drill: Tab forwards DrillTab, Enter forwards
+                // DrillEnter — leaf nodes submit on DrillEnter (unless
+                // drill_rewrite intercepts), listing nodes ignore both.
+                let drill_key = if matches!(key, HostKey::Tab) {
+                    HostKey::DrillTab
+                } else {
+                    HostKey::DrillEnter
+                };
                 self.children[child_idx].node_traverse(
                     epoch,
-                    HostKey::DrillTab,
+                    drill_key,
                     new_path,
                     " ",
-                    term_width,
+                    render_ctx,
                 )
             }
-            HostKey::Enter => {
-                self.ensure_view(epoch, parsed, &view_args_clean);
-                let Some(active_id) = self.cursor_id_or_fallback() else {
-                    return self.build_continue(path, prompt_suffix);
-                };
-                let child_idx = match self.content.row_index.get(&active_id) {
-                    Some(&idx) => idx as usize,
-                    None => return self.build_continue(path, prompt_suffix),
-                };
-                self.epoch.view_args = view_args_clean;
-                self.epoch.should_restore_view_args = true;
-                let mut new_path = path.to_vec();
-                new_path.push(active_id.clone());
-                // Listing drill: forward DrillEnter to child — leaf
-                // nodes submit on DrillEnter (unless drill_rewrite
-                // intercepts), listing nodes ignore it.
-                self.children[child_idx].node_traverse(
-                    epoch,
-                    HostKey::DrillEnter,
-                    new_path,
-                    " ",
-                    term_width,
-                )
-            }
-            HostKey::Esc => {
-                self.handle_esc(path, parsed, trailing_space, prompt_suffix)
-            }
+            HostKey::Esc => Self::handle_esc(parsed),
             _ => {
                 self.ensure_view(epoch, parsed, &view_args_clean);
-                let plan = self.build_render_plan(path, prompt_suffix);
-                MenuResult::Continue(plan, full_prompt(path, prompt_suffix))
+                let plan = self.build_render_plan(pa, render_ctx);
+                MenuResult::Continue(plan, pa.full_prompt())
             }
         }
     }
 
     // --- Esc ladder (§5.1) ---
 
-    fn handle_esc(
-        &mut self,
-        path: &[String],
-        parsed: &ParsedSection,
-        trailing_space: bool,
-        prompt_suffix: &str,
-    ) -> MenuResult {
+    fn handle_esc(parsed: &ParsedSection) -> MenuResult {
+        let pa = &parsed.path_args;
         // Step 2: clear refinement — terms, modifiers, selection dropped.
-        if !parsed.positional.is_empty() || !parsed.modifiers.is_empty() || parsed.matched_child.is_some() {
+        if !pa.args.positional.is_empty()
+            || !pa.args.modifiers.is_empty()
+            || parsed.matched()
+        {
             // Rewrite section to just the parent path (no terms/modifiers/selection).
-            return MenuResult::Continue(RenderPlan::default(), full_prompt(path, ""));
+            return MenuResult::Continue(RenderPlan::default(), pa.prompt_with(""));
         }
 
         // Step 3: strip trailing space → parent becomes responsible.
-        if trailing_space {
-            let trimmed = prompt_suffix.trim_end().to_string();
-            return MenuResult::Continue(RenderPlan::default(), full_prompt(path, &trimmed));
+        if pa.suffix.ends_with(' ') {
+            let trimmed = pa.suffix.trim_end();
+            return MenuResult::Continue(RenderPlan::default(), pa.prompt_with(trimmed));
         }
 
         // Step 4: nothing left at this level → close.
-        MenuResult::DoneSuccess(None, full_prompt(path, prompt_suffix))
+        MenuResult::DoneSuccess(None, pa.full_prompt())
     }
 
     // --- Data refresh ---
@@ -540,18 +508,17 @@ impl NodeEntry {
     /// path for parent→child data access (design §3.2). It may augment
     /// the response (e.g. value forwarding). Bypassing it breaks the
     /// encapsulation that `NodeEntry` provides over `SlashDotNode`.
-    fn refresh_data(&mut self, epoch: u64, path: &[String], suffix: &str) -> bool {
+    fn refresh_data(&mut self, epoch: u64, path: &[String], tail: &str) -> bool {
+        // Children's `data()` receives this node's path + tail; this
+        // node's `Args` are irrelevant to them (they describe *this*
+        // node's section only) — hence two plain slices, not `&PathArgs`.
+        let path_args = PathArgs::new(path.to_vec(), tail);
         let mut changed = false;
         let mut new_data: Vec<Option<Rc<crate::node_impl::DataResponse>>> =
             Vec::with_capacity(self.children.len());
 
         for (i, child) in self.children.iter_mut().enumerate() {
-            let path_args = PathArgs {
-                ids: path.to_vec(),
-                suffix: suffix.to_string(),
-                args: Args::default(),
-                term_width: self.epoch.term_width,
-            };
+            // One shared `&PathArgs` for every child — built once above.
             match child.node_data(epoch, &path_args) {
                 Ok(response) => {
                     let same = match self.content.data_rc.get(i) {
@@ -627,10 +594,10 @@ impl NodeEntry {
         // on parent comes in step 5).
         let field_space = self.field_space();
 
-        // Step 1: Filter by modifiers.
+        // Step 1: Filter by modifiers (sliced from suffix via ranges).
         let modifier_tokens: Vec<ModifierToken> = parsed
-            .modifiers
-            .iter()
+            .path_args
+            .modifiers()
             .map(|(k, v)| ModifierToken {
                 key: k.to_string(),
                 value: v.to_string(),
@@ -679,7 +646,7 @@ impl NodeEntry {
             .collect();
 
         // Step 2: Fuzzy rank by positional terms.
-        let terms = parsed.positional.join(" ");
+        let terms = parsed.path_args.positional().collect::<Vec<_>>().join(" ");
         let mut ranked: Vec<RowRef> = crate::cursor::rank_row_refs(&filtered, &terms, None)
             .rows;
 
@@ -754,9 +721,9 @@ impl NodeEntry {
 
         // Re-seed: selection (if any) → first active → row 0.
         self.epoch.cursor_id = parsed
-            .matched_child
+            .matched_id
             .as_ref()
-            .map(|(id, _)| id.clone())
+            .map(|r| parsed.path_args.suffix[r.clone()].to_string())
             .or_else(|| self.content.active_ids.iter().next().cloned())
             .or_else(|| {
                 self.content
@@ -832,8 +799,8 @@ impl NodeEntry {
         FieldSpace::new(specs)
     }
 
-    fn build_continue(&self, path: &[String], prompt_suffix: &str) -> MenuResult {
-        MenuResult::Continue(RenderPlan::default(), full_prompt(path, prompt_suffix))
+    fn build_continue(path_args: &PathArgs) -> MenuResult {
+        MenuResult::Continue(RenderPlan::default(), path_args.full_prompt())
     }
 
     // --- Render plan construction (§5) ---
@@ -848,7 +815,7 @@ impl NodeEntry {
     ///
     /// The host uses `sticky_count` to decide vertical truncation when
     /// the terminal is too short for all sticky + data lines.
-    fn build_render_plan(&mut self, path: &[String], suffix: &str) -> RenderPlan {
+    fn build_render_plan(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> RenderPlan {
         // Pre-compute: do we have data rows and table columns?
         let has_data = !self.content.ranked_rows.is_empty();
         let columns = self.inner.columns();
@@ -858,19 +825,13 @@ impl NodeEntry {
             && columns.iter().any(|c| !c.header.is_empty());
 
         // 1. Header lines from the node's header() method → detail.
-        let path_args = PathArgs {
-            ids: path.to_vec(),
-            suffix: suffix.to_string(),
-            args: Args::default(),
-            term_width: self.epoch.term_width,
-        };
-        let header = self.inner.header(&path_args);
+        let header = self.inner.header(path_args, render_ctx);
         let detail: Vec<LogicalLine> = header.into_iter()
             .map(LogicalLine::new)
             .collect();
 
         // 2. Table header + data rows.
-        let term_width: usize = self.epoch.term_width;
+        let term_width: usize = render_ctx.term_width;
         let mut table_header_line: Option<LogicalLine> = None;
         let row_lines: Vec<LogicalLine>;
         {
@@ -965,14 +926,8 @@ impl NodeEntry {
 
     /// Cursor-move fast path: reuse cached table_header + rows Rc,
     /// recompute detail (may depend on focused row) and selected/active.
-    fn plan_from_cache(&mut self, path: &[String], suffix: &str) -> RenderPlan {
-        let path_args = PathArgs {
-            ids: path.to_vec(),
-            suffix: suffix.to_string(),
-            args: Args::default(),
-            term_width: self.epoch.term_width,
-        };
-        let detail: Vec<LogicalLine> = self.inner.header(&path_args).into_iter()
+    fn plan_from_cache(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> RenderPlan {
+        let detail: Vec<LogicalLine> = self.inner.header(path_args, render_ctx).into_iter()
             .map(LogicalLine::new)
             .collect();
 
@@ -994,111 +949,102 @@ impl NodeEntry {
 
 // --- Section parsing (single parse pass, §2.1) ---
 
-/// Result of parsing a prompt section.
+/// Result of parsing a prompt section: the level's [`PathArgs`] (ids +
+/// owned suffix + range-based args) plus the matched child / tail.
+///
+/// The new parser is the source of truth for v2.5: it records byte
+/// ranges into `path_args.suffix` instead of copying strings.
 struct ParsedSection {
-    /// Dot modifiers: (key, raw_value) pairs. Owned strings.
-    modifiers: Vec<(String, String)>,
-    /// Positional tokens (fuzzy terms / leaf args).
-    positional: Vec<String>,
-    /// Matched child: (row_id, child_index) if a word matched a row ID.
-    matched_child: Option<(String, usize)>,
-    /// Everything after the matched child's word (including leading space).
-    tail: String,
+    /// The level's path args (args filled by this parse).
+    path_args: PathArgs,
+    /// Byte range of the matched child ID within `path_args.suffix`.
+    /// `None` = no child matched — this is the "matched?" boolean
+    /// (`.is_some()`), as requested of the parse result.
+    matched_id: Option<Range<usize>>,
+    /// Child index for the matched ID (valid only when `matched_id`
+    /// is `Some`).
+    child_idx: usize,
+    /// The child's section within `path_args.suffix`. Empty when no
+    /// child matched (`start == suffix.len()`) or when the matched ID
+    /// is the last token (bare-ID / restore checks).
+    tail: Range<usize>,
+}
+
+impl ParsedSection {
+    /// Whether a child row ID matched in this section.
+    fn matched(&self) -> bool {
+        self.matched_id.is_some()
+    }
 }
 
 /// Parse a prompt section one word at a time (single pass, §2.1).
 ///
-/// Words are classified left-to-right:
-/// - `.key:value` or `.key` → modifier
-/// - word in row_index → matched child (section terminates)
-/// - otherwise → positional (fuzzy term)
+/// Fills `path_args.args` with byte ranges into `path_args.suffix`:
+/// - `.key:value` / `.key` → modifier ranges (no string copies)
+/// - word in `row_index` → matched child (section terminates)
+/// - otherwise → positional (fuzzy term) range
 ///
-/// The first word matching a row ID terminates the section; everything
-/// after it is the `tail` for the child.
-fn parse_section(section: &str, row_index: &HashMap<String, u16>) -> ParsedSection {
-    let mut modifiers: Vec<(String, String)> = Vec::new();
-    let mut positional: Vec<String> = Vec::new();
-    let mut matched_child: Option<(String, usize)> = None;
-    let mut pos = 0;
+/// The first word matching a row ID terminates the section; `tail`
+/// covers everything after it (including the leading space).
+fn parse_section(
+    mut path_args: PathArgs,
+    row_index: &HashMap<String, u16>,
+) -> ParsedSection {
+    let suffix_len = path_args.suffix.len();
+    let mut matched_id: Option<Range<usize>> = None;
+    let mut child_idx = 0usize;
+    let mut pos = 0usize;
 
-    while pos < section.len() {
+    while pos < suffix_len {
         // Skip whitespace.
-        while pos < section.len() && section.as_bytes()[pos] == b' ' {
+        while pos < suffix_len && path_args.suffix.as_bytes()[pos] == b' ' {
             pos += 1;
         }
-        if pos >= section.len() {
+        if pos >= suffix_len {
             break;
         }
 
         // Find end of word.
         let start = pos;
-        while pos < section.len() && section.as_bytes()[pos] != b' ' {
+        while pos < suffix_len && path_args.suffix.as_bytes()[pos] != b' ' {
             pos += 1;
         }
-        let word = &section[start..pos];
+        let word = &path_args.suffix[start..pos];
 
         // Check if this word is a row ID.
-        if let Some(&child_idx) = row_index.get(word) {
-            matched_child = Some((word.to_string(), child_idx as usize));
+        if let Some(&idx) = row_index.get(word) {
+            matched_id = Some(start..pos);
+            child_idx = idx as usize;
             break;
         }
 
-        // Check if dot modifier.
-        if let Some(dot) = parse_dot_token(word) {
-            match dot {
-                crate::grammar::DotToken::Key(key) => {
-                    modifiers.push((key, String::new()));
+        // Dot modifier: `.key` or `.key:value` (first colon splits).
+        // Classified by range arithmetic over the word — no allocations
+        // (grammar.rs serves the v2.0 interpreter only).
+        if word.as_bytes()[0] == b'.' {
+            match word.find(':') {
+                Some(c) => {
+                    // c is relative to `word`; shift to absolute offsets.
+                    path_args.args.modifiers.push((
+                        start + 1..start + c,
+                        start + c + 1..pos,
+                    ));
                 }
-                crate::grammar::DotToken::NameValue { key, value } => {
-                    modifiers.push((key, value));
+                None => {
+                    // Bare `.key` — empty value range at the word end.
+                    path_args.args.modifiers.push((start + 1..pos, pos..pos));
                 }
             }
         } else {
-            positional.push(word.to_string());
+            path_args.args.positional.push(start..pos);
         }
     }
-
-    let tail = match &matched_child {
-        Some(_) => section[pos..].to_string(),
-        None => String::new(),
-    };
 
     ParsedSection {
-        modifiers,
-        positional,
-        matched_child,
-        tail,
-    }
-}
-
-/// Build PathArgs for a leaf node's prepare/submit call.
-fn build_path_args(path: &[String], parsed: &ParsedSection, suffix: &str, term_width: usize) -> PathArgs {
-    PathArgs {
-        ids: path.to_vec(),
-        suffix: suffix.to_string(),
-        args: Args {
-            modifiers: parsed.modifiers.clone(),
-            positional: parsed.positional.clone(),
-        },
-        term_width,
-    }
-}
-
-/// Construct the full prompt for the host from the drilled path and
-/// the current level's suffix. For the root (empty path), this is
-/// just the suffix.
-fn full_prompt(path: &[String], suffix: &str) -> String {
-    if path.is_empty() {
-        suffix.to_string()
-    } else {
-        let base = path.join(" ");
-        if suffix.is_empty() {
-            base
-        } else if suffix.starts_with(' ') {
-            format!("{}{}", base, suffix)
-        } else {
-            format!("{} {}", base, suffix)
-        }
+        path_args,
+        matched_id,
+        child_idx,
+        tail: pos..suffix_len,
     }
 }
 
@@ -1165,11 +1111,10 @@ mod tests {
         fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() = Some(
                 path_args
-                    .args
-                    .positional
-                    .first()
-                    .cloned()
-                    .unwrap_or_default(),
+                    .positional()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
             );
             SubmitResult::Done(None)
         }
@@ -1181,7 +1126,11 @@ mod tests {
     }
 
     impl SlashDotNode for HeaderLeaf {
-        fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        fn header(
+            &mut self,
+            _path_args: &PathArgs,
+            _render_ctx: &RenderContext,
+        ) -> Vec<String> {
             vec![self.text.clone()]
         }
 
@@ -1217,11 +1166,16 @@ mod tests {
 
     fn ep() -> u64 { 1 }
 
+    /// Test render context: 80 columns.
+    fn rctx() -> RenderContext {
+        RenderContext { term_width: 80 }
+    }
+
     #[test]
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "");
@@ -1239,7 +1193,7 @@ mod tests {
     fn fuzzy_filter_at_root() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1255,7 +1209,7 @@ mod tests {
     fn bare_id_shows_parent_listing() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", &rctx());
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "alpha");
@@ -1270,8 +1224,8 @@ mod tests {
     fn tab_drills_into_child() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(_, prompt) => assert_eq!(prompt, "alpha "),
             other => panic!("expected Continue, got {:?}", other),
@@ -1282,13 +1236,13 @@ mod tests {
     fn move_cursor_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
         root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(1)),
             other => panic!("expected Continue, got {:?}", other),
         }
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1299,17 +1253,17 @@ mod tests {
     fn move_cursor_clamps_not_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
         root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         // Move past last row: should clamp to last, not wrap to 0.
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", 80);
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", &rctx());
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(2)),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Move before first row: should clamp to 0, not wrap.
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", 80);
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", &rctx());
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1323,7 +1277,7 @@ mod tests {
             CmdNode::with_active("b", "b"),
         ]);
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.active_rows, vec![1]);
@@ -1336,7 +1290,7 @@ mod tests {
     fn esc_at_root_closes() {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", &rctx());
         assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
     }
 
@@ -1353,7 +1307,11 @@ mod tests {
                 active_ids: Vec::new(),
             }))
         }
-        fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        fn header(
+            &mut self,
+            _path_args: &PathArgs,
+            _render_ctx: &RenderContext,
+        ) -> Vec<String> {
             vec![self.header_text.clone()]
         }
     }
@@ -1367,7 +1325,7 @@ mod tests {
         // Give it a child so it's a listing node (not a leaf).
         root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let headers: Vec<&str> = plan.detail.iter().map(|l| l.0.as_str())
@@ -1380,51 +1338,87 @@ mod tests {
 
     // --- Section parse tests ---
 
+    /// Parse a suffix with empty ids (tests only).
+    fn parse(section: &str, row_index: &HashMap<String, u16>) -> ParsedSection {
+        parse_section(PathArgs::new(Vec::new(), section), row_index)
+    }
+
+    /// Modifier (key, value) pairs as owned strings.
+    fn mods(p: &ParsedSection) -> Vec<(String, String)> {
+        p.path_args
+            .modifiers()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Positional tokens as owned strings.
+    fn pos(p: &ParsedSection) -> Vec<String> {
+        p.path_args.positional().map(str::to_string).collect()
+    }
+
+    /// The matched child ID as an owned string.
+    fn matched_id(p: &ParsedSection) -> Option<String> {
+        p.matched_id
+            .as_ref()
+            .map(|r| p.path_args.suffix[r.clone()].to_string())
+    }
+
+    /// The child tail as an owned string.
+    fn tail(p: &ParsedSection) -> String {
+        p.path_args.suffix[p.tail.clone()].to_string()
+    }
+
     #[test]
     fn parse_empty_section() {
         let ri = HashMap::new();
-        let p = parse_section("", &ri);
-        assert!(p.modifiers.is_empty());
-        assert!(p.positional.is_empty());
-        assert!(p.matched_child.is_none());
+        let p = parse("", &ri);
+        assert!(mods(&p).is_empty());
+        assert!(pos(&p).is_empty());
+        assert!(!p.matched());
     }
 
     #[test]
     fn parse_modifiers_only() {
         let ri = HashMap::new();
-        let p = parse_section(".sort:price .tier:free", &ri);
-        assert_eq!(p.modifiers.len(), 2);
-        assert_eq!(p.modifiers[0].0, "sort");
-        assert_eq!(p.modifiers[0].1, "price");
-        assert_eq!(p.modifiers[1].0, "tier");
-        assert_eq!(p.modifiers[1].1, "free");
+        let p = parse(".sort:price .tier:free", &ri);
+        assert_eq!(
+            mods(&p),
+            vec![
+                ("sort".to_string(), "price".to_string()),
+                ("tier".to_string(), "free".to_string()),
+            ]
+        );
     }
 
     #[test]
     fn parse_positional_and_modifier_interleave() {
         let ri = HashMap::new();
-        let p = parse_section("fuzzy .sort:price more", &ri);
-        assert_eq!(p.positional, vec!["fuzzy", "more"]);
-        assert_eq!(p.modifiers.len(), 1);
-        assert_eq!(p.modifiers[0].0, "sort");
+        let p = parse("fuzzy .sort:price more", &ri);
+        assert_eq!(pos(&p), vec!["fuzzy", "more"]);
+        assert_eq!(
+            mods(&p),
+            vec![("sort".to_string(), "price".to_string())]
+        );
     }
 
     #[test]
     fn parse_matched_child_terminates() {
         let mut ri = HashMap::new();
         ri.insert("model".to_string(), 0);
-        let p = parse_section("model extra words", &ri);
-        assert_eq!(p.matched_child.as_ref().map(|(id, _)| id.as_str()), Some("model"));
-        assert_eq!(p.tail, " extra words");
-        assert!(p.positional.is_empty());
+        let p = parse("model extra words", &ri);
+        assert!(p.matched());
+        assert_eq!(matched_id(&p).as_deref(), Some("model"));
+        assert_eq!(tail(&p), " extra words");
+        assert!(pos(&p).is_empty());
     }
 
     #[test]
     fn parse_no_trailing_space_means_empty_tail() {
         let mut ri = HashMap::new();
         ri.insert("model".to_string(), 0);
-        let p = parse_section("model", &ri);
-        assert_eq!(p.matched_child.as_ref().map(|(id, _)| id.as_str()), Some("model"));
+        let p = parse("model", &ri);
+        assert!(p.matched());
+        assert_eq!(matched_id(&p).as_deref(), Some("model"));
         assert!(p.tail.is_empty());
     }
 
@@ -1432,19 +1426,17 @@ mod tests {
     fn parse_fuzzy_terms_before_id() {
         let mut ri = HashMap::new();
         ri.insert("model".to_string(), 0);
-        let p = parse_section("fuzzy model", &ri);
-        assert_eq!(p.positional, vec!["fuzzy"]);
-        assert_eq!(p.matched_child.as_ref().map(|(id, _)| id.as_str()), Some("model"));
+        let p = parse("fuzzy model", &ri);
+        assert_eq!(pos(&p), vec!["fuzzy"]);
+        assert_eq!(matched_id(&p).as_deref(), Some("model"));
         assert!(p.tail.is_empty());
     }
 
     #[test]
     fn bare_dot_modifier() {
         let ri = HashMap::new();
-        let p = parse_section(".sort", &ri);
-        assert_eq!(p.modifiers.len(), 1);
-        assert_eq!(p.modifiers[0].0, "sort");
-        assert_eq!(p.modifiers[0].1, "");
+        let p = parse(".sort", &ri);
+        assert_eq!(mods(&p), vec![("sort".to_string(), String::new())]);
     }
 
     // --- Epoch reset test ---
@@ -1453,11 +1445,11 @@ mod tests {
     fn epoch_reset_clears_cursor() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
         root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx());
         assert_eq!(root.epoch.cursor_idx, 1);
         // New epoch resets.
-        let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", &rctx());
         assert_eq!(root.epoch.cursor_idx, 0);
     }
 
@@ -1474,7 +1466,7 @@ mod tests {
         })));
         root.refresh_data(ep(), &[], "");
         // "first" is in m1's description but not a row ID → fuzzy filter.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_count = plan.rows.len();
@@ -1483,7 +1475,7 @@ mod tests {
             other => panic!("expected Continue, got {:?}", other),
         }
         // Esc on filtered view clears to empty (root close or clear).
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first", 80);
+        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first", &rctx());
         match result {
             MenuResult::Continue(_, _) | MenuResult::DoneSuccess(..) => {}
             other => panic!("expected Continue or DoneSuccess on Esc, got {:?}", other),
@@ -1503,7 +1495,7 @@ mod tests {
             ],
         })));
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1567,7 +1559,7 @@ mod tests {
         root.refresh_data(ep(), &[], "");
 
         // Both children's rows should appear in the listing.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1607,22 +1599,22 @@ mod tests {
         root.refresh_data(ep(), &[], "");
 
         // Tab on "add" → drills into add_cmd → shows "action" leaf row.
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         // Move cursor to "add" (it's first) and Tab.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Now at "add ", the add_cmd node shows its leaf child "action".
         // Tab into the leaf.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", 80);
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", &rctx());
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add action ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Enter on "add action " → submit.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", 80);
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", &rctx());
         match result {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -1643,7 +1635,7 @@ mod tests {
         root.refresh_data(ep(), &[], "");
 
         // "bind" fuzzy-matches both binding rows but not "add".
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1669,7 +1661,7 @@ mod tests {
         root.refresh_data(ep(), &[], "");
 
         // Only "valid" should appear.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1694,15 +1686,15 @@ mod tests {
             }))
         }
 
-        fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+        fn header(
+            &mut self,
+            _path_args: &PathArgs,
+            _render_ctx: &RenderContext,
+        ) -> Vec<String> {
             vec!["rename header".into()]
         }
 
-        fn drill_rewrite(
-            &mut self,
-            _path: &[String],
-            _prompt_suffix: &str,
-        ) -> Option<String> {
+        fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
             Some(format!("abc rename {}", self.prefill))
         }
     }
@@ -1723,7 +1715,7 @@ mod tests {
         root.refresh_data(ep(), &[], "");
         // User presses Enter at root listing → drills into "rename" leaf
         // with DrillEnter → leaf's drill_rewrite fires.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert!(plan.rows.is_empty(), "rewrite returns empty plan");
@@ -1737,7 +1729,7 @@ mod tests {
     fn drill_rewrite_fires_on_drill_tab() {
         let mut root = rewrite_root("TabFill");
         root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert!(plan.rows.is_empty());
@@ -1757,7 +1749,7 @@ mod tests {
         let result = root.node_traverse(
             ep(), HostKey::Enter,
             Vec::new(),
-            "rename ", 80,
+            "rename ", &rctx(),
         );
         match result {
             MenuResult::DoneSuccess(_, _) => {
@@ -1775,7 +1767,7 @@ mod tests {
         root.children.push(NodeEntry::new_child(Box::new(LeafNode::new())));
         root.refresh_data(ep(), &[], "");
         // User presses Enter at root → drills into leaf with DrillEnter.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", 80);
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx());
         match result {
             MenuResult::DoneSuccess(_, _) => { /* leaf submitted */ }
             other => panic!("expected DoneSuccess, got {:?}", other),

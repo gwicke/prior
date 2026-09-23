@@ -12,7 +12,8 @@ use std::rc::Rc;
 use crate::slash_menu_bridge::{AsyncOp, MenuShared};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult,
 };
 use crate::slashdot_menu::provider::ColumnDef;
 
@@ -210,11 +211,7 @@ impl SlashDotNode for SessionListingNode {
         session_fields()
     }
 
-    fn drill_rewrite(
-        &mut self,
-        _path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
+    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // On drill, add a default path filter to show only sessions
         // relevant to the current working directory.
         Some("session .path:.".to_string())
@@ -294,7 +291,7 @@ impl SlashDotNode for SessionListNode {
         session_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
+    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(session_id) = drilled_session_id(path_args) else {
             return vec!["Select a session, then choose an action.".to_string()];
         };
@@ -320,7 +317,7 @@ impl SlashDotNode for SessionListNode {
                 )
             });
 
-        let tw = path_args.term_width.max(1);
+        let tw = render_ctx.term_width.max(1);
 
         // --- Summary as a wrapping table ---
         let summary_text = format!(
@@ -403,7 +400,11 @@ impl SlashDotNode for SessionResumeNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Resume the session and replay the last N turns.".to_string(),
             "".to_string(),
@@ -438,7 +439,11 @@ impl SlashDotNode for SessionForkNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Fork this session into a new one in the current directory.".to_string(),
             "The new session starts with the same history.".to_string(),
@@ -467,7 +472,7 @@ impl SlashDotNode for SessionRenameNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs) -> Vec<String> {
+    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let current_name = action_session_id(path_args)
             .and_then(|sid| find_session(&self.shared, sid))
             .and_then(|m| m.name)
@@ -479,20 +484,17 @@ impl SlashDotNode for SessionRenameNode {
         ]
     }
 
-    fn drill_rewrite(
-        &mut self,
-        path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
-        // Pre-fill the current session name. path is
+    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+        // Pre-fill the current session name. ids are
         // ["session", "<uuid>", "rename"].
-        let sid = path.get(1).map(|s| s.as_str()).unwrap_or_default();
+        let sid = path_args.ids.get(1).map(|s| s.as_str()).unwrap_or_default();
         let current_name = find_session(&self.shared, sid)
             .and_then(|m| m.name)
             .unwrap_or_default();
         // Rebuild the full prompt: "session <uuid> rename <name>"
-        let prefix = path.join(" ");
-        Some(format!("{} {}", prefix, current_name))
+        // (leading space preserves the trailing-space behavior of the old
+        // `format!("{} {}", prefix, name)` for an empty name).
+        Some(path_args.prompt_with(&format!(" {}", current_name)))
     }
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -519,7 +521,11 @@ impl SlashDotNode for SessionDeleteNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Permanently delete this session and its history.".to_string(),
             "This action cannot be undone.".to_string(),
@@ -746,7 +752,6 @@ mod tests {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.data(1, &path_args).unwrap();
         assert!(
@@ -764,7 +769,6 @@ mod tests {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.data(1, &path_args).unwrap();
         assert_eq!(result.rows.len(), 1);
@@ -780,7 +784,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "resume".into()],
             suffix: " 10t ".to_string(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -801,7 +804,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "fork".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -821,7 +823,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: " my-name ".to_string(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -842,7 +843,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: "  ".to_string(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -863,7 +863,6 @@ mod tests {
             ids: vec!["session".into(), "test-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.prepare(1, &path_args);
         match result {
@@ -883,7 +882,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let result = node.prepare(1, &path_args);
         assert!(
@@ -900,7 +898,6 @@ mod tests {
             ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         let _ = node.submit(1, &path_args);
         let op = shared.pending_op.borrow();
@@ -942,7 +939,6 @@ mod tests {
             ids: vec!["session".into(), "uuid-1".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         assert_eq!(drilled_session_id(&listing), Some("uuid-1"));
         assert_eq!(action_session_id(&listing), Some("session"));
@@ -951,7 +947,6 @@ mod tests {
             ids: vec!["session".into(), "uuid-1".into(), "resume".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         assert_eq!(drilled_session_id(&action), Some("resume"));
         assert_eq!(action_session_id(&action), Some("uuid-1"));
@@ -961,14 +956,12 @@ mod tests {
             ids: vec!["session".into()],
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         assert_eq!(action_session_id(&short), None);
         let empty = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
-            term_width: 80,
         };
         assert_eq!(action_session_id(&empty), None);
         assert_eq!(drilled_session_id(&empty), None);
@@ -1038,7 +1031,7 @@ mod tests {
         use crate::slashdot_menu::node_impl::SlashDotNode;
         let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("session .path:.".to_string()));
     }
 
@@ -1049,7 +1042,7 @@ mod tests {
         let shared = make_shared();
         let mut node = SessionRenameNode { shared: shared.clone() };
         let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

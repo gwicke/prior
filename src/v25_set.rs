@@ -14,8 +14,8 @@ use crate::settings::{SettingKey, SettingsStore, SETTINGS, ValueKind};
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
-    StaticListingNode, StaticRow,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult, StaticListingNode, StaticRow,
 };
 
 // ---------------------------------------------------------------------------
@@ -85,21 +85,22 @@ impl SlashDotNode for SettingLeafNode {
         }
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
         let val = self.settings.borrow().value(self.key);
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
     }
 
-    fn drill_rewrite(
-        &mut self,
-        path: &[String],
-        _prompt_suffix: &str,
-    ) -> Option<String> {
-        // Pre-fill the current value. path is ["set", "<setting-name>"].
+    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+        // Pre-fill the current value. ids are ["set", "<setting-name>"].
+        // The leading space keeps the trailing-space behavior of the old
+        // `format!("{} {}", prefix, val)` (empty value → trailing space).
         let val = self.settings.borrow().value(self.key);
-        let prefix = path.join(" ");
-        Some(format!("{} {}", prefix, val))
+        Some(path_args.prompt_with(&format!(" {}", val)))
     }
 }
 
@@ -412,7 +413,7 @@ mod tests {
             settings: settings.clone(),
         };
         let path = vec!["set".to_string(), "tool_call_limit".to_string()];
-        let result = node.drill_rewrite(&path, " ");
+        let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("set tool_call_limit 50".to_string()));
     }
 }

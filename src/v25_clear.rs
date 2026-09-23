@@ -7,7 +7,8 @@ use std::rc::Rc;
 
 use crate::slash_menu_bridge::{AsyncOp, MenuShared};
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult,
 };
 
 pub struct ClearNode {
@@ -23,7 +24,11 @@ impl SlashDotNode for ClearNode {
         }))
     }
 
-    fn header(&mut self, _path_args: &PathArgs) -> Vec<String> {
+    fn header(
+        &mut self,
+        _path_args: &PathArgs,
+        _render_ctx: &RenderContext,
+    ) -> Vec<String> {
         vec![
             "Delete the current session and start fresh.".to_string(),
             "".to_string(),
