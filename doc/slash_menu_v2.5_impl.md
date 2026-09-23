@@ -156,14 +156,16 @@ v2.5 engine.
   param leaf with missing/invalid args — sandbox: nonexistent path — can
   only close the menu, which is wrong for an inline-edit failure.
   - Same surfacing slot as the (landed) completion `Err` line, but must be
-    *stored* on `EpochState.error`: a completion `Err` re-derives every
-    passive frame, while a submit error happens once, on the Enter key.
-    Cleared when the level's prompt section changes.
-  - Drill-arrival alternative: `drill_rewrite` pre-fill of an example path
-    also suppresses DrillEnter-submit (the rewrite runs before dispatch).
+    *stored* on `EpochState.error` (+ `error_suffix`): a completion `Err`
+    re-derives every passive frame, while a submit error happens once, on
+    the Enter key. Cleared when the level's prompt section changes.
+  - Drill guard: the sandbox port uses this `Error` path directly (empty
+    args on drill arrival ⇒ `Error("host path required")` keeps the leaf
+    open); no `drill_rewrite` prefill.
   - Not yet implemented: audit the `handle_leaf` submit mapping
     (`Done`/`Prepared`/`NewPath` → add `Error` → `Continue` + epoch slot)
-    and add the guard tests alongside the sandbox port (design-plan step 7).
+    and add the guard tests alongside the sandbox port (step 7). Final
+    shape: slashdot/sandbox_design.md → "Engine: `SubmitResult::Error`".
 
 **Dot modifier auto-complete - DONE**
 Final design + implementation plan: slashdot/arg_and_modifier_autocomplete.md
@@ -181,6 +183,9 @@ again, at every listing level, not just `/model`).
   Enter/Esc bypass. 33 new crate tests (159 total in `slashdot_menu`).
 - Remaining from the design plan: step 7 (sandbox leaf wiring) — picks up
   with the `/sandbox` port; plus the `SubmitResult::Error` item above.
+  Full sandbox design + implementation plan now in
+  slashdot/sandbox_design.md (tree, nodes, `SandboxOp`/AsyncOp wiring,
+  `path_complete` extraction, `sandbox_state` rename).
 
 **PathArgs / Args cleanup - DONE**
 - Clean up unrelated data (e.g. term_width)
@@ -255,8 +260,9 @@ again, at every listing level, not just `/model`).
    v2.0 session overlay code removed. 19 unit tests. Rendering
    refinements: header() no background, compact timestamps,
    Table wrap option for single-line listings.
-7. **Sandbox** — Mixed static+dynamic children. WIP design:
-   slashdot/sandbox_design.md
+7. **Sandbox** — Mixed static+dynamic children. Design finalized:
+   slashdot/sandbox_design.md (incl. `SubmitResult::Error` + detailed
+   implementation plan). Not yet started.
 9. **Tree + compact - DONE** — Most complex: dynamic listing with nested
    actions, confirm dialogs, `NewPath` rewrites.
 10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
@@ -308,8 +314,9 @@ the `from_buffer_cursors` dispatcher is only reached by v2.0 tests.
 3. **Stat + Replay** (step 6): Simple leaf/interstitial commands.
    Retires `Stat` overlay, `ReplayDetailProvider`.
 
-4. **Sandbox** (step 7): Mixed static+dynamic children. Retires
-   `Sandbox` overlay and `sandbox_bindings` module.
+4. **Sandbox** (step 7): Mixed static+dynamic children. Retires the
+   `Sandbox` overlay + `InputAction::Sandbox`; keeps `sandbox_bindings`,
+   renamed `sandbox_state` (data-only). Design: slashdot/sandbox_design.md.
 
 5. **Session** (step 8): Dynamic listing with action children. Retires
    `Session`, `SessionAction`, `Confirm` overlays and `SessionProvider`.
