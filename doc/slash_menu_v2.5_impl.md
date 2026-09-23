@@ -9,6 +9,24 @@ Design: `slash_menu_v2.5_design.md`. Prior work: `slash_menu_v2_impl.md`
 
 **Done (v2.5 reshape):** Steps 1–6h + tree phases 1–2 complete. 628 lib tests pass. Tree indent fix: assistant +2 via role, invisible entries don't break turn state. Iterative DFS for tree traversal (1000+ message sessions). Duplicate separator on commit fixed. Tree action children show id column. Overlay vertical space: balanced 50:50 detail/rows split with min 3 rows. Visual-line-aware row windowing. `drill_rewrite` for prompt pre-fill/redirect on drill (all 5 use cases).
 
+**PathArgs / RenderContext refactor (c831d2f):**
+- `RenderContext { term_width }` threaded by reference through
+  `node_traverse`; `header(path_args, render_ctx)`; `term_width` out of
+  `PathArgs` (the old TODO) and `EpochState`.
+- `Args` = byte `Range<usize>` pairs into `PathArgs::suffix`; accessors
+  `positional()` / `modifiers()` return `&str` slices.
+- `ParsedSection { path_args, matched_id, child_idx, tail }` built by a
+  single `parse_section` pass over the already-materialized `PathArgs`;
+  `matched()?` is the boolean. Phase order: epoch → PathArgs →
+  drill_rewrite → refresh → parse → restore → dispatch (the old
+  parse→refresh→re-parse double pass is gone).
+- `PathArgs::full_prompt()` / `prompt_with()` replace the free
+  `full_prompt` / `build_path_args`; `drill_rewrite(&PathArgs)`.
+- `refresh_data(epoch, path, tail)` — parent `Args` never reach
+  children's `data()`.
+- grammar.rs is now consumed only by the v2.0 interpreter; the new
+  parser classifies dot tokens by range arithmetic (no allocations).
+
 Steps 1–5: Core engine. `SlashDotNode` trait (all defaults), `NodeEntry`
 (internal wrapper), `SlashDotMenu` + `SlashDotHandle` (public API). Full
 traversal: section parse, data refresh (Rc::ptr_eq), view derivation
