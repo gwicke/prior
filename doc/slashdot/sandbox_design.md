@@ -24,33 +24,30 @@ of `refresh_data()`.
 
 ### 9.2 Tree structure
 
-```
 /sandbox (StaticListingNode)
-  columns: id (sandbox_path), description (host_path), mode (Mode), source (Source)
-  fields: mode (string), source (string)
-
-  Children:
-  1. SandboxPathNode (leaf — dynamic data)
-     data(): returns rows from combined_list()
-     header(): "Press enter to remove the path mapping"
-     prepare(): confirm dialog (two-phase)
-     submit(): remove/exclude binding, re-merge, publish
-
+- columns: id (host_path), description (sandbox_path), mode (Mode), source (Source)
+- fields: mode (string), source (string)
+- Children:
+  1. SandboxPathNode (listing — dynamic data)
+     - data(): returns rows from combined_list(); id=host_path
+     - header(): "Press enter to remove the path mapping"
+     - children:
+       - SandboxRemoveNode
+         - data() row: "remove" | "Remove this mapping"
+         - prepare(): confirm dialog (two-phase) accept / cancel
+         - submit(): remove/exclude binding, re-merge, publish
   2. add (StaticListingNode)
-     row: {id: "add", desc: "Add a path mapping to the sandbox"}
-
-     Child:
-       mode_selector (StaticListingNode)
-         rows: [{id: "ro", desc: "read only mapping"},
+     - data() row: {id: "add", desc: "Add a path mapping to the sandbox"}
+     - children:
+       - PathPickerNode (StaticListingNode)
+       - rows: [{id: "ro", desc: "read only mapping"},
                 {id: "rw", desc: "read-write mapping"}]
-         columns: [id="Path"]
-
-         Child:
-           PathPickerNode (leaf — dynamic data)
-             data(): live host filesystem autocomplete
-             header(): self-documenting prompt
-             submit(): call add_ro/add_rw, re-merge, publish
-```
+       - columns: [id="Path"]
+       - children:
+         - PathPickerNode (leaf — dynamic data)
+           - data(): live host filesystem autocomplete
+           - header(): self-documenting prompt
+           - submit(): call add_ro/add_rw, re-merge, publish
 
 Prompt examples:
 - `/sandbox ` → root listing: all bindings + "add" row
