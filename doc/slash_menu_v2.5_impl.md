@@ -120,24 +120,26 @@ v2.5 engine.
 
 ### Deferred (not blocking, pick up as needed)
 
-**RenderPlan / rendering:**
+**RenderPlan / rendering**
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
+- This might be done - TODO confirm
 
 **Row uniformity:**
 - Only enforces non-empty `id`. Description optional.
 
-**Field space inference fallback:**
+**Field space inference fallback, field spec cleanup**
 - When `SlashDotNode::fields()` returns empty, `infer_field_space()`
   builds from row data. Commands with known fields should override
   `fields()`.
+- Audit field_spec / colums code; support enum overrides
 
 **Cursor / view state:**
 - `cursor_idx` updated in-place and kept in sync. No debug_assert
   enforcing the ID-authoritative invariant.
 
-**Prompt rewrite support**
-- WIP design doc: slashdot/prompt_rewrite_design.md
+**Prompt rewrite support - DONE**
+- Finalized design doc: slashdot/prompt_rewrite_design.md
 
 **Avoid drill-submit where args are expected**
 - Some nodes like `/session <id> rename` expect a parameter - a name in this
@@ -145,8 +147,11 @@ v2.5 engine.
   is auto-submitted with no name. Provide a clear way for submit() to only
   trigger when a genuine local Enter is received, not when MaybeSubmit is sent
   from a parent drill.
+  Plan in ./slashdot/arg_and_modifier_autocomplete.md
 
-**Dot modifier auto-complete:** The v2.5 engine applies `.field:value`
+**Dot modifier auto-complete - IN PROGRESS** 
+Final design: slashdot/arg_and_modifier_autocomplete.md
+The v2.5 engine applies `.field:value`
 filter/sort syntax correctly, but the auto-complete *discovery UI* is
 missing. In v2.0, typing `/model .` showed a popup of available field
 names (via `Interpreter::field_options()` + `ActiveOverlay::Mod`).
@@ -163,7 +168,7 @@ Implementation options:
 - A dedicated overlay mode in the engine (e.g. `MenuResult::ModComplete`).
 - Host-side detection + engine query (like v2.0's `field_options()`).
 
-**PathArgs / Args cleanup**
+**PathArgs / Args cleanup - DONE**
 - Clean up unrelated data (e.g. term_width)
 - Try to make it cheaper / less copying with refs. Deferred to avoid lifetime
   complexity in the trait API.
@@ -181,7 +186,7 @@ Implementation options:
 3. ~~**`/model`**~~ — Done.
 4. ~~**Root `/` list**~~ — Done. All `/` prefixes route through v2.5.
    `SlashDotMenuNode` API for bottom-up tree construction.
-5. **Settings** (`/set`) — Next command to port. Sub-steps:
+5. **Settings - DONE** (`/set`) — Next command to port. Sub-steps:
 
    0. **Fix `node_data()` deviation.** Design §3.2 specifies
       `NodeEntry::node_data()` as the only way parent nodes access child
@@ -196,18 +201,18 @@ Implementation options:
       queries children's `node_data()` for `active_ids`, injects them as
       `"value"` field. Generic — no closures needed.
 
-   2. **`LiveState` bundle.** Replace three separate `Rc<RefCell<...>>`
+   2. **`LiveState` bundle. - DONE** Replace three separate `Rc<RefCell<...>>`
       fields in `MenuShared` with `Rc<RefCell<LiveState>>` holding model,
       persona, thinking_level. `/model`, `/persona`, `/thinking` read/write
       LiveState (transient). `/set` reads/writes `SettingsStore` (persistent).
 
-   3. **Closure-parametrized nodes.** ModelNode, PersonaEnumNode,
+   3. **Closure-parametrized nodes. - DONE** ModelNode, PersonaEnumNode,
       ThinkingEnumNode take `active_fn: Box<dyn Fn()->String>` and
       `submit_fn: Box<dyn FnMut(&str)->Result<(),String>>`. Two
       instantiations: live (→ LiveState) and persistent (→ SettingsStore).
       Shared helpers (`model_row`, `order_models`, columns, fields) reused.
 
-   4. **`/set` tree.** `set` node is `StaticListingNode` with
+   4. **`/set` tree. - DONE** `set` node is `StaticListingNode` with
       Setting|Value|Description columns. Children:
       - Listing settings (default_model, default_persona, etc.):
         `SlashDotMenuNode` with value_forwarding; child is the
@@ -219,10 +224,10 @@ Implementation options:
         `data()` returns row with value directly; `submit()` persists;
         `header()` shows current value on drill.
 
-   5. **Move root menu.** `build_menu()` from `v25_thinking.rs` → new
+   5. **Move root menu. - DONE** `build_menu()` from `v25_thinking.rs` → new
       `src/v25_menu.rs`. Exports `build_root_menu(live_state, settings, shared)`.
 
-   6. **REPL sync.** After DoneSuccess: LiveState → agent rebuild if
+   6. **REPL sync. - DONE** After DoneSuccess: LiveState → agent rebuild if
       changed; dirty flag for `/set` (existing mechanism). Engine stays
       generic — no `/set`-specific dispatch.
 
@@ -230,7 +235,7 @@ Implementation options:
 6f. **Quit** — Leaf node via `AsyncOp::Quit`. **Done.** 3 tests.
 6g. **New** — Leaf node via `AsyncOp::New { name }`. **Done.** 3 tests.
 6h. **Clear** — Leaf node via `AsyncOp::Clear { name }`. **Done.** 3 tests.
-8. **Session** — Dynamic listing with action children:
+8. **Session - DONE** — Dynamic listing with action children:
    slashdot/session_design.md. **Done** (steps 0–5). Full session
    lifecycle: listing, resume, fork, rename, delete with confirm.
    v2.0 session overlay code removed. 19 unit tests. Rendering
@@ -238,11 +243,12 @@ Implementation options:
    Table wrap option for single-line listings.
 7. **Sandbox** — Mixed static+dynamic children. WIP design:
    slashdot/sandbox_design.md
-9. **Tree + compact** — Most complex: dynamic listing with nested
+9. **Tree + compact - DONE** — Most complex: dynamic listing with nested
    actions, confirm dialogs, `NewPath` rewrites.
 10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
     `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
     dead v2.0 code.
+11. Re-merge with mainline
 
 ---
 
