@@ -518,7 +518,22 @@ Design + plan: `slashdot/sandbox_design.md`.
 
 ### Step 15: Final cleanup
 
-(See previous versions for detailed per-step specs.)
+Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
+
+- **P1 — repl.rs pruning — DONE**: `ActiveOverlay` reduced to
+  `{None, V25Menu, PathComplete}` (10 legacy variants + all their
+  display/key/derivation arms gone), `from_buffer`/`from_buffer_cursors`
+  word-dispatch world deleted, run-loop locals (`engine`,
+  `stat_phase`, `help_view`, `value_error`) + `OverlayAction` +
+  `ValueCandidate` + the tree/model/settings helper clusters removed,
+  66 dead tests deleted. repl.rs 9615 → 4441 lines. Workspace green
+  (587 lib tests + full suites); P1 sentinels clean; only the
+  pre-existing v25_tree warning remains. Prompt-completion island
+  untouched (scoped out to its own step). *(Incident note: the first
+  compiler-driven test-deletion script escaped `mod tests` and
+  deleted production fns — recovered by restoring HEAD and replaying
+  the recorded edits; the rerun script was range-guarded to `mod
+  tests`. Prefer the edit tool; commit before any scripted edit.)*
 
 ---
 

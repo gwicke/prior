@@ -142,9 +142,17 @@ Status: **PROPOSED** (plan only; not yet implemented)
 
 ## Execution order (each phase: green build + tests, doc touch, commit)
 
-1. **P1 — repl.rs pruning**: dead variants/arms/helpers/params + their
-   tests. Gate: `cargo test`; sentinel grep for removed variant names
-   in non-test code is empty.
+1. ~~**P1 — repl.rs pruning**~~ — **DONE**. Dead variants/arms/
+   helpers/params + their tests removed: `ActiveOverlay` →
+   `{None, V25Menu, PathComplete}`; `from_buffer*` word-dispatch,
+   `engine`/`stat_phase`/`help_view`/`value_error` locals,
+   `OverlayAction`/`ValueCandidate`, the tree/model/settings helper
+   clusters, and 66 dead tests. repl.rs 9615 → 4441 lines;
+   `handle_enter`/`handle_esc` reshaped to the live arms only;
+   agent-side `dirty` rebuild plumbing removed (channel had no writer
+   since `/set` went v2.5). Gates met: `cargo test` green (587+169+…);
+   P1 sentinels empty (bridge `OverlayAction`/`on_edit` remain for
+   P2/P3 as planned); warnings = pre-existing v25_tree fields only.
 2. **P2 — crate surgery**: `ColumnDef` → `fields.rs`; delete
    `interpreter`/`accept`/`node`/`provider`; `PlanBuilder`; `lib.rs`.
    Gate: lib tests green (expect a large drop: interpreter 25 +
