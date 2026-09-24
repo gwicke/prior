@@ -771,6 +771,40 @@ pub(crate) fn sandbox_list_dir(dir: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Run `ls -la` with an ISO-8601 (seconds, local) time style inside the
+/// sandbox and return the **raw lines** (metadata intact). Returns `None`
+/// when no sandbox is configured, bwrap is unavailable, or `ls` fails
+/// (e.g. the directory does not exist inside the sandbox).
+///
+/// Parsing lives in [`crate::path_complete`] — this is the raw IO edge.
+pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
+    let cfg = sandbox_config();
+    let mut cfg = (*cfg).clone()?;
+    crate::sandbox_bindings::merge_into(&mut cfg);
+    let args = build_bwrap_args(&cfg, true).ok()?;
+
+    let output = std::process::Command::new("bwrap")
+        .args(&args)
+        .arg("--")
+        .args([
+            "ls",
+            "-lap",
+            "--time-style=+%Y-%m-%dT%H:%M:%S",
+            dir,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(stdout.lines().map(|l| l.to_string()).collect())
+}
+
 /// Resolve the active path policy for the non-shell file tools. Returns `None`
 /// when the sandbox is disabled, bwrap is absent, or no explicit bindings are
 /// configured (permissive default). Mirrors the shell-sandboxing activation

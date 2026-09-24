@@ -475,6 +475,20 @@ Replace the per-keypress engine rebuild with a persistent node tree.
 
 ### Step 12: Sandbox
 
+Design + plan: `slashdot/sandbox_design.md`.
+
+- **Engine `SubmitResult::Error` — DONE** (`70b5f41`): direct render, no
+  error state (`frame_error` removed; `view_plan(error: Option<&str>)`).
+  Host paints unchanged-prompt content plans one-shot. +3 tests.
+- **`path_complete` extraction — DONE** (`4910e9a`): structured `Entry`
+  (full display path, mtime/size, `description()` = ISO secs + raw
+  bytes), host + sandbox listings (`tools::sandbox_list_lines`, `ls -lap
+  --time-style=+ISO`), v1 split/`~`-round-trip/fallback semantics, labels
+  `Host path`/`Sandbox path`. Legacy repl helpers untouched (in-prompt
+  switch deferred to cleanup). +7 tests — 635 lib tests pass.
+- Next: `sandbox_state` rename → `v25_sandbox` nodes + `AsyncOp::Sandbox`
+  wiring + v2.0 overlay retirement.
+
 ### Step 13: Session
 
 ### Step 14: Tree + `/compact`

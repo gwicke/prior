@@ -142,37 +142,41 @@ frame; nothing is stored, so there is no clearing rule to reason about.
    Minimal bridge until the v1/v2.0 repl cleanup; the semantic rule to keep
    then: *direct render when the prompt did not change*.
 
-## Path completion extraction
+## Path completion extraction — DONE
 
-Today: `complete_path_prefix_impl` (free fn, host) + a `Repl` method
-`complete_path_prefix_sandbox` (sandbox `ls` → host fallback). Neither
-exposes mtime/size, and both live in `repl.rs`.
-
-New module **`src/path_complete.rs`**:
+Landed module **`src/path_complete.rs`** (registered in `lib.rs`):
 
 ```rust
 pub struct Entry {
-    pub name: String,      // basename
-    pub is_dir: bool,      // trailing '/' when displayed
-    pub mtime: Option<std::time::SystemTime>,
-    pub size: Option<u64>,
+    pub path: String,      // FULL display path (dir-joined, '~/…' round-trip,
+                           // trailing '/' when is_dir) — the row id
+    pub is_dir: bool,
+    pub mtime: Option<std::time::SystemTime>,   // second resolution
+    pub size: Option<u64>,                       // raw bytes
 }
-pub fn list_host(dir: &str) -> Vec<Entry>;      // std::fs::read_dir + metadata
-pub fn list_sandbox(dir: &str) -> Option<Vec<Entry>>;  // bwrap ls, long format
-pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry>; // split dir/stem, filter
+impl Entry { pub fn description(&self) -> String; }  // "ISO-TS  size" ('-' gaps)
+pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry>; // split dir/stem, filter, sort
+pub fn list_host(dir: &str) -> Vec<Entry>;            // read_dir, no symlink follow
+pub fn list_sandbox(dir: &str) -> Option<Vec<Entry>>; // bwrap ls → parse
 ```
 
-- `complete` reproduces today's split (ends-in-`/` or is-dir ⇒ list all;
-  else filter by stem), `~` round-trip, sort.
-- `list_sandbox`: run `ls -lap --time-style=full-iso` in bwrap; parse
-  size + mtime; keep the `-p` `/` marker for dirs. `None` (no sandbox / not
-  found) ⇒ caller may fall back to host (arg 1) or return empty (arg 2).
-  Baseline still works with names only if long-format parsing is skipped.
-- The two `repl.rs` helpers should be dead / only used by dead 2.0 code, so do
-  not spend much effort keeping them alive. If really necessary, they could
-  become thin wrappers over `path_complete` (string projection of `Entry`),
-  but they will be removed in the next cleanup step anyway - sandbox is the
-  last item in the 2.5 migration.
+- `complete`: v1 split preserved (ends-in-`/` or is-dir ⇒ list contents;
+  else filter parent by stem), `~` round-trip inside the module (consumer
+  never joins), sorted by path. `sandbox=false` ⇒ host; `sandbox=true` ⇒
+  v1 semantics: sandbox listing wins; sandbox configured but dir invisible
+  ⇒ **empty** (never leak host paths); no sandbox at all ⇒ host fallback.
+- `list_sandbox`: `tools::sandbox_list_lines` (new `pub(crate)` raw-IO fn)
+  runs `ls -lap --time-style=+%Y-%m-%dT%H:%M:%S` in bwrap — custom format
+  = ISO-8601 seconds directly (no ns/offset parsing); parser strips the
+  `ls -l` symlink `name -> target` suffix, skips `total`/`.`/`..`, derives
+  `is_dir` from the perms column (symlink-to-dir ≠ dir, matching host
+  `file_type()`), and round-trips the timestamp through local time.
+- Dialog labels (confirmed): id column `Host path` (arg 1) / `Sandbox
+  path` (arg 2); description column keeps the default `Description`.
+- Legacy `repl.rs` helpers (`complete_path_prefix_impl`,
+  `complete_path_prefix_sandbox`) left untouched — only the in-prompt Tab
+  complete still uses them; switching it to `path_complete` and deleting
+  both is deferred to the v1/v2.0 cleanup (sandbox is the last 2.5 item).
 
 ## `sandbox_state` module
 
