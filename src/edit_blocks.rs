@@ -91,6 +91,30 @@ fn marker_of(line: &str) -> Option<&'static str> {
 fn strip_fence(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
 
+    // Split any `<<<<<<< SEARCH>content...` (or `]`, `}`, `)`) line into the
+    // marker line and the content line. Models occasionally hallucinate the
+    // bracket without a following newline. The prefix `<<<<<<< SEARCH` must
+    // match exactly; the first char of `rest` must be one of `>]})`.
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].clone();
+        if let Some(rest) = line.trim_start().strip_prefix("<<<<<<< SEARCH") {
+            let first = rest.chars().next();
+            if matches!(first, Some('>') | Some(']') | Some('}') | Some(')')) {
+                // Only split if there's *content* after the bracket on the same
+                // line (i.e. `<<<<<<< SEARCH>foo`, not `<<<<<<< SEARCH>\n`).
+                let content_after = rest[1..].trim_start();
+                if !content_after.is_empty() {
+                    lines[i] = SEARCH_MARKER.to_string();
+                    lines.insert(i + 1, content_after.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+
     // Drop a leading fence line (``` or ```lang).
     if let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) {
         if lines[first].trim_start().starts_with("```") {
@@ -519,11 +543,19 @@ mod tests {
     }
 
     #[test]
-    fn lenient_search_marker_rejects_extra_chars() {
-        // Two chars, or a char outside the allowed set, must NOT be accepted.
-        assert!(parse_blocks("<<<<<<< SEARCH>>\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+    fn lenient_search_marker_rejects_invalid_brackets() {
+        // A char outside the allowed set, or a space before the bracket,
+        // must NOT be accepted.
         assert!(parse_blocks("<<<<<<< SEARCHX\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
         assert!(parse_blocks("<<<<<<< SEARCH ]\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+    }
+
+    #[test]
+    fn lenient_search_marker_splits_hallucinated_bracket_from_content() {
+        // `<<<<<<< SEARCH>>` → treat as `<<<<<<< SEARCH\n>` (marker + content line ">")
+        let text = "<<<<<<< SEARCH>>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits, vec![plain(">\nold", "new")]);
     }
 
     #[test]
@@ -531,6 +563,34 @@ mod tests {
         // The closing marker must remain exact — no leniency for REPLACE.
         assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE>").is_err());
         assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE]").is_err());
+    }
+
+    #[test]
+    fn lenient_search_marker_accepts_content_on_same_line() {
+        // When the bracket is followed directly by content (no newline), the
+        // line is split and the content becomes the first SEARCH line.
+        let text = "src/foo.py\n<<<<<<< SEARCH>old\n=======\nnew\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
+        assert_eq!(p.edits, vec![plain("old", "new")]);
+
+        let text2 = "src/foo.py\n<<<<<<< SEARCH]old\n=======\nnew\n>>>>>>> REPLACE";
+        let p2 = parse_blocks(text2).unwrap();
+        assert_eq!(p2.edits, vec![plain("old", "new")]);
+
+        // Multi-line content on the same line after the bracket.
+        let text3 = "src/foo.py\n<<<<<<< SEARCH>line 1\nline 2\n=======\nnew\n>>>>>>> REPLACE";
+        let p3 = parse_blocks(text3).unwrap();
+        assert_eq!(p3.edits, vec![plain("line 1\nline 2", "new")]);
+    }
+
+    #[test]
+    fn lenient_search_marker_newline_style_still_works() {
+        // The original `<<<<<<< SEARCH>\n` style still parses correctly.
+        let text = "src/foo.py\n<<<<<<< SEARCH>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
+        assert_eq!(p.edits, vec![plain("old", "new")]);
     }
 
     #[test]
