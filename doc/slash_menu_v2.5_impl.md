@@ -593,6 +593,42 @@ Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
   NOT-list (prompt-completion island) intact. Workspace green: 568
   lib + 133 crate + all integration, 0 failed.
 
+### Step 16: Re-merge with mainline — DONE (511a948)
+
+Merged `origin/main` (31 upstream commits since `c23abec`); backup
+branch `backup/pre-upstream-merge` at 215394e. Upstream delta: flat
+edit-batch rework (`src/edit_blocks.rs` new + `tools.rs` flat EditArgs
++ session edit canonicalization), session fixes (ForkMode, subtree
+stack overflow), live formatting, `Guard::map_error`, compaction file
+order, xiaomimimo/mimo data, markdown renderer updates.
+
+**Conflicts — 2 files, both resolved keeping ours:**
+- `src/lib.rs`: v2.5 module set kept (deleted `pub mod slash;` stays
+  deleted); upstream's `pub mod edit_blocks;` added.
+- `src/repl.rs`: upstream's entire 3-line delta fell inside legacy
+  regions the cleanup deleted (P1/P4: `ActiveOverlay::from_buffer`'s
+  stat arm, `sandbox_overlay_entries`); ours kept wholesale — verified
+  the merge-base..origin/main diff was exactly those 3 lines, so no
+  auto-merged upstream content lived outside the conflict hunks.
+
+**Upstream repl.rs changes — ports:**
+- **f199117 `/stat` estimated context tokens — PORTED**: `MenuShared`
+  gained `context_tokens: Rc<RefCell<u64>>` (synced from
+  `ReplCtx.context_tokens` per `read_input`, alongside
+  `session_usage`); `StatNode::header` passes it as the new 5th arg of
+  `session_stats_lines`. Test:
+  `stat_header_shows_estimated_context_tokens` asserts the
+  `estimated context tokens: 42000` row.
+- **248c9d9 `/sandbox` add_rw executed add_ro — no port needed
+  (structurally immune)**: v2.5 derives mode from the drilled
+  `ids.last()` row (`BindMode::Rw`/`Ro`) in `AddSandboxMappingNode::submit`
+  and errors on a missing mode; it never relies on the completion
+  return value the legacy overlay hardcoded to `"add_ro"`.
+
+Gate: workspace green post-merge — 623 lib + 133 crate + all
+integration, 0 failed; 1 warning = pre-existing `v25_tree::FlatRow`
+baseline.
+
 ---
 
 ## 5a. Follow-up: global app state and async (post-migration)
