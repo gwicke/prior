@@ -4,7 +4,7 @@
 //! See `doc/batch_editing_v2.md`. Three representations are in play:
 //!
 //! - **Blob** — the model-facing text format, a filename line followed by one
-//!   or more `<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE` blocks.
+//!   or more `SEARCH_MARKER` / `DIVIDER` / `REPLACE_MARKER` blocks.
 //! - **Canonical array** — the internal/persisted form, pi-compatible:
 //!   `{"path": ..., "edits": [{"oldText": ..., "newText": ...}, ...]}`.
 //! - **Legacy** — `oldText`/`newText` (single) and `old`/`new` (very old
@@ -17,11 +17,11 @@
 use serde_json::{json, Value};
 
 /// Opening marker of a SEARCH region.
-pub const SEARCH_MARKER: &str = "<<<<<<< SEARCH";
+pub const SEARCH_MARKER: &str = "@@@OLD";
 /// Divider between the SEARCH and REPLACE regions.
-pub const DIVIDER: &str = "=======";
+pub const DIVIDER: &str = "@@@DIV";
 /// Closing marker of a REPLACE region.
-pub const REPLACE_MARKER: &str = ">>>>>>> REPLACE";
+pub const REPLACE_MARKER: &str = "@@@NEW";
 
 /// One parsed SEARCH/REPLACE block.
 #[derive(Debug, PartialEq, Clone)]
@@ -59,8 +59,8 @@ impl std::fmt::Display for ParseError {
 /// so trailing whitespace from the model does not defeat detection).
 ///
 /// For SEARCH only, be lenient with a single hallucinated closing bracket/brace
-/// (`>`, `]`, `}`, `)`) that some models emit — e.g. `<<<<<<< SEARCH>`
-/// or `<<<<<<< SEARCH]`. The prefix must match exactly; only a single such
+/// (`>`, `]`, `}`, `)`) that some models emit — e.g. `@@@OLD>`
+/// or `@@@OLD]`. The prefix must match exactly; only a single such
 /// char is allowed and nothing else may follow. REPLACE and DIVIDER remain
 /// strict.
 fn marker_of(line: &str) -> Option<&'static str> {
@@ -90,9 +90,9 @@ fn marker_of(line: &str) -> Option<&'static str> {
 fn strip_fence(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
 
-    // Split any `<<<<<<< SEARCH>content...` (or `]`, `}`, `)`) line into the
+    // Split any `@@@OLD>content...` (or `]`, `}`, `)`) line into the
     // marker line and the content line. Models occasionally hallucinate the
-    // bracket without a following newline. The prefix `<<<<<<< SEARCH` must
+    // bracket without a following newline. The prefix `@@@OLD` must
     // match exactly; the first char of `rest` must be one of `>]})`.
     let mut i = 0;
     while i < lines.len() {
@@ -100,7 +100,7 @@ fn strip_fence(text: &str) -> Vec<String> {
         // keeping a borrow across the mutation.
         let should_split = {
             let line = &lines[i];
-            if let Some(rest) = line.trim_start().strip_prefix("<<<<<<< SEARCH") {
+            if let Some(rest) = line.trim_start().strip_prefix(SEARCH_MARKER) {
                 let first = rest.chars().next();
                 if matches!(first, Some('>') | Some(']') | Some('}') | Some(')')) {
                     let content_after = rest[1..].trim_start();
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn parses_single_block_with_path() {
-        let text = "src/foo.py\n<<<<<<< SEARCH\ndef foo():\n    return 1\n=======\ndef foo():\n    return 2\n>>>>>>> REPLACE";
+        let text = "src/foo.py\n@@@OLD\ndef foo():\n    return 1\n@@@DIV\ndef foo():\n    return 2\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn parses_two_blocks_same_file_second_inherits() {
-        let text = "src/foo.py\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE";
+        let text = "src/foo.py\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -511,7 +511,7 @@ mod tests {
     fn header_line_anchor_is_captured_per_block() {
         // `path:LINE` on a header supplies that block's anchor; differing
         // anchors on the same file do NOT count as a multi-file attempt.
-        let text = "src/foo.py:10\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\nsrc/foo.py:42\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE";
+        let text = "src/foo.py:10\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\nsrc/foo.py:42\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn header_line_anchor_only_on_first_block() {
-        let text = "src/foo.py:7\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE";
+        let text = "src/foo.py:7\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.edits[0].start_line, Some(7));
         assert_eq!(p.edits[1].start_line, None);
@@ -531,23 +531,23 @@ mod tests {
     #[test]
     fn lenient_search_marker_accepts_trailing_bracket() {
         // The model occasionally hallucinates a closing bracket/brace after
-        // SEARCH (e.g. `<<<<<<< SEARCH>` or `<<<<<<< SEARCH]`). Be lenient
+        // SEARCH (e.g. `@@@OLD>` or `@@@OLD]`). Be lenient
         // for SEARCH only — the prefix must match exactly, only one char from
         // the set `>]})` is allowed, and nothing else may follow.
-        let text = "src/foo.py\n<<<<<<< SEARCH>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text = "src/foo.py\n@@@OLD>\nold\n@@@DIV\nnew\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
 
-        let text2 = "src/foo.py\n<<<<<<< SEARCH]\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text2 = "src/foo.py\n@@@OLD]\nold\n@@@DIV\nnew\n@@@NEW";
         let p2 = parse_blocks(text2).unwrap();
         assert_eq!(p2.edits, vec![plain("old", "new")]);
 
-        let text3 = "src/foo.py\n<<<<<<< SEARCH}\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text3 = "src/foo.py\n@@@OLD}\nold\n@@@DIV\nnew\n@@@NEW";
         let p3 = parse_blocks(text3).unwrap();
         assert_eq!(p3.edits, vec![plain("old", "new")]);
 
-        let text4 = "src/foo.py\n<<<<<<< SEARCH)\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text4 = "src/foo.py\n@@@OLD)\nold\n@@@DIV\nnew\n@@@NEW";
         let p4 = parse_blocks(text4).unwrap();
         assert_eq!(p4.edits, vec![plain("old", "new")]);
     }
@@ -556,14 +556,14 @@ mod tests {
     fn lenient_search_marker_rejects_invalid_brackets() {
         // A char outside the allowed set, or a space before the bracket,
         // must NOT be accepted.
-        assert!(parse_blocks("<<<<<<< SEARCHX\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
-        assert!(parse_blocks("<<<<<<< SEARCH ]\nold\n=======\nnew\n>>>>>>> REPLACE").is_err());
+        assert!(parse_blocks("@@@OLDX\nold\n@@@DIV\nnew\n@@@NEW").is_err());
+        assert!(parse_blocks("@@@OLD ]\nold\n@@@DIV\nnew\n@@@NEW").is_err());
     }
 
     #[test]
     fn lenient_search_marker_splits_hallucinated_bracket_from_content() {
         // `<<<<<<< SEARCH>>` → treat as `<<<<<<< SEARCH\n>` (marker + content line ">")
-        let text = "<<<<<<< SEARCH>>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text = "@@@OLD>>\nold\n@@@DIV\nnew\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.edits, vec![plain(">\nold", "new")]);
     }
@@ -571,25 +571,25 @@ mod tests {
     #[test]
     fn lenient_only_for_search_not_replace() {
         // The closing marker must remain exact — no leniency for REPLACE.
-        assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE>").is_err());
-        assert!(parse_blocks("<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE]").is_err());
+        assert!(parse_blocks("@@@OLD\nold\n@@@DIV\nnew\n@@@NEW>").is_err());
+        assert!(parse_blocks("@@@OLD\nold\n@@@DIV\nnew\n@@@NEW]").is_err());
     }
 
     #[test]
     fn lenient_search_marker_accepts_content_on_same_line() {
         // When the bracket is followed directly by content (no newline), the
         // line is split and the content becomes the first SEARCH line.
-        let text = "src/foo.py\n<<<<<<< SEARCH>old\n=======\nnew\n>>>>>>> REPLACE";
+        let text = "src/foo.py\n@@@OLD>old\n@@@DIV\nnew\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
 
-        let text2 = "src/foo.py\n<<<<<<< SEARCH]old\n=======\nnew\n>>>>>>> REPLACE";
+        let text2 = "src/foo.py\n@@@OLD]old\n@@@DIV\nnew\n@@@NEW";
         let p2 = parse_blocks(text2).unwrap();
         assert_eq!(p2.edits, vec![plain("old", "new")]);
 
         // Multi-line content on the same line after the bracket.
-        let text3 = "src/foo.py\n<<<<<<< SEARCH>line 1\nline 2\n=======\nnew\n>>>>>>> REPLACE";
+        let text3 = "src/foo.py\n@@@OLD>line 1\nline 2\n@@@DIV\nnew\n@@@NEW";
         let p3 = parse_blocks(text3).unwrap();
         assert_eq!(p3.edits, vec![plain("line 1\nline 2", "new")]);
     }
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn lenient_search_marker_newline_style_still_works() {
         // The original `<<<<<<< SEARCH>\n` style still parses correctly.
-        let text = "src/foo.py\n<<<<<<< SEARCH>\nold\n=======\nnew\n>>>>>>> REPLACE";
+        let text = "src/foo.py\n@@@OLD>\nold\n@@@DIV\nnew\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn flags_multi_file_on_differing_headers() {
-        let text = "a.rs\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n\nb.rs\n<<<<<<< SEARCH\np\n=======\nq\n>>>>>>> REPLACE";
+        let text = "a.rs\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW\n\nb.rs\n@@@OLD\np\n@@@DIV\nq\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         assert!(p.multi_file);
         assert!(merge_path(Some("a.rs"), p).is_err());
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn strips_fences() {
-        let text = "```\nsrc/x.rs\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```";
+        let text = "```\nsrc/x.rs\n@@@OLD\na\n@@@DIV\nb\n@@@NEW\n```";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
         assert_eq!(p.edits, vec![plain("a", "b")]);
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn prose_before_block_is_not_a_header() {
-        let text = "Sure, here is the change:\n\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE";
+        let text = "Sure, here is the change:\n\n@@@OLD\na\n@@@DIV\nb\n@@@NEW";
         let p = parse_blocks(text).unwrap();
         // The immediate predecessor of SEARCH is blank → no header.
         assert_eq!(p.path, None);
@@ -661,19 +661,19 @@ mod tests {
 
     #[test]
     fn missing_divider_errors() {
-        let text = "<<<<<<< SEARCH\na\n>>>>>>> REPLACE";
+        let text = "@@@OLD\na\n@@@NEW";
         assert!(parse_blocks(text).is_err());
     }
 
     #[test]
     fn missing_replace_errors() {
-        let text = "<<<<<<< SEARCH\na\n=======\nb";
+        let text = "@@@OLD\na\n@@@DIV\nb";
         assert!(parse_blocks(text).is_err());
     }
 
     #[test]
     fn empty_search_errors() {
-        let text = "<<<<<<< SEARCH\n=======\nb\n>>>>>>> REPLACE";
+        let text = "@@@OLD\n@@@DIV\nb\n@@@NEW";
         assert!(parse_blocks(text).is_err());
     }
 
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn canonicalize_blob_string() {
         let v =
-            json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"});
+            json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@DIV\nb\n@@@NEW"});
         let c = canonicalize_edit_value(&v);
         assert_eq!(
             c,
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn canonicalize_malformed_blob_is_identity() {
-        let v = json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n>>>>>>> REPLACE"});
+        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW"});
         assert_eq!(canonicalize_edit_value(&v), v);
     }
 

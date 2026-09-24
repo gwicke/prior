@@ -3031,7 +3031,7 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        let blob = "src/x.rs\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE";
+        let blob = "src/x.rs\n@@@OLD\na\n@@@DIV\nb\n@@@NEW";
         session
             .append_message(&Message::Assistant {
                 id: None,
@@ -3070,7 +3070,7 @@ mod tests {
     }
 
     /// Local copy of the search marker so the assertion above is explicit.
-    const SEARCH_MARKER_TEST: &str = "<<<<<<< SEARCH";
+    const SEARCH_MARKER_TEST: &str = "@@@OLD";
 
     #[tokio::test]
     async fn test_toolname_multiple_tools() {
