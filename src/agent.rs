@@ -1840,8 +1840,8 @@ the original text
 the replacement text
 >>>>>>> REPLACE
 ```
-You can send many edit blocks in a `edits` string, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
-For single edits, the traditional path / oldText / newText API is available as well.
+You can send many edit blocks in a single `edits` batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
+For single edits, the traditional OpenAI path / oldText / newText API is available as well.
 3. **Verify Everything**: After modifying code, verify the results. Run tests or build commands via `bash`. Read the modified file to ensure the change was applied correctly.
 4. **Tool Mastery**:
    - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
