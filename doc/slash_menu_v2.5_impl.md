@@ -626,8 +626,26 @@ order, xiaomimimo/mimo data, markdown renderer updates.
   return value the legacy overlay hardcoded to `"add_ro"`.
 
 Gate: workspace green post-merge — 623 lib + 133 crate + all
-integration, 0 failed; 1 warning = pre-existing `v25_tree::FlatRow`
-baseline.
+integration, 0 failed.
+
+**Post-merge warning cleanup — DONE (zero warnings workspace-wide):**
+- `v25_tree::FlatRow`: dropped never-read `branch_depth` / `full_text`
+  / `timestamp` — `header()` reads those straight from the raw entry
+  (`find_entry`), so `flatten_turns` was cloning full multi-line text
+  and timestamps per row for nothing; the `branch_depth` plumbing
+  (param, stack tuple, `child_bd`) went with it. The struct doc notes
+  why rows only carry listing/selection data.
+- `node_entry` test fixture `HeaderLeaf`: never constructed since its
+  introduction (6a5c8e0) — deleted.
+- `RecordingLeaf.submitted_via` getter: never called because the test
+  has no handle to the leaf once boxed into the tree. Reworked the
+  record cell to `Rc<RefCell<Option<String>>>` shared with the test;
+  `mixed_children_tab_drill_dispatches_correct_child` now asserts the
+  routing it was written for — add leaf records `action`, bind leaf
+  stays `None`.
+
+Gate: `cargo check --all-targets --workspace` → 0 warnings; full
+workspace tests green (623 + 133 + integration, 0 failed).
 
 ---
 
