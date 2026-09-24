@@ -6,13 +6,22 @@
 //! [`crate::tools::sandbox_list_lines`]) both yield structured
 //! [`Entry`]s carrying mtime/size for the dialog's description column.
 //! [`complete`] reproduces the v1 prefix split (ends-in-`/` or existing
-//! dir ⇒ list its contents; else filter the parent by stem) with the
-//! `~` round-trip — every consumer gets **full display paths** back
-//! (that is what the row id needs).
+//! dir ⇒ list its contents; empty parent ⇒ `.`; else the parent with
+//! the basename as stem) with the `~` round-trip, then ranks the
+//! path-sorted children with [`crate::fuzzy::rank_candidates`]
+//! (query = stem: dir level ⇒ alphabetical, typed stem ⇒ prefix tier
+//! then fuzzy) — every consumer gets **full display paths** back (that
+//! is what the row id needs).
+//!
+//! Listings are cached in a shared single slot (L1): the host side
+//! revalidates with one dir-`mtime` stat per call, the sandbox side
+//! with a TTL (a probe would be a bwrap spawn). See [`listing_stale`].
 
+use crate::fuzzy::rank_candidates;
 use chrono::TimeZone;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 /// One completable filesystem entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +55,37 @@ impl Entry {
     }
 }
 
+/// Split an expanded prefix into `(dir to list, ranking stem)`.
+///
+/// Ends-in-`/` or an existing dir ⇒ list that dir (empty stem); else
+/// list the parent — an **empty parent (bare relative word) ⇒ `.`**,
+/// so dot-words like `.gitignore` complete against the cwd (v1 returned
+/// nothing here) — with the basename as the stem.
+fn split_prefix(expanded: &str, path_is_dir: bool) -> (String, String) {
+    if expanded.ends_with('/') || path_is_dir {
+        let d = expanded.trim_end_matches('/');
+        return (
+            if d.is_empty() { "/".to_string() } else { d.to_string() },
+            String::new(),
+        );
+    }
+    let path = Path::new(expanded);
+    let parent = path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = if parent.is_empty() {
+        ".".to_string()
+    } else {
+        parent
+    };
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (parent, stem)
+}
+
 /// Complete `prefix` against the host FS (`sandbox = false`) or the
 /// sandbox-visible FS with host fallback (`sandbox = true`, the v1
 /// `complete_path_prefix_sandbox` semantics: sandbox listing wins;
@@ -53,7 +93,10 @@ impl Entry {
 /// return *nothing* rather than leaking host paths; fall back to the
 /// host only when no sandbox is configured at all).
 ///
-/// Empty prefix ⇒ empty (inert). Results are sorted by path.
+/// Candidates are the dir's children (via the L1 listing cache),
+/// path-sorted as the ranking input: an empty stem keeps that
+/// alphabetical order; a typed stem ranks prefix matches first, then
+/// fuzzy matches, dropping non-matches. Empty prefix ⇒ empty (inert).
 pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
     if prefix.is_empty() {
         return Vec::new();
@@ -62,47 +105,153 @@ pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
     let expanded = crate::path_util::expand_tilde(prefix)
         .to_string_lossy()
         .into_owned();
-    let path = Path::new(&expanded);
-    let (dir, filter) = if expanded.ends_with('/') || path.is_dir() {
-        let d = expanded.trim_end_matches('/');
-        (
-            if d.is_empty() { "/".to_string() } else { d.to_string() },
-            String::new(),
-        )
-    } else {
-        let parent = path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let stem = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        (parent, stem)
+    let path_is_dir = Path::new(&expanded).is_dir();
+    let (dir, stem) = split_prefix(&expanded, path_is_dir);
+
+    let listing = match listing_for(&dir, sandbox) {
+        Listing::Found(entries) => entries,
+        // Sandbox configured but the dir did not list inside it —
+        // never suggest host paths the sandbox cannot see.
+        Listing::Invisible => return Vec::new(),
     };
 
-    let mut entries = if sandbox {
-        match list_sandbox(&dir) {
-            Some(entries) => entries,
-            // Sandbox configured but the dir did not list inside it —
-            // never suggest host paths the sandbox cannot see.
-            None if crate::tools::sandbox_config().is_some() => return Vec::new(),
-            // No sandbox at all → plain host listing.
-            None => list_host(&dir),
-        }
-    } else {
-        list_host(&dir)
-    };
-
-    if !filter.is_empty() {
-        entries.retain(|e| basename_of(&e.path).starts_with(&filter));
-    }
-    if uses_tilde {
+    let mut entries: Vec<Entry> = if uses_tilde {
         let home = std::env::var("HOME").unwrap_or_default();
-        for e in &mut entries {
-            e.path = tilde_map(&e.path, &home);
+        listing
+            .into_iter()
+            .map(|mut e| {
+                e.path = tilde_map(&e.path, &home);
+                e
+            })
+            .collect()
+    } else {
+        listing
+    };
+
+    let ranked = rank_candidates(&entries, &stem, |e| {
+        basename_of(&e.path).to_string()
+    }, |e| basename_of(&e.path).to_string());
+    entries = ranked.into_iter().cloned().collect();
+    entries
+}
+
+/// L1 validity window: sandbox side (a revalidation probe would be a
+/// bwrap spawn) and host fallback when the dir stat is unavailable.
+const LISTING_TTL: Duration = Duration::from_secs(5);
+
+/// Shared single-slot directory listing cache (L1).
+struct ListingSlot {
+    dir: String,
+    sandbox: bool,
+    /// Raw (expanded) paths, path-sorted.
+    entries: Vec<Entry>,
+    /// Sandbox configured, but the dir did not list inside it.
+    invisible: bool,
+    fetched_at: Instant,
+    /// Host side: the dir's mtime captured *before* listing (the
+    /// revalidation probe); `None` for sandbox slots.
+    dir_mtime: Option<SystemTime>,
+}
+
+static LISTING: LazyLock<Mutex<Option<ListingSlot>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Drop the shared L1 listing slot. Called when the sandbox config is
+/// re-published (`tools::set_sandbox`) — the invisible/visible state
+/// of every dir can change with it.
+pub fn invalidate_listing() {
+    if let Ok(mut guard) = LISTING.lock() {
+        *guard = None;
+    }
+}
+
+/// Would a [`complete`] call in this mode refetch its listing right
+/// now (slot missing, mode mismatch, or failed revalidation)?
+/// Completion leaves use this to invalidate their row cache without
+/// performing the IO themselves.
+pub fn listing_stale(sandbox: bool) -> bool {
+    let Ok(guard) = LISTING.lock() else {
+        return true;
+    };
+    match guard.as_ref() {
+        None => true,
+        Some(slot) => slot.sandbox != sandbox || !slot_fresh(slot),
+    }
+}
+
+/// Host: revalidate with one dir-`mtime` stat (stat unavailable ⇒
+/// TTL). Sandbox: TTL only.
+fn slot_fresh(slot: &ListingSlot) -> bool {
+    if slot.sandbox {
+        return slot.fetched_at.elapsed() < LISTING_TTL;
+    }
+    match std::fs::metadata(&slot.dir).and_then(|m| m.modified()) {
+        Ok(now) if slot.dir_mtime.is_some() => Some(now) == slot.dir_mtime,
+        _ => slot.fetched_at.elapsed() < LISTING_TTL,
+    }
+}
+
+enum Listing {
+    Found(Vec<Entry>),
+    /// Sandbox configured, but the dir is not visible inside it.
+    Invisible,
+}
+
+/// Cached listing for `dir` (fetching + replacing the slot on miss or
+/// staleness; the lock is held across the fetch, so a slow bwrap spawn
+/// can't stampede).
+fn listing_for(dir: &str, sandbox: bool) -> Listing {
+    let Ok(mut guard) = LISTING.lock() else {
+        return fetch_listing(dir, sandbox);
+    };
+    if let Some(slot) = guard.as_ref() {
+        if slot.dir == dir && slot.sandbox == sandbox && slot_fresh(slot) {
+            return if slot.invisible {
+                Listing::Invisible
+            } else {
+                Listing::Found(slot.entries.clone())
+            };
         }
     }
+    let dir_mtime = if sandbox {
+        None
+    } else {
+        // Captured before listing: a change after the stat makes the
+        // stored mtime stale → the next call refetches.
+        std::fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let listing = fetch_listing(dir, sandbox);
+    let (entries, invisible) = match &listing {
+        Listing::Found(entries) => (entries.clone(), false),
+        Listing::Invisible => (Vec::new(), true),
+    };
+    *guard = Some(ListingSlot {
+        dir: dir.to_string(),
+        sandbox,
+        entries,
+        invisible,
+        fetched_at: Instant::now(),
+        dir_mtime,
+    });
+    listing
+}
+
+/// Uncached fetch: sandbox listing wins; configured-but-invisible ⇒
+/// `Invisible`; no sandbox ⇒ host fallback.
+fn fetch_listing(dir: &str, sandbox: bool) -> Listing {
+    if sandbox {
+        return match list_sandbox(dir) {
+            Some(entries) => Listing::Found(sorted(entries)),
+            None if crate::tools::sandbox_config().is_some() => Listing::Invisible,
+            None => Listing::Found(sorted(list_host(dir))),
+        };
+    }
+    Listing::Found(sorted(list_host(dir)))
+}
+
+/// Path-sorted — the ranking input (empty query ⇒ alphabetical).
+fn sorted(mut entries: Vec<Entry>) -> Vec<Entry> {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries
 }
@@ -256,11 +405,28 @@ mod tests {
     }
 
     #[test]
+    fn split_prefix_empty_parent_is_dot() {
+        // v1 returned nothing for bare relative words (read_dir("") fails);
+        // the dot gate makes them reachable, so the parent must be ".".
+        assert_eq!(
+            split_prefix(".gitignore", false),
+            (".".to_string(), ".gitignore".to_string())
+        );
+        assert_eq!(split_prefix("foo", false), (".".to_string(), "foo".to_string()));
+        assert_eq!(split_prefix("x/y", false), ("x".to_string(), "y".to_string()));
+        assert_eq!(split_prefix("/a/b/", true), ("/a/b".to_string(), String::new()));
+        assert_eq!(split_prefix("/", true), ("/".to_string(), String::new()));
+        assert_eq!(split_prefix("/a/b", true), ("/a/b".to_string(), String::new()));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn empty_prefix_is_inert() {
         assert!(complete("", false).is_empty());
     }
 
     #[test]
+    #[serial_test::serial]
     fn host_dir_listing_full_paths_sorted_with_metadata() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("a.txt"), "hello"); // 5 bytes
@@ -301,6 +467,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn host_existing_dir_without_slash_lists_children() {
         // v1 quirk preserved: an existing dir prefix lists its contents
         // even without a trailing slash.
@@ -310,6 +477,61 @@ mod tests {
         let entries = complete(&format!("{}/sub", dir.path().display()), false);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert!(entries[0].path.ends_with("sub/x"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stem_ranking_prefix_then_fuzzy() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("abcde"), "1");
+        write(&dir.path().join("someabc"), "2");
+        write(&dir.path().join("zzz"), "3");
+
+        let got = complete(&format!("{}/abc", dir.path().display()), false);
+        let names: Vec<&str> = got.iter().map(|e| basename_of(&e.path)).collect();
+        // Prefix tier first, fuzzy second, non-match dropped — the whole
+        // dir is ranked (v1's strict starts_with would drop someabc).
+        assert_eq!(names, vec!["abcde", "someabc"], "{names:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dir_level_listing_is_alphabetical() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("zeta"), "");
+        write(&dir.path().join("alpha"), "");
+        write(&dir.path().join("mid"), "");
+
+        let got = complete(&format!("{}/", dir.path().display()), false);
+        let names: Vec<&str> = got.iter().map(|e| basename_of(&e.path)).collect();
+        // Empty stem ⇒ rank_candidates' input order ⇒ path-sorted.
+        assert_eq!(names, vec!["alpha", "mid", "zeta"], "{names:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn host_listing_cache_revalidates_on_change() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("first"), "");
+        let e1 = complete(&format!("{}/", dir.path().display()), false);
+        assert!(e1.iter().any(|e| e.path.ends_with("/first")));
+
+        write(&dir.path().join("second"), "");
+        let e2 = complete(&format!("{}/", dir.path().display()), false);
+        assert!(
+            e2.iter().any(|e| e.path.ends_with("/second")),
+            "dir-mtime revalidation must refetch: {e2:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn listing_stale_tracks_slot_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("x"), "");
+        let _ = complete(&format!("{}/", dir.path().display()), false);
+        assert!(!listing_stale(false), "fresh host slot");
+        assert!(listing_stale(true), "mode mismatch is stale");
     }
 
     #[test]
@@ -374,7 +596,7 @@ mod tests {
         assert!(d.ends_with("  4096"), "{d}");
     }
 
-    #[test]
+        #[test]
     #[serial_test::serial]
     fn sandbox_flag_falls_back_to_host_when_no_sandbox() {
         crate::tools::set_sandbox(None);

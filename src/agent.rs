@@ -4003,6 +4003,72 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         }
                     }
                 }
+                crate::slash_menu_bridge::AsyncOp::Sandbox(op) => {
+                    // Relocated v2.0 /sandbox handler: mutate the state
+                    // store, then re-publish the merged config — BOTH
+                    // `tools::set_sandbox` (live) AND `config.sandbox`
+                    // (so the merge survives a lazy agent rebuild, which
+                    // does `set_sandbox(config.sandbox.clone())`).
+                    use crate::slash_menu_bridge::SandboxOp;
+                    let result = match &op {
+                        SandboxOp::Add {
+                            host_path,
+                            sandbox_path,
+                            mode,
+                        } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
+                        SandboxOp::Remove { sandbox_path } => {
+                            crate::sandbox_state::remove(sandbox_path)
+                        }
+                        SandboxOp::Exclude { sandbox_path } => {
+                            crate::sandbox_state::exclude(sandbox_path)
+                        }
+                        SandboxOp::Restore { sandbox_path } => {
+                            crate::sandbox_state::restore(sandbox_path)
+                        }
+                    };
+                    match result {
+                        Ok(()) => {
+                            let mut merged = config.sandbox.clone().unwrap_or_default();
+                            crate::sandbox_state::merge_into(&mut merged);
+                            crate::tools::set_sandbox(Some(merged.clone()));
+                            config.sandbox = Some(merged);
+                            let msg = match &op {
+                                SandboxOp::Add {
+                                    host_path,
+                                    sandbox_path,
+                                    mode,
+                                } => {
+                                    let m = if *mode == crate::config::BindMode::Rw {
+                                        "add_rw"
+                                    } else {
+                                        "add_ro"
+                                    };
+                                    if sandbox_path.is_empty() {
+                                        format!("sandbox: {} {} (ok)", m, host_path)
+                                    } else {
+                                        format!(
+                                            "sandbox: {} {} → {} (ok)",
+                                            m, host_path, sandbox_path
+                                        )
+                                    }
+                                }
+                                SandboxOp::Remove { sandbox_path } => {
+                                    format!("sandbox: removed {} (ok)", sandbox_path)
+                                }
+                                SandboxOp::Exclude { sandbox_path } => {
+                                    format!("sandbox: excluded {} (ok)", sandbox_path)
+                                }
+                                SandboxOp::Restore { sandbox_path } => {
+                                    format!("sandbox: restored {} (ok)", sandbox_path)
+                                }
+                            };
+                            config.output.display_text(&msg);
+                        }
+                        Err(e) => {
+                            config.output.display_text(&format!("sandbox error: {}", e));
+                        }
+                    }
+                }
             }
             continue;
         }

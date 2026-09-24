@@ -67,9 +67,9 @@ pub fn registry() -> &'static [SlashCommand] {
             help: "Quit the session",
             kind: SlashKind::Quit,
         },
-        SlashCommand {
+                SlashCommand {
             name: "/sandbox",
-            help: "Manage session path bindings: add_ro | add_rw | remove",
+            help: "Manage sandbox path mappings: add ro | add rw | remove",
             kind: SlashKind::Sandbox,
         },
         SlashCommand {

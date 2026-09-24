@@ -733,6 +733,10 @@ static SANDBOX: std::sync::LazyLock<std::sync::Mutex<Arc<Option<SandboxConfig>>>
 
 pub(crate) fn set_sandbox(cfg: Option<SandboxConfig>) {
     *SANDBOX.lock().expect("sandbox lock poisoned") = Arc::new(cfg);
+    // Dir visibility inside the sandbox may have changed with the
+    // config — drop the completion L1 cache so the next completion
+    // re-lists (and `listing_stale` reports stale to row caches).
+    crate::path_complete::invalidate_listing();
 }
 
 pub(crate) fn sandbox_config() -> Arc<Option<SandboxConfig>> {

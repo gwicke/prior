@@ -73,9 +73,6 @@ pub fn exclude(sandbox_path: &str) -> Result<(), String> {
 
 /// Re-enable a temporarily excluded config binding (drop it from the
 /// exclusion list).
-// Consumed by `AsyncOp::Sandbox(Restore)` once the v2.5 `/sandbox` port
-// lands; until then it has no caller.
-#[allow(dead_code)]
 pub fn restore(sandbox_path: &str) -> Result<(), String> {
     let resolved = resolve_sandbox_path(sandbox_path);
     let mut exc = EXCLUDED.lock().map_err(|e| format!("lock error: {}", e))?;
@@ -297,11 +294,18 @@ fn resolve_sandbox_path(path: &str) -> PathBuf {
     path_util::normalize(&path_util::expand_tilde(path))
 }
 
-/// Clear all session bindings (used in tests).
+    /// Clear all session bindings, exclusions, and the base-config
+    /// snapshot (used in tests).
 #[cfg(test)]
 pub fn clear() {
     if let Ok(mut b) = SESSION_BINDS.lock() {
         b.clear();
+    }
+    if let Ok(mut e) = EXCLUDED.lock() {
+        e.clear();
+    }
+    if let Ok(mut b) = BASE_CONFIG.lock() {
+        *b = None;
     }
 }
 

@@ -186,6 +186,9 @@ pub enum AsyncOp {
         mode: CompactMode,
         payload: String,
     },
+        /// Mutate the sandbox path mappings (v2.5 `/sandbox`). The agent
+    /// loop owns `config`, so it performs the mutation + re-publish.
+    Sandbox(SandboxOp),
 }
 
 /// Compact mode for `AsyncOp::TreeCompact`.
@@ -197,6 +200,26 @@ pub enum CompactMode {
     TextOnly,
     /// LLM-generated summary; `payload` is the custom prompt.
     Prompt,
+}
+
+/// Sandbox path-mapping mutations requested by the v2.5 `/sandbox`
+/// nodes. Executed by the agent loop (it owns `config`, which must be
+/// re-published with the merged bindings — see the `AsyncOp::Sandbox`
+/// arm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxOp {
+    /// Add/upgrade a session binding.
+    Add {
+        host_path: String,
+        sandbox_path: String,
+        mode: crate::config::BindMode,
+    },
+    /// Remove a session binding.
+    Remove { sandbox_path: String },
+    /// Temporarily exclude a config binding.
+    Exclude { sandbox_path: String },
+    /// Re-enable an excluded config binding.
+    Restore { sandbox_path: String },
 }
 
 impl MenuShared {

@@ -113,6 +113,12 @@ pub fn build_menu(
         root.add_child(crate::v25_tree::build_tree_node(shared));
     }
 
+    // Sandbox (/sandbox) — path mappings: static add + dynamic mapping
+    // listing with remove/restore actions.
+    {
+        root.add_child(crate::v25_sandbox::build_sandbox_node(shared));
+    }
+
     // Quit (/quit) — leaf node; sets AsyncOp::Quit.
     {
         root.add_child(crate::v25_quit::QuitNode {
