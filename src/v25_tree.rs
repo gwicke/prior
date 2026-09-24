@@ -18,6 +18,7 @@ use crate::slashdot_menu::node_impl::{
     SubmitResult,
 };
 use crate::slashdot_menu::fields::ColumnDef;
+use crate::slashdot_menu::value::Value;
 
 // ---------------------------------------------------------------------------
 // Entry display helpers (ported from repl.rs entry_display_label)
@@ -122,6 +123,31 @@ fn sanitise_single_line(text: &str) -> String {
         .join(" ")
 }
 
+/// Strip carriage returns and control characters, **keeping `\n` and
+/// `\t`** — row descriptions carry full multi-line text (design: "Full
+/// message text as the description"). The listing's wrap-disabled table
+/// flattens `\n` to spaces and ellipsizes for display; fuzzy rank and
+/// `header()` see the raw multi-line string.
+fn sanitise_multiline(text: &str) -> String {
+    text.replace('\r', "")
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
+}
+
+/// Cap a compaction "from" context line at `max` characters (char-safe),
+/// appending an ellipsis when cut — enough to identify the line in the
+/// listing without flooding it.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Active-path computation
 // ---------------------------------------------------------------------------
@@ -183,17 +209,23 @@ fn find_entry<'a>(
     None
 }
 
-/// One row in the flattened tree. `header()` reads full text, role, and
-/// timestamp straight from the raw entry (`find_entry`), so rows only
-/// carry listing/selection data.
+/// One row in the flattened tree. The row *is* the data: listing
+/// display, fuzzy rank, filters, and `header()` all read it (design:
+/// "header() → entry detail from the same cached row data").
 struct FlatRow {
     indent: usize,
-    label: String,
+    /// Full row text (markers + body, newlines kept). The listing's
+    /// wrap-disabled table flattens it to one line for display.
+    desc: String,
     entry_id: String,
     on_active_path: bool,
     is_current: bool,
-    /// Role for listing metadata.
+    /// Role for listing metadata (`entry_role`).
     role: String,
+    /// Entry timestamp (ISO 8601) — shown by `header()`, filterable.
+    timestamp: String,
+    /// Terminal endpoint of a branch: no visible entries below.
+    is_terminal: bool,
 }
 
 /// Build a label map: entry ID → display label (for compaction rows that
@@ -284,6 +316,53 @@ fn entry_role(entry: &SessionEntry) -> String {
     }
 }
 
+/// Ids of visible entries with no visible entries anywhere below them —
+/// the branch endpoints shown in the listing. Invisible meta entries
+/// (tool results, session info) don't count as descendants, so a
+/// visible message above a dead-end tool result is the endpoint you
+/// actually see.
+///
+/// Iterative post-order (deep linear sessions overflow recursion):
+/// `(node, expanded)` state stack; `has_vis` = "some visible entry
+/// exists in this node's subtree".
+fn visible_terminals(
+    nodes: &[SessionTreeNode],
+    labels: &HashMap<String, String>,
+) -> HashSet<String> {
+    let visible = |n: &SessionTreeNode| -> bool {
+        !entry_display_label_ext(&n.entry, n.label.as_deref(), labels).is_empty()
+    };
+    let mut terminals = HashSet::new();
+    let mut has_vis: HashMap<String, bool> = HashMap::new();
+    let mut stack: Vec<(&SessionTreeNode, bool)> = Vec::new();
+    for n in nodes.iter().rev() {
+        stack.push((n, false));
+    }
+    while let Some((node, expanded)) = stack.pop() {
+        if !expanded {
+            stack.push((node, true));
+            for child in node.children.iter().rev() {
+                stack.push((child, false));
+            }
+            continue;
+        }
+        let mut has = false;
+        for child in &node.children {
+            if visible(child)
+                || has_vis.get(&child.entry.id).copied().unwrap_or(false)
+            {
+                has = true;
+                break;
+            }
+        }
+        if visible(node) && !has {
+            terminals.insert(node.entry.id.clone());
+        }
+        has_vis.insert(node.entry.id.clone(), has);
+    }
+    terminals
+}
+
 /// Recursively flatten the tree into rows.
 fn flatten_turns(
     nodes: &[SessionTreeNode],
@@ -291,6 +370,7 @@ fn flatten_turns(
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
+    terminals: &HashSet<String>,
     out: &mut Vec<FlatRow>,
 ) {
     // Iterative DFS to avoid stack overflow on deep linear sessions.
@@ -323,14 +403,19 @@ fn flatten_turns(
         let is_active = active_path.contains(&node.entry.id);
         let is_current = leaf_id == Some(node.entry.id.as_str());
         let role = entry_role(&node.entry);
+        let desc = entry_row_desc(&node.entry, node.label.as_deref(), labels);
+        let timestamp = node.entry.timestamp.clone();
+        let is_terminal = terminals.contains(&node.entry.id);
 
         out.push(FlatRow {
             indent: row_indent,
-            label,
+            desc,
             entry_id: node.entry.id.clone(),
             on_active_path: is_active,
             is_current,
             role,
+            timestamp,
+            is_terminal,
         });
 
         // Push children in reverse so first child is processed first.
@@ -365,6 +450,47 @@ fn entry_display_label_ext(
     }
 }
 
+/// Full row description for a *visible* entry — what fuzzy rank and
+/// `header()` see (design: "Full message text as the description").
+/// Differs from the single-line listing label in two ways: messages
+/// keep their newlines, and compactions carry both the truncated
+/// "from" context (identifying line) and the summary text.
+fn entry_row_desc(
+    entry: &SessionEntry,
+    label: Option<&str>,
+    labels: &HashMap<String, String>,
+) -> String {
+    match &entry.content {
+        SessionEntryContent::Message { .. } => sanitise_multiline(&entry_full_text(entry)),
+        SessionEntryContent::Compaction {
+            first_kept_entry_id,
+            summary,
+            ..
+        } => {
+            let kept = labels
+                .get(first_kept_entry_id)
+                .map(|t| sanitise_single_line(t))
+                .or_else(|| label.map(|l| sanitise_single_line(l)));
+            let head = match kept {
+                Some(t) if !t.is_empty() => format!("from {}", truncate_chars(&t, 300)),
+                _ => format!("before {}", first_kept_entry_id),
+            };
+            format!("[COMPACT] {}\n{}", head, sanitise_multiline(summary))
+        }
+        SessionEntryContent::BranchSummary { summary, .. } => {
+            let s = sanitise_multiline(summary);
+            if s.is_empty() {
+                "[SUMMARY] (branch summary)".into()
+            } else {
+                format!("[SUMMARY] {}", s)
+            }
+        }
+        // Model/thinking/label/custom keep their marker labels; meta
+        // entries never reach here (invisible, no row).
+        _ => entry_display_label_ext(entry, label, labels),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Column definitions
 // ---------------------------------------------------------------------------
@@ -377,7 +503,13 @@ pub fn tree_listing_columns() -> Vec<ColumnDef> {
 
 /// Field metadata for the tree listing.
 pub fn tree_fields() -> Vec<FieldSpec> {
-    vec![FieldSpec::new("role", false)]
+    let mut tags = FieldSpec::new("tags", false);
+    tags.description = Some("leaf = branch endpoint".to_string());
+    vec![
+        FieldSpec::new("role", false),
+        FieldSpec::new("timestamp", false),
+        tags,
+    ]
 }
 
 /// Wrap `text` to `width` columns, prefixing the first line with `prefix`.
@@ -457,8 +589,6 @@ impl TreeListNode {
 
 impl SlashDotNode for TreeListNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        use crate::slashdot_menu::value::Value;
-
         // Read the shared tree (Rc — O(1) clone, no deep copy).
         let tree_rc = self.shared.raw_tree.borrow().clone();
         let leaf = self.shared.leaf_id.borrow().clone();
@@ -487,6 +617,7 @@ impl SlashDotNode for TreeListNode {
             .unwrap_or_default();
 
         let labels = build_label_map(&tree_rc);
+        let terminals = visible_terminals(&tree_rc, &labels);
         let mut flat = Vec::new();
         flatten_turns(
             &tree_rc,
@@ -494,21 +625,29 @@ impl SlashDotNode for TreeListNode {
             leaf.as_deref(),
             &active_path,
             &labels,
+            &terminals,
             &mut flat,
         );
 
         let rows: Vec<Row> = flat
             .iter()
             .map(|r| {
-                let padded_label = format!("{:indent$}{}", "", r.label, indent = r.indent);
+                let padded = format!("{:indent$}{}", "", r.desc, indent = r.indent);
                 let mut row = Row::new(r.entry_id.clone())
-                    .desc(padded_label)
-                    .field("role", Value::Str(r.role.clone()));
+                    .desc(padded)
+                    .field("role", Value::Str(r.role.clone()))
+                    .field("timestamp", Value::Str(r.timestamp.clone()));
                 if r.on_active_path {
                     row = row.field("on_path", Value::Str("1".into()));
                 }
                 if r.is_current {
                     row = row.field("leaf", Value::Str("1".into()));
+                }
+                // Optional tag: present only on branch endpoints, so
+                // `.tags:leaf` (missing field ⇒ row dropped) filters to
+                // terminal nodes.
+                if r.is_terminal {
+                    row = row.field("tags", Value::Str("leaf".into()));
                 }
                 row
             })
@@ -549,45 +688,45 @@ impl SlashDotNode for TreeListNode {
             return vec!["Select a tree entry, then choose an action.".to_string()];
         };
 
-        // Call self.data() to ensure the cache is populated (cheap Rc::ptr_eq
-        // return if the tree hasn't changed).
-        let _ = self.data(0, path_args);
-
-        // Find the entry in the raw tree for full details.
-        let tree_borrow = self.shared.raw_tree.borrow();
-        let tree: &[SessionTreeNode] = &tree_borrow;
-
-        let Some(node) = find_entry(tree, entry_id) else {
+        // Refresh the cache (cheap Rc::ptr_eq when unchanged) and render
+        // from the row — the same data the listing and fuzzy search use
+        // (design: "header() → entry detail from the same cached row data").
+        let Ok(resp) = self.data(0, path_args) else {
             return vec![format!("Entry not found: {}", entry_id)];
         };
-
-        let entry = &node.entry;
-        let role = entry_role(entry);
-        let ts = &entry.timestamp;
-        let tw = render_ctx.term_width.max(1).saturating_sub(2);
-        let lines: Vec<String> = match &entry.content {
-            SessionEntryContent::Message { message: _ } => {
-                let full = entry_full_text(entry);
-                let prefix = format!("[{} {}] ", role.to_uppercase(), ts);
-                wrap_with_prefix(&prefix, &full, tw)
-            }
-            SessionEntryContent::Compaction { summary, .. } => {
-                let prefix = format!("[COMPACT {}] ", ts);
-                wrap_with_prefix(&prefix, summary, tw)
-            }
-            SessionEntryContent::ModelChange { provider, model_id } => {
-                vec![format!("[MODEL] {}/{} ({})", provider, model_id, ts)]
-            }
-            SessionEntryContent::ThinkingLevelChange { thinking_level } => {
-                vec![format!("[THINK] {} ({})", thinking_level, ts)]
-            }
-            SessionEntryContent::BranchSummary { summary, .. } => {
-                let prefix = format!("[SUMMARY {}] ", ts);
-                wrap_with_prefix(&prefix, summary, tw)
-            }
-            _ => vec![format!("[{}] {}", role, ts)],
+        let Some(row) = resp.rows.iter().find(|r| r.id == entry_id) else {
+            return vec![format!("Entry not found: {}", entry_id)];
         };
-        lines
+        let field_str = |name: &str| -> String {
+            match row.fields.iter().find(|(k, _)| k == name) {
+                Some((_, Value::Str(s))) => s.clone(),
+                _ => String::new(),
+            }
+        };
+        let role = field_str("role");
+        let ts = field_str("timestamp");
+        // Full text incl. markers; drop the tree indent for display.
+        let body = row.description.as_deref().unwrap_or_default().trim_start();
+        let tw = render_ctx.term_width.max(1).saturating_sub(2);
+        match role.as_str() {
+            "compaction" => {
+                let text = body.strip_prefix("[COMPACT] ").unwrap_or(body);
+                wrap_with_prefix(&format!("[COMPACT {}] ", ts), text, tw)
+            }
+            "summary" => {
+                let text = body.strip_prefix("[SUMMARY] ").unwrap_or(body);
+                wrap_with_prefix(&format!("[SUMMARY {}] ", ts), text, tw)
+            }
+            // Marker already in the body; timestamp goes in parens.
+            "model" | "thinking" => vec![format!("{} ({})", body, ts)],
+            "user" | "assistant" => wrap_with_prefix(
+                &format!("[{} {}] ", role.to_uppercase(), ts),
+                body,
+                tw,
+            ),
+            // Label/custom/meta: terse legacy form.
+            r => vec![format!("[{}] {}", r, ts)],
+        }
     }
 }
 
@@ -1090,6 +1229,141 @@ mod tests {
         assert!(joined.contains("hello"), "header should contain message text: {}", joined);
         assert!(joined.contains("world"), "header should contain full text: {}", joined);
         assert!(joined.contains("USER"), "header should contain role: {}", joined);
+    }
+
+    fn row_field(row: &Row, name: &str) -> Option<String> {
+        row.fields.iter().find(|(k, _)| k == name).and_then(|(_, v)| {
+            match v {
+                crate::slashdot_menu::value::Value::Str(s) => Some(s.clone()),
+                _ => None,
+            }
+        })
+    }
+
+    fn tree_path(ids: &[&str]) -> PathArgs {
+        PathArgs {
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+            suffix: String::new(),
+            args: Default::default(),
+        }
+    }
+
+    #[test]
+    fn tree_row_desc_keeps_newlines_and_carries_fields() {
+        let tree = vec![node(
+            make_entry("u1", None, "user", "hello\nworld"),
+            vec![],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared.clone());
+        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let row = resp
+            .rows
+            .iter()
+            .find(|r| r.id == "u1")
+            .expect("u1 row");
+        let desc = row.description.clone().unwrap_or_default();
+        assert!(desc.contains("hello\nworld"),
+            "desc must keep newlines for header/fuzzy: {:?}", desc);
+        assert_eq!(row_field(row, "role").as_deref(), Some("user"));
+        assert_eq!(
+            row_field(row, "timestamp").as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn tree_terminal_nodes_get_leaf_tag() {
+        let tree = vec![node(
+            make_entry("u1", None, "user", "parent"),
+            vec![
+                node(make_entry("u2", Some("u1"), "user", "child a"), vec![]),
+                node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
+            ],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared.clone());
+        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let tags = |id: &str| {
+            resp.rows
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| row_field(r, "tags"))
+        };
+        assert_eq!(tags("u1"), None,
+            "parent has visible children — not a leaf endpoint");
+        assert_eq!(tags("u2"), Some("leaf".to_string()));
+        assert_eq!(tags("u3"), Some("leaf".to_string()));
+    }
+
+    #[test]
+    fn tree_terminal_hides_behind_visible_descendants() {
+        // u1 → u2 (invisible tool result) → u3 (visible): u1 is NOT a
+        // terminal (visible descendant below), u3 is.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "start"),
+            vec![node(
+                make_entry("u2", Some("u1"), "toolResult", ""),
+                vec![node(
+                    make_entry("u3", Some("u2"), "user", "after tools"),
+                    vec![],
+                )],
+            )],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared.clone());
+        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let tags = |id: &str| {
+            resp.rows
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| row_field(r, "tags"))
+        };
+        assert_eq!(tags("u1"), None, "visible descendant below");
+        assert_eq!(tags("u3"), Some("leaf".to_string()));
+        assert!(resp.rows.iter().all(|r| r.id != "u2"),
+            "invisible tool result has no row");
+    }
+
+    #[test]
+    fn tree_compaction_header_from_cached_row() {
+        let compaction = SessionEntry {
+            id: "c1".into(),
+            parent_id: Some("u1".into()),
+            timestamp: "2025-01-02T00:00:00.000Z".into(),
+            content: SessionEntryContent::Compaction {
+                summary: "summarised body".into(),
+                first_kept_entry_id: "u1".into(),
+                tokens_before: 100,
+            },
+        };
+        let tree = vec![node(
+            make_entry("u1", None, "user", "kept context line"),
+            vec![node(compaction, vec![])],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut tree_node = TreeListNode::new(shared.clone());
+
+        // Desc carries the truncated "from" context AND the summary.
+        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let row = resp.rows.iter().find(|r| r.id == "c1").expect("c1 row");
+        let desc = row.description.clone().unwrap_or_default();
+        assert!(desc.contains("[COMPACT] from kept context line"),
+            "desc from-context: {:?}", desc);
+        assert!(desc.contains("summarised body"), "desc summary: {:?}", desc);
+        assert_eq!(row_field(row, "tags").as_deref(), Some("leaf"));
+
+        // Header renders from that row: marker with timestamp, then
+        // from-context, then summary.
+        let header = tree_node.header(&tree_path(&["tree", "c1"]),
+            &RenderContext { term_width: 120 });
+        let joined = header.join("\n");
+        assert!(joined.contains("[COMPACT 2025-01-02"),
+            "header timestamped marker: {}", joined);
+        assert!(joined.contains("from kept context line"),
+            "header from-context: {}", joined);
+        assert!(joined.contains("summarised body"),
+            "header summary: {}", joined);
     }
 
     // --- Switch ---

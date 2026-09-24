@@ -647,6 +647,36 @@ integration, 0 failed.
 Gate: `cargo check --all-targets --workspace` → 0 warnings; full
 workspace tests green (623 + 133 + integration, 0 failed).
 
+### Step 17: /tree rows as the single data source + `tags` — DONE
+
+Closes the two open `slashdot/tree_design.md` points surfaced during
+the warning cleanup (`FlatRow.full_text/timestamp` had been born dead
+in the port — scaffolding for these):
+
+- **Full text in rows**: `entry_row_desc()` — messages keep newlines
+  (`sanitise_multiline`: control chars stripped, `\n`/`\t` kept);
+  compactions carry `[COMPACT] from <kept context ≤300 chars>` + `\n`
+  + summary; model/thinking/summary/label keep their marker labels.
+  The tree column is wrap-disabled, so `Table::render` already
+  flattens `\n` + ellipsizes for display — listing output unchanged,
+  fuzzy rank (`id` + `description`) sees the full multi-line text.
+- **`header()` from the cached row**: no raw-tree `find_entry` walk and
+  no cache-warm-and-discard; role/timestamp from row fields, body from
+  the description (indent stripped; `[COMPACT]`/`[SUMMARY]` marker
+  re-stamped with the timestamp; model/thinking append ` (ts)`).
+- **`tags` field (optional)**: `visible_terminals()` — iterative
+  post-order, visibility-aware (invisible tool results don't hide the
+  visible endpoint above them) — tags branch endpoints
+  `tags="leaf"`; other rows omit the field, so `.tags:leaf` (missing ⇒
+  row dropped, exact match) filters to terminals. No filter code.
+  Declared in `tree_fields()` (`leaf = branch endpoint`); `timestamp`
+  newly declared too (filterable/sortable).
+
+Tests: +4 — desc newlines + role/timestamp fields, terminal tagging,
+invisible-descendant edge, compaction from+summary desc + header.
+Workspace green: 627 lib + 133 crate + all integration, 0 failed;
+0 warnings.
+
 ---
 
 ## 5a. Follow-up: global app state and async (post-migration)
