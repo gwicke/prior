@@ -178,7 +178,7 @@ pub struct EditOp {
 ///
 /// - single edit: `{path, oldText, newText, startLine?}` — `startLine` is the
 ///   anchor.
-/// - block edit:  `{path?, edits: "<Aider SEARCH/REPLACE blocks>"}` — anchors
+/// - block edit:  `{path?, edits: "<Aider inspired SEARCH/REPLACE blocks>"}` — anchors
 ///   come from each block's `path:LINE` header; a top-level `startLine` is
 ///   ignored in this shape.
 /// - legacy batch (replay only): `{path, edits: [{oldText, newText, startLine?}]}`
@@ -473,7 +473,17 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in a file. For one edit use `oldText`/`newText`. For several edits in one call, put SEARCH/REPLACE blocks in the `edits` string (single file). Each block is `@@@OLD` then the exact text, `@@@DIV`, the replacement, `@@@NEW`. Each edit's old text must occur exactly once, or be disambiguated with a `path:LINE` anchor (a line number acts as a near-line hint, not a range). Edits are computed against the original file, not incrementally.".into()
+        "Replace text in a file. Prefer the following block syntax in the `edits` string:
+```
+some/path
+@@@OLD
+the original text
+@@@DIV
+the replacement text
+@@@NEW
+```
+You can send many edit blocks in a single `edits` batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
+For single edits, the traditional OpenAI path / oldText / newText API is available as well.".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
