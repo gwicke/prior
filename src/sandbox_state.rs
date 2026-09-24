@@ -1,13 +1,12 @@
-//! Session-scoped temporary path bindings for the sandbox.
+//! Session-scoped sandbox path-mapping **state** — data/state-only (no UI
+//! code; the `/sandbox` menu nodes live in `v25_sandbox`).
 //!
-//! The `/sandbox` slash menu adds/removes entries here; they are merged into
-//! the live `SandboxConfig` before each `bwrap` invocation, but are **never**
-//! persisted to `settings.toml`.
-//!
-//! Also stores a snapshot of the **base** config (from `settings.toml`) so the
-//! `/sandbox remove` overlay can list **all** bindings (both config-provided
-//! and ad-hoc session binds) and the user can temporarily exclude config
-//! shares.
+//! Stores the session bindings, a snapshot of the **base** config (from
+//! `settings.toml`), and the exclusion set. Session entries are merged
+//! into the live `SandboxConfig` before each `bwrap` invocation
+//! ([`merge_into`]) but are **never** persisted. The base snapshot lets
+//! listings show config-provided bindings and lets the user temporarily
+//! exclude them (re-enabled via [`restore`]).
 //!
 //! All public functions are thread-safe (backed by a `Mutex`).
 
@@ -72,9 +71,12 @@ pub fn exclude(sandbox_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Remove a path from the exclusion list (re-enable a config binding).
+/// Re-enable a temporarily excluded config binding (drop it from the
+/// exclusion list).
+// Consumed by `AsyncOp::Sandbox(Restore)` once the v2.5 `/sandbox` port
+// lands; until then it has no caller.
 #[allow(dead_code)]
-pub fn remove_exclude(sandbox_path: &str) -> Result<(), String> {
+pub fn restore(sandbox_path: &str) -> Result<(), String> {
     let resolved = resolve_sandbox_path(sandbox_path);
     let mut exc = EXCLUDED.lock().map_err(|e| format!("lock error: {}", e))?;
     exc.retain(|p| *p != resolved);
@@ -86,12 +88,14 @@ pub fn list_excluded() -> Vec<PathBuf> {
     EXCLUDED.lock().map(|e| e.clone()).unwrap_or_default()
 }
 
-/// Add a read-only path binding for the session.
+/// Add (or upgrade) a session binding with the given `mode`.
 ///
 /// `host_path` is resolved against the CWD (`~` expanded); it must exist.
 /// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
-/// empty).  Returns an error if the host path does not exist.
-pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
+/// empty).  An existing binding with the same sandbox path is upgraded
+/// (mode + host overwritten).  Returns an error if the host path does not
+/// exist.
+pub fn add(host_path: &str, sandbox_path: &str, mode: BindMode) -> Result<(), String> {
     let host = path_util::resolve_canonical(host_path)?;
     let sandbox = if sandbox_path.is_empty() {
         host.clone()
@@ -101,43 +105,28 @@ pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
     let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
     // Dedup by sandbox (in-sandbox) path.
     if let Some(pos) = binds.iter().position(|b| b.sandbox_path == sandbox) {
-        binds[pos].mode = BindMode::Ro;
+        binds[pos].mode = mode;
         binds[pos].host_path = host;
     } else {
         binds.push(SessionBind {
             host_path: host,
             sandbox_path: sandbox,
-            mode: BindMode::Ro,
+            mode,
         });
     }
     Ok(())
 }
 
-/// Add a read-write path binding for the session.
-///
-/// `host_path` is resolved against the CWD (`~` expanded); it must exist.
-/// `sandbox_path` is the in-sandbox destination (defaults to `host_path` when
-/// empty).  Returns an error if the host path does not exist.
+/// Read-only shorthand for [`add`] (kept for the v2.0 overlay handler,
+/// retired with the v2.5 `/sandbox` port).
+pub fn add_ro(host_path: &str, sandbox_path: &str) -> Result<(), String> {
+    add(host_path, sandbox_path, BindMode::Ro)
+}
+
+/// Read-write shorthand for [`add`] (kept for the v2.0 overlay handler,
+/// retired with the v2.5 `/sandbox` port).
 pub fn add_rw(host_path: &str, sandbox_path: &str) -> Result<(), String> {
-    let host = path_util::resolve_canonical(host_path)?;
-    let sandbox = if sandbox_path.is_empty() {
-        host.clone()
-    } else {
-        resolve_sandbox_path(sandbox_path)
-    };
-    let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
-    // Dedup by sandbox (in-sandbox) path.
-    if let Some(pos) = binds.iter().position(|b| b.sandbox_path == sandbox) {
-        binds[pos].mode = BindMode::Rw;
-        binds[pos].host_path = host;
-    } else {
-        binds.push(SessionBind {
-            host_path: host,
-            sandbox_path: sandbox,
-            mode: BindMode::Rw,
-        });
-    }
-    Ok(())
+    add(host_path, sandbox_path, BindMode::Rw)
 }
 
 /// Remove a path binding from the session.
@@ -442,5 +431,42 @@ mod tests {
         let ps = path.to_string_lossy();
         let result = remove(&ps);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_with_explicit_mode() {
+        setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("add_mode");
+        fs::create_dir_all(&path).unwrap();
+        let ps = path.to_string_lossy();
+
+        add(&ps, "", BindMode::Rw).unwrap();
+        let binds = list();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].mode, BindMode::Rw);
+        assert_eq!(binds[0].host_path, binds[0].sandbox_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_restore_re_enables_excluded() {
+        setup();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restore_me");
+        fs::create_dir_all(&path).unwrap();
+        let ps = path.to_string_lossy();
+
+        exclude(&ps).unwrap();
+        assert!(
+            list_excluded().iter().any(|p| *p == path),
+            "must be excluded after exclude()"
+        );
+        restore(&ps).unwrap();
+        assert!(
+            !list_excluded().iter().any(|p| *p == path),
+            "must be re-enabled after restore()"
+        );
     }
 }

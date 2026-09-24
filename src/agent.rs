@@ -3510,7 +3510,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     let mut config = config;
     // Store the original (non-merged) sandbox config so the remove overlay
     // can list config-provided bindings and allow temporary exclusion.
-    crate::sandbox_bindings::set_base(config.sandbox.clone());
+    crate::sandbox_state::set_base(config.sandbox.clone());
     // Publish the resolved sandbox config immediately so that user-initiated
     // `!`/`!!` shell commands use the same bwrap/timeout policy as the agent's
     // `bash` tool — even before the agent is lazily created on the first
@@ -4095,10 +4095,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
             }
             InputAction::Sandbox(sub, path, sandbox_path) => {
                 let result = match sub.as_str() {
-                    "add_ro" => crate::sandbox_bindings::add_ro(&path, &sandbox_path),
-                    "add_rw" => crate::sandbox_bindings::add_rw(&path, &sandbox_path),
-                    "remove" => crate::sandbox_bindings::remove(&path),
-                    "exclude" => crate::sandbox_bindings::exclude(&path),
+                    "add_ro" => crate::sandbox_state::add_ro(&path, &sandbox_path),
+                    "add_rw" => crate::sandbox_state::add_rw(&path, &sandbox_path),
+                    "remove" => crate::sandbox_state::remove(&path),
+                    "exclude" => crate::sandbox_state::exclude(&path),
                     _ => Err(format!("unknown sandbox subcommand: {}", sub)),
                 };
                 match result {
@@ -4109,7 +4109,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         // `set_sandbox(config.sandbox.clone())` inside
                         // `build_rig_agent`).
                         let mut merged = config.sandbox.clone().unwrap_or_default();
-                        crate::sandbox_bindings::merge_into(&mut merged);
+                        crate::sandbox_state::merge_into(&mut merged);
                         crate::tools::set_sandbox(Some(merged.clone()));
                         config.sandbox = Some(merged);
                         let msg = if sub == "exclude" {

@@ -26,7 +26,7 @@ pub mod v25_quit;
 pub mod v25_new;
 pub mod v25_clear;
 pub mod v25_tree;
-pub mod sandbox_bindings;
+pub mod sandbox_state;
 pub mod settings;
 pub mod path_util;
 pub mod path_complete;

@@ -69,13 +69,17 @@ child.
   `remove` → `Remove` for a session bind, `Exclude` for a config bind.
   Binding resolved by `ids[1]`, not `ids.last()` (`last()` is the action).
 
-## Data model & state
+## Data model & state — DONE
 
-`sandbox_bindings` → **`sandbox_state`** (data/state-only role; no UI code).
-Keeps: session binds, base-config snapshot, exclusion set. Public API:
-`set_base`, `add`(host, sandbox, mode) [/ `add_ro`/`add_rw` shims], `remove`,
-`exclude`, `restore`, `list`, `combined_list`, `merge_into`,
-`resolve_for_display`. `remove_exclude` (dead) becomes `restore`.
+`sandbox_bindings` → **`sandbox_state`** (renamed; data/state-only role, no
+UI code). Public API as planned: `set_base`, **new** `add`(host, sandbox,
+mode) with `add_ro`/`add_rw` as shims (still called by the v2.0 handler
+until retirement), `remove`, `exclude`, **new** `restore` (was the dead
+`remove_exclude`; `#[allow(dead_code)]` until `AsyncOp::Sandbox(Restore)`
+wires it), `list`, `combined_list`, `merge_into`, `resolve_for_display`.
+All references updated (`tools`, `agent`, `repl`, `lib`, `path_util`).
++2 tests (explicit mode, restore re-enables); all pre-existing tests
+green after the rename.
 
 Mutation is asynchronous: nodes never touch the globals directly.
 

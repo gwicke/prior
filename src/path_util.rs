@@ -2,7 +2,7 @@
 //!
 //! Consolidates `~` expansion, relative-path resolution, and path normalization
 //! that used to be duplicated across [`config`](crate::config),
-//! [`sandbox_bindings`](crate::sandbox_bindings), and [`repl`](crate::repl).
+//! [`sandbox_state`](crate::sandbox_state), and [`repl`](crate::repl).
 
 use std::path::{Path, PathBuf};
 

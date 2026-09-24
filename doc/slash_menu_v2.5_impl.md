@@ -486,8 +486,11 @@ Design + plan: `slashdot/sandbox_design.md`.
   --time-style=+ISO`), v1 split/`~`-round-trip/fallback semantics, labels
   `Host path`/`Sandbox path`. Legacy repl helpers untouched (in-prompt
   switch deferred to cleanup). +7 tests — 635 lib tests pass.
-- Next: `sandbox_state` rename → `v25_sandbox` nodes + `AsyncOp::Sandbox`
-  wiring + v2.0 overlay retirement.
+- **`sandbox_state` rename — DONE**: `sandbox_bindings` → `sandbox_state`
+  (data-only), new `add(host, sandbox, mode)` + shims, `restore` (was
+  dead `remove_exclude`). All refs updated; +2 tests — 637 lib tests.
+- Next: `v25_sandbox` nodes + `AsyncOp::Sandbox` wiring + v2.0 overlay
+  retirement.
 
 ### Step 13: Session
 

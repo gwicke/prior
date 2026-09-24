@@ -745,7 +745,7 @@ pub(crate) fn sandbox_config() -> Arc<Option<SandboxConfig>> {
 pub(crate) fn sandbox_list_dir(dir: &str) -> Option<Vec<String>> {
     let cfg = sandbox_config();
     let mut cfg = (*cfg).clone()?;
-    crate::sandbox_bindings::merge_into(&mut cfg);
+    crate::sandbox_state::merge_into(&mut cfg);
     let args = build_bwrap_args(&cfg, true).ok()?;
 
     let output = std::process::Command::new("bwrap")
@@ -780,7 +780,7 @@ pub(crate) fn sandbox_list_dir(dir: &str) -> Option<Vec<String>> {
 pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     let cfg = sandbox_config();
     let mut cfg = (*cfg).clone()?;
-    crate::sandbox_bindings::merge_into(&mut cfg);
+    crate::sandbox_state::merge_into(&mut cfg);
     let args = build_bwrap_args(&cfg, true).ok()?;
 
     let output = std::process::Command::new("bwrap")

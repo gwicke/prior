@@ -1364,7 +1364,7 @@ impl ActiveOverlay {
                             .split_once(' ')
                             .map(|(_, r)| r.trim())
                             .unwrap_or("");
-                        let combined = crate::sandbox_bindings::combined_list();
+                        let combined = crate::sandbox_state::combined_list();
                         let filtered: Vec<_> = if filter.is_empty() {
                             combined
                         } else {
@@ -1725,7 +1725,7 @@ impl ActiveOverlay {
                             .map(|(_, r)| r.trim())
                             .unwrap_or("");
                         let (sub_cmd, sandbox_path) = {
-                            let combined = crate::sandbox_bindings::combined_list();
+                            let combined = crate::sandbox_state::combined_list();
                             let filtered: Vec<_> = if filter.is_empty() {
                                 combined
                             } else {
@@ -4896,7 +4896,7 @@ impl Repl {
             }
             "remove" => {
                 let path = path.trim();
-                let combined = crate::sandbox_bindings::combined_list();
+                let combined = crate::sandbox_state::combined_list();
                 if combined.is_empty() {
                     opts.push("(no bindings configured)".into());
                     *active = None;
