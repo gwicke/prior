@@ -699,7 +699,6 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                             old_text: e.get("oldText")?.as_str()?.to_string(),
                             new_text: e.get("newText")?.as_str()?.to_string(),
                             start_line: e.get("startLine").and_then(|v| v.as_u64()).map(crate::config::EditStartLine),
-                            end_line: e.get("endLine").and_then(|v| v.as_u64()).map(crate::config::EditEndLine),
                         })
                     })
                     .collect()
@@ -709,7 +708,6 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                     old_text: old.to_string(),
                     new_text: new.to_string(),
                     start_line: None,
-                    end_line: None,
                 }]
             } else {
                 vec![]
@@ -720,7 +718,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 // Old format: old/new fields.
                 let old = get_str("old").unwrap_or("");
                 let new_str = get_str("new").unwrap_or("");
-                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None, end_line: None }])
+                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None }])
             };
             let mut s = format!("edit {}", path);
             if let Some(r) = range {
@@ -882,9 +880,9 @@ impl ConsoleOutput {
             text_buffer: Mutex::new(String::new()),
             live: Mutex::new(false),
             writer: Mutex::new(Box::new(io::stdout())),
-            parser: Mutex::new(StreamParser::new_gfm()),
+            parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
-            thinking_parser: Mutex::new(StreamParser::new_gfm()),
+            thinking_parser: Mutex::new(StreamParser::new_gfm_stream()),
             thinking_renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
             dim_on: Mutex::new(false),
             answer_held: Mutex::new(false),
@@ -935,14 +933,14 @@ impl ConsoleOutput {
             // Reset the incremental parser/renderer for a fresh response and
             // print a leading blank to separate from the user prompt.
             let mut parser = self.parser.lock().unwrap();
-            *parser = StreamParser::new_gfm();
+            *parser = StreamParser::new_gfm_stream();
             let mut theme = Theme::default();
             theme.clickable_links = true; // real TTY path
             let mut renderer = self.renderer.lock().unwrap();
             *renderer = Renderer::new(theme, term_width());
             // Reset the thinking parser/renderer and dim state for this response.
             let mut tparser = self.thinking_parser.lock().unwrap();
-            *tparser = StreamParser::new_gfm();
+            *tparser = StreamParser::new_gfm_stream();
             let mut trenderer = self.thinking_renderer.lock().unwrap();
             *trenderer = Renderer::new(Theme::dimmed(), term_width());
             *self.dim_on.lock().unwrap() = false;
@@ -1119,7 +1117,7 @@ impl ConsoleOutput {
         let events = {
             let mut tparser = self.thinking_parser.lock().unwrap();
             let events = tparser.flush();
-            *tparser = StreamParser::new_gfm();
+            *tparser = StreamParser::new_gfm_stream();
             events
         };
         let mut trenderer = self.thinking_renderer.lock().unwrap();
@@ -1172,7 +1170,7 @@ impl ConsoleOutput {
         // for the caller's renderer reset. `flush()` (not just `write`) so the
         // answer's final, blank-line-unterminated paragraph is emitted rather
         // than dropped (a `write`-only parser holds the last block back).
-        let mut local_parser = StreamParser::new_gfm();
+        let mut local_parser = StreamParser::new_gfm_stream();
         let mut events = local_parser.write(buffer.as_bytes());
         events.extend(local_parser.flush());
         let mut renderer = self.renderer.lock().unwrap();
@@ -1429,6 +1427,11 @@ impl Output for ConsoleOutput {
             }
             self.note_text();
         } else {
+            if !self.ended_blank() {
+                let _ = out.write_all(b"\n");
+                self.note_lines(1);
+                self.set_blank(true);
+            }
             self.ensure_dim(false, &mut *out);
         }
         let mut parser = self.parser.lock().unwrap();
@@ -1492,7 +1495,7 @@ impl Output for ConsoleOutput {
                 // ends in a list/table is emitted now rather than stranded; then
                 // start a fresh answer parser + renderer for the next segment.
                 let events = parser.flush();
-                *parser = StreamParser::new_gfm();
+                *parser = StreamParser::new_gfm_stream();
                 let mut renderer = self.renderer.lock().unwrap();
                 let _ = renderer.feed(&events, &mut *out);
                 if !events.is_empty() {
@@ -1668,12 +1671,58 @@ impl Output for ConsoleOutput {
         }
 
         // Which tool produced this result (set by `display_tool_call`). Drives
-        // read-specific line-number stripping and language guessing.
+        // read/write-specific rendering and language guessing.
         let tool = self.last_tool.lock().unwrap().clone();
         let is_read = tool
             .as_ref()
             .map(|(n, _)| n.eq_ignore_ascii_case("read") || n.eq_ignore_ascii_case("read_file"))
             .unwrap_or(false);
+        let is_write = tool
+            .as_ref()
+            .map(|(n, _)| n.eq_ignore_ascii_case("write") || n.eq_ignore_ascii_case("write_file"))
+            .unwrap_or(false);
+
+        // Handle structured write result: {"path": "...", "content": "...", "lines": N, "bytes": N}
+        if is_write {
+            if let Ok(v) = serde_json::from_str::<Value>(result) {
+                if let (Some(path), Some(content), Some(total_lines)) = (
+                    v.get("path").and_then(|x| x.as_str()),
+                    v.get("content").and_then(|x| x.as_str()),
+                    v.get("lines").and_then(|x| x.as_u64()),
+                ) {
+                    // Show the path as a header with line count
+                    let color = std::io::stdout().is_terminal();
+                    let lang = guess_lang(path);
+                    let header = format!("write {} [{} lines]", path, total_lines);
+                    let header_styled = highlight_code_fg(&header, "bash", color);
+                    self.paint_panel(&header_styled, true);
+
+                    // Render the content with syntax highlighting (like read_file)
+                    let show_max = 10; // Limit preview to 10 lines (match read_file)
+                    let width = term_width();
+                    let inner = width.saturating_sub(1).max(1);
+                    let content_lines: Vec<_> = content.lines().collect();
+                    for (printed, line) in content_lines.iter().enumerate() {
+                        if printed >= show_max {
+                            break;
+                        }
+                        for wline in wrap(line, inner) {
+                            let styled = highlight_code_fg(&wline, lang, color);
+                            self.paint_panel(&styled, true);
+                        }
+                    }
+                    if content_lines.len() > show_max {
+                        self.tool_panel(
+                            &format!("... +{} lines", content_lines.len() - show_max),
+                            false,
+                            true,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+
         let read_path = tool
             .as_ref()
             .and_then(|(_, a)| a.get("path"))
@@ -2450,7 +2499,6 @@ mod tests {
             old_text: old_text.clone(),
             new_text: new_text.clone(),
             start_line: None,
-            end_line: None,
         }];
         let (_range, diff) = edit_preview(path.to_str().unwrap(), &edits);
 
@@ -2681,7 +2729,7 @@ mod tests {
     /// it closes (coarse-grained). These tests pin that contract.
     #[test]
     fn incremental_renderer_streams_code_lines_and_coarsens_paragraphs() {
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_stream();
         let mut renderer = Renderer::new(Theme::no_color(), 80);
         let mut buf: Vec<u8> = Vec::new();
 
@@ -2715,7 +2763,7 @@ mod tests {
 
     #[test]
     fn incremental_renderer_gfm_table_renders() {
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_stream();
         let mut renderer = Renderer::new(Theme::no_color(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let evs = parser.write("| a | b |\n|---|---|\n| 1 | 2 |\n\n".as_bytes());
@@ -2744,7 +2792,7 @@ mod tests {
         // Mirrors Phase 5's TTY thinking path: a faint SGR + a faded theme whose
         // `reset` re-applies the dim keep thinking faded even through inline
         // formatting (bold/code), without re-rendering past content.
-        let mut parser = StreamParser::new_gfm();
+        let mut parser = StreamParser::new_gfm_stream();
         let mut renderer = Renderer::new(Theme::dimmed(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let _ = write!(buf, "\x1b[2m"); // initial dim (mirrors `ensure_dim(true)`)
@@ -2757,6 +2805,37 @@ mod tests {
             out.contains("\x1b[0m\x1b[2m"),
             "inline formatting must re-apply dim (reset re-dim), not clear it"
         );
+    }
+
+    #[test]
+    fn thinking_flushes_on_paragraph_boundary() {
+        // Regression test: thinking content should emit on paragraph boundaries
+        // (blank line) without waiting for end_response.
+        let mut parser = StreamParser::new_gfm_stream();
+        let mut renderer = Renderer::new(Theme::dimmed(), 80);
+        let mut buf: Vec<u8> = Vec::new();
+        let _ = write!(buf, "\x1b[2m");
+        
+        // First paragraph - no flush yet (no blank line)
+        let _ = renderer.feed(&parser.write("\n\n[test] first ".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("\nparagraph \n".as_bytes()), &mut buf);
+        let before_flush = String::from_utf8(buf.clone()).unwrap();
+        assert!(!before_flush.contains("first paragraph"), "content held before boundary");
+        
+        // Add blank line - should flush
+        let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
+        let after_flush = String::from_utf8(buf.clone()).unwrap();
+        eprintln!("after newline: {}", after_flush);
+        assert!(after_flush.contains("first paragraph"), "content emitted after boundary");
+        
+        // Second paragraph with explicit blank line
+        let _ = renderer.feed(&parser.write("second paragraph\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
+        // let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
+        let after_blank = String::from_utf8(buf.clone()).unwrap();
+        assert!(after_blank.contains("second paragraph"), "content emitted on blank line");
+        
+        let _ = write!(buf, "\x1b[0m");
     }
 
     #[test]
@@ -3019,5 +3098,33 @@ mod tests {
             "expected a blank line between the tool result and trailing text, got {:?}",
             between
         );
+    }
+
+    #[test]
+    fn write_tool_renders_content_like_read() {
+        // Write tool result should render with path header and syntax-highlighted
+        // content preview (first 10 lines), matching read_file's rendering.
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.begin_response_inner(true);
+        out.set_answer_hold(false);
+        out.begin_capture_inner();
+
+        // Simulate a write tool call with structured result (as write_file returns)
+        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs", "content": "fn main() {}"}));
+        let result = r#"{"path":"./test.rs","content":"fn main() {\n    let x = 42;\n    println!(\"Hello, world! {}\", x);\n}","lines":4,"bytes":72}"#;
+        out.display_tool_result(result);
+
+        out.end_response();
+        let captured = out.end_capture_inner();
+        let output = strip_ansi(&String::from_utf8_lossy(&captured));
+
+        // Should contain the path header with line count
+        assert!(output.contains("write ./test.rs [4 lines]"), "missing path header with line count: {}", output);
+        // Should contain syntax-highlighted content (first 10 lines)
+        assert!(output.contains("fn main()"), "missing fn main: {}", output);
+        assert!(output.contains("let x = 42"), "missing let x = 42: {}", output);
+        assert!(output.contains("println!"), "missing println!: {}", output);
+        // Should NOT contain line numbers (unlike read_file which has them in raw result but stripped for display)
+        assert!(!output.contains("|"), "should not contain line number gutter: {}", output);
     }
 }

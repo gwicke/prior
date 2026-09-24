@@ -2,7 +2,7 @@ use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx, ModelFilter};
 use crate::settings::SettingsStore;
 use crate::session::Session;
-use crate::session::repo::SessionRepo;
+use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
@@ -1098,6 +1098,37 @@ fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
         .join("\n")
 }
 
+/// Render `edit` tool-call arguments in the model-facing block form.
+///
+/// The transcript is stored canonically (a pi-compatible `edits` array), but
+/// the model is shown the block form **consistently** so it keeps emitting the
+/// reliable shape and is not nudged back toward the array (the form weak
+/// harnesses mangle). Idempotent and allocation-light: non-`edit` calls and
+/// already-block arguments pass through unchanged.
+fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
+    messages
+        .into_iter()
+        .map(|m| match m {
+            Message::Assistant { id, content } => {
+                let content = content
+                    .into_iter()
+                    .map(|c| match c {
+                        AssistantContent::ToolCall(tc) if tc.function.name == "edit" => {
+                            let mut tc = tc;
+                            tc.function.arguments =
+                                crate::edit_blocks::array_to_blob_value(&tc.function.arguments);
+                            AssistantContent::ToolCall(tc)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                Message::Assistant { id, content }
+            }
+            other => other,
+        })
+        .collect()
+}
+
     /// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
     /// always present — minted at the provider boundary when the provider
     /// issued no id — so the old cross-provider `call_id` normalisation is
@@ -1639,44 +1670,39 @@ impl AgentHook for LoggingHook {
         event: CompletionCallEvent<'_>,
     ) -> CompletionCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
-            CompletionCallAction::Stop("cancelled by user".into())
-        } else {
-            // Build stripped history for sending to the provider and logging.
-            // The prompt is sent separately (not part of history), but we
-            // log it alongside. When `reasoning_in_context` is false,
-            // `maybe_strip_reasoning` removes reasoning blocks from the
-            // history — and the log should reflect exactly what the
-            // model sees.
-            let stripped_history = maybe_strip_reasoning(
-                event.history.iter().cloned().collect(),
-                self.reasoning_in_context,
-                &self.provider,
-                &self.model,
-            );
-
-            // `--log-messages`: capture the exact context sent to the
-            // model on this call — the full history plus the current
-            // prompt — under one turn id shared with the matching
-            // response. Logging the stripped history reflects what
-            // the provider actually receives.
-            if let Some(logger) = &self.message_logger {
-                let turn_id = logger.advance_turn();
-                for m in &stripped_history {
-                    logger.log_message("sent", m, turn_id).await;
-                }
-                logger.log_message("sent", event.prompt, turn_id).await;
-            }
-
-            // When `reasoning_in_context` is false, send the stripped
-            // history to the provider via a patch. `maybe_strip_reasoning`
-            // also handles the Anthropic-family thinking+tool_use replay
-            // contract (reasoning is force-kept on turns with tool calls),
-            // so the patch is a no-op there.
-            if !self.reasoning_in_context {
-                return CompletionCallAction::Patch(RequestPatch::new().history(stripped_history));
-            }
-            CompletionCallAction::Continue
+            return CompletionCallAction::Stop("cancelled by user".into());
         }
+        // Build the history to send: strip reasoning when configured, then
+        // render `edit` tool calls in the model-facing block form. The
+        // transcript is stored canonically (a pi-compatible array); the model is
+        // shown the block form *consistently* so it keeps emitting the reliable
+        // shape. This hook is the one place that sees the whole request history,
+        // so it covers prior and within-turn messages alike.
+        let stripped_history = maybe_strip_reasoning(
+            event.history.iter().cloned().collect(),
+            self.reasoning_in_context,
+            &self.provider,
+            &self.model,
+        );
+        let history = blob_edit_tool_calls(stripped_history);
+
+        // `--log-messages`: capture the exact context sent to the model on this
+        // call — the (stripped, block-form) history plus the current prompt —
+        // under one turn id shared with the matching response. Logging `history`
+        // reflects what the provider actually receives.
+        if let Some(logger) = &self.message_logger {
+            let turn_id = logger.advance_turn();
+            for m in &history {
+                logger.log_message("sent", m, turn_id).await;
+            }
+            logger.log_message("sent", event.prompt, turn_id).await;
+        }
+
+        // Always send via a patch: it replaces the run's history with exactly
+        // `history`. `maybe_strip_reasoning` also handles the Anthropic-family
+        // thinking+tool_use replay contract (reasoning is force-kept on turns
+        // with tool calls). Identity for every message without an `edit` call.
+        CompletionCallAction::Patch(RequestPatch::new().history(history))
     }
 
     async fn on_completion_response(
@@ -1736,8 +1762,14 @@ impl AgentHook for LoggingHook {
         if self.user_cancel.load(Ordering::SeqCst) {
             return ToolCallAction::Stop("cancelled by user".into());
         }
-        let args_json = serde_json::from_str(event.args)
+        let mut args_json = serde_json::from_str(event.args)
             .unwrap_or(serde_json::Value::String(event.args.to_string()));
+        // Canonicalize `edit` arguments to the array form for display, so
+        // `get_preview` sees the same shape it gets on replay (the parser stays
+        // out of `output.rs`). No-op for other tools / already-canonical args.
+        if event.tool_name == "edit" {
+            args_json = crate::edit_blocks::canonicalize_edit_value(&args_json);
+        }
         self.output.display_tool_call(event.tool_name, &args_json);
         ToolCallAction::Run
     }
@@ -1793,13 +1825,23 @@ impl AgentHook for LoggingHook {
     }
 }
 
-const DEFAULT_AGENT_PROMPT: &str = r#"You are picocode, a world-class software engineering agent. You are direct, technical, and highly efficient.
+const DEFAULT_AGENT_PROMPT: &str = r#"You are picocode, a software engineering agent. You are direct, technical, and highly efficient.
 
 Your mission is to assist the user in their development tasks by utilizing a set of specialized tools. You operate within a specific codebase and must maintain its integrity while delivering high-quality solutions.
 
 ### WORKFLOW & STRATEGY
 1. **Understand Before Acting**: Always start by exploring the codebase. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
-2. **Be Precise**: When editing files, use `edit` with enough context in `oldText` to ensure a unique match. You can pass multiple edits at once via the `edits` array. Avoid replacing large blocks if a small change suffices.
+2. **Be Precise**: When editing files, use `edit`. Prefer Aider-style SEARCH/REPLACE blocks in the `edits` string — each block looks like this:
+```
+some/path
+<<<<<<< SEARCH
+the original text
+=======
+the replacement text
+>>>>>>> REPLACE
+```
+You can send many edit blocks in a single `edits` batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
+For single edits, the traditional OpenAI path / oldText / newText API is available as well.
 3. **Verify Everything**: After modifying code, verify the results. Run tests or build commands via `bash`. Read the modified file to ensure the change was applied correctly.
 4. **Tool Mastery**:
    - `read`: Use to read code. Note that it provides line numbers (e.g., `  10| code`). These are for your reference only; do not include them in your output or when writing files.
@@ -1811,7 +1853,7 @@ Your mission is to assist the user in their development tasks by utilizing a set
 - **Clean Code**: Follow established patterns in the codebase. Write idiomatic, readable, and well-documented code.
 - **Security First**: Be vigilant about security vulnerabilities. Sanitize inputs, avoid hardcoded secrets, and follow least-privilege principles.
 - **Minimalism**: Don't add unnecessary dependencies or over-engineer solutions.
-- **Communication**: Keep explanations brief and focused on the "how" and "why" of your technical decisions.
+- **Communication**: Keep explanations brief and focused on the "how" and "why" of your technical decisions. If you are unsure, do not guess or over-analyze - ask.
 "#;
 
 fn build_rig_agent(
@@ -1882,7 +1924,7 @@ fn build_rig_agent(
     builder.build()
 }
 
-use rig_core::tool::Tool;
+use rig_core::tool::{Tool, ToolErrorKind, ToolExecutionError};
 
 struct Guard<T: Tool> {
     tool: T,
@@ -1905,6 +1947,32 @@ impl<T: Tool<Error = crate::tools::ToolError>> Tool for Guard<T> {
 
     fn parameters(&self) -> serde_json::Value {
         self.tool.parameters()
+    }
+
+    /// Map picocode's domain errors into rig's typed error taxonomy so the
+    /// model and hooks receive a meaningful classification instead of always
+    /// `ToolErrorKind::Other` (which renders as the generic "the tool failed").
+    ///
+    /// - `ToolError::Io` → `Other` (infrastructure failure, not auto-retryable)
+    /// - `ToolError::Generic` containing "timed out" → `Timeout` (auto-retryable)
+    /// - `ToolError::Generic` containing "cancelled" → `Cancelled` (not retryable)
+    /// - everything else → `Other` with the specific message preserved
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        use crate::tools::ToolError;
+
+        match error {
+            ToolError::Io(msg) => ToolExecutionError::other(msg),
+            ToolError::Generic(msg) => {
+                let kind = if msg.contains("timed out") {
+                    ToolErrorKind::Timeout
+                } else if msg.contains("cancelled") {
+                    ToolErrorKind::Cancelled
+                } else {
+                    ToolErrorKind::Other
+                };
+                ToolExecutionError::new(kind, msg)
+            }
+        }
     }
 
     async fn call(
@@ -2613,7 +2681,7 @@ async fn handle_session_command(
 
                 let (storage, index) = if meta.cwd != cwd {
                     let repo = repo.as_ref().unwrap();
-                    match repo.fork(&meta, "", &cwd).await {
+                    match repo.fork(&meta, "", &cwd, ForkMode::FullTree).await {
                         Ok(forked_storage) => {
                             let index = match forked_storage.build_index().await {
                                 Ok(i) => i,
@@ -2712,7 +2780,7 @@ async fn handle_session_command(
                         return SessionCommandResult::Handled;
                     }
                 };
-                match repo.as_ref().unwrap().fork(&meta, "", &cwd).await {
+                match repo.as_ref().unwrap().fork(&meta, "", &cwd, ForkMode::FullTree).await {
                     Ok(new_storage) => {
                         let index = new_storage.build_index().await.unwrap_or_else(|_| {
                             let header = crate::session::SessionHeader::new(&cwd);
@@ -4808,7 +4876,7 @@ pub struct SessionStatsInfo {
 /// Compute the `/stat` panel lines. Renders two sections:
 ///
 /// 1. **session** — display name, created/last-updated times, total session size
-///    (mirrors `/session <id>`).
+///    (mirrors `/session <id>`), estimated compacted context tokens.
 /// 2. **model**   — provider/model identifier, context-window limit, current
 ///    usage, approximate session cost, cache hit rate.
 ///
@@ -4821,6 +4889,7 @@ pub fn session_stats_lines(
     model: &str,
     usage: SessionUsage,
     session: Option<SessionStatsInfo>,
+    context_tokens: u64,
 ) -> Vec<String> {
     let entry = model_catalog::lookup(provider, model);
     let ctx_len = entry.as_ref().and_then(|e| e.context_length);
@@ -4847,6 +4916,10 @@ pub fn session_stats_lines(
             // No repo / no metadata available (e.g. in tests without a session).
             lines.push("session: (unavailable)".to_string());
         }
+    }
+    // Estimated compacted context tokens (what would be sent on next turn).
+    if context_tokens > 0 {
+        lines.push(format!("  estimated context tokens: {}", context_tokens));
     }
 
     // ── model section ───────────────────────────────────────────────────
@@ -4971,6 +5044,7 @@ mod tests {
     use crate::session::storage::SessionStorage;
     use crate::SettingsStore;
     use super::{
+        blob_edit_tool_calls,
         build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir,
         find_predecessor_on_active_branch,
@@ -4982,6 +5056,47 @@ mod tests {
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
     use rig_core::message::{AssistantContent, Message, Text};
+
+    #[test]
+    fn blob_edit_tool_calls_renders_block_form_and_is_idempotent() {
+        let args = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        });
+        let mk = |args: serde_json::Value| Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(rig_core::message::ToolCall {
+                id: rig_core::message::ToolCallId::new("t1").unwrap(),
+                provider: None,
+                function: rig_core::message::ToolFunction::new("edit".into(), args),
+                signature: None,
+                additional_params: None,
+            })],
+        };
+
+        // Array -> block.
+        let out = blob_edit_tool_calls(vec![mk(args)]);
+        let Message::Assistant { content, .. } = &out[0] else {
+            panic!("expected assistant")
+        };
+        let AssistantContent::ToolCall(tc) = &content[0] else {
+            panic!("expected tool call")
+        };
+        let edits = tc.function.arguments.get("edits").and_then(|v| v.as_str()).unwrap();
+        assert!(edits.contains("<<<<<<< SEARCH"), "got: {edits}");
+        assert!(edits.contains("src/x.rs"), "got: {edits}");
+
+        // Idempotent: an already-block value is unchanged.
+        let already = serde_json::json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"});
+        let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
+        let Message::Assistant { content, .. } = &out2[0] else {
+            panic!("expected assistant")
+        };
+        let AssistantContent::ToolCall(tc) = &content[0] else {
+            panic!("expected tool call")
+        };
+        assert_eq!(tc.function.arguments, already);
+    }
 
     #[test]
     fn turn_persistence_counts_dispatch_not_text() {
@@ -7558,7 +7673,7 @@ mod tests {
             user_message_count: 7,
         };
         let usage = SessionUsage::default();
-        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info));
+        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info), 42_000);
 
         // The first three lines are the new "session:" section.
         assert!(
@@ -7576,6 +7691,8 @@ mod tests {
         // number of user prompts (= turns), the latter the total entries
         // (user + assistant + toolResult).
         assert_eq!(lines[2], "  size: 7 turns (14 messages)");
+        // New line: estimated context tokens
+        assert_eq!(lines[3], "  estimated context tokens: 42000");
 
         // Then the "model:" section starts on the next line, with the rest
         // of the existing context-window / usage / cost / cache rows.
@@ -7583,7 +7700,7 @@ mod tests {
             .iter()
             .position(|l| l.starts_with("model:"))
             .expect("model section must be present");
-        assert!(model_idx >= 3, "model section must follow session section");
+        assert!(model_idx >= 4, "model section must follow session section");
         assert!(lines[model_idx].contains("openrouter:minimax/minimax-m3:free"));
         assert!(lines.iter().any(|l| l.contains("context window limit")));
     }
@@ -7597,6 +7714,7 @@ mod tests {
             "minimax/minimax-m3:free",
             SessionUsage::default(),
             None,
+            0,
         );
 
         // Without a repo / session metadata the panel still renders both

@@ -132,88 +132,16 @@ pub fn render_batch(failure: &BatchEditFailure) -> String {
 /// file contents. On exact-match (the normal path) we never get here; this
 /// is only called when `text.contains(query)` already returned `false`.
 ///
-/// Optional `start_line` and `end_line` (1-indexed, inclusive) restrict the
-/// search to a specific line range in the file. This allows the diagnostic
-/// to focus on the region the user specified.
+/// The whole file is searched: the anchor only disambiguates between *exact*
+/// matches, so it plays no part in diagnosing a miss.
 ///
 /// Returns `None` if no region is similar enough to be worth showing.
-pub fn diagnose(
-    query: &str,
-    file_text: &str,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-) -> Option<EditFailure> {
+pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     if query.is_empty() || file_text.is_empty() {
         return None;
     }
 
-    // If line range is specified, restrict the search to that range
-    let (search_text, line_offset) = if let (Some(sl), Some(el)) = (start_line, end_line) {
-        // Convert 1-indexed inclusive to 0-indexed byte range
-        let total_lines = file_text.lines().count();
-        if sl == 0 || sl > total_lines || el == 0 || el > total_lines || sl > el {
-            return None; // Invalid range, no diagnosis
-        }
-        let start_idx = sl - 1;
-        let end_idx = el; // exclusive
-        
-        // Find byte offsets
-        let mut byte_start = 0;
-        for (idx, line) in file_text.lines().enumerate() {
-            if idx == start_idx {
-                break;
-            }
-            byte_start += line.len() + 1;
-        }
-        let mut byte_end = 0;
-        for (idx, line) in file_text.lines().enumerate() {
-            if idx == end_idx {
-                break;
-            }
-            byte_end += line.len() + 1;
-        }
-        if end_idx >= total_lines {
-            byte_end = file_text.len();
-        }
-        
-        (&file_text[byte_start..byte_end], sl - 1)
-    } else if let Some(sl) = start_line {
-        // From start_line to end of file
-        let total_lines = file_text.lines().count();
-        if sl == 0 || sl > total_lines {
-            return None;
-        }
-        let start_idx = sl - 1;
-        let mut byte_start = 0;
-        for (idx, line) in file_text.lines().enumerate() {
-            if idx == start_idx {
-                break;
-            }
-            byte_start += line.len() + 1;
-        }
-        (&file_text[byte_start..], sl - 1)
-    } else if let Some(el) = end_line {
-        // From start of file to end_line
-        let total_lines = file_text.lines().count();
-        if el == 0 || el > total_lines {
-            return None;
-        }
-        let end_idx = el;
-        let mut byte_end = 0;
-        for (idx, line) in file_text.lines().enumerate() {
-            if idx == end_idx {
-                break;
-            }
-            byte_end += line.len() + 1;
-        }
-        if end_idx >= total_lines {
-            byte_end = file_text.len();
-        }
-        (&file_text[..byte_end], 0)
-    } else {
-        // No line range specified, search entire file
-        (file_text, 0)
-    };
+    let search_text = file_text;
 
     // Stage 1: anchor via longest-common-substring.
     let anchor = find_anchor(search_text, query, MIN_ANCHOR_LEN)?;
@@ -260,7 +188,7 @@ pub fn diagnose(
 
     // Translate the window-relative line numbers back to file-relative
     // line numbers so the model can `read` the right region.
-    let window_line_offset = line_offset + count_lines(&search_text[..win_start]);
+    let window_line_offset = count_lines(&search_text[..win_start]);
 
     // Build the rich model_view body (no header; the caller adds a
     // batch envelope around it).
@@ -319,6 +247,59 @@ impl EditFailure {
         EditFailure { ui_view, model_view }
     }
 
+    /// Construct a failure for "oldText appears N times but none close enough
+    /// to the anchor line". Used by anchor-mode matching when the nearest
+    /// occurrence is farther than the tolerance.
+    pub fn anchor_out_of_tolerance(
+        edit_index_1based: usize,
+        old_text: &str,
+        anchor: usize,
+        nearest_line: usize,
+        tolerance: usize,
+        count: usize,
+    ) -> Self {
+        let ui_view = format!(
+            "edit #{edit_index_1based} oldText appears {count} times; none within \
+             {tolerance} line(s) of anchor line {anchor} (nearest at line {nearest_line}).",
+        );
+        let model_view = format!(
+            "oldText appears {count} times but none is within {tolerance} line(s) \
+             of the anchor line {anchor}; the nearest is at line {nearest_line}. \
+             The anchor is a near-line hint, not a range, so it does not widen the \
+             search. Re-read the file (`read` gives line numbers) and either correct \
+             the `path:LINE`/`startLine` anchor or include more surrounding context \
+             in oldText so the match is unambiguous. Original oldText: '{}'.",
+            old_text,
+        );
+        EditFailure { ui_view, model_view }
+    }
+
+    /// Construct a failure for "two or more occurrences are equidistant from
+    /// the anchor line", so nearest-match cannot pick one safely.
+    pub fn anchor_ambiguous(
+        edit_index_1based: usize,
+        old_text: &str,
+        anchor: usize,
+        line_numbers: &[usize],
+    ) -> Self {
+        let line_list = line_numbers
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ui_view = format!(
+            "edit #{edit_index_1based} oldText ambiguous near anchor line {anchor} \
+             (occurrences at lines: {line_list}).",
+        );
+        let model_view = format!(
+            "oldText has multiple occurrences equally close to the anchor line \
+             {anchor} (lines: {line_list}). Include more surrounding context in \
+             oldText so exactly one occurrence matches. Original oldText: '{}'.",
+            old_text,
+        );
+        EditFailure { ui_view, model_view }
+    }
+
     /// Construct a failure for "oldText appears N times" with line
     /// numbers so the model can disambiguate.
     pub fn non_unique(
@@ -347,14 +328,20 @@ impl EditFailure {
         };
         let ui_view = format!(
             "edit #{edit_index_1based} oldText appears {count} times \
-             (lines: {line_list}).",
+             (lines: {line_list}); anchor it with a `path:LINE` header.",
         );
         let model_view = format!(
-            "oldText appears {count} times, must be unique. \
-             Occurrences at lines: {line_list}. Include more surrounding \
-             context in oldText (the line(s) immediately before/after) so \
-             only one occurrence matches. Original oldText: '{}'.",
+            "oldText appears {count} times, so it is ambiguous. \
+             Occurrences at lines: {line_list}. To pick one, put a `path:LINE` \
+             header line just above that block's `{marker}` marker — e.g. use \
+             `...:{first}` to target the first occurrence — which anchors the \
+             block to the nearest occurrence (line numbers come from `read`). \
+             Alternatively, include more surrounding context in oldText (the \
+             line(s) immediately before/after) so only one occurrence matches. \
+             Original oldText: '{}'.",
             old_text,
+            marker = crate::edit_blocks::SEARCH_MARKER,
+            first = line_numbers.first().copied().unwrap_or(0),
         );
         EditFailure { ui_view, model_view }
     }
@@ -464,7 +451,7 @@ mod tests {
         let q = "completely unrelated content here";
         // The longest common substring will be very small; similarity
         // should fall below MIN_SIMILARITY.
-        assert!(diagnose(q, file, None, None).is_none());
+        assert!(diagnose(q, file).is_none());
     }
 
     #[test]
@@ -473,7 +460,7 @@ mod tests {
         // Off-by-one indentation in the query — the dominant real-world
         // failure mode.
         let q = "fn main() {\n   let x = 1;\n    let y = 2;\n}\n";
-        let f = diagnose(q, file, None, None).expect("should diagnose");
+        let f = diagnose(q, file).expect("should diagnose");
         assert!(f.ui_view.contains("Closest match"));
         assert!(f.model_view.contains("Closest match"));
         // UI view should NOT contain large chunks of file content.
@@ -485,7 +472,7 @@ mod tests {
     fn ui_view_does_not_echo_file_regions() {
         let file = "secret_token = \"ABCDEFG12345\"\n";
         let q = "secret_token = \"ABCDEFG12346\"\n";
-        let f = diagnose(q, file, None, None).expect("should diagnose");
+        let f = diagnose(q, file).expect("should diagnose");
         // The UI summary must not leak the secret token.
         assert!(!f.ui_view.contains("ABCDEFG12345"));
         // The model view SHOULD contain it — that's the whole point.
@@ -518,8 +505,8 @@ mod tests {
 
     #[test]
     fn empty_inputs_return_none() {
-        assert!(diagnose("", "anything", None, None).is_none());
-        assert!(diagnose("anything", "", None, None).is_none());
+        assert!(diagnose("", "anything").is_none());
+        assert!(diagnose("anything", "").is_none());
     }
 
     #[test]
@@ -527,7 +514,7 @@ mod tests {
         // Tab-vs-space drift: the model wrote spaces, the file has tabs.
         let file = "fn main() {\n\tlet x = 1;\n}\n";
         let q = "fn main() {\n    let x = 1;\n}\n";
-        let f = diagnose(q, file, None, None);
+        let f = diagnose(q, file);
         // Should produce a diagnosis (it's close enough).
         assert!(f.is_some());
     }
@@ -678,7 +665,7 @@ mod tests {
         let file_text = "start ─── middle ─── end"; // '─' is 3 bytes each
         // Query that will match near a multi-byte char boundary
         let query = "─── midd"; // This overlaps the 3-byte chars
-        let f = diagnose(query, file_text, None, None).expect("should diagnose");
+        let f = diagnose(query, file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         // The window slice must not panic
         assert!(f.model_view.contains("Diff"));
@@ -689,12 +676,12 @@ mod tests {
         // Test when the anchor is near the start/end of file with multi-byte chars
         let file_text = "───start"; // 3-byte chars at start
         let query = "───sta";
-        let f = diagnose(query, file_text, None, None).expect("should diagnose");
+        let f = diagnose(query, file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         
         let file_text2 = "end───"; // 3-byte chars at end
         let query2 = "nd───";
-        let f2 = diagnose(query2, file_text2, None, None).expect("should diagnose");
+        let f2 = diagnose(query2, file_text2).expect("should diagnose");
         assert!(f2.model_view.contains("Closest match"));
     }
 
@@ -706,7 +693,7 @@ mod tests {
         let file_text = "a".repeat(1016) + "─" + &"b".repeat(100); // '─' at byte 1016 (3 bytes)
         // Query matching a region that includes the multi-byte char
         let query = &file_text[1000..1030]; // Includes the '─'
-        let f = diagnose(query, &file_text, None, None).expect("should diagnose");
+        let f = diagnose(query, &file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
         assert!(f.model_view.contains("Diff"));
     }

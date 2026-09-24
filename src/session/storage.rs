@@ -57,18 +57,11 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
             obj.remove("limit");
         }
         "edit" => {
-            // Canonical is edits[{oldText,newText}]. Old picocode format used
-            // top-level old/new/all. Pi's format is already canonical.
-            if obj.contains_key("old") {
-                let old_val = obj.remove("old").unwrap();
-                let new_val = obj.remove("new").unwrap_or(serde_json::Value::Null);
-                let path = obj.get("path").cloned();
-                let path = path.unwrap_or(serde_json::Value::Null);
-                *args = serde_json::json!({
-                    "path": path,
-                    "edits": [{"oldText": old_val, "newText": new_val}]
-                });
-            }
+            // Canonical is `edits:[{oldText,newText}]` (pi-compatible). Fold the
+            // model's block form (a string), the legacy single `oldText`/`newText`
+            // shape, and the very old `old`/`new` shape all into it. Best-effort:
+            // an unparseable blob is left as-is so replay degrades gracefully.
+            *args = crate::edit_blocks::canonicalize_edit_value(args);
         }
         _ => {}
     }
@@ -363,6 +356,40 @@ mod tests {
     use crate::session::types::session_filename;
     use chrono::Utc;
     use std::path::Path;
+
+    #[test]
+    fn normalize_edit_args_handles_all_forms() {
+        // Block string -> canonical array.
+        let mut v = serde_json::json!({
+            "path": "src/x.rs",
+            "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"
+        });
+        normalize_args_in_place("edit", &mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
+        );
+
+        // Legacy `old`/`new` -> canonical array.
+        let mut v = serde_json::json!({"path": "src/x.rs", "old": "a", "new": "b"});
+        normalize_args_in_place("edit", &mut v);
+        assert_eq!(
+            v,
+            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
+        );
+
+        // Already-array form is unchanged (idempotent).
+        let orig = serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]});
+        let mut v = orig.clone();
+        normalize_args_in_place("edit", &mut v);
+        assert_eq!(v, orig);
+
+        // Malformed blob is left as-is (graceful degradation).
+        let orig = serde_json::json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n>>>>>>> REPLACE"});
+        let mut v = orig.clone();
+        normalize_args_in_place("edit", &mut v);
+        assert_eq!(v, orig);
+    }
 
     /// Helper: create a JsonlSessionStorage backed by a temp file.
     async fn create_temp_storage() -> (JsonlSessionStorage, PathBuf) {

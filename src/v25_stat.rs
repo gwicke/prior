@@ -61,7 +61,13 @@ impl SlashDotNode for StatNode {
             }
         };
 
-        crate::agent::session_stats_lines(&provider, &model, usage, session_info)
+        crate::agent::session_stats_lines(
+            &provider,
+            &model,
+            usage,
+            session_info,
+            *shared.context_tokens.borrow(),
+        )
     }
 
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
@@ -140,6 +146,28 @@ mod tests {
                     .join("\n");
                 assert!(header_text.contains("(unavailable)"),
                     "header should show unavailable: {}", header_text);
+            }
+            other => panic!("expected Continue, got {:?}",
+                std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn stat_header_shows_estimated_context_tokens() {
+        let shared = make_shared();
+        shared.live_state.borrow_mut().model = "openai:gpt-4o".to_string();
+        *shared.context_tokens.borrow_mut() = 42_000;
+        let mut menu = build_stat_menu(&shared);
+        let mut handle = menu.get_handle();
+        let result = handle.eval_prompt("stat ", HostKey::None, 80);
+        match result {
+            MenuResult::Continue(plan, _) => {
+                let header_text: String = plan.detail.iter()
+                    .map(|l| l.0.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(header_text.contains("estimated context tokens: 42000"),
+                    "header should show estimated context tokens: {}", header_text);
             }
             other => panic!("expected Continue, got {:?}",
                 std::mem::discriminant(&other)),

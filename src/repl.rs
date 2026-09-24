@@ -625,6 +625,7 @@ impl Repl {
         *shared.raw_tree.borrow_mut() = ctx.tree.clone();
         *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
         *shared.session_usage.borrow_mut() = ctx.session_usage;
+        *shared.context_tokens.borrow_mut() = ctx.context_tokens;
         // Share the pending_op cell with the caller so async ops are
         // visible after read_input returns.
         shared.pending_op = pending_op.clone();

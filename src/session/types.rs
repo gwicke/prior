@@ -509,7 +509,8 @@ impl SessionIndex {
         out
     }
 
-    /// Recursively build a subtree rooted at `entry_id`.
+    /// Build a subtree rooted at `entry_id` iteratively (no recursion) to
+    /// avoid stack overflow on deeply nested session trees.
     ///
     /// Skips the entry itself if it is a meta entry (Leaf, SessionInfo)
     /// — they don't show as rows in the tree list — but **still walks
@@ -519,62 +520,95 @@ impl SessionIndex {
     /// if one of the hops is a meta entry the user doesn't need to
     /// see. (The flat list filters by visibility separately, so even
     /// if the meta node is in the tree, no row is produced for it.)
-    fn build_subtree<'a>(
-        &'a self,
-        entry_id: &str,
-        active_path: &std::collections::HashSet<String>,
+    fn build_subtree(
+        &self,
+        root_entry_id: &str,
+        _active_path: &std::collections::HashSet<String>,
         labels: &std::collections::HashMap<&str, Option<&str>>,
     ) -> Option<SessionTreeNode> {
-        let entry = self.entries.get(entry_id)?.clone();
-
-        let children: Vec<SessionTreeNode> = self
-            .children
-            .get(entry_id)
-            .map(|child_ids| {
-                let mut v: Vec<SessionTreeNode> = Vec::new();
-                for cid in child_ids {
-                    // Recurse into the child. If the child is a
-                    // meta entry, the recursive call returns
-                    // something with the meta's own children
-                    // spliced in, so the chain stays gap-free.
-                    if let Some(node) =
-                        self.build_subtree(cid, active_path, labels)
-                    {
-                        v.push(node);
-                    }
-                }
-                v
-            })
-            .unwrap_or_default();
-
-        // Meta entries (Leaf, SessionInfo) — the entry itself is
-        // invisible in the list, but its children must still be
-        // reachable. If the meta node has visible descendants,
-        // return them wrapped under the meta entry so the tree
-        // shape mirrors the JSONL exactly. The flat list filters
-        // these out via `entry_display_label`, so the user never
-        // sees the SessionInfo row.
-        if matches!(
-            entry.content,
-            SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
-        ) {
-            if children.is_empty() {
-                return None;
-            }
-            return Some(SessionTreeNode {
-                entry,
-                children,
-                label: None,
-            });
+        // Stack frames for iterative post-order traversal.
+        // Each frame: (entry_id, state)
+        // state = 0: visiting, state = 1: processing children results
+        #[derive(Debug)]
+        struct Frame {
+            entry_id: String,
+            state: u8,
+            entry: SessionEntry,
+            children_results: Vec<SessionTreeNode>,
         }
 
-        let label = labels.get(entry_id).copied().flatten().map(String::from);
+        let root_entry = self.entries.get(root_entry_id)?.clone();
+        let mut stack = vec![Frame {
+            entry_id: root_entry_id.to_string(),
+            state: 0,
+            entry: root_entry,
+            children_results: Vec::new(),
+        }];
 
-        Some(SessionTreeNode {
-            entry,
-            children,
-            label,
-        })
+        while let Some(frame) = stack.last_mut() {
+            if frame.state == 0 {
+                frame.state = 1;
+                // Push children onto stack for post-order processing
+                if let Some(child_ids) = self.children.get(&frame.entry_id) {
+                    for cid in child_ids.iter().rev() {
+                        if let Some(child_entry) = self.entries.get(cid) {
+                            stack.push(Frame {
+                                entry_id: cid.clone(),
+                                state: 0,
+                                entry: child_entry.clone(),
+                                children_results: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            } else {
+                // Pop the frame and build its node
+                let frame = stack.pop().unwrap();
+                let entry = frame.entry;
+                let children = frame.children_results;
+
+                // Meta entries (Leaf, SessionInfo) — the entry itself is
+                // invisible in the list, but its children must still be
+                // reachable. If the meta node has visible descendants,
+                // return them wrapped under the meta entry so the tree
+                // shape mirrors the JSONL exactly. The flat list filters
+                // these out via `entry_display_label`, so the user never
+                // sees the SessionInfo row.
+                let node = if matches!(
+                    entry.content,
+                    SessionEntryContent::Leaf { .. } | SessionEntryContent::SessionInfo { .. }
+                ) {
+                    if children.is_empty() {
+                        None
+                    } else {
+                        Some(SessionTreeNode {
+                            entry,
+                            children,
+                            label: None,
+                        })
+                    }
+                } else {
+                    let label = labels.get(entry.id.as_str()).copied().flatten().map(String::from);
+                    Some(SessionTreeNode {
+                        entry,
+                        children,
+                        label,
+                    })
+                };
+
+                // If there's a parent frame, pass the result up
+                if let Some(parent_frame) = stack.last_mut() {
+                    if let Some(node) = node {
+                        parent_frame.children_results.push(node);
+                    }
+                } else {
+                    // This was the root frame
+                    return node;
+                }
+            }
+        }
+
+        None
     }
 }
 

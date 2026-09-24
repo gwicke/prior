@@ -7,7 +7,7 @@ use tokio::fs;
 use rig_core::tool::ToolContext;
 
 #[allow(unused_imports)]
-use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes, EditStartLine, EditEndLine};
+use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes, EditStartLine};
 use crate::edit_match;
 use crate::path_util::relativize_path;
 
@@ -130,8 +130,21 @@ pub async fn read_file(
 
 #[rig_tool(name = "write", description = "Write content to file", required(path, content))]
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
-    fs::write(get_path_with(&path, true)?, content).await?;
-    Ok("ok".into())
+    let p = get_path_with(&path, true)?;
+    fs::write(&p, &content).await?;
+    // Return a structured result similar to read_file: include the path and
+    // content preview so display_tool_result can render it with syntax
+    // highlighting and the user sees what was written.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
+    let shown = crate::path_util::relativize_path(&p, &cwd);
+    // Limit preview to first 50 lines, without line numbers (display handles formatting)
+    let preview = content.lines().take(50).collect::<Vec<_>>().join("\n");
+    Ok(serde_json::json!({
+        "path": shown,
+        "content": preview,
+        "lines": content.lines().count(),
+        "bytes": content.len(),
+    }).to_string())
 }
 
 /// A single targeted text replacement within a file.
@@ -144,71 +157,36 @@ pub struct EditOp {
     /// Replacement text.
     #[serde(rename = "newText")]
     pub new_text: String,
-    /// Optional: restrict the search to this line range (1-indexed, inclusive)
-    /// in the original file. When set, the match must occur entirely within
-    /// these lines. Useful when oldText appears multiple times.
+    /// Optional *anchor* line (1-indexed) in the original file. It does not
+    /// restrict the search; it disambiguates. When `old_text` occurs more than
+    /// once, the occurrence whose start line is closest to this line is chosen,
+    /// provided it is within a small, context-scaled tolerance (see
+    /// [`anchor_tolerance`]); the `old_text` end is implied by its own length,
+    /// so there is no end line. A `path:LINE` block header supplies this
+    /// per-block in the blob form.
     #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<EditStartLine>,
-    /// Optional: restrict the search to this line range (1-indexed, inclusive)
-    /// in the original file. When set, the match must occur entirely within
-    /// these lines.
-    #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
-    pub end_line: Option<EditEndLine>,
 }
 
-/// Arguments accepted by the `edit` tool.
+/// Arguments accepted by the `edit` tool, after normalization to the execution
+/// form (a resolved single-file `path` plus one or more [`EditOp`]s).
 ///
-/// Accepts two wire formats:
-/// - Single (single edit): `{path, oldText, newText, startLine?, endLine?}`
-/// - Batch: `{path, edits: [{oldText, newText, startLine?, endLine?}]}`
+/// The advertised wire format is a **flat bag of optional fields** (see
+/// [`EditFile::parameters`]); variant selection happens in
+/// [`EditArgs::from_wire`] so no `anyOf` union is ever advertised. Accepted
+/// shapes:
 ///
-/// The schema advertises both formats via `anyOf`.
-#[derive(Serialize, JsonSchema)]
+/// - single edit: `{path, oldText, newText, startLine?}` — `startLine` is the
+///   anchor.
+/// - block edit:  `{path?, edits: "<Aider SEARCH/REPLACE blocks>"}` — anchors
+///   come from each block's `path:LINE` header; a top-level `startLine` is
+///   ignored in this shape.
+/// - legacy batch (replay only): `{path, edits: [{oldText, newText, startLine?}]}`
 pub struct EditArgs {
-    /// File to edit, relative to the working directory.
+    /// File to edit (from the `path` argument, or inferred from a block header).
     pub path: String,
-    /// Either the canonical `edits` array or the legacy single-edit fields.
-    #[serde(flatten)]
-    pub variant: EditArgsVariant,
-}
-
-/// Internal enum to represent the two accepted wire formats.
-/// The `#[serde(untagged)]` attribute makes serde try each variant in order
-/// without a discriminant field, and `schemars` emits this as `anyOf` in the schema.
-#[derive(Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum EditArgsVariant {
-    /// Single format: single edit at top level (for backwards compatibility).
-    Single {
-        #[serde(rename = "oldText")]
-        old_text: String,
-        #[serde(rename = "newText")]
-        new_text: String,
-        #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
-        start_line: Option<EditStartLine>,
-        #[serde(rename = "endLine", default, skip_serializing_if = "Option::is_none")]
-        end_line: Option<EditEndLine>,
-    },
-    /// Batch format: one or more edits in an array.
-    Batch {
-        /// One or more targeted text replacements.
-        edits: Vec<EditOp>,
-    },
-}
-
-impl EditArgs {
-    /// Get the list of edits, converting from legacy format if needed.
-    pub fn edits(&self) -> Vec<EditOp> {
-        match &self.variant {
-            EditArgsVariant::Batch { edits } => edits.clone(),
-            EditArgsVariant::Single { old_text, new_text, start_line, end_line } => vec![EditOp {
-                old_text: old_text.clone(),
-                new_text: new_text.clone(),
-                start_line: start_line.clone(),
-                end_line: end_line.clone(),
-            }],
-        }
-    }
+    /// The edits to apply, computed against the original file.
+    pub edits: Vec<EditOp>,
 }
 
 /// Cap on the JSON echoed back in an invalid-parameters error, so a bad call
@@ -216,89 +194,258 @@ impl EditArgs {
 /// can't blow up the tool message.
 const MAX_ECHOED_ARGS: usize = 400;
 
-const EDIT_ARGS_EXAMPLE: &str = r#"Single: {"path": "some/path", "oldText": "original text", "newText": "replacement text" }
-Batch: {"path": "some/path","edits": [{ "oldText": "original text", "newText": "replacement text" }]
-}"#;
+/// A string field shorter than this is echoed verbatim; longer ones are
+/// elided, so small fields (a `path`, a short `oldText`) survive intact.
+const ELIDE_MIN_CHARS: usize = 120;
 
-/// Truncate the echoed parameter JSON to [`MAX_ECHOED_ARGS`] chars on a
-/// char boundary, appending an ellipsis when cut.
-fn truncate_wire_repr(raw: &serde_json::Value) -> String {
-    let s = raw.to_string();
-    if s.len() <= MAX_ECHOED_ARGS {
-        return s;
+/// Per-field budget for a long string that carries no structural markers —
+/// nothing worth keeping line-by-line, so a prefix stands in for it.
+const ELIDE_FIELD_BUDGET: usize = 160;
+
+/// Lines of context kept either side of a structural (marker) line when
+/// eliding a blob, so the block shape reads clearly.
+const ELIDE_CONTEXT: usize = 1;
+
+const EDIT_ARGS_EXAMPLE: &str = r#"Single edit: {"path": "some/path", "oldText": "original text", "newText": "replacement text"}
+Multiple edits: {"path": "some/path", "edits": "<<<<<<< SEARCH\noriginal text\n=======\nreplacement text\n>>>>>>> REPLACE"}
+Anchored block (when the text repeats): {"path": "some/path", "edits": "some/path:120\n<<<<<<< SEARCH\noriginal text\n=======\nreplacement text\n>>>>>>> REPLACE"}"#;
+
+/// Truncate `s` to `max` bytes on a char boundary, appending ` …` when cut.
+fn char_truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
     }
-    let mut cut = MAX_ECHOED_ARGS;
-    while !s.is_char_boundary(cut) {
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
     format!("{} …", &s[..cut])
 }
 
-/// Extract a clean, user-friendly error from serde's untagged enum mismatch.
-fn clean_error(e: &serde_json::Error) -> String {
-    let msg = e.to_string();
-    if msg.contains("data did not match any variant of untagged enum") {
-        "provided arguments don't match any accepted format".to_string()
-    } else if msg.contains("missing field `path`") {
-        "missing required field 'path'".to_string()
-    } else if msg.contains("missing field `edits`") {
-        "missing required field 'edits' (for canonical format)".to_string()
-    } else if msg.contains("missing field `oldText`") {
-        "missing required field 'oldText' (for legacy format)".to_string()
-    } else if msg.contains("missing field `newText`") {
-        "missing required field 'newText' (for legacy format)".to_string()
-    } else {
-        msg.replace("RawEditArgsVariant", "the expected format")
-            .replace("RawEditArgs", "the expected format")
+/// A line worth keeping when eliding a SEARCH/REPLACE blob: the structural
+/// markers. Prefix matching (not exact equality) so near-miss markers the
+/// model invents — e.g. a stray `<<<<<<< SEARCH>` — are still shown.
+fn is_structural_line(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("<<<<<<<") || t.starts_with("=======") || t.starts_with(">>>>>>>")
+}
+
+/// The marker emitted in place of a run of elided lines.
+fn elision_notice(lines: usize) -> String {
+    format!(
+        "… ({lines} line{} elided) …",
+        if lines == 1 { "" } else { "s" }
+    )
+}
+
+/// Shrink a long string field by keeping only its structural lines (plus
+/// [`ELIDE_CONTEXT`] lines of context) and collapsing every other run of lines
+/// into a single [`elision_notice`]. A string with no structural lines degrades
+/// to a plain prefix. Short strings pass through untouched.
+fn elide_string(s: &str) -> String {
+    if s.len() < ELIDE_MIN_CHARS {
+        return s.to_string();
+    }
+    let lines: Vec<&str> = s.split('\n').collect();
+    let structural: Vec<bool> = lines.iter().map(|l| is_structural_line(l)).collect();
+    if !structural.iter().any(|&b| b) {
+        return char_truncate(s, ELIDE_FIELD_BUDGET);
+    }
+
+    let mut keep = vec![false; lines.len()];
+    for (i, &is_sep) in structural.iter().enumerate() {
+        if !is_sep {
+            continue;
+        }
+        let lo = i.saturating_sub(ELIDE_CONTEXT);
+        let hi = (i + ELIDE_CONTEXT).min(lines.len() - 1);
+        for k in lo..=hi {
+            keep[k] = true;
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut run = 0usize;
+    for (i, &k) in keep.iter().enumerate() {
+        if k {
+            if run > 0 {
+                out.push(elision_notice(run));
+                run = 0;
+            }
+            out.push(lines[i].to_string());
+        } else {
+            run += 1;
+        }
+    }
+    if run > 0 {
+        out.push(elision_notice(run));
+    }
+    out.join("\n")
+}
+
+/// Recursively replace long string values in `value` with their elided form.
+fn elide_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(s) => serde_json::Value::String(elide_string(s)),
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(elide_value).collect())
+        }
+        serde_json::Value::Object(o) => serde_json::Value::Object(
+            o.iter().map(|(k, v)| (k.clone(), elide_value(v))).collect(),
+        ),
+        other => other.clone(),
     }
 }
 
+/// Render the received parameters for the error echo, elided to fit
+/// [`MAX_ECHOED_ARGS`]. A blob is shown by its *structure* — the marker lines
+/// and a line of context around each — rather than by a raw byte prefix, so the
+/// model can see the shape of what it sent.
+fn truncate_wire_repr(raw: &serde_json::Value) -> String {
+    let s = raw.to_string();
+    if s.len() <= MAX_ECHOED_ARGS {
+        return s;
+    }
+    let elided = elide_value(raw).to_string();
+    // Only prefer the elided form when it actually shrinks the payload.
+    let picked = if elided.len() < s.len() { elided } else { s };
+    char_truncate(&picked, MAX_ECHOED_ARGS)
+}
+
 impl EditArgs {
-    /// Parse the wire JSON, accepting both the canonical `edits` array and
-    /// the legacy top-level single-edit shape (with optional startLine/endLine).
-    /// Any other payload yields an error that echoes the received parameters
-    /// (truncated) plus the canonical shape, so the model can self-correct
-    /// in a single retry.
+    /// Build the self-correcting error: what went wrong, the accepted shapes,
+    /// and the (truncated) parameters actually received.
+    fn invalid(raw: &serde_json::Value, why: &str) -> String {
+        format!(
+            "Invalid edit tool arguments: {why}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nPlease do NOT use sed or python for editing, they lack the protections of this tool.",
+            EDIT_ARGS_EXAMPLE,
+            truncate_wire_repr(raw),
+        )
+    }
+
+    /// Parse one legacy `edits[]` entry.
+    fn op_from_value(e: &serde_json::Value) -> Option<EditOp> {
+        Some(EditOp {
+            old_text: e.get("oldText")?.as_str()?.to_string(),
+            new_text: e.get("newText")?.as_str()?.to_string(),
+            start_line: e
+                .get("startLine")
+                .and_then(|v| v.as_u64())
+                .map(crate::config::EditStartLine),
+        })
+    }
+
+    /// Parse the wire JSON. The `path` argument is authoritative; a filename
+    /// line inside the blocks may agree with it (or supply it when absent), but
+    /// a disagreement is a hard error (never silently write the wrong file).
+    ///
+    /// The `path` argument also accepts the `file:LINE` idiom; the trailing
+    /// `:LINE` is peeled off before path resolution in **every** shape (so
+    /// `f.rs:12` resolves to `f.rs`, not a nonexistent file named `f.rs:12`).
+    ///
+    /// Anchors are **per shape, never mixed**:
+    ///
+    /// - single edit: anchors come from `path:LINE` and/or `startLine` (they
+    ///   must agree if both are present);
+    /// - blob form: anchors come *only* from each block's `path:LINE` header —
+    ///   the top-level `startLine` and any `path:LINE` are ignored, so a stray
+    ///   call-wide anchor cannot silently aim an unrelated block.
     fn from_wire(raw: &serde_json::Value) -> Result<Self, String> {
-        // Use a temporary type without custom Deserialize to avoid recursion.
-        #[derive(serde::Deserialize)]
-        struct RawEditArgs {
-            path: String,
-            #[serde(flatten)]
-            variant: RawEditArgsVariant,
+        let obj = match raw.as_object() {
+            Some(o) => o,
+            None => return Err(Self::invalid(raw, "arguments must be a JSON object")),
+        };
+        let raw_path = obj
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // Peel a `file:LINE` suffix off the `path` argument; the path part is
+        // what resolves to a file.
+        let (json_path, path_anchor): (Option<String>, Option<u64>) = match raw_path {
+            Some(p) => {
+                let (path, anchor) = crate::edit_blocks::split_line_anchor(p);
+                (Some(path), anchor)
+            }
+            None => (None, None),
+        };
+        let json_path = json_path.as_deref();
+        let start_line = obj
+            .get("startLine")
+            .and_then(|v| v.as_u64())
+            .map(crate::config::EditStartLine);
+
+        // Block form: `edits` is a string of Aider SEARCH/REPLACE blocks.
+        // Anchors come solely from each block's `path:LINE` header.
+        if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
+            let parsed = crate::edit_blocks::parse_blocks(text)
+                .map_err(|e| Self::invalid(raw, &format!("invalid SEARCH/REPLACE blocks: {e}")))?;
+            let (path, blocks) = crate::edit_blocks::merge_path(json_path, parsed)
+                .map_err(|e| Self::invalid(raw, &e))?;
+            let edits = blocks
+                .into_iter()
+                .map(|b| EditOp {
+                    old_text: b.old_text,
+                    new_text: b.new_text,
+                    start_line: b.start_line.map(crate::config::EditStartLine),
+                })
+                .collect();
+            return Ok(EditArgs { path, edits });
         }
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum RawEditArgsVariant {
-            Batch { edits: Vec<EditOp> },
-            Single {
-                #[serde(rename = "oldText")]
-                old_text: String,
-                #[serde(rename = "newText")]
-                new_text: String,
-                #[serde(rename = "startLine", default)]
-                start_line: Option<EditStartLine>,
-                #[serde(rename = "endLine", default)]
-                end_line: Option<EditEndLine>,
-            },
+
+        // Legacy batch form: `edits` is an array.
+        if let Some(arr) = obj.get("edits").and_then(|v| v.as_array()) {
+            let path = json_path
+                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let mut edits = Vec::with_capacity(arr.len());
+            for e in arr {
+                edits.push(Self::op_from_value(e).ok_or_else(|| {
+                    Self::invalid(raw, "each `edits[]` entry needs string 'oldText' and 'newText'")
+                })?);
+            }
+            return Ok(EditArgs {
+                path: path.to_string(),
+                edits,
+            });
         }
-        match serde_json::from_value::<RawEditArgs>(raw.clone()) {
-            Ok(raw_args) => Ok(EditArgs {
-                path: raw_args.path,
-                variant: match raw_args.variant {
-                    RawEditArgsVariant::Batch { edits } => EditArgsVariant::Batch { edits },
-                    RawEditArgsVariant::Single { old_text, new_text, start_line, end_line } => {
-                        EditArgsVariant::Single { old_text, new_text, start_line, end_line }
-                    }
-                },
-            }),
-            Err(e) => Err(format!(
-                "Invalid edit tool arguments: {}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nDo NOT use sed or python for editing.",
-                clean_error(&e),
-                EDIT_ARGS_EXAMPLE,
-                truncate_wire_repr(raw),
-            )),
+
+        // Single form: top-level oldText/newText. Both `path:LINE` and
+        // `startLine` may anchor it; if both are present they must agree.
+        if let (Some(o), Some(n)) = (
+            obj.get("oldText").and_then(|v| v.as_str()),
+            obj.get("newText").and_then(|v| v.as_str()),
+        ) {
+            let path = json_path
+                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let anchor = match (start_line, path_anchor) {
+                (Some(s), Some(p)) if s.0 != p => {
+                    return Err(Self::invalid(
+                        raw,
+                        &format!(
+                            "the `path` argument anchors line {p} but `startLine` is {}; \
+                             they must agree",
+                            s.0
+                        ),
+                    ));
+                }
+                (Some(s), _) => Some(s),
+                (None, Some(p)) => Some(crate::config::EditStartLine(p)),
+                (None, None) => None,
+            };
+            return Ok(EditArgs {
+                path: path.to_string(),
+                edits: vec![EditOp {
+                    old_text: o.to_string(),
+                    new_text: n.to_string(),
+                    start_line: anchor,
+                }],
+            });
         }
+
+        Err(Self::invalid(
+            raw,
+            "no recognizable edit arguments (expected `oldText`+`newText`, or `edits`)",
+        ))
     }
 }
 
@@ -312,10 +459,10 @@ impl<'de> Deserialize<'de> for EditArgs {
     }
 }
 
-/// Static tool facade for `edit`, mirroring what `#[rig_tool]` would emit.
-/// Hand-written instead of macro-generated so the args deserializer can
-/// accept the legacy single-edit shape without advertising it — see
-/// [`EditArgs`]. The `Bash` tool follows the same manual-impl pattern.
+/// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
+/// the args deserializer can select a variant from the raw JSON and accept the
+/// legacy shapes without advertising them — see [`EditArgs`]. The `Bash` tool
+/// follows the same manual-impl pattern.
 pub struct EditFile;
 
 impl rig_core::tool::Tool for EditFile {
@@ -326,22 +473,38 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in file using one or more targeted edits. Each edit must match unique text. Edits target the original file, not the output of previous edits.".into()
+        "Replace text in a file. For one edit use `oldText`/`newText`. For several edits in one call, put Aider-style SEARCH/REPLACE blocks in the `edits` string (single file). Each block is `<<<<<<< SEARCH` then the exact text, `=======`, the replacement, `>>>>>>> REPLACE`. Each edit's old text must occur exactly once, or be disambiguated with a `path:LINE` anchor (a line number acts as a near-line hint, not a range). Edits are computed against the original file, not incrementally.".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
-        static SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
-            let mut schema = schemars::schema_for!(EditArgs).to_value();
-            // Providers expect an explicit `required` array even when no
-            // parameter is required (mirrors the macro-generated schema).
-            if let Some(object) = schema.as_object_mut() {
-                object
-                    .entry("required")
-                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            }
-            schema
-        });
-        SCHEMA.clone()
+        // A flat object of optional scalars — deliberately no `anyOf`/nested
+        // array, which weak tool-call harnesses tend to mangle (stringify).
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "File to edit, relative to the working directory. Required for the single-edit form; optional for the block form when the edit text starts with a filename line. It accepts the `file:LINE` idiom (e.g. `src/foo.rs:120`): for a single edit the suffix is an anchor; in the block form only the path part is used (per-block anchors live on the block headers)."
+                },
+                "oldText": {
+                    "type": "string",
+                    "description": "Exact text to replace (single-edit form). Must occur exactly once in the file, or pair with `startLine`/a `path:LINE` suffix."
+                },
+                "newText": {
+                    "type": "string",
+                    "description": "Replacement text (single-edit form)."
+                },
+                "startLine": {
+                    "type": "integer",
+                    "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. A `path:LINE` suffix is an equivalent alias; if both are given they must agree. Ignored in the block form — use a `path:LINE` block header there instead."
+                },
+                "edits": {
+                    "type": "string",
+                    "description": "One or more Aider-style SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `<<<<<<< SEARCH` line, exact text, `=======`, replacement, `>>>>>>> REPLACE`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. HEADER-LESS BLOCKS REMAIN AMBIGUOUS: if such a block's text occurs more than once the call fails, so add a `path:LINE` header whenever the matched text is not unique. Preferred over `oldText`/`newText` when making multiple edits."
+                }
+            },
+            "required": []
+        })
     }
 
     async fn call(
@@ -349,74 +512,21 @@ impl rig_core::tool::Tool for EditFile {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let edits = args.edits();
-        edit_file(args.path, edits).await
+        edit_file(args.path, args.edits).await
     }
 }
 
-/// Convert 1-indexed inclusive line numbers to byte range (start inclusive, end exclusive).
-/// Returns (start_byte, end_byte) in the text.
-fn line_range_to_byte_range(
-    text: &str,
-    start_line: Option<u64>,
-    end_line: Option<u64>,
-) -> Result<(usize, usize), ToolError> {
-    let total_lines = text.lines().count();
-    if total_lines == 0 {
-        return Ok((0, 0));
-    }
-
-    // Convert to 0-indexed
-    let start = start_line.map(|l| (l - 1) as usize).unwrap_or(0);
-    let end = end_line
-        .map(|l| l as usize)
-        .unwrap_or(total_lines);
-
-    if start >= total_lines {
-        return Err(ToolError::Generic(format!(
-            "startLine {} exceeds file length ({} lines)",
-            start + 1,
-            total_lines
-        )));
-    }
-    if end == 0 || end > total_lines {
-        return Err(ToolError::Generic(format!(
-            "endLine {} exceeds file length ({} lines)",
-            end,
-            total_lines
-        )));
-    }
-    if start >= end {
-        return Err(ToolError::Generic(format!(
-            "startLine {} must be less than endLine {}",
-            start + 1,
-            end
-        )));
-    }
-
-    // Find byte offset of start line
-    let mut byte_start = 0;
-    for (idx, line) in text.lines().enumerate() {
-        if idx == start {
-            break;
-        }
-        byte_start += line.len() + 1; // +1 for newline
-    }
-
-    // Find byte offset of end line (after the line)
-    let mut byte_end = 0;
-    for (idx, line) in text.lines().enumerate() {
-        if idx == end {
-            break;
-        }
-        byte_end += line.len() + 1; // +1 for newline
-    }
-    // If end == total_lines, byte_end should be text.len()
-    if end >= total_lines {
-        byte_end = text.len();
-    }
-
-    Ok((byte_start, byte_end))
+/// Distance tolerance (in lines) for anchor-based matching.
+///
+/// Scales with the amount of SEARCH context: more context makes a false
+/// nearest-match less likely, so a wider window is safe. `(context_lines / 3)`
+/// capped at 4 — so three context lines (a common one-before/one-after shape)
+/// enables a ±1 window, while a bare single-line SEARCH stays exact (`0`).
+///
+/// Tolerance only matters when `old_text` occurs more than once; a globally
+/// unique match is applied regardless of the anchor.
+fn anchor_tolerance(old_text: &str) -> usize {
+    (old_text.lines().count() / 3).min(4)
 }
 
 pub async fn edit_file(
@@ -427,68 +537,60 @@ pub async fn edit_file(
     let text = fs::read_to_string(&p).await?;
     let total = edits.len();
     let mut failures: Vec<edit_match::BatchItem> = Vec::new();
+    // Byte offset of the chosen match for each edit, in edit order. Fully
+    // populated only when validation succeeds for every edit.
+    let mut resolved: Vec<usize> = Vec::with_capacity(total);
 
     for (i, edit) in edits.iter().enumerate() {
         let start_line = edit.start_line.map(|l| l.0);
-        let end_line = edit.end_line.map(|l| l.0);
 
-        // Determine the search range
-        let (search_start, search_end) = line_range_to_byte_range(&text, start_line, end_line)?;
-        let search_text = &text[search_start..search_end];
+        // The whole file is always searched. An anchor never narrows the
+        // search; it only disambiguates between repeated occurrences.
+        let search_text = text.as_str();
 
-        if !search_text.contains(&edit.old_text) {
-            // Exact match failed in the specified range.
-            // Check if it exists elsewhere in the file for a better error message.
-            let exists_elsewhere = text.contains(&edit.old_text);
+        // Every occurrence of `oldText`, as
+        // `(absolute byte offset, 1-based file line)`.
+        let occs: Vec<(usize, usize)> = search_text
+            .match_indices(&edit.old_text)
+            .map(|(off, _)| {
+                (off, crate::edit_match::count_lines(&text[..off]) + 1)
+            })
+            .collect();
+
+        if occs.is_empty() {
+            // No exact match anywhere. Check whether the text exists as a
+            // whitespace-drifted near-match for a better error message.
             let edit_idx_1 = i + 1;
-            // Pass the line range to diagnose so it can report correct file line numbers
-            let (diag_start_line, diag_end_line) = match (start_line, end_line) {
-                (Some(s), Some(e)) => (Some(s as usize), Some(e as usize)),
-                (Some(s), None) => (Some(s as usize), None),
-                (None, Some(e)) => (None, Some(e as usize)),
-                (None, None) => (None, None),
+            let anchor_info = match start_line {
+                Some(s) => format!(" (anchored near line {})", s),
+                None => String::new(),
             };
-            let failure = match edit_match::diagnose(&edit.old_text, &text, diag_start_line, diag_end_line) {
+            let failure = match edit_match::diagnose(&edit.old_text, &text) {
                 Some(mut f) => {
-                    // Add line range info to the diagnostic
-                    let range_info = match (start_line, end_line) {
-                        (Some(s), Some(e)) => format!(" (searched lines {}-{})", s, e),
-                        (Some(s), None) => format!(" (searched from line {} to end)", s),
-                        (None, Some(e)) => format!(" (searched lines 1-{})", e),
-                        (None, None) => String::new(),
-                    };
                     f.ui_view = format!(
                         "edit #{} oldText not found.{}. {}",
                         edit_idx_1,
-                        range_info,
+                        anchor_info,
                         f.ui_view
                     );
                     f
                 }
                 None => {
-                    let range_info = match (start_line, end_line) {
-                        (Some(s), Some(e)) => format!(" in lines {}-{}", s, e),
-                        (Some(s), None) => format!(" from line {} to end", s),
-                        (None, Some(e)) => format!(" in lines 1-{}", e),
-                        (None, None) => String::new(),
-                    };
                     let mut msg = format!(
                         "edit #{} oldText not found{}. ",
                         edit_idx_1,
-                        range_info
+                        anchor_info
                     );
-                    if exists_elsewhere {
-                        msg.push_str("Note: oldText exists elsewhere in the file; adjust startLine/endLine or include more context.");
-                    } else {
-                        msg.push_str("No similar region in file.");
-                    }
+                    msg.push_str(
+                        "No similar region in the file; re-read the file and re-anchor the edit.",
+                    );
                     edit_match::EditFailure {
                         ui_view: msg,
                         model_view: format!(
-                            "oldText not found{}. No close-enough region in the file; 
-                             please re-read the file and re-anchor your edit. 
+                            "oldText not found{}. No close-enough region in the file; \
+                             please re-read the file and re-anchor your edit. \
                              Original oldText: '{}'.",
-                            range_info,
+                            anchor_info,
                             edit.old_text
                         ),
                     }
@@ -501,39 +603,66 @@ pub async fn edit_file(
             continue;
         }
 
-        // Count matches in the search range
-        let count = search_text.matches(&edit.old_text).count();
-        if count > 1 {
-            // List the line numbers of every occurrence in the search range
-            let mut line_numbers: Vec<usize> = Vec::with_capacity(count.min(10));
-            let mut listed = 0usize;
-            for (byte_off, _) in search_text.match_indices(&edit.old_text) {
-                if listed >= 10 {
-                    break;
-                }
-                line_numbers.push(
-                    crate::edit_match::count_lines(&search_text[..byte_off]) + 1,
-                );
-                listed += 1;
+        // Choose which occurrence to replace. Up to 10 candidate line
+        // numbers are collected for any ambiguity diagnostic.
+        let list_lines = |occs: &[(usize, usize)]| -> Vec<usize> {
+            occs.iter().take(10).map(|(_, l)| *l).collect()
+        };
+        let chosen: usize = if occs.len() == 1 {
+            // Globally unambiguous — the anchor plays no part.
+            occs[0].0
+        } else if let Some(anchor) = start_line {
+            // Anchor: nearest occurrence, within a context-scaled tolerance.
+            let tol = anchor_tolerance(&edit.old_text);
+            let mut ranked: Vec<(usize, usize, usize)> = occs
+                .iter()
+                .map(|(byte, line)| (*byte, *line, line.abs_diff(anchor as usize)))
+                .collect();
+            ranked.sort_by_key(|(_, _, d)| *d);
+            let nearest_d = ranked[0].2;
+            let nearest_line = ranked[0].1;
+            if nearest_d > tol {
+                failures.push(edit_match::BatchItem {
+                    edit_index: i,
+                    failure: edit_match::EditFailure::anchor_out_of_tolerance(
+                        i + 1,
+                        &edit.old_text,
+                        anchor as usize,
+                        nearest_line,
+                        tol,
+                        occs.len(),
+                    ),
+                });
+                continue;
             }
-            // Adjust line numbers to be relative to the file (not the search range)
-            let line_offset = if search_start == 0 {
-                0
-            } else {
-                crate::edit_match::count_lines(&text[..search_start])
-            };
-            let line_numbers: Vec<usize> = line_numbers.into_iter().map(|n| n + line_offset).collect();
-
+            if ranked.iter().filter(|(_, _, d)| *d == nearest_d).count() > 1 {
+                let lines: Vec<usize> = ranked.iter().take(10).map(|(_, l, _)| *l).collect();
+                failures.push(edit_match::BatchItem {
+                    edit_index: i,
+                    failure: edit_match::EditFailure::anchor_ambiguous(
+                        i + 1,
+                        &edit.old_text,
+                        anchor as usize,
+                        &lines,
+                    ),
+                });
+                continue;
+            }
+            ranked[0].0
+        } else {
+            // Repeated text with no anchor to disambiguate: refuse to guess.
             failures.push(edit_match::BatchItem {
                 edit_index: i,
                 failure: edit_match::EditFailure::non_unique(
                     i + 1,
                     &edit.old_text,
-                    count,
-                    &line_numbers,
+                    occs.len(),
+                    &list_lines(&occs),
                 ),
             });
-        }
+            continue;
+        };
+        resolved.push(chosen);
     }
 
     if !failures.is_empty() {
@@ -544,19 +673,24 @@ pub async fn edit_file(
         return Ok(edit_match::render_batch(&batch));
     }
 
-    // Compute all offsets against the original text first, then apply from end to start
-    // Edits target the original file, not the output of previous edits.
+    // Compute all offsets against the original text first, then apply from end
+    // to start. Edits target the original file, not the output of previous
+    // edits. `resolved` holds the validated match offset per edit.
+    debug_assert_eq!(resolved.len(), edits.len());
     let mut replacements: Vec<(usize, usize, String)> = Vec::new(); // (start, end, new_text)
-    for edit in &edits {
-        let start_line = edit.start_line.map(|l| l.0);
-        let end_line = edit.end_line.map(|l| l.0);
-        let (search_start, search_end) = line_range_to_byte_range(&text, start_line, end_line)?;
-        let search_text = &text[search_start..search_end];
-        let match_offset = search_text.find(&edit.old_text).expect("validated earlier");
-        let absolute_start = search_start + match_offset;
-        let absolute_end = absolute_start + edit.old_text.len();
-        replacements.push((absolute_start, absolute_end, edit.new_text.clone()));
+    for (edit, abs_start) in edits.iter().zip(resolved.iter()) {
+        let abs_start = *abs_start;
+        let abs_end = abs_start + edit.old_text.len();
+        replacements.push((abs_start, abs_end, edit.new_text.clone()));
     }
+
+    // Match line of each edit, from the *original* text (the offsets target it;
+    // computing after the edits below would shift the numbers). Used to teach
+    // the `path:LINE` anchor by example when the model didn't supply one.
+    let matched_lines: Vec<usize> = resolved
+        .iter()
+        .map(|off| crate::edit_match::count_lines(&text[..*off]) + 1)
+        .collect();
 
     // Sort by start position descending so we can apply from end to start
     replacements.sort_by(|a, b| b.0.cmp(&a.0));
@@ -573,10 +707,33 @@ pub async fn edit_file(
     // outside cwd — see `path_util::relativize_path`.
     let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
     let shown = relativize_path(&p, &cwd);
+    // When no anchor was supplied, echo where each block actually matched. The
+    // `path:LINE` idiom shown here is the same anchor syntax the blob form
+    // accepts, so the model learns it from its own transcript. Only shown when
+    // *no* edit anchored (`matched_lines` then lines up with `edits`); if the
+    // model already anchored, it needs no reminder.
+    let matched_note = if edits.iter().any(|e| e.start_line.is_some()) {
+        String::new()
+    } else {
+        match matched_lines.as_slice() {
+            [] => String::new(),
+            [l] => format!(" (matched at {shown}:{l})"),
+            lines if lines.len() <= 3 => {
+                let list = lines
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" (matched lines {list})")
+            }
+            lines => format!(" (matched {} lines)", lines.len()),
+        }
+    };
     Ok(format!(
-        "Replaced {} block(s) in {}",
+        "Replaced {} block(s) in {}{}",
         edits.len(),
-        shown
+        shown,
+        matched_note
     ))
 }
 
@@ -2354,7 +2511,6 @@ mod edit_file_tests {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2381,7 +2537,6 @@ mod edit_file_tests {
                 old_text: "hello".into(),
                 new_text: "goodbye".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2416,7 +2571,6 @@ mod edit_file_tests {
                 old_text: "fn main() {\n   let x = 1;\n    let y = 2;\n}\n".into(),
                 new_text: "noop".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2447,7 +2601,6 @@ mod edit_file_tests {
                 old_text: "completely different unrelated content here that shares no characters with the file".into(),
                 new_text: "noop".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2483,7 +2636,6 @@ mod edit_file_tests {
                 old_text: "foo".into(),
                 new_text: "bar".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2511,7 +2663,6 @@ mod edit_file_tests {
                 old_text: "x ".into(),
                 new_text: "y ".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2546,19 +2697,16 @@ mod edit_file_tests {
                     old_text: "    let a = 1;".into(),
                     new_text: "    let a = 42;".into(),
                     start_line: None,
-                    end_line: None,
                 },
                 EditOp {
                     old_text: "    let nonexistent = 99;".into(),
                     new_text: "    let z = 99;".into(),
                     start_line: None,
-                    end_line: None,
                 },
                 EditOp {
                     old_text: "fn".into(),
                     new_text: "function".into(),
                     start_line: None,
-                    end_line: None,
                 },
             ],
         )
@@ -2610,7 +2758,6 @@ mod edit_file_tests {
                 old_text: "fn main() {\n   let x = 1;\n}\n".into(),
                 new_text: "noop".into(),
                 start_line: None,
-                end_line: None,
             }],
         )
         .await
@@ -2789,52 +2936,359 @@ mod edit_args_wire_tests {
         let result = execute_edit(serde_json::json!({ "path": "p", "stuff": blob })).await;
         assert!(result.is_error());
         let msg = result.output().render();
+        // The template is fixed-size; the point is that the 5_000-char blob
+        // is not echoed raw (it is truncated to MAX_ECHOED_ARGS + `…`).
         assert!(
-            msg.len() < 1_000,
+            msg.len() < 1_200,
             "echo must be truncated, got {} chars",
             msg.len()
         );
         assert!(msg.contains("…"), "truncation marker missing: {msg}");
     }
 
+    #[test]
+    fn echoed_blob_keeps_markers_and_elides_bulk_content() {
+        // A big, well-formed blob: the echo must keep the *structure* (the
+        // marker lines) and elide the bulky middle, rather than chopping the
+        // blob at an arbitrary byte offset.
+        let old: String = (0..40).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (0..40).map(|i| format!("new line {i}\n")).collect();
+        let blob = format!("<<<<<<< SEARCH\n{old}=======\n{new}>>>>>>> REPLACE");
+        let v = serde_json::json!({ "path": "p", "edits": blob });
+        let out = super::truncate_wire_repr(&v);
+
+        assert!(out.contains("<<<<<<< SEARCH"), "opening marker lost: {out}");
+        assert!(out.contains("======="), "divider lost: {out}");
+        assert!(out.contains(">>>>>>> REPLACE"), "closing marker lost: {out}");
+        assert!(out.contains("lines elided"), "no elision notice: {out}");
+        assert!(!out.contains("old line 20"), "bulk content not elided: {out}");
+        assert!(
+            out.len() <= super::MAX_ECHOED_ARGS,
+            "echo exceeds cap: {} chars",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn echoed_blob_recognizes_near_miss_markers() {
+        // Prefix matching keeps a hallucinated marker (trailing `>`) visible,
+        // which is exactly the failure the echo should surface.
+        let body: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let blob = format!("<<<<<<< SEARCH>\n{body}");
+        let v = serde_json::json!({ "path": "p", "edits": blob });
+        let out = super::truncate_wire_repr(&v);
+        assert!(out.contains("<<<<<<< SEARCH>"), "marker lost: {out}");
+        assert!(out.contains("elided"), "no elision notice: {out}");
+    }
+
+    #[test]
+    fn short_fields_are_not_elided() {
+        // Under the cap: everything is echoed verbatim.
+        let v = serde_json::json!({ "path": "src/main.rs", "oldText": "a", "newText": "b" });
+        assert_eq!(super::truncate_wire_repr(&v), v.to_string());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_top_level_startline_is_ignored() {
+        // Shape (B): in the blob form anchors come *only* from `path:LINE`
+        // headers. A stray top-level `startLine` must not silently aim a
+        // header-less block, so it is ignored — the ambiguous block still
+        // fails loudly rather than editing a guessed occurrence.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("win.txt", "x\nkeep\nx\n").await.unwrap();
+        let blob = "win.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+
+        let result = execute_edit(serde_json::json!({
+            "path": "win.txt", "edits": blob, "startLine": 3
+        }))
+        .await;
+        assert!(
+            result.output().render().contains("appears 2 times"),
+            "top-level startLine must be ignored in blob form; got: {}",
+            result.output().render()
+        );
+        // Nothing applied.
+        assert_eq!(tokio::fs::read_to_string("win.txt").await.unwrap(), "x\nkeep\nx\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_header_anchor_disambiguates() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("win2.txt", "x\nkeep\nx\n").await.unwrap();
+        // The header anchors the block to line 3 (the second `x`).
+        let blob = "win2.txt:3\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "win2.txt", "edits": blob})).await;
+        assert!(result.is_success(), "got: {result:?}");
+        assert_eq!(tokio::fs::read_to_string("win2.txt").await.unwrap(), "x\nkeep\ny\n");
+    }
+
+    // ---- `path:LINE` on the JSON `path` argument ----
+
+    #[tokio::test]
+    #[serial]
+    async fn path_argument_line_suffix_anchors_single_edit() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("pa.txt", "x\nkeep\nx\n").await.unwrap();
+        // `path` carries the anchor, so it also proves the suffix is stripped:
+        // the file resolves to `pa.txt`, not a literal `pa.txt:3`.
+        let result = execute_edit(serde_json::json!({
+            "path": "pa.txt:3", "oldText": "x", "newText": "y"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("pa.txt").await.unwrap(),
+            "x\nkeep\ny\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn path_argument_line_and_startline_must_agree() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let result = execute_edit(serde_json::json!({
+            "path": "pf.txt:3", "oldText": "x", "newText": "y", "startLine": 5
+        }))
+        .await;
+        assert!(result.is_error(), "conflict must fail: {result:?}");
+        assert!(
+            result.output().render().contains("must agree"),
+            "got: {}",
+            result.output().render()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn blob_form_path_line_suffix_is_stripped_but_not_an_anchor() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("pb.txt", "x\nkeep\nx\n").await.unwrap();
+        // In blob form the `path` suffix is only stripped (file resolves), NOT
+        // used as an anchor — repeated text stays ambiguous and fails loudly
+        // rather than silently aiming an unrelated block.
+        let result = execute_edit(serde_json::json!({
+            "path": "pb.txt:3",
+            "edits": "pb.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(
+            result.output().render().contains("appears 2 times"),
+            "got: {}",
+            result.output().render()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("pb.txt").await.unwrap(),
+            "x\nkeep\nx\n",
+        );
+    }
+
+    // ---- Success-string match location (imitation hint) ----
+
+    #[tokio::test]
+    #[serial]
+    async fn success_string_reports_match_location_when_unanchored() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("m.txt", "a\nb\nc\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "m.txt", "edits": "m.txt\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        // The match sits on line 2; the result teaches the `path:LINE` idiom.
+        assert!(
+            result.output().render().contains("(matched at ./m.txt:2)"),
+            "got: {}",
+            result.output().render()
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn success_string_omits_location_when_anchored() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("ma.txt", "x\nkeep\nx\n").await.unwrap();
+        let result = execute_edit(serde_json::json!({
+            "path": "ma.txt", "edits": "ma.txt:3\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+        }))
+        .await;
+        assert!(result.is_success(), "got: {result:?}");
+        // The model already anchored — no teaching hint needed.
+        assert!(
+            !result.output().render().contains("matched"),
+            "anchored call must not add a location hint: {}",
+            result.output().render()
+        );
+    }
+
+    // ---- Per-block line anchors (`path:LINE` headers) ----
+
+    #[tokio::test]
+    #[serial]
+    async fn header_anchor_selects_nearest_duplicate() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let before = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n\nfn b() {\n    let x = 1;\n    let y = 2;\n}\n";
+        tokio::fs::write("anchor.txt", before).await.unwrap();
+        // Two identical 2-line bodies (lines 2 and 7). The header anchors to
+        // line 7, so the *second* occurrence must be replaced.
+        let blob = "anchor.txt:7\n<<<<<<< SEARCH\n    let x = 1;\n    let y = 2;\n=======\n    let x = 9;\n    let y = 9;\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "anchor.txt", "edits": blob})).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("anchor.txt").await.unwrap();
+        assert_eq!(
+            after,
+            "fn a() {\n    let x = 1;\n    let y = 2;\n}\n\nfn b() {\n    let x = 9;\n    let y = 9;\n}\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn header_anchor_within_tolerance_applies() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("tol.txt", "alpha\nbeta\ngamma\nzzz\nalpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        // 3-line context → tolerance 1. Occurrences start at lines 1 and 5;
+        // anchoring to line 6 lands within 1 of the second.
+        let blob = "tol.txt:6\n<<<<<<< SEARCH\nalpha\nbeta\ngamma\n=======\nA\nB\nC\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "tol.txt", "edits": blob})).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("tol.txt").await.unwrap(),
+            "alpha\nbeta\ngamma\nzzz\nA\nB\nC\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn header_anchor_out_of_tolerance_errors() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("far.txt", "alpha\nbeta\ngamma\nzzz\nalpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        // Anchor line 3 is >1 away from *both* occurrences (lines 1 and 5).
+        let blob = "far.txt:3\n<<<<<<< SEARCH\nalpha\nbeta\ngamma\n=======\nA\nB\nC\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "far.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(
+            out.contains("none within"),
+            "expected out-of-tolerance failure, got: {out}",
+        );
+        // Nothing was applied.
+        assert_eq!(
+            tokio::fs::read_to_string("far.txt").await.unwrap(),
+            "alpha\nbeta\ngamma\nzzz\nalpha\nbeta\ngamma\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn header_anchor_ignored_when_match_is_unique() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("uniq.txt", "only\nhere\n").await.unwrap();
+        // A wildly-off anchor is harmless when oldText occurs exactly once.
+        let blob = "uniq.txt:100\n<<<<<<< SEARCH\nhere\n=======\nthere\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "uniq.txt", "edits": blob})).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        assert_eq!(tokio::fs::read_to_string("uniq.txt").await.unwrap(), "only\nthere\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn header_anchor_tie_is_ambiguous() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        // Two occurrences on the same line, equidistant from the anchor.
+        tokio::fs::write("amb.txt", "x x\n").await.unwrap();
+        let blob = "amb.txt:1\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({"path": "amb.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(out.contains("ambiguous"), "expected ambiguity failure, got: {out}");
+        assert_eq!(tokio::fs::read_to_string("amb.txt").await.unwrap(), "x x\n");
+    }
+
+    #[test]
+    fn anchor_tolerance_scales_then_caps() {
+        assert_eq!(super::anchor_tolerance("x"), 0);
+        assert_eq!(super::anchor_tolerance("a\nb\nc"), 1);
+        assert_eq!(super::anchor_tolerance("a\nb\nc\nd\ne\nf"), 2);
+        assert_eq!(super::anchor_tolerance(&"l\n".repeat(12)), 4);
+        assert_eq!(super::anchor_tolerance(&"l\n".repeat(120)), 4);
+    }
+
     // ---- Schema advertisement ----
 
     #[test]
-    fn schema_advertises_both_formats() {
+    fn schema_is_flat_with_no_anyof() {
+        // The whole point of v2: a flat bag of optional scalars, with NO
+        // `anyOf` union or nested array that weak harnesses stringify.
         let schema = EditFile.parameters();
+        assert!(schema.get("anyOf").is_none(), "schema must not use anyOf: {schema}");
+        assert!(
+            schema.get("oneOf").is_none(),
+            "schema must not use oneOf: {schema}"
+        );
+
+        let props = schema.get("properties").expect("properties present");
+        for key in ["path", "oldText", "newText", "startLine", "edits"] {
+            assert!(props.get(key).is_some(), "missing property `{key}`: {schema}");
+        }
+        assert!(
+            props.get("endLine").is_none(),
+            "`endLine` must no longer be advertised: {schema}"
+        );
+        // `edits` is a *string* (the blob), not an array.
+        assert_eq!(
+            props.get("edits").and_then(|e| e.get("type")).and_then(|t| t.as_str()),
+            Some("string"),
+            "`edits` must be advertised as a string"
+        );
+
         let required = schema
             .get("required")
             .and_then(|v| v.as_array())
-            .expect("required array present")
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            required.contains(&"path"),
-            "path must be required: {required:?}"
-        );
-        // The schema should advertise both formats via anyOf
-        let any_of = schema.get("anyOf").and_then(|v| v.as_array()).expect("anyOf present");
-        assert!(!any_of.is_empty(), "anyOf should not be empty");
-        // Check that the canonical format (edits array) is present
-        let has_canonical = any_of.iter().any(|v| {
-            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
-                r.iter().any(|v| v.as_str() == Some("edits"))
-            })
-        });
-        assert!(has_canonical, "canonical format with 'edits' should be present");
-        // Check that the legacy format (oldText/newText) is present
-        let has_legacy = any_of.iter().any(|v| {
-            v.get("required").and_then(|r| r.as_array()).map_or(false, |r| {
-                r.iter().any(|v| v.as_str() == Some("oldText")) && r.iter().any(|v| v.as_str() == Some("newText"))
-            })
-        });
-        assert!(has_legacy, "legacy format with 'oldText'/'newText' should be present");
-        // The legacy top-level fields should NOT be at the top level properties
-        let props = schema.get("properties").unwrap();
-        assert!(props.get("edits").is_none(), "edits should not be at top level");
-        assert!(props.get("oldText").is_none());
-        assert!(props.get("newText").is_none());
+            .expect("required array present");
+        assert!(required.is_empty(), "no parameter is required: {required:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_applies_all_edits() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("blob.txt", "a\nb\nc\n").await.unwrap();
+        let blob = "blob.txt\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nc\n=======\nC\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({
+            "path": "blob.txt",
+            "edits": blob
+        }))
+        .await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("blob.txt").await.unwrap();
+        assert_eq!(after, "A\nb\nC\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_infers_path_from_header() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("infer.txt", "hello\n").await.unwrap();
+        let blob = "infer.txt\n<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({ "edits": blob })).await;
+        assert!(result.is_success(), "expected success, got: {result:?}");
+        let after = tokio::fs::read_to_string("infer.txt").await.unwrap();
+        assert_eq!(after, "world\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn block_form_conflicting_path_errors() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("a.txt", "x\n").await.unwrap();
+        let blob = "b.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let result = execute_edit(serde_json::json!({ "path": "a.txt", "edits": blob })).await;
+        assert!(result.is_error(), "conflicting path must fail: {result:?}");
+        let msg = result.output().render();
+        assert!(msg.contains("path mismatch"), "got: {msg}");
     }
 
     #[test]

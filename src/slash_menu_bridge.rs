@@ -83,6 +83,11 @@ pub struct MenuShared {
     /// agent's `session_usage()`). Used by `/stat` to display context
     /// window and cost info.
     pub session_usage: Rc<RefCell<crate::agent::SessionUsage>>,
+    /// Estimated tokens of the current (compaction-scoped) context — what
+    /// would be sent on the next turn. Snapshot per `read_input`
+    /// iteration from `ReplCtx.context_tokens`; `/stat` shows it in the
+    /// session section.
+    pub context_tokens: Rc<RefCell<u64>>,
     /// Async operation requested by a submit handler.  The agent loop
     /// checks this after each `DoneSuccess` and executes it in its own
     /// async context (the node cannot call `block_on` from inside a
@@ -168,6 +173,7 @@ impl MenuShared {
             raw_tree: Rc::new(RefCell::new(Rc::new(Vec::new()))),
             leaf_id: Rc::new(RefCell::new(None)),
             session_usage: Rc::new(RefCell::new(crate::agent::SessionUsage::default())),
+            context_tokens: Rc::new(RefCell::new(0)),
             pending_op: Rc::new(RefCell::new(None)),
         }
     }
@@ -184,6 +190,7 @@ impl MenuShared {
             raw_tree: self.raw_tree.clone(),
             leaf_id: self.leaf_id.clone(),
             session_usage: self.session_usage.clone(),
+            context_tokens: self.context_tokens.clone(),
             pending_op: self.pending_op.clone(),
         }
     }
