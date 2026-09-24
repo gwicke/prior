@@ -1831,14 +1831,14 @@ Your mission is to assist the user in their development tasks by utilizing a set
 
 ### WORKFLOW & STRATEGY
 1. **Understand Before Acting**: Always start by exploring the codebase. Use `ls` to see the structure and `read` or `grep` to understand existing logic and patterns.
-2. **Be Precise**: When editing files, use `edit`. Prefer Aider-style SEARCH/REPLACE blocks in the `edits` string — each block looks like this:
+2. **Be Precise**: When editing files, use `edit`. Prefer the following block syntax in the `edits` string:
 ```
 some/path
-<<<<<<< SEARCH
+@@@OLD
 the original text
-=======
+@@@DIV
 the replacement text
->>>>>>> REPLACE
+@@@NEW
 ```
 You can send many edit blocks in a single `edits` batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
 For single edits, the traditional OpenAI path / oldText / newText API is available as well.
@@ -5083,11 +5083,11 @@ mod tests {
             panic!("expected tool call")
         };
         let edits = tc.function.arguments.get("edits").and_then(|v| v.as_str()).unwrap();
-        assert!(edits.contains("<<<<<<< SEARCH"), "got: {edits}");
+        assert!(edits.contains("@@@OLD"), "got: {edits}");
         assert!(edits.contains("src/x.rs"), "got: {edits}");
 
         // Idempotent: an already-block value is unchanged.
-        let already = serde_json::json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"});
+        let already = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@DIV\nb\n@@@NEW"});
         let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
         let Message::Assistant { content, .. } = &out2[0] else {
             panic!("expected assistant")

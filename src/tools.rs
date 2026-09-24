@@ -207,8 +207,8 @@ const ELIDE_FIELD_BUDGET: usize = 160;
 const ELIDE_CONTEXT: usize = 1;
 
 const EDIT_ARGS_EXAMPLE: &str = r#"Single edit: {"path": "some/path", "oldText": "original text", "newText": "replacement text"}
-Multiple edits: {"path": "some/path", "edits": "<<<<<<< SEARCH\noriginal text\n=======\nreplacement text\n>>>>>>> REPLACE"}
-Anchored block (when the text repeats): {"path": "some/path", "edits": "some/path:120\n<<<<<<< SEARCH\noriginal text\n=======\nreplacement text\n>>>>>>> REPLACE"}"#;
+Multiple edits: {"path": "some/path", "edits": "@@@OLD\noriginal text\n@@@DIV\nreplacement text\n@@@NEW"}
+Anchored block (when the text repeats): {"path": "some/path", "edits": "some/path:120\n@@@OLD\noriginal text\n@@@DIV\nreplacement text\n@@@NEW"}"#;
 
 /// Truncate `s` to `max` bytes on a char boundary, appending ` …` when cut.
 fn char_truncate(s: &str, max: usize) -> String {
@@ -224,10 +224,10 @@ fn char_truncate(s: &str, max: usize) -> String {
 
 /// A line worth keeping when eliding a SEARCH/REPLACE blob: the structural
 /// markers. Prefix matching (not exact equality) so near-miss markers the
-/// model invents — e.g. a stray `<<<<<<< SEARCH>` — are still shown.
+/// model invents — e.g. a stray `@@@OLD>` — are still shown.
 fn is_structural_line(line: &str) -> bool {
     let t = line.trim();
-    t.starts_with("<<<<<<<") || t.starts_with("=======") || t.starts_with(">>>>>>>")
+    t.starts_with("@@@OLD") || t.starts_with("@@@DIV") || t.starts_with("@@@NEW")
 }
 
 /// The marker emitted in place of a run of elided lines.
@@ -473,7 +473,7 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in a file. For one edit use `oldText`/`newText`. For several edits in one call, put Aider-style SEARCH/REPLACE blocks in the `edits` string (single file). Each block is `<<<<<<< SEARCH` then the exact text, `=======`, the replacement, `>>>>>>> REPLACE`. Each edit's old text must occur exactly once, or be disambiguated with a `path:LINE` anchor (a line number acts as a near-line hint, not a range). Edits are computed against the original file, not incrementally.".into()
+        "Replace text in a file. For one edit use `oldText`/`newText`. For several edits in one call, put SEARCH/REPLACE blocks in the `edits` string (single file). Each block is `@@@OLD` then the exact text, `@@@DIV`, the replacement, `@@@NEW`. Each edit's old text must occur exactly once, or be disambiguated with a `path:LINE` anchor (a line number acts as a near-line hint, not a range). Edits are computed against the original file, not incrementally.".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -500,7 +500,7 @@ impl rig_core::tool::Tool for EditFile {
                 },
                 "edits": {
                     "type": "string",
-                    "description": "One or more Aider-style SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `<<<<<<< SEARCH` line, exact text, `=======`, replacement, `>>>>>>> REPLACE`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. HEADER-LESS BLOCKS REMAIN AMBIGUOUS: if such a block's text occurs more than once the call fails, so add a `path:LINE` header whenever the matched text is not unique. Preferred over `oldText`/`newText` when making multiple edits."
+                    "description": "One or more SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `@@@OLD` line, exact text, `@@@DIV`, replacement, `@@@NEW`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. HEADER-LESS BLOCKS REMAIN AMBIGUOUS: if such a block's text occurs more than once the call fails, so add a `path:LINE` header whenever the matched text is not unique. Preferred over `oldText`/`newText` when making multiple edits."
                 }
             },
             "required": []
@@ -2953,13 +2953,13 @@ mod edit_args_wire_tests {
         // blob at an arbitrary byte offset.
         let old: String = (0..40).map(|i| format!("old line {i}\n")).collect();
         let new: String = (0..40).map(|i| format!("new line {i}\n")).collect();
-        let blob = format!("<<<<<<< SEARCH\n{old}=======\n{new}>>>>>>> REPLACE");
+        let blob = format!("@@@OLD\n{old}@@@DIV\n{new}@@@NEW");
         let v = serde_json::json!({ "path": "p", "edits": blob });
         let out = super::truncate_wire_repr(&v);
 
-        assert!(out.contains("<<<<<<< SEARCH"), "opening marker lost: {out}");
-        assert!(out.contains("======="), "divider lost: {out}");
-        assert!(out.contains(">>>>>>> REPLACE"), "closing marker lost: {out}");
+        assert!(out.contains("@@@OLD"), "opening marker lost: {out}");
+        assert!(out.contains("@@@DIV"), "divider lost: {out}");
+        assert!(out.contains("@@@NEW"), "closing marker lost: {out}");
         assert!(out.contains("lines elided"), "no elision notice: {out}");
         assert!(!out.contains("old line 20"), "bulk content not elided: {out}");
         assert!(
@@ -2974,10 +2974,10 @@ mod edit_args_wire_tests {
         // Prefix matching keeps a hallucinated marker (trailing `>`) visible,
         // which is exactly the failure the echo should surface.
         let body: String = (0..60).map(|i| format!("line {i}\n")).collect();
-        let blob = format!("<<<<<<< SEARCH>\n{body}");
+        let blob = format!("@@@OLD>\n{body}");
         let v = serde_json::json!({ "path": "p", "edits": blob });
         let out = super::truncate_wire_repr(&v);
-        assert!(out.contains("<<<<<<< SEARCH>"), "marker lost: {out}");
+        assert!(out.contains("@@@OLD>"), "marker lost: {out}");
         assert!(out.contains("elided"), "no elision notice: {out}");
     }
 
@@ -2997,7 +2997,7 @@ mod edit_args_wire_tests {
         // fails loudly rather than editing a guessed occurrence.
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("win.txt", "x\nkeep\nx\n").await.unwrap();
-        let blob = "win.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let blob = "win.txt\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW";
 
         let result = execute_edit(serde_json::json!({
             "path": "win.txt", "edits": blob, "startLine": 3
@@ -3018,7 +3018,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("win2.txt", "x\nkeep\nx\n").await.unwrap();
         // The header anchors the block to line 3 (the second `x`).
-        let blob = "win2.txt:3\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let blob = "win2.txt:3\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "win2.txt", "edits": blob})).await;
         assert!(result.is_success(), "got: {result:?}");
         assert_eq!(tokio::fs::read_to_string("win2.txt").await.unwrap(), "x\nkeep\ny\n");
@@ -3070,7 +3070,7 @@ mod edit_args_wire_tests {
         // rather than silently aiming an unrelated block.
         let result = execute_edit(serde_json::json!({
             "path": "pb.txt:3",
-            "edits": "pb.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+            "edits": "pb.txt\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW"
         }))
         .await;
         assert!(
@@ -3092,7 +3092,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("m.txt", "a\nb\nc\n").await.unwrap();
         let result = execute_edit(serde_json::json!({
-            "path": "m.txt", "edits": "m.txt\n<<<<<<< SEARCH\nb\n=======\nB\n>>>>>>> REPLACE"
+            "path": "m.txt", "edits": "m.txt\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW"
         }))
         .await;
         assert!(result.is_success(), "got: {result:?}");
@@ -3110,7 +3110,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("ma.txt", "x\nkeep\nx\n").await.unwrap();
         let result = execute_edit(serde_json::json!({
-            "path": "ma.txt", "edits": "ma.txt:3\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE"
+            "path": "ma.txt", "edits": "ma.txt:3\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW"
         }))
         .await;
         assert!(result.is_success(), "got: {result:?}");
@@ -3132,7 +3132,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("anchor.txt", before).await.unwrap();
         // Two identical 2-line bodies (lines 2 and 7). The header anchors to
         // line 7, so the *second* occurrence must be replaced.
-        let blob = "anchor.txt:7\n<<<<<<< SEARCH\n    let x = 1;\n    let y = 2;\n=======\n    let x = 9;\n    let y = 9;\n>>>>>>> REPLACE";
+        let blob = "anchor.txt:7\n@@@OLD\n    let x = 1;\n    let y = 2;\n@@@DIV\n    let x = 9;\n    let y = 9;\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "anchor.txt", "edits": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         let after = tokio::fs::read_to_string("anchor.txt").await.unwrap();
@@ -3151,7 +3151,7 @@ mod edit_args_wire_tests {
             .unwrap();
         // 3-line context → tolerance 1. Occurrences start at lines 1 and 5;
         // anchoring to line 6 lands within 1 of the second.
-        let blob = "tol.txt:6\n<<<<<<< SEARCH\nalpha\nbeta\ngamma\n=======\nA\nB\nC\n>>>>>>> REPLACE";
+        let blob = "tol.txt:6\n@@@OLD\nalpha\nbeta\ngamma\n@@@DIV\nA\nB\nC\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "tol.txt", "edits": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         assert_eq!(
@@ -3168,7 +3168,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         // Anchor line 3 is >1 away from *both* occurrences (lines 1 and 5).
-        let blob = "far.txt:3\n<<<<<<< SEARCH\nalpha\nbeta\ngamma\n=======\nA\nB\nC\n>>>>>>> REPLACE";
+        let blob = "far.txt:3\n@@@OLD\nalpha\nbeta\ngamma\n@@@DIV\nA\nB\nC\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "far.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(
@@ -3188,7 +3188,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("uniq.txt", "only\nhere\n").await.unwrap();
         // A wildly-off anchor is harmless when oldText occurs exactly once.
-        let blob = "uniq.txt:100\n<<<<<<< SEARCH\nhere\n=======\nthere\n>>>>>>> REPLACE";
+        let blob = "uniq.txt:100\n@@@OLD\nhere\n@@@DIV\nthere\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "uniq.txt", "edits": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         assert_eq!(tokio::fs::read_to_string("uniq.txt").await.unwrap(), "only\nthere\n");
@@ -3200,7 +3200,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         // Two occurrences on the same line, equidistant from the anchor.
         tokio::fs::write("amb.txt", "x x\n").await.unwrap();
-        let blob = "amb.txt:1\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let blob = "amb.txt:1\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW";
         let result = execute_edit(serde_json::json!({"path": "amb.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(out.contains("ambiguous"), "expected ambiguity failure, got: {out}");
@@ -3256,7 +3256,7 @@ mod edit_args_wire_tests {
     async fn block_form_applies_all_edits() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("blob.txt", "a\nb\nc\n").await.unwrap();
-        let blob = "blob.txt\n<<<<<<< SEARCH\na\n=======\nA\n>>>>>>> REPLACE\n\n<<<<<<< SEARCH\nc\n=======\nC\n>>>>>>> REPLACE";
+        let blob = "blob.txt\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\n@@@OLD\nc\n@@@DIV\nC\n@@@NEW";
         let result = execute_edit(serde_json::json!({
             "path": "blob.txt",
             "edits": blob
@@ -3272,7 +3272,7 @@ mod edit_args_wire_tests {
     async fn block_form_infers_path_from_header() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("infer.txt", "hello\n").await.unwrap();
-        let blob = "infer.txt\n<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE";
+        let blob = "infer.txt\n@@@OLD\nhello\n@@@DIV\nworld\n@@@NEW";
         let result = execute_edit(serde_json::json!({ "edits": blob })).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         let after = tokio::fs::read_to_string("infer.txt").await.unwrap();
@@ -3284,7 +3284,7 @@ mod edit_args_wire_tests {
     async fn block_form_conflicting_path_errors() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("a.txt", "x\n").await.unwrap();
-        let blob = "b.txt\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE";
+        let blob = "b.txt\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW";
         let result = execute_edit(serde_json::json!({ "path": "a.txt", "edits": blob })).await;
         assert!(result.is_error(), "conflicting path must fail: {result:?}");
         let msg = result.output().render();
