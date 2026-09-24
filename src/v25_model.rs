@@ -334,7 +334,8 @@ mod tests {
     use super::*;
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
-        h.eval_prompt(prompt, key, 80)
+        // Resolve ContinuePrompt like the host (repl::v25_eval) does.
+        h.eval_prompt_resolved(prompt, key, 80)
     }
 
     fn test_shared() -> Rc<crate::slash_menu_bridge::MenuShared> {

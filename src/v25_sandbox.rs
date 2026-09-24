@@ -626,10 +626,10 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Enter #1: drill into `remove` + arm the confirm (Prepared).
-        // The arming frame returns the default plan (prompt changed ⇒
-        // the host re-derives); the rendered confirm frame is the next
-        // passive eval.
-        let (_, prompt) = expect_continue(h.eval_prompt(
+        // The arming step is a prompt-only rewrite; resolving it (as
+        // repl::v25_eval does) re-derives the rendered confirm frame
+        // from the rewritten prompt.
+        let (_, prompt) = expect_continue(h.eval_prompt_resolved(
             "sandbox /cfg-ro remove",
             HostKey::Enter,
             100,

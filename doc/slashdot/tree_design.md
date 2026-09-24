@@ -85,9 +85,40 @@ let tree_rc = Rc::new(s.get_tree().await);
 ### Row building in data()
 
 `TreeListNode::data()` flattens the raw tree into rows:
-- Full message text as the description (not truncated to single-line)
-- Role/type prefix: `[COMPACT]`, `[MODEL]`, `[THINK]` for non-message entries
-- Header format: `[USER ts]`, `[COMPACT ts]`, `[MODEL] provider/model (ts)`
+- **Description = full text** ("full text for fuzzy search"). Messages
+  keep their newlines (`sanitise_multiline` strips control chars but
+  keeps `\n`/`\t`). The tree column is wrap-disabled, so
+  `Table::render` flattens `\n` to spaces and ellipsizes for display —
+  fuzzy rank (`id` + `description`) and `header()` see the raw
+  multi-line string.
+- **Non-message markers** in the description: `[MODEL] provider/model`,
+  `[THINK] level`, `[SUMMARY] …`, and for compactions
+  `[COMPACT] from <kept context, ≤300 chars>` + `\n` + the summary
+  (identifying line first, then the content).
+- **Fields**: `role`, `timestamp` (ISO, filterable/sortable), the
+  `on_path`/`leaf` position markers, and optional `tags` (below).
+- Header format: `[USER ts]`, `[COMPACT ts] from … / summary`,
+  `[MODEL] provider/model (ts)`.
+
+### Header from the cached row
+
+`header()` renders from the same cached `data()` row (design: "entry
+detail from the same cached row data") — no raw-tree `find_entry`
+walk, no second derivation. Role/timestamp come from the row's fields;
+the body is the row description with the tree indent stripped. The
+`[COMPACT …]`/`[SUMMARY …]` prefixes re-stamp the marker with the
+timestamp; model/thinking keep their in-body marker and append ` (ts)`.
+
+### Branch endpoints (`tags` field)
+
+`visible_terminals()` (iterative post-order; deep sessions overflow
+recursion) marks visible entries with no visible entries anywhere
+below them — the endpoints you actually see: invisible meta entries
+(tool results, session info) don't count, so a visible message above a
+dead-end tool result is the terminal node. Those rows carry
+`tags = "leaf"`; all other rows **omit** the field. Since a missing
+filtered field drops the row (exact string match), `.tags:leaf` filters
+the listing to terminal nodes with no filter code at all.
 
 ### Data caching (Rc::ptr_eq)
 

@@ -157,7 +157,7 @@ mod tests {
         let shared = test_shared();
         let mut menu = build_thinking_menu(&shared);
         let mut h = menu.get_handle();
-        let prompt = match h.eval_prompt("thinking ", HostKey::Tab, 80) {
+        let prompt = match h.eval_prompt_resolved("thinking ", HostKey::Tab, 80) {
             MenuResult::Continue(_, prompt) => prompt,
             other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
         };

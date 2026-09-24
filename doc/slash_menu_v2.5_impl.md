@@ -647,6 +647,101 @@ integration, 0 failed.
 Gate: `cargo check --all-targets --workspace` → 0 warnings; full
 workspace tests green (623 + 133 + integration, 0 failed).
 
+### Step 17: /tree rows as the single data source + `tags` — DONE
+
+Closes the two open `slashdot/tree_design.md` points surfaced during
+the warning cleanup (`FlatRow.full_text/timestamp` had been born dead
+in the port — scaffolding for these):
+
+- **Full text in rows**: `entry_row_desc()` — messages keep newlines
+  (`sanitise_multiline`: control chars stripped, `\n`/`\t` kept);
+  compactions carry `[COMPACT] from <kept context ≤300 chars>` + `\n`
+  + summary; model/thinking/summary/label keep their marker labels.
+  The tree column is wrap-disabled, so `Table::render` already
+  flattens `\n` + ellipsizes for display — listing output unchanged,
+  fuzzy rank (`id` + `description`) sees the full multi-line text.
+- **`header()` from the cached row**: no raw-tree `find_entry` walk and
+  no cache-warm-and-discard; role/timestamp from row fields, body from
+  the description (indent stripped; `[COMPACT]`/`[SUMMARY]` marker
+  re-stamped with the timestamp; model/thinking append ` (ts)`).
+- **`tags` field (optional)**: `visible_terminals()` — iterative
+  post-order, visibility-aware (invisible tool results don't hide the
+  visible endpoint above them) — tags branch endpoints
+  `tags="leaf"`; other rows omit the field, so `.tags:leaf` (missing ⇒
+  row dropped, exact match) filters to terminals. No filter code.
+  Declared in `tree_fields()` (`leaf = branch endpoint`); `timestamp`
+  newly declared too (filterable/sortable).
+
+Tests: +4 — desc newlines + role/timestamp fields, terminal tagging,
+invisible-descendant edge, compaction from+summary desc + header.
+Workspace green: 627 lib + 133 crate + all integration, 0 failed;
+0 warnings.
+
+### Step 18: `ContinuePrompt` API + Esc-restore regression — DONE
+
+Follow-up split agreed with the user: **(1) API restructure** (this
+step), **(2) display-loop restructure** (next step: wait → eval →
+display, with prompt application folded into one place — this also
+covers the remaining passive-frame prompt discard, `MoveCursor`
+discard, and removal of the `v25_enter_plan` one-frame hack).
+
+**Bug that motivated it** (`doc/slash_menu_v2.5_design.md` §5.1):
+`/tree .tags:leaf` → Tab (drill) → Esc (drill-out) rendered the
+restored filtered view *behind the scenes* but left `/tree <id>` in the
+prompt; the next cursor move then dropped to the full listing. Root
+cause: pure prompt rewrites travelled as `Continue(RenderPlan::default(),
+prompt)`, and the passive frame eval (and the Esc arm, before Phase 2's
+loop change) discarded or raced the prompt half of that tuple.
+
+**API change** (`node_impl::MenuResult`):
+
+```rust
+Continue(RenderPlan, String)   // frame + prompt; plan honest for the
+                               // prompt (§ honesty invariant, user 2)
+ContinuePrompt(String)         // prompt rewrite ONLY — host sets the
+                               // prompt and re-evals with HostKey::None
+                               // until Continue/Done* (bounded; cycle =
+                               // engine bug → loud error, never a
+                               // synthesized plan)
+```
+
+The `Continue*` prefix keeps terminate-vs-continue obvious at every
+match site; `ContinuePrompt` (not `ContinueNewPrompt`) because
+`build_continue` no-op continuations carry an *unchanged* prompt.
+
+**Engine sites now returning `ContinuePrompt`**: drill_rewrite
+(phase 0.5), Esc ladder steps 2–3, completion Tab expansion,
+`SubmitResult::NewPath`, and `build_continue` (confirm-arm / no-op
+re-derives). The §5.1 restore keeps returning `Continue` — it builds
+the plan for the restored prompt itself.
+
+**Host side**:
+
+- `Repl::v25_eval` resolves `ContinuePrompt` chains internally (apply
+  prompt → re-eval `HostKey::None`, ≤16 steps, cursor to EOL after a
+  rewrite as `LineEditor::set` would). Returns a private `V25Frame`
+  (`Continue`/`DoneSuccess`/`DoneError` only) — the "no half-rewrite
+  escapes the helper" invariant is compiler-checked at all four call
+  sites (passive, Tab, Enter, Esc). Cycle → `eprintln!` chain + the
+  same message as `DoneError` (transcript), prompt cleared by the
+  existing `DoneError` handling.
+- `SlashDotHandle::eval_prompt_resolved` — the cursor-free public twin
+  of that loop, for hosts (and tests) without cursor state.
+
+The reported Esc sequence now lands correctly *within one keypress*:
+Esc → `ContinuePrompt("tree <id>")` → resolver re-evals → §5.1 restore
+fires → `Continue(restored_plan, "tree .tags:leaf")` → Esc arm applies
+the prompt.
+
+**Tests**: +1 regression (`esc_drill_out_restores_filter_and_cursor`
+— the exact reported sequence incl. post-restore cursor move); engine
+tests asserting specific rewrites now match `ContinuePrompt`
+(drill ×2, completion Tab ×2, Esc clear-filter via resolver, bare-id
+drill); host tests route key-driven evals through
+`eval_prompt_resolved` (the test-visible twin of `v25_eval`).
+Workspace green: 630 lib + 133 crate + all integration, 0 failed,
+0 warnings.
+
 ---
 
 ## 5a. Follow-up: global app state and async (post-migration)

@@ -336,7 +336,7 @@ mod tests {
         }
         // The cursor follows the active row ("confirm" is current).
         // Tab drills into the highlighted row; Enter on it persists.
-        match h.eval_prompt("set security_mode ", HostKey::Tab, 80) {
+        match h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("security_mode"),
                     "should drill into a value, got: {}", prompt);
@@ -360,7 +360,7 @@ mod tests {
         // Move cursor to "yolo" (Down from "confirm" position).
         let _ = h.eval_prompt("set security_mode ", HostKey::None, 80);
         let _ = h.eval_prompt("set security_mode ", HostKey::MoveCursor(1), 80);
-        match h.eval_prompt("set security_mode ", HostKey::Tab, 80) {
+        match h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {

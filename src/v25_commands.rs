@@ -16,7 +16,9 @@ mod tests {
     use crate::slashdot_menu::HostKey;
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
-        h.eval_prompt(prompt, key, 80)
+        // Resolve ContinuePrompt like the host (repl::v25_eval) does:
+        // tests observe frames, never half-completed rewrites.
+        h.eval_prompt_resolved(prompt, key, 80)
     }
 
     // -----------------------------------------------------------------------
@@ -287,7 +289,8 @@ mod persona_tests {
     use crate::slashdot_menu::HostKey;
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
-        h.eval_prompt(prompt, key, 80)
+        // Resolve ContinuePrompt like the host (repl::v25_eval) does.
+        h.eval_prompt_resolved(prompt, key, 80)
     }
 
     /// Single node returning all persona rows + "none".

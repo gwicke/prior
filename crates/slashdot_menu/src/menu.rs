@@ -134,4 +134,47 @@ impl<'a> SlashDotHandle<'a> {
         self.root
             .node_traverse_at(self.epoch, key, Vec::new(), prompt, cursor_pos, &render_ctx)
     }
+
+    /// Like [`eval_prompt`](Self::eval_prompt), but resolves
+    /// [`MenuResult::ContinuePrompt`] rewrite chains: apply the new
+    /// prompt and re-eval with [`HostKey::None`] until a plan-carrying
+    /// or terminal result arrives. This is the standard host contract —
+    /// a host that has no cursor state of its own can call this and
+    /// only ever see frames (`Continue`) and terminal outcomes.
+    ///
+    /// Bounded: a rewrite cycle is an engine bug, reported as a
+    /// `DoneError` whose message carries the full chain (no plan is
+    /// ever synthesized). Hosts with their own cursor handling (the
+    /// REPL's `v25_eval`) implement the same loop themselves so they
+    /// can trace it.
+    pub fn eval_prompt_resolved(
+        &mut self,
+        prompt: &str,
+        key: HostKey,
+        term_width: usize,
+    ) -> MenuResult {
+        // Normal chains are 1–2 steps (rewrite → passive re-derive).
+        const MAX_REWRITES: usize = 16;
+        let mut prompt = prompt.to_string();
+        let mut key = key;
+        let mut chain: Vec<String> = Vec::new();
+        for _ in 0..MAX_REWRITES {
+            match self.eval_prompt(&prompt, key, term_width) {
+                MenuResult::ContinuePrompt(new_prompt) => {
+                    chain.push(new_prompt.clone());
+                    prompt = new_prompt;
+                    key = HostKey::None;
+                }
+                other => return other,
+            }
+        }
+        MenuResult::DoneError(
+            format!(
+                "menu engine bug: prompt-rewrite cycle after {} steps: {}",
+                MAX_REWRITES,
+                chain.join(" -> ")
+            ),
+            prompt,
+        )
+    }
 }

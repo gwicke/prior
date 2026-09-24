@@ -137,7 +137,7 @@ mod tests {
         shared.live_state.borrow_mut().persona = Some("definitely-not-a-persona".into());
         let mut menu = build_persona_menu(&shared);
         let mut h = menu.get_handle();
-        let prompt = match h.eval_prompt("persona ", HostKey::Tab, 80) {
+        let prompt = match h.eval_prompt_resolved("persona ", HostKey::Tab, 80) {
             MenuResult::Continue(_, prompt) => prompt,
             other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
         };
