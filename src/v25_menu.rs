@@ -128,3 +128,55 @@ pub fn build_menu(
 
     SlashDotMenu::from_root_node(root)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slashdot_menu::node_impl::MenuResult;
+    use crate::slashdot_menu::HostKey;
+
+    fn test_shared() -> Rc<MenuShared> {
+        let settings = SettingsStore {
+            default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        Rc::new(MenuShared::new(settings, None))
+    }
+
+    /// The root listing lists every command, and `help` is **absent**
+    /// (codifies the deliberate removal of the help overlay).
+    #[test]
+    fn root_listing_lists_all_commands_without_help() {
+        let shared = test_shared();
+        let mut menu = build_menu(&shared.live_state, &shared.settings, &shared);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("", HostKey::None, 80) {
+            MenuResult::Continue(plan, _) => {
+                let ids: Vec<&str> = plan
+                    .rows
+                    .iter()
+                    .filter_map(|l| l.0.split_whitespace().next())
+                    .collect();
+                for cmd in [
+                    "thinking", "persona", "model", "set", "stat", "replay", "session",
+                    "new", "clear", "compact", "tree", "sandbox", "quit",
+                ] {
+                    assert!(ids.contains(&cmd), "missing '{cmd}' in root listing: {ids:?}");
+                }
+                assert!(
+                    !ids.contains(&"help"),
+                    "'help' must stay removed from the root listing: {ids:?}"
+                );
+            }
+            other => panic!("expected Continue at root, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+}

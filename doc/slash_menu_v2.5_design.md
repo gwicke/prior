@@ -490,3 +490,20 @@ translation → `InputAction`. Non-slash affordances (`!shell`, path completion)
 **Dispatch**: one `ActiveOverlay::Menu`. Host loop: `node_traverse(epoch, buffer)` →
 apply `MenuResult` (buffer / submit). Per-command code lives only in node
 impls, never as overlay arms.
+
+---
+
+> **Cleanup note (impl step 10 / Step 15 —
+> `slashdot/final_cleanup.md` P1–P5, DONE)**: the v1.0/v2.0 machinery
+> this design was written against — `Interpreter` /
+> `AcceptController` / `PlanBuilder` / `MenuEngine` /
+> `from_buffer_cursors`, the legacy `ActiveOverlay` variants
+> (`Menu`, `Mod`, `Help`, `Settings`, `Stat`, …), the `slash.rs`
+> registry — has been deleted. The host overlay set is now
+> `ActiveOverlay::{None, V25Menu, PathComplete}` and `InputAction` is
+> `{Submit, MenuDone}` (v2.5 writes `LiveState` + `menu_submitted`
+> directly; async goes through `AsyncOp`). §12's layer split still
+> holds: "Engine" = the `slashdot_menu` crate default impl, "Host" =
+> repl/agent; only the type names moved. The prompt-completion island
+> (`PathComplete` + `complete_path_prefix*`) is deliberately scoped
+> out to the prompt-completion step.

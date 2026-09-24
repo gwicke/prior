@@ -1,6 +1,6 @@
 # Final cleanup — remove v1.0 / v2.0 menu remnants (impl step 10)
 
-Status: **IN PROGRESS** — P1, P3, P2, P4 done; P5 remaining
+Status: **DONE** — P1–P5 complete
 
 ## Goal & principles
 
@@ -208,20 +208,33 @@ Status: **IN PROGRESS** — P1, P3, P2, P4 done; P5 remaining
    `engine_esc`, `is_engine_backed`, `model_overlay_entries`,
    `InputAction::Set*`/`Quit`) empty in `src/`; ported
    `fuzz_path_completion_preserves_layout` confirmed present.
-5. **P5 — test gap-fill + docs**: add `v25_thinking` tests (set +
-   active marker + root row), `v25_persona` tests (set + root row),
-   `v25_menu` root-listing test (all commands present, `help`
-   **absent** — codifies the decision), `v25_model` `/model .`
-   modifier eval test; update this doc's status, impl doc step 10 →
-   DONE (incl. re-pointing the "in-prompt Tab switch" note to the
-   prompt-completion step), design-doc cleanup note; final
-   full-workspace run + sentinel block; commit.
+5. ~~**P5 — test gap-fill + docs**~~ — **DONE**. 7 tests added (the
+   full gap-fill list): `v25_thinking` (root row; `*`-active marker
+   asserted via `plan.active_rows`; Tab+Enter submit →
+   `LiveState.thinking_level`), `v25_persona` (root row; submit →
+   `LiveState.persona`, incl. `none` → None), `v25_menu` root listing
+   (all 13 commands present, `help` **absent** — codifies the
+   decision), `v25_model` eval-level `/model .` modifier dialog —
+   opens with `.sort:` + dataset-derived field keys; declared-spec
+   keys for row-less fields are the arg/modifier rework track's
+   finding (noted in the test). One interim fix: the test's own doc
+   comment initially tripped the `Interpreter`/`field_options`
+   sentinels — reworded; final sentinel block now empty, NOT-list
+   (prompt-completion island: `complete_path_prefix*`,
+   `token_at_cursor`, `PathComplete`, `completion_pos`) intact. Docs:
+   this file → DONE, impl doc Step 15 → DONE (step-10 list items
+   marked, §8 superseded with the `PathComplete` row re-pointed to the
+   prompt-completion step, test table corrected), design-doc cleanup
+   note added. Final full-workspace run green: 568 lib + 133 crate +
+   all integration, 0 failed; warnings = pre-existing `v25_tree`
+   `FlatRow` only.
 
-## Test expectations
+## Test expectations (final actuals)
 
-- Deleted: ~60–80 tests (repl from_buffer-era family, bridge 18,
-  interpreter 25, accept 8, render PlanBuilder ≤6, slash 9).
-- Added: ~8–12 targeted tests (P5 gap-fill list).
+- Deleted: 121 tests — repl from_buffer-era family 66, bridge 18,
+  interpreter 25, accept 8, render PlanBuilder 3, slash 9
+  (baseline 653 + 169 → 568 + 133).
+- Added: 7 targeted tests (P5 gap-fill list, completed in full).
 - Workspace green at **every** phase boundary (baseline: 653 + 169).
 
 ## Sentinel greps (must be empty after P5)

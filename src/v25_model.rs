@@ -557,4 +557,35 @@ mod tests {
             other => panic!("expected Continue on fuzzy filter, got {:?}", other),
         }
     }
+
+    /// Eval-level gate for the relocated dotted-modifier completion
+    /// (`node_entry::default_complete`): a dot-prefixed suffix inside
+    /// `/model` opens the modifier dialog with the injected `sort` key
+    /// plus the model field keys.
+    #[test]
+    fn model_dot_modifier_opens_completion_dialog() {
+        let shared = test_shared();
+        let mut menu = build_test_menu(&shared);
+        let mut h = menu.get_handle();
+        match eval(&mut h, "model .", crate::slashdot_menu::HostKey::None) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
+                // Dialog discriminator: candidates render with the fixed
+                // Modifier/Description columns (the listing has none).
+                assert!(plan.table_header.is_some(),
+                    "dot word must open the modifier dialog");
+                let rows: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
+                assert!(rows.iter().any(|r| r.contains(".sort:")),
+                    "sort key must be offered: {rows:?}");
+                // Keys at this level are inferred from the merged dataset
+                // rows (declared-spec completion for row-less fields is the
+                // arg/modifier rework track): context/price are present on
+                // every catalog row.
+                assert!(rows.iter().any(|r| r.contains(".context:")),
+                    ".context: must be offered: {rows:?}");
+                assert!(rows.iter().any(|r| r.contains(".price:")),
+                    ".price: must be offered: {rows:?}");
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
 }

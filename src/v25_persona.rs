@@ -72,3 +72,85 @@ pub fn add_persona_child(
         }),
     }.into());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slash_menu_bridge::MenuShared;
+    use crate::slashdot_menu::menu::SlashDotMenu;
+    use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
+    use crate::slashdot_menu::HostKey;
+
+    fn test_shared() -> Rc<MenuShared> {
+        let settings = crate::settings::SettingsStore {
+            default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        Rc::new(MenuShared::new(settings, None))
+    }
+
+    /// Mini menu mirroring the `v25_menu` wiring: root → listing row
+    /// "persona" → `PersonaEnumNode` bound to `LiveState`.
+    fn build_persona_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
+            StaticRow::new("persona", "set runtime persona"),
+        ])
+        .into();
+        add_persona_child(&mut pl, &shared.live_state);
+        let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
+        root.add_child(pl);
+        SlashDotMenu::from_root_node(root)
+    }
+
+    /// Root listing shows the `persona` command row.
+    #[test]
+    fn persona_root_row_present() {
+        let shared = test_shared();
+        let mut menu = build_persona_menu(&shared);
+        let mut h = menu.get_handle();
+        match h.eval_prompt("", HostKey::None, 80) {
+            MenuResult::Continue(plan, _) => {
+                let rows: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
+                assert!(
+                    rows.iter().any(|r| r.split_whitespace().next() == Some("persona")),
+                    "root should list 'persona': {rows:?}"
+                );
+            }
+            other => panic!("expected Continue at root, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// Tab selects a row (persona name or "none"), Enter commits it to
+    /// `LiveState.persona` (`none` → None).
+    #[test]
+    fn persona_submit_sets_live_state() {
+        let shared = test_shared();
+        // Pre-set a persona that is not a row, so any selection is observable.
+        shared.live_state.borrow_mut().persona = Some("definitely-not-a-persona".into());
+        let mut menu = build_persona_menu(&shared);
+        let mut h = menu.get_handle();
+        let prompt = match h.eval_prompt("persona ", HostKey::Tab, 80) {
+            MenuResult::Continue(_, prompt) => prompt,
+            other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
+        };
+        let sel = prompt
+            .split_whitespace()
+            .last()
+            .expect("Tab should append the selected persona row")
+            .to_string();
+        match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+            MenuResult::DoneSuccess(..) => {}
+            other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
+        }
+        let expect = if sel == "none" { None } else { Some(sel) };
+        assert_eq!(shared.live_state.borrow().persona, expect);
+    }
+}

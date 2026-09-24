@@ -284,23 +284,30 @@ and with-keys - so this change should not cause regressions.
    `root_descriptor` arm removed (−422 lines). 653 lib tests.
 9. **Tree + compact - DONE** — Most complex: dynamic listing with nested
    actions, confirm dialogs, `NewPath` rewrites.
-10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
-    `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
-    dead v2.0 code.
+10. ~~**Final cleanup**~~ — **Done.** Remove `MenuEngine`,
+    `PlanBuilder`, `Interpreter`, `AcceptController`,
+    `from_buffer_cursors`, and all dead v2.0 code. Executed as
+    `slashdot/final_cleanup.md` P1–P5 (see Step 15 below).
 11. Re-merge with mainline
 
 ---
 
 ## 8. Remaining v2.0 code and retirement path
 
-### Current v2.0 overlay variants
+> **Superseded by step 10 (Step 15 / `slashdot/final_cleanup.md`)**:
+> every v2.0 overlay except `PathComplete` is retired; the tables and
+> order list below record the final retirement state (the order list is
+> historical). `PathComplete` and its helpers are deliberately scoped
+> out of cleanup to the prompt-completion step.
+
+### Overlay variants (retirement state)
 
 | Variant | Used by | v2.5 replacement |
 |---|---|---|
-| `Menu` | Root list, model, tree list, replay | `V25Menu` (when commands are ported) |
-| `Settings` | `/set` settings list | — (not yet ported) |
-| `SettingsVal` | `/set <key>` value picker | — (not yet ported) |
-| `Stat` | `/stat` interstitial | — (not yet ported) |
+| ~~`Menu`~~ | Root list, model, tree list, replay | **Done.** All `/` routes to `V25Menu`; overlay removed (cleanup P1). |
+| ~~`Settings`~~ | `/set` settings list | **Done.** Ported to `v25_set`; overlay removed (cleanup P1). |
+| ~~`SettingsVal`~~ | `/set <key>` value picker | **Done.** Ported to `v25_set`; overlay removed (cleanup P1). |
+| ~~`Stat`~~ | `/stat` interstitial | **Done.** `stat_phase` relocated to `v25_stat::StatNode::header`; overlay removed (cleanup P1). |
 | ~~`Sandbox`~~ | removed | **Done.** Ported to v2.5 `v25_sandbox`; overlay + `InputAction::Sandbox` removed. |
 | ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
@@ -308,8 +315,8 @@ and with-keys - so this change should not cause regressions.
 | ~~`TreeAction`~~ | `/tree <id>` action menu | **Done.** Ported to v2.5 `TreeListNode` + action children. |
 | ~~`SwitchAction`~~ | `/tree <id> switch` | **Done.** `TreeSwitchNode` → `AsyncOp::TreeSwitch`. |
 | ~~`CompactSummary`~~ | `/tree <id> compact` summary | **Done.** Three compact nodes → `AsyncOp::TreeCompact`. |
-| `Mod` | Dotted modifier completion | — (not yet ported) |
-| `PathComplete` | Tab path completion | — (not yet ported) |
+| ~~`Mod`~~ | Dotted modifier completion | **Done.** Relocated to `node_entry::default_complete`; overlay removed (cleanup P1/P2). |
+| `PathComplete` | Tab path completion | **Scoped out of cleanup** — lives until the prompt-completion step (`arg_and_modifier_autocomplete.md` §Prompt-line completion). |
 
 ### Retirement path
 
@@ -320,8 +327,9 @@ The v2.0 code lives primarily in:
   per-variant rendering/key handling
 - `interpreter.rs` — v2.0 `Interpreter` (state machine)
 
-**Status:** Step 1 (root `/` list) is done. All `/` now routes through v2.5;
-the `from_buffer_cursors` dispatcher is only reached by v2.0 tests.
+**Status:** Complete — step 10 (Step 15) deleted `from_buffer_cursors`,
+`interpreter.rs`, `accept.rs`, `provider.rs`, `node.rs`, `MenuEngine`,
+and every remaining v2.0 path except the prompt-completion island.
 
 **Recommended order for remaining v2.0 retirement:**
 
@@ -344,9 +352,10 @@ the `from_buffer_cursors` dispatcher is only reached by v2.0 tests.
    nested actions, confirm dialogs, `NewPath` rewrites. Retires
    `TreeAction`, `SwitchAction`, `CompactSummary`, `TreeProvider`.
 
-7. **Final cleanup** (step 10): Remove `MenuEngine`, `PlanBuilder`,
-   `Interpreter`, `AcceptController`, `from_buffer_cursors`, and all
-   dead v2.0 code.
+7. ~~**Final cleanup**~~ (step 10) — **Done.** Remove `MenuEngine`,
+   `PlanBuilder`, `Interpreter`, `AcceptController`,
+   `from_buffer_cursors`, and all dead v2.0 code. See Step 15 /
+   `slashdot/final_cleanup.md` (P1–P5).
 
 Each step is independently shippable — the old and new paths coexist via
 the `V25Menu` vs `Menu` overlay variants until all commands are ported.
@@ -516,7 +525,7 @@ Design + plan: `slashdot/sandbox_design.md`.
 
 ### Step 14: Tree + `/compact`
 
-### Step 15: Final cleanup
+### Step 15: Final cleanup — DONE (P1–P5)
 
 Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
 
@@ -556,6 +565,33 @@ Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
   deleted production fns — recovered by restoring HEAD and replaying
   the recorded edits; the rerun script was range-guarded to `mod
   tests`. Prefer the edit tool; commit before any scripted edit.)*
+
+- **P4 — slash.rs + InputAction audit + help remnants — DONE**:
+  `src/slash.rs` deleted (registry, `SlashKind`, `SlashIntent`,
+  `filter_commands`, `parse_slash`, `render_help` + 9 tests; zero live
+  consumers confirmed by grep). `InputAction` → `{Submit, MenuDone}`:
+  the producer-less `SetModel`/`SetThinking`/`SetPersona` arms and the
+  orphaned `Quit` variant (live quit path is `AsyncOp::Quit`) removed
+  after a full producer audit; the `menu_submitted` LiveState sync
+  (agent ~3702) covers model/thinking/persona with equivalent
+  semantics (rebuild, recent-models, session logging). Stale comments
+  rewritten (`model_overlay_entries`, `InputAction::SetModel`,
+  `read_input`/`ActiveOverlay` docs with `/help` prose, duplicated
+  `Ctrl-C` line); one `render_help` substring false-positive test
+  renamed. Gate: workspace green — lib 570 → 561 (= exactly slash's 9
+  tests); P4 sentinels empty in `src/`.
+
+- **P5 — test gap-fill + docs — DONE**: 7 new tests — `v25_thinking`
+  (root row, `*`-active marker via `plan.active_rows`, Tab+Enter
+  submit → `LiveState.thinking_level`), `v25_persona` (root row,
+  submit → `LiveState.persona` incl. `none` → None), `v25_menu` root
+  listing (all 13 commands present, `help` absent — codifies the
+  deliberate removal), `v25_model` eval-level `/model .` modifier
+  dialog (`.sort:` + dataset-derived field keys; declared-spec keys
+  for row-less fields belong to the arg/modifier rework track —
+  finding noted in the test). Final sentinel block empty;
+  NOT-list (prompt-completion island) intact. Workspace green: 568
+  lib + 133 crate + all integration, 0 failed.
 
 ---
 
@@ -602,16 +638,17 @@ Options for a cleaner design:
 | Category | Count | Status |
 | --- | --- | --- |
 | Grammar / filter / fuzzy / table / render / wrap / value / prompt | 75 | Unchanged (v2.0 free functions) |
-| Accept (confirm, interstitial, editor, new-path) | 8 | Unchanged (v2.0 accept.rs) |
-| Interpreter (state/tab/enter/esc, dynamic, field_options) | 26 | Unchanged (v2.0, will be replaced) |
+| Accept (confirm, interstitial, editor, new-path) | 0 | **Deleted** with `accept.rs` (cleanup P2) |
+| Interpreter (state/tab/enter/esc, dynamic, field_options) | 0 | **Deleted** with `interpreter.rs` (cleanup P2) |
 | **v2.5 node_entry (parse, listing, drill, cursor, esc, header, mixed)** | **23** | **New (steps 4–5)** |
 | **v2.5 `/thinking` command (drill, submit, cursor, active, filter, esc)** | **12** | **New (step 6a)** |
 | **v2.5 `/persona` command (drill, submit, cursor, active, filter, esc, none-clear)** | **8** | **New (step 6b)** |
 | **v2.5 `/model` command (rows, cache, columns, fields, submit, traversal, filter)** | **7** | **New (step 6c)** |
 
-Total: 571 lib tests + 4 integration tests (2 ignored for unported `/set`).
-The 26 interpreter tests test the old code path and will be removed
-when v2.0 is fully retired.
+Total (after cleanup step 10): 568 lib tests + integration suites +
+133 crate tests, 0 failed. The interpreter/accept/PlanBuilder test
+families were removed with their code (cleanup P2); the P5 gap-fill
+added 7 targeted v2.5 tests.
 
 ---
 
