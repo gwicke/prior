@@ -1314,28 +1314,6 @@ mod tests {
         }
     }
 
-    /// A node with a static header.
-    struct HeaderLeaf {
-        text: String,
-    }
-
-    impl SlashDotNode for HeaderLeaf {
-        fn header(
-            &mut self,
-            _path_args: &PathArgs,
-            _render_ctx: &RenderContext,
-        ) -> Vec<String> {
-            vec![self.text.clone()]
-        }
-
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            Ok(Rc::new(DataResponse {
-                rows: vec![crate::fields::Row::new("hleaf")],
-                active_ids: Vec::new(),
-            }))
-        }
-    }
-
     /// A node with dynamic rows for testing fuzzy + filter + sort.
     struct DynamicNode {
         rows: Vec<crate::fields::Row>,
@@ -1730,19 +1708,17 @@ mod tests {
 
     // --- Step 5: Merged child set tests ---
 
-    /// A leaf that records the child_index it was dispatched from.
+    /// A leaf that records the path element it was dispatched from. The
+    /// record cell is handed in by the test — once the leaf is boxed
+    /// into the tree the test has no handle to it — so the test can
+    /// assert *which* leaf received the submit.
     struct RecordingLeaf {
-        submitted_via: std::cell::RefCell<Option<String>>,
+        submitted_via: Rc<std::cell::RefCell<Option<String>>>,
     }
 
     impl RecordingLeaf {
-        fn new() -> Self {
-            RecordingLeaf {
-                submitted_via: std::cell::RefCell::new(None),
-            }
-        }
-        fn submitted_via(&self) -> Option<String> {
-            self.submitted_via.borrow().clone()
+        fn new(record: Rc<std::cell::RefCell<Option<String>>>) -> Self {
+            RecordingLeaf { submitted_via: record }
         }
     }
 
@@ -1801,8 +1777,14 @@ mod tests {
     #[test]
     fn mixed_children_tab_drill_dispatches_correct_child() {
         let mut root = NodeEntry::new_root();
-        let add_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new()));
-        let bind_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new()));
+        let add_seen: Rc<std::cell::RefCell<Option<String>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let bind_seen: Rc<std::cell::RefCell<Option<String>>> =
+            Rc::new(std::cell::RefCell::new(None));
+        let add_leaf =
+            NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&add_seen))));
+        let bind_leaf =
+            NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&bind_seen))));
 
         // add_child returns a static "add" row.
         let mut add_cmd = NodeEntry::new_child(Box::new(CmdNode::new("add")));
@@ -1839,6 +1821,12 @@ mod tests {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
+        // Routing: only the add-branch leaf receives the submit, and it
+        // records the row id it was dispatched from.
+        assert_eq!(add_seen.borrow().as_deref(), Some("action"),
+            "add leaf should record its dispatched row");
+        assert!(bind_seen.borrow().is_none(),
+            "bind leaf must not receive the add-branch submit");
     }
 
     #[test]

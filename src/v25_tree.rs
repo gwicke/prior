@@ -183,20 +183,17 @@ fn find_entry<'a>(
     None
 }
 
-/// One row in the flattened tree.
+/// One row in the flattened tree. `header()` reads full text, role, and
+/// timestamp straight from the raw entry (`find_entry`), so rows only
+/// carry listing/selection data.
 struct FlatRow {
     indent: usize,
     label: String,
     entry_id: String,
     on_active_path: bool,
     is_current: bool,
-    branch_depth: usize,
-    /// Full text for header() — may be multi-line.
-    full_text: String,
-    /// Role for header metadata.
+    /// Role for listing metadata.
     role: String,
-    /// Timestamp for header metadata.
-    timestamp: String,
 }
 
 /// Build a label map: entry ID → display label (for compaction rows that
@@ -291,7 +288,6 @@ fn entry_role(entry: &SessionEntry) -> String {
 fn flatten_turns(
     nodes: &[SessionTreeNode],
     indent: usize,
-    branch_depth: usize,
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
@@ -299,25 +295,24 @@ fn flatten_turns(
 ) {
     // Iterative DFS to avoid stack overflow on deep linear sessions.
     // Push root nodes in reverse so the first sibling is processed first.
-    let mut stack: Vec<(&SessionTreeNode, usize, usize)> = Vec::new();
+    let mut stack: Vec<(&SessionTreeNode, usize)> = Vec::new();
     for node in nodes.iter().rev() {
-        stack.push((node, indent, branch_depth));
+        stack.push((node, indent));
     }
 
-    while let Some((node, cur_indent, cur_bd)) = stack.pop() {
+    while let Some((node, cur_indent)) = stack.pop() {
         let label =
             entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
-        // Children indent/branch_depth: visible multi-child nodes get +4
-        // indent and +1 branch_depth; everything else keeps current level.
+        // Children indent: visible multi-child nodes get +4 indent;
+        // everything else keeps current level.
         let is_branch = node.children.len() > 1;
         let child_indent = if is_branch { cur_indent + 4 } else { cur_indent };
-        let child_bd = if is_branch { cur_bd + 1 } else { cur_bd };
 
         if label.is_empty() {
             // Meta entry: skip visual row but descend into children.
             for child in node.children.iter().rev() {
-                stack.push((child, cur_indent, child_bd));
+                stack.push((child, cur_indent));
             }
             continue;
         }
@@ -327,9 +322,7 @@ fn flatten_turns(
 
         let is_active = active_path.contains(&node.entry.id);
         let is_current = leaf_id == Some(node.entry.id.as_str());
-        let full_text = entry_full_text(&node.entry);
         let role = entry_role(&node.entry);
-        let timestamp = node.entry.timestamp.clone();
 
         out.push(FlatRow {
             indent: row_indent,
@@ -337,15 +330,12 @@ fn flatten_turns(
             entry_id: node.entry.id.clone(),
             on_active_path: is_active,
             is_current,
-            branch_depth: cur_bd,
-            full_text,
             role,
-            timestamp,
         });
 
         // Push children in reverse so first child is processed first.
         for child in node.children.iter().rev() {
-            stack.push((child, child_indent, child_bd));
+            stack.push((child, child_indent));
         }
     }
 }
@@ -500,7 +490,6 @@ impl SlashDotNode for TreeListNode {
         let mut flat = Vec::new();
         flatten_turns(
             &tree_rc,
-            0,
             0,
             leaf.as_deref(),
             &active_path,
