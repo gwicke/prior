@@ -66,6 +66,7 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn explicit_path_wins() {
@@ -74,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn xdg_config_home_takes_precedence() {
         std::env::set_var("XDG_CONFIG_HOME", "/xdg");
         std::env::remove_var("HOME");
@@ -90,6 +92,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn home_fallback_used_without_xdg() {
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_var("HOME", "/home/me");
@@ -102,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn windows_appdata_used_without_home() {
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("HOME");
@@ -116,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn no_location_returns_none() {
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::remove_var("HOME");
