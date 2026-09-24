@@ -266,17 +266,19 @@ Mirror `src/v25_tree.rs` / `src/v25_session.rs`.
    replacing the `/sandbox` help text source in `slash.rs` (update help to
    `add ro | add rw | remove`).
 
-## Wiring / retire v2.0
+## Wiring / retire v2.0 — DONE
 
-- Add `AsyncOp::Sandbox(SandboxOp)` + the agent-loop arm (relocated v2.0
-  handler).
-- Delete: `ActiveOverlay::Sandbox` (+ all arms), `Repl::sandbox_overlay_entries`,
-  `InputAction::Sandbox` (+ its `agent.rs` arm), and the legacy `"sandbox"`
-  `MenuNode` arm in `slash_menu_bridge::root_descriptor`.
-- More broadly, *all* v2.0 and also the remaining v1.0 repl menu code are dead
-  now, and need to be removed in the next bigger step. If Sandbox specific
-  surgery is complicated, add note in impl cleanup section, so it can be
-  addressed as a whole.
+- `AsyncOp::Sandbox(SandboxOp)` + the agent-loop arm (relocated v2.0
+  handler: mutate `sandbox_state` → `set_sandbox(merged)` +
+  `config.sandbox` → success/error display).
+- Deleted: `ActiveOverlay::Sandbox` (+ all arms), the
+  `from_buffer` `"sandbox" | "sb"` arm now defers to the v2.5 engine
+  like session/tree, `Repl::sandbox_overlay_entries`,
+  `InputAction::Sandbox` (+ its `agent.rs` arm), and the legacy
+  `"sandbox"` `MenuNode` arm in `slash_menu_bridge::root_descriptor`.
+  Surgery was pure deletion — no cleanup note needed.
+- More broadly, *all* remaining v2.0 and v1.0 repl menu code is dead
+  now and goes in the next bigger step (impl step 10 final cleanup).
 
 ## Tests
 

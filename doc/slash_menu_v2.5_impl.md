@@ -277,9 +277,11 @@ and with-keys - so this change should not cause regressions.
    v2.0 session overlay code removed. 19 unit tests. Rendering
    refinements: header() no background, compact timestamps,
    Table wrap option for single-line listings.
-7. **Sandbox** — Mixed static+dynamic children. Design finalized:
-   slashdot/sandbox_design.md (incl. `SubmitResult::Error` + detailed
-   implementation plan). Not yet started.
+7. **Sandbox - DONE** — Mixed static+dynamic children. Design + plan:
+   slashdot/sandbox_design.md (incl. the settled `complete_parameter`
+   contract). `v25_sandbox` nodes + `AsyncOp::Sandbox` wiring landed
+   (11 tests); v2.0 `Sandbox` overlay / `InputAction::Sandbox` /
+   `root_descriptor` arm removed (−422 lines). 653 lib tests.
 9. **Tree + compact - DONE** — Most complex: dynamic listing with nested
    actions, confirm dialogs, `NewPath` rewrites.
 10. **Final cleanup** — Remove `MenuEngine`, `PlanBuilder`,
@@ -299,7 +301,7 @@ and with-keys - so this change should not cause regressions.
 | `Settings` | `/set` settings list | — (not yet ported) |
 | `SettingsVal` | `/set <key>` value picker | — (not yet ported) |
 | `Stat` | `/stat` interstitial | — (not yet ported) |
-| `Sandbox` | `/sandbox` path bindings | — (not yet ported) |
+| ~~`Sandbox`~~ | removed | **Done.** Ported to v2.5 `v25_sandbox`; overlay + `InputAction::Sandbox` removed. |
 | ~~`Session`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`SessionAction`~~ | removed | **Done.** Removed (`48b17df`). |
 | ~~`Confirm`~~ | removed | **Done.** Removed (`48b17df`). |
@@ -331,9 +333,9 @@ the `from_buffer_cursors` dispatcher is only reached by v2.0 tests.
 3. **Stat + Replay** (step 6): Simple leaf/interstitial commands.
    Retires `Stat` overlay, `ReplayDetailProvider`.
 
-4. **Sandbox** (step 7): Mixed static+dynamic children. Retires the
-   `Sandbox` overlay + `InputAction::Sandbox`; keeps `sandbox_bindings`,
-   renamed `sandbox_state` (data-only). Design: slashdot/sandbox_design.md.
+4. ~~**Sandbox**~~ (step 7) — **Done.** Mixed static+dynamic children;
+   `Sandbox` overlay + `InputAction::Sandbox` removed, `sandbox_bindings`
+   → `sandbox_state` (data-only). Design: slashdot/sandbox_design.md.
 
 5. **Session** (step 8): Dynamic listing with action children. Retires
    `Session`, `SessionAction`, `Confirm` overlays and `SessionProvider`.
@@ -489,8 +491,24 @@ Design + plan: `slashdot/sandbox_design.md`.
 - **`sandbox_state` rename — DONE**: `sandbox_bindings` → `sandbox_state`
   (data-only), new `add(host, sandbox, mode)` + shims, `restore` (was
   dead `remove_exclude`). All refs updated; +2 tests — 637 lib tests.
-- Next: `v25_sandbox` nodes + `AsyncOp::Sandbox` wiring + v2.0 overlay
-  retirement.
+- **`v25_sandbox` nodes + `AsyncOp::Sandbox` wiring — DONE** (`3e887da`):
+  root listing (host | sandbox path | mode | source columns, fields
+  mode+source), `add` leaf with the settled completion contract (gate /
+  committed routing / L1+L2 caching / exactness) + submit validation
+  (0 args ⇒ Error drill guard, ≥3 ⇒ Error, host existence stay-open
+  Error), `SandboxMappingNode` dual role (rows id = sandbox path,
+  `cfg [DISABLED]`, drilled header) + `SandboxRemoveNode`
+  (remove/restore/exclude picked by binding state, two-phase confirm),
+  registered in `v25_menu`, slash.rs help updated. Agent-loop
+  `AsyncOp::Sandbox` arm relocates the v2.0 handler (mutate →
+  `set_sandbox(merged)` + `config.sandbox`). +11 tests.
+- **v2.0 retirement — DONE**: `ActiveOverlay::Sandbox` (+ all arms),
+  `Repl::sandbox_overlay_entries`, `InputAction::Sandbox` (+ its
+  `agent.rs` arm), and the `root_descriptor` `"sandbox"` arm removed
+  (−422 lines); the `from_buffer` arm defers to the v2.5 engine like
+  session/tree. Surgery was pure deletion — no cleanup note needed.
+- **Step 12 complete.** 653 lib tests; remaining v1/v2.0 repl removal
+  is generic step-10 cleanup.
 
 ### Step 13: Session
 

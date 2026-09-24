@@ -4159,40 +4159,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                     }
                 }
             }
-            InputAction::Sandbox(sub, path, sandbox_path) => {
-                let result = match sub.as_str() {
-                    "add_ro" => crate::sandbox_state::add_ro(&path, &sandbox_path),
-                    "add_rw" => crate::sandbox_state::add_rw(&path, &sandbox_path),
-                    "remove" => crate::sandbox_state::remove(&path),
-                    "exclude" => crate::sandbox_state::exclude(&path),
-                    _ => Err(format!("unknown sandbox subcommand: {}", sub)),
-                };
-                match result {
-                    Ok(()) => {
-                        // Re-publish the sandbox config with session bindings merged,
-                        // AND update `config.sandbox` so the merged version survives
-                        // a subsequent lazy agent creation (which calls
-                        // `set_sandbox(config.sandbox.clone())` inside
-                        // `build_rig_agent`).
-                        let mut merged = config.sandbox.clone().unwrap_or_default();
-                        crate::sandbox_state::merge_into(&mut merged);
-                        crate::tools::set_sandbox(Some(merged.clone()));
-                        config.sandbox = Some(merged);
-                        let msg = if sub == "exclude" {
-                            format!("sandbox: excluded {} (ok)", path)
-                        } else if sandbox_path.is_empty() {
-                            format!("sandbox: {} {} (ok)", sub, path)
-                        } else {
-                            format!("sandbox: {} {} → {} (ok)", sub, path, sandbox_path)
-                        };
-                        config.output.display_plain(&msg);
-                    }
-                    Err(e) => {
-                        let msg = format!("sandbox error: {}", e);
-                        config.output.display_plain(&msg);
-                    }
-                }
-            }
             InputAction::MenuDone => {
                 // v2.5 menu committed: the node already wrote to shared state.
                 // `menu_submitted` (LiveState sync) and `pending_op` (async
