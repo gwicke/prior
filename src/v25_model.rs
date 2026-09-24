@@ -366,6 +366,49 @@ mod tests {
         )
     }
 
+    /// The *_price ratios floor the combined price at a tiny epsilon so free
+    /// models (price == 0) sort ahead of paid ones, still in rating order.
+    /// (Ported from the legacy bridge test `model_row_floors_price_for_free_models`.)
+    #[test]
+    fn model_row_floors_price_for_free_models() {
+        use crate::model_catalog::CostSource;
+        use crate::model_catalog::ModelEntry;
+        use crate::slashdot_menu::value::Value;
+        let entry = |prompt: Option<f64>, coding: Option<f32>| ModelEntry {
+            provider: "p".into(),
+            id: "m".into(),
+            display: "p:m".into(),
+            context_length: None,
+            prompt_cost: prompt,
+            completion_cost: None,
+            reasoning: false,
+            cost_source: CostSource::Direct,
+            created: None,
+            coding_index: coding,
+            intelligence_index: None,
+            agentic_index: None,
+        };
+        // Free model: price 0, coding 80.
+        let free = entry(Some(0.0), Some(80.0));
+        let r = model_row(&free);
+        let cp = r
+            .field_value("coding_price")
+            .expect("coding_price present for free model");
+        let Value::Num(n) = cp else {
+            panic!("coding_price must be numeric");
+        };
+        // floored: 80 / 1e-10 == 8e11 -> huge positive, sorts ahead of paid.
+        assert!(*n > 1e9, "free model ratio huge, got {}", n);
+
+        // A slightly-priced model (price 0.5, coding 80) sorts below the
+        // free one (80/0.5 == 160 vs 8e11).
+        let paid = entry(Some(0.5), Some(80.0));
+        let r2 = model_row(&paid);
+        if let Some(Value::Num(p2)) = r2.field_value("coding_price") {
+            assert!(*p2 < *n, "free model must outrank the paid one");
+        }
+    }
+
     #[test]
     fn model_node_returns_rows() {
         let shared = test_shared();

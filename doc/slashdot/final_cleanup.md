@@ -1,6 +1,6 @@
 # Final cleanup — remove v1.0 / v2.0 menu remnants (impl step 10)
 
-Status: **PROPOSED** (plan only; not yet implemented)
+Status: **IN PROGRESS** — P1, P3 done; P2 → P4 → P5 remaining
 
 ## Goal & principles
 
@@ -157,8 +157,18 @@ Status: **PROPOSED** (plan only; not yet implemented)
    `interpreter`/`accept`/`node`/`provider`; `PlanBuilder`; `lib.rs`.
    Gate: lib tests green (expect a large drop: interpreter 25 +
    accept 8 + render ≤6).
-3. **P3 — bridge slimming**: `MenuEngine`, `Frame`, providers out;
-   repl has zero engine refs after P1. Gate: workspace green.
+3. ~~**P3 — bridge slimming**~~ — **DONE** (executed **before** P2:
+   the bridge turned out to be the sole consumer of the four files P2
+   deletes, so the phases had to swap to keep every boundary compiling —
+   plan order corrected here). Deleted `MenuEngine` (+ `Frame`,
+   `level_of`, `resolve_node`), bridge `HostKey`/`StepResult`, all four
+   providers (`Persona`/`Thinking`/`Replay`/`Model`) + `model_row`,
+   `enum_rows`/`row_str`, and the 18 step_at-era tests; module header
+   rewritten to the host-state-only world. Keep-list (`MenuShared`+impl,
+   `LiveState`, `AsyncOp`, `CompactMode`, `SandboxOp`) verified
+   byte-identical; the `model_row` epsilon-floor test was ported to
+   `v25_model` first (relocate-then-delete). bridge 1452 → 191 lines.
+   Gate met: workspace green — 570 lib + 169 integration, 0 failed.
 4. **P4 — slash.rs + help remnants + `InputAction` audit + agent
    comments.** Gate: sentinels.
 5. **P5 — test gap-fill + docs**: add `v25_thinking` tests (set +

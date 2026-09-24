@@ -520,6 +520,19 @@ Design + plan: `slashdot/sandbox_design.md`.
 
 Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
 
+- **P3 — bridge slimming — DONE** (run before P2; the bridge was the
+  sole consumer of the crate files P2 deletes, so the phase order was
+  corrected — see `final_cleanup.md` P3): `slash_menu_bridge.rs`
+  reduced to its keep-list — `MenuShared`(+impl), `LiveState`,
+  `AsyncOp`, `CompactMode`, `SandboxOp` — plus a rewritten v2.5-era
+  module header. Deleted: `MenuEngine` (+ `Frame`/`level_of`/
+  `resolve_node`), bridge `HostKey`/`StepResult`, the four providers
+  (`Persona`/`Thinking`/`Replay`/`Model`) + `model_row` + dead row
+  helpers, and the 18 step_at-era tests. The `model_row` epsilon-floor
+  test was ported to `v25_model` first (relocate-then-delete). Bridge
+  1452 → 191 lines, keep-list verified byte-identical. Workspace green:
+  570 lib + 169 integration, 0 failed.
+
 - **P1 — repl.rs pruning — DONE**: `ActiveOverlay` reduced to
   `{None, V25Menu, PathComplete}` (10 legacy variants + all their
   display/key/derivation arms gone), `from_buffer`/`from_buffer_cursors`
