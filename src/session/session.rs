@@ -775,6 +775,14 @@ impl Session {
         }
     }
 
+    /// Whether the session header has been written to disk (i.e. the
+    /// `.jsonl` file exists). Metadata writers use this to fold values
+    /// into the in-memory header instead of appending an entry — metadata
+    /// alone must never create a session file.
+    pub fn is_persisted(&self) -> bool {
+        self.persisted.load(Ordering::Acquire)
+    }
+
     /// Ensure the session header is written to disk. No-op after the first
     /// call. Called automatically by `append_message()` — callers do not
     /// need to invoke this manually.

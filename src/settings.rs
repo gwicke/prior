@@ -227,7 +227,7 @@ impl SettingsStore {
     /// is already applied by the caller in `main.rs`).
     pub fn from_agent_config(cfg: &crate::AgentConfig, path: Option<&Path>) -> Self {
         SettingsStore {
-            default_model: format!("{}:{}", cfg.provider, cfg.model),
+            default_model: cfg.qualified_model_id(),
             security_mode: if cfg.yolo {
                 "yolo".to_string()
             } else {

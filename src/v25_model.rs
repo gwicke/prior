@@ -319,7 +319,15 @@ pub fn build_model_node(
     let recent = Some(shared.recent_models.clone());
     node.add_child(ModelNode::new(
         Box::new(move || ls.borrow().model.clone()),
-        Box::new(move |model| { ls2.borrow_mut().model = model.to_string(); Ok(()) }),
+        Box::new(move |model| {
+            let mut ls = ls2.borrow_mut();
+            ls.model = model.to_string();
+            // Explicit user commit of this model (Enter on the row): the
+            // agent loop's menu sync consumes this flag to decide whether a
+            // `ModelChange` entry may be appended to the session.
+            ls.model_commit = Some(model.to_string());
+            Ok(())
+        }),
         recent,
     ).into());
     node

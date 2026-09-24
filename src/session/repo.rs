@@ -423,6 +423,11 @@ impl SessionRepo for JsonlSessionRepo {
 
     async fn delete(&self, meta: &SessionMetadata) -> crate::Result<()> {
         tokio::fs::remove_file(&meta.path).await?;
+        // Drop the sync-listing cache immediately: the `/session` overlay
+        // reads via `list_sessions_sync()` (2s mtime-debounce cache), which
+        // would otherwise keep showing the deleted session as a ghost for
+        // up to 2 seconds — looking like the delete never happened.
+        self.invalidate_cache();
         Ok(())
     }
 
@@ -480,6 +485,9 @@ impl SessionRepo for JsonlSessionRepo {
                 }
 
                 let new_storage = JsonlSessionStorage::open_or_create(new_path).await?;
+                // New file on disk — drop the sync-listing cache so the
+                // `/session` overlay lists it immediately (see `delete`).
+                self.invalidate_cache();
                 Ok(new_storage)
             }
             ForkMode::ActivePath => {
@@ -516,6 +524,9 @@ impl SessionRepo for JsonlSessionRepo {
                 let leaf = SessionEntry::new_leaf(Some(effective_leaf.to_string()), None);
                 new_storage.append_entry(&leaf).await?;
 
+                // New file on disk — drop the sync-listing cache so the
+                // `/session` overlay lists it immediately (see `delete`).
+                self.invalidate_cache();
                 Ok(new_storage)
             }
         }
@@ -739,6 +750,33 @@ mod tests {
 
         let sessions_after = repo.list(Some(cwd)).await.unwrap();
         assert!(sessions_after.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(&base_dir).await;
+    }
+
+    /// Regression: `delete()` must invalidate the sync-listing cache.
+    /// The `/session` overlay lists via `list_sessions_sync()`, which
+    /// serves cached results for up to 2 seconds — without invalidation a
+    /// just-deleted session stayed visible as a ghost, so the delete
+    /// appeared to have done nothing.
+    #[tokio::test]
+    async fn test_delete_invalidates_sync_listing_cache() {
+        let (repo, base_dir) = create_test_repo().await;
+        let cwd = Path::new("/home/test");
+
+        let _storage = create_persisted(&repo, cwd).await;
+        // Prime the sync-listing cache.
+        assert_eq!(repo.list_sessions_sync(Some(cwd)).len(), 1);
+
+        let sessions = repo.list(None).await.unwrap();
+        repo.delete(&sessions[0]).await.unwrap();
+
+        // Immediately (well inside the 2s debounce window) the deleted
+        // session must be gone from the sync listing too.
+        assert!(
+            repo.list_sessions_sync(Some(cwd)).is_empty(),
+            "deleted session still visible via sync listing (stale cache)"
+        );
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
     }

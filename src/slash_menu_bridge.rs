@@ -32,6 +32,12 @@ pub struct LiveState {
     pub persona: Option<String>,
     /// Session thinking level. `None` ≈ "off".
     pub thinking_level: Option<String>,
+    /// Set by the `/model` node's `submit()` on an explicit model commit
+    /// (Enter on a model row), `take()`n by the agent loop's menu sync.
+    /// The sync records a `ModelChange` entry in the session only while
+    /// this is `Some` — a bare `menu_submitted` (quit, delete confirm,
+    /// replay, …) must never append model metadata to the session.
+    pub model_commit: Option<String>,
 }
 
 impl Default for LiveState {
@@ -40,6 +46,7 @@ impl Default for LiveState {
             model: String::new(),
             persona: None,
             thinking_level: None,
+            model_commit: None,
         }
     }
 }

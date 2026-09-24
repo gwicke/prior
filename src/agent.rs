@@ -1316,6 +1316,20 @@ pub struct AgentConfig {
     pub message_log_path: Option<String>,
 }
 
+impl AgentConfig {
+    /// Canonical `provider:model` id for the model this config runs.
+    ///
+    /// This is the single canonical form used for equality checks against
+    /// `LiveState.model` and session-recorded model ids — compare whole
+    /// strings, never split segments: model ids themselves may contain
+    /// colons (e.g. openrouter `…:free`), and a `split(':').nth(1)` style
+    /// truncation reads a different value than what was configured.
+    /// Mirrors `ModelEntry::qualified()` for catalog entries.
+    pub fn qualified_model_id(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
+}
+
 /// Sentinel env-var value that triggers the interactive device-code OAuth
 /// flow instead of using a literal token. Consistent with the other providers:
 /// the env var must be set; its value decides the auth method.
@@ -2562,32 +2576,95 @@ pub(crate) async fn handle_replay(
     }
 }
 
+/// The canonical `provider:model` id a session has recorded, or `None`
+/// when it records no model at all. Branch first (a `ModelChange` entry is
+/// authoritative for mid-session `/model` switches), then the session
+/// header (`with_model_context` sessions that never recorded an entry —
+/// the header is written once, at first persistence).
+async fn session_recorded_model_id(session: &Session) -> Option<String> {
+    let branch = session.get_branch().await;
+    if let Some((provider, model_id)) = crate::session::session::derive_model_change(&branch) {
+        return Some(format!("{}:{}", provider, model_id));
+    }
+    let index = session.index.lock().await;
+    match (&index.header.provider, &index.header.model_id) {
+        (Some(provider), Some(model_id)) => Some(format!("{}:{}", provider, model_id)),
+        _ => None,
+    }
+}
+
+/// The thinking level a session has recorded: latest `ThinkingLevelChange`
+/// on the branch, else the header, else `None`.
+async fn session_recorded_thinking(session: &Session) -> Option<String> {
+    let branch = session.get_branch().await;
+    if let Some(level) = crate::session::session::derive_thinking_level(&branch) {
+        return Some(level);
+    }
+    session.index.lock().await.header.thinking_level.clone()
+}
+
+/// Record an explicit `/model <id>` commit in the session — but only when
+/// the session does not already record exactly this model.
+///
+/// For a session that has never been persisted (no file on disk yet) the
+/// value is folded into the in-memory header instead of appended: metadata
+/// alone must never create a session file (that is what littered the
+/// `/session` listing with header+marker-only "empty" sessions). The
+/// first real message persists the updated header.
+async fn record_model_change(session: &Session, qualified_id: &str) {
+    if session_recorded_model_id(session).await.as_deref() == Some(qualified_id) {
+        return; // already recorded — no redundant entry
+    }
+    let Some((provider, model_id)) = qualified_id.split_once(':') else {
+        return; // malformed id — refuse to record rather than persist junk
+    };
+    if !session.is_persisted() {
+        let mut index = session.index.lock().await;
+        index.header.provider = Some(provider.to_string());
+        index.header.model_id = Some(model_id.to_string());
+        return;
+    }
+    let _ = session.append_model_change(provider, model_id).await;
+}
+
+/// Record a thinking-level change — same rules as [`record_model_change`]:
+/// skip when already recorded; fold into the in-memory header (no file)
+/// while the session is still unpersisted.
+async fn record_thinking_change(session: &Session, level: &str) {
+    if session_recorded_thinking(session).await.as_deref() == Some(level) {
+        return;
+    }
+    if !session.is_persisted() {
+        session.index.lock().await.header.thinking_level = Some(level.to_string());
+        return;
+    }
+    let _ = session.append_thinking_level_change(level).await;
+}
+
 /// Build the `/model <provider>:<model_id>` prefill to surface the model
-/// the resumed session was last using. Looks at the active leaf→root
-/// branch first (a `ModelChange` entry is authoritative for mid-session
-/// `/model` switches); falls back to the session header's
-/// `provider`/`modelId` when no entry exists; returns `None` otherwise so
-/// the prompt stays empty and the user is not nudged to switch.
+/// the resumed session was last using — but only when it DIFFERS from the
+/// model the agent is currently running (`live_model_id`, the canonical
+/// `config.qualified_model_id()`): when they already match there is
+/// nothing to accept and no nudge is due, and committing a matching
+/// prefill would only churn the menu sync.
+///
+/// Looks at the active leaf→root branch first (a `ModelChange` entry is
+/// authoritative for mid-session `/model` switches); falls back to the
+/// session header's `provider`/`modelId`; returns `None` when the session
+/// records no model or when it matches the live model.
 ///
 /// The full `provider:model_id` form is intentional: pre-filling the
 /// unqualified `model_id` might surface multiple catalog entries that
 /// share a short name under different providers.
-async fn compute_resume_model_prefill(session: &Session) -> Option<String> {
-    let branch = session.get_branch().await;
-    // Branch-derived first: covers mid-session `/model` switches recorded
-    // as `ModelChange` entries.
-    if let Some((provider, model_id)) = crate::session::session::derive_model_change(&branch) {
-        return Some(format!("/model {}:{}", provider, model_id));
+async fn compute_resume_model_prefill(
+    session: &Session,
+    live_model_id: &str,
+) -> Option<String> {
+    let recorded = session_recorded_model_id(session).await?;
+    if recorded == live_model_id {
+        return None; // session already runs the live model — no prefill
     }
-    // Header fallback: covers sessions created with `with_model_context`
-    // that never recorded an explicit `ModelChange`. The header is only
-    // written once (at session creation), so this case is mostly relevant
-    // for sessions resumed very soon after their first turn.
-    let index = session.index.lock().await;
-    if let (Some(provider), Some(model_id)) = (&index.header.provider, &index.header.model_id) {
-        return Some(format!("/model {}:{}", provider, model_id));
-    }
-    None
+    Some(format!("/model {}", recorded))
 }
 /// Parse and dispatch a `/session <name> <action>` command.
 ///
@@ -2706,9 +2783,10 @@ async fn handle_session_command(
                 // user's back, removing the chance to accept/abort/choose a model.
                 // The resumed session is loaded and replay is rendered below; the
                 // model/thinking decision is surfaced via `compute_resume_model_prefill`,
-                // which returns a `/model <provider>:<model_id>` prefill when a
-                // `ModelChange` is on the active path or the header carries
-                // provider/model metadata, otherwise leaves the prompt empty so the
+                // which returns a `/model <provider>:<model_id>` prefill when the
+                // session records a model (branch `ModelChange` or header metadata)
+                // that DIFFERS from the running model; when they match — or the
+                // session records nothing — the prompt stays empty and the
                 // user is not nudged to switch. We only restore the model (not
                 // thinking level) -- they share the single input field, and silently
                 // setting `config.model` plus rebuilding the agent bypasses the
@@ -2751,7 +2829,9 @@ async fn handle_session_command(
                     }
                 }
 
-                let prefill = compute_resume_model_prefill(&new_session).await;
+                let prefill =
+                    compute_resume_model_prefill(&new_session, &config.qualified_model_id())
+                        .await;
 
                 *session = Some(new_session);
 
@@ -3579,9 +3659,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let live_state = std::rc::Rc::new(std::cell::RefCell::new(
         crate::slash_menu_bridge::LiveState {
-            model: format!("{}:{}", config.provider, config.model),
+            model: config.qualified_model_id(),
             persona: config.persona_name.clone(),
             thinking_level: config.thinking_level.clone(),
+            model_commit: None,
         },
     ));
     // Agent is created lazily on first use (or on /model, /thinking) so that
@@ -3645,7 +3726,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     let mut recent_models: Vec<String> = load_recent_models();
     // Also seed the model switch from the configured default model so it
     // appears in the recent list on first run (if present and available).
-    let default_seed = format!("{}:{}", config.provider, config.model);
+    let default_seed = config.qualified_model_id();
     if !recent_models.contains(&default_seed) {
         recent_models.push(default_seed.clone());
     }
@@ -3754,72 +3835,58 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         // through a Submit string).
         if menu_submitted {
             menu_submitted = false;
-            let ls = live_state.borrow();
-            let new_model = ls.model.clone();
-            let new_thinking = ls.thinking_level.clone();
-            let new_persona = ls.persona.clone();
-            drop(ls);
-
-            // Compare against the session's current model (branch + header),
-            // not the running agent's config. This prevents redundant
-            // ModelChange entries on resume (where config != session model
-            // because the user hasn't accepted the prefill yet).
-            let (session_provider, session_model, session_thinking) = if let Some(ref s) = session {
-                let branch = s.get_branch().await;
-                let model_change = crate::session::session::derive_model_change(&branch);
-                let thinking_level = crate::session::session::derive_thinking_level(&branch);
-                let idx = s.index.lock().await;
-                let provider = model_change.clone().map(|(p, _)| p).or(idx.header.provider.clone());
-                let model = model_change.map(|(_, m)| m).or(idx.header.model_id.clone());
-                let thinking = thinking_level.or(idx.header.thinking_level.clone());
-                (provider, model, thinking)
-            } else {
-                (Some(config.provider.clone()), Some(config.model.clone()), config.thinking_level.clone())
+            // Snapshot LiveState and consume any explicit `/model` commit.
+            // `model_commit` is written only by the `/model` node's submit(),
+            // so session metadata recording below is gated on a real user
+            // commit — a bare `menu_submitted` (quit, delete confirm, replay,
+            // …) must never append model/thinking entries to the session
+            // (which, via `ensure_persisted`, used to create header+marker
+            // "empty" sessions and re-mark the current session active right
+            // after deleting another one).
+            let (live_model, live_thinking, live_persona, model_commit) = {
+                let mut ls = live_state.borrow_mut();
+                (
+                    ls.model.clone(),
+                    ls.thinking_level.clone(),
+                    ls.persona.clone(),
+                    ls.model_commit.take(),
+                )
             };
 
-            let model_changed = session_provider.as_deref() != Some(new_model.split(':').next().unwrap_or(""))
-                || session_model.as_deref() != Some(new_model.split(':').nth(1).unwrap_or(""));
-            let thinking_changed = session_thinking.as_deref() != new_thinking.as_deref();
-            let session_persona = config.persona_name.clone(); // persona is not stored in session
-            let persona_changed = session_persona != new_persona;
+            // Rebuild gate: canonical whole-string compares against the
+            // RUNNING model (config), never a segment split — model ids may
+            // themselves contain colons (openrouter `…:free`), and a
+            // `nth(1)`-style truncation reads a different value than what is
+            // configured, making every menu commit look like a model change.
+            let model_changed = config.qualified_model_id() != live_model;
+            let thinking_changed = config.thinking_level != live_thinking;
+            let persona_changed = config.persona_name != live_persona;
 
             if model_changed || thinking_changed || persona_changed {
                 let mut new_cfg = config.clone();
-                {
-                    let ls = live_state.borrow();
-                    if model_changed {
-                        if let Some((p, m)) = ls.model.split_once(':') {
-                            new_cfg.provider = p.to_string();
-                            new_cfg.model = m.to_string();
-                        }
+                if model_changed {
+                    if let Some((p, m)) = live_model.split_once(':') {
+                        new_cfg.provider = p.to_string();
+                        new_cfg.model = m.to_string();
                     }
-                    if thinking_changed {
-                        new_cfg.thinking_level = ls.thinking_level.clone();
-                    }
-                    if persona_changed {
-                        new_cfg.persona_name = ls.persona.clone();
-                        new_cfg.persona_prompt = ls.persona.as_ref()
-                            .and_then(|p| crate::persona::get_persona(p));
-                    }
+                }
+                if thinking_changed {
+                    new_cfg.thinking_level = live_thinking.clone();
+                }
+                if persona_changed {
+                    new_cfg.persona_name = live_persona.clone();
+                    new_cfg.persona_prompt = live_persona
+                        .as_ref()
+                        .and_then(|p| crate::persona::get_persona(p));
                 }
                 match create_agent(new_cfg.clone()).await {
                     Ok(new_agent) => {
                         agent = Some(new_agent);
                         if model_changed {
-                            let model_id = format!("{}:{}", new_cfg.provider, new_cfg.model);
+                            let model_id = new_cfg.qualified_model_id();
                             recent_models.retain(|m| m != &model_id);
                             recent_models.insert(0, model_id);
                             save_recent_models(&recent_models);
-                            if let Some(ref s) = session {
-                                let _ = s.append_model_change(&new_cfg.provider, &new_cfg.model).await;
-                            }
-                        }
-                        if thinking_changed {
-                            if let Some(ref s) = session {
-                                let _ = s.append_thinking_level_change(
-                                    new_cfg.thinking_level.as_deref().unwrap_or("off")
-                                ).await;
-                            }
                         }
                         config = new_cfg;
                     }
@@ -3831,6 +3898,28 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             &format!("Cannot {}: {}", kind, e)
                         );
                     }
+                }
+            }
+
+            // Session metadata recording. Runs AFTER the rebuild so `config`
+            // at this point matches the committed values exactly when the
+            // agent actually runs them (rebuild succeeded, or the commit
+            // equalled the running value and no rebuild was needed) — a
+            // failed rebuild records nothing. Model entries additionally
+            // require the explicit `/model` commit flag; the record helpers
+            // skip values the session already holds and fold metadata into
+            // the in-memory header instead of a file while the session is
+            // still unpersisted.
+            if let Some(ref committed) = model_commit {
+                if config.qualified_model_id() == *committed {
+                    if let Some(ref s) = session {
+                        record_model_change(s, committed).await;
+                    }
+                }
+            }
+            if thinking_changed && config.thinking_level == live_thinking {
+                if let Some(ref s) = session {
+                    record_thinking_change(s, live_thinking.as_deref().unwrap_or("off")).await;
                 }
             }
         }
@@ -5062,7 +5151,10 @@ mod tests {
         find_predecessor_on_active_branch,
         is_anthropic_family, last_turns_start,
         maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
-        retry_summarization, run_compaction, CompactionResult, CompactionSummaryReview, CompactionTarget,
+        record_model_change, record_thinking_change,
+        retry_summarization, run_compaction, session_recorded_model_id,
+        session_recorded_thinking, CompactionResult, CompactionSummaryReview,
+        CompactionTarget,
         MessageLogger,
     };
     use super::{ReplayUnit, TreeAction, CompactSummaryMode};
@@ -5218,7 +5310,9 @@ mod tests {
             },
         ];
         let (session, path) = build_session_with_entries(entries).await;
-        let prefill = compute_resume_model_prefill(&session).await;
+        // Live model differs from the session's recorded model → prefill.
+        let prefill =
+            compute_resume_model_prefill(&session, "openai:gpt-4o").await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model anthropic:claude-sonnet-4-5")
@@ -5251,7 +5345,8 @@ mod tests {
             },
         ];
         let (session, path) = build_session_with_entries(entries).await;
-        let prefill = compute_resume_model_prefill(&session).await;
+        let prefill =
+            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet").await;
         assert_eq!(prefill.as_deref(), Some("/model openai:gpt-4o"));
         let _ = std::fs::remove_file(&path);
     }
@@ -5290,7 +5385,8 @@ mod tests {
         let ro = JsonlSessionStorage::open_readonly(path.clone()).await.unwrap();
         let index = ro.build_index().await.unwrap();
         let session = Session::new_persisted(ro, index);
-        let prefill = compute_resume_model_prefill(&session).await;
+        let prefill =
+            compute_resume_model_prefill(&session, "openai:gpt-4o").await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model openrouter:anthropic/claude-sonnet-4")
@@ -5302,9 +5398,199 @@ mod tests {
     async fn resume_model_prefill_returns_none_when_nothing_known() {
         // No `ModelChange`, no header metadata → empty prompt (no nudge).
         let (session, path) = build_session_with_entries(vec![]).await;
-        let prefill = compute_resume_model_prefill(&session).await;
+        let prefill =
+            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022")
+                .await;
         assert_eq!(prefill, None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn resume_model_prefill_none_when_session_matches_live() {
+        // Spec: the prefill only opens when the session's last model
+        // differs from the running model. Session records
+        // `anthropic:claude-sonnet-4-5`; the agent already runs it → no
+        // prefill (no nudge, and committing it would churn the sync).
+        let entries = vec![
+            crate::session::SessionEntry {
+                id: "m1".into(),
+                parent_id: None,
+                timestamp: "t1".into(),
+                content: crate::session::SessionEntryContent::ModelChange {
+                    provider: "anthropic".into(),
+                    model_id: "claude-sonnet-4-5".into(),
+                },
+            },
+        ];
+        let (session, path) = build_session_with_entries(entries).await;
+        let prefill =
+            compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5").await;
+        assert_eq!(prefill, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ------------------------------------------------------------------
+    // Session metadata recording (menu sync band-aids)
+    // ------------------------------------------------------------------
+
+    /// Build an UNPERSISTED fresh session (no file on disk) via
+    /// `repo.create()` + the `ensure_session` fallback header, like
+    /// `run_interactive` does at startup. Returns `(session, file path)`.
+    async fn fresh_unpersisted_session() -> (
+        crate::session::Session,
+        std::path::PathBuf,
+    ) {
+        use crate::session::repo::SessionRepo;
+        use crate::session::storage::SessionStorage;
+        use std::path::PathBuf;
+
+        let base: PathBuf = std::env::temp_dir().join(format!(
+            "picocode-record-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let repo = crate::session::repo::JsonlSessionRepo::new(base);
+        let cwd = std::path::Path::new("/home/test/record");
+        let storage = repo.create(cwd).await.unwrap();
+        let path = storage.path().clone();
+        let index = storage.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
+            header: crate::session::SessionHeader::with_model_context(
+                cwd,
+                Some("anthropic".into()),
+                Some("claude-3-5-sonnet-20241022".into()),
+                Some("off".into()),
+            ),
+            entries: std::collections::HashMap::new(),
+            leaf_id: None,
+            children: std::collections::HashMap::new(),
+            session_name: None,
+        });
+        (crate::session::Session::new(storage, index), path)
+    }
+
+    /// The core "empty session" regression: recording model/thinking
+    /// metadata on a session that has never been persisted must NOT create
+    /// a `.jsonl` file. Metadata is folded into the in-memory header (to be
+    /// persisted by the first real message) instead of appended — the old
+    /// path (`append_*` → `ensure_persisted`) wrote a header+marker-only
+    /// file that littered `/session` with undeletable `(empty)` sessions
+    /// (e.g. on `/quit`, whose DoneSuccess ran the menu sync one last time).
+    #[tokio::test]
+    async fn record_metadata_on_unpersisted_session_creates_no_file() {
+        let (session, path) = fresh_unpersisted_session().await;
+        assert!(!session.is_persisted(), "fresh session must start unpersisted");
+        assert!(!path.exists(), "precondition: no file yet");
+
+        record_model_change(&session, "openai:gpt-4o").await;
+        record_thinking_change(&session, "high").await;
+
+        assert!(
+            !path.exists(),
+            "metadata must never create a session file: {} exists",
+            path.display()
+        );
+        assert!(!session.is_persisted(), "recording must not flip persisted");
+        // The values landed in the in-memory header instead.
+        assert_eq!(
+            session_recorded_model_id(&session).await.as_deref(),
+            Some("openai:gpt-4o")
+        );
+        assert_eq!(
+            session_recorded_thinking(&session).await.as_deref(),
+            Some("high")
+        );
+
+        // Recording the same values again is a no-op (no state change).
+        record_model_change(&session, "openai:gpt-4o").await;
+        record_thinking_change(&session, "high").await;
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// On a persisted session: a value the session already records is
+    /// skipped (no redundant entry — the resume-accept case), a genuinely
+    /// new value is appended.
+    #[tokio::test]
+    async fn record_model_change_on_persisted_session_skips_duplicate() {
+        use crate::session::storage::SessionStorage;
+        use std::path::PathBuf;
+
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "picocode-record-persisted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+
+        let storage = crate::session::storage::JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let header = crate::session::SessionHeader::with_model_context(
+            std::path::Path::new("/t"),
+            Some("anthropic".into()),
+            Some("claude-3-5-sonnet-20241022".into()),
+            None,
+        );
+        storage.write_header(&header).await.unwrap();
+        drop(storage);
+
+        // Writable handle — mirrors `repo.open()` (resume path); a
+        // read-only handle would make `append_entry` fail silently.
+        let rw = crate::session::storage::JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
+        let index = rw.build_index().await.unwrap();
+        let session = crate::session::Session::new_persisted(rw, index);
+        assert!(session.is_persisted());
+
+        let count_model_changes = || -> usize {
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter(|l| l.contains("\"type\":\"model_change\""))
+                .count()
+        };
+
+        // Already recorded (header fallback) → skipped.
+        record_model_change(&session, "anthropic:claude-3-5-sonnet-20241022").await;
+        assert_eq!(count_model_changes(), 0, "duplicate must not be appended");
+
+        // Genuinely new model → appended once.
+        record_model_change(&session, "openai:gpt-4o").await;
+        assert_eq!(count_model_changes(), 1, "new model must be appended");
+        // And now it IS recorded — same value again is skipped.
+        record_model_change(&session, "openai:gpt-4o").await;
+        assert_eq!(count_model_changes(), 1, "second identical append skipped");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whole-string canonical model ids: model ids may contain colons
+    /// (openrouter `ns/model:free`), so equality checks must compare the
+    /// full `provider:model` string. The old sync split on ':' and took
+    /// `nth(1)` — for `openrouter:tencent/hy3:free` that read
+    /// `tencent/hy3`, never matching the configured id, so EVERY menu
+    /// DoneSuccess (including `/quit`) looked like a model change.
+    #[test]
+    fn colon_model_id_roundtrips_through_qualified_form() {
+        let provider = "openrouter";
+        let model = "tencent/hy3:free";
+        // The canonical id keeps the model's own colon intact…
+        let canonical = format!("{}:{}", provider, model);
+        assert_eq!(canonical, "openrouter:tencent/hy3:free");
+        // …and the model part recovered via split_once is the FULL model id
+        // (everything after the FIRST colon), unlike split(':').nth(1).
+        let (p, m) = canonical.split_once(':').unwrap();
+        assert_eq!(p, provider);
+        assert_eq!(m, model);
     }
 
     #[test]
