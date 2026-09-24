@@ -46,15 +46,64 @@ child.
 - `data()`: `[{id:"ro",desc:"read only mapping"}, {id:"rw",desc:"read-write mapping"}]`.
   Mode is read from `ids.last()`; the paths come from `args` (arg 1 = host,
   arg 2 = optional sandbox dst).
-- `complete_parameter`: arg 1 → host FS; arg 2 → sandbox-aware listing
-  (`sandbox_list_dir` → host fallback). Selected via
-  `PathArgs::committed(cursor)` (empty ⇒ arg 1); `≥2` committed ⇒ inert.
-- `submit`: missing/nonexistent host path ⇒ `SubmitResult::Error("…")`
-  (keeps the menu open — this is also the drill guard; see below). Else set
+- `submit`: 0 args ⇒ `Error("host path required")` (the drill guard, see
+  below); ≥3 args ⇒ `Error("expected: <host path> [sandbox path]")`
+  (likely a sign of other trouble); 1–2 args ⇒ validate
+  `path_util::resolve_canonical(host)` — failure (nonexistent) ⇒
+  `Error(…)` stay-open. The sandbox dst is **not** validated — bwrap
+  creates it lazily even when parent dirs are missing. Success ⇒
   `AsyncOp::Sandbox(Add{…})` → `Done(Some(msg))`.
 - Drill arrival (Enter on `ro`/`rw`) forwards `DrillEnter`; `submit()` sees
   empty args and returns `Error("host path required")`, which renders above
   `header()` and keeps the leaf open. No `drill_rewrite` prefill needed.
+
+#### `complete_parameter` contract (settled)
+
+- **Gate** (checked before any IO): the word contains `/`, or starts with
+  `~` or `.`. Ordinary bare words are inert — v1 never completed them
+  either. A dot-word that matches nothing shows no dialog (at worst a
+  harmless non-event; no typing disruption).
+- **Routing** via `PathArgs::committed(cursor)`:
+  - 0 committed ⇒ arg 1 (host path): `complete(word, false)` — always the
+    host FS; the host path must exist on the host.
+  - 1 committed ⇒ arg 2 (sandbox dst): `complete(word, true)` —
+    sandbox-aware (sandbox listing wins; configured-but-invisible ⇒ empty,
+    never host paths; no sandbox ⇒ host fallback).
+  - ≥2 ⇒ inert (empty).
+- **Candidates = the dir's children only — no directory-itself row.** The
+  prompt already holds the fully-expanded directory after a Tab expand:
+  accept it with **space** (dismisses the dialog + finalizes the arg; the
+  next word routes to arg 2) or **Enter** (submits the raw word). A self
+  row would only add a no-op first Tab. Empty dir ⇒ empty vec ⇒ the
+  engine's trailing-space convenience finalizes the arg.
+- **Ordering** — `fuzzy::rank_candidates` with **query = the stem after
+  the last `/`**, prefix/text keys = basename, fed the path-sorted
+  children:
+  - dir level (word ends in `/`, empty stem) ⇒ empty query ⇒ helper
+    returns input order (confirmed in `fuzzy.rs`) ⇒ **alphabetical**;
+  - typed stem ⇒ prefix tier first (`dir/abc` ⇒ `dir/abcde`), then fuzzy
+    (`dir/someabc`); non-matches dropped by the helper. This replaces
+    v1's strict `starts_with` pre-filter — the whole dir listing is
+    ranked.
+- **Exactness** (engine contract, handler-side): every candidate
+  byte-equal to the word ⇒ return empty ⇒ engine appends the trailing
+  space (arg finalized). Only reachable via file completion — children
+  never byte-equal the dir word. ≥1 non-exact ⇒ return the **full** set,
+  exact matches included (no highlighting).
+- **Rows**: `id = entry.path` (full display path; dirs carry `/`, so a
+  Tab-expand lands directly in the dir-listing branch), `desc =
+  entry.description()` (ISO-8601 secs + raw bytes), `labels = (("Host
+  path" | "Sandbox path" by arg), "Description")`.
+- **Caching** (`complete_parameter` runs every passive frame):
+  - **L1 dir listing** (path_complete): single slot keyed by the resolved
+    dir. Host: revalidate per call with one dir-`mtime` stat; stat
+    unavailable ⇒ TTL 5s. Sandbox: TTL 5s — a revalidation probe would
+    itself be a bwrap spawn. Within-dir typing ⇒ zero IO; crossing `/` ⇒
+    at most one `read_dir`/bwrap per 5s.
+  - **L2 rows** (node): `Rc<CompletionRows>` keyed by (arg position,
+    word) — an unchanged word (MoveCursor/None frames) returns the same
+    `Rc` ⇒ `ptr_eq` skips the view re-derive. L1 expiry forces a rebuild
+    even on an unchanged key.
 
 ### `SandboxRemoveNode`
 
@@ -164,11 +213,21 @@ pub fn list_host(dir: &str) -> Vec<Entry>;            // read_dir, no symlink fo
 pub fn list_sandbox(dir: &str) -> Option<Vec<Entry>>; // bwrap ls → parse
 ```
 
-- `complete`: v1 split preserved (ends-in-`/` or is-dir ⇒ list contents;
-  else filter parent by stem), `~` round-trip inside the module (consumer
-  never joins), sorted by path. `sandbox=false` ⇒ host; `sandbox=true` ⇒
-  v1 semantics: sandbox listing wins; sandbox configured but dir invisible
-  ⇒ **empty** (never leak host paths); no sandbox at all ⇒ host fallback.
+- `complete`: v1 split preserved (ends-in-`/` or is-dir ⇒ list that dir;
+  else list the parent — **empty parent ⇒ `.`**, fixing the v1 hole that
+  made bare dot-words inert — stem = basename), `~` round-trip inside the
+  module (consumer never joins). Candidates = the dir's children,
+  **path-sorted as the ranking input**, ordered by
+  `fuzzy::rank_candidates`(query = stem, keys = basename): empty stem ⇒
+  input order (alphabetical); typed stem ⇒ prefix tier then fuzzy,
+  non-matches dropped — **replaces** the v1 strict `starts_with`
+  pre-filter. No directory-itself row (the prompt already holds the
+  expanded dir — see `AddSandboxMappingNode`). Caching: L1 single-slot
+  dir listing (host: dir-mtime revalidate, stat-fail ⇒ TTL 5s;
+  sandbox: TTL 5s). `sandbox=false` ⇒ host; `sandbox=true` ⇒ v1
+  semantics: sandbox listing wins; sandbox configured but dir invisible
+  ⇒ **empty** (never leak host paths); no sandbox at all ⇒ host
+  fallback.
 - `list_sandbox`: `tools::sandbox_list_lines` (new `pub(crate)` raw-IO fn)
   runs `ls -lap --time-style=+%Y-%m-%dT%H:%M:%S` in bwrap — custom format
   = ISO-8601 seconds directly (no ns/offset parsing); parser strips the
