@@ -182,8 +182,9 @@ mod tests {
         let mut handle = menu.get_handle();
         // Drill into leaf first.
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
-        // Enter → submit → NewPath("") → closes.
-        let r = handle.eval_prompt("stat ", HostKey::Enter, 80);
+        // Enter → submit → NewPath("") → host re-derives from the
+        // rewritten prompt (resolved here like repl::v25_eval does).
+        let r = handle.eval_prompt_resolved("stat ", HostKey::Enter, 80);
         assert!(matches!(r, MenuResult::Continue(_, _)));
     }
 
@@ -194,7 +195,7 @@ mod tests {
         let mut menu = build_stat_menu(&shared);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
-        let result = handle.eval_prompt("stat ", HostKey::Esc, 80);
+        let result = handle.eval_prompt_resolved("stat ", HostKey::Esc, 80);
         assert!(matches!(result, MenuResult::Continue(_, _)));
     }
 }

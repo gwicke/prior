@@ -159,8 +159,22 @@ pub enum SubmitResult {
 /// Outcome of `node_traverse()` — what the host should do next.
 #[derive(Debug)]
 pub enum MenuResult {
-    /// Keep interacting. The host renders the plan and sets the prompt.
+    /// Keep interacting: here is the render plan **and** the prompt.
+    /// The plan is honest for the prompt — a `HostKey::None` re-eval of
+    /// that prompt would deliver the same frame (per-frame error text
+    /// injected aside). The host renders the plan and sets the prompt.
     Continue(RenderPlan, String),
+    /// Keep interacting, **prompt rewrite only** — no plan. The host
+    /// must set the prompt and immediately re-eval with
+    /// [`HostKey::None`](crate::node_entry::HostKey) until a `Continue`
+    /// or terminal result arrives (bounded — a cycle is an engine bug:
+    /// report it and bail out; never synthesize a plan).
+    ///
+    /// Returned for pure rewrites: drill rewrite, Esc ladder steps,
+    /// completion expansion, `SubmitResult::NewPath`, and no-op
+    /// "re-derive the current frame" continuations. The prompt may be
+    /// unchanged in the last case.
+    ContinuePrompt(String),
     /// Menu done; close the overlay. (message, self-documenting prompt).
     DoneSuccess(Option<String>, String),
     /// Error; close the overlay. (message, self-documenting prompt).

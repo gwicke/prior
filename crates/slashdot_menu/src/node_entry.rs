@@ -12,7 +12,7 @@ use crate::node_impl::{
     SlashDotNode,
 };
 use crate::fields::ColumnDef;
-use crate::render::{LogicalLine, RenderPlan};
+use crate::render::LogicalLine;
 use crate::value::Value;
 use crate::view::{RowView, ViewPlan, ViewRequest, ViewRows};
 use std::ops::Range;
@@ -112,7 +112,8 @@ impl Default for EpochState {
 // --- Internal traversal result ---
 
 // Re-use MenuResult directly (user confirmed: single type).
-// The Continue variant carries (RenderPlan, new_prompt_string).
+// `Continue` carries (RenderPlan, prompt); `ContinuePrompt` is a pure
+// prompt rewrite — the host re-evals with `HostKey::None` for the plan.
 
 // --- NodeEntry ---
 
@@ -291,7 +292,7 @@ impl NodeEntry {
         // time the suffix is " " and needs no row data.
         if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
             if let Some(new_prompt) = self.inner.drill_rewrite(&path_args) {
-                return MenuResult::Continue(RenderPlan::default(), new_prompt);
+                return MenuResult::ContinuePrompt(new_prompt);
             }
         }
 
@@ -410,10 +411,7 @@ impl NodeEntry {
                     self.epoch.confirm_pending = false;
                     match self.inner.submit(epoch, pa) {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
-                        SubmitResult::NewPath(p) => MenuResult::Continue(
-                            RenderPlan::default(),
-                            p,
-                        ),
+                        SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
                         SubmitResult::Prepared => Self::build_continue(pa),
                         SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
                     }
@@ -424,10 +422,7 @@ impl NodeEntry {
                             self.epoch.confirm_pending = true;
                             Self::build_continue(pa)
                         }
-                        SubmitResult::NewPath(p) => MenuResult::Continue(
-                            RenderPlan::default(),
-                            p,
-                        ),
+                        SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
                         SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
                     }
                 }
@@ -556,13 +551,13 @@ impl NodeEntry {
         // Step 2: clear refinement — terms, modifiers, selection dropped.
         if !pa.args.is_empty() || parsed.matched() {
             // Rewrite section to just the parent path (no terms/modifiers/selection).
-            return MenuResult::Continue(RenderPlan::default(), pa.prompt_with(""));
+            return MenuResult::ContinuePrompt(pa.prompt_with(""));
         }
 
         // Step 3: strip trailing space → parent becomes responsible.
         if pa.suffix.ends_with(' ') {
             let trimmed = pa.suffix.trim_end();
-            return MenuResult::Continue(RenderPlan::default(), pa.prompt_with(trimmed));
+            return MenuResult::ContinuePrompt(pa.prompt_with(trimmed));
         }
 
         // Step 4: nothing left at this level → close.
@@ -904,8 +899,7 @@ impl NodeEntry {
                 if !matches!(&rerun, Ok(r) if !r.rows.is_empty()) {
                     new_suffix.push(' ');
                 }
-                Ok(Some(MenuResult::Continue(
-                    RenderPlan::default(),
+                Ok(Some(MenuResult::ContinuePrompt(
                     reparsed.path_args.prompt_with(&new_suffix),
                 )))
             }
@@ -1149,7 +1143,7 @@ impl NodeEntry {
     }
 
     fn build_continue(path_args: &PathArgs) -> MenuResult {
-        MenuResult::Continue(RenderPlan::default(), path_args.full_prompt())
+        MenuResult::ContinuePrompt(path_args.full_prompt())
     }
 
 
@@ -1343,6 +1337,31 @@ mod tests {
         RenderContext { term_width: 80 }
     }
 
+    /// Traverse like a host: resolve `ContinuePrompt` rewrite chains
+    /// (apply prompt, re-key `HostKey::None`) until a frame or terminal
+    /// result arrives. Tests that care about host-observable behavior
+    /// use this; tests asserting a specific rewrite use `node_traverse`
+    /// raw.
+    fn traverse_resolved(
+        root: &mut NodeEntry,
+        key: HostKey,
+        suffix: &str,
+    ) -> MenuResult {
+        const MAX_REWRITES: usize = 16;
+        let mut suffix = suffix.to_string();
+        let mut key = key;
+        for _ in 0..MAX_REWRITES {
+            match root.node_traverse(ep(), key, Vec::new(), &suffix, &rctx()) {
+                MenuResult::ContinuePrompt(new) => {
+                    suffix = new;
+                    key = HostKey::None;
+                }
+                other => return other,
+            }
+        }
+        panic!("prompt-rewrite cycle at `{}`", suffix);
+    }
+
     #[test]
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
@@ -1399,8 +1418,8 @@ mod tests {
         let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
         match result {
-            MenuResult::Continue(_, prompt) => assert_eq!(prompt, "alpha "),
-            other => panic!("expected Continue, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, "alpha "),
+            other => panic!("expected ContinuePrompt drill, got {:?}", other),
         }
     }
 
@@ -1672,8 +1691,9 @@ mod tests {
             }
             other => panic!("expected Continue, got {:?}", other),
         }
-        // Esc on filtered view clears to empty (root close or clear).
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "first", &rctx());
+        // Esc on filtered view clears the refinement (host re-derives
+        // the cleared prompt), or closes outright at root.
+        let result = traverse_resolved(&mut root, HostKey::Esc, "first");
         match result {
             MenuResult::Continue(_, _) | MenuResult::DoneSuccess(..) => {}
             other => panic!("expected Continue or DoneSuccess on Esc, got {:?}", other),
@@ -1812,8 +1832,9 @@ mod tests {
         // Tab into the leaf.
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", &rctx());
         match result {
-            MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add action ")),
-            other => panic!("expected Continue, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) =>
+                assert!(prompt.starts_with("add action ")),
+            other => panic!("expected ContinuePrompt drill, got {:?}", other),
         }
         // Enter on "add action " → submit.
         let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", &rctx());
@@ -1925,11 +1946,9 @@ mod tests {
         // with DrillEnter → leaf's drill_rewrite fires.
         let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx());
         match result {
-            MenuResult::Continue(plan, prompt) => {
-                assert!(plan.rows.is_empty(), "rewrite returns empty plan");
-                assert_eq!(prompt, "abc rename MySession");
-            }
-            other => panic!("expected Continue with rewrite, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) =>
+                assert_eq!(prompt, "abc rename MySession"),
+            other => panic!("expected ContinuePrompt rewrite, got {:?}", other),
         }
     }
 
@@ -1939,11 +1958,9 @@ mod tests {
         root.refresh_data(ep(), &[], "");
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
         match result {
-            MenuResult::Continue(plan, prompt) => {
-                assert!(plan.rows.is_empty());
-                assert_eq!(prompt, "abc rename TabFill");
-            }
-            other => panic!("expected Continue with rewrite, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) =>
+                assert_eq!(prompt, "abc rename TabFill"),
+            other => panic!("expected ContinuePrompt rewrite, got {:?}", other),
         }
     }
 
@@ -2241,8 +2258,8 @@ mod tests {
         // re-run lands in value mode (non-empty) and keeps going.
         let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx());
         match result {
-            MenuResult::Continue(_, prompt) => assert_eq!(prompt, ".sort:"),
-            other => panic!("expected Continue, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".sort:"),
+            other => panic!("expected ContinuePrompt expansion, got {:?}", other),
         }
     }
 
@@ -2260,8 +2277,8 @@ mod tests {
             &rctx(),
         );
         match result {
-            MenuResult::Continue(_, prompt) => assert_eq!(prompt, ".tier:free "),
-            other => panic!("expected Continue, got {:?}", other),
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".tier:free "),
+            other => panic!("expected ContinuePrompt expansion, got {:?}", other),
         }
     }
 

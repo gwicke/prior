@@ -1151,6 +1151,67 @@ mod tests {
         }
     }
 
+    // --- §5.1 restore ladder ---
+
+    fn expect_continue(result: MenuResult) -> (crate::slashdot_menu::render::RenderPlan, String) {
+        match result {
+            MenuResult::Continue(plan, prompt) => (plan, prompt),
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    /// Esc drill-out must restore the stored `view_args` (the filter)
+    /// *and* pin the cursor on the drilled row — the reported bug had
+    /// the restore firing behind the scenes while the prompt kept the
+    /// bare `<id>`, so the next cursor move dropped back to the full
+    /// listing. Exercises the full sequence: `/tree .tags:leaf` →
+    /// MoveCursor → Tab (drill) → Esc (restore).
+    #[test]
+    fn esc_drill_out_restores_filter_and_cursor() {
+        let tree = vec![node(
+            make_entry("u1", None, "user", "parent"),
+            vec![
+                node(make_entry("u2", Some("u1"), "user", "child a"), vec![]),
+                node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
+            ],
+        )];
+        let shared = shared_with_tree(tree);
+        let mut menu = build_tree_menu(&shared);
+        let mut handle = menu.get_handle();
+
+        // 1. Filtered leaf overview: u1 is a branch parent (no `tags`
+        //    field → dropped); only u2/u3 survive.
+        let (plan, prompt) =
+            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80));
+        assert_eq!(plan.rows.len(), 2, "filter must show only leaves: {:?}", plan.rows);
+        assert_eq!(prompt, "tree .tags:leaf");
+
+        // 2. Cursor to the second leaf, Tab drills into it.
+        let _ = handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80);
+        let (_, prompt) =
+            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80));
+        assert_eq!(prompt, "tree u3 ", "drill appends cursored id + space");
+
+        // 3. Esc drills out: §5.1 step 1 restores the stored filter in
+        //    the prompt (not a bare id) with the cursor back on u3.
+        let (plan, prompt) =
+            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80));
+        assert_eq!(prompt, "tree .tags:leaf",
+            "Esc must restore the filter view_args into the prompt");
+        assert_eq!(plan.rows.len(), 2,
+            "restored view is the filtered listing: {:?}", plan.rows);
+        let selected = plan.selected.unwrap_or(0);
+        assert!(plan.rows[selected].0.contains("child b"),
+            "cursor must be pinned on the drilled row (u3): {:?}", plan.rows[selected]);
+
+        // 4. A cursor move after the restore stays in the filtered
+        //    view (the bug: it fell back to the full listing).
+        let (plan, _) =
+            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80));
+        assert_eq!(plan.rows.len(), 2,
+            "filtered view must survive cursor moves: {:?}", plan.rows);
+    }
+
     // --- Caching ---
 
     #[test]

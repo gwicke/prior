@@ -554,6 +554,16 @@ impl ActiveOverlay {
     }
 }
 
+/// Result of [`Repl::v25_eval`]: a `MenuResult` with the prompt-rewrite
+/// case (`ContinuePrompt`) already resolved. The helper re-evals rewrite
+/// chains to completion, so callers only ever see a frame to render
+/// (`Continue`) or a terminal outcome — this type encodes that.
+enum V25Frame {
+    Continue(crate::slashdot_menu::render::RenderPlan, String),
+    DoneSuccess(Option<String>, String),
+    DoneError(String, String),
+}
+
 impl Repl {
     pub fn new() -> Self {
         Self {
@@ -823,9 +833,7 @@ impl Repl {
                     crate::slashdot_menu::HostKey::None,
                 );
                 match result {
-                    crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                        ActiveOverlay::V25Menu { plan }
-                    }
+                    V25Frame::Continue(plan, _) => ActiveOverlay::V25Menu { plan },
                     _ => ActiveOverlay::None,
                 }
             } else if !path_completions.is_empty() {
@@ -1078,7 +1086,7 @@ impl Repl {
                                             editor.cursor,
                                             crate::slashdot_menu::HostKey::Tab,
                                         );
-                                        if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, prompt) = result {
+                                        if let V25Frame::Continue(plan, prompt) = result {
                                             // Same direct-render rule as the Enter arm.
                                             let new_buf = format!("/{}", prompt);
                                             let unchanged =
@@ -1106,7 +1114,7 @@ impl Repl {
                                                 crate::slashdot_menu::HostKey::Enter,
                                             );
                                             match result {
-                                                crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, prompt) => {
+                                                V25Frame::DoneSuccess(msg, prompt) => {
                                                     // The node's submit() wrote to shared state
                                                     // (LiveState for `/thinking`/`/model`/…, or
                                                     // `pending_op` for `/session`/`/replay`).
@@ -1128,14 +1136,14 @@ impl Repl {
                                                     *menu_submitted = true;
                                                     return Some(InputAction::MenuDone);
                                                 }
-                                                crate::slashdot_menu::node_impl::MenuResult::Continue(plan, prompt) => {
-                                                    // Rewrite (drill / NewPath): update the
-                                                    // buffer; next frame re-evals. Prompt
-                                                    // unchanged (modulo trailing whitespace —
-                                                    // the drill's structural space) + a plan
-                                                    // with content: render it directly for
-                                                    // one frame — not re-derivable (the
-                                                    // SubmitResult::Error line).
+                                                V25Frame::Continue(plan, prompt) => {
+                                                    // Prompt rewritten (drill / NewPath) or
+                                                    // unchanged. Unchanged (modulo trailing
+                                                    // whitespace — the drill's structural
+                                                    // space) + a plan with content: render it
+                                                    // directly for one frame — not
+                                                    // re-derivable (the SubmitResult::Error
+                                                    // line).
                                                     let new_buf = format!("/{}", prompt);
                                                     let unchanged =
                                                         new_buf.trim_end() == editor.text().trim_end();
@@ -1146,7 +1154,7 @@ impl Repl {
                                                         v25_enter_plan = Some(plan);
                                                     }
                                                 }
-                                                crate::slashdot_menu::node_impl::MenuResult::DoneError(err, prompt) => {
+                                                V25Frame::DoneError(err, prompt) => {
                                                     let committed = format!("/{}", prompt);
                                                     Repl::emit_commit(
                                                         output, &mut editor, &redraw, sel,
@@ -1177,11 +1185,11 @@ impl Repl {
                                             crate::slashdot_menu::HostKey::Esc,
                                         );
                                         match result {
-                                            crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
+                                            V25Frame::Continue(_plan, prompt) => {
                                                 // Esc popped a level — update buffer.
                                                 editor.set(&format!("/{}", prompt));
                                             }
-                                            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(_, _) => {
+                                            V25Frame::DoneSuccess(_, _) => {
                                                 // Esc at root — close overlay.
                                                 editor.set("");
                                                 v25_handle = None;
@@ -1535,27 +1543,73 @@ impl Repl {
     /// engine's EOL guard), which avoids completing a different word
     /// than the user is editing.
     /// True when a `RenderPlan` carries something to paint (column
-    /// header, detail lines, or rows) — i.e. it is not the empty
-    /// `RenderPlan::default()` that `Prepared`/`NewPath`/no-drill
-    /// outcomes return (those must keep re-deriving from the buffer).
+    /// header, detail lines, or rows) — i.e. it is not an empty plan.
+    /// Gates the one-frame direct render: an empty plan is never worth
+    /// painting directly (the next frame re-derives anyway).
     fn plan_has_content(plan: &crate::slashdot_menu::render::RenderPlan) -> bool {
         plan.table_header.is_some() || !plan.detail.is_empty() || !plan.rows.is_empty()
     }
 
+    /// Evaluate one menu key event, resolving `ContinuePrompt` rewrites.
+    ///
+    /// The engine answers a pure prompt rewrite (Esc ladder step, drill
+    /// rewrite, completion expansion, `SubmitResult::NewPath`) with
+    /// `ContinuePrompt(p)`: the prompt is authoritative and the frame
+    /// must be re-derived from it. This helper applies the rewrite
+    /// locally and re-evals with `HostKey::None` until a plan-carrying
+    /// (`Continue`) or terminal (`Done*`) result arrives — so callers
+    /// only ever see frames, never half-rewrites.
+    ///
+    /// The loop is bounded: an engine rewrite cycle is a bug, so we
+    /// report the chain on stderr (debugging detail) and bail out with
+    /// `DoneError` carrying the same message — never spin, never
+    /// synthesize a plan.
     fn v25_eval(
         handle: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         buf: &str,
         cursor_char: usize,
         key: crate::slashdot_menu::HostKey,
-    ) -> crate::slashdot_menu::node_impl::MenuResult {
-        let line = buf.trim_start_matches('/');
-        let byte_in_buf = buf
-            .char_indices()
-            .nth(cursor_char)
-            .map(|(b, _)| b)
-            .unwrap_or(buf.len());
-        let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
-        handle.eval_prompt_with_cursor(line, key, crate::output::term_width(), cursor)
+    ) -> V25Frame {
+        use crate::slashdot_menu::node_impl::MenuResult;
+        // Max rewrites before we call it a cycle. Normal chains are
+        // 1–2 steps (rewrite → passive re-derive).
+        const MAX_REWRITES: usize = 16;
+        let mut buf = buf.to_string();
+        let mut cursor_char = cursor_char;
+        let mut key = key;
+        let mut chain: Vec<String> = Vec::new();
+        for _ in 0..MAX_REWRITES {
+            let line = buf.trim_start_matches('/').to_string();
+            let byte_in_buf = buf
+                .char_indices()
+                .nth(cursor_char)
+                .map(|(b, _)| b)
+                .unwrap_or(buf.len());
+            let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
+            match handle.eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+            {
+                MenuResult::ContinuePrompt(new_prompt) => {
+                    chain.push(format!("/{}", new_prompt));
+                    // Structural rewrite: the text cursor jumps to the
+                    // end (same as `LineEditor::set` at the call sites).
+                    // `cursor_char` indexes *buf* chars, which include
+                    // the leading '/', hence `buf.chars().count()`.
+                    buf = format!("/{}", new_prompt);
+                    cursor_char = buf.chars().count();
+                    key = crate::slashdot_menu::HostKey::None;
+                }
+                MenuResult::Continue(plan, prompt) => return V25Frame::Continue(plan, prompt),
+                MenuResult::DoneSuccess(msg, prompt) => return V25Frame::DoneSuccess(msg, prompt),
+                MenuResult::DoneError(err, prompt) => return V25Frame::DoneError(err, prompt),
+            }
+        }
+        let msg = format!(
+            "menu engine bug: prompt-rewrite cycle after {} steps: {}",
+            MAX_REWRITES,
+            chain.join(" -> ")
+        );
+        eprintln!("picocode: {}", msg);
+        V25Frame::DoneError(msg, buf.trim_start_matches('/').to_string())
     }
 
     fn cursor_sel_policy(disc_changed: bool, sel: usize) -> usize {
