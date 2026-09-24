@@ -234,7 +234,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if j >= lines.len() {
             return Err(ParseError(format!(
-                "a SEARCH block is missing its `{DIVIDER}` divider"
+                "a {SEARCH_MARKER} block is missing its `{DIVIDER}` divider"
             )));
         }
 
@@ -247,14 +247,14 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if k >= lines.len() {
             return Err(ParseError(format!(
-                "a SEARCH block is missing its `{REPLACE_MARKER}` closing marker"
+                "a {SEARCH_MARKER} block is missing its `{REPLACE_MARKER}` closing marker"
             )));
         }
 
         let old_text = search_lines.join("\n");
         if old_text.is_empty() {
             return Err(ParseError(
-                "a SEARCH block has empty search text".to_string(),
+                "a {SEARCH_MARKER} block has empty search text".to_string(),
             ));
         }
         let new_text = replace_lines.join("\n");
