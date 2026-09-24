@@ -13,7 +13,7 @@ use std::rc::Rc;
 use crate::fields::{row_field_value, Row};
 use crate::node_entry::RowRef;
 use crate::node_impl::{DataResponse, RenderContext};
-use crate::provider::ColumnDef;
+use crate::fields::ColumnDef;
 use crate::render::{LogicalLine, RenderPlan};
 
 /// The view's single input: source rows + display order + markers,

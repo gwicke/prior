@@ -23,7 +23,7 @@ use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext,
     SlashDotNode, StaticListingNode, StaticRow, SubmitResult,
 };
-use crate::slashdot_menu::provider::ColumnDef;
+use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::value::Value;
 use crate::sandbox_state::CombinedBind;
 

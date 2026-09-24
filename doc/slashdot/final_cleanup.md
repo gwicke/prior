@@ -1,6 +1,6 @@
 # Final cleanup — remove v1.0 / v2.0 menu remnants (impl step 10)
 
-Status: **IN PROGRESS** — P1, P3 done; P2 → P4 → P5 remaining
+Status: **IN PROGRESS** — P1, P3, P2 done; P4 → P5 remaining
 
 ## Goal & principles
 
@@ -153,10 +153,22 @@ Status: **IN PROGRESS** — P1, P3 done; P2 → P4 → P5 remaining
    since `/set` went v2.5). Gates met: `cargo test` green (587+169+…);
    P1 sentinels empty (bridge `OverlayAction`/`on_edit` remain for
    P2/P3 as planned); warnings = pre-existing v25_tree fields only.
-2. **P2 — crate surgery**: `ColumnDef` → `fields.rs`; delete
-   `interpreter`/`accept`/`node`/`provider`; `PlanBuilder`; `lib.rs`.
-   Gate: lib tests green (expect a large drop: interpreter 25 +
-   accept 8 + render ≤6).
+2. ~~**P2 — crate surgery**~~ — **DONE** (after P3; see the order note
+   there). `ColumnDef` + builder moved to `fields.rs` (the only
+   provider survivor); all `provider::ColumnDef` refs repointed (core:
+   `view`/`node_entry`/`node_impl`/`lib` re-export; host: `v25_set/
+   session/model/tree/sandbox`). Deleted `interpreter.rs` (25 tests),
+   `accept.rs` (8), `node.rs`, `provider.rs` (`str_field`/`num_field`
+   had no callers) and `PlanBuilder` + its 3 interpreter-coupled
+   render tests; the 2 remaining paint tests were rewritten to build
+   `RenderPlan` directly, so `paint()` keeps coverage. `lib.rs`: mod
+   decls dropped, `ColumnDef` re-export repointed to `fields`, crate
+   header rewritten to the v2.5 design doc. Legacy-comment sentinels
+   in `node_entry` reworded. Gate met: workspace green — crate tests
+   169 → 133 (= exactly the 36 deleted); workspace totals 570 lib +
+   all suites, 0 failed. Warnings: pre-existing only (`v25_tree`
+   `FlatRow` + 2 `node_entry` test helpers, all visible before this
+   phase).
 3. ~~**P3 — bridge slimming**~~ — **DONE** (executed **before** P2:
    the bridge turned out to be the sole consumer of the four files P2
    deletes, so the phases had to swap to keep every boundary compiling —

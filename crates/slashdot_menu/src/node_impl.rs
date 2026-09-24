@@ -251,7 +251,7 @@ pub trait SlashDotNode {
     /// non-empty, the engine renders rows as a table with these column
     /// definitions (header labels, alignment, sizing). When empty,
     /// rows render as plain `id — description` text. Default: empty.
-    fn columns(&self) -> Vec<crate::provider::ColumnDef> {
+    fn columns(&self) -> Vec<crate::fields::ColumnDef> {
         Vec::new()
     }
 
@@ -352,7 +352,7 @@ pub struct StaticListingNode {
     header_lines: Vec<String>,
     active_ids: std::rc::Rc<std::cell::RefCell<std::collections::HashSet<String>>>,
     field_specs: Vec<crate::fields::FieldSpec>,
-    column_defs: Vec<crate::provider::ColumnDef>,
+    column_defs: Vec<crate::fields::ColumnDef>,
 }
 
 impl StaticListingNode {
@@ -383,7 +383,7 @@ impl StaticListingNode {
     /// table header row shows these column labels and the table renders
     /// only these columns. Use `"id"` for the row id, `"description"`
     /// for the row description, or any custom field name.
-    pub fn with_columns(mut self, cols: Vec<crate::provider::ColumnDef>) -> Self {
+    pub fn with_columns(mut self, cols: Vec<crate::fields::ColumnDef>) -> Self {
         self.column_defs = cols;
         self
     }
@@ -415,7 +415,7 @@ impl SlashDotNode for StaticListingNode {
         self.field_specs.clone()
     }
 
-    fn columns(&self) -> Vec<crate::provider::ColumnDef> {
+    fn columns(&self) -> Vec<crate::fields::ColumnDef> {
         self.column_defs.clone()
     }
 }

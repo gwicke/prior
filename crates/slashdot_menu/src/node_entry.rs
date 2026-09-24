@@ -11,7 +11,7 @@ use crate::node_impl::{
     CompletionRows, DataError, MenuResult, PathArgs, RenderContext, SubmitResult,
     SlashDotNode,
 };
-use crate::provider::ColumnDef;
+use crate::fields::ColumnDef;
 use crate::render::{LogicalLine, RenderPlan};
 use crate::value::Value;
 use crate::view::{RowView, ViewPlan, ViewRequest, ViewRows};
@@ -941,7 +941,7 @@ impl NodeEntry {
         view
     }
 
-    /// Listing completion — port of v2.0 `Interpreter::field_options`
+    /// Listing completion — field names and dataset value options
     /// over flat args + merged rows (doc: NodeEntry default
     /// completion). An empty `Ok` is the "nothing to complete" signal
     /// (gate miss, no matches, or every match exact).
@@ -966,7 +966,7 @@ impl NodeEntry {
             return empty();
         }
         let field_space = self.field_space();
-        // Description format (v2.0 field_options): type, or
+        // Description format: type, or
         // "<desc>; <order>, <type>"; `sort` keeps its standing text.
         let field_desc = |name: &str| -> String {
             if name == "sort" {

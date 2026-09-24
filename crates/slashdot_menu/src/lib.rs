@@ -1,26 +1,23 @@
 //! # slashdot_menu
 //!
-//! A data-driven slash-menu engine: menu descriptors, a uniform per-level
-//! path grammar, field filtering/sorting, cursor-in-the-path semantics, and
-//! a generic overlay interpreter.
+//! The v2.5 slash-menu engine: a persistent node tree whose nodes return
+//! rows (static or dynamic) per level, a uniform path grammar, field
+//! filtering/sorting, cursor-in-the-path semantics, and plain-data
+//! [`render::RenderPlan`] output the host paints.
 //!
-//! The crate is independent of any host application: host data (catalogs,
-//! sessions, filesystem) is supplied through handler traits, the prompt
-//! buffer through a narrow [`prompt::PromptBuffer`] interface, and rendering
-//! is emitted as a plain-data [`render::RenderPlan`] the host paints.
+//! The crate is independent of any host application: host state is wired
+//! through [`node_impl::SlashDotNode`] implementations, the prompt buffer
+//! through a narrow [`prompt::PromptBuffer`] interface.
 //!
-//! See `doc/slash_menu_v2_design.md` in the picocode repository for the
+//! See `doc/slash_menu_v2.5_design.md` in the picocode repository for the
 //! design this implements.
 
 // --- Public API (what the host sees) ---
 pub mod menu;
 
-// --- Internal modules (exposed to host for v2.0 bridge) ---
+// --- Engine modules ---
 pub mod node_impl;
 pub mod node_entry;
-pub mod node;
-pub mod provider;
-pub mod interpreter;
 pub mod cursor;
 pub mod fields;
 pub mod filter;
@@ -32,12 +29,11 @@ pub mod table;
 pub mod value;
 pub mod wrap;
 mod view;
-pub mod accept;
 
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle, SlashDotMenuNode};
 pub use node_entry::HostKey;
 pub use node_impl::{SlashDotNode, MenuResult, PathArgs, RenderContext, CompletionRows, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
-pub use provider::ColumnDef;
+pub use fields::ColumnDef;
 pub use render::LogicalLine;
 pub use table::{Align, Table};

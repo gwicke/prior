@@ -15,7 +15,7 @@ use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
-use crate::slashdot_menu::provider::ColumnDef;
+use crate::slashdot_menu::fields::ColumnDef;
 
 // ---------------------------------------------------------------------------
 // Shared helpers

@@ -520,6 +520,16 @@ Design + plan: `slashdot/sandbox_design.md`.
 
 Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
 
+- **P2 — crate surgery — DONE**: `ColumnDef` (+builder) moved to
+  `fields.rs` and all refs repointed; `interpreter.rs`, `accept.rs`,
+  `node.rs`, `provider.rs` deleted; `PlanBuilder` + its 3
+  interpreter-coupled render tests removed (2 paint tests rewritten to
+  construct `RenderPlan` directly, keeping `paint()` coverage); mod
+  decls/`lib.rs` re-export repointed, crate header rewritten to the
+  v2.5 design; legacy-comment sentinels in `node_entry` reworded.
+  Gate: workspace green — crate tests 169 → 133 (= exactly the 36
+  deleted: interpreter 25 + accept 8 + render 3); full run 0 failed.
+
 - **P3 — bridge slimming — DONE** (run before P2; the bridge was the
   sole consumer of the crate files P2 deletes, so the phase order was
   corrected — see `final_cleanup.md` P3): `slash_menu_bridge.rs`
@@ -532,7 +542,6 @@ Plan: `doc/slashdot/final_cleanup.md` (5 phases, P1–P5).
   test was ported to `v25_model` first (relocate-then-delete). Bridge
   1452 → 191 lines, keep-list verified byte-identical. Workspace green:
   570 lib + 169 integration, 0 failed.
-
 - **P1 — repl.rs pruning — DONE**: `ActiveOverlay` reduced to
   `{None, V25Menu, PathComplete}` (10 legacy variants + all their
   display/key/derivation arms gone), `from_buffer`/`from_buffer_cursors`

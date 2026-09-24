@@ -13,7 +13,7 @@ use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
     StaticListingNode, StaticRow,
 };
-use crate::slashdot_menu::provider::ColumnDef;
+use crate::slashdot_menu::fields::ColumnDef;
 
 // ---------------------------------------------------------------------------
 // ModelNode — dynamic catalog rows with Rc-cached DataResponse.

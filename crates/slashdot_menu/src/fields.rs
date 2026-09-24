@@ -4,6 +4,7 @@
 //! small metadata (type, filterable/sortable opt-outs, default sort
 //! direction) used by the filter/sort engine and completion.
 
+use crate::table::Align;
 use crate::value::Value;
 
 /// A dynamic row: id + description + typed fields (design §8).
@@ -214,6 +215,64 @@ pub fn distinct_values(rows: &[Row], name: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Presentation metadata for one displayed column of a dynamic level
+/// (design §8.1 / §6): which row field each column shows, its header label,
+/// alignment, and table-builder sizing hints. Declared by the node so the
+/// generic renderer needs no per-command column layout in host code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    /// Row field name to render (e.g. "id", "description", or any custom
+    /// field). The implicit fields "id" and "description" are always
+    /// available on every row.
+    pub field: String,
+    /// Header label shown above the column.
+    pub header: String,
+    pub align: Align,
+    /// Minimum visible width (table shrink floor).
+    pub min_width: usize,
+    /// Shrink priority (higher = kept wider under pressure).
+    pub priority: usize,
+    /// When `true` (default), long cell content wraps across multiple
+    /// visual lines. When `false`, the table uses single-line rows with
+    /// ellipsis truncation instead.
+    pub wrap: bool,
+}
+
+impl ColumnDef {
+    /// A default left-aligned column over a row field.
+    pub fn new(field: impl Into<String>, header: impl Into<String>) -> Self {
+        ColumnDef {
+            field: field.into(),
+            header: header.into(),
+            align: Align::Left,
+            min_width: 3,
+            priority: 1,
+            wrap: true,
+        }
+    }
+
+    pub fn align(mut self, a: Align) -> Self {
+        self.align = a;
+        self
+    }
+
+    pub fn min(mut self, w: usize) -> Self {
+        self.min_width = w;
+        self
+    }
+
+    pub fn prio(mut self, p: usize) -> Self {
+        self.priority = p;
+        self
+    }
+
+    /// Set whether this column's content wraps (default: true).
+    pub fn wrap(mut self, w: bool) -> Self {
+        self.wrap = w;
+        self
+    }
 }
 
 #[cfg(test)]

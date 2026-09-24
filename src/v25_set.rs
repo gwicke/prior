@@ -136,7 +136,7 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
 pub fn build_set_node(
     settings: &Rc<RefCell<SettingsStore>>,
 ) -> SlashDotMenuNode {
-    use crate::slashdot_menu::provider::ColumnDef;
+    use crate::slashdot_menu::fields::ColumnDef;
 
     let mut set_node: SlashDotMenuNode = StaticListingNode::new(&[
         StaticRow::new("set", "view and edit settings"),
