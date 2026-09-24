@@ -2120,6 +2120,13 @@ impl Repl {
             crate::v25_menu::build_menu(&shared.live_state, &shared.settings, &shared_rc)
         };
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
+        // Direct render: a plan returned by an Enter/Tab whose prompt did
+        // not change (modulo trailing whitespace) — painted for exactly
+        // the next frame instead of discarded, because such a frame (e.g.
+        // `SubmitResult::Error`) is not re-derivable from the buffer.
+        // Consumed by the `take()` at the top of the next iteration; no
+        // clearing logic — the next key re-derives as always.
+        let mut v25_enter_plan: Option<crate::slashdot_menu::render::RenderPlan> = None;
         // D4 interstitial phase for /stat: first Enter shows the panel,
         // second Enter dismisses the menu entirely.
         let mut stat_phase = false;
@@ -2266,7 +2273,12 @@ impl Repl {
             }
             // --- Compute the overlay from the current buffer. ---
             let buf_text = editor.text();
-            let overlay = if buf_text.starts_with('/') {
+            // Direct render: paint the previous dispatch's returned plan
+            // once (prompt unchanged); otherwise derive from the buffer.
+            let direct_plan = v25_enter_plan.take();
+            let overlay = if let Some(plan) = direct_plan {
+                ActiveOverlay::V25Menu { plan }
+            } else if buf_text.starts_with('/') {
                 // All `/` commands route through the v2.5 engine.
                 // Manage handle lifecycle: create on first `/`, drop when not `/`.
                 if v25_handle.is_none() {
@@ -2689,8 +2701,15 @@ impl Repl {
                                             editor.cursor,
                                             crate::slashdot_menu::HostKey::Tab,
                                         );
-                                        if let crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) = result {
-                                            editor.set(&format!("/{}", prompt));
+                                        if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, prompt) = result {
+                                            // Same direct-render rule as the Enter arm.
+                                            let new_buf = format!("/{}", prompt);
+                                            let unchanged =
+                                                new_buf.trim_end() == editor.text().trim_end();
+                                            editor.set(&new_buf);
+                                            if unchanged && Self::plan_has_content(&plan) {
+                                                v25_enter_plan = Some(plan);
+                                            }
                                         }
                                     }
                                 } else {
@@ -2745,10 +2764,23 @@ impl Repl {
                                                     *menu_submitted = true;
                                                     return Some(InputAction::MenuDone);
                                                 }
-                                                crate::slashdot_menu::node_impl::MenuResult::Continue(_plan, prompt) => {
-                                                    // Drill happened — update buffer, next
-                                                    // frame re-evals.
-                                                    editor.set(&format!("/{}", prompt));
+                                                crate::slashdot_menu::node_impl::MenuResult::Continue(plan, prompt) => {
+                                                    // Rewrite (drill / NewPath): update the
+                                                    // buffer; next frame re-evals. Prompt
+                                                    // unchanged (modulo trailing whitespace —
+                                                    // the drill's structural space) + a plan
+                                                    // with content: render it directly for
+                                                    // one frame — not re-derivable (the
+                                                    // SubmitResult::Error line).
+                                                    let new_buf = format!("/{}", prompt);
+                                                    let unchanged =
+                                                        new_buf.trim_end() == editor.text().trim_end();
+                                                    editor.set(&new_buf);
+                                                    if unchanged
+                                                        && Self::plan_has_content(&plan)
+                                                    {
+                                                        v25_enter_plan = Some(plan);
+                                                    }
                                                 }
                                                 crate::slashdot_menu::node_impl::MenuResult::DoneError(err, prompt) => {
                                                     let committed = format!("/{}", prompt);
@@ -3158,6 +3190,14 @@ impl Repl {
     /// end-of-line only — a mid-line cursor simply suppresses it (the
     /// engine's EOL guard), which avoids completing a different word
     /// than the user is editing.
+    /// True when a `RenderPlan` carries something to paint (column
+    /// header, detail lines, or rows) — i.e. it is not the empty
+    /// `RenderPlan::default()` that `Prepared`/`NewPath`/no-drill
+    /// outcomes return (those must keep re-deriving from the buffer).
+    fn plan_has_content(plan: &crate::slashdot_menu::render::RenderPlan) -> bool {
+        plan.table_header.is_some() || !plan.detail.is_empty() || !plan.rows.is_empty()
+    }
+
     fn v25_eval(
         handle: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         buf: &str,

@@ -138,10 +138,6 @@ pub(crate) struct NodeEntry {
     /// Completion dialog view — the second RowView instance (exclusive
     /// view: candidates fully replace rows while the dialog is up).
     completion_view: RowView,
-    /// Per-frame completion `Err` scratch: set while handling a key,
-    /// read by `view_plan` for the `[ERROR]` detail line, never
-    /// survives the key.
-    frame_error: Option<String>,
     /// Completer-response → ViewRows wrap memo (ptr_eq passthrough for
     /// handler-cached responses).
     completion_wrap: Option<(Rc<CompletionRows>, Rc<ViewRows>)>,
@@ -167,7 +163,6 @@ impl NodeEntry {
             value_forwarding: false,
             view: RowView::new(),
             completion_view: RowView::new(),
-            frame_error: None,
             completion_wrap: None,
         }
     }
@@ -286,9 +281,6 @@ impl NodeEntry {
             self.completion_view.reset();
         }
 
-        // Per-frame completion-error scratch (never survives the key).
-        self.frame_error = None;
-
         // Materialize this level's PathArgs by value: `ids` moved in,
         // `suffix` copied once. Everything downstream borrows this local.
         let path_args = PathArgs::new(path, prompt_suffix);
@@ -330,8 +322,14 @@ impl NodeEntry {
                     &self.content.row_index,
                 );
                 let rows = self.ensure_rows(&restore_args.path_args);
-                let out =
-                    self.view_plan(&restore_args, Some(&matched_word), rows, None, render_ctx);
+                let out = self.view_plan(
+                    &restore_args,
+                    Some(&matched_word),
+                    rows,
+                    None,
+                    None,
+                    render_ctx,
+                );
                 return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
             }
         }
@@ -389,14 +387,20 @@ impl NodeEntry {
         // Completion: passive frames + cursor moves + Tab. Enter/Esc/
         // Drill* bypass entirely (submit raw word / ladder / drill
         // semantics); the confirm dialog has highest precedence.
+        // A completer `Err` falls through carrying its message — passed
+        // straight to `view_plan` below (rendered this frame, stored
+        // nowhere).
+        let mut frame_err: Option<String> = None;
         if !self.epoch.confirm_pending
             && matches!(
                 key,
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            if let Some(m) = self.completion_pass(parsed, cursor_pos, key, render_ctx) {
-                return m;
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+                Ok(Some(m)) => return m,
+                Ok(None) => {}
+                Err(msg) => frame_err = Some(msg),
             }
         }
         match key {
@@ -411,6 +415,7 @@ impl NodeEntry {
                             p,
                         ),
                         SubmitResult::Prepared => Self::build_continue(pa),
+                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
                     }
                 } else {
                     match self.inner.prepare(epoch, pa) {
@@ -423,6 +428,7 @@ impl NodeEntry {
                             RenderPlan::default(),
                             p,
                         ),
+                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
                     }
                 }
             }
@@ -438,11 +444,27 @@ impl NodeEntry {
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                let out =
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             _ => Self::build_continue(pa),
         }
+    }
+
+    /// Stay-open render for `SubmitResult::Error`: this level's rows
+    /// with `[ERROR]: …` above `header()`. Direct render — the returned
+    /// plan *is* the frame; nothing is stored, so the next eval
+    /// re-derives without the error.
+    fn error_continue(
+        &mut self,
+        parsed: &ParsedSection,
+        error: &str,
+        render_ctx: &RenderContext,
+    ) -> MenuResult {
+        let rows = self.ensure_rows(&parsed.path_args);
+        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx);
+        MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
     }
 
     // --- Listing handling ---
@@ -462,27 +484,34 @@ impl NodeEntry {
 
         // Completion first: while the dialog is up it owns the passive
         // render, cursor moves, and Tab (exclusive view); Enter/Esc/
-        // Drill* bypass to the surrounding context.
+        // Drill* bypass to the surrounding context. A completer `Err`
+        // falls through carrying its message (rendered below, stored
+        // nowhere).
+        let mut frame_err: Option<String> = None;
         if !self.epoch.confirm_pending
             && matches!(
                 key,
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            if let Some(m) = self.completion_pass(parsed, cursor_pos, key, render_ctx) {
-                return m;
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+                Ok(Some(m)) => return m,
+                Ok(None) => {}
+                Err(msg) => frame_err = Some(msg),
             }
         }
 
         match key {
             HostKey::MoveCursor(delta) => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out = self.view_plan(parsed, None, rows, Some(delta), render_ctx);
+                let out =
+                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx);
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             HostKey::Tab | HostKey::Enter => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                let out =
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
                 let Some(row) = out.cursor_row else {
                     return Self::build_continue(pa);
                 };
@@ -513,7 +542,8 @@ impl NodeEntry {
             HostKey::Esc => Self::handle_esc(parsed),
             _ => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out = self.view_plan(parsed, None, rows, None, render_ctx);
+                let out =
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
         }
@@ -716,18 +746,21 @@ impl NodeEntry {
         rows
     }
 
-    /// Build this level's `ViewRequest` (detail from `header()`,
-    /// columns, seed from the parsed matched id) and run the view.
-    /// `pin` is the §5.1 restore cursor force; `cursor_delta` covers
-    /// MoveCursor / page keys. Drill arms call this too and discard
-    /// the returned plan (one `header()` + assembly on an unchanged
-    /// view — rows Rc reused).
+    /// Build this level's `ViewRequest` (detail from `error` line +
+    /// `header()`, columns, seed from the parsed matched id) and run
+    /// the view. `pin` is the §5.1 restore cursor force;
+    /// `cursor_delta` covers MoveCursor / page keys. `error` is passed
+    /// in by the caller for *this frame only* (completion `Err` /
+    /// `SubmitResult::Error`) — never stored. Drill arms call this too
+    /// and discard the returned plan (one `header()` + assembly on an
+    /// unchanged view — rows Rc reused).
     fn view_plan(
         &mut self,
         parsed: &ParsedSection,
         pin: Option<&str>,
         rows: Rc<ViewRows>,
         cursor_delta: Option<i32>,
+        error: Option<&str>,
         render_ctx: &RenderContext,
     ) -> ViewPlan {
         let path_args = &parsed.path_args;
@@ -737,7 +770,7 @@ impl NodeEntry {
             .map(|r| path_args.suffix[r.clone()].to_string());
         let columns = self.inner.columns();
         let mut detail: Vec<LogicalLine> = Vec::new();
-        if let Some(msg) = &self.frame_error {
+        if let Some(msg) = error {
             detail.push(LogicalLine::new(format!("[ERROR]: {msg}")));
         }
         detail.extend(
@@ -761,9 +794,11 @@ impl NodeEntry {
 
     // --- Completion (dialog) ---
 
-    /// One completion evaluation for this frame. Returns `Some(result)`
+    /// One completion evaluation for this frame. `Ok(Some(result))`
     /// when the dialog owns the frame (render / cursor move / Tab
-    /// expansion); `None` falls through to the normal path. Listing
+    /// expansion); `Ok(None)` falls through to the normal path;
+    /// `Err(msg)` falls through carrying the completer's message for
+    /// the caller to render above `header()` this frame. Listing
     /// levels use the internal `default_complete`; leaves use the
     /// `SlashDotNode::complete_parameter` trait method (empty by
     /// default). v1 guards: cursor at the end of this level's section,
@@ -775,17 +810,17 @@ impl NodeEntry {
         cursor_pos: usize,
         key: HostKey,
         render_ctx: &RenderContext,
-    ) -> Option<MenuResult> {
+    ) -> Result<Option<MenuResult>, String> {
         let pa = &parsed.path_args;
         if cursor_pos != pa.suffix.len() {
             self.completion_view.reset();
-            return None;
+            return Ok(None);
         }
         let word_range = match pa.word_before(cursor_pos) {
             Some(w) => w,
             None => {
                 self.completion_view.reset();
-                return None;
+                return Ok(None);
             }
         };
         let result = if self.children.is_empty() {
@@ -796,16 +831,15 @@ impl NodeEntry {
         let rc = match result {
             Ok(rc) => rc,
             Err(e) => {
-                // No dialog; surface via the per-frame scratch on the
-                // normal (listing/leaf) detail line this frame.
-                self.frame_error = Some(e.message);
+                // No dialog; caller renders the message above header()
+                // on the normal detail line this frame.
                 self.completion_view.reset();
-                return None;
+                return Err(e.message);
             }
         };
         if rc.rows.is_empty() {
             self.completion_view.reset();
-            return None;
+            return Ok(None);
         }
         // Wrap the completer response — memoized on the response ptr so
         // a handler-cached Rc passes through unchanged (no reconcile;
@@ -852,7 +886,9 @@ impl NodeEntry {
                 // (directory drilling / key→value progression);
                 // empty/Err (final or exact) appends a trailing space
                 // as a convenience (which also dismisses).
-                let row = out.cursor_row?;
+                let Some(row) = out.cursor_row else {
+                    return Ok(None);
+                };
                 let mut new_suffix = pa.suffix.clone();
                 new_suffix.replace_range(word_range.clone(), &row.id);
                 let cursor2 = word_range.start + row.id.len();
@@ -868,13 +904,13 @@ impl NodeEntry {
                 if !matches!(&rerun, Ok(r) if !r.rows.is_empty()) {
                     new_suffix.push(' ');
                 }
-                Some(MenuResult::Continue(
+                Ok(Some(MenuResult::Continue(
                     RenderPlan::default(),
                     reparsed.path_args.prompt_with(&new_suffix),
-                ))
+                )))
             }
             // None / MoveCursor: dialog render (delta applied inside).
-            _ => Some(MenuResult::Continue(out.plan, pa.full_prompt())),
+            _ => Ok(Some(MenuResult::Continue(out.plan, pa.full_prompt()))),
         }
     }
 
@@ -2372,6 +2408,104 @@ mod tests {
                 assert!(plan.rows.is_empty(), "no dialog on Err: {:?}", plan.rows);
             }
             other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    /// Param leaf: `submit` fails without an arg (the sandbox-shaped
+    /// drill guard) and succeeds with one.
+    struct ParamLeaf;
+
+    impl SlashDotNode for ParamLeaf {
+        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![Row::new("param").desc("needs an arg")],
+                active_ids: Vec::new(),
+            }))
+        }
+
+        fn header(
+            &mut self,
+            _path_args: &PathArgs,
+            _render_ctx: &RenderContext,
+        ) -> Vec<String> {
+            vec!["Specify a host path.".to_string()]
+        }
+
+        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            if path_args.args().next().is_none() {
+                SubmitResult::Error("host path required".to_string())
+            } else {
+                SubmitResult::Done(None)
+            }
+        }
+    }
+
+    fn param_root() -> NodeEntry {
+        let mut root = NodeEntry::new_root();
+        root.children.push(NodeEntry::new_child(Box::new(ParamLeaf)));
+        root.refresh_data(ep(), &[], "");
+        root
+    }
+
+    #[test]
+    fn submit_error_renders_inline_above_header_and_stays_open() {
+        let mut root = param_root();
+        // Drill arrival: Enter on the bare id forwards DrillEnter into
+        // the leaf with an empty suffix → submit sees no args → Error.
+        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx());
+        match result {
+            MenuResult::Continue(plan, prompt) => {
+                assert_eq!(prompt, "param ", "{prompt:?}");
+                assert_eq!(plan.detail.len(), 2, "{:?}", plan.detail);
+                assert!(
+                    plan.detail[0].0.contains("[ERROR]: host path required"),
+                    "{:?}",
+                    plan.detail[0]
+                );
+                assert!(
+                    plan.detail[1].0.contains("Specify a host path"),
+                    "{:?}",
+                    plan.detail[1]
+                );
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn submit_error_is_one_shot() {
+        let mut root = param_root();
+        let first = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx());
+        assert!(matches!(first, MenuResult::Continue(..)), "{:?}", first);
+        // The next frame over the SAME prompt re-derives without the
+        // error: nothing was stored (direct render, stateless).
+        let second = root.node_traverse(ep(), HostKey::None, Vec::new(), "param ", &rctx());
+        match second {
+            MenuResult::Continue(plan, _) => {
+                assert!(
+                    plan.detail.iter().all(|l| !l.0.contains("[ERROR]")),
+                    "error leaked into next frame: {:?}",
+                    plan.detail
+                );
+                assert_eq!(plan.detail.len(), 1, "{:?}", plan.detail);
+                assert!(
+                    plan.detail[0].0.contains("Specify a host path"),
+                    "{:?}",
+                    plan.detail[0]
+                );
+            }
+            other => panic!("expected Continue, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn submit_with_arg_succeeds() {
+        let mut root = param_root();
+        let result =
+            root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param /home/gab", &rctx());
+        match result {
+            MenuResult::DoneSuccess(_, prompt) => assert_eq!(prompt, "param /home/gab"),
+            other => panic!("expected DoneSuccess, got {:?}", other),
         }
     }
 

@@ -16,7 +16,7 @@ and `sandbox_overlay_entries`. The session-bind store is kept (renamed
 - children:
   1. "add" (StaticListingNode) — added first, so it tops the default listing
      - data() row: {id: "add", desc: "Add a path mapping to the sandbox"}
-       (id-only; the other columns render blank — rendering tolerates
+       (id/desc-only; the other columns render blank — rendering tolerates
         missing fields, only the id is required)
      - child: AddSandboxMappingNode (leaf)
   2. SandboxMappingNode (dynamic; emits one row per merged binding)
@@ -27,9 +27,9 @@ and `sandbox_overlay_entries`. The session-bind store is kept (renamed
      - child: SandboxRemoveNode
 ```
 
-`SandboxMappingNode` plays both roles in the `TreeListNode` style: at the
-`/sandbox` listing it returns *all* bindings as rows; drilled into (id =
-sandbox path) it shows `header()` and its single action child.
+`SandboxMappingNode` returns *all* bindings as rows for the /sandbox listing;
+drilled into (id = sandbox path) it shows `header()` and its single action
+child.
 
 ## Nodes (all `SlashDotNode` impls)
 
@@ -39,7 +39,7 @@ sandbox path) it shows `header()` and its single action child.
 | (add) `StaticListingNode` | the `add` row | — | — |
 | `AddSandboxMappingNode` (leaf) | `ro` / `rw` rows | "Specify host path and optionally sandbox path" (+ mode) | `complete_parameter` (fs); `submit` → add |
 | `SandboxMappingNode` | one row per binding | src/dst/mode/source | — |
-| `SandboxRemoveNode` (leaf) | `remove` (or `restore` when excluded) | remove/exclude note | `prepare` (confirm) → `submit` |
+| `SandboxRemoveNode` (leaf) | `remove` (or `restore` when excluded) | remove/disable note | `prepare` (confirm) → `submit` |
 
 ### `AddSandboxMappingNode`
 
@@ -59,7 +59,7 @@ sandbox path) it shows `header()` and its single action child.
 ### `SandboxRemoveNode`
 
 - `data()`: look up the binding by `ids[1]` (sandbox path).
-  - excluded config bind → `{id:"restore", desc:"re-enable this mapping"}`
+  - disabled ("excluded") config bind → `{id:"restore", desc:"re-enable this mapping"}`
   - session bind → `{id:"remove", desc:"remove this session mapping"}`
   - active config bind → `{id:"remove", desc:"exclude this config mapping"}`
 - `header()`: binding detail; for a config bind add a note that the action
@@ -101,6 +101,7 @@ v2.0 handler, relocated.
 - `/sandbox add ro ` → leaf, `header()` shown
 - `/sandbox add ro /home/gab` → host-path picker (`/home/…` filtered)
 - `/sandbox add ro /home/gabriel/project` → Enter adds
+- `/sandbox add ro /home/gabriel/project ~/proj` → sandbox path picker, enter adds
 - `/sandbox /home/user/project` → mapping selected, `header()` shown
 - `/sandbox /home/user/project remove` → confirm → removes/excludes
 
@@ -113,28 +114,33 @@ resolution) + size.
 
 # Implementation plan
 
-## Engine: `SubmitResult::Error` (generic leaf guard)
+## Engine: `SubmitResult::Error` (generic leaf guard) — DONE
 
-Needed by any parameter leaf whose Enter may fail validation. Currently
-`SubmitResult` has `Done` / `Prepared` / `NewPath`; a failed submit can only
-close the menu.
+Needed by any parameter leaf whose Enter may fail validation. Previously
+`SubmitResult` had only `Done` / `Prepared` / `NewPath`; a failed submit could
+only close the menu.
+
+**Direct render, no error state anywhere** — the returned plan *is* the
+frame; nothing is stored, so there is no clearing rule to reason about.
 
 1. **`SubmitResult::Error(String)`** (node_impl.rs).
-2. **`EpochState.error: Option<String>` + `error_suffix: String`**
-   (node_entry.rs). Purely *stored* state (unlike `frame_error`, which is
-   recomputed per frame).
-3. **`handle_leaf`**: add the `Error(msg)` arm to both `SubmitResult` matches
-   (confirm-submit and `prepare`). It sets `epoch.error`/`error_suffix =
-   pa.suffix`, then returns `Continue(plan, pa.full_prompt())` built like the
-   `HostKey::None` arm (`ensure_rows` + `view_plan`) so the rows *and* the
-   error line render this frame. Same for the drill path (which arrives via
-   `prepare`).
-4. **`view_plan` detail order**: `[epoch.error]?` → `[frame_error]?` →
-   `header()`. Both prefixed `[ERROR]: `.
-5. **Clearing**: at the top of `node_traverse_at`, if `epoch.error.is_some()
-   && epoch.error_suffix != prompt_suffix` → `epoch.error = None` (the
-   section changed, the failure is stale).
-6. Reset naturally with the rest of `EpochState` (epoch gate).
+2. **`handle_leaf`**: `Error(msg)` arm on both `SubmitResult` matches
+   (confirm-submit and `prepare`) → helper `error_continue()` returns
+   `Continue(plan, pa.full_prompt())` built like the `HostKey::None` arm
+   (`ensure_rows` + `view_plan` with `error: Some(msg)`) — the detail line
+   `"[ERROR]: …"` renders above `header()` this frame. Same path for the
+   drill arrival (which arrives via `prepare`).
+3. **`view_plan` takes `error: Option<&str>`** as a parameter (this frame
+   only). The old per-frame `frame_error` field is **gone**: `completion_pass`
+   now returns `Result<Option<MenuResult>, String>` and its callers pass a
+   completer `Err` straight through to `view_plan` — same for `Error`.
+4. **Host side (repl.rs)**: an Enter/Tab `Continue` whose prompt is unchanged
+   (modulo trailing whitespace — the drill's structural space) and whose plan
+   has content (rows/detail/header) is painted directly for one frame via a
+   one-shot `v25_enter_plan` slot (`plan_has_content` guard). Everything else
+   keeps today's behavior: rewrite ⇒ buffer update ⇒ re-derive next frame.
+   Minimal bridge until the v1/v2.0 repl cleanup; the semantic rule to keep
+   then: *direct render when the prompt did not change*.
 
 ## Path completion extraction
 
@@ -162,9 +168,11 @@ pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry>; // split dir/stem, f
   size + mtime; keep the `-p` `/` marker for dirs. `None` (no sandbox / not
   found) ⇒ caller may fall back to host (arg 1) or return empty (arg 2).
   Baseline still works with names only if long-format parsing is skipped.
-- The two `repl.rs` helpers become thin wrappers over `path_complete`
-  (string projection of `Entry`), so the v2.0 `PathComplete` overlay is
-  unchanged.
+- The two `repl.rs` helpers should be dead / only used by dead 2.0 code, so do
+  not spend much effort keeping them alive. If really necessary, they could
+  become thin wrappers over `path_complete` (string projection of `Entry`),
+  but they will be removed in the next cleanup step anyway - sandbox is the
+  last item in the 2.5 migration.
 
 ## `sandbox_state` module
 
@@ -198,6 +206,10 @@ Mirror `src/v25_tree.rs` / `src/v25_session.rs`.
 - Delete: `ActiveOverlay::Sandbox` (+ all arms), `Repl::sandbox_overlay_entries`,
   `InputAction::Sandbox` (+ its `agent.rs` arm), and the legacy `"sandbox"`
   `MenuNode` arm in `slash_menu_bridge::root_descriptor`.
+- More broadly, *all* v2.0 and also the remaining v1.0 repl menu code are dead
+  now, and need to be removed in the next bigger step. If Sandbox specific
+  surgery is complicated, add note in impl cleanup section, so it can be
+  addressed as a whole.
 
 ## Tests
 

@@ -141,31 +141,28 @@ v2.5 engine.
 **Prompt rewrite support - DONE**
 - Finalized design doc: slashdot/prompt_rewrite_design.md
 
-**Avoid drill-submit where args are expected / `SubmitResult::Error`**
-- Some nodes like `/session <id> rename` expect a parameter - a name in this
-  case. When enter-drilling from the `/tree <id> ` action listing, the rename
-  is auto-submitted with no name. Provide a clear way for submit() to only
-  trigger when a genuine local Enter is received, not when MaybeSubmit is sent
-  from a parent drill.
-  Plan in ./slashdot/arg_and_modifier_autocomplete.md
-- Decided companion (see that doc's main body): a new
-  `SubmitResult::Error(String)` variant → engine returns `Continue` (menu
-  stays open) with NodeEntry rendering the message at the top of detail as
-  `[ERROR]: …`. Today `SubmitResult` has no stay-open-with-error outcome
-  (`Done` closes, `Prepared` confirms, `NewPath` rewrites), so Enter on a
-  param leaf with missing/invalid args — sandbox: nonexistent path — can
-  only close the menu, which is wrong for an inline-edit failure.
-  - Same surfacing slot as the (landed) completion `Err` line, but must be
-    *stored* on `EpochState.error` (+ `error_suffix`): a completion `Err`
-    re-derives every passive frame, while a submit error happens once, on
-    the Enter key. Cleared when the level's prompt section changes.
-  - Drill guard: the sandbox port uses this `Error` path directly (empty
-    args on drill arrival ⇒ `Error("host path required")` keeps the leaf
-    open); no `drill_rewrite` prefill.
-  - Not yet implemented: audit the `handle_leaf` submit mapping
-    (`Done`/`Prepared`/`NewPath` → add `Error` → `Continue` + epoch slot)
-    and add the guard tests alongside the sandbox port (step 7). Final
-    shape: slashdot/sandbox_design.md → "Engine: `SubmitResult::Error`".
+**Avoid drill-submit where args are expected / `SubmitResult::Error` - DONE**
+- Some nodes like `/session <id> rename` expect a parameter. Enter-drilling
+  from a parent action listing auto-submitted with no name. Plan in
+  ./slashdot/arg_and_modifier_autocomplete.md.
+- Landed: `SubmitResult::Error(String)` → `handle_leaf` renders inline
+  (helper `error_continue`: rows + `[ERROR]` above `header()`) and returns
+  `Continue`. **Direct render, no error state anywhere** — the old
+  `frame_error` scratch field was removed too: `completion_pass` now returns
+  `Result<Option<MenuResult>, String>` and callers pass the message per call
+  into `view_plan(error: Option<&str>)`. Nothing stored ⇒ no clearing rules.
+  - Host (repl.rs): an Enter/Tab `Continue` with unchanged prompt (mod
+    trailing space) + content-bearing plan is painted directly for one
+    frame (`v25_enter_plan` one-shot + `plan_has_content`); everything else
+    re-derives from the buffer as before. Minimal bridge until the v1/v2.0
+    repl cleanup — semantic rule to keep: *direct render when the prompt
+    did not change*.
+  - Drill guard: empty args on drill arrival ⇒ `Error("host path required")`
+    keeps the leaf open; no `drill_rewrite` prefill.
+  - 3 new engine tests (169 total in `slashdot_menu`): inline render above
+    `header()`, one-shot (next eval over same prompt is clean), arg-present
+    submit succeeds. Final shape: slashdot/sandbox_design.md →
+    "Engine: `SubmitResult::Error`".
 
 **Dot modifier auto-complete - DONE**
 Final design + implementation plan: slashdot/arg_and_modifier_autocomplete.md
@@ -191,6 +188,26 @@ again, at every listing level, not just `/model`).
 - Clean up unrelated data (e.g. term_width)
 - Try to make it cheaper / less copying with refs. Deferred to avoid lifetime
   complexity in the trait API.
+
+**Render loop order / direct rendering**
+Current loop is 
+1) eval_menu(Key::None)
+2) read event
+3) dispatch key
+4) eval_menu(key); ignore returned render plan
+5) repeat
+
+So the eval'ed render plan is thrown away, and replaced by a no-key render
+plan at the beginning of the loop. While this ensures that all render output
+is re-derivable from the path alone, it is less efficient (e.g. double render
+each screen when cursoring through a long list), and requires stateful error
+handling, since rendering a small error in response to a user action (say, a
+missing parameter in a submit()) is not possible. Conceptually, it is also
+surprising that a returned render plan is systematically thrown away.
+
+The eval model is already for each eval to directly return a sensible render
+plan, and structurally the render plan is generally identical between no-keys
+and with-keys - so this change should not cause regressions.
 
 **State and async review**
 - Consider better designs for app state access and async execution

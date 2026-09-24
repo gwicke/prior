@@ -281,13 +281,17 @@ No other trait changes; `HostKey` unchanged.
 **`SubmitResult`**: new variant `Error(String)` → engine returns
 `Continue` (menu stays open) with NodeEntry rendering the message at
 the top of detail as `[ERROR]: …` — the same surfacing slot as a
-completion `Err`, but *stored* on `EpochState.error` (an engine `Err`
-re-derives every frame; a submit error happens once, on the Enter key)
-and cleared when the level's prompt section changes. Needed for: Enter
-on a param leaf with missing/invalid args (sandbox: nonexistent path).
-Drill-arrival alternative (suppresses DrillEnter-submit before
-dispatch): `drill_rewrite` pre-fill of an example path. `MenuResult`
-unchanged.
+completion `Err` — both **direct render**: the message is passed
+straight into this frame's `view_plan(error: Option<&str>)` and stored
+nowhere (no epoch slot, no frame scratch — the old `frame_error` field
+is gone; `completion_pass` returns `Result<Option<MenuResult>,
+String>`). The returned plan *is* the frame; the next input re-derives
+without it. The host paints a `Continue` plan directly when the prompt
+is unchanged (mod trailing space) and the plan has content — see
+sandbox_design.md §Engine. Needed for: Enter
+on a param leaf with missing/invalid args (sandbox: nonexistent path);
+doubles as the drill guard (arrives via
+`prepare`). `MenuResult` unchanged.
 
 ### Render pipeline extraction
 
@@ -439,10 +443,10 @@ struct ContentCache {
 - Traversal memory stays in `EpochState`: `view_args` +
   `should_restore_view_args` (§5.1 restore source — same string as
   `last_key` in steady state, but memory, not cache), `confirm_pending`,
-  `value_forwarding`, the per-frame completion-`Err` scratch, and
-  `error: Option<String>` for `SubmitResult::Error` (set on the failing
-  Enter, cleared when the level's prompt section changes). NodeEntry
-  still composes the two views (`view`, `completion_view`).
+  and `value_forwarding`. **No error state**: completion `Err` and
+  `SubmitResult::Error` are both direct-rendered (passed per call into
+  `view_plan`, never stored — nothing to clear). NodeEntry still
+  composes the two views (`view`, `completion_view`).
 
 `plan()` internals:
 
@@ -552,8 +556,9 @@ suffix-relative). Gated on `key ∈ {None, MoveCursor, Tab}`,
 result = children.is_empty() ? inner.complete_parameter(args, cursor_pos)
                              : default_complete(parsed, cursor_pos)
 None / empty → normal path (listing/leaf handling unchanged)
-Err(msg)     → per-frame scratch = msg; fall through (detail prepends
-               "[ERROR]: msg" this frame; recomputed next frame)
+Err(msg)     → fall through carrying msg; caller passes it to
+               view_plan this frame (detail prepends "[ERROR]: msg";
+               stored nowhere, recomputed next frame)
 Rows(rc)     → out = completion_view.plan(wrap(rc), ViewRequest {
                  cursor_delta: MoveCursor? d : None,
                  columns from labels, detail: error? + header(), … }):

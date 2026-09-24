@@ -147,6 +147,13 @@ pub enum SubmitResult {
     /// Rewrite the buffer to a new menu path (e.g. `/compact` →
     /// `/tree <id> compact `).
     NewPath(String),
+    /// Stay open with `[ERROR]: …` rendered above `header()` on this
+    /// frame's plan (direct render — nothing stored; the next eval
+    /// re-derives without it). For a parameter leaf with missing or
+    /// invalid args; doubles as the drill-arrival guard (`DrillEnter`
+    /// → `prepare` → `Error` keeps the leaf open instead of submitting
+    /// empty).
+    Error(String),
 }
 
 /// Outcome of `node_traverse()` — what the host should do next.
