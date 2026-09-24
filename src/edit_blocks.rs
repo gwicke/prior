@@ -67,8 +67,7 @@ fn marker_of(line: &str) -> Option<&'static str> {
     let t = line.trim();
     // Lenient SEARCH marker: exact `<<<<<<< SEARCH` or with exactly one
     // trailing char from the set `>]})`.
-    if t.starts_with(SEARCH_MARKER) {
-        let after = &t[SEARCH_MARKER.len()..];
+    if let Some(after) = t.strip_prefix(SEARCH_MARKER) {
         if after.is_empty() {
             return Some(SEARCH_MARKER);
         }
@@ -97,20 +96,31 @@ fn strip_fence(text: &str) -> Vec<String> {
     // match exactly; the first char of `rest` must be one of `>]})`.
     let mut i = 0;
     while i < lines.len() {
-        let line = lines[i].clone();
-        if let Some(rest) = line.trim_start().strip_prefix("<<<<<<< SEARCH") {
-            let first = rest.chars().next();
-            if matches!(first, Some('>') | Some(']') | Some('}') | Some(')')) {
-                // Only split if there's *content* after the bracket on the same
-                // line (i.e. `<<<<<<< SEARCH>foo`, not `<<<<<<< SEARCH>\n`).
-                let content_after = rest[1..].trim_start();
-                if !content_after.is_empty() {
-                    lines[i] = SEARCH_MARKER.to_string();
-                    lines.insert(i + 1, content_after.to_string());
-                    i += 2;
-                    continue;
+        // Determine whether to split, extracting any needed data without
+        // keeping a borrow across the mutation.
+        let should_split = {
+            let line = &lines[i];
+            if let Some(rest) = line.trim_start().strip_prefix("<<<<<<< SEARCH") {
+                let first = rest.chars().next();
+                if matches!(first, Some('>') | Some(']') | Some('}') | Some(')')) {
+                    let content_after = rest[1..].trim_start();
+                    if !content_after.is_empty() {
+                        Some(content_after.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+        if let Some(content_after) = should_split {
+            lines[i] = SEARCH_MARKER.to_string();
+            lines.insert(i + 1, content_after);
+            i += 2;
+            continue;
         }
         i += 1;
     }
