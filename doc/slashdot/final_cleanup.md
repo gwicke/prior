@@ -40,14 +40,16 @@ Status: **PROPOSED** (plan only; not yet implemented)
 - Prompt-line Tab still uses the old completer
   (`complete_path_prefix_sandbox`), while `src/path_complete.rs`
   (structured entries, listing cache + invalidation) backs
-  `/sandbox` and tool paths — the prompt-side switch was explicitly
-  deferred to this cleanup.
+  `/sandbox` and tool paths — the prompt-side switch is **scoped OUT
+  of this plan**: it is standalone repl code (not menu v1/v2.0) and
+  becomes its own step; design findings in
+  `arg_and_modifier_autocomplete.md` §Prompt-line completion.
 
 ## Still-needed bits → new homes
 
 | Bit (today, in legacy code) | New home | Notes |
 |---|---|---|
-| Prompt-line Tab path completion (`complete_path_prefix_sandbox` + `_prefix` + `_impl`, repl.rs) | `src/path_complete.rs`: add `pub fn complete_prompt(prefix: &str) -> Vec<String>` — sandbox-aware (`tools::sandbox_config().is_some()`), `~` round-trip, trailing-`/` on dirs, built from `complete()` entries | Repl keeps `token_at_cursor`, `completion_pos`, and `ActiveOverlay::PathComplete` (host UI state, not legacy). Gets listing invalidation for free (`tools.rs` already calls `invalidate_listing`). Port `fuzz_path_completion_preserves_layout` to the new source. |
+
 | Dotted-modifier completion (`Interpreter::field_options`, repl `Mod` overlay) | **already relocated** → `node_entry::default_complete` | Just delete. Gate: existing `completion_*` tests + one eval-level `/model .` test in `v25_model.rs`. |
 | `/stat` interstitial D4 (`stat_phase`, `Stat` overlay) | **already relocated** → `v25_stat::StatNode::header` | Panel shows on drill (v2.5 leaf pattern, same as `/replay`), Enter closes. Accepted UX alignment; `stat_phase` dies. |
 | Help | **none — intentionally removed** | Delete all remnants (see inventory D/E). |
@@ -83,10 +85,11 @@ Status: **PROPOSED** (plan only; not yet implemented)
 - **cursor policy**: `cursor_sel_policy` loses
   `is_tree_list`/`follows_active` (constants → false; PathComplete
   sel-tracking stays).
-- **Old completer**: `complete_path_prefix_sandbox` (3476),
-  `complete_path_prefix` (4581), `complete_path_prefix_impl` (4844),
-  `expand_tilde` wrapper (4829) — after P2 rewire. Keep
-  `token_at_cursor` + its tests.
+- **Prompt-completion island stays untouched**: `complete_path_prefix*`,
+  `expand_tilde` wrapper, `token_at_cursor`, `completion_pos` /
+  `path_completions`, `ActiveOverlay::PathComplete` + its arms — live
+  code owned by the separate prompt-completion port step (see
+  `arg_and_modifier_autocomplete.md` §Prompt-line completion).
 - **Tests**: all `from_buffer`-era overlay tests die (tree / compact /
   switch / model / persona / thinking / settings / stat / mod / help
   family). Port `fuzz_path_completion_preserves_layout` (8832).
@@ -142,43 +145,41 @@ Status: **PROPOSED** (plan only; not yet implemented)
 1. **P1 — repl.rs pruning**: dead variants/arms/helpers/params + their
    tests. Gate: `cargo test`; sentinel grep for removed variant names
    in non-test code is empty.
-2. **P2 — prompt Tab → `path_complete::complete_prompt`**: rewire both
-   Tab sites (overlay + bare), delete old completer trio, port the
-   fuzz test (tilde round-trip, dir `/`, single-completion inline
-   replace, sandbox-aware switch). Gate: path tests green.
-3. **P3 — crate surgery**: `ColumnDef` → `fields.rs`; delete
+2. **P2 — crate surgery**: `ColumnDef` → `fields.rs`; delete
    `interpreter`/`accept`/`node`/`provider`; `PlanBuilder`; `lib.rs`.
    Gate: lib tests green (expect a large drop: interpreter 25 +
    accept 8 + render ≤6).
-4. **P4 — bridge slimming**: `MenuEngine`, `Frame`, providers out;
+3. **P3 — bridge slimming**: `MenuEngine`, `Frame`, providers out;
    repl has zero engine refs after P1. Gate: workspace green.
-5. **P5 — slash.rs + help remnants + `InputAction` audit + agent
+4. **P4 — slash.rs + help remnants + `InputAction` audit + agent
    comments.** Gate: sentinels.
-6. **P6 — test gap-fill + docs**: add `v25_thinking` tests (set +
+5. **P5 — test gap-fill + docs**: add `v25_thinking` tests (set +
    active marker + root row), `v25_persona` tests (set + root row),
    `v25_menu` root-listing test (all commands present, `help`
    **absent** — codifies the decision), `v25_model` `/model .`
-   modifier eval test, `path_complete::complete_prompt` tests; update
-   this doc's status, impl doc step 10 → DONE (incl. resolving the
-   "in-prompt Tab switch deferred to cleanup" note), design-doc
-   cleanup note; final full-workspace run + sentinel block; commit.
+   modifier eval test; update this doc's status, impl doc step 10 →
+   DONE (incl. re-pointing the "in-prompt Tab switch" note to the
+   prompt-completion step), design-doc cleanup note; final
+   full-workspace run + sentinel block; commit.
 
 ## Test expectations
 
 - Deleted: ~60–80 tests (repl from_buffer-era family, bridge 18,
   interpreter 25, accept 8, render PlanBuilder ≤6, slash 9).
-- Added: ~12–18 targeted tests (P6 list + P2 port).
+- Added: ~8–12 targeted tests (P5 gap-fill list).
 - Workspace green at **every** phase boundary (baseline: 653 + 169).
 
-## Sentinel greps (must be empty after P6)
+## Sentinel greps (must be empty after P5)
 
 `MenuEngine`, `PlanBuilder`, `AcceptController`, `Interpreter`,
 `root_descriptor`, `SlashKind`, `render_help`, `filter_commands`,
 `parse_slash`, `from_buffer_cursors`, `ActiveOverlay::{Help, Mod,
 Settings, SettingsVal, Stat, Menu, Tree, TreeAction, SwitchAction,
-CompactSummary}`, `field_options`, `complete_path_prefix`,
-`help_view`, `stat_phase`, `engine_esc`, `is_engine_backed`,
-`on_edit` (bridge), `value_error` (repl).
+CompactSummary}`, `field_options`, `help_view`, `stat_phase`,
+`engine_esc`, `is_engine_backed`, `on_edit` (bridge), `value_error`
+(repl). NOT in these sentinels (live until the prompt-completion
+step): `complete_path_prefix*`, `token_at_cursor`, `PathComplete`,
+`completion_pos`.
 
 ## Risks / verify-at-implementation
 
@@ -198,6 +199,12 @@ CompactSummary}`, `field_options`, `complete_path_prefix`,
 
 ## Out of scope
 
+- **Prompt-line Tab completion port** to the engine completion frame
+  — its own step; design findings in `arg_and_modifier_autocomplete.md`
+  §Prompt-line completion. The legacy island
+  (`complete_path_prefix*`, `token_at_cursor`, `PathComplete` overlay,
+  `completion_pos`) survives cleanup untouched. (Cleanup's earlier P2
+  `complete_prompt` shim was dropped as throwaway.)
 - Step 11 re-merge with mainline.
 - §5a state/async follow-up; confirm-dialog rendering refinement
   (design §table) — v2.5 feature work, not cleanup.

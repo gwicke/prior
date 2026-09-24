@@ -238,8 +238,10 @@ pub fn list_sandbox(dir: &str) -> Option<Vec<Entry>>; // bwrap ls → parse
   path` (arg 2); description column keeps the default `Description`.
 - Legacy `repl.rs` helpers (`complete_path_prefix_impl`,
   `complete_path_prefix_sandbox`) left untouched — only the in-prompt Tab
-  complete still uses them; switching it to `path_complete` and deleting
-  both is deferred to the v1/v2.0 cleanup (sandbox is the last 2.5 item).
+  complete still uses them; switching it to the engine completion frame
+  and deleting both is a dedicated follow-up step (findings in
+  arg_and_modifier_autocomplete.md §Prompt-line completion; scoped out
+  of the v1/v2.0 cleanup).
 
 ## `sandbox_state` module
 

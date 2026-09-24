@@ -487,7 +487,9 @@ Design + plan: `slashdot/sandbox_design.md`.
   bytes), host + sandbox listings (`tools::sandbox_list_lines`, `ls -lap
   --time-style=+ISO`), v1 split/`~`-round-trip/fallback semantics, labels
   `Host path`/`Sandbox path`. Legacy repl helpers untouched (in-prompt
-  switch deferred to cleanup). +7 tests — 635 lib tests pass.
+  switch → its own step; findings in slashdot/
+  `arg_and_modifier_autocomplete.md` §Prompt-line completion).
+  +7 tests — 635 lib tests pass.
 - **`sandbox_state` rename — DONE**: `sandbox_bindings` → `sandbox_state`
   (data-only), new `add(host, sandbox, mode)` + shims, `restore` (was
   dead `remove_exclude`). All refs updated; +2 tests — 637 lib tests.
