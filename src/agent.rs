@@ -3755,11 +3755,33 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         if menu_submitted {
             menu_submitted = false;
             let ls = live_state.borrow();
-            let model_changed = config.provider != ls.model.split(':').next().unwrap_or("")
-                || config.model != ls.model.split(':').nth(1).unwrap_or("");
-            let thinking_changed = config.thinking_level != ls.thinking_level;
-            let persona_changed = config.persona_name != ls.persona;
+            let new_model = ls.model.clone();
+            let new_thinking = ls.thinking_level.clone();
+            let new_persona = ls.persona.clone();
             drop(ls);
+
+            // Compare against the session's current model (branch + header),
+            // not the running agent's config. This prevents redundant
+            // ModelChange entries on resume (where config != session model
+            // because the user hasn't accepted the prefill yet).
+            let (session_provider, session_model, session_thinking) = if let Some(ref s) = session {
+                let branch = s.get_branch().await;
+                let model_change = crate::session::session::derive_model_change(&branch);
+                let thinking_level = crate::session::session::derive_thinking_level(&branch);
+                let idx = s.index.lock().await;
+                let provider = model_change.clone().map(|(p, _)| p).or(idx.header.provider.clone());
+                let model = model_change.map(|(_, m)| m).or(idx.header.model_id.clone());
+                let thinking = thinking_level.or(idx.header.thinking_level.clone());
+                (provider, model, thinking)
+            } else {
+                (Some(config.provider.clone()), Some(config.model.clone()), config.thinking_level.clone())
+            };
+
+            let model_changed = session_provider.as_deref() != Some(new_model.split(':').next().unwrap_or(""))
+                || session_model.as_deref() != Some(new_model.split(':').nth(1).unwrap_or(""));
+            let thinking_changed = session_thinking.as_deref() != new_thinking.as_deref();
+            let session_persona = config.persona_name.clone(); // persona is not stored in session
+            let persona_changed = session_persona != new_persona;
 
             if model_changed || thinking_changed || persona_changed {
                 let mut new_cfg = config.clone();

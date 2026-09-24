@@ -1711,7 +1711,7 @@ pub(crate) fn rig_message_to_pi_entries(
 // ---------------------------------------------------------------------------
 
 /// Find the most recent `ThinkingLevelChange` on the branch (closest to leaf).
-fn derive_thinking_level(entries: &[SessionEntry]) -> Option<String> {
+pub(crate) fn derive_thinking_level(entries: &[SessionEntry]) -> Option<String> {
     entries
         .iter()
         .rev()
