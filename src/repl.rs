@@ -664,13 +664,12 @@ impl Repl {
             crate::v25_menu::build_menu(&shared.live_state, &shared.settings, &shared_rc)
         };
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
-        // Direct render: a plan returned by an Enter/Tab whose prompt did
-        // not change (modulo trailing whitespace) — painted for exactly
-        // the next frame instead of discarded, because such a frame (e.g.
-        // `SubmitResult::Error`) is not re-derivable from the buffer.
-        // Consumed by the `take()` at the top of the next iteration; no
-        // clearing logic — the next key re-derives as always.
-        let mut v25_enter_plan: Option<crate::slashdot_menu::render::RenderPlan> = None;
+        // Engine key queued by the dispatch below for the *next*
+        // iteration's eval (eval → display → wait loop shape). `None`
+        // = passive frame (buffer edits, first iteration). Consumed
+        // unconditionally at the top, so a stale key can never outlive
+        // one iteration.
+        let mut pending_key: Option<crate::slashdot_menu::HostKey> = None;
         // The input line starts at `initial_row` — the natural cursor row tracked
         // by the console `Output` — and is *not* forced to the bottom of the
         // screen, so it never leaves a gap in the session scrollback. `input_row`
@@ -812,29 +811,88 @@ impl Repl {
             if cur_h != prev_term_h.get() {
                 input_row = output.cursor_row();
             }
-            // --- Compute the overlay from the current buffer. ---
+            // --- Eval: resolve the pending key (or a passive frame)
+            // into an overlay. Single place where an engine prompt is
+            // applied to the buffer AND its plan rendered, so a §5.1
+            // keyless restore lands both in the same frame — no window
+            // for a racing edit between them. ---
+            let key = pending_key.take().unwrap_or(crate::slashdot_menu::HostKey::None);
             let buf_text = editor.text();
-            // Direct render: paint the previous dispatch's returned plan
-            // once (prompt unchanged); otherwise derive from the buffer.
-            let direct_plan = v25_enter_plan.take();
-            let overlay = if let Some(plan) = direct_plan {
-                ActiveOverlay::V25Menu { plan }
-            } else if buf_text.starts_with('/') {
+            let overlay = if buf_text.starts_with('/') {
                 // All `/` commands route through the v2.5 engine.
-                // Manage handle lifecycle: create on first `/`, drop when not `/`.
+                // Manage handle lifecycle: create on first `/`, drop when not `/.
                 if v25_handle.is_none() {
                     v25_handle = Some(v25_menu.get_handle());
                 }
-                let handle = v25_handle.as_mut().unwrap();
-                let result = Self::v25_eval(
-                    handle,
-                    &buf_text,
-                    editor.cursor,
-                    crate::slashdot_menu::HostKey::None,
-                );
+                let result = {
+                    let handle = v25_handle.as_mut().unwrap();
+                    Self::v25_eval(handle, &buf_text, editor.cursor, key)
+                };
                 match result {
-                    V25Frame::Continue(plan, _) => ActiveOverlay::V25Menu { plan },
-                    _ => ActiveOverlay::None,
+                    V25Frame::Continue(plan, prompt) => {
+                        // Apply the engine's prompt — but only when it
+                        // actually changed: an unchanged passive eval
+                        // must not reset a mid-line text cursor
+                        // (`LineEditor::set` jumps to EOL).
+                        let new_buf = format!("/{}", prompt);
+                        if new_buf != editor.text() {
+                            editor.set(&new_buf);
+                        }
+                        ActiveOverlay::V25Menu { plan }
+                    }
+                    V25Frame::DoneSuccess(msg, prompt)
+                        if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
+                    {
+                        // The node's submit() wrote to shared state
+                        // (LiveState for `/thinking`/`/model`/…, or
+                        // `pending_op` for `/session`/`/replay`). Use the
+                        // engine-provided self-documenting prompt
+                        // (e.g. "/thinking low").
+                        let committed = format!("/{}", prompt);
+                        Repl::emit_commit(
+                            output, &mut editor, &redraw, sel,
+                            &mut input_row, &committed, "", false,
+                        );
+                        if let Some(text) = msg {
+                            output.display_text(&text);
+                        }
+                        // Dismiss the overlay and hand control back to
+                        // the agent loop, which processes
+                        // `menu_submitted` (LiveState sync) and any
+                        // `pending_op` (async dispatch) before the
+                        // next prompt.
+                        *menu_submitted = true;
+                        return Some(InputAction::MenuDone);
+                    }
+                    V25Frame::DoneError(err, prompt)
+                        if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
+                    {
+                        let committed = format!("/{}", prompt);
+                        Repl::emit_commit(
+                            output, &mut editor, &redraw, sel,
+                            &mut input_row, &committed, "", false,
+                        );
+                        output.display_text(&err);
+                        return Some(InputAction::MenuDone);
+                    }
+                    // Rewrite-cycle bail-out on a non-Enter key (chain
+                    // already on stderr from v25_eval): clear the input
+                    // area, surface it in the transcript, and drop the
+                    // prompt — back to normal operation.
+                    V25Frame::DoneError(err, _) => {
+                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                        output.display_text(&err);
+                        input_row = output.cursor_row();
+                        editor.set("");
+                        v25_handle = None;
+                        ActiveOverlay::None
+                    }
+                    // Esc at root — close the overlay.
+                    V25Frame::DoneSuccess(_, _) => {
+                        editor.set("");
+                        v25_handle = None;
+                        ActiveOverlay::None
+                    }
                 }
             } else if !path_completions.is_empty() {
                 v25_handle = None;
@@ -1006,20 +1064,14 @@ impl Repl {
                     if !matches!(overlay, ActiveOverlay::None) {
                         match key.code {
                             KeyCode::Down | KeyCode::Up => {
-                                // v2.5: arrows route through the engine's
-                                // cursor; the next frame's `sel` re-derives
-                                // from it. Host-cursor overlays
-                                // (PathComplete) move `sel` directly.
+                                // v2.5: queue the cursor move for the next
+                                // eval — the loop applies the result (plan
+                                // + prompt) in one place. Host-cursor
+                                // overlays (PathComplete) move `sel`
+                                // directly.
                                 if overlay.cursor_row().is_some() {
-                                    if let Some(handle) = &mut v25_handle {
-                                        let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                        let _ = Self::v25_eval(
-                                            handle,
-                                            &editor.text(),
-                                            editor.cursor,
-                                            crate::slashdot_menu::HostKey::MoveCursor(delta),
-                                        );
-                                    }
+                                    let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
+                                    pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
@@ -1031,7 +1083,9 @@ impl Repl {
                             KeyCode::PageDown | KeyCode::PageUp => {
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                     // V25Menu: visual-line-aware page scroll through engine.
-                                    if let Some(handle) = &mut v25_handle {
+                                    // (Handle must exist: a V25Menu overlay
+                                    // was just produced by an eval on it.)
+                                    if v25_handle.is_some() {
                                         // Get current selected from the plan.
                                         let cur_sel = match &overlay {
                                             ActiveOverlay::V25Menu { plan } => plan.selected.unwrap_or(0),
@@ -1057,12 +1111,7 @@ impl Repl {
                                         let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
                                         let delta = Self::page_delta(plan_rows, cur_sel, data_budget, direction);
                                         if delta != 0 {
-                                            let _ = Self::v25_eval(
-                                                handle,
-                                                &editor.text(),
-                                                editor.cursor,
-                                                crate::slashdot_menu::HostKey::MoveCursor(delta),
-                                            );
+                                            pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                         }
                                     }
                                     continue;
@@ -1079,24 +1128,7 @@ impl Repl {
                             }
                             KeyCode::Tab => {
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    if let Some(handle) = &mut v25_handle {
-                                        let result = Self::v25_eval(
-                                            handle,
-                                            &editor.text(),
-                                            editor.cursor,
-                                            crate::slashdot_menu::HostKey::Tab,
-                                        );
-                                        if let V25Frame::Continue(plan, prompt) = result {
-                                            // Same direct-render rule as the Enter arm.
-                                            let new_buf = format!("/{}", prompt);
-                                            let unchanged =
-                                                new_buf.trim_end() == editor.text().trim_end();
-                                            editor.set(&new_buf);
-                                            if unchanged && Self::plan_has_content(&plan) {
-                                                v25_enter_plan = Some(plan);
-                                            }
-                                        }
-                                    }
+                                    pending_key = Some(crate::slashdot_menu::HostKey::Tab);
                                 } else {
                                     overlay.handle_tab(sel, &mut editor,
                                         &mut path_completions, &mut completion_pos);
@@ -1104,67 +1136,11 @@ impl Repl {
                             }
                             KeyCode::Enter => {
                                 if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    // v2.5 path: route through the persistent handle.
+                                    // v2.5 path: queue the key; the next
+                                    // iteration's eval handles submit
+                                    // (commit + return) or rewrite inline.
                                     if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                        if let Some(handle) = &mut v25_handle {
-                                            let result = Self::v25_eval(
-                                                handle,
-                                                &editor.text(),
-                                                editor.cursor,
-                                                crate::slashdot_menu::HostKey::Enter,
-                                            );
-                                            match result {
-                                                V25Frame::DoneSuccess(msg, prompt) => {
-                                                    // The node's submit() wrote to shared state
-                                                    // (LiveState for `/thinking`/`/model`/…, or
-                                                    // `pending_op` for `/session`/`/replay`).
-                                                    // Use the engine-provided self-documenting
-                                                    // prompt (e.g. "/thinking low").
-                                                    let committed = format!("/{}", prompt);
-                                                    Repl::emit_commit(
-                                                        output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &committed, "", false,
-                                                    );
-                                                    if let Some(text) = msg {
-                                                        output.display_text(&text);
-                                                    }
-                                                    // Dismiss the overlay and hand control
-                                                    // back to the agent loop, which processes
-                                                    // `menu_submitted` (LiveState sync) and any
-                                                    // `pending_op` (async dispatch) before the
-                                                    // next prompt.
-                                                    *menu_submitted = true;
-                                                    return Some(InputAction::MenuDone);
-                                                }
-                                                V25Frame::Continue(plan, prompt) => {
-                                                    // Prompt rewritten (drill / NewPath) or
-                                                    // unchanged. Unchanged (modulo trailing
-                                                    // whitespace — the drill's structural
-                                                    // space) + a plan with content: render it
-                                                    // directly for one frame — not
-                                                    // re-derivable (the SubmitResult::Error
-                                                    // line).
-                                                    let new_buf = format!("/{}", prompt);
-                                                    let unchanged =
-                                                        new_buf.trim_end() == editor.text().trim_end();
-                                                    editor.set(&new_buf);
-                                                    if unchanged
-                                                        && Self::plan_has_content(&plan)
-                                                    {
-                                                        v25_enter_plan = Some(plan);
-                                                    }
-                                                }
-                                                V25Frame::DoneError(err, prompt) => {
-                                                    let committed = format!("/{}", prompt);
-                                                    Repl::emit_commit(
-                                                        output, &mut editor, &redraw, sel,
-                                                        &mut input_row, &committed, "", false,
-                                                    );
-                                                    output.display_text(&err);
-                                                    return Some(InputAction::MenuDone);
-                                                }
-                                            }
-                                        }
+                                        pending_key = Some(crate::slashdot_menu::HostKey::Enter);
                                         continue;
                                     }
                                     overlay.handle_enter(sel, &mut editor);
@@ -1177,31 +1153,7 @@ impl Repl {
                                 // overlays keep their bespoke rewrites until
                                 // they migrate.
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    if let Some(handle) = &mut v25_handle {
-                                        let result = Self::v25_eval(
-                                            handle,
-                                            &editor.text(),
-                                            editor.cursor,
-                                            crate::slashdot_menu::HostKey::Esc,
-                                        );
-                                        match result {
-                                            V25Frame::Continue(_plan, prompt) => {
-                                                // Esc popped a level — update buffer.
-                                                editor.set(&format!("/{}", prompt));
-                                            }
-                                            V25Frame::DoneSuccess(_, _) => {
-                                                // Esc at root — close overlay.
-                                                editor.set("");
-                                                v25_handle = None;
-                                            }
-                                            _ => {
-                                                editor.set("");
-                                                v25_handle = None;
-                                            }
-                                        }
-                                    } else {
-                                        editor.set("");
-                                    }
+                                    pending_key = Some(crate::slashdot_menu::HostKey::Esc);
                                     continue;
                                 }
                                 overlay.handle_esc(&mut path_completions, &mut completion_pos);
@@ -1511,46 +1463,10 @@ impl Repl {
         delta
     }
 
-    /// Cursor policy for buffer-derived option menus (`read_input`).
-    ///
-    /// `active` is the overlay's current-state / default row as re-derived
-    /// from the typed buffer on every keystroke. Two cases seed the cursor
-    /// from `active`:
-    ///
-    /// - **On open** (`disc_changed`): a freshly-opened menu whose default
-    ///   is meaningful (the /tree list seeding on the current leaf row, or a
-    ///   tree action sub-menu whose `active` names the mode the prompt
-    ///   already spells out, e.g. `/tree <id> compact llm <payload>` →
-    ///   `llm`) starts the cursor on that row. Without this, restoring such a
-    ///   prompt from history leaves the cursor on row 0 and Enter commits
-    ///   the wrong option.
-    /// - **On re-derivation** (`follow_changes`): when the buffer changes
-    ///   within the same menu and `active` moves to a different row (the
-    ///   user typed `switch --summarize` or `compact llm …`), the cursor
-    ///   follows it.
-    ///
-    /// Arrow navigation stays intact: arrows modify only `sel`, never the
-    /// buffer, so `active` is unchanged on the next frame and the cursor is
-    /// left where the user put it.
-    ///
-    /// `seed_on_open` and `follow_changes` are separate because the /tree
-    /// *list* seeds on the leaf row when it opens but must not yank the
-    /// cursor as the user types a fuzzy search term, whereas the tree action
-    /// sub-menus seed and follow.
-    /// Evaluate the v2.5 menu with the editor's real cursor: char index
-    /// → byte offset into the slash-stripped line. v1 completion is
-    /// end-of-line only — a mid-line cursor simply suppresses it (the
-    /// engine's EOL guard), which avoids completing a different word
-    /// than the user is editing.
-    /// True when a `RenderPlan` carries something to paint (column
-    /// header, detail lines, or rows) — i.e. it is not an empty plan.
-    /// Gates the one-frame direct render: an empty plan is never worth
-    /// painting directly (the next frame re-derives anyway).
-    fn plan_has_content(plan: &crate::slashdot_menu::render::RenderPlan) -> bool {
-        plan.table_header.is_some() || !plan.detail.is_empty() || !plan.rows.is_empty()
-    }
-
-    /// Evaluate one menu key event, resolving `ContinuePrompt` rewrites.
+    /// Evaluate one menu key event (editor's real cursor: char index →
+    /// byte offset into the slash-stripped line; v1 completion is
+    /// end-of-line only, so a mid-line cursor just suppresses it —
+    /// the engine's EOL guard), resolving `ContinuePrompt` rewrites.
     ///
     /// The engine answers a pure prompt rewrite (Esc ladder step, drill
     /// rewrite, completion expansion, `SubmitResult::NewPath`) with
@@ -1612,6 +1528,32 @@ impl Repl {
         V25Frame::DoneError(msg, buf.trim_start_matches('/').to_string())
     }
 
+    /// Cursor policy for buffer-derived option menus (`read_input`).
+    ///
+    /// `active` is the overlay's current-state / default row as re-derived
+    /// from the typed buffer on every keystroke. Two cases seed the cursor
+    /// from `active`:
+    ///
+    /// - **On open** (`disc_changed`): a freshly-opened menu whose default
+    ///   is meaningful (the /tree list seeding on the current leaf row, or a
+    ///   tree action sub-menu whose `active` names the mode the prompt
+    ///   already spells out, e.g. `/tree <id> compact llm <payload>` →
+    ///   `llm`) starts the cursor on that row. Without this, restoring such a
+    ///   prompt from history leaves the cursor on row 0 and Enter commits
+    ///   the wrong option.
+    /// - **On re-derivation** (`follow_changes`): when the buffer changes
+    ///   within the same menu and `active` moves to a different row (the
+    ///   user typed `switch --summarize` or `compact llm …`), the cursor
+    ///   follows it.
+    ///
+    /// Arrow navigation stays intact: arrows modify only `sel`, never the
+    /// buffer, so `active` is unchanged on the next frame and the cursor is
+    /// left where the user put it.
+    ///
+    /// `seed_on_open` and `follow_changes` are separate because the /tree
+    /// *list* seeds on the leaf row when it opens but must not yank the
+    /// cursor as the user types a fuzzy search term, whereas the tree action
+    /// sub-menus seed and follow.
     fn cursor_sel_policy(disc_changed: bool, sel: usize) -> usize {
         if disc_changed { 0 } else { sel }
     }

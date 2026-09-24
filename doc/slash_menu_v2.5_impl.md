@@ -680,9 +680,9 @@ Workspace green: 627 lib + 133 crate + all integration, 0 failed;
 ### Step 18: `ContinuePrompt` API + Esc-restore regression — DONE
 
 Follow-up split agreed with the user: **(1) API restructure** (this
-step), **(2) display-loop restructure** (next step: wait → eval →
-display, with prompt application folded into one place — this also
-covers the remaining passive-frame prompt discard, `MoveCursor`
+step), **(2) display-loop restructure** (next step: eval-until-plan →
+display → wait, with prompt application folded into one place — this
+also covers the remaining passive-frame prompt discard, `MoveCursor`
 discard, and removal of the `v25_enter_plan` one-frame hack).
 
 **Bug that motivated it** (`doc/slash_menu_v2.5_design.md` §5.1):
@@ -741,6 +741,57 @@ drill); host tests route key-driven evals through
 `eval_prompt_resolved` (the test-visible twin of `v25_eval`).
 Workspace green: 630 lib + 133 crate + all integration, 0 failed,
 0 warnings.
+
+### Step 19: display loop → eval → display → wait — DONE
+
+Phase 2 of the split above; shape confirmed with the user as
+**eval (until plan) → display → wait**, with the input wait staying at
+the *end* of the loop so the first iteration is a `HostKey::None` eval
+of whatever buffer the prompt starts with (initial render happens
+before any keystroke).
+
+**One eval site.** The loop now queues engine keys in `pending_key`
+(`Option<HostKey>`, taken unconditionally at the top — a stale key can
+never outlive one iteration) and evaluates exactly once per frame at
+the top. Dispatch arms (Up/Down, PageUp/Down, Tab, Enter, Esc) only
+*record* the key and `continue`; buffer edits just mutate and fall
+through — both become the next iteration's eval input. The old four
+inline-eval arms (with their duplicated prompt/prompt handling) are
+gone.
+
+**Prompt + plan land in the same frame.** The single eval applies the
+returned prompt to the buffer (only when it actually changed — an
+unchanged passive eval must not reset a mid-line text cursor, since
+`LineEditor::set` jumps to EOL) and renders the returned plan
+immediately. This closes the remaining holes from Phase 1:
+
+- passive-frame `Continue(prompt)` discard (the other door to the
+  keyless-restore bug: hand-backspacing the drill's trailing space),
+- `MoveCursor`/PageUp/PageDown result discard (restore fired on a
+  cursor move was dropped entirely — flag consumed, frame never
+  painted),
+- and it shrinks the edit race the user identified: prompt-rewrite and
+  redraw happen in the same iteration, so there is no loop iteration
+  between them in which another backspace can land.
+
+**`v25_enter_plan` / `plan_has_content` deleted.** The one-frame
+direct-render hack existed because Enter/Tab evaluated in the dispatch
+arm *after* the frame was painted; with eval-first, the returned plan
+is simply this frame's render — nothing to stash.
+
+**Terminal results** are keyed off the eval's key: `DoneSuccess`/
+`DoneError` under Enter keep the old `emit_commit` + transcript +
+`MenuDone` path; under Esc, `DoneSuccess` closes the overlay; a
+non-Enter `DoneError` (rewrite-cycle bail-out from `v25_eval`, chain
+already on stderr) clears the input area, reports to the transcript
+via `display_text`, and drops the prompt back to normal operation.
+
+Also relocated two stray doc comments that were fused onto the wrong
+functions (`cursor_sel_policy`'s block, `v25_eval`'s cursor note).
+
+Tests: workspace green — 637 passed, 0 failed, 0 warnings. The
+Phase 1 regression (`esc_drill_out_restores_filter_and_cursor`) passes
+unchanged against the new loop.
 
 ---
 
