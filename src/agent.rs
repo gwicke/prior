@@ -3703,7 +3703,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         // The user presses Enter to resume the top (most recent) session.
         // This is simpler than resolving the session ID upfront and avoids
         // any race conditions with the session repository listing.
-        pending_prefill = Some("/session path:.".to_string());
+        pending_prefill = Some("/session .path:.".to_string());
     }
     loop {
         let action = match repl.as_mut() {
