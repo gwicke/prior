@@ -7,7 +7,6 @@ pub mod tools;
 pub mod persona;
 pub mod config;
 pub mod edit_match;
-pub mod slash;
 pub use slashdot_menu;
 pub mod slash_menu_bridge;
 pub mod repl;

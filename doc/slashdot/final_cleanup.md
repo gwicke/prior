@@ -1,6 +1,6 @@
 # Final cleanup — remove v1.0 / v2.0 menu remnants (impl step 10)
 
-Status: **IN PROGRESS** — P1, P3, P2 done; P4 → P5 remaining
+Status: **IN PROGRESS** — P1, P3, P2, P4 done; P5 remaining
 
 ## Goal & principles
 
@@ -181,8 +181,33 @@ Status: **IN PROGRESS** — P1, P3, P2 done; P4 → P5 remaining
    byte-identical; the `model_row` epsilon-floor test was ported to
    `v25_model` first (relocate-then-delete). bridge 1452 → 191 lines.
    Gate met: workspace green — 570 lib + 169 integration, 0 failed.
-4. **P4 — slash.rs + help remnants + `InputAction` audit + agent
-   comments.** Gate: sentinels.
+4. ~~**P4 — slash.rs + help remnants + `InputAction` audit + agent
+   comments.**~~ — **DONE**. `src/slash.rs` deleted (252 lines: `registry`,
+   `SlashKind`, `SlashCommand`, `filter_commands`, `parse_slash`,
+   `SlashIntent`, `render_help` + 9 tests) after greps confirmed zero live
+   consumers (only historical doc references); `pub mod slash` dropped
+   from `lib.rs`. `InputAction` → `{Submit, MenuDone}`: the
+   `SetModel/SetThinking/SetPersona` arms were producers-less since P1,
+   and the `menu_submitted` LiveState sync (agent ~3702) covers
+   model/thinking/persona with equivalent semantics (verified: agent
+   rebuild, `recent_models` update, session logging) before the arms were
+   deleted; `Quit` was an orphan too — the live quit path is
+   `AsyncOp::Quit` — so its variant + arm went as well (full producer
+   audit: `Submit` ← read_input/get_user_input, `MenuDone` ← v2.5 menu
+   commits). Stale comments rewritten: `compute_resume_model_prefill`
+   doc + resume-prefill comment (`model_overlay_entries` / `SetModel`
+   refs), `read_input` doc (Set* returns, `/help` overlay prose,
+   duplicated `Ctrl-C` line), `ActiveOverlay` doc (`help_view` ref).
+   Help-remnant sentinel had one substring false positive
+   (`tmp_verify_tool_render_helpers` in `output.rs`) — renamed to
+   `tmp_verify_tool_rendering_helpers` so the sentinel is literally
+   empty. Gate met: `cargo check` clean (pre-existing `v25_tree`
+   `FlatRow` warning only); full workspace suite green — lib 570 → 561
+   (= exactly slash's 9 tests), slashdot 133, integration 10, 0 failed;
+   P4 sentinels (`SlashKind`, slash fns, `help_view`, `stat_phase`,
+   `engine_esc`, `is_engine_backed`, `model_overlay_entries`,
+   `InputAction::Set*`/`Quit`) empty in `src/`; ported
+   `fuzz_path_completion_preserves_layout` confirmed present.
 5. **P5 — test gap-fill + docs**: add `v25_thinking` tests (set +
    active marker + root row), `v25_persona` tests (set + root row),
    `v25_menu` root-listing test (all commands present, `help`

@@ -244,14 +244,6 @@ pub fn active_model_id(settings: &crate::settings::SettingsStore) -> Option<Stri
 pub enum InputAction {
     /// Submit a normal prompt (text may be empty when the line was cancelled).
     Submit(String),
-    /// Switch model: (provider, model).
-    SetModel(String, String),
-    /// Set thinking level (string form: off | low | med | high).
-    SetThinking(String),
-    /// Set runtime persona (empty string => none).
-    SetPersona(String),
-    /// Quit the session.
-    Quit,
     /// A v2.5 menu committed a value (wrote to shared state / pending_op).
     /// The agent loop processes `menu_submitted` (LiveState sync) and any
     /// `pending_op` after the match; this variant is a no-op so the
@@ -434,11 +426,10 @@ pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMe
 
 // ── Option A: ActiveOverlay enum ───────────────────────────────────────
 
-/// A single overlay "variant" that carries its own pre-computed data so
-/// Tab/Enter/Esc handlers never need to re-query the buffer or re-filter.
-///
-/// Eliminates `kind: u8`, the three parallel match ladders, `help_view`,
-/// `cur_word`/`cur_filter` bridge variables, and the `value_cands` hack.
+/// The input-region overlay currently shown: none, the v2.5 menu frame, or
+/// the prompt-line path-completion popup. Each variant carries its own
+/// pre-computed display data so Tab/Enter/Esc handlers never need to
+/// re-query the buffer.
 pub(crate) enum ActiveOverlay {
     None,
 
@@ -582,25 +573,19 @@ impl Repl {
         self.guard.clone()
     }
 
-    /// Read a multi-line input in raw mode, with inline slash-command overlays.
+    /// Read a multi-line input in raw mode, with the v2.5 slash-menu frame.
     ///
     /// Returns `Some(InputAction::Submit(text))` with the submitted prompt,
-    /// `Some(InputAction::SetModel(p, m))` / `SetThinking(level)` / `Quit` when
-    /// the user accepts an overlay selection, or `None` only on a read error.
-    /// `Ctrl-C` restores the terminal and exits the process.
+    /// `Some(InputAction::MenuDone)` when a v2.5 menu commit wrote shared
+    /// state (no text is treated as a prompt), or `None` only on a read
+    /// error. `Ctrl-C` restores the terminal and exits the process.
     ///
     /// `history` backs `Up`/`Down` navigation and is persisted to disk.
-    /// `Ctrl-C` restores the terminal and exits the process.
     ///
-    /// As the user types a command (`/model`, `/thinking`, `/help`, `/quit`),
-    /// an inline overlay opens in the input region and live-filters as they
-    /// type. The prompt stays in the same position; overlays are dismissed with
-    /// Esc (or any key for `/help`).
-    /// The multi-line input loop. Slash commands (`/model`, `/thinking`,
-    /// `/help`, `/quit`) open an **inline overlay** directly *above* the
-    /// input line. The prompt stays in the same position; overlays are
-    /// dismissed with `Esc` (or any key for `/help`). Any key typed into
-    /// `/help` is passed through to the editor.
+    /// Typing `/` opens the v2.5 menu frame in the input region; keys
+    /// dispatch through the persistent `SlashDotHandle` and `Esc` dismisses
+    /// the frame. Prompt-line Tab completion uses its own `PathComplete`
+    /// overlay.
     ///
     /// The input line sits at `initial_row` — the natural cursor row tracked
     /// by the console `Output` — and is *not* forced to the screen

@@ -2923,7 +2923,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_verify_tool_render_helpers() {
+    fn tmp_verify_tool_rendering_helpers() {
         // line-number gutter stripping
         assert_eq!(strip_read_lineno("   1| fn main()"), "fn main()");
         assert_eq!(strip_read_lineno("  12| let x = a | b;"), "let x = a | b;");

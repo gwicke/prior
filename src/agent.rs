@@ -2511,13 +2511,9 @@ pub(crate) async fn handle_replay(
 /// `provider`/`modelId` when no entry exists; returns `None` otherwise so
 /// the prompt stays empty and the user is not nudged to switch.
 ///
-/// The full `provider:model_id` form is intentional: the `/model`
-/// overlay's fuzzy filter is keyed off `provider`/`display`/`id`/`qualified`
-/// (see `model_overlay_entries` in repl.rs), and the catalog entry's
-/// `qualified()` form is what the Enter handler emits as
-/// `InputAction::SetModel`. Pre-filling the unqualified `model_id` would
-/// only fuzzy-match on the short name and might surface multiple catalog
-/// entries with the same short name under different providers.
+/// The full `provider:model_id` form is intentional: pre-filling the
+/// unqualified `model_id` might surface multiple catalog entries that
+/// share a short name under different providers.
 async fn compute_resume_model_prefill(session: &Session) -> Option<String> {
     let branch = session.get_branch().await;
     // Branch-derived first: covers mid-session `/model` switches recorded
@@ -2660,10 +2656,9 @@ async fn handle_session_command(
                 // setting `config.model` plus rebuilding the agent bypasses the
                 // user's chance to accept/abort/choose. Pending: a slug syntax
                 // that bundles model + thinking into one prefill (see
-                // doc/todo.md). The full `provider:model_id` form is used so the
-                // `/model` overlay's fuzzy filter matches the catalog entry
-                // directly; Enter then dispatches `InputAction::SetModel` and
-                // rebuilds the agent.
+                // doc/todo.md). The full `provider:model_id` form is what the
+                // v2.5 `/model` node resolves directly; Enter commits it to
+                // `LiveState` and the `menu_submitted` sync rebuilds the agent.
                 //
                 // Computed BEFORE moving `new_session` into `*session` because
                 // `compute_resume_model_prefill` takes `&Session`.
@@ -4069,92 +4064,6 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
             continue;
         }
         match action {
-            InputAction::Quit => break,
-            InputAction::SetModel(provider, model) => {
-                let mut new_cfg = config.clone();
-                new_cfg.provider = provider;
-                new_cfg.model = model;
-                match create_agent(new_cfg.clone()).await {
-                    Ok(new_agent) => {
-                        agent = Some(new_agent);
-                        config = new_cfg;
-                        let model_id = format!("{}:{}", config.provider, config.model);
-                        // Push to front, remove duplicates from lower down.
-                        recent_models.retain(|m| m != &model_id);
-                        recent_models.insert(0, model_id);
-                        save_recent_models(&recent_models);
-                        // Log model change to session.
-                        if let Some(ref s) = session {
-                            let _ = s.append_model_change(&config.provider, &config.model).await;
-                        }
-                    }
-                    Err(e) => config
-                        .output
-                        .display_text(&format!("Cannot switch model: {}", e)),
-                }
-            }
-            InputAction::SetThinking(level) => {
-                match level.parse::<thinking::ThinkingLevel>() {
-                    Ok(level) => {
-                        let mut new_cfg = config.clone();
-                        new_cfg.thinking_level = Some(level.as_str().to_string());
-                        match create_agent(new_cfg.clone()).await {
-                            Ok(new_agent) => {
-                                agent = Some(new_agent);
-                                config = new_cfg;
-                                // Log thinking change to session.
-                                if let Some(ref s) = session {
-                                    let _ = s.append_thinking_level_change(config.thinking_level.as_deref().unwrap_or("off")).await;
-                                }
-                            }
-                            Err(e) => {
-                                let msg = format!("Cannot set thinking: {}", e);
-                                config.output.display_plain(&msg);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        config.output.display_plain(&msg);
-                    }
-                }
-            }
-            InputAction::SetPersona(name) => {
-                let mut new_cfg = config.clone();
-                // Empty name (the "none" entry) clears the runtime persona.
-                new_cfg.persona_name = if name.trim().is_empty() {
-                    None
-                } else {
-                    // Resolve now so an unknown name is rejected before rebuild.
-                    match crate::persona::get_persona(&name) {
-                        Some(prompt) => {
-                            new_cfg.persona_prompt = Some(prompt);
-                            Some(name.clone())
-                        }
-                        None => {
-                            config.output.display_plain(&format!(
-                                "Unknown persona '{}' (see /persona for the list)",
-                                name
-                            ));
-                            // Skip the agent rebuild; keep the old persona.
-                            None
-                        }
-                    }
-                };
-                if new_cfg.persona_name.is_some() || name.trim().is_empty() {
-                    match create_agent(new_cfg.clone()).await {
-                        Ok(new_agent) => {
-                            agent = Some(new_agent);
-                            config = new_cfg;
-                            // No confirmation line: the `/persona <name>` input is self-documenting.
-                        }
-                        Err(e) => {
-                            let msg = format!("Cannot set persona: {}", e);
-                            config.output.display_plain(&msg);
-                        }
-                    }
-                }
-            }
             InputAction::MenuDone => {
                 // v2.5 menu committed: the node already wrote to shared state.
                 // `menu_submitted` (LiveState sync) and `pending_op` (async
