@@ -1314,6 +1314,9 @@ pub struct AgentConfig {
     /// Optional path to JSONL file for logging raw messages sent/received.
     /// When Some, messages are appended to this file in JSONL format.
     pub message_log_path: Option<String>,
+    /// Optional custom directory for session storage. When None, the platform
+    /// default is used (e.g., `~/.config/picocode/sessions`).
+    pub sessions_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentConfig {
@@ -3694,7 +3697,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // Session storage: create repo eagerly (just a path, no I/O) for /session
     // overlay, but defer actual session file creation to the first turn
     // to avoid empty sessions.
-    let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
+    let sessions_dir = config.sessions_dir.clone().or_else(|| {
+        crate::platform::app_config_dir().map(|d| d.join("sessions"))
+    });
     let cwd = std::env::current_dir().ok();
     let (mut session, mut repo) = if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
         let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
@@ -6903,6 +6908,11 @@ mod tests {
             shown: shown.clone(),
         };
 
+        // Use a temp directory for session storage to avoid littering the user's config.
+        // tempfile::TempDir cleans up automatically on drop.
+        let sessions_tempdir = tempfile::tempdir().unwrap();
+        let sessions_dir = sessions_tempdir.path().to_path_buf();
+
         let config = AgentConfig {
             provider: "openai".into(),
             model: "gpt-4o".into(),
@@ -6922,6 +6932,7 @@ mod tests {
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
             message_log_path: None,
+            sessions_dir: Some(sessions_dir.clone()),
         };
         let mut settings = SettingsStore::from_agent_config(&config, None);
 
@@ -6934,6 +6945,7 @@ mod tests {
 
         let shown = shown.lock().unwrap().clone();
         let _ = std::fs::remove_file(&host_path);
+        // sessions_tempdir is automatically cleaned up when dropped here
 
         assert!(
             !shown.contains("No such file"),

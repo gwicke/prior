@@ -307,6 +307,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         show_reasoning_handle,
         reasoning_in_context,
         message_log_path: args.log_messages.clone(),
+        sessions_dir: None,
     };
     let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {
