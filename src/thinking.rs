@@ -48,19 +48,49 @@ impl ThinkingLevel {
 /// Map a thinking level to provider-specific `additional_params`.
 /// Returns `None` when thinking is `Off` or the provider is unsupported.
 pub fn mapping(provider: &str, level: ThinkingLevel) -> Option<Value> {
-    if level == ThinkingLevel::Off {
-        return None;
-    }
-    let effort = match level {
-        ThinkingLevel::Low => "low",
-        ThinkingLevel::Med => "medium",
-        ThinkingLevel::High => "high",
-        ThinkingLevel::Off => unreachable!(),
-    };
     match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => Some(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}})),
-        "openai" => Some(json!({"reasoning_effort": effort})),
-        "openrouter" => Some(json!({"reasoning": {"effort": effort}})),
+        "anthropic" => {
+            if level == ThinkingLevel::Off {
+                None
+            } else {
+                Some(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}))
+            }
+        }
+        "openai" => {
+            if level == ThinkingLevel::Off {
+                None
+            } else {
+                let effort = match level {
+                    ThinkingLevel::Low => "low",
+                    ThinkingLevel::Med => "medium",
+                    ThinkingLevel::High => "high",
+                    ThinkingLevel::Off => unreachable!(),
+                };
+                Some(json!({"reasoning_effort": effort}))
+            }
+        }
+        "openrouter" => {
+            if level == ThinkingLevel::Off {
+                None
+            } else {
+                let effort = match level {
+                    ThinkingLevel::Low => "low",
+                    ThinkingLevel::Med => "medium",
+                    ThinkingLevel::High => "high",
+                    ThinkingLevel::Off => unreachable!(),
+                };
+                Some(json!({"reasoning": {"effort": effort}}))
+            }
+        }
+        "xiaomimimo" => {
+            // Xiaomi MiMo 2.6 supports thinking.type = "enabled" | "disabled" (no levels)
+            let thinking_type = if level == ThinkingLevel::Off {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            Some(json!({"thinking": {"type": thinking_type}}))
+        }
         _ => None,
     }
 }
@@ -122,6 +152,28 @@ mod tests {
     fn unsupported_provider_falls_back_to_none() {
         assert!(mapping("groq", ThinkingLevel::High).is_none());
         assert!(mapping("ollama", ThinkingLevel::Low).is_none());
+    }
+
+    #[test]
+    fn xiaomimimo_thinking_enabled_disabled() {
+        // Off maps to disabled
+        assert_eq!(
+            mapping("xiaomimimo", ThinkingLevel::Off),
+            Some(json!({"thinking": {"type": "disabled"}}))
+        );
+        // Any "on" level maps to enabled
+        assert_eq!(
+            mapping("xiaomimimo", ThinkingLevel::Low),
+            Some(json!({"thinking": {"type": "enabled"}}))
+        );
+        assert_eq!(
+            mapping("xiaomimimo", ThinkingLevel::Med),
+            Some(json!({"thinking": {"type": "enabled"}}))
+        );
+        assert_eq!(
+            mapping("xiaomimimo", ThinkingLevel::High),
+            Some(json!({"thinking": {"type": "enabled"}}))
+        );
     }
 
     #[test]
