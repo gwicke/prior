@@ -476,7 +476,7 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in a file. Prefer the following block syntax in the `edits` string:
+        "Replace text in a file. Prefer the `edits` batch string using block syntax:
 ```
 some/path
 @@@OLD
@@ -485,7 +485,7 @@ the original text
 the replacement text
 @@@END
 ```
-You can send many edit blocks in a single `edits` batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
+Multiple blocks are executed as an all-or-nothing batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
 For single edits, the traditional OpenAI path / oldText / newText API is available as well.".into()
     }
 
@@ -513,7 +513,16 @@ For single edits, the traditional OpenAI path / oldText / newText API is availab
                 },
                 "edits": {
                     "type": "string",
-                    "description": "One or more SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `@@@OLD` line, exact text, `@@@NEW`, replacement, `@@@END`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. Preferred over `oldText`/`newText` when making multiple edits."
+                    "description": "Main edit entry point with batching support, using block syntax:
+```
+some/path
+@@@OLD
+the original text
+@@@NEW
+the replacement text
+@@@END
+```
+Multiple blocks are executed as an all-or-nothing batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`)."
                 }
             },
             "required": []
