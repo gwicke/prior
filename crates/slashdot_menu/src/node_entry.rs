@@ -41,8 +41,8 @@ pub enum HostKey {
 /// A lightweight handle (child_idx, row_offset) into a child's
 /// `Rc<DataResponse>.rows` vec. Copy, 8 bytes. Created by `refresh_data`
 /// and `ensure_view`; resolved via `RowRef::resolve`.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RowRef {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowRef {
     pub child_idx: u16,
     pub row_offset: u32,
 }
@@ -747,8 +747,16 @@ impl NodeEntry {
 
         // Fuzzy rank by the remaining flat words.
         let terms = fuzzy_terms.join(" ");
-        let mut ranked: Vec<RowRef> = crate::cursor::rank_row_refs(&filtered, &terms, None)
-            .rows;
+
+        // Collect displayed field names for match index computation.
+        let display_fields: Vec<String> = if !self.inner.columns().is_empty() {
+            self.inner.columns().iter().map(|c| c.field.clone()).collect()
+        } else {
+            vec!["id".to_string(), "description".to_string()]
+        };
+
+        let rank_result = crate::cursor::rank_row_refs(&filtered, &terms, None, &display_fields);
+        let mut ranked: Vec<RowRef> = rank_result.rows;
 
         // Apply explicit sort (overrides fuzzy rank order).
         if let Some((ref sort_field, sort_dir)) = query.sort {
@@ -759,6 +767,7 @@ impl NodeEntry {
             self.content.data_rc.clone(),
             ranked,
             self.content.active_ids.clone(),
+            rank_result.match_indices,
         ));
         self.content.slots_dirty = false;
         self.content.last_key = key;
@@ -957,6 +966,7 @@ impl NodeEntry {
                 })
                 .collect(),
             HashSet::new(),
+            HashMap::new(),
         ));
         self.completion_wrap = Some((Rc::clone(rc), Rc::clone(&view)));
         view
@@ -976,6 +986,7 @@ impl NodeEntry {
             Ok(Rc::new(CompletionRows {
                 rows: Vec::new(),
                 labels: None,
+                match_indices: None,
             }))
         };
         // Word + gate: dot-prefixed, not `..`.
@@ -1008,12 +1019,6 @@ impl NodeEntry {
                 _ => ty.to_string(),
             }
         };
-        let finish = |rows: Vec<Row>| -> Result<Rc<CompletionRows>, DataError> {
-            if rows.is_empty() || rows.iter().all(|r| r.id == word) {
-                return empty();
-            }
-            Ok(Rc::new(CompletionRows { rows, labels: None }))
-        };
         let body = &word[1..];
         match body.find(':') {
             None => {
@@ -1028,33 +1033,75 @@ impl NodeEntry {
                 if !names.iter().any(|n| n == "sort") {
                     names.push("sort".to_string());
                 }
-                let rows = crate::fuzzy::rank_candidates(
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = names
+                    .iter()
+                    .map(|n| {
+                        let owned: String = n.clone();
+                        (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
+                    })
+                    .collect();
+                let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
                     &names,
                     prefix,
-                    |k| k.clone(),
-                    |k| k.clone(),
-                )
-                .into_iter()
-                .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
-                .collect();
-                finish(rows)
+                    |k| k.to_string(),
+                    |k| k.to_string(),
+                    &field_extractors,
+                );
+                let rows: Vec<Row> = ranked
+                    .into_iter()
+                    .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
+                    .collect();
+                let match_indices = if !rows.is_empty() {
+                    let mut map = HashMap::new();
+                    for (idx, name) in names.iter().enumerate() {
+                        let ptr = name as *const String;
+                        if let Some(indices) = match_indices_map.get(&ptr) {
+                            map.insert(idx, indices.clone());
+                        }
+                    }
+                    Some(map)
+                } else {
+                    None
+                };
+                return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
             }
             Some(c) => {
                 let key = &body[..c];
                 let value = &body[c + 1..];
                 // `.sort:` → field names as values (contains filter).
                 if key == "sort" {
-                    let names = field_space.names(true);
-                    let rows = crate::fuzzy::rank_candidates(
+                    let names: Vec<String> = field_space.names(true).into_iter().map(|s| s.to_string()).collect();
+                    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = names
+                        .iter()
+                        .map(|n| {
+                            let owned: String = n.clone();
+                            (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
+                        })
+                        .collect();
+                    let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
                         &names,
                         value,
                         |f| f.to_string(),
                         |f| f.to_string(),
-                    )
-                    .into_iter()
-                    .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
-                    .collect();
-                    return finish(rows);
+                        &field_extractors,
+                    );
+                    let rows: Vec<Row> = ranked
+                        .into_iter()
+                        .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
+                        .collect();
+                    let match_indices = if !rows.is_empty() {
+                        let mut map = HashMap::new();
+                        for (idx, name) in names.iter().enumerate() {
+                            let ptr = name as *const String;
+                            if let Some(indices) = match_indices_map.get(&ptr) {
+                                map.insert(idx, indices.clone());
+                            }
+                        }
+                        Some(map)
+                    } else {
+                        None
+                    };
+                    return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
                 }
                 // Unknown key → no dialog (word stays positional).
                 let Some(spec) = field_space.spec(key) else {
@@ -1079,16 +1126,44 @@ impl NodeEntry {
                         }
                     }
                 }
-                let rows = crate::fuzzy::rank_candidates(
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = values
+                    .iter()
+                    .map(|v| {
+                        let owned: String = v.clone();
+                        (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
+                    })
+                    .collect();
+                let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
                     &values,
                     value,
                     |s| s.clone(),
                     |s| s.clone(),
-                )
-                .into_iter()
-                .map(|v| Row::new(format!(".{}:{}", key, v)).desc("string"))
-                .collect();
-                finish(rows)
+                    &field_extractors,
+                );
+                let rows: Vec<Row> = ranked
+                    .into_iter()
+                    .map(|v| Row::new(format!(".{}:{}", key, v)).desc("string"))
+                    .collect();
+                // Exact match check: if all rows have the same id as the typed word, return empty (closes dialog).
+                let all_exact = !rows.is_empty() && rows.iter().all(|r| r.id == word);
+                let (final_rows, final_match_indices) = if all_exact {
+                    (Vec::new(), None)
+                } else {
+                    let match_indices = if !rows.is_empty() {
+                        let mut map = HashMap::new();
+                        for (idx, val) in values.iter().enumerate() {
+                            let ptr = val as *const String;
+                            if let Some(indices) = match_indices_map.get(&ptr) {
+                                map.insert(idx, indices.clone());
+                            }
+                        }
+                        Some(map)
+                    } else {
+                        None
+                    };
+                    (rows, match_indices)
+                };
+                return Ok(Rc::new(CompletionRows { rows: final_rows, labels: None, match_indices: final_match_indices }));
             }
         }
     }
@@ -2373,6 +2448,7 @@ mod tests {
             Ok(Rc::new(CompletionRows {
                 rows: self.rows.clone(),
                 labels: None,
+                match_indices: None,
             }))
         }
 

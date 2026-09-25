@@ -396,6 +396,147 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
     pad(&with_ell, width, align)
 }
 
+/// Extract a snippet from `cell` centered around `match_indices` (byte offsets).
+/// Returns the snippet, or the original cell if no indices or cell fits in width.
+/// The snippet will be at most `max_width` visible columns.
+pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) -> String {
+    if match_indices.is_empty() {
+        return cell.to_string();
+    }
+    let cell_width = display_width(cell);
+    if cell_width <= max_width {
+        return cell.to_string();
+    }
+
+    // Build maps: byte index -> char index, char index -> byte index, char index -> visible width.
+    let mut byte_to_char = Vec::with_capacity(cell.len() + 1);
+    let mut char_to_byte = Vec::new();
+    let mut char_to_visible = Vec::new();
+    let mut visible = 0;
+    char_to_byte.push(0);
+    char_to_visible.push(0);
+    
+    let mut char_idx = 0;
+    for (byte_idx, c) in cell.char_indices() {
+        // Fill byte_to_char for bytes before this char
+        while byte_to_char.len() <= byte_idx {
+            byte_to_char.push(char_idx);
+        }
+        char_to_byte.push(byte_idx);
+        let cw = char_width(c);
+        visible += cw;
+        char_to_visible.push(visible);
+        char_idx += 1;
+    }
+    // Fill remaining byte_to_char entries
+    while byte_to_char.len() <= cell.len() {
+        byte_to_char.push(char_idx);
+    }
+    // Add end position
+    char_to_byte.push(cell.len());
+    char_to_visible.push(visible);
+
+    // Find the character range covering all match indices.
+    let mut min_char = usize::MAX;
+    let mut max_char = 0;
+    for &byte_idx in match_indices {
+        if byte_idx < byte_to_char.len() {
+            let c_idx = byte_to_char[byte_idx];
+            min_char = min_char.min(c_idx);
+            max_char = max_char.max(c_idx);
+        }
+    }
+    if min_char == usize::MAX {
+        return cell.to_string();
+    }
+
+    // We want to show context around the matches. Aim for a window of
+    // max_width, centered on the match range.
+    let match_range_vis = char_to_visible[max_char + 1].saturating_sub(char_to_visible[min_char]);
+    let context = max_width.saturating_sub(match_range_vis).min(40); // cap context at 40 cols
+    let left_context = context / 2;
+    let right_context = context - left_context;
+
+    let start_vis = char_to_visible[min_char].saturating_sub(left_context);
+    let end_vis = (char_to_visible[max_char + 1] + right_context).min(cell_width);
+
+    // Find character boundaries for the visible range.
+    let mut start_char = 0;
+    let mut end_char = char_to_visible.len() - 1;
+    for (i, &v) in char_to_visible.iter().enumerate() {
+        if v >= start_vis && start_char == 0 {
+            start_char = i;
+        }
+        if v >= end_vis {
+            end_char = i;
+            break;
+        }
+    }
+
+    let start_byte = char_to_byte[start_char];
+    let end_byte = char_to_byte[end_char];
+    let snippet = &cell[start_byte..end_byte];
+    let mut result = String::new();
+
+    // Add leading ellipsis if we trimmed the start.
+    if start_byte > 0 {
+        result.push('…');
+    }
+    result.push_str(snippet);
+    // Add trailing ellipsis if we trimmed the end.
+    if end_byte < cell.len() {
+        result.push('…');
+    }
+
+    // If the snippet with ellipses is still too wide, truncate it.
+    if display_width(&result) > max_width {
+        // Fall back to simple truncation.
+        return fit(cell, max_width, Align::Left, '…');
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::*;
+
+    #[test]
+    fn snippet_no_indices_returns_original() {
+        let cell = "hello world";
+        assert_eq!(extract_snippet(cell, &[], 20), "hello world");
+    }
+
+    #[test]
+    fn snippet_fits_in_width_returns_original() {
+        let cell = "hello world";
+        assert_eq!(extract_snippet(cell, &[6], 20), "hello world");
+    }
+
+    #[test]
+    fn snippet_extracts_around_match() {
+        let cell = "this is a very long path with many directories";
+        // "path" starts at byte 18
+        let path_start = cell.find("path").unwrap();
+        let indices = (path_start..path_start+4).collect::<Vec<_>>();
+        // Use wider width to ensure we can see "path" with context
+        let snippet = extract_snippet(cell, &indices, 35);
+        assert!(snippet.contains("path"), "snippet: {}", snippet);
+        assert!(snippet.len() <= 37); // 35 + 2 ellipsis
+    }
+
+    #[test]
+    fn snippet_handles_unicode() {
+        let cell = "path/to/日本語/dir";
+        // "日本語" starts at byte 8
+        let match_start = cell.find("日本語").unwrap();
+        let match_end = match_start + "日本語".len();
+        let indices: Vec<usize> = (match_start..match_end).collect();
+        let snippet = extract_snippet(cell, &indices, 15);
+        assert!(snippet.contains("日本語"), "snippet: {}", snippet);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

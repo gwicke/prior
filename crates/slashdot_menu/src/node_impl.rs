@@ -130,6 +130,8 @@ pub struct DataError {
 /// Result type for `data()`.
 pub type DataResult = Result<std::rc::Rc<DataResponse>, DataError>;
 
+use std::collections::HashMap;
+
 /// Completion payload (implicit-open auto-complete): candidate rows +
 /// optional dialog column labels for (id, description). Plain owned
 /// data — `Clone`/`Send`, so it can cross the prose-completion worker
@@ -138,6 +140,9 @@ pub type DataResult = Result<std::rc::Rc<DataResponse>, DataError>;
 pub struct CompletionRows {
     pub rows: Vec<Row>,
     pub labels: Option<(String, String)>,
+    /// Per-row match indices for fuzzy highlighting: row_index → (field_name → byte indices).
+    /// Only populated for string columns that are displayed and have fuzzy terms.
+    pub match_indices: Option<HashMap<usize, HashMap<String, Vec<usize>>>>,
 }
 
 /// Outcome of `submit()` / `prepare()`.
@@ -254,6 +259,7 @@ pub trait SlashDotNode {
         Ok(std::rc::Rc::new(CompletionRows {
             rows: Vec::new(),
             labels: None,
+            match_indices: None,
         }))
     }
 

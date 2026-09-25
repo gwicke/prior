@@ -5,6 +5,8 @@
 //! R8-5). Exact-token preselection and fuzzy-unique auto-jumps are one
 //! generic rule.
 
+use std::collections::HashMap;
+
 use fuzzy_matcher::FuzzyMatcher;
 
 use crate::fields::Row;
@@ -81,6 +83,9 @@ pub(crate) struct RankRefResult {
     pub(crate) rows: Vec<RowRef>,
     pub(crate) _active: usize,
     pub(crate) _pinned_survived: bool,
+    /// Per-row match indices: RowRef → (field_name → match byte indices).
+    /// Only populated for string columns that were requested.
+    pub(crate) match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
 }
 
 /// Rank `candidates` (RowRef handles with pre-resolved Row references)
@@ -92,12 +97,40 @@ pub(crate) struct RankRefResult {
 /// remaining fuzzy matches by score (§4: "exact token pre-selection").
 /// Pin: if `selection` is present and still in the filtered view, it
 /// becomes the active index; otherwise active defaults to 0.
+///
+/// `display_fields` specifies which row fields to compute match indices for.
+/// These should be the fields that appear as string columns in the table.
 pub(crate) fn rank_row_refs(
     candidates: &[(RowRef, &Row)],
     terms: &str,
     selection: Option<&str>,
+    display_fields: &[String],
 ) -> RankRefResult {
-    let ranked: Vec<RowRef> = crate::fuzzy::rank_candidates(
+    // Build field extractors for match index computation.
+    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)> = display_fields
+        .iter()
+        .filter_map(|f| {
+            match f.as_str() {
+                "id" => Some(("id".to_string(), Box::new(|(_, row): &(RowRef, &Row)| row.id.clone()) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)),
+                "description" => Some(("description".to_string(), Box::new(|(_, row): &(RowRef, &Row)| row.description.clone().unwrap_or_default()) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)),
+                _ => {
+                    // Custom field - extract from row.fields
+                    let field_name = f.clone();
+                    Some((f.clone(), Box::new(move |(_, row): &(RowRef, &Row)| {
+                        row.fields.iter()
+                            .find(|(k, _)| k == &field_name)
+                            .map(|(_, v)| match v {
+                                crate::value::Value::Str(s) => s.clone(),
+                                crate::value::Value::Num(n) => crate::value::fmt_num(*n),
+                            })
+                            .unwrap_or_default()
+                    }) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>))
+                }
+            }
+        })
+        .collect();
+
+    let (ranked_items, match_indices_map) = crate::fuzzy::rank_candidates(
         candidates,
         terms,
         |(_, row)| row.id.clone(),
@@ -105,13 +138,23 @@ pub(crate) fn rank_row_refs(
             Some(d) => format!("{} {}", row.id, d),
             None => row.id.clone(),
         },
-    )
-    .into_iter()
-    .map(|(rref, _)| *rref)
-    .collect();
+        &field_extractors,
+    );
+
+    let ranked: Vec<RowRef> = ranked_items.into_iter().map(|(rref, _)| *rref).collect();
+
+    // Convert match_indices_map (keyed by *const T where T = &(RowRef, &Row))
+    // to HashMap<RowRef, ...>. The key in match_indices_map is *const &(RowRef, &Row).
+    // We need to get the pointer to the original slice element.
+    let mut match_indices = HashMap::new();
+    for item in candidates {
+        let ptr = item as *const (RowRef, &Row);
+        if let Some(indices) = match_indices_map.get(&ptr) {
+            match_indices.insert(item.0, indices.clone());
+        }
+    }
 
     let pinned_idx = selection.and_then(|sel| {
-        // Find the matching candidate's RowRef, then find its position in ranked.
         candidates
             .iter()
             .find(|(_, row)| row.id == sel)
@@ -129,6 +172,7 @@ pub(crate) fn rank_row_refs(
         rows: ranked,
         _active: active,
         _pinned_survived: survived,
+        match_indices,
     }
 }
 
@@ -219,7 +263,7 @@ mod tests {
             (mk(2), &short),
             (mk(3), &mid),
         ];
-        let ranked = rank_row_refs(&candidates, "mod", None).rows;
+        let ranked = rank_row_refs(&candidates, "mod", None, &["id".to_string(), "description".to_string()]).rows;
         let order: Vec<u32> = ranked.iter().map(|r| r.row_offset).collect();
         assert_eq!(
             order,

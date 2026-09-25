@@ -32,7 +32,7 @@ pub mod wrap;
 
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle, SlashDotMenuNode};
-pub use node_entry::HostKey;
+pub use node_entry::{HostKey, RowRef};
 pub use node_impl::{SlashDotNode, MenuResult, PathArgs, RenderContext, CompletionRows, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
 pub use fields::ColumnDef;
 pub use render::LogicalLine;

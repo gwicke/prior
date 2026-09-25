@@ -18,6 +18,7 @@
 //! convenience. `Enter`/`Esc` never reach this layer — the surrounding
 //! input loop keeps their semantics (submit / no-op).
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -221,7 +222,20 @@ impl PromptCompletion {
                         self.view.reset();
                     } else {
                         let rc = Rc::new(rows);
-                        let vrows = ViewRows::of(rc.rows.clone());
+                        let vrows = if let Some(ref match_indices) = rc.match_indices {
+                            // Convert from row index to RowRef key
+                            let mut map = HashMap::new();
+                            for (idx, indices) in match_indices {
+                                let rref = crate::slashdot_menu::RowRef {
+                                    child_idx: 0,
+                                    row_offset: *idx as u32,
+                                };
+                                map.insert(rref, indices.clone());
+                            }
+                            ViewRows::of_with_match_indices(rc.rows.clone(), map)
+                        } else {
+                            ViewRows::of(rc.rows.clone())
+                        };
                         self.last = Some((w, rc, vrows));
                     }
                 }
@@ -411,6 +425,7 @@ mod tests {
         CompletionRows {
             rows: ids.iter().map(|i| Row::new(*i)).collect(),
             labels: Some(("Path".into(), "Description".into())),
+            match_indices: None,
         }
     }
 
@@ -572,7 +587,7 @@ mod tests {
         assert_eq!(selected(&pc.eval(&mut ed, HostKey::MoveCursor(1), ctx())), Some(1));
 
         // Re-run comes back all-exact ⇒ empty ⇒ dismissed (Idle).
-        res.send(("./only".into(), CompletionRows { rows: Vec::new(), labels: None }))
+        res.send(("./only".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
             .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
 
@@ -612,7 +627,7 @@ mod tests {
         idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
         assert_eq!(ed.text(), "./file.txt");
 
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None }))
+        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
             .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         assert_eq!(ed.text(), "./file.txt ", "trailing space appended");
@@ -657,7 +672,7 @@ mod tests {
 
         // User types on before the re-run lands: expansion void.
         ed.insert('x');
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None }))
+        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
             .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         assert_eq!(ed.text(), "./file.txtx", "no space for a void expansion");
@@ -673,7 +688,7 @@ mod tests {
         idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
         assert_eq!(ed.text(), "./file.txt ");
 
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None }))
+        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
             .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         // Should consume the existing space, not add a second one

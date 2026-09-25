@@ -269,6 +269,7 @@ impl SlashDotNode for AddSandboxMappingNode {
             Rc::new(CompletionRows {
                 rows: Vec::new(),
                 labels: None,
+                match_indices: None,
             })
         };
         let Some(word_range) = args.word_before(cursor_pos) else {
@@ -291,7 +292,7 @@ impl SlashDotNode for AddSandboxMappingNode {
             }
         }
 
-        let entries = crate::path_complete::complete(&word, sandbox);
+        let (entries, _) = crate::path_complete::complete(&word, sandbox);
         // Exactness: every candidate byte-equal to the word ⇒ nothing
         // left to complete (engine appends the trailing space on Tab;
         // a passive frame shows no dialog).
@@ -308,7 +309,7 @@ impl SlashDotNode for AddSandboxMappingNode {
             if sandbox { "Sandbox path" } else { "Host path" }.to_string(),
             "Description".to_string(),
         ));
-        let rc = Rc::new(CompletionRows { rows, labels });
+        let rc = Rc::new(CompletionRows { rows, labels, match_indices: None });
         self.last_rows = Some((arg_idx, word, Rc::clone(&rc)));
         Ok(rc)
     }
