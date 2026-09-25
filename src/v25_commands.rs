@@ -21,6 +21,29 @@ mod tests {
         futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
 
+    /// Rendered row texts with ANSI SGR escapes stripped (fuzzy highlighting).
+    fn row_texts(plan: &crate::slashdot_menu::render::RenderPlan) -> Vec<String> {
+        plan.rows
+            .iter()
+            .map(|l| {
+                let mut s = String::new();
+                let mut chars = l.0.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\x1b' {
+                        for e in chars.by_ref() {
+                            if e.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    s.push(c);
+                }
+                s
+            })
+            .collect()
+    }
+
     // -----------------------------------------------------------------------
     // ThinkingEnumNode — single node returning all four levels.
     // -----------------------------------------------------------------------
@@ -200,13 +223,12 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "thinking h", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
-                assert!(row_texts.iter().any(|t| t.contains("high")));
-                assert!(!row_texts.iter().any(|t| t.contains("off")));
-                assert!(!row_texts.iter().any(|t| t.contains("low")));
-                assert!(!row_texts.iter().any(|t| t.contains("med")));
-                assert!(!row_texts.iter().any(|t| t.contains("max")));
+                let rows = row_texts(&plan);
+                assert!(rows.iter().any(|t| t.contains("high")));
+                assert!(!rows.iter().any(|t| t.contains("off")));
+                assert!(!rows.iter().any(|t| t.contains("low")));
+                assert!(!rows.iter().any(|t| t.contains("med")));
+                assert!(!rows.iter().any(|t| t.contains("max")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }

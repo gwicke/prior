@@ -1492,8 +1492,7 @@ mod tests {
         let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts = rows_of(MenuResult::Continue(plan, String::new()));
                 assert!(row_texts.iter().any(|t| t.contains("alpha")));
                 assert!(!row_texts.iter().any(|t| t.contains("beta")));
             }
@@ -1822,8 +1821,7 @@ mod tests {
         let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts = rows_of(MenuResult::Continue(plan, String::new()));
                 assert!(row_texts.iter().any(|t| t.contains("gpt4o")));
                 assert!(row_texts.iter().any(|t| t.contains("gpt4-mini")));
                 assert!(!row_texts.iter().any(|t| t.contains("opus")));
@@ -1971,18 +1969,17 @@ mod tests {
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // "bind" fuzzy-matches both binding rows but not "add".
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", &rctx()));
-        match result {
-            MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
-                assert!(!row_texts.iter().any(|t| t.contains("add")));
-                assert!(row_texts.iter().any(|t| t.contains("bind1")));
-                assert!(row_texts.iter().any(|t| t.contains("bind2")));
-                assert_eq!(row_texts.len(), 2);
-            }
-            other => panic!("expected Continue, got {:?}", other),
-        }
+        let row_texts = rows_of(futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "bind",
+            &rctx(),
+        )));
+        assert!(!row_texts.iter().any(|t| t.contains("add")));
+        assert!(row_texts.iter().any(|t| t.contains("bind1")));
+        assert!(row_texts.iter().any(|t| t.contains("bind2")));
+        assert_eq!(row_texts.len(), 2);
     }
 
     #[test]

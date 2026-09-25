@@ -400,107 +400,127 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
 const MATCH_HIGHLIGHT_START: &str = "\x1b[1;35m"; // bold magenta
 const MATCH_HIGHLIGHT_END: &str = "\x1b[0m";
 
-/// Extract a snippet from `cell` centered around `match_indices` (byte offsets).
-/// Returns the snippet, or the original cell if no indices or cell fits in width.
-/// The snippet will be at most `max_width` visible columns (excluding ANSI codes).
-/// Matched characters are highlighted with ANSI escape codes.
+/// Extract a snippet from `cell` centered on `match_indices` (byte offsets),
+/// at most `max_width` visible columns wide (ANSI codes excluded), with the
+/// matched characters highlighted.
+///
+/// The window is chosen to use the *full* available width even when the match
+/// sits at the very start or end of the cell (asymmetric context): the slack
+/// the match cannot use on one side is re-allocated to the other. A `…` is
+/// emitted for each side that was trimmed, reserving a column for it.
 pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) -> String {
     if match_indices.is_empty() {
         return cell.to_string();
     }
     let cell_width = display_width(cell);
     if cell_width <= max_width {
-        // Still apply highlighting even if it fits
+        // Fits: highlight in place.
         return highlight_matches(cell, match_indices);
     }
 
-    // Build maps: byte index -> char index, char index -> byte index, char index -> visible width.
-    let mut byte_to_char = Vec::with_capacity(cell.len() + 1);
-    let mut char_to_byte = Vec::new();
-    let mut char_to_visible = Vec::new();
+    // Per-character tables: byte → char index, char → byte index / visible col.
+    let chars: Vec<char> = cell.chars().collect();
+    let mut byte_to_char = vec![0usize; cell.len() + 1];
+    let mut char_to_byte = Vec::with_capacity(chars.len() + 1);
+    let mut char_to_visible = Vec::with_capacity(chars.len() + 1);
     let mut visible = 0;
     char_to_byte.push(0);
     char_to_visible.push(0);
-    
-    let mut char_idx = 0;
-    for (byte_idx, c) in cell.char_indices() {
-        // Fill byte_to_char for bytes before this char
-        while byte_to_char.len() <= byte_idx {
-            byte_to_char.push(char_idx);
-        }
-        char_to_byte.push(byte_idx);
-        let cw = char_width(c);
+    for (i, c) in chars.iter().enumerate() {
+        let byte_idx = char_to_byte[i];
+        byte_to_char[byte_idx] = i;
+        let cw = char_width(*c);
         visible += cw;
+        char_to_byte.push(byte_idx + c.len_utf8());
         char_to_visible.push(visible);
-        char_idx += 1;
     }
-    // Fill remaining byte_to_char entries
-    while byte_to_char.len() <= cell.len() {
-        byte_to_char.push(char_idx);
-    }
-    // Add end position
-    char_to_byte.push(cell.len());
-    char_to_visible.push(visible);
+    let n_chars = chars.len();
 
-    // Find the character range covering all match indices.
-    let mut min_char = usize::MAX;
-    let mut max_char = 0;
-    for &byte_idx in match_indices {
-        if byte_idx < byte_to_char.len() {
-            let c_idx = byte_to_char[byte_idx];
-            min_char = min_char.min(c_idx);
-            max_char = max_char.max(c_idx);
+    // Matched char set.
+    let mut matched = std::collections::HashSet::new();
+    for &b in match_indices {
+        if b < byte_to_char.len() {
+            matched.insert(byte_to_char[b]);
         }
     }
-    if min_char == usize::MAX {
-        return cell.to_string();
-    }
 
-    // We want to show context around the matches. Aim for a window of
-    // max_width, centered on the match range. Use the full available width.
-    let match_range_vis = char_to_visible[max_char + 1].saturating_sub(char_to_visible[min_char]);
-    let context = max_width.saturating_sub(match_range_vis);
-    let left_context = context / 2;
-    let right_context = context - left_context;
+    // Match span in visible columns.
+    let ms = char_to_visible
+        .iter()
+        .enumerate()
+        .find(|(i, _)| matched.contains(i))
+        .map(|(i, _)| char_to_visible[i])
+        .unwrap_or(0);
+    let me = char_to_visible
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, _)| matched.contains(i))
+        .map(|(i, _)| char_to_visible[i + 1])
+        .unwrap_or(cell_width);
+    let match_w = me.saturating_sub(ms);
 
-    let start_vis = char_to_visible[min_char].saturating_sub(left_context);
-    let end_vis = (char_to_visible[max_char + 1] + right_context).min(cell_width);
-
-    // Find character boundaries for the visible range.
-    let mut start_char = 0;
-    let mut end_char = char_to_visible.len() - 1;
-    for (i, &v) in char_to_visible.iter().enumerate() {
-        if v >= start_vis && start_char == 0 {
-            start_char = i;
+    // Choose a visible-column window [w_start, w_end) covering the match.
+    let budget = max_width;
+    let mut w_start;
+    let mut w_end;
+    if match_w >= budget {
+        // Match alone fills (or exceeds) the budget: show from its start.
+        w_start = ms;
+        w_end = (ms + budget).min(cell_width);
+    } else {
+        let slack = budget - match_w;
+        w_start = ms.saturating_sub(slack / 2);
+        w_end = (me + (slack - (ms - w_start))).min(cell_width);
+        // Re-flow the slack the match could not use on one side to the other
+        // so near-edge matches still fill the width (no early truncation).
+        w_start = w_start.saturating_sub(budget.saturating_sub(w_end - w_start));
+        if w_end < cell_width {
+            w_end = (w_start + budget).min(cell_width);
         }
-        if v >= end_vis {
-            end_char = i;
+    }
+    // Account for ellipses (one column each) and trim to fit `max_width`.
+    loop {
+        let le = (w_start > 0) as usize;
+        let re = (w_end < cell_width) as usize;
+        let total = (w_end - w_start) + le + re;
+        if total <= max_width {
             break;
         }
+        let over = total - max_width;
+        if w_end == cell_width {
+            w_start += over;
+        } else {
+            w_end = w_end.saturating_sub(over);
+        }
     }
 
-    let start_byte = char_to_byte[start_char];
-    let end_byte = char_to_byte[end_char];
-    let snippet = &cell[start_byte..end_byte];
+    // Visible cols → char boundaries.
+    let start_char = char_to_visible.iter().position(|&v| v >= w_start).unwrap_or(0);
+    let end_char = char_to_visible.iter().position(|&v| v >= w_end).unwrap_or(n_chars);
+
     let mut result = String::new();
-
-    // Add leading ellipsis if we trimmed the start.
-    if start_byte > 0 {
+    if start_char > 0 {
         result.push('…');
     }
-    // Apply highlighting to the snippet
-    result.push_str(&highlight_matches(snippet, match_indices));
-    // Add trailing ellipsis if we trimmed the end.
-    if end_byte < cell.len() {
+    let mut in_match = false;
+    for (i, c) in chars.iter().enumerate().take(end_char).skip(start_char) {
+        let is_matched = matched.contains(&i);
+        if is_matched && !in_match {
+            result.push_str(MATCH_HIGHLIGHT_START);
+            in_match = true;
+        } else if !is_matched && in_match {
+            result.push_str(MATCH_HIGHLIGHT_END);
+            in_match = false;
+        }
+        result.push(*c);
+    }
+    if in_match {
+        result.push_str(MATCH_HIGHLIGHT_END);
+    }
+    if end_char < n_chars {
         result.push('…');
     }
-
-    // If the snippet with ellipses is still too wide, truncate it.
-    if display_width(&result) > max_width {
-        // Fall back to simple truncation with highlighting.
-        return highlight_matches(&fit(cell, max_width, Align::Left, '…'), match_indices);
-    }
-
     result
 }
 
@@ -572,22 +592,42 @@ mod snippet_tests {
     }
 
     #[test]
-    fn snippet_extracts_around_match() {
+    fn snippet_extracts_around_match_within_budget() {
         let cell = "this is a very long path with many directories";
-        // "path" starts at byte 18
         let path_start = cell.find("path").unwrap();
-        let indices = (path_start..path_start+4).collect::<Vec<_>>();
-        // Use wider width to ensure we can see "path" with context
+        let indices = (path_start..path_start + 4).collect::<Vec<_>>();
         let snippet = extract_snippet(cell, &indices, 35);
         assert!(snippet.contains("path"), "snippet: {}", snippet);
-        // Check visual width (excluding ANSI codes) is within bounds
-        assert!(display_width(&snippet) <= 37, "visual width: {}", display_width(&snippet));
+        assert!(display_width(&snippet) <= 35, "visual width: {}", display_width(&snippet));
+    }
+
+    #[test]
+    fn snippet_match_at_start_fills_full_width() {
+        // A match at the very beginning must not leave the right half empty:
+        // the slack the match cannot use on the left is re-allocated right.
+        let cell = "model_with_a_very_long_suffix_indeed";
+        let indices = vec![0, 1, 2, 3, 4];
+        let snippet = extract_snippet(cell, &indices, 20);
+        assert!(snippet.starts_with("\x1b[1;35mmodel"), "snippet: {:?}", snippet);
+        // No leading ellipsis (nothing trimmed at the start) and full width used.
+        assert!(!snippet.starts_with('…'));
+        assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
+    }
+
+    #[test]
+    fn snippet_match_at_end_fills_full_width() {
+        let cell = "a_very_long_prefix_then_model";
+        let m = cell.find("model").unwrap();
+        let indices: Vec<usize> = (m..m + 5).collect();
+        let snippet = extract_snippet(cell, &indices, 20);
+        assert!(snippet.ends_with("model\x1b[0m"), "snippet: {:?}", snippet);
+        assert!(snippet.starts_with('…'));
+        assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
     }
 
     #[test]
     fn snippet_handles_unicode() {
         let cell = "path/to/日本語/dir";
-        // "日本語" starts at byte 8
         let match_start = cell.find("日本語").unwrap();
         let match_end = match_start + "日本語".len();
         let indices: Vec<usize> = (match_start..match_end).collect();

@@ -330,49 +330,46 @@ impl RowView {
             col_field_names.iter().map(|s| s.as_str()).collect()
         };
 
-        // First pass: collect full cell content for all rows to compute column widths.
         let width = render_ctx.term_width.saturating_sub(2);
-        let mut all_cells: Vec<Vec<String>> = Vec::new();
-        let mut row_refs: Vec<RowRef> = Vec::new();
-        let mut active_rows = Vec::new();
+        // Wrapping vs single-line is decided by the columndefs; when there
+        // are none, the implicit id/description pair wraps (matching today).
+        let use_wrap = columns.iter().all(|c| c.wrap);
 
-        for (i, (row, active)) in view.iter().enumerate() {
-            if active {
-                active_rows.push(i);
+        // Two-pass when single-line: compute column widths from the raw
+        // (unhighlighted) cells first, so snippet extraction can target the
+        // exact budget a cell will be rendered into. The wrap path needs no
+        // snippet (wrapping handles overflow), so it stays single-pass.
+        let col_widths: Vec<usize> = if use_wrap {
+            Vec::new()
+        } else {
+            let mut temp = Table::new(&header_labels).set_gap(2);
+            if !columns.is_empty() {
+                let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+                let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+                let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+                temp = temp.with_aligns(&aligns)
+                    .with_min_widths(&mins)
+                    .with_priorities(&prios);
             }
-            row_refs.push(view.order[i]);
-            let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
-            for k in &col_field_names {
-                cells.push(
-                    row.field_display(k)
-                        .or_else(|| {
-                            row_field_value(row, k).map(|v| match v {
-                                crate::value::Value::Str(s) => s,
-                                crate::value::Value::Num(n) => crate::value::fmt_num(n),
+            for (row, _active) in view.iter() {
+                let raw: Vec<String> = col_field_names
+                    .iter()
+                    .map(|k| {
+                        row.field_display(k)
+                            .or_else(|| {
+                                row_field_value(row, k).map(|v| match v {
+                                    crate::value::Value::Str(s) => s,
+                                    crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                                })
                             })
-                        })
-                        .unwrap_or_default(),
-                );
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                temp.add_row(&raw);
             }
-            all_cells.push(cells);
-        }
+            temp.column_widths(width)
+        };
 
-        // Build a temporary table to compute column widths.
-        let mut temp_table = Table::new(&header_labels).set_gap(2);
-        if !columns.is_empty() {
-            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
-            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
-            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-            temp_table = temp_table.with_aligns(&aligns)
-                .with_min_widths(&mins)
-                .with_priorities(&prios);
-        }
-        for cells in &all_cells {
-            temp_table.add_row(cells);
-        }
-        let col_widths = temp_table.column_widths(width);
-
-        // Second pass: extract snippets using computed column widths.
         let mut t = Table::new(&header_labels).set_gap(2);
         if !columns.is_empty() {
             let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
@@ -382,37 +379,40 @@ impl RowView {
                 .with_min_widths(&mins)
                 .with_priorities(&prios);
         }
-        for (row_idx, cells) in all_cells.into_iter().enumerate() {
-            let rref = &row_refs[row_idx];
-            let match_indices = view.match_indices(rref);
-            let mut final_cells = Vec::with_capacity(cells.len());
-            for (col_idx, cell) in cells.into_iter().enumerate() {
-                let field_name = col_field_names.get(col_idx).cloned().unwrap_or_default();
-                let cell_width = display_width(&cell);
-                let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
-                
-                // Determine if this column wraps: explicit ColumnDef.wrap or default false
-                let is_wrapping = if !columns.is_empty() {
-                    columns.get(col_idx).map(|c| c.wrap).unwrap_or(false)
-                } else {
-                    false // default columns don't wrap
-                };
-                
-                let snippet = if !columns.is_empty() {
-                    // Only apply highlighting/snippet for explicitly defined columns.
-                    // Default columns (id, description) keep raw text for test compatibility.
-                    if let Some(indices_map) = match_indices {
-                        if let Some(indices) = indices_map.get(&field_name) {
-                            // Only apply snippet extraction for non-wrapping columns that would truncate
-                            let should_snippet = cell_width > col_w && col_w > 0 && !is_wrapping;
-                            if should_snippet {
-                                extract_snippet(&cell, indices, col_w)
-                            } else {
-                                // For wrapping columns or cells that fit: apply highlighting
-                                highlight_matches(&cell, indices)
-                            }
+        let mut active_rows = Vec::new();
+        for (i, (row, active)) in view.iter().enumerate() {
+            if active {
+                active_rows.push(i);
+            }
+            let rref = view.order[i];
+            let match_indices = view.match_indices(&rref);
+            let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
+            for (col_idx, k) in col_field_names.iter().enumerate() {
+                let cell = row.field_display(k)
+                    .or_else(|| {
+                        row_field_value(row, k).map(|v| match v {
+                            crate::value::Value::Str(s) => s,
+                            crate::value::Value::Num(n) => crate::value::fmt_num(n),
+                        })
+                    })
+                    .unwrap_or_default();
+
+                // Highlight fuzzy matches on every string column (explicit
+                // ColumnDefs and the implicit id/description pair alike).
+                let cell = if let Some(indices_map) = match_indices {
+                    if let Some(indices) = indices_map.get(k) {
+                        // Single-line column whose content would truncate:
+                        // extract a snippet centered on the matches (and
+                        // highlight it). Otherwise highlight in place (the
+                        // wrap path renders the whole cell).
+                        let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
+                        if !use_wrap
+                            && col_w > 0
+                            && display_width(&cell) > col_w
+                        {
+                            extract_snippet(&cell, indices, col_w)
                         } else {
-                            cell
+                            highlight_matches(&cell, indices)
                         }
                     } else {
                         cell
@@ -420,9 +420,9 @@ impl RowView {
                 } else {
                     cell
                 };
-                final_cells.push(snippet);
+                cells.push(cell);
             }
-            t.add_row(&final_cells);
+            t.add_row(&cells);
         }
 
         let table_header = if has_table_header {
@@ -432,7 +432,6 @@ impl RowView {
         } else {
             None
         };
-        let use_wrap = columns.iter().all(|c| c.wrap);
         let lines: Vec<LogicalLine> = if use_wrap {
             t.render_multiline(width)
         } else {
