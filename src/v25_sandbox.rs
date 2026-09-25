@@ -14,6 +14,7 @@
 //! Mutations go through the `sandbox` control target (`SandboxOp`) — the
 //! agent loop owns the applied `config`, so it performs the mutation +
 //! re-publish at the cycle point.
+use std::sync::Arc;
 
 use std::rc::Rc;
 
@@ -416,7 +417,7 @@ mod tests {
         }
     }
 
-    /// Returns an `AppState` (binding kept as `shared` in tests below).
+    /// Returns an `AppState` (binding kept as `app_state` in tests below).
     fn test_app_state() -> Arc<AppState> {
         crate::app_state::AppState::for_test(test_settings())
     }

@@ -1,5 +1,6 @@
 //! v2.5 root menu builder — constructs the `SlashDotMenu` tree with all
 //! ported commands. Called once at REPL startup.
+use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};

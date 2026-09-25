@@ -3,6 +3,7 @@
 //! Leaf node: header() shows help text; submit() writes the `replay`
 //! control target on `AppState` — the agent loop executes it (needs the
 //! active session + output, both loop-owned) at the cycle point.
+use std::sync::Arc;
 
 use std::rc::Rc;
 

@@ -4,8 +4,10 @@
 //! `data()`. Active marker from `LiveState.persona` (transient session
 //! state), write on submit. `/set default_persona` will use a separate
 //! node that reads/writes `SettingsStore`.
+use std::sync::Arc;
 
-use std::cell::RefCell;
+use crate::app_state::AppState;
+
 use std::rc::Rc;
 
 use crate::slashdot_menu::node_impl::{
@@ -57,7 +59,7 @@ impl SlashDotNode for PersonaEnumNode {
 // ---------------------------------------------------------------------------
 
 /// Add `/persona` child to a listing `SlashDotMenuNode`.
-pub fn add_persona_child(listing: &mut SlashDotMenuNode, app_state: &crate::app_state::AppState) {
+pub fn add_persona_child(listing: &mut SlashDotMenuNode, app_state: &Arc<AppState>) {
     let reader = app_state.clone();
     let writer = app_state.clone();
     listing.add_child(PersonaEnumNode {

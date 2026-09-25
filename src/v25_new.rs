@@ -2,6 +2,7 @@
 //!
 //! Leaf node: submit() writes the `new_session` control target on
 //! `AppState`; the agent loop converges (fresh session) at the cycle point.
+use std::sync::Arc;
 
 use std::rc::Rc;
 

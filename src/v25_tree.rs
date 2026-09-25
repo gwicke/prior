@@ -590,7 +590,7 @@ impl TreeListNode {
 
 impl SlashDotNode for TreeListNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        // Read the shared tree (Arc — O(1) clone, no deep copy).
+        // Read the app_state tree (Arc — O(1) clone, no deep copy).
         let tree_rc = self.app_state.raw_tree();
         let leaf = self.app_state.leaf_id();
 
@@ -1059,7 +1059,7 @@ mod tests {
         }
     }
 
-    /// Fresh app state for tests (binding kept as `shared` in tests below).
+    /// Fresh app state for tests (binding kept as `app_state` in tests below).
     fn test_app_state() -> Arc<AppState> {
         crate::app_state::AppState::for_test(test_settings())
     }

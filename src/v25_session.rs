@@ -6,6 +6,7 @@
 //!
 //! Action nodes are in this same file since they are small and tightly
 //! coupled to `SessionListNode`.
+use std::sync::Arc;
 
 use std::rc::Rc;
 
@@ -606,7 +607,7 @@ mod tests {
         }
     }
 
-    /// Returns an `AppState` (binding kept as `shared` in tests below —
+    /// Returns an `AppState` (binding kept as `app_state` in tests below —
     /// it is the injected source-of-truth handle).
     fn test_app_state() -> Arc<AppState> {
         crate::app_state::AppState::for_test(test_settings())

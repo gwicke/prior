@@ -4,6 +4,7 @@
 //! node caches its `Rc<DataResponse>` keyed by the catalog's generation
 //! counter — when the catalog hasn't refreshed, the engine's `Rc::ptr_eq`
 //! check skips the full re-derive (filter → fuzzy → sort → render).
+use std::sync::Arc;
 
 use std::rc::Rc;
 

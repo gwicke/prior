@@ -6,6 +6,7 @@
 //! (id + description), and the child's active_ids become the "value"
 //! column. Enum settings use the same pattern with `EnumSettingNode`.
 //! Leaf settings (int, freetext) return their value directly in `data()`.
+use std::sync::Arc;
 
 use std::rc::Rc;
 

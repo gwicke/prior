@@ -4,6 +4,7 @@
 //! fresh session AND delete the outgoing one afterwards
 //! (`new_session` + `delete_session_ids_after`); the loop's applier defines
 //! the order (create → swap → delete), idempotence makes replays safe.
+use std::sync::Arc;
 
 use std::rc::Rc;
 

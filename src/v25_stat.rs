@@ -3,6 +3,7 @@
 //! Leaf node: header() shows session stats; submit() closes the menu.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{

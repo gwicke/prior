@@ -3,6 +3,7 @@
 //! Leaf node: submit() latches the `quit` control target on `AppState`
 //! (declarative — never cleared); the agent loop observes it at the cycle
 //! point and breaks.
+use std::sync::Arc;
 
 use std::rc::Rc;
 
