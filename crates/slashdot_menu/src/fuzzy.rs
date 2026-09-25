@@ -68,22 +68,28 @@ pub fn rank_candidates<'a, T>(
     prefix_of: impl Fn(&T) -> String,
     text_of: impl Fn(&T) -> String,
     field_extractors: &[(String, impl Fn(&T) -> String)],
-) -> (Vec<&'a T>, HashMap<*const T, MatchIndices>) {
+) -> (Vec<&'a T>, Vec<MatchIndices>) {
     if query.trim().is_empty() {
-        return (items.iter().collect(), HashMap::new());
+        // Parallel vector: one (empty) index map per item.
+        return (
+            items.iter().collect(),
+            (0..items.len()).map(|_| HashMap::new()).collect(),
+        );
     }
     let ql = query.to_lowercase();
     let matcher = SkimMatcherV2::default();
-    // (tier, prefix_len, prefix, score, input_idx, item_ptr) — tier 0 =
-    // prefix match, tier 1 = fuzzy-only match.
-    let mut classified: Vec<(u8, usize, String, i64, usize, *const T)> = Vec::new();
+    // (tier, prefix_len, prefix, score, input_idx, input_slot) — tier 0 =
+    // prefix match, tier 1 = fuzzy-only match. The input slot (index into
+    // `items`) is a stable key: pointers would dangle once the caller moves
+    // its item container.
+    let mut classified: Vec<(u8, usize, String, i64, usize, usize)> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let prefix = prefix_of(item);
         let pl = prefix.to_lowercase();
         if pl.starts_with(&ql) {
-            classified.push((0, pl.len(), pl, 0, idx, item as *const T));
+            classified.push((0, pl.len(), pl, 0, idx, idx));
         } else if let Some(score) = matcher.fuzzy_match(&text_of(item), query) {
-            classified.push((1, pl.len(), pl, score, idx, item as *const T));
+            classified.push((1, pl.len(), pl, score, idx, idx));
         }
     }
     classified.sort_by(|a, b| {
@@ -97,14 +103,18 @@ pub fn rank_candidates<'a, T>(
             // Input order breaks remaining ties (deterministic).
             .then_with(|| a.4.cmp(&b.4))
     });
-    let ranked: Vec<&'a T> = classified.iter().map(|(_, _, _, _, _, ptr)| unsafe { &**ptr }).collect();
+    let ranked: Vec<&'a T> = classified.iter().map(|(_, _, _, _, slot, _)| &items[*slot]).collect();
 
-    // Compute match indices for the requested fields, but ONLY for items
-    // that made it into the ranked list (filtered items).
-    let mut match_indices = HashMap::new();
-    if !field_extractors.is_empty() {
-        for (_, _, _, _, _, ptr) in &classified {
-            let item = unsafe { &**ptr };
+    // Match indices for the requested fields, parallel to `ranked` (so the
+    // caller never has to key by pointer). Only filtered items are computed.
+    let mut match_indices: Vec<MatchIndices> = Vec::with_capacity(ranked.len());
+    if field_extractors.is_empty() {
+        for _ in &ranked {
+            match_indices.push(HashMap::new());
+        }
+    } else {
+        for (_, _, _, _, slot, _) in &classified {
+            let item = &items[*slot];
             let mut field_map = HashMap::new();
             for (name, extractor) in field_extractors {
                 let field_text = extractor(item);
@@ -114,9 +124,7 @@ pub fn rank_candidates<'a, T>(
                     }
                 }
             }
-            if !field_map.is_empty() {
-                match_indices.insert(*ptr, field_map);
-            }
+            match_indices.push(field_map);
         }
     }
 

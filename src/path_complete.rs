@@ -114,11 +114,13 @@ use std::collections::HashMap;
 /// alphabetical order; a typed stem ranks prefix matches first, then
 /// fuzzy matches, dropping non-matches. Empty prefix ⇒ empty (inert).
 ///
-/// Returns (ranked_entries, match_indices) where match_indices maps
-/// entry pointer to field_name → match byte indices.
-pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, HashMap<*const Entry, HashMap<String, Vec<usize>>>) {
+/// Returns `(ranked_entries, match_indices)` where `match_indices[i]` holds
+/// the `field_name → match byte indices` for `ranked_entries[i]` (parallel
+/// vectors — no pointer keys, so the result stays valid after the entries
+/// are moved).
+pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, Vec<HashMap<String, Vec<usize>>>) {
     if prefix.is_empty() {
-        return (Vec::new(), HashMap::new());
+        return (Vec::new(), Vec::new());
     }
     let uses_tilde = prefix.starts_with('~');
     let expanded = crate::path_util::expand_tilde(prefix)
@@ -131,10 +133,10 @@ pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, HashMap<*const Entr
         Listing::Found(entries) => entries,
         // Sandbox configured but the dir did not list inside it —
         // never suggest host paths the sandbox cannot see.
-        Listing::Invisible => return (Vec::new(), HashMap::new()),
+        Listing::Invisible => return (Vec::new(), Vec::new()),
     };
 
-    let mut entries: Vec<Entry> = if uses_tilde {
+    let entries: Vec<Entry> = if uses_tilde {
         let home = std::env::var("HOME").unwrap_or_default();
         listing
             .into_iter()
@@ -147,19 +149,26 @@ pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, HashMap<*const Entr
         listing
     };
 
+    // Field names must match the completion dialog's column fields
+    // (`id` / `description`) so the renderer can attach highlights.
     let field_extractors: Vec<(String, Box<dyn Fn(&Entry) -> String>)> = vec![
-        ("path".to_string(), Box::new(|e: &Entry| e.path.clone())),
+        ("id".to_string(), Box::new(|e: &Entry| e.path.clone())),
         ("description".to_string(), Box::new(|e: &Entry| e.description())),
     ];
-    let (ranked, match_indices) = rank_candidates(
+    let (ranked, match_indices_by_rank) = rank_candidates(
         &entries,
         &stem,
         |e| basename_of(&e.path).to_string(),
         |e| basename_of(&e.path).to_string(),
         &field_extractors,
     );
-    entries = ranked.into_iter().cloned().collect();
-    (entries, match_indices)
+    let mut out_entries = Vec::with_capacity(ranked.len());
+    let mut out_indices: Vec<HashMap<String, Vec<usize>>> = Vec::with_capacity(ranked.len());
+    for (e, indices) in ranked.into_iter().zip(match_indices_by_rank) {
+        out_entries.push(e.clone());
+        out_indices.push(indices);
+    }
+    (out_entries, out_indices)
 }
 
 /// Prose (in-prompt) FS completer — the prose worker's unit of work
@@ -205,7 +214,7 @@ impl FileCompleter {
                 return rows.clone();
             }
         }
-        let (entries, match_indices_map) = complete(word, true);
+        let (entries, match_indices_by_rank) = complete(word, true);
         // Exactness: every candidate byte-equal to the word ⇒ nothing
         // left to complete (empty rows ⇒ no dialog; the engine appends
         // the trailing space on Tab).
@@ -219,13 +228,12 @@ impl FileCompleter {
                 .collect()
         };
 
-        // Convert match_indices_map from *const Entry to row index
+        // `match_indices_by_rank` is parallel to `entries`, hence to `rows`.
         let match_indices = if !rows.is_empty() {
             let mut result = HashMap::new();
-            for (idx, entry) in entries.iter().enumerate() {
-                let ptr = entry as *const Entry;
-                if let Some(indices) = match_indices_map.get(&ptr) {
-                    result.insert(idx, indices.clone());
+            for (idx, indices) in match_indices_by_rank.into_iter().enumerate() {
+                if !indices.is_empty() {
+                    result.insert(idx, indices);
                 }
             }
             Some(result)
@@ -791,6 +799,27 @@ mod tests {
         let mut fc = FileCompleter::new();
         let out = fc.complete(&full);
         assert!(out.rows.is_empty(), "exact match = nothing to complete: {out:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_emits_match_indices_keyed_by_id() {
+        crate::tools::set_sandbox(None);
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("alpha.txt"), "1");
+        write(&dir.path().join("beta.txt"), "2");
+        let prefix = format!("{}/al", dir.path().display());
+
+        let mut fc = FileCompleter::new();
+        let out = fc.complete(&prefix);
+        assert_eq!(out.rows.len(), 1, "{out:?}");
+        let indices = out
+            .match_indices
+            .as_ref()
+            .expect("match indices must be populated for a narrowing stem");
+        let fm = indices.get(&0).expect("row 0 must carry indices");
+        assert!(fm.contains_key("id"), "indices keyed by id column: {fm:?}");
+        assert!(!fm["id"].is_empty());
     }
 
     #[test]

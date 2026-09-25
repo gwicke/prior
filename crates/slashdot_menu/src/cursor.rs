@@ -130,7 +130,7 @@ pub(crate) fn rank_row_refs(
         })
         .collect();
 
-    let (ranked_items, match_indices_map) = crate::fuzzy::rank_candidates(
+    let (ranked_items, match_indices_by_rank) = crate::fuzzy::rank_candidates(
         candidates,
         terms,
         |(_, row)| row.id.clone(),
@@ -141,17 +141,15 @@ pub(crate) fn rank_row_refs(
         &field_extractors,
     );
 
-    let ranked: Vec<RowRef> = ranked_items.into_iter().map(|(rref, _)| *rref).collect();
-
-    // Convert match_indices_map (keyed by *const T where T = &(RowRef, &Row))
-    // to HashMap<RowRef, ...>. The key in match_indices_map is *const &(RowRef, &Row).
-    // We need to get the pointer to the original slice element.
+    // `match_indices_by_rank` is parallel to `ranked_items`, so zipping keeps
+    // them aligned without pointer keys.
+    let mut ranked: Vec<RowRef> = Vec::with_capacity(ranked_items.len());
     let mut match_indices = HashMap::new();
-    for item in candidates {
-        let ptr = item as *const (RowRef, &Row);
-        if let Some(indices) = match_indices_map.get(&ptr) {
-            match_indices.insert(item.0, indices.clone());
+    for (item, indices) in ranked_items.into_iter().zip(match_indices_by_rank) {
+        if !indices.is_empty() {
+            match_indices.insert(item.0, indices);
         }
+        ranked.push(item.0);
     }
 
     let pinned_idx = selection.and_then(|sel| {
