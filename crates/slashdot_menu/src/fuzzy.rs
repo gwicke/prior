@@ -4,6 +4,7 @@
 
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
+use std::collections::HashMap;
 
 /// A reference to an item plus its fuzzy match score (higher = better).
 pub struct Ranked<'a, T> {
@@ -38,9 +39,12 @@ pub fn fuzzy_filter_bonus<'a, T>(
     fuzzy_filter_impl(items, query, to_text, true)
 }
 
-/// Rank `items` against `query` with the shared predictability rule —
-/// used by listing drill order (`cursor::rank_row_refs`), the default
-/// modifier completer, and leaf `complete_parameter` implementations:
+/// Match indices for a single item across multiple fields.
+/// Maps field name → list of byte indices in that field's string where the query matched.
+pub type MatchIndices = HashMap<String, Vec<usize>>;
+
+/// Rank `items` against `query` with the shared predictability rule,
+/// returning both the ranked items AND match indices for specified fields.
 ///
 /// 1. **Prefix matches first**: `prefix_of(item)` starts with `query`
 ///    (case-insensitive) — ordered shortest prefix first, then
@@ -54,27 +58,32 @@ pub fn fuzzy_filter_bonus<'a, T>(
 ///
 /// Input order breaks any remaining tie, so the output is fully
 /// deterministic.
+///
+/// `field_extractors` specifies which fields to compute match indices for.
+/// Each entry is `(field_name, extractor_fn)`. Match indices are byte
+/// offsets into the extracted field string.
 pub fn rank_candidates<'a, T>(
     items: &'a [T],
     query: &str,
     prefix_of: impl Fn(&T) -> String,
     text_of: impl Fn(&T) -> String,
-) -> Vec<&'a T> {
+    field_extractors: &[(String, impl Fn(&T) -> String)],
+) -> (Vec<&'a T>, HashMap<*const T, MatchIndices>) {
     if query.trim().is_empty() {
-        return items.iter().collect();
+        return (items.iter().collect(), HashMap::new());
     }
     let ql = query.to_lowercase();
     let matcher = SkimMatcherV2::default();
-    // (tier, prefix_len, prefix, score, input_idx, item) — tier 0 =
+    // (tier, prefix_len, prefix, score, input_idx, item_ptr) — tier 0 =
     // prefix match, tier 1 = fuzzy-only match.
-    let mut classified: Vec<(u8, usize, String, i64, usize, &'a T)> = Vec::new();
+    let mut classified: Vec<(u8, usize, String, i64, usize, *const T)> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         let prefix = prefix_of(item);
         let pl = prefix.to_lowercase();
         if pl.starts_with(&ql) {
-            classified.push((0, pl.len(), pl, 0, idx, item));
+            classified.push((0, pl.len(), pl, 0, idx, item as *const T));
         } else if let Some(score) = matcher.fuzzy_match(&text_of(item), query) {
-            classified.push((1, pl.len(), pl, score, idx, item));
+            classified.push((1, pl.len(), pl, score, idx, item as *const T));
         }
     }
     classified.sort_by(|a, b| {
@@ -88,7 +97,30 @@ pub fn rank_candidates<'a, T>(
             // Input order breaks remaining ties (deterministic).
             .then_with(|| a.4.cmp(&b.4))
     });
-    classified.into_iter().map(|(_, _, _, _, _, item)| item).collect()
+    let ranked: Vec<&'a T> = classified.iter().map(|(_, _, _, _, _, ptr)| unsafe { &**ptr }).collect();
+
+    // Compute match indices for the requested fields, but ONLY for items
+    // that made it into the ranked list (filtered items).
+    let mut match_indices = HashMap::new();
+    if !field_extractors.is_empty() {
+        for (_, _, _, _, _, ptr) in &classified {
+            let item = unsafe { &**ptr };
+            let mut field_map = HashMap::new();
+            for (name, extractor) in field_extractors {
+                let field_text = extractor(item);
+                if let Some((_, indices)) = matcher.fuzzy(&field_text, query, true) {
+                    if !indices.is_empty() {
+                        field_map.insert(name.clone(), indices);
+                    }
+                }
+            }
+            if !field_map.is_empty() {
+                match_indices.insert(*ptr, field_map);
+            }
+        }
+    }
+
+    (ranked, match_indices)
 }
 
 fn fuzzy_filter_impl<'a, T>(
@@ -182,7 +214,12 @@ mod tests {
     }
 
     fn rc_rank(items: &[String], query: &str) -> Vec<String> {
-        rank_candidates(items, query, |s| s.clone(), |s| s.clone())
+        let field_extractors: Vec<(String, Box<dyn Fn(&String) -> String>)> = items
+            .iter()
+            .map(|s| (s.clone(), Box::new(|x: &String| x.clone()) as Box<dyn Fn(&String) -> String>))
+            .collect();
+        rank_candidates(items, query, |s| s.clone(), |s| s.clone(), &field_extractors)
+            .0
             .into_iter()
             .cloned()
             .collect()

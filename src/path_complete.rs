@@ -100,6 +100,8 @@ fn split_prefix(expanded: &str, path_is_dir: bool) -> (String, String) {
     (parent, stem)
 }
 
+use std::collections::HashMap;
+
 /// Complete `prefix` against the host FS (`sandbox = false`) or the
 /// sandbox-visible FS with host fallback (`sandbox = true`, the v1
 /// `complete_path_prefix_sandbox` semantics: sandbox listing wins;
@@ -111,9 +113,12 @@ fn split_prefix(expanded: &str, path_is_dir: bool) -> (String, String) {
 /// path-sorted as the ranking input: an empty stem keeps that
 /// alphabetical order; a typed stem ranks prefix matches first, then
 /// fuzzy matches, dropping non-matches. Empty prefix ⇒ empty (inert).
-pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
+///
+/// Returns (ranked_entries, match_indices) where match_indices maps
+/// entry pointer to field_name → match byte indices.
+pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, HashMap<*const Entry, HashMap<String, Vec<usize>>>) {
     if prefix.is_empty() {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
     let uses_tilde = prefix.starts_with('~');
     let expanded = crate::path_util::expand_tilde(prefix)
@@ -126,7 +131,7 @@ pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
         Listing::Found(entries) => entries,
         // Sandbox configured but the dir did not list inside it —
         // never suggest host paths the sandbox cannot see.
-        Listing::Invisible => return Vec::new(),
+        Listing::Invisible => return (Vec::new(), HashMap::new()),
     };
 
     let mut entries: Vec<Entry> = if uses_tilde {
@@ -142,11 +147,19 @@ pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
         listing
     };
 
-    let ranked = rank_candidates(&entries, &stem, |e| {
-        basename_of(&e.path).to_string()
-    }, |e| basename_of(&e.path).to_string());
+    let field_extractors: Vec<(String, Box<dyn Fn(&Entry) -> String>)> = vec![
+        ("path".to_string(), Box::new(|e: &Entry| e.path.clone())),
+        ("description".to_string(), Box::new(|e: &Entry| e.description())),
+    ];
+    let (ranked, match_indices) = rank_candidates(
+        &entries,
+        &stem,
+        |e| basename_of(&e.path).to_string(),
+        |e| basename_of(&e.path).to_string(),
+        &field_extractors,
+    );
     entries = ranked.into_iter().cloned().collect();
-    entries
+    (entries, match_indices)
 }
 
 /// Prose (in-prompt) FS completer — the prose worker's unit of work
@@ -181,6 +194,7 @@ impl FileCompleter {
         let empty = || CompletionRows {
             rows: Vec::new(),
             labels: None,
+            match_indices: None,
         };
         if !completable(word) {
             return empty();
@@ -191,7 +205,7 @@ impl FileCompleter {
                 return rows.clone();
             }
         }
-        let entries = complete(word, true);
+        let (entries, match_indices_map) = complete(word, true);
         // Exactness: every candidate byte-equal to the word ⇒ nothing
         // left to complete (empty rows ⇒ no dialog; the engine appends
         // the trailing space on Tab).
@@ -204,6 +218,21 @@ impl FileCompleter {
                 .map(|e| Row::new(&e.path).desc(e.description()))
                 .collect()
         };
+
+        // Convert match_indices_map from *const Entry to row index
+        let match_indices = if !rows.is_empty() {
+            let mut result = HashMap::new();
+            for (idx, entry) in entries.iter().enumerate() {
+                let ptr = entry as *const Entry;
+                if let Some(indices) = match_indices_map.get(&ptr) {
+                    result.insert(idx, indices.clone());
+                }
+            }
+            Some(result)
+        } else {
+            None
+        };
+
         let sandbox = crate::tools::sandbox_config().is_some();
         let out = CompletionRows {
             rows,
@@ -211,6 +240,7 @@ impl FileCompleter {
                 if sandbox { "Sandbox path" } else { "Host path" }.to_string(),
                 "Description".to_string(),
             )),
+            match_indices,
         };
         self.last = Some((word.to_string(), out.clone()));
         out
@@ -504,7 +534,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn empty_prefix_is_inert() {
-        assert!(complete("", false).is_empty());
+        assert!(complete("", false).0.is_empty());
     }
 
     #[test]
@@ -515,7 +545,7 @@ mod tests {
         fs::create_dir(dir.path().join("sub")).unwrap();
         let prefix = format!("{}/", dir.path().display());
 
-        let entries = complete(&prefix, false);
+        let (entries, _) = complete(&prefix, false);
         assert_eq!(entries.len(), 2, "{entries:?}");
 
         let a = entries.iter().find(|e| e.path.ends_with("a.txt")).unwrap();
@@ -543,7 +573,7 @@ mod tests {
         assert!(d.ends_with("  5"), "{d}");
 
         // Stem filter: parent + prefix-of-basename.
-        let stem = complete(&format!("{}/a", dir.path().display()), false);
+        let (stem, _) = complete(&format!("{}/a", dir.path().display()), false);
         assert_eq!(stem.len(), 1, "{stem:?}");
         assert!(stem[0].path.ends_with("a.txt"), "{stem:?}");
     }
@@ -556,7 +586,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();
         write(&dir.path().join("sub/x"), "y");
-        let entries = complete(&format!("{}/sub", dir.path().display()), false);
+        let (entries, _) = complete(&format!("{}/sub", dir.path().display()), false);
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert!(entries[0].path.ends_with("sub/x"));
     }
@@ -569,7 +599,7 @@ mod tests {
         write(&dir.path().join("someabc"), "2");
         write(&dir.path().join("zzz"), "3");
 
-        let got = complete(&format!("{}/abc", dir.path().display()), false);
+        let (got, _) = complete(&format!("{}/abc", dir.path().display()), false);
         let names: Vec<&str> = got.iter().map(|e| basename_of(&e.path)).collect();
         // Prefix tier first, fuzzy second, non-match dropped — the whole
         // dir is ranked (v1's strict starts_with would drop someabc).
@@ -584,7 +614,7 @@ mod tests {
         write(&dir.path().join("alpha"), "");
         write(&dir.path().join("mid"), "");
 
-        let got = complete(&format!("{}/", dir.path().display()), false);
+        let (got, _) = complete(&format!("{}/", dir.path().display()), false);
         let names: Vec<&str> = got.iter().map(|e| basename_of(&e.path)).collect();
         // Empty stem ⇒ rank_candidates' input order ⇒ path-sorted.
         assert_eq!(names, vec!["alpha", "mid", "zeta"], "{names:?}");
@@ -595,11 +625,11 @@ mod tests {
     fn host_listing_cache_revalidates_on_change() {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("first"), "");
-        let e1 = complete(&format!("{}/", dir.path().display()), false);
+        let (e1, _) = complete(&format!("{}/", dir.path().display()), false);
         assert!(e1.iter().any(|e| e.path.ends_with("/first")));
 
         write(&dir.path().join("second"), "");
-        let e2 = complete(&format!("{}/", dir.path().display()), false);
+        let (e2, _) = complete(&format!("{}/", dir.path().display()), false);
         assert!(
             e2.iter().any(|e| e.path.ends_with("/second")),
             "dir-mtime revalidation must refetch: {e2:?}"
@@ -684,7 +714,7 @@ mod tests {
         crate::tools::set_sandbox(None);
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("f"), "x");
-        let entries = complete(&format!("{}/", dir.path().display()), true);
+        let (entries, _) = complete(&format!("{}/", dir.path().display()), true);
         assert!(!entries.is_empty(), "host fallback expected: {entries:?}");
         assert!(entries[0].path.ends_with("/f"), "{entries:?}");
     }
@@ -698,7 +728,7 @@ mod tests {
         // Default sandbox: deny-by-default — the tempdir is not visible
         // (bwrap absent ⇒ ls fails; present ⇒ tmpfs /tmp hides it).
         // Either way: empty, never host entries.
-        let entries = complete(&format!("{}/", dir.path().display()), true);
+        let (entries, _) = complete(&format!("{}/", dir.path().display()), true);
         assert!(entries.is_empty(), "must not leak host paths: {entries:?}");
         crate::tools::set_sandbox(None);
     }

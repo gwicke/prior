@@ -7,7 +7,7 @@
 //! cache and assembles `RenderPlan`s. The render side never sees how
 //! rows are stored: it mints `iter()`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::fields::{row_field_value, Row};
@@ -25,6 +25,9 @@ pub struct ViewRows {
     slots: Vec<Option<Rc<DataResponse>>>,
     order: Vec<RowRef>,
     active_ids: HashSet<String>,
+    /// Per-row match indices for fuzzy highlighting: RowRef → (field_name → byte indices).
+    /// Only populated for string columns that are displayed and have fuzzy terms.
+    match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
 }
 
 impl ViewRows {
@@ -33,11 +36,27 @@ impl ViewRows {
         slots: Vec<Option<Rc<DataResponse>>>,
         order: Vec<RowRef>,
         active_ids: HashSet<String>,
+        match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
     ) -> Self {
         ViewRows {
             slots,
             order,
             active_ids,
+            match_indices,
+        }
+    }
+
+    /// Content-side constructor without match indices (backward compatible).
+    pub(crate) fn new_empty_match(
+        slots: Vec<Option<Rc<DataResponse>>>,
+        order: Vec<RowRef>,
+        active_ids: HashSet<String>,
+    ) -> Self {
+        ViewRows {
+            slots,
+            order,
+            active_ids,
+            match_indices: HashMap::new(),
         }
     }
 
@@ -45,6 +64,28 @@ impl ViewRows {
     /// markers. The public entry for a completer's `Vec<Row>` (host
     /// prose completion and the engine's `wrap_completion` shape).
     pub fn of(rows: Vec<Row>) -> Rc<ViewRows> {
+        let n = rows.len();
+        let resp = Some(Rc::new(DataResponse {
+            rows,
+            active_ids: Vec::new(),
+        }));
+        Rc::new(ViewRows::new_empty_match(
+            vec![resp],
+            (0..n as u32)
+                .map(|i| RowRef {
+                    child_idx: 0,
+                    row_offset: i,
+                })
+                .collect(),
+            HashSet::new(),
+        ))
+    }
+
+    /// Completion source → view with match indices.
+    pub fn of_with_match_indices(
+        rows: Vec<Row>,
+        match_indices: HashMap<RowRef, HashMap<String, Vec<usize>>>,
+    ) -> Rc<ViewRows> {
         let n = rows.len();
         let resp = Some(Rc::new(DataResponse {
             rows,
@@ -59,6 +100,7 @@ impl ViewRows {
                 })
                 .collect(),
             HashSet::new(),
+            match_indices,
         ))
     }
 
@@ -72,6 +114,12 @@ impl ViewRows {
             let row = rref.resolve(&self.slots)?;
             Some((row, self.active_ids.contains(&row.id)))
         })
+    }
+
+    /// Get match indices for a specific row (for fuzzy highlighting).
+    /// Returns field_name → byte indices, or empty if none.
+    pub(crate) fn match_indices(&self, rref: &RowRef) -> Option<&HashMap<String, Vec<usize>>> {
+        self.match_indices.get(rref)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -263,7 +311,7 @@ impl RowView {
         columns: &[ColumnDef],
         render_ctx: RenderContext,
     ) {
-        use crate::table::{Align, Table};
+        use crate::table::{Align, Table, extract_snippet};
         let col_field_names: Vec<String> = if !columns.is_empty() {
             columns.iter().map(|c| c.field.clone()).collect()
         } else {
@@ -280,20 +328,18 @@ impl RowView {
         } else {
             col_field_names.iter().map(|s| s.as_str()).collect()
         };
-        let mut t = Table::new(&header_labels).set_gap(2);
-        if !columns.is_empty() {
-            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
-            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
-            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-            t = t.with_aligns(&aligns)
-                .with_min_widths(&mins)
-                .with_priorities(&prios);
-        }
+
+        // First pass: collect full cell content for all rows to compute column widths.
+        let width = render_ctx.term_width.saturating_sub(2);
+        let mut all_cells: Vec<Vec<String>> = Vec::new();
+        let mut row_refs: Vec<RowRef> = Vec::new();
         let mut active_rows = Vec::new();
+
         for (i, (row, active)) in view.iter().enumerate() {
             if active {
                 active_rows.push(i);
             }
+            row_refs.push(view.order[i]);
             let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
             for k in &col_field_names {
                 cells.push(
@@ -307,17 +353,67 @@ impl RowView {
                         .unwrap_or_default(),
                 );
             }
-            t.add_row(&cells);
+            all_cells.push(cells);
         }
+
+        // Build a temporary table to compute column widths.
+        let mut temp_table = Table::new(&header_labels).set_gap(2);
+        if !columns.is_empty() {
+            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+            temp_table = temp_table.with_aligns(&aligns)
+                .with_min_widths(&mins)
+                .with_priorities(&prios);
+        }
+        for cells in &all_cells {
+            temp_table.add_row(cells);
+        }
+        let col_widths = temp_table.column_widths(width);
+
+        // Second pass: extract snippets using computed column widths.
+        let mut t = Table::new(&header_labels).set_gap(2);
+        if !columns.is_empty() {
+            let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
+            let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
+            let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
+            t = t.with_aligns(&aligns)
+                .with_min_widths(&mins)
+                .with_priorities(&prios);
+        }
+        for (row_idx, cells) in all_cells.into_iter().enumerate() {
+            let rref = &row_refs[row_idx];
+            let match_indices = view.match_indices(rref);
+            let mut final_cells = Vec::with_capacity(cells.len());
+            for (col_idx, cell) in cells.into_iter().enumerate() {
+                let field_name = col_field_names.get(col_idx).cloned().unwrap_or_default();
+                let snippet = if let Some(indices_map) = match_indices {
+                    if let Some(indices) = indices_map.get(&field_name) {
+                        let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
+                        if col_w > 0 {
+                            extract_snippet(&cell, indices, col_w)
+                        } else {
+                            cell
+                        }
+                    } else {
+                        cell
+                    }
+                } else {
+                    cell
+                };
+                final_cells.push(snippet);
+            }
+            t.add_row(&final_cells);
+        }
+
         let table_header = if has_table_header {
             Some(LogicalLine::new(
-                t.render_header(render_ctx.term_width.saturating_sub(2)),
+                t.render_header(width),
             ))
         } else {
             None
         };
         let use_wrap = columns.iter().all(|c| c.wrap);
-        let width = render_ctx.term_width.saturating_sub(2);
         let lines: Vec<LogicalLine> = if use_wrap {
             t.render_multiline(width)
         } else {
@@ -354,6 +450,7 @@ mod tests {
                 })
                 .collect(),
             HashSet::new(),
+            HashMap::new(),
         ))
     }
 
@@ -451,6 +548,7 @@ mod tests {
                 },
             ],
             HashSet::from(["b".to_string()]),
+            HashMap::new(),
         ));
         let flags: Vec<bool> = view.iter().map(|(_, a)| a).collect();
         assert_eq!(flags, vec![false, true]);
