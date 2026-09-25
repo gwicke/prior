@@ -397,8 +397,16 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
 }
 
 /// ANSI escape codes for match highlighting.
-const MATCH_HIGHLIGHT_START: &str = "\x1b[1;35m"; // bold magenta
-const MATCH_HIGHLIGHT_END: &str = "\x1b[0m";
+/// Match highlight: bold + magenta foreground only. The end sequence resets
+/// *only* bold and foreground (SGR 22;39) so any row background / selection
+/// styling applied by the host survives the highlight.
+const MATCH_HIGHLIGHT_START: &str = "\x1b[1;35m";
+const MATCH_HIGHLIGHT_END: &str = "\x1b[22;39m";
+
+/// Max number of visible columns between two match runs that still counts as
+/// "one cluster" (shown as a single snippet span). Longer gaps become separate
+/// spans joined by `…`.
+const SNIPPET_CLUSTER_GAP: usize = 4;
 
 /// Extract a snippet from `cell` centered on `match_indices` (byte offsets),
 /// at most `max_width` visible columns wide (ANSI codes excluded), with the
@@ -420,21 +428,19 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
 
     // Per-character tables: byte → char index, char → byte index / visible col.
     let chars: Vec<char> = cell.chars().collect();
+    let n_chars = chars.len();
     let mut byte_to_char = vec![0usize; cell.len() + 1];
-    let mut char_to_byte = Vec::with_capacity(chars.len() + 1);
-    let mut char_to_visible = Vec::with_capacity(chars.len() + 1);
+    let mut char_to_visible = Vec::with_capacity(n_chars + 1);
     let mut visible = 0;
-    char_to_byte.push(0);
     char_to_visible.push(0);
+    let mut byte_off = 0usize;
     for (i, c) in chars.iter().enumerate() {
-        let byte_idx = char_to_byte[i];
-        byte_to_char[byte_idx] = i;
-        let cw = char_width(*c);
-        visible += cw;
-        char_to_byte.push(byte_idx + c.len_utf8());
+        byte_to_char[byte_off] = i;
+        byte_off += c.len_utf8();
+        visible += char_width(*c);
         char_to_visible.push(visible);
     }
-    let n_chars = chars.len();
+    let vis = |ci: usize| char_to_visible[ci];
 
     // Matched char set.
     let mut matched = std::collections::HashSet::new();
@@ -444,42 +450,246 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
         }
     }
 
-    // Match span in visible columns.
-    let ms = char_to_visible
-        .iter()
-        .enumerate()
-        .find(|(i, _)| matched.contains(i))
-        .map(|(i, _)| char_to_visible[i])
-        .unwrap_or(0);
-    let me = char_to_visible
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(i, _)| matched.contains(i))
-        .map(|(i, _)| char_to_visible[i + 1])
-        .unwrap_or(cell_width);
-    let match_w = me.saturating_sub(ms);
-
-    // Choose a visible-column window [w_start, w_end) covering the match.
-    let budget = max_width;
-    let mut w_start;
-    let mut w_end;
-    if match_w >= budget {
-        // Match alone fills (or exceeds) the budget: show from its start.
-        w_start = ms;
-        w_end = (ms + budget).min(cell_width);
-    } else {
-        let slack = budget - match_w;
-        w_start = ms.saturating_sub(slack / 2);
-        w_end = (me + (slack - (ms - w_start))).min(cell_width);
-        // Re-flow the slack the match could not use on one side to the other
-        // so near-edge matches still fill the width (no early truncation).
-        w_start = w_start.saturating_sub(budget.saturating_sub(w_end - w_start));
-        if w_end < cell_width {
-            w_end = (w_start + budget).min(cell_width);
+    // Contiguous match runs → clusters (runs separated by more than
+    // SNIPPET_CLUSTER_GAP visible columns become distinct spans).
+    let mut clusters: Vec<(usize, usize)> = Vec::new(); // char ranges [start,end)
+    {
+        let mut i = 0;
+        while i < n_chars {
+            if matched.contains(&i) {
+                let start = i;
+                let mut end = i + 1;
+                while end < n_chars && matched.contains(&end) {
+                    end += 1;
+                }
+                // Merge with previous cluster if the visible gap is small.
+                if let Some(last) = clusters.last_mut() {
+                    if vis(start).saturating_sub(vis(last.1)) <= SNIPPET_CLUSTER_GAP {
+                        last.1 = end;
+                        i = end;
+                        continue;
+                    }
+                }
+                clusters.push((start, end));
+                i = end;
+            } else {
+                i += 1;
+            }
         }
     }
-    // Account for ellipses (one column each) and trim to fit `max_width`.
+    if clusters.is_empty() {
+        return cell.to_string();
+    }
+
+    // Single cluster: one contiguous window with maximal context (asymmetric
+    // slack re-flow so near-edge matches still fill the width).
+    if clusters.len() == 1 {
+        let (cs, ce) = clusters[0];
+        let (ms, me) = (vis(cs), vis(ce));
+        let match_w = me - ms;
+        let (mut w_start, mut w_end) = if match_w >= max_width {
+            (ms, (ms + max_width).min(cell_width))
+        } else {
+            let slack = max_width - match_w;
+            let s = ms.saturating_sub(slack / 2);
+            let e = (me + (slack - (ms - s))).min(cell_width);
+            let s = s.saturating_sub(max_width.saturating_sub(e - s));
+            let e = if e < cell_width { (s + max_width).min(cell_width) } else { e };
+            (s, e)
+        };
+        // Reserve a column per ellipsis.
+        loop {
+            let le = (w_start > 0) as usize;
+            let re = (w_end < cell_width) as usize;
+            let total = (w_end - w_start) + le + re;
+            if total <= max_width {
+                break;
+            }
+            let over = total - max_width;
+            if w_end == cell_width {
+                w_start += over;
+            } else {
+                w_end = w_end.saturating_sub(over);
+            }
+        }
+        let start_char = char_to_visible.iter().position(|&v| v >= w_start).unwrap_or(0);
+        let end_char = char_to_visible.iter().position(|&v| v >= w_end).unwrap_or(n_chars);
+        let (s, e) = tighten(&chars, &matched, start_char, end_char, start_char > 0, end_char < n_chars);
+        let mut out = String::new();
+        if s > 0 {
+            out.push('…');
+        }
+        out.push_str(&render_highlighted(&chars, &matched, s, e));
+        if e < n_chars {
+            out.push('…');
+        }
+        return out;
+    }
+
+    // Multiple clusters: show each as a context-padded span joined by `…`,
+    // sharing the budget. If they cannot all fit, fall back to a single
+    // window covering everything (current behaviour).
+    let interior = clusters.len() - 1;
+    let total_match: usize = clusters.iter().map(|(s, e)| vis(*e) - vis(*s)).sum();
+    if total_match + interior >= max_width {
+        // Cannot show several spans — degrade to the single-window behaviour
+        // over the whole match extent by treating all clusters as one.
+        let ms = vis(clusters[0].0);
+        let me = vis(clusters.last().unwrap().1);
+        return single_extent_snippet(
+            &chars,
+            &matched,
+            &char_to_visible,
+            ms,
+            me,
+            cell_width,
+            max_width,
+        );
+    }
+
+    // Equal context share per cluster (remaining budget after matches and the
+    // interior ellipses).
+    let ctx_budget = max_width - total_match - interior;
+    let per = ctx_budget / clusters.len();
+    let mut segs: Vec<(usize, usize)> = Vec::with_capacity(clusters.len());
+    for (s, e) in &clusters {
+        let left = per / 2;
+        let right = per - left;
+        // Approximate context in characters (matches are width-1 chars in the
+        // common ASCII path; wide chars just yield slightly tighter spans).
+        let ls = s.saturating_sub(left);
+        let le = (e + right).min(n_chars);
+        segs.push((ls, le));
+    }
+    // Shrink while over budget, preferring the widest segment's larger side.
+    let seg_w = |(s, e): (usize, usize)| vis(e) - vis(s);
+    loop {
+        let leading = (segs[0].0 > 0) as usize;
+        let trailing = (segs[segs.len() - 1].1 < n_chars) as usize;
+        let total: usize = segs.iter().map(|&s| seg_w(s)).sum::<usize>()
+            + interior
+            + leading
+            + trailing;
+        if total <= max_width {
+            break;
+        }
+        // Find the segment with the most shrinkable context.
+        let mut idx = None;
+        let mut best = 0usize;
+        for (i, &(s, e)) in segs.iter().enumerate() {
+            let w = seg_w((s, e));
+            if w > best && w > vis(clusters[i].1) - vis(clusters[i].0) {
+                best = w;
+                idx = Some(i);
+            }
+        }
+        let Some(i) = idx else { break };
+        let (s, e) = segs[i];
+        let lctx = vis(clusters[i].0) - vis(s);
+        let rctx = vis(e) - vis(clusters[i].1);
+        if lctx >= rctx {
+            segs[i].0 = s + 1;
+        } else {
+            segs[i].1 = e - 1;
+        }
+    }
+
+    let n_segs = segs.len();
+    let mut out = String::new();
+    for (i, &(s, e)) in segs.iter().enumerate() {
+        let left_ell = i > 0 || s > 0;
+        let right_ell = i < n_segs - 1 || e < n_chars;
+        let (ts, te) = tighten(&chars, &matched, s, e, left_ell, right_ell);
+        if i == 0 {
+            if ts > 0 {
+                out.push('…');
+            }
+        } else {
+            out.push('…');
+        }
+        out.push_str(&render_highlighted(&chars, &matched, ts, te));
+    }
+    if segs[n_segs - 1].1 < n_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// Tighten a segment's bounds by trimming whitespace that sits against an
+/// ellipsis boundary (a space next to `…` adds no information). Never trims a
+/// matched character or crosses the match content.
+fn tighten(
+    chars: &[char],
+    matched: &std::collections::HashSet<usize>,
+    start: usize,
+    end: usize,
+    left_ellipsis: bool,
+    right_ellipsis: bool,
+) -> (usize, usize) {
+    let mut s = start;
+    let mut e = end;
+    if left_ellipsis {
+        while s < e && chars[s].is_whitespace() && !matched.contains(&s) {
+            s += 1;
+        }
+    }
+    if right_ellipsis {
+        while e > s && chars[e - 1].is_whitespace() && !matched.contains(&(e - 1)) {
+            e -= 1;
+        }
+    }
+    (s, e)
+}
+
+/// Render `chars[start,end)` with ANSI highlight runs (no ellipses).
+fn render_highlighted(
+    chars: &[char],
+    matched: &std::collections::HashSet<usize>,
+    start: usize,
+    end: usize,
+) -> String {
+    let mut out = String::new();
+    let mut in_match = false;
+    for (i, c) in chars.iter().enumerate().take(end).skip(start) {
+        let is_matched = matched.contains(&i);
+        if is_matched && !in_match {
+            out.push_str(MATCH_HIGHLIGHT_START);
+            in_match = true;
+        } else if !is_matched && in_match {
+            out.push_str(MATCH_HIGHLIGHT_END);
+            in_match = false;
+        }
+        out.push(*c);
+    }
+    if in_match {
+        out.push_str(MATCH_HIGHLIGHT_END);
+    }
+    out
+}
+
+/// Single contiguous window covering visible extents `[ms, me)` with maximal
+/// context and ellipsis reservation (the pre-clustering behaviour).
+fn single_extent_snippet(
+    chars: &[char],
+    matched: &std::collections::HashSet<usize>,
+    char_to_visible: &[usize],
+    ms: usize,
+    me: usize,
+    cell_width: usize,
+    max_width: usize,
+) -> String {
+    let n_chars = chars.len();
+    let match_w = me.saturating_sub(ms);
+    let (mut w_start, mut w_end) = if match_w >= max_width {
+        (ms, (ms + max_width).min(cell_width))
+    } else {
+        let slack = max_width - match_w;
+        let s = ms.saturating_sub(slack / 2);
+        let e = (me + (slack - (ms - s))).min(cell_width);
+        let s = s.saturating_sub(max_width.saturating_sub(e - s));
+        let e = if e < cell_width { (s + max_width).min(cell_width) } else { e };
+        (s, e)
+    };
     loop {
         let le = (w_start > 0) as usize;
         let re = (w_end < cell_width) as usize;
@@ -494,34 +704,18 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
             w_end = w_end.saturating_sub(over);
         }
     }
-
-    // Visible cols → char boundaries.
     let start_char = char_to_visible.iter().position(|&v| v >= w_start).unwrap_or(0);
     let end_char = char_to_visible.iter().position(|&v| v >= w_end).unwrap_or(n_chars);
-
-    let mut result = String::new();
-    if start_char > 0 {
-        result.push('…');
+    let (s, e) = tighten(chars, matched, start_char, end_char, start_char > 0, end_char < n_chars);
+    let mut out = String::new();
+    if s > 0 {
+        out.push('…');
     }
-    let mut in_match = false;
-    for (i, c) in chars.iter().enumerate().take(end_char).skip(start_char) {
-        let is_matched = matched.contains(&i);
-        if is_matched && !in_match {
-            result.push_str(MATCH_HIGHLIGHT_START);
-            in_match = true;
-        } else if !is_matched && in_match {
-            result.push_str(MATCH_HIGHLIGHT_END);
-            in_match = false;
-        }
-        result.push(*c);
+    out.push_str(&render_highlighted(chars, matched, s, e));
+    if e < n_chars {
+        out.push('…');
     }
-    if in_match {
-        result.push_str(MATCH_HIGHLIGHT_END);
-    }
-    if end_char < n_chars {
-        result.push('…');
-    }
-    result
+    out
 }
 
 /// Apply ANSI highlighting to matched byte indices in `text`.
@@ -584,9 +778,9 @@ mod snippet_tests {
     #[test]
     fn snippet_fits_in_width_highlights_matches() {
         let cell = "hello world";
-        // "w" at byte 6 is matched - should be highlighted
+        // "w" at byte 6 is matched - should be highlighted.
         let snippet = extract_snippet(cell, &[6], 20);
-        assert!(snippet.contains("\x1b[1;35mw\x1b[0m"), "snippet: {}", snippet);
+        assert!(snippet.contains("\x1b[1;35mw\x1b[22;39m"), "snippet: {:?}", snippet);
         assert!(snippet.contains("hello "));
         assert!(snippet.contains("orld"));
     }
@@ -608,7 +802,7 @@ mod snippet_tests {
         let cell = "model_with_a_very_long_suffix_indeed";
         let indices = vec![0, 1, 2, 3, 4];
         let snippet = extract_snippet(cell, &indices, 20);
-        assert!(snippet.starts_with("\x1b[1;35mmodel"), "snippet: {:?}", snippet);
+        assert!(snippet.starts_with("\x1b[1;35mmodel\x1b[22;39m"), "snippet: {:?}", snippet);
         // No leading ellipsis (nothing trimmed at the start) and full width used.
         assert!(!snippet.starts_with('…'));
         assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
@@ -620,9 +814,37 @@ mod snippet_tests {
         let m = cell.find("model").unwrap();
         let indices: Vec<usize> = (m..m + 5).collect();
         let snippet = extract_snippet(cell, &indices, 20);
-        assert!(snippet.ends_with("model\x1b[0m"), "snippet: {:?}", snippet);
+        assert!(snippet.ends_with("model\x1b[22;39m"), "snippet: {:?}", snippet);
         assert!(snippet.starts_with('…'));
         assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
+    }
+
+    #[test]
+    fn snippet_ellipsis_is_tight() {
+        // Whitespace adjacent to a trimming ellipsis is dropped.
+        let cell = "one two three TARGET four five six seven";
+        let t = cell.find("TARGET").unwrap();
+        let indices: Vec<usize> = (t..t + 6).collect();
+        let snippet = extract_snippet(cell, &indices, 16);
+        assert!(!snippet.contains("… "), "leading space after ellipsis: {:?}", snippet);
+        assert!(!snippet.contains(" …"), "space before ellipsis: {:?}", snippet);
+        assert!(snippet.contains("TARGET"), "{:?}", snippet);
+    }
+
+    #[test]
+    fn snippet_multiple_spans_when_matches_far_apart() {
+        // Two matches far apart: both must be visible, joined by an ellipsis.
+        let cell = "alpha_one_two_three_four_five_six_seven_eight_nine_omega";
+        let a = cell.find("alpha").unwrap();
+        let o = cell.find("omega").unwrap();
+        let mut indices: Vec<usize> = (a..a + 5).collect();
+        indices.extend(o..o + 5);
+        let snippet = extract_snippet(cell, &indices, 30);
+        assert!(snippet.contains("alpha"), "snippet: {:?}", snippet);
+        assert!(snippet.contains("omega"), "snippet: {:?}", snippet);
+        // The interior gap is elided (an interior ellipsis is present).
+        assert!(snippet.matches('…').count() >= 1, "snippet: {:?}", snippet);
+        assert!(display_width(&snippet) <= 30, "w={}", display_width(&snippet));
     }
 
     #[test]
