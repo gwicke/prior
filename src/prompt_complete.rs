@@ -202,9 +202,16 @@ impl PromptCompletion {
                     if self.expand.as_deref() == Some(w.as_str()) {
                         self.expand = None;
                         if empty {
-                            // Re-run empty ⇒ trailing-space convenience
-                            // (cursor sits right after the id).
-                            editor.insert(' ');
+                            // Re-run empty ⇒ trailing-space convenience,
+                            // unless we're mid-text with a space already
+                            // following the cursor — then just consume it.
+                            if editor.cursor() < editor.chars().len()
+                                && editor.chars()[editor.cursor()] == ' '
+                            {
+                                editor.right();
+                            } else {
+                                editor.insert(' ');
+                            }
                             expanded_final = true;
                         }
                     }
@@ -654,6 +661,24 @@ mod tests {
             .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         assert_eq!(ed.text(), "./file.txtx", "no space for a void expansion");
+    }
+
+    #[test]
+    fn tab_rerun_empty_mid_text_consumes_existing_space() {
+        let (mut pc, _req, res) = harness();
+        // Cursor at end of "./fi" with a space already after it
+        let mut ed = editor_at("./fi ", 4);
+        res.send(("./fi".into(), rows(&["./file.txt"]))).unwrap();
+        selected(&pc.eval(&mut ed, HostKey::None, ctx()));
+        idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
+        assert_eq!(ed.text(), "./file.txt ");
+
+        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None }))
+            .unwrap();
+        idle(&pc.eval(&mut ed, HostKey::None, ctx()));
+        // Should consume the existing space, not add a second one
+        assert_eq!(ed.text(), "./file.txt ", "single space preserved");
+        assert_eq!(ed.cursor(), 11, "cursor advanced past consumed space");
     }
 
     // --- worker death ---
