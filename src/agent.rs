@@ -4055,14 +4055,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 }
             }
         }
-        if let Some(target_id) = control.tree_switch {
-            if let Some(s) = app_state.session() {
-                let old_leaf_id = s.get_leaf_id().await;
-                if old_leaf_id.as_deref() != Some(target_id.as_str()) {
-                    let _ = s.move_leaf(Some(target_id.clone())).await;
-                }
-            }
-        }
+
         if let Some(tc) = control.tree_compact {
             let (target_id, mode, payload) = (tc.target_id, tc.mode, tc.payload);
             let Some(s) = app_state.session() else {
@@ -5154,6 +5147,48 @@ impl CodeAgent {
             usage: Mutex::new(SessionUsage::default()),
         }
     }
+}
+
+/// Test helper: a writable session built from `entries` (temp dir,
+/// header written, leaf set to the last entry) wrapped in an `Arc` —
+/// for tests that need a session in the AppState slot. Sync facade with
+/// an internal current-thread runtime (`tokio::fs` needs one); leaks its
+/// temp dir (same policy as the in-module compaction helper).
+#[cfg(test)]
+pub(crate) fn test_session_with_entries(
+    entries: Vec<crate::session::SessionEntry>,
+) -> Arc<Session> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async move {
+        use crate::session::storage::JsonlSessionStorage;
+        use crate::session::types::session_filename;
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-slot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join(session_filename(&chrono::Utc::now()));
+        let storage = JsonlSessionStorage::open_or_create(path)
+            .await
+            .expect("create storage");
+        let header = crate::session::SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.expect("write header");
+        for entry in &entries {
+            storage.append_entry(entry).await.expect("append");
+        }
+        if let Some(last) = entries.last() {
+            let leaf = crate::session::SessionEntry::new_leaf(Some(last.id.clone()), None);
+            storage.append_entry(&leaf).await.expect("append leaf");
+        }
+        let index = storage.build_index().await.expect("build index");
+        Arc::new(Session::new_persisted(storage, index))
+    })
 }
 
 #[cfg(test)]

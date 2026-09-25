@@ -128,8 +128,7 @@ pub struct ControlConfig {
     /// Sessions that should not exist (idempotent deletes; `/clear` pushes
     /// the outgoing current id alongside `new_session`).
     pub delete_session_ids_after: Vec<String>,
-    /// `/tree <id>` — move the session leaf.
-    pub tree_switch: Option<String>,
+
     /// `/tree <id> compact …`.
     pub tree_compact: Option<TreeCompactIntent>,
     /// `/sandbox` mutations (applier merges + re-publishes).
@@ -152,7 +151,7 @@ impl ControlConfig {
             fork: self.fork.take(),
             rename: self.rename.take(),
             delete_session_ids_after: std::mem::take(&mut self.delete_session_ids_after),
-            tree_switch: self.tree_switch.take(),
+
             tree_compact: self.tree_compact.take(),
             sandbox: self.sandbox.take(),
             model_commit: self.model_commit.take(),
@@ -508,9 +507,6 @@ impl AppState {
         }
     }
 
-    pub fn request_tree_switch(&self, target_id: String) {
-        self.state.lock().control.tree_switch = Some(target_id);
-    }
 
     pub fn request_tree_compact(&self, target_id: String, mode: CompactMode, payload: String) {
         self.state.lock().control.tree_compact = Some(TreeCompactIntent {

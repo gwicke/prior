@@ -774,7 +774,15 @@ impl SlashDotNode for TreeSwitchNode {
                 String::new()
             }
         };
-        self.app_state.request_tree_switch(target_id);
+        // Data-plane inline: move the leaf directly — the session is
+        // reachable via the slot. No session → nothing to move (same as
+        // the old applier's silent no-op).
+        if let Some(s) = self.app_state.session() {
+            let old_leaf_id = s.get_leaf_id().await;
+            if old_leaf_id.as_deref() != Some(target_id.as_str()) {
+                let _ = s.move_leaf(Some(target_id.clone())).await;
+            }
+        }
         SubmitResult::Done(None)
     }
 }
@@ -1433,8 +1441,15 @@ mod tests {
     // --- Switch ---
 
     #[test]
-    fn tree_switch_submit_sets_control_target() {
+    fn tree_switch_submit_moves_leaf() {
         let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "some-entry",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
         let mut tree_node = TreeSwitchNode { app_state: app_state.clone() };
         // Action node path: ["tree", "<entry-id>", "switch"]
         let path_args = PathArgs {
@@ -1443,8 +1458,12 @@ mod tests {
             args: Default::default(),
         };
         let _ = futures::executor::block_on(tree_node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        assert_eq!(taken.tree_switch.as_deref(), Some("some-entry"));
+        let leaf = futures::executor::block_on(session.get_leaf_id());
+        assert_eq!(
+            leaf.as_deref(),
+            Some("some-entry"),
+            "submit must move the session leaf directly"
+        );
     }
 
     // --- Full traversal ---
@@ -1461,6 +1480,13 @@ mod tests {
             ),
         ];
         let app_state = app_state_with_tree(tree);
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "first message",
+        )]);
+        app_state.set_session(Some(session.clone()));
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
@@ -1483,11 +1509,11 @@ mod tests {
 
         // 4. Enter → submit.
         let _ = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
+        let leaf = futures::executor::block_on(session.get_leaf_id());
         assert_eq!(
-            taken.tree_switch.as_deref(),
+            leaf.as_deref(),
             Some("u1"),
-            "switch target must carry the entry ID"
+            "switch must move the session leaf to the entry ID"
         );
     }
 
