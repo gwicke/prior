@@ -807,12 +807,17 @@ impl Repl {
             // maximize just revealed. `prev_term_h` stays one step behind (it is
             // advanced only after the redraw), so `redraw` uses it as the clear
             // boundary and the revealed rows survive.
-            let cur_h = crossterm::terminal::size()
-                .map(|(_, h)| h.max(1) as usize)
-                .unwrap_or(24);
+            let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
+            let cur_h = cur_h_u16 as usize;
+            let cur_w = cur_w_u16 as usize;
             if cur_h != prev_term_h.get() {
                 input_row = output.cursor_row();
             }
+            // Keep the shared width in sync (covers width changes even without
+            // an explicit Resize event, e.g. on some terminals).
+            TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
+            // Also keep `cur_h` available as `u16` for code below that expects it.
+            let cur_h = cur_h_u16;
             // --- Eval: resolve the pending key (or a passive frame)
             // into an overlay. Single place where an engine prompt is
             // applied to the buffer AND its plan rendered, so a §5.1
@@ -1006,7 +1011,7 @@ impl Repl {
                 1 + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
             };
             redraw(&editor, &overlay_vec, focus, &mut input_row);
-            prev_term_h.set(cur_h);
+            prev_term_h.set(cur_h as usize);
 
             // --- Read and dispatch one key. ---
             match event::read() {
@@ -1215,7 +1220,11 @@ impl Repl {
                 Ok(Event::Paste(text)) => {
                     editor.insert_str(&text);
                 }
-                Ok(Event::Resize(_, _)) => {
+                Ok(Event::Resize(w, _h)) => {
+                    // Update the shared terminal width so renderers pick up
+                    // the change. This covers both the REPL input phase and
+                    // any output rendering happening outside the in-flight reader.
+                    TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
                     // Belt-and-suspenders re-anchor: the terminal changed size,
                     // so `input_row` may now sit above the real input line. The
                     // primary re-anchor already happens *before* the redraw at
