@@ -104,8 +104,7 @@ pub struct ControlConfig {
     pub quit: bool,
     /// `/session <id> resume [replay]` — load + swap + prefill.
     pub resume: Option<ResumeIntent>,
-    /// `/session <id> fork`.
-    pub fork: Option<String>,
+
 
 
 
@@ -126,7 +125,7 @@ impl ControlConfig {
         ControlConfig {
             quit: self.quit,
             resume: self.resume.take(),
-            fork: self.fork.take(),
+
             tree_compact: self.tree_compact.take(),
             sandbox: self.sandbox.take(),
             model_commit: self.model_commit.take(),
@@ -443,9 +442,6 @@ impl AppState {
         });
     }
 
-    pub fn request_fork(&self, session_id: String) {
-        self.state.lock().control.fork = Some(session_id);
-    }
 
 
 
@@ -557,20 +553,17 @@ mod tests {
     fn control_take_gc_one_shots_but_quit_latches() {
         let app_state = AppState::for_test(test_settings());
         app_state.request_resume("abc".into(), "5t".into());
-        app_state.request_fork("fork-me".into());
         app_state.set_model_commit("test:model".into());
         app_state.request_quit();
 
         let taken = app_state.take_control();
         assert_eq!(taken.resume.as_ref().unwrap().session_id, "abc");
-        assert_eq!(taken.fork.as_deref(), Some("fork-me"));
         assert_eq!(taken.model_commit.as_deref(), Some("test:model"));
         assert!(taken.quit);
 
         // GC: one-shots gone, quit still latching.
         let taken2 = app_state.take_control();
         assert!(taken2.resume.is_none());
-        assert!(taken2.fork.is_none());
         assert!(taken2.model_commit.is_none());
         assert!(app_state.should_quit(), "quit is latching — never cleared");
     }

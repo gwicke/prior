@@ -460,8 +460,28 @@ impl SlashDotNode for SessionForkNode {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
-        self.app_state.request_fork(session_id);
-        SubmitResult::Done(None)
+        // Data-plane inline: resolve the meta by id, fork, and activate —
+        // the slot write bundles session + current id (same effect as the
+        // old Switched path).
+        let found = match self.app_state.repo() {
+            Some(repo) => repo
+                .list(None)
+                .await
+                .ok()
+                .and_then(|metas| metas.into_iter().find(|m| m.id == session_id))
+                .map(|m| (repo, m)),
+            None => None,
+        };
+        let Some((repo, meta)) = found else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        match crate::agent::fork_session_at(&repo, &meta).await {
+            Ok((new_session, id)) => {
+                self.app_state.activate_session(Some(new_session), id);
+                SubmitResult::Done(None)
+            }
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -854,17 +874,27 @@ mod tests {
     }
 
     #[test]
-    fn session_fork_submit_sets_control_target() {
-        let app_state = test_app_state();
+    fn session_fork_submit_switches_to_fork() {
+        let (app_state, uuid, base) = temp_repo_with_session();
         let mut node = SessionForkNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "fork".into()],
+            ids: vec!["session".into(), uuid.clone(), "fork".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = futures::executor::block_on(node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        assert_eq!(taken.fork.as_deref(), Some("some-uuid"));
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "fork must succeed");
+        let s = app_state.session().expect("fork activated into the slot");
+        assert_ne!(s.get_session_id(), uuid, "a fork is a new session");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        // Source file (encoded fixture dir) + fork (encoded process-cwd
+        // dir) both under the temp base.
+        assert_eq!(
+            app_state.repo().unwrap().list_sessions_sync(None).len(),
+            2,
+            "source + fork on disk"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -2844,32 +2844,13 @@ async fn handle_session_command(
         }
 "fork" => {
             if let Some(meta) = meta {
-                let cwd = match std::env::current_dir() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        config.output.display_text("Cannot determine current directory");
-                        return SessionCommandResult::Handled;
-                    }
-                };
-                match repo.as_ref().unwrap().fork(&meta, "", &cwd, ForkMode::FullTree).await {
-                    Ok(new_storage) => {
-                        let index = new_storage.build_index().await.unwrap_or_else(|_| {
-                            let header = crate::session::SessionHeader::new(&cwd);
-                            crate::session::SessionIndex {
-                                header,
-                                entries: std::collections::HashMap::new(),
-                                leaf_id: None,
-                                children: std::collections::HashMap::new(),
-                                session_name: None,
-                            }
-                        });
-                        let new_session = Session::new_persisted(new_storage, index);
-                        let id = new_session.get_session_id().to_string();
-                        *session = Some(Arc::new(new_session));
+                match fork_session_at(repo.as_ref().unwrap(), &meta).await {
+                    Ok((new_session, id)) => {
+                        *session = Some(new_session);
                         SessionCommandResult::Switched { id, prefill: None }
                     }
-                    Err(e) => {
-                        config.output.display_text(&format!("Cannot fork session: {}", e));
+                    Err(msg) => {
+                        config.output.display_text(&msg);
                         SessionCommandResult::Handled
                     }
                 }
@@ -3596,6 +3577,36 @@ pub(crate) async fn ensure_session(
     }
 }
 
+/// Fork a session (full tree, current dir) into a fresh `Arc<Session>` —
+/// shared by the inline fork node and `handle_session_command`. The
+/// caller activates it (slot) or stores it (typed path's local write).
+pub(crate) async fn fork_session_at(
+    repo: &crate::session::repo::JsonlSessionRepo,
+    meta: &crate::session::SessionMetadata,
+) -> std::result::Result<(Arc<Session>, String), String> {
+    use crate::session::repo::SessionRepo;
+    let cwd = std::env::current_dir()
+        .map_err(|_| "Cannot determine current directory".to_string())?;
+    match repo.fork(meta, "", &cwd, ForkMode::FullTree).await {
+        Ok(new_storage) => {
+            let index = new_storage.build_index().await.unwrap_or_else(|_| {
+                let header = crate::session::SessionHeader::new(&cwd);
+                crate::session::SessionIndex {
+                    header,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                }
+            });
+            let new_session = Session::new_persisted(new_storage, index);
+            let id = new_session.get_session_id().to_string();
+            Ok((Arc::new(new_session), id))
+        }
+        Err(e) => Err(format!("Cannot fork session: {}", e)),
+    }
+}
+
 /// Create a fresh session (dropping the in-memory one), activate it in
 /// the slot, and apply an optional name — shared by the inline `/new`
 /// and `/clear` nodes. Provider/model/thinking come from the **target**
@@ -3993,25 +4004,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 SessionCommandResult::Handled => {}
                 other => {
                     eprintln!("[v25] resume: unexpected result {:?}", std::mem::discriminant(&other));
-                }
-            }
-        }
-        if let Some(session_id) = control.fork {
-            let input = format!("/session {} fork", session_id);
-            let out = config.output.clone();
-            let mut session = app_state.session();
-            let result = handle_session_command(
-                &input, &mut session, &mut repo, &mut config, &out,
-                &app_state.settings(),
-            ).await;
-            app_state.set_session(session);
-            match result {
-                SessionCommandResult::Switched { id: new_id, .. } => {
-                    app_state.set_current_session_id(new_id);
-                }
-                SessionCommandResult::Handled => {}
-                other => {
-                    eprintln!("[v25] fork: unexpected result {:?}", std::mem::discriminant(&other));
                 }
             }
         }

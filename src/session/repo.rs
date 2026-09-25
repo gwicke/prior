@@ -449,6 +449,11 @@ impl SessionRepo for JsonlSessionRepo {
         let orig_header: SessionHeader = serde_json::from_str(lines[0])?;
 
         let new_path = self.session_file_path(cwd);
+        // The target cwd's session dir may not exist yet (first fork into
+        // a fresh directory) — `File::create` below would fail with ENOENT.
+        if let Some(parent) = new_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         match mode {
             ForkMode::FullTree => {
