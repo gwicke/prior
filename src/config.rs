@@ -222,6 +222,34 @@ impl From<BashTimeout> for Option<u64> {
     }
 }
 
+/// Custom deserializer for `ReasoningInContextMode` that accepts both legacy
+/// boolean values (`true`/`false`) and new string enum values
+/// (`"always"`, `"never"`, `"aborted_turns_only"`).
+fn deserialize_reasoning_in_context<'de, D>(deserializer: D) -> Result<Option<crate::settings::ReasoningInContextMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrString {
+        Bool(bool),
+        String(String),
+    }
+
+    let opt = Option::<BoolOrString>::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        BoolOrString::Bool(b) => {
+            if b {
+                crate::settings::ReasoningInContextMode::Always
+            } else {
+                crate::settings::ReasoningInContextMode::Never
+            }
+        }
+        BoolOrString::String(s) => crate::settings::ReasoningInContextMode::parse_opt(&s)
+            .unwrap_or_default(),
+    }))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
 pub struct SandboxTimeoutSecs(pub Option<u64>);
 
@@ -693,7 +721,7 @@ pub struct Config {
     /// from aborted/errored turns. Default: `never`. Forced `always` for
     /// Anthropic-family providers (thinking+tool_use replay contract).
     /// See `doc/compaction.md`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_reasoning_in_context")]
     pub reasoning_in_context: Option<crate::settings::ReasoningInContextMode>,
     /// Free-text instruction prepended to the dropped-span transcript when
     /// `/tree <id> compact llm` is run with no trailing text. When unset,
