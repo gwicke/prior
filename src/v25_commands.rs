@@ -34,7 +34,7 @@ mod tests {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.app_state.borrow();
             let active = current.as_deref().unwrap_or("off").to_string();
-            let rows = ["off", "low", "med", "high"].iter()
+            let rows = ["off", "low", "med", "high", "max"].iter()
                 .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
                 .collect();
             Ok(Rc::new(DataResponse {
@@ -78,11 +78,12 @@ mod tests {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
                     .collect();
-                assert_eq!(row_texts.len(), 4);
+                assert_eq!(row_texts.len(), 5);
                 assert!(row_texts.iter().any(|t| t.contains("off")));
                 assert!(row_texts.iter().any(|t| t.contains("low")));
                 assert!(row_texts.iter().any(|t| t.contains("med")));
                 assert!(row_texts.iter().any(|t| t.contains("high")));
+                assert!(row_texts.iter().any(|t| t.contains("max")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -109,7 +110,7 @@ mod tests {
         let r = eval(&mut h, "thinking ", HostKey::None);
         match &r {
             MenuResult::Continue(plan, _) => {
-                assert_eq!(plan.rows.len(), 4);
+                assert_eq!(plan.rows.len(), 5);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -205,6 +206,7 @@ mod tests {
                 assert!(!row_texts.iter().any(|t| t.contains("off")));
                 assert!(!row_texts.iter().any(|t| t.contains("low")));
                 assert!(!row_texts.iter().any(|t| t.contains("med")));
+                assert!(!row_texts.iter().any(|t| t.contains("max")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }

@@ -32,7 +32,8 @@ impl SlashDotNode for ThinkingEnumNode {
             ("off", "no extra reasoning"),
             ("low", "minimal reasoning"),
             ("med", "balanced reasoning"),
-            ("high", "maximum reasoning"),
+            ("high", "high reasoning"),
+            ("max", "maximum reasoning"),
         ];
         let rows = levels.iter()
             .map(|(l, d)| crate::slashdot_menu::fields::Row::new(*l).desc(*d))

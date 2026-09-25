@@ -16,6 +16,7 @@ pub enum ThinkingLevel {
     Low,
     Med,
     High,
+    Max,
 }
 
 impl FromStr for ThinkingLevel {
@@ -25,7 +26,8 @@ impl FromStr for ThinkingLevel {
             "off" | "none" | "0" | "false" => Ok(ThinkingLevel::Off),
             "low" | "min" | "1" => Ok(ThinkingLevel::Low),
             "med" | "medium" | "2" => Ok(ThinkingLevel::Med),
-            "high" | "max" | "3" => Ok(ThinkingLevel::High),
+            "high" | "3" => Ok(ThinkingLevel::High),
+            "max" | "xhigh" | "x-high" | "4" => Ok(ThinkingLevel::Max),
             other => Err(format!(
                 "unknown thinking level: '{}' (use off | low | med | high)",
                 other
@@ -41,6 +43,7 @@ impl ThinkingLevel {
             ThinkingLevel::Low => "low",
             ThinkingLevel::Med => "med",
             ThinkingLevel::High => "high",
+            ThinkingLevel::Max => "max",
         }
     }
 }
@@ -64,23 +67,21 @@ pub fn mapping(provider: &str, level: ThinkingLevel) -> Option<Value> {
                     ThinkingLevel::Low => "low",
                     ThinkingLevel::Med => "medium",
                     ThinkingLevel::High => "high",
+                    ThinkingLevel::Max => "max",
                     ThinkingLevel::Off => unreachable!(),
                 };
                 Some(json!({"reasoning_effort": effort}))
             }
         }
-        "openrouter" => {
-            if level == ThinkingLevel::Off {
-                None
-            } else {
-                let effort = match level {
-                    ThinkingLevel::Low => "low",
-                    ThinkingLevel::Med => "medium",
-                    ThinkingLevel::High => "high",
-                    ThinkingLevel::Off => unreachable!(),
-                };
-                Some(json!({"reasoning": {"effort": effort}}))
-            }
+        "openrouter" | "deepseek" => {
+            let effort = match level {
+                ThinkingLevel::Off => "none",
+                ThinkingLevel::Low => "low",
+                ThinkingLevel::Med => "medium",
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Max => "max",
+            };
+            Some(json!({"reasoning": {"effort": effort}}))
         }
         "xiaomimimo" => {
             // Xiaomi MiMo 2.6 supports thinking.type = "enabled" | "disabled" (no levels)
@@ -113,14 +114,14 @@ mod tests {
         assert_eq!("LOW".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Low);
         assert_eq!("medium".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Med);
         assert_eq!("3".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::High);
+        assert_eq!("max".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Max);
         assert!("bogus".parse::<ThinkingLevel>().is_err());
     }
 
     #[test]
-    fn off_maps_to_none_everywhere() {
+    fn off_maps_to_none_almost_everywhere() {
         assert!(mapping("anthropic", ThinkingLevel::Off).is_none());
         assert!(mapping("openai", ThinkingLevel::Off).is_none());
-        assert!(mapping("openrouter", ThinkingLevel::Off).is_none());
         assert!(mapping("groq", ThinkingLevel::Off).is_none());
     }
 
