@@ -73,7 +73,7 @@ pub fn mapping(provider: &str, level: ThinkingLevel) -> Option<Value> {
                 Some(json!({"reasoning_effort": effort}))
             }
         }
-        "openrouter" | "deepseek" => {
+        "openrouter" => {
             let effort = match level {
                 ThinkingLevel::Off => "none",
                 ThinkingLevel::Low => "low",
@@ -83,14 +83,22 @@ pub fn mapping(provider: &str, level: ThinkingLevel) -> Option<Value> {
             };
             Some(json!({"reasoning": {"effort": effort}}))
         }
-        "xiaomimimo" => {
-            // Xiaomi MiMo 2.6 supports thinking.type = "enabled" | "disabled" (no levels)
+        "deepseek" | "xiaomimimo" => {
+            // Like openrouter, but with extra "thinking: {type: "enabled|disabled" }" object
             let thinking_type = if level == ThinkingLevel::Off {
                 "disabled"
             } else {
                 "enabled"
             };
-            Some(json!({"thinking": {"type": thinking_type}}))
+            // Xiaomimimo does not officially support reasoning_effort, but ignores it
+            let effort = match level {
+                ThinkingLevel::Off => "none", // Should technically be omitted, but probably fine
+                ThinkingLevel::Low => "low",
+                ThinkingLevel::Med => "medium", // For DS 4.1, service maps "medium" to "high"
+                ThinkingLevel::High => "high",
+                ThinkingLevel::Max => "max",
+            };
+            Some(json!({"thinking": {"type": thinking_type}, "reasoning_effort": effort}))
         }
         _ => None,
     }
@@ -160,20 +168,24 @@ mod tests {
         // Off maps to disabled
         assert_eq!(
             mapping("xiaomimimo", ThinkingLevel::Off),
-            Some(json!({"thinking": {"type": "disabled"}}))
+            Some(json!({"thinking": {"type": "disabled"}, "reasoning_effort": "none"}))
         );
         // Any "on" level maps to enabled
         assert_eq!(
             mapping("xiaomimimo", ThinkingLevel::Low),
-            Some(json!({"thinking": {"type": "enabled"}}))
+            Some(json!({"thinking": {"type": "enabled"}, "reasoning_effort": "low"}))
         );
         assert_eq!(
             mapping("xiaomimimo", ThinkingLevel::Med),
-            Some(json!({"thinking": {"type": "enabled"}}))
+            Some(json!({"thinking": {"type": "enabled"}, "reasoning_effort": "medium"}))
         );
         assert_eq!(
             mapping("xiaomimimo", ThinkingLevel::High),
-            Some(json!({"thinking": {"type": "enabled"}}))
+            Some(json!({"thinking": {"type": "enabled"}, "reasoning_effort": "high"}))
+        );
+        assert_eq!(
+            mapping("xiaomimimo", ThinkingLevel::Max),
+            Some(json!({"thinking": {"type": "enabled"}, "reasoning_effort": "max"}))
         );
     }
 
