@@ -1,7 +1,7 @@
 //! v2.5 `SlashDotNode` implementation for `/new`.
 //!
-//! Leaf node: submit() writes the `new_session` control target on
-//! `AppState`; the agent loop converges (fresh session) at the cycle point.
+//! Leaf node: submit() creates and activates a fresh session **inline**
+//! (stamped from the target config — recorded judgment in the plan).
 use std::sync::Arc;
 
 use std::rc::Rc;
@@ -41,7 +41,9 @@ impl SlashDotNode for NewNode {
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
-        self.app_state.request_new(name);
+        // Data-plane inline: drop + create + activate, now — no control
+        // field, no loop round-trip.
+        crate::agent::start_fresh_session(&self.app_state, &name).await;
         SubmitResult::Done(None)
     }
 }
@@ -95,24 +97,33 @@ mod tests {
     }
 
     #[test]
-    fn new_submit_sets_new_session_target() {
+    fn new_submit_creates_fresh_session() {
         let app_state = test_app_state();
+        let (repo, outgoing, base) = crate::agent::test_repo_with_session();
+        app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = futures::executor::block_on(handle.eval_prompt("new ", HostKey::None, 80));
-        let _ = futures::executor::block_on(handle.eval_prompt("new ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some(""));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        assert_ne!(s.get_session_id(), outgoing, "must be a different session");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn new_with_name_sets_new_session_target() {
+    fn new_with_name_names_session() {
         let app_state = test_app_state();
+        let (repo, _outgoing, base) = crate::agent::test_repo_with_session();
+        app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = futures::executor::block_on(handle.eval_prompt("new my-session ", HostKey::None, 80));
-        let _ = futures::executor::block_on(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some("my-session"));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        let name =
+            crate::agent::block_on_test(async { s.index().lock().await.session_name.clone() });
+        assert_eq!(name.as_deref(), Some("my-session"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

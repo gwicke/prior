@@ -1,14 +1,14 @@
 //! v2.5 `SlashDotNode` implementation for `/clear`.
 //!
-//! Leaf node: submit() composes the `/clear` target declaratively — start a
-//! fresh session AND delete the outgoing one afterwards
-//! (`new_session` + `delete_session_ids_after`); the loop's applier defines
-//! the order (create → swap → delete), idempotence makes replays safe.
+//! Leaf node: submit() does the whole transaction **inline** in the
+//! applier's original order — create → activate → delete outgoing —
+//! idempotent (a missing/stale outgoing id is a no-op).
 use std::sync::Arc;
 
 use std::rc::Rc;
 
 use crate::app_state::AppState;
+use crate::session::repo::SessionRepo;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
@@ -43,7 +43,23 @@ impl SlashDotNode for ClearNode {
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
         let outgoing = self.app_state.current_session_id();
-        self.app_state.request_clear(name, outgoing);
+        // Data-plane inline: create → activate first (so the fresh
+        // session is the current one), then delete the outgoing file —
+        // same order the applier used; deletion is idempotent.
+        crate::agent::start_fresh_session(&self.app_state, &name).await;
+        if !outgoing.is_empty() {
+            if let Some(repo) = self.app_state.repo() {
+                let meta = repo
+                    .list(None)
+                    .await
+                    .ok()
+                    .and_then(|metas| metas.into_iter().find(|m| m.id == outgoing));
+                if let Some(meta) = meta {
+                    // `delete` invalidates the listing cache itself.
+                    let _ = repo.delete(&meta).await;
+                }
+            }
+        }
         SubmitResult::Done(None)
     }
 }
@@ -97,28 +113,42 @@ mod tests {
     }
 
     #[test]
-    fn clear_submit_composes_new_plus_delete_targets() {
+    fn clear_submit_switches_and_deletes_outgoing() {
         let app_state = test_app_state();
-        app_state.set_current_session_id("outgoing-1".into());
+        let (repo, outgoing, base) = crate::agent::test_repo_with_session();
+        app_state.set_repo(Some(repo));
+        app_state.set_current_session_id(outgoing.clone());
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = futures::executor::block_on(handle.eval_prompt("clear ", HostKey::None, 80));
-        let _ = futures::executor::block_on(handle.eval_prompt("clear ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some(""));
-        assert_eq!(taken.delete_session_ids_after, vec!["outgoing-1".to_string()]);
+        let _ = crate::agent::block_on_test(handle.eval_prompt("clear ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        assert_ne!(s.get_session_id(), outgoing, "fresh session replaces the outgoing one");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        assert!(
+            app_state.repo().unwrap().list_sessions_sync(None).is_empty(),
+            "the outgoing file must be gone (the fresh one is not written until its first turn)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn clear_with_name_composes_targets() {
+    fn clear_with_name_names_fresh_session() {
         let app_state = test_app_state();
+        let base = std::env::temp_dir().join(format!(
+            "v25-clear-name-test-{}",
+            std::process::id()
+        ));
+        let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
+        app_state.set_repo(Some(repo));
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = futures::executor::block_on(handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80));
-        let _ = futures::executor::block_on(handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some("my-fresh-start"));
-        // No current session id → nothing to delete.
-        assert!(taken.delete_session_ids_after.is_empty());
+        let _ = crate::agent::block_on_test(handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        let name =
+            crate::agent::block_on_test(async { s.index().lock().await.session_name.clone() });
+        assert_eq!(name.as_deref(), Some("my-fresh-start"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

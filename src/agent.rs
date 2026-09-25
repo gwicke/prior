@@ -3596,6 +3596,39 @@ pub(crate) async fn ensure_session(
     }
 }
 
+/// Create a fresh session (dropping the in-memory one), activate it in
+/// the slot, and apply an optional name — shared by the inline `/new`
+/// and `/clear` nodes. Provider/model/thinking come from the **target**
+/// config (handler-side stamping: recorded judgment — diverges from the
+/// applied layer only in the failed-rebuild state; a later `ModelChange`
+/// record corrects the journal).
+pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
+    let (provider, model, thinking) = app_state.with_config(|c| {
+        (
+            c.provider.clone(),
+            c.model.clone(),
+            c.thinking_level.clone(),
+        )
+    });
+    let repo = app_state.repo();
+    let fresh = ensure_session(None, &repo, Some(provider), Some(model), thinking).await;
+    let id = fresh
+        .as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
+    app_state.activate_session(fresh.clone(), id);
+    if !name.is_empty() {
+        if let Some(ref s) = fresh {
+            let out = app_state.with_config(|c| c.output.clone());
+            if let Err(e) = s.set_session_name(name).await {
+                out.display_text(&format!("Could not name session: {}", e));
+            } else if let Some(r) = app_state.repo() {
+                r.invalidate_cache();
+            }
+        }
+    }
+}
+
 /// Load the list of recently-used model IDs from `recent_models.txt`.
 /// Returns an empty vec if the file doesn't exist or can't be read.
 fn load_recent_models() -> Vec<String> {
@@ -3982,60 +4015,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 }
             }
         }
-        // Fresh session first: `/clear` composes `new_session` +
-        // `delete_session_ids_after`, and this applier defines the order —
-        // create → swap → delete (idempotent: a missing id is a no-op).
-        if let Some(name) = control.new_session {
-            // `/new` drops the in-memory session — pass `None` explicitly
-            // (ensure would keep a `Some` as-is), then activate atomically.
-            let fresh = ensure_session(
-                None,
-                &repo,
-                Some(config.provider.clone()),
-                Some(config.model.clone()),
-                config.thinking_level.clone(),
-            )
-            .await;
-            let fresh_id = fresh
-                .as_ref()
-                .map(|s| s.get_session_id().to_string())
-                .unwrap_or_default();
-            app_state.activate_session(fresh.clone(), fresh_id);
-            if !name.is_empty() {
-                if let Some(ref s) = fresh {
-                    if let Err(e) = s.set_session_name(&name).await {
-                        config
-                            .output
-                            .display_text(&format!("Could not name session: {}", e));
-                    } else if let Some(ref r) = repo {
-                        r.invalidate_cache();
-                    }
-                }
-            }
-        }
-        for session_id in control.delete_session_ids_after {
-            let input = format!("/session {} delete", session_id);
-            let out = config.output.clone();
-            let mut sess = app_state.session();
-            let result = handle_session_command(
-                &input, &mut sess, &mut repo, &mut config, &out,
-                &app_state.settings(),
-            ).await;
-            let became_none = sess.is_none();
-            app_state.set_session(sess);
-            match result {
-                SessionCommandResult::Deleted => {
-                    if became_none {
-                        app_state.set_current_session_id(String::new());
-                    }
-                }
-                SessionCommandResult::Handled => {}
-                other => {
-                    eprintln!("[v25] delete: unexpected result {:?}", std::mem::discriminant(&other));
-                }
-            }
-        }
-
         if let Some(tc) = control.tree_compact {
             let (target_id, mode, payload) = (tc.target_id, tc.mode, tc.payload);
             let Some(s) = app_state.session() else {
@@ -5127,6 +5106,56 @@ impl CodeAgent {
             usage: Mutex::new(SessionUsage::default()),
         }
     }
+}
+
+/// Test helper: a temp-dir repo holding one session file (header + user
+/// message + leaf, written directly so listings see it immediately).
+/// Returns `(repo, session id, base dir)`; leaks the dir unless the
+/// caller removes it.
+#[cfg(test)]
+pub(crate) fn test_repo_with_session() -> (
+    crate::session::repo::JsonlSessionRepo,
+    String,
+    std::path::PathBuf,
+) {
+    use crate::session::repo::JsonlSessionRepo;
+    use crate::session::types::{encode_cwd, session_filename, SessionHeader};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "picocode-repo-test-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let cwd = std::path::Path::new("/tmp/v25-cwd");
+    let dir = base.join(encode_cwd(cwd));
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = SessionHeader::new(cwd);
+    let uuid = header.id.clone();
+    let path = dir.join(session_filename(&chrono::Utc::now()));
+    let user_entry = serde_json::json!({
+        "id": "e1",
+        "timestamp": "2025-01-01T00:00:00.000Z",
+        "type": "message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello world"}]},
+    });
+    let leaf = serde_json::json!({
+        "id": "leaf1",
+        "timestamp": "2025-01-01T00:00:01.000Z",
+        "type": "leaf",
+        "targetId": "e1",
+    });
+    let contents = format!(
+        "{}\n{}\n{}\n",
+        serde_json::to_string(&header).unwrap(),
+        serde_json::to_string(&user_entry).unwrap(),
+        serde_json::to_string(&leaf).unwrap(),
+    );
+    std::fs::write(&path, contents).unwrap();
+    let repo = JsonlSessionRepo::new(base.clone());
+    (repo, uuid, base)
 }
 
 /// Test helper: drive a future on a fresh current-thread tokio runtime.

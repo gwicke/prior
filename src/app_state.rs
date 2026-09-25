@@ -102,16 +102,12 @@ pub enum SandboxOp {
 pub struct ControlConfig {
     /// Latching: the loop exits when it observes `true` (never cleared).
     pub quit: bool,
-    /// `/new` (and `/clear`): create a fresh session, optionally named.
-    pub new_session: Option<String>,
     /// `/session <id> resume [replay]` — load + swap + prefill.
     pub resume: Option<ResumeIntent>,
     /// `/session <id> fork`.
     pub fork: Option<String>,
 
-    /// Sessions that should not exist (idempotent deletes; `/clear` pushes
-    /// the outgoing current id alongside `new_session`).
-    pub delete_session_ids_after: Vec<String>,
+
 
     /// `/tree <id> compact …`.
     pub tree_compact: Option<TreeCompactIntent>,
@@ -129,12 +125,8 @@ impl ControlConfig {
     fn take_one_shots(&mut self) -> ControlConfig {
         ControlConfig {
             quit: self.quit,
-            new_session: self.new_session.take(),
             resume: self.resume.take(),
             fork: self.fork.take(),
-
-            delete_session_ids_after: std::mem::take(&mut self.delete_session_ids_after),
-
             tree_compact: self.tree_compact.take(),
             sandbox: self.sandbox.take(),
             model_commit: self.model_commit.take(),
@@ -443,21 +435,6 @@ impl AppState {
         self.state.lock().control.quit
     }
 
-    pub fn request_new(&self, name: String) {
-        self.state.lock().control.new_session = Some(name);
-    }
-
-    /// `/clear`: start fresh *and* delete the outgoing session afterwards —
-    /// declarative transaction intent (`applier`: create → swap → delete).
-    pub fn request_clear(&self, name: String, outgoing_session_id: String) {
-        let mut st = self.state.lock();
-        st.control.new_session = Some(name);
-        if !outgoing_session_id.is_empty()
-            && !st.control.delete_session_ids_after.contains(&outgoing_session_id)
-        {
-            st.control.delete_session_ids_after.push(outgoing_session_id);
-        }
-    }
 
     pub fn request_resume(&self, session_id: String, replay_arg: String) {
         self.state.lock().control.resume = Some(ResumeIntent {
@@ -580,25 +557,20 @@ mod tests {
     fn control_take_gc_one_shots_but_quit_latches() {
         let app_state = AppState::for_test(test_settings());
         app_state.request_resume("abc".into(), "5t".into());
-        app_state.request_clear("fresh".into(), "outgoing-id".into());
+        app_state.request_fork("fork-me".into());
         app_state.set_model_commit("test:model".into());
         app_state.request_quit();
 
         let taken = app_state.take_control();
         assert_eq!(taken.resume.as_ref().unwrap().session_id, "abc");
-        assert_eq!(taken.new_session.as_deref(), Some("fresh"));
-        assert_eq!(
-            taken.delete_session_ids_after,
-            vec!["outgoing-id".to_string()]
-        );
+        assert_eq!(taken.fork.as_deref(), Some("fork-me"));
         assert_eq!(taken.model_commit.as_deref(), Some("test:model"));
         assert!(taken.quit);
 
         // GC: one-shots gone, quit still latching.
         let taken2 = app_state.take_control();
         assert!(taken2.resume.is_none());
-        assert!(taken2.new_session.is_none());
-        assert!(taken2.delete_session_ids_after.is_empty());
+        assert!(taken2.fork.is_none());
         assert!(taken2.model_commit.is_none());
         assert!(app_state.should_quit(), "quit is latching — never cleared");
     }
@@ -631,12 +603,4 @@ mod tests {
         assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
     }
 
-    #[test]
-    fn clear_composes_new_plus_delete() {
-        let app_state = AppState::for_test(test_settings());
-        app_state.request_clear("".into(), "old".into());
-        let taken = app_state.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some(""));
-        assert_eq!(taken.delete_session_ids_after, vec!["old".to_string()]);
-    }
 }
