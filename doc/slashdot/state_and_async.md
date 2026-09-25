@@ -356,12 +356,35 @@ still sync); the async conversion rides on top.
    in `#[cfg(test)]` regions are wrapped in `futures::executor::block_on`
    (scripted, paren-balanced, one descending insertion pass) — 242
    wraps; test bodies and helpers unchanged.
-4. **Data-plane inline.** rename/delete/fork/replay/settings-save run in
-   `submit().await`; `/model` records `ModelChange` inline → delete
-   `model_commit` + the loop-side detection; delete the `AsyncOp`
-   dispatch match — each consumer applies its own `ControlConfig` fields
-   at its application point (small applier fns, not one central match).
-5. **Verify.** Full suite; E2E: the empty-session repro from the
+4. **Slot exposure.** `SessionSlot` gains the two shared handles —
+   `session: Option<Arc<Session>>` (all methods `&self`; internals are
+   `Arc<AsyncMutex>` by design) and `agent: Option<Arc<dyn PicoAgent>>`
+   (`Send + Sync`, all methods `&self`) — plus `activate_session(id)` /
+   `activate_agent(a)` one-acquisition swaps (stronger bundle guarantee:
+   one atomic write). Loop call-sites become *lock → clone `Arc` out →
+   drop guard → await*; creation/rebuild stays loop-side, from the
+   **applied** config (handlers only ever consume the `Arc`s).
+5. **Data-plane inline — appliers collapse.** rename/delete/fork/
+   replay/resume/tree_switch/new/compact run in `submit().await`
+   (session + agent + output all reachable); `/model` records
+   `ModelChange` inline → delete `model_commit` + the loop-side
+   detection. Editor review works mid-eval (`guard.stop` → editor →
+   `guard.start` → confirm — overlay-agnostic) but needs a **DSR cursor
+   resync after `guard.start()`** before `emit_commit`/redraw draw
+   against the pre-editor `input_row` (the Ctrl-E path's "only when no
+   overlay is active" gate is the known precedent). Judgment call
+   recorded: session creation stamps provider/model from the **target**
+   config handler-side (divergence only in the failed-rebuild state; a
+   later `ModelChange` record corrects the journal) — reject that and
+   `new`/`resume` stay thin loop-stamping appliers instead.
+   `ControlConfig` shrinks to `quit` + whatever loop-stamping remains.
+   Also: handler-internal sync IO → awaits, **cache-preserving** —
+   session listings + `find_session` move to an async `list` that
+   consults the shared 2s mtime cache first (warm = memory, stale =
+   `tokio::fs` scan; never a per-keystroke rescan — the naive swap to
+   the uncached async `list()` would be strictly worse); settings
+   `save()` gets an async facade (clone out → drop guard → await write).
+6. **Verify.** Full suite; E2E: the empty-session repro from the
    model-change bug must stay dead; grep `MenuShared|LiveState|
    pending_op|model_commit` → zero; smoke `/session` ops, quit,
    resume + prefill, `/model`.
