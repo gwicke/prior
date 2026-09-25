@@ -52,8 +52,11 @@
   only when the target is achieved (or abandoned after a reported
   error), relying on idempotence (re-applying is a no-op). Latching
   fields (`quit`) are never cleared. Eval is the only writer, so each
-  field is last-wins; missing an application point only delays
-  convergence, never loses the request.
+ field is last-wins; missing an application point only delays
+  convergence, never loses the request. Config convergence attempts one
+  rebuild per distinct target (fingerprint of model/thinking/persona;
+  an explicit `/model` re-commit re-arms) — a failed attempt errors once,
+  not every cycle (`create_agent` errors are final for a given target).
 - **Membership rule:** direct call if the handler can finish the
   operation itself (rename/delete/fork/replay/tree-switch); a target
   field only when application needs loop/agent-owned objects (control

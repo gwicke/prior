@@ -3732,6 +3732,11 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             .map(|s| s.get_session_id().to_string())
             .unwrap_or_default(),
     );
+    // Rebuild gate state: fingerprint of the last target we ATTEMPTED to
+    // apply. A failed attempt (bad id, missing key) stays silent and
+    // un-retried until the target changes — one error per distinct target,
+    // not one per cycle while the user navigates back to the menu.
+    let mut last_attempted_target: Option<(String, Option<String>, Option<String>)> = None;
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
     if guard.is_some() {
@@ -3839,7 +3844,21 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         let persona_changed = config.persona_name != target.persona_name;
         let target_thinking = target.thinking_level.clone();
 
-        if model_changed || thinking_changed || persona_changed {
+        // One rebuild attempt per distinct target: re-running a failed
+        // attempt would reprint the same error every cycle while the user
+        // digs back to the menu to fix it. Changing the target — or an
+        // explicit `/model` re-commit of the same model — arms the next
+        // attempt. (`create_agent` is local: key/config errors are final
+        // for a given target, so recovery really is "change the target".)
+        let target_fp = (
+            target.qualified_model_id(),
+            target.thinking_level.clone(),
+            target.persona_name.clone(),
+        );
+        let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp)
+            || control.model_commit.is_some();
+        if (model_changed || thinking_changed || persona_changed) && rebuild_armed {
+            last_attempted_target = Some(target_fp);
             let mut new_cfg = config.clone();
             if model_changed {
                 new_cfg.provider = target.provider.clone();
