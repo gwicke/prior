@@ -236,6 +236,7 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
     let mut args: Vec<String> = vec!["-p".into(), "llamacpp".into(), "-m".into(), "test".into(), "--yolo".into(), "true".into()];
     let _cfg_keep;
+    let _config_tempdir;
     if thinking {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = tmp.path().join("picocode.toml");
@@ -246,12 +247,17 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     } else {
         _cfg_keep = None;
     }
+    // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
+    let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
+    cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
     let mut child = pair
         .slave
         .spawn_command(cmd)
         .expect("spawn picocode");
+    // Keep the tempdir alive for the duration of the run.
+    _config_tempdir = Some(config_tempdir);
 
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
