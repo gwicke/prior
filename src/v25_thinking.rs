@@ -24,8 +24,9 @@ pub struct ThinkingEnumNode {
     pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ThinkingEnumNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let active = (self.active_fn)();
         let levels: &[(&str, &str)] = &[
             ("off", "no extra reasoning"),
@@ -42,7 +43,7 @@ impl SlashDotNode for ThinkingEnumNode {
         }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let level = path_args.ids.last().cloned().unwrap_or_default();
         match (self.submit_fn)(&level) {
             Ok(()) => SubmitResult::Done(None),
@@ -54,12 +55,13 @@ impl SlashDotNode for ThinkingEnumNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
+    use std::sync::Arc;
+    use crate::app_state::AppState;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
     use crate::slashdot_menu::HostKey;
 
-    fn test_shared() -> Rc<MenuShared> {
+    fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -72,14 +74,14 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        Rc::new(MenuShared::new(settings, None))
+        crate::app_state::AppState::for_test(settings)
     }
 
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
-    /// "thinking" → `ThinkingEnumNode` bound to `LiveState`.
-    fn build_thinking_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
-        let ls = shared.live_state.clone();
-        let ls2 = shared.live_state.clone();
+    /// "thinking" → `ThinkingEnumNode` bound to the target config.
+    fn build_thinking_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
         ])
@@ -87,13 +89,12 @@ mod tests {
         tl.add_child(
             ThinkingEnumNode {
                 active_fn: Box::new(move || {
-                    ls.borrow()
-                        .thinking_level
-                        .clone()
+                    reader
+                        .thinking()
                         .unwrap_or_else(|| "off".to_string())
                 }),
                 submit_fn: Box::new(move |level| {
-                    ls2.borrow_mut().thinking_level = Some(level.to_string());
+                    writer.set_thinking(Some(level.to_string()));
                     Ok(())
                 }),
             }
@@ -111,10 +112,10 @@ mod tests {
     /// Root listing shows the `thinking` command row.
     #[test]
     fn thinking_root_row_present() {
-        let shared = test_shared();
-        let mut menu = build_thinking_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 assert!(
@@ -130,11 +131,11 @@ mod tests {
     /// the row whose id is the active level.
     #[test]
     fn thinking_active_marker_on_current_level() {
-        let shared = test_shared();
-        shared.live_state.borrow_mut().thinking_level = Some("med".to_string());
-        let mut menu = build_thinking_menu(&shared);
+        let app_state = test_app_state();
+        app_state.set_thinking(Some("med".to_string()));
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("thinking ", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("thinking ", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 let idx = rows
@@ -151,13 +152,13 @@ mod tests {
         }
     }
 
-    /// Tab selects a level, Enter submits it → `LiveState.thinking_level`.
+    /// Tab selects a level, Enter submits it → the target config's thinking.
     #[test]
-    fn thinking_submit_sets_live_state() {
-        let shared = test_shared();
-        let mut menu = build_thinking_menu(&shared);
+    fn thinking_submit_sets_target_config() {
+        let app_state = test_app_state();
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        let prompt = match h.eval_prompt_resolved("thinking ", HostKey::Tab, 80) {
+        let prompt = match futures::executor::block_on(h.eval_prompt_resolved("thinking ", HostKey::Tab, 80)) {
             MenuResult::Continue(_, prompt) => prompt,
             other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
         };
@@ -166,13 +167,10 @@ mod tests {
             .last()
             .expect("Tab should append the selected level")
             .to_string();
-        match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+        match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
         }
-        assert_eq!(
-            shared.live_state.borrow().thinking_level.as_deref(),
-            Some(sel.as_str())
-        );
+        assert_eq!(app_state.thinking().as_deref(), Some(sel.as_str()));
     }
 }

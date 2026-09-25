@@ -10,7 +10,6 @@ pub mod edit_match;
 pub mod edit_blocks;
 pub use slashdot_menu;
 pub mod app_state;
-pub mod slash_menu_bridge;
 pub mod repl;
 pub mod model_catalog;
 pub mod thinking;

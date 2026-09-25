@@ -52,8 +52,11 @@
   only when the target is achieved (or abandoned after a reported
   error), relying on idempotence (re-applying is a no-op). Latching
   fields (`quit`) are never cleared. Eval is the only writer, so each
-  field is last-wins; missing an application point only delays
-  convergence, never loses the request.
+ field is last-wins; missing an application point only delays
+  convergence, never loses the request. Config convergence attempts one
+  rebuild per distinct target (fingerprint of model/thinking/persona;
+  an explicit `/model` re-commit re-arms) — a failed attempt errors once,
+  not every cycle (`create_agent` errors are final for a given target).
 - **Membership rule:** direct call if the handler can finish the
   operation itself (rename/delete/fork/replay/tree-switch); a target
   field only when application needs loop/agent-owned objects (control
@@ -84,8 +87,8 @@
 ### Engine (`crates/slashdot_menu`) — async, no context parameter
 
 The crate stays app-agnostic and gains **no** type parameter: nodes carry
-their own `Arc<AppShared>` field exactly as today's nodes carry
-`Rc<MenuShared>`; the engine never sees it.
+their own `Arc<AppState>` field (where they used to carry
+`Rc<MenuShared>`); the engine never sees it.
 
 ```rust
 // node_impl.rs
@@ -96,7 +99,7 @@ pub trait SlashDotNode {
     fn columns(&self) -> Vec<ColumnDef> { Vec::new() }
 
     // State-touching — async; state comes from the node's own
-    // `Arc<AppShared>` field, not from parameters:
+    // `Arc<AppState>` field, not from parameters:
     async fn data(&mut self, epoch: u64, pa: &PathArgs) -> DataResult;
     async fn prepare(&mut self, epoch: u64, pa: &PathArgs) -> SubmitResult {
         self.submit(epoch, pa).await        // default still delegates
@@ -129,30 +132,32 @@ signature change. Pure fns (`parse_section`, `ensure_rows`,
 filter/rank/sort) stay sync. `NodeEntry`, `MenuResult`, `RenderPlan`,
 `HostKey`, `SubmitResult` are unchanged data.
 
-### Host (`src/`) — `AppShared` / `AppState`
+### Host (`src/`) — `AppState` (handle) / `State` (payload)
 
 The single injected handle — `MenuShared`'s replacement:
 
 ```rust
-pub struct AppShared {
-    state: parking_lot::Mutex<AppState>,   // one coarse lock, no poisoning
+pub struct AppState {
+    state: parking_lot::Mutex<State>,       // one coarse lock, no poisoning
 }
 
 /// Coarse-grained app state: a few reasonably-sized pieces, one source
 /// of truth, one lock. Accessor rules: see "Context shape".
-pub struct AppState {
+pub struct State {
     /// Runtime target config: model, persona, thinking, sandbox —
     /// `LiveState` folded in here. (Durable target stays `SettingsStore`.)
     pub config: AgentConfig,
-    /// Durable-target store. Async load/save via `AppShared` methods:
+    /// Durable-target store. Async load/save via `AppState` methods:
     /// clone out → drop guard → await → relock to write.
     pub settings: SettingsStore,
-    /// Session slot — swapped as ONE bundle (built across awaits, swapped
-    /// in a single acquisition → half-applied states unobservable).
+    /// Menu-facing session view. The active `Session` object itself is
+    /// the loop's applied layer (loop-local): activation builds it
+    /// across awaits, then writes `current_id` — the menu never sees a
+    /// half-applied state. `repo` is a clone-shared handle (Arc cache).
     pub session: SessionSlot,
     /// Former loose MenuShared cells, each with a single-writer owner:
     pub recent_models: Vec<String>,        // RMW inside one acquisition
-    pub raw_tree: Vec<SessionTreeNode>,
+    pub raw_tree: Arc<Vec<SessionTreeNode>>,
     pub leaf_id: Option<String>,
     pub session_usage: SessionUsage,
     pub context_tokens: u64,
@@ -163,25 +168,24 @@ pub struct AppState {
 }
 
 pub struct SessionSlot {
-    pub session: Option<Session>,
     pub repo: Option<JsonlSessionRepo>,
     pub current_id: String,
 }
 // `ControlConfig` membership = "direct call if the handler can finish
 // it, target field otherwise" (see Decisions).
 
-impl AppShared {
+impl AppState {
     // Accessors: lock ONCE, complete the whole read/write inside, and
     // return owned values — never return a guard.
     pub fn model(&self) -> String { /* lock → read → owned */ }
-    pub fn set_model(&self, id: String) { /* one acquisition, whole RMW */ }
-    pub fn session_slot(&self) -> SessionSlot { /* clone handles out */ }
+    pub fn set_model(&self, id: &str) { /* one acquisition, whole RMW */ }
+    pub fn take_control(&self) -> ControlConfig { /* sole-consumer GC */ }
 }
 
-// Nodes hold `Arc<AppShared>` (background tasks clone the Arc).
+// Nodes hold `Arc<AppState>` (background tasks clone the Arc).
 // Service handles that never change after startup (output, cancel
-// flags) stay outside the lock. AppState members must be `Send` for
-// the Arc to cover background tasks at all — Send check, plan phase 1.
+// flags) stay outside the lock. `State` members must be `Send` for the
+// Arc to cover background tasks — Send check passed (phase 1).
 ```
 
 What the shared async state kills directly:
@@ -259,11 +263,12 @@ set. Revisit only if a profile ever says otherwise (it will not).
 
 ## Context shape (decided): A″ — one coarse shared state
 
-**Decision:** a single coarse-grained `AppState` behind one
-`Arc<Mutex<AppState>>` (`parking_lot` — no poisoning), injected into node
-instances as the replacement for `MenuShared`. Nodes hold
-`Arc<AppShared>`; background tasks clone the `Arc`. The engine gets **no
-context type parameter**; its only change is going async.
+**Decision:** a single coarse-grained `AppState` — the injected handle,
+`pub struct AppState { state: parking_lot::Mutex<State> }` (no poisoning)
+— replacing `MenuShared`. Nodes hold `Arc<AppState>`; background tasks
+clone the `Arc`; the locked payload is `State` (target config, settings,
+slot, display snapshots, `ControlConfig`). The engine gets **no context
+type parameter**; its only change is going async.
 
 **Why it wins:** every historical bug was a *mirror* (`LiveState`), a
 *snapshot* (`ReplCtx`, pre-eval builds), a *data channel* (`pending_op`),
@@ -280,9 +285,9 @@ there is only ever one lock, so no lock-ordering problem.
 
 ### Rules (the price — review-enforced, not compiler-enforced)
 
-1. **Encapsulated handle only:** `AppShared` exposes methods; no pub
+1. **Encapsulated handle only:** `AppState` exposes methods; no pub
    cells — otherwise this is MenuShared again.
-2. **Lock once per public method** — private helpers take `&mut AppState`.
+2. **Lock once per public method** — private helpers take `&mut State`.
    The Mutex is *not* re-entrant: an inner re-lock deadlocks
    (unspecified behavior in std; RefCell's equivalent at least panicked).
 3. **Never hold a guard across `.await`** — clone handle/value out →
@@ -293,8 +298,9 @@ there is only ever one lock, so no lock-ordering problem.
    races, not lost updates split across critical sections.
 5. **Single source of truth:** no mirrors, no snapshots; `control`
    target fields are written by eval, read + GC'd only by their sole
-   consumer; session activation is a bundle swap (build across awaits,
-   swap the whole `SessionSlot` in one acquisition).
+   consumer. The active `Session` is the loop's applied layer: activation
+   builds it across awaits, then writes `SessionSlot::current_id` in one
+   acquisition — the menu sees only the slot, never a half-applied state.
 6. **Only prepare/submit mutate** — `data()`/`header()` are render-path
    reads. Convention only; the rejected threaded design could have
    encoded this as `&C` vs `&mut C` — accepted loss.
@@ -325,33 +331,96 @@ convert/wrap it or accept that tasks stay single-thread
 The main work is **source-of-truth migration** (phases 0–2, doable while
 still sync); the async conversion rides on top.
 
-0. **Audit.** Inventory every state location — MenuShared's cells,
-   `LiveState`, `ReplCtx` snapshots, `pending_op`, `model_commit`,
+0. **Audit** **[done].** Inventory every state location — MenuShared's
+   cells, `LiveState`, `ReplCtx` snapshots, `pending_op`, `model_commit`,
    `recent_models` sync, loop-locals the menu reads — and assign each a
    home in `AppState` or a deletion.
-1. **`AppShared`/`AppState` module** (still sync): struct, accessor
-   methods, lock rules in the module doc. **Send check:** verify members
-   (`Session`, repo, config services); convert, wrap, or scope tasks to
-   `spawn_local`.
-2. **Migrate to source of truth** (still sync): swap `Rc<MenuShared>` →
-   `Arc<AppShared>` in all `v25_*` nodes; delete `LiveState` + its loop
-   sync (handlers write `config` directly); `pending_op` →
-   `ControlConfig` target fields; menu-side ReplCtx snapshots →
-   `AppState` reads. Tests stay green (sync).
-3. **Async conversion.** `#[async_trait(?Send)]` on `SlashDotNode` (no
-   parameter change) + the eval path; `Repl::read_input` → `v25_eval`
-   become async (the only production chain — everything else is
-   `#[cfg(test)]`); test executor (`futures::executor::block_on`
-   dev-dep) + mechanical `.await`.
-4. **Data-plane inline.** rename/delete/fork/replay/settings-save run in
-   `submit().await`; `/model` records `ModelChange` inline → delete
-   `model_commit` + the loop-side detection; delete the `AsyncOp`
-   dispatch match — each consumer applies its own `ControlConfig` fields
-   at its application point (small applier fns, not one central match).
-5. **Verify.** Full suite; E2E: the empty-session repro from the
-   model-change bug must stay dead; grep `MenuShared|LiveState|
-   pending_op|model_commit` → zero; smoke `/session` ops, quit,
-   resume + prefill, `/model`.
+1. **`AppState` module** (still sync) **[done].** Struct, accessor
+   methods, lock rules in the module doc; `ControlConfig` register types
+   moved in from `AsyncOp`. **Send check passed** (test asserts
+   `Send + Sync`).
+2. **Migrate to source of truth** (still sync) **[done].** Swap
+   `Rc<MenuShared>` → `Arc<AppState>` in all `v25_*` nodes; delete
+   `LiveState` + its loop sync (handlers write `config` directly);
+   `pending_op` → `ControlConfig` target fields; menu-side ReplCtx
+   snapshots → `update_cycle_view` writes. Also landed: `repl`/`agent`
+   wiring (convergence step + per-field control appliers),
+   `slash_menu_bridge.rs` deleted. Tests green (639 + 2 ignored).
+3. **Async conversion** **[done].** `#[async_trait(?Send)]` on
+   `SlashDotNode` + all 38 impls (no signature change beyond `async`);
+   the whole engine eval path is async (`node_data`, `node_traverse*`,
+   `handle_leaf/listing`, `refresh_data`, `view_plan`, `completion_pass`,
+   `eval_prompt*`) with its two recursive cycles boxed (`Box::pin`, one
+   manual future each — E0733); `Repl::read_input` → `v25_eval` are
+   async (the only production chain). Sync tests stay sync: call sites
+   in `#[cfg(test)]` regions are wrapped in `futures::executor::block_on`
+   (scripted, paren-balanced, one descending insertion pass) — 242
+   wraps; test bodies and helpers unchanged.
+4. **Slot exposure** **[done].** `SessionSlot` gains the two shared handles —
+   `session: Option<Arc<Session>>` (all methods `&self`; internals are
+   `Arc<AsyncMutex>` by design) and `agent: Option<Arc<dyn PicoAgent>>`
+   (`Send + Sync`, all methods `&self`) — plus `activate_session(id)` /
+   `activate_agent(a)` one-acquisition swaps (stronger bundle guarantee:
+   one atomic write). Loop call-sites become *lock → clone `Arc` out →
+   drop guard → await*; creation/rebuild stays loop-side, from the
+   **applied** config (handlers only ever consume the `Arc`s).
+5. **Data-plane inline — appliers collapse** **[done].** Inline
+   in `submit().await` (slot session/agent/output/repo reachable):
+   tree_switch, replay, rename, delete, new, clear (full transaction —
+   `agent::start_fresh_session` + outgoing delete, preserving the
+   applier's create→activate→delete order), fork
+   (`agent::fork_session_at`, shared with the typed path — also fixed
+   a latent bug: `repo.fork` never created the target cwd's dir, so the
+   first fork into a fresh directory failed with ENOENT), and `/model`'s
+   inline `ModelChange` journal (live-node role; `model_commit`
+   deleted; the rebuild-gate re-arm is fingerprint-change-only now).
+   `ControlConfig` = **quit, resume, tree_compact, sandbox** (from 12).
+   Tests assert side effects (leaf moved, rendered output captured via
+   `output::RecordingOutput`, index session_name, files gone/present,
+   journal entry), driven through `agent::block_on_test` (submits hit
+   `tokio::fs`) with the `test_session_with_entries` /
+   `test_repo_with_session` fixtures.
+   Also done: **resume** (`agent::resume_session` extracted from
+   `handle_session_command`, shared with the typed path — foreign-cwd
+   fork migration included; the model decision rides the new **prefill
+   register** in `AppState`, sole consumer the loop before
+   `read_input`, which replaced the `pending_prefill` local entirely)
+   and **compact** (`agent::compact_inline`: entry/tokens/early-out
+   guards, Llm agent from the TARGET config, review closure from the
+   slot's published `TermGuard`). Mid-eval `$EDITOR` is safe via
+   **`emit_commit`'s live-DSR re-anchor** of `input_row` before redraw
+   (the Ctrl-E post-`guard.start()` pattern, applied unconditionally).
+   Async-IO follow-ups **[done]**: `JsonlSessionRepo::
+  list_sessions_overlay` — cache-first (the same 2s mtime debounce;
+  warm = zero IO), `tokio::fs` cold scan, cache lock never held across
+  an await. Production callers migrated (session listing, `find_session`,
+  `/stat` header, the inline rename/delete/fork/resume meta lookups);
+  `list_sessions_sync` is now `#[cfg(test)]` (same cache, same
+  results). Settings save: async facade **dropped as low value** — a
+  tiny user-paced write the frame waits on regardless; the real defect
+  was holding the coarse lock across the TOML write, fixed as
+  apply-under-lock → clone → write-outside (`SettingsStore::
+  apply_value`), with the rule recorded in the module doc.
+   Judgment recorded and applied: session creation, the model journal,
+   AND compact's Llm-agent creation stamp from the **target** config
+   handler-side (divergence only in the failed-rebuild state; a later
+   `ModelChange` corrects). Final `ControlConfig`: **quit, sandbox**
+   (was 12 fields) — the convergence appliers are just the sandbox
+   merge/re-publish.
+6. **Verify.** Full suite green **[done]**; stale-name grep
+   `MenuShared|LiveState|pending_op|model_commit|AsyncOp` → zero
+   **[done]**. E2E pty tests **[done]** — `tests/e2e_session_state.rs`
+   (isolated XDG + temp cwd + seeded sessions, real binary, no network):
+   `menu_traffic_never_creates_empty_session_files` = THE empty-session
+   repro (menu delete + thinking switch → convergence → journal record
+   against an unpersisted session must not mint files) plus
+   `/session`-listing/delete/quit smokes; `resume_replays_history_and_
+   seeds_model_prefill` = resume replay + `/model` prefill smoke. Both
+   green. `/model`-overlay switch itself stays unit-covered (the static
+   catalog has no llamacpp rows without network — E2E uses `/thinking`
+   for the same convergence/record surface). Harness notes: reply to
+   DSR scans before every keystroke (`cursor_row`'s 60ms window eats
+   bytes) and clear the input line before typing over a prefill.
 
 ## Open questions / potential issues
 

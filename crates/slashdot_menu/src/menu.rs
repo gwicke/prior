@@ -114,8 +114,8 @@ impl<'a> SlashDotHandle<'a> {
     /// `term_width` is the current terminal width in columns; it is
     /// packaged into a [`RenderContext`] and threaded through the
     /// traversal by reference.
-    pub fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
-        self.eval_prompt_with_cursor(prompt, key, term_width, prompt.len())
+    pub async fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
+        self.eval_prompt_with_cursor(prompt, key, term_width, prompt.len()).await
     }
 
     /// Like [`eval_prompt`](Self::eval_prompt) with an explicit cursor
@@ -123,7 +123,7 @@ impl<'a> SlashDotHandle<'a> {
     /// completion — the resolved level suppresses completion when the
     /// cursor is not at the end of its section, so a mid-line cursor
     /// can never complete a different word than the user edits.
-    pub fn eval_prompt_with_cursor(
+    pub async fn eval_prompt_with_cursor(
         &mut self,
         prompt: &str,
         key: HostKey,
@@ -133,6 +133,7 @@ impl<'a> SlashDotHandle<'a> {
         let render_ctx = RenderContext { term_width };
         self.root
             .node_traverse_at(self.epoch, key, Vec::new(), prompt, cursor_pos, &render_ctx)
+            .await
     }
 
     /// Like [`eval_prompt`](Self::eval_prompt), but resolves
@@ -147,7 +148,7 @@ impl<'a> SlashDotHandle<'a> {
     /// ever synthesized). Hosts with their own cursor handling (the
     /// REPL's `v25_eval`) implement the same loop themselves so they
     /// can trace it.
-    pub fn eval_prompt_resolved(
+    pub async fn eval_prompt_resolved(
         &mut self,
         prompt: &str,
         key: HostKey,
@@ -159,7 +160,7 @@ impl<'a> SlashDotHandle<'a> {
         let mut key = key;
         let mut chain: Vec<String> = Vec::new();
         for _ in 0..MAX_REWRITES {
-            match self.eval_prompt(&prompt, key, term_width) {
+            match self.eval_prompt(&prompt, key, term_width).await {
                 MenuResult::ContinuePrompt(new_prompt) => {
                     chain.push(new_prompt.clone());
                     prompt = new_prompt;

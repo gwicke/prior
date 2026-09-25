@@ -1,3 +1,4 @@
+use crate::app_state::AppState;
 use crate::output::Confirmation;
 use crate::repl::{InputAction, Repl, ReplCtx, ModelFilter};
 use crate::settings::SettingsStore;
@@ -1323,7 +1324,7 @@ impl AgentConfig {
     /// Canonical `provider:model` id for the model this config runs.
     ///
     /// This is the single canonical form used for equality checks against
-    /// `LiveState.model` and session-recorded model ids — compare whole
+    /// the `AppState` target model and session-recorded model ids — compare whole
     /// strings, never split segments: model ids themselves may contain
     /// colons (e.g. openrouter `…:free`), and a `split(':').nth(1)` style
     /// truncation reads a different value than what was configured.
@@ -2033,11 +2034,11 @@ fn guard<T: Tool>(
 /// Returns `(sessions list, branch message previews, session tree, leaf_id,
 /// context_tokens)`.
 async fn build_session_ctx(
-    session: &Option<Session>,
+    session: &Option<Arc<Session>>,
 ) -> (
     Vec<crate::repl::SessionMeta>,
     Vec<(String, String)>,
-    std::rc::Rc<Vec<crate::session::SessionTreeNode>>,
+    std::sync::Arc<Vec<crate::session::SessionTreeNode>>,
     Option<String>,
     u64,
 ) {
@@ -2078,9 +2079,9 @@ async fn build_session_ctx(
                 .await
                 .map(|c| estimate_context_tokens(&c.messages))
                 .unwrap_or(0);
-            (std::rc::Rc::new(tree), leaf_id, context_tokens)
+            (std::sync::Arc::new(tree), leaf_id, context_tokens)
         }
-        None => (std::rc::Rc::new(Vec::new()), None, 0),
+        None => (std::sync::Arc::new(Vec::new()), None, 0),
     };
 
     (sessions, branch_messages, tree, leaf_id, context_tokens)
@@ -2614,7 +2615,7 @@ async fn session_recorded_thinking(session: &Session) -> Option<String> {
 /// alone must never create a session file (that is what littered the
 /// `/session` listing with header+marker-only "empty" sessions). The
 /// first real message persists the updated header.
-async fn record_model_change(session: &Session, qualified_id: &str) {
+pub(crate) async fn record_model_change(session: &Session, qualified_id: &str) {
     if session_recorded_model_id(session).await.as_deref() == Some(qualified_id) {
         return; // already recorded — no redundant entry
     }
@@ -2678,7 +2679,7 @@ async fn compute_resume_model_prefill(
 /// decision in the user's hands.
 async fn handle_session_command(
     input: &str,
-    session: &mut Option<Session>,
+    session: &mut Option<Arc<Session>>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
     config: &mut AgentConfig,
     output: &Arc<dyn Output>,
@@ -2737,108 +2738,26 @@ async fn handle_session_command(
                     .as_deref()
                     .map(|s| crate::agent::parse_replay_len_arg(s, default))
                     .unwrap_or((default, false));
-
-                // Resume in a different directory -> fork the session to the new
-                // cwd and delete the original. This migrates the session file to
-                // the current location and sets the header's `cwd` field.
-                let cwd = match std::env::current_dir() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        config.output.display_text("Cannot determine current directory");
-                        return SessionCommandResult::Handled;
+                // Load/migrate/replay/prefill — shared with the inline
+                // resume node (`resume_session` owns the rationale).
+                match resume_session(
+                    repo.as_ref().unwrap(),
+                    &meta,
+                    (count, is_lines),
+                    output.as_ref(),
+                    &config.qualified_model_id(),
+                )
+                .await
+                {
+                    Ok((new_session, id, prefill)) => {
+                        *session = Some(new_session);
+                        SessionCommandResult::Switched { id, prefill }
                     }
-                };
-
-                let (storage, index) = if meta.cwd != cwd {
-                    let repo = repo.as_ref().unwrap();
-                    match repo.fork(&meta, "", &cwd, ForkMode::FullTree).await {
-                        Ok(forked_storage) => {
-                            let index = match forked_storage.build_index().await {
-                                Ok(i) => i,
-                                Err(e) => {
-                                    config.output.display_text(&format!("Cannot build session index: {}", e));
-                                    return SessionCommandResult::Handled;
-                                }
-                            };
-                            if let Err(e) = repo.delete(&meta).await {
-                                config.output.display_text(&format!("Cannot remove old session: {}", e));
-                                return SessionCommandResult::Handled;
-                            }
-                            (forked_storage, index)
-                        }
-                        Err(e) => {
-                            config.output.display_text(&format!("Cannot fork session: {}", e));
-                            return SessionCommandResult::Handled;
-                        }
-                    }
-                } else {
-                    match repo.as_ref().unwrap().open(&meta).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            config.output.display_text(&format!("Cannot resume session: {}", e));
-                            return SessionCommandResult::Handled;
-                        }
-                    }
-                };
-
-                // No silent restore of provider/model/thinking on resume: doing so
-                // would mutate `config` and rebuild the running agent behind the
-                // user's back, removing the chance to accept/abort/choose a model.
-                // The resumed session is loaded and replay is rendered below; the
-                // model/thinking decision is surfaced via `compute_resume_model_prefill`,
-                // which returns a `/model <provider>:<model_id>` prefill when the
-                // session records a model (branch `ModelChange` or header metadata)
-                // that DIFFERS from the running model; when they match — or the
-                // session records nothing — the prompt stays empty and the
-                // user is not nudged to switch. We only restore the model (not
-                // thinking level) -- they share the single input field, and silently
-                // setting `config.model` plus rebuilding the agent bypasses the
-                // user's chance to accept/abort/choose. Pending: a slug syntax
-                // that bundles model + thinking into one prefill (see
-                // doc/todo.md). The full `provider:model_id` form is what the
-                // v2.5 `/model` node resolves directly; Enter commits it to
-                // `LiveState` and the `menu_submitted` sync rebuilds the agent.
-                //
-                // Computed BEFORE moving `new_session` into `*session` because
-                // `compute_resume_model_prefill` takes `&Session`.
-                let new_session = Session::new_persisted(storage, index);
-                let id = new_session.get_session_id().to_string();
-
-                if count > 0 {
-                    // Replay from the RAW branch so compaction entries render as
-                    // markers while the whole history is available; only the agent
-                    // context is scoped.
-                    let branch = new_session.get_branch().await;
-                    let units = build_replay_units(&branch);
-                    let total = count_turns(&units);
-                    output.display_separator();
-                    if is_lines {
-                        // Line-based: capture full replay via writer, tail lines.
-                        output.begin_capture();
-                        replay_units(output.as_ref(), &units, 0);
-                        let bytes = output.end_capture();
-                        let captured = String::from_utf8_lossy(&bytes);
-                        let lines: Vec<&str> = captured.lines().collect();
-                        let start = lines.len().saturating_sub(count);
-                        use std::io::Write as _;
-                        let stdout = std::io::stdout();
-                        let mut handle = stdout.lock();
-                        for line in &lines[start..] {
-                            let _ = writeln!(handle, "{}", line);
-                        }
-                        let _ = handle.flush();
-                    } else {
-                        replay_last_turns(output.as_ref(), &units, count.min(total));
+                    Err(msg) => {
+                        config.output.display_text(&msg);
+                        SessionCommandResult::Handled
                     }
                 }
-
-                let prefill =
-                    compute_resume_model_prefill(&new_session, &config.qualified_model_id())
-                        .await;
-
-                *session = Some(new_session);
-
-                SessionCommandResult::Switched { id, prefill }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
@@ -2846,32 +2765,13 @@ async fn handle_session_command(
         }
 "fork" => {
             if let Some(meta) = meta {
-                let cwd = match std::env::current_dir() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        config.output.display_text("Cannot determine current directory");
-                        return SessionCommandResult::Handled;
-                    }
-                };
-                match repo.as_ref().unwrap().fork(&meta, "", &cwd, ForkMode::FullTree).await {
-                    Ok(new_storage) => {
-                        let index = new_storage.build_index().await.unwrap_or_else(|_| {
-                            let header = crate::session::SessionHeader::new(&cwd);
-                            crate::session::SessionIndex {
-                                header,
-                                entries: std::collections::HashMap::new(),
-                                leaf_id: None,
-                                children: std::collections::HashMap::new(),
-                                session_name: None,
-                            }
-                        });
-                        let new_session = Session::new_persisted(new_storage, index);
-                        let id = new_session.get_session_id().to_string();
+                match fork_session_at(repo.as_ref().unwrap(), &meta).await {
+                    Ok((new_session, id)) => {
                         *session = Some(new_session);
                         SessionCommandResult::Switched { id, prefill: None }
                     }
-                    Err(e) => {
-                        config.output.display_text(&format!("Cannot fork session: {}", e));
+                    Err(msg) => {
+                        config.output.display_text(&msg);
                         SessionCommandResult::Handled
                     }
                 }
@@ -3142,7 +3042,7 @@ fn find_predecessor(branch: &[crate::session::SessionEntry], target_id: &str) ->
 }
 
 /// Find the predecessor of `target_id` on the session's active branch.
-fn find_predecessor_on_active_branch(
+pub(crate) fn find_predecessor_on_active_branch(
     index: &crate::session::SessionIndex,
     target_id: &str,
 ) -> Option<String> {
@@ -3257,11 +3157,11 @@ impl From<CompactionResult> for std::result::Result<(), String> {
 /// when the user cancelled at the review step (no entry written),
 /// `CompactionResult::Err(msg)` on failure. The caller is responsible for
 /// handling `Cancelled` — typically by returning to the editor with the
-/// original prompt line pre-filled (e.g. via `pending_prefill`).
+/// original prompt line pre-filled (e.g. via the slot's prefill register).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     session: &Session,
-    agent: &Option<Box<dyn PicoAgent>>,
+    agent: &Option<Arc<dyn PicoAgent>>,
     settings: &SettingsStore,
     target: CompactionTarget,
     mode: CompactSummaryMode,
@@ -3304,12 +3204,100 @@ pub(crate) async fn run_compaction(
     }
 }
 
+/// Run a compaction from an inline menu node — session/agent/output/
+/// guard/settings all reachable via the slot (the loop-side applier it
+/// replaces did the same through its own locals). Returns the message to display;
+/// `None` = Done/Cancelled are silent (the review gate prints its own
+/// cancel notice). The Llm-mode agent is created here from the TARGET
+/// config — same target-stamp judgment as session creation.
+pub(crate) async fn compact_inline(
+    app_state: &AppState,
+    target_id: &str,
+    mode: crate::app_state::CompactMode,
+    payload: &str,
+) -> Option<String> {
+    let Some(s) = app_state.session() else {
+        return Some("Cannot compact: no active session".to_string());
+    };
+    if s.get_entry(target_id).await.is_none() {
+        return Some(format!(
+            "Cannot compact: unknown tree entry {}",
+            &target_id[..target_id.len().min(12)]
+        ));
+    }
+    let tokens_before = match s.build_context().await {
+        Ok(ctx) => estimate_context_tokens(&ctx.messages),
+        Err(_) => 0,
+    };
+    let resolved_mode = match mode {
+        crate::app_state::CompactMode::Manual => CompactSummaryMode::Manual,
+        crate::app_state::CompactMode::TextOnly => CompactSummaryMode::TextOnly,
+        crate::app_state::CompactMode::Prompt => CompactSummaryMode::Llm,
+    };
+    // LLM mode needs a live agent (slot is the source).
+    let mut agent = app_state.agent();
+    if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
+        let cfg = app_state.config_snapshot();
+        match create_agent(cfg).await {
+            Ok(a) => {
+                let a: Arc<dyn PicoAgent> = Arc::from(a);
+                app_state.activate_agent(a.clone());
+                agent = Some(a);
+            }
+            Err(e) => return Some(format!("Cannot start agent: {}", e)),
+        }
+    }
+    // LLM mode early-out: refuse if nothing to compact.
+    if resolved_mode == CompactSummaryMode::Llm {
+        let current_leaf = s.get_leaf_id().await;
+        if let Some(leaf) = current_leaf.as_deref() {
+            let index = s.index().lock().await;
+            if find_predecessor_on_active_branch(&index, target_id).as_deref() == Some(leaf) {
+                return Some("Cannot compact: nothing before the current position".to_string());
+            }
+        }
+    }
+    // Editor review: the term guard + output clone out of the slot; the
+    // closure suspends raw mode around $EDITOR (overlay-agnostic —
+    // `emit_commit` re-anchors the row via DSR afterwards).
+    let review: Option<CompactionSummaryReview> = app_state.term_guard().map(|g| {
+        let out = app_state.with_config(|c| c.output.clone());
+        Box::new(move |draft: &str| {
+            crate::repl::review_compaction_summary(&g, out.as_ref(), draft)
+        }) as CompactionSummaryReview
+    });
+    let output = app_state.with_config(|c| c.output.clone());
+    let settings = app_state.settings();
+    let (user_cancel, cancel_notify) =
+        app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
+    match run_compaction(
+        &s,
+        &agent,
+        &settings,
+        CompactionTarget::AtPoint {
+            target_id: target_id.to_string(),
+            tokens_before,
+        },
+        resolved_mode,
+        payload,
+        output.as_ref(),
+        review,
+        &user_cancel,
+        &cancel_notify,
+    )
+    .await
+    {
+        CompactionResult::Done | CompactionResult::Cancelled => None,
+        CompactionResult::Err(msg) => Some(msg),
+    }
+}
+
 /// Implementation of the `AtPoint` arm. The dropped span for any mode
 /// is the active-branch entries strictly before `target_id`.
 #[allow(clippy::too_many_arguments)]
 async fn run_compaction_at_point(
     session: &Session,
-    agent: &Option<Box<dyn PicoAgent>>,
+    agent: &Option<Arc<dyn PicoAgent>>,
     settings: &SettingsStore,
     target_id: &str,
     tokens_before: u64,
@@ -3555,23 +3543,27 @@ where
 
 /// Ensure a session exists, creating one lazily if needed.
 /// Called on first actual turn (Submit or ! command), not at startup.
+/// Pure-ish transform: returns `current` unchanged when it is `Some`,
+/// otherwise creates a fresh session. The caller writes the result back
+/// into the AppState slot (`set_session`/`activate_session`) — helpers
+/// never touch the slot themselves.
 pub(crate) async fn ensure_session(
-    session: &mut Option<Session>,
+    current: Option<Arc<Session>>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
     provider: Option<String>,
     model: Option<String>,
     thinking_level: Option<String>,
-) {
-    if session.is_some() {
-        return;
+) -> Option<Arc<Session>> {
+    if current.is_some() {
+        return current;
     }
     let repo = match repo {
         Some(r) => r,
-        None => return,
+        None => return None,
     };
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return None,
     };
     match repo.create(&cwd).await {
         Ok(storage) => {
@@ -3585,10 +3577,155 @@ pub(crate) async fn ensure_session(
                     children: std::collections::HashMap::new(),
                     session_name: None,
                 });
-            *session = Some(Session::new(storage, index));
+            Some(Arc::new(Session::new(storage, index)))
         }
         Err(e) => {
             eprintln!("Warning: cannot create session: {}", e);
+            None
+        }
+    }
+}
+
+/// Fork a session (full tree, current dir) into a fresh `Arc<Session>` —
+/// shared by the inline fork node and `handle_session_command`. The
+/// caller activates it (slot) or stores it (typed path's local write).
+pub(crate) async fn fork_session_at(
+    repo: &crate::session::repo::JsonlSessionRepo,
+    meta: &crate::session::SessionMetadata,
+) -> std::result::Result<(Arc<Session>, String), String> {
+    use crate::session::repo::SessionRepo;
+    let cwd = std::env::current_dir()
+        .map_err(|_| "Cannot determine current directory".to_string())?;
+    match repo.fork(meta, "", &cwd, ForkMode::FullTree).await {
+        Ok(new_storage) => {
+            let index = new_storage.build_index().await.unwrap_or_else(|_| {
+                let header = crate::session::SessionHeader::new(&cwd);
+                crate::session::SessionIndex {
+                    header,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                }
+            });
+            let new_session = Session::new_persisted(new_storage, index);
+            let id = new_session.get_session_id().to_string();
+            Ok((Arc::new(new_session), id))
+        }
+        Err(e) => Err(format!("Cannot fork session: {}", e)),
+    }
+}
+
+/// Load a session by meta and switch to it (the `/session resume`
+/// action — shared by the typed path and the inline resume node).
+/// Migrates to the current cwd when the session lives elsewhere (fork
+/// + delete original), replays `(count, is_lines)` through `output`,
+/// and computes the `/model` prefill against `qualified_id`.
+///
+/// No silent restore of provider/model/thinking on resume: mutating
+/// config and rebuilding the agent behind the user's back would remove
+/// the chance to accept/abort/choose a model. The decision is surfaced
+/// via the returned prefill instead when the session records a model
+/// that DIFFERS from `qualified_id` (full `provider:model_id` form —
+/// what the v2.5 `/model` node resolves directly); when they match or
+/// the session records nothing, no prefill is returned. Errors are
+/// caller-displayed messages (same texts the old arm printed).
+pub(crate) async fn resume_session(
+    repo: &crate::session::repo::JsonlSessionRepo,
+    meta: &crate::session::SessionMetadata,
+    replay: (usize, bool),
+    output: &dyn Output,
+    qualified_id: &str,
+) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
+    use crate::session::repo::SessionRepo;
+    let (count, is_lines) = replay;
+    let cwd = std::env::current_dir()
+        .map_err(|_| "Cannot determine current directory".to_string())?;
+    let (storage, index) = if meta.cwd != cwd {
+        // Resume in a different directory → fork the session to the new
+        // cwd and delete the original (migrates the file, sets the
+        // header's `cwd` field).
+        match repo.fork(meta, "", &cwd, ForkMode::FullTree).await {
+            Ok(forked_storage) => {
+                let index = match forked_storage.build_index().await {
+                    Ok(i) => i,
+                    Err(e) => return Err(format!("Cannot build session index: {}", e)),
+                };
+                if let Err(e) = repo.delete(meta).await {
+                    return Err(format!("Cannot remove old session: {}", e));
+                }
+                (forked_storage, index)
+            }
+            Err(e) => return Err(format!("Cannot fork session: {}", e)),
+        }
+    } else {
+        match repo.open(meta).await {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Cannot resume session: {}", e)),
+        }
+    };
+    let new_session = Session::new_persisted(storage, index);
+    let id = new_session.get_session_id().to_string();
+    if count > 0 {
+        // Replay from the RAW branch so compaction entries render as
+        // markers while the whole history is available; only the agent
+        // context is scoped.
+        let branch = new_session.get_branch().await;
+        let units = build_replay_units(&branch);
+        let total = count_turns(&units);
+        output.display_separator();
+        if is_lines {
+            // Line-based: capture full replay via writer, tail lines.
+            output.begin_capture();
+            replay_units(output, &units, 0);
+            let bytes = output.end_capture();
+            let captured = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = captured.lines().collect();
+            let start = lines.len().saturating_sub(count);
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            for line in &lines[start..] {
+                let _ = writeln!(handle, "{}", line);
+            }
+            let _ = handle.flush();
+        } else {
+            replay_last_turns(output, &units, count.min(total));
+        }
+    }
+    let prefill = compute_resume_model_prefill(&new_session, qualified_id).await;
+    Ok((Arc::new(new_session), id, prefill))
+}
+
+/// Create a fresh session (dropping the in-memory one), activate it in
+/// the slot, and apply an optional name — shared by the inline `/new`
+/// and `/clear` nodes. Provider/model/thinking come from the **target**
+/// config (handler-side stamping: recorded judgment — diverges from the
+/// applied layer only in the failed-rebuild state; a later `ModelChange`
+/// record corrects the journal).
+pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
+    let (provider, model, thinking) = app_state.with_config(|c| {
+        (
+            c.provider.clone(),
+            c.model.clone(),
+            c.thinking_level.clone(),
+        )
+    });
+    let repo = app_state.repo();
+    let fresh = ensure_session(None, &repo, Some(provider), Some(model), thinking).await;
+    let id = fresh
+        .as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
+    app_state.activate_session(fresh.clone(), id);
+    if !name.is_empty() {
+        if let Some(ref s) = fresh {
+            let out = app_state.with_config(|c| c.output.clone());
+            if let Err(e) = s.set_session_name(name).await {
+                out.display_text(&format!("Could not name session: {}", e));
+            } else if let Some(r) = app_state.repo() {
+                r.invalidate_cache();
+            }
         }
     }
 }
@@ -3642,7 +3779,7 @@ fn save_recent_models(models: &[String]) {
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
-pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, auto_resume: bool) -> Result<()> {
+pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_resume: bool) -> Result<()> {
     let mut config = config;
     // Store the original (non-merged) sandbox config so the remove overlay
     // can list config-provided bindings and allow temporary exclusion.
@@ -3656,21 +3793,10 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // session (`apply_to_config` never touches it), so publishing once here is
     // sufficient.
     set_sandbox(config.sandbox.clone());
-    // Pending `/settings` changes that need an agent rebuild before the next
-    let mut menu_submitted = false;
-    let pending_op: std::rc::Rc<std::cell::RefCell<Option<crate::slash_menu_bridge::AsyncOp>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let live_state = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::slash_menu_bridge::LiveState {
-            model: config.qualified_model_id(),
-            persona: config.persona_name.clone(),
-            thinking_level: config.thinking_level.clone(),
-            model_commit: None,
-        },
-    ));
-    // Agent is created lazily on first use (or on /model, /thinking) so that
-    // commands like /help work without a network round-trip.
-    let mut agent: Option<Box<dyn PicoAgent>> = None;
+    // The agent lives in the AppState slot: created lazily on first use
+    // (or on /model, /thinking — commands like /help must work without a
+    // network round-trip), always **loop-side from the applied config**,
+    // published via `activate_agent`; every reader clones it out.
 
     // Empty prompt: the REPL input is left-aligned on every row (a `> ` prefix
     // would only indent the first line and leave wrapped/continuation lines
@@ -3701,7 +3827,8 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         crate::platform::app_config_dir().map(|d| d.join("sessions"))
     });
     let cwd = std::env::current_dir().ok();
-    let (mut session, mut repo) = if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
+    let mut repo: Option<crate::session::repo::JsonlSessionRepo> =
+        if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
         let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
         // Repo is created eagerly (just a path); the session object is also
         // created unconditionally here so the `/session` overlay can mark the
@@ -3711,30 +3838,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
         // file is created if the user never takes a turn. Creating up front
         // removes the mid-loop `ensure_session` calls (in the first-turn and
         // `!`/`!!` paths).
-        (None, Some(repo))
+        Some(repo)
     } else {
-        (None, None)
+        None
     };
-    ensure_session(
-        &mut session,
-        &repo,
-        Some(config.provider.clone()),
-        Some(config.model.clone()),
-        config.thinking_level.clone(),
-    ).await;
-    let mut current_session_id = session
-        .as_ref()
-        .map(|s| s.get_session_id().to_string())
-        .unwrap_or_default();
-
     let mut line_history = crate::repl::History::load();
-    let mut recent_models: Vec<String> = load_recent_models();
-    // Also seed the model switch from the configured default model so it
-    // appears in the recent list on first run (if present and available).
-    let default_seed = config.qualified_model_id();
-    if !recent_models.contains(&default_seed) {
-        recent_models.push(default_seed.clone());
-    }
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
     // current request.
@@ -3745,8 +3853,45 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // of polling.  Paired with `user_cancel` above.
     let cancel_notify = Arc::new(tokio::sync::Notify::new());
     config.cancel_notify = cancel_notify.clone();
+    // Single source of truth for menu-visible state. The target config is
+    // seeded from the startup config (same Arc handles: output, cancel
+    // flags); the loop's local `config` remains the applied layer that
+    // converges to it. Settings move in as the one durable copy.
+    let app_state = AppState::new(config.clone(), settings, repo.clone());
+    // First session — created up front so the `/session` overlay can mark
+    // it from the start (the file itself is written lazily on the first
+    // `append_message`, so no empty session is created for a user who
+    // never takes a turn).
+    let first = ensure_session(
+        app_state.session(),
+        &repo,
+        Some(config.provider.clone()),
+        Some(config.model.clone()),
+        config.thinking_level.clone(),
+    )
+    .await;
+    let first_id = first
+        .as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
+    app_state.activate_session(first, first_id);
+    app_state.set_recent_models(load_recent_models());
+    // Seed the model switch from the configured default model so it appears
+    // in the recent list on first run (if present and available).
+    app_state.seed_recent_model(&config.qualified_model_id());
+    // Rebuild gate state: fingerprint of the last target we ATTEMPTED to
+    // apply. A failed attempt (bad id, missing key) stays silent and
+    // un-retried until the target changes — one error per distinct target,
+    // not one per cycle while the user navigates back to the menu.
+    let mut last_attempted_target: Option<(String, Option<String>, Option<String>)> = None;
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
+    // Publish to the slot: the inline compact node's review closure
+    // suspends raw mode around `$EDITOR` with it (service handle,
+    // clone-out — never held behind the lock across the editor).
+    if let Some(g) = guard.clone() {
+        app_state.set_term_guard(g);
+    }
     if guard.is_some() {
         crate::repl::register_sigcont();
     }
@@ -3769,17 +3914,16 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
     // Enter once and goes through the exact same code path as a manual
     // `/session`, Tab, Enter: the REPL parses `/session <id> resume`, the
     // `handle_session_command` dispatch opens + replays the session, and the
-    // usual `/model …` prefill flows back into `pending_prefill` for the
+    // usual `/model …` prefill flows back into the slot's prefill
     // second prompt. This keeps the history and UX identical to a typed
     // resume (including the model-overlay catalog fetch that needs the
     // inter-keystroke time to land).
-    let mut pending_prefill: Option<String> = None;
     if auto_resume {
         // Pre-fill with the session listing for the current directory.
         // The user presses Enter to resume the top (most recent) session.
         // This is simpler than resolving the session ID upfront and avoids
         // any race conditions with the session repository listing.
-        pending_prefill = Some("/session .path:.".to_string());
+        app_state.set_prefill("/session .path:.".to_string());
     }
     loop {
         let action = match repl.as_mut() {
@@ -3788,21 +3932,21 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
 
                 // Build session context data for REPL overlays.
                 let (_sessions, branch_messages, tree, leaf_id, context_tokens) =
-                    build_session_ctx(&session).await;
+                    build_session_ctx(&app_state.session()).await;
 
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
                     model: config.model.clone(),
-                    recent: recent_models.clone(),
+                    recent: app_state.recent_models(),
                     persona: config.persona_name.clone(),
                     // Snapshot the agent's accumulated token usage so the `/stat`
                     // overlay can render without needing the agent directly.
-                    session_usage: agent
-                        .as_ref()
+                    session_usage: app_state
+                        .agent()
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
                     repo: repo.clone(),
-                    current_session_id: current_session_id.clone(),
+                    current_session_id: app_state.current_session_id(),
                     branch_messages,
                     tree,
                     leaf_id,
@@ -3813,20 +3957,18 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop
                 // iteration starts with `None`.
-                let prefill = pending_prefill.take();
+                let prefill = app_state.take_prefill();
                 let prefill_ref = prefill.as_deref();
                 r.read_input(
                     &prompt_str,
                     prefill_ref,
                     &mut line_history,
                     &ctx,
-                    settings,
-                    &mut menu_submitted,
-                    &pending_op,
-                    &live_state,
+                    &app_state,
                     config.output.cursor_row(),
                     config.output.as_ref(),
                 )
+                .await
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };
@@ -3834,414 +3976,170 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
             Some(a) => a,
             None => continue,
         };
-        // Sync LiveState → AgentConfig after any menu submit, and dispatch any
-        // async op the node's submit() requested. Runs before the action match
-        // so it fires for `MenuDone` too (v2.5 menus no longer round-trip
-        // through a Submit string).
-        if menu_submitted {
-            menu_submitted = false;
-            // Snapshot LiveState and consume any explicit `/model` commit.
-            // `model_commit` is written only by the `/model` node's submit(),
-            // so session metadata recording below is gated on a real user
-            // commit — a bare `menu_submitted` (quit, delete confirm, replay,
-            // …) must never append model/thinking entries to the session
-            // (which, via `ensure_persisted`, used to create header+marker
-            // "empty" sessions and re-mark the current session active right
-            // after deleting another one).
-            let (live_model, live_thinking, live_persona, model_commit) = {
-                let mut ls = live_state.borrow_mut();
-                (
-                    ls.model.clone(),
-                    ls.thinking_level.clone(),
-                    ls.persona.clone(),
-                    ls.model_commit.take(),
-                )
-            };
+        // Convergence: fold the runtime-target config (AppState) into the
+        // applied layer, then record session metadata and drain control
+        // targets — this loop is the targets' sole consumer. Runs every
+        // cycle: run-to-completion means at most one menu submit per cycle,
+        // and a missed application point only delays convergence.
+        let target = app_state.config_snapshot();
+        let control = app_state.take_control();
+        if control.quit {
+            break;
+        }
 
-            // Rebuild gate: canonical whole-string compares against the
-            // RUNNING model (config), never a segment split — model ids may
-            // themselves contain colons (openrouter `…:free`), and a
-            // `nth(1)`-style truncation reads a different value than what is
-            // configured, making every menu commit look like a model change.
-            let model_changed = config.qualified_model_id() != live_model;
-            let thinking_changed = config.thinking_level != live_thinking;
-            let persona_changed = config.persona_name != live_persona;
+        // Rebuild gate: canonical whole-string compares against the
+        // RUNNING model (config), never a segment split — model ids may
+        // themselves contain colons (openrouter `…:free`), and a
+        // `nth(1)`-style truncation reads a different value than what is
+        // configured, making every menu commit look like a model change.
+        let model_changed = config.qualified_model_id() != target.qualified_model_id();
+        let thinking_changed = config.thinking_level != target.thinking_level;
+        let persona_changed = config.persona_name != target.persona_name;
+        let target_thinking = target.thinking_level.clone();
 
-            if model_changed || thinking_changed || persona_changed {
-                let mut new_cfg = config.clone();
-                if model_changed {
-                    if let Some((p, m)) = live_model.split_once(':') {
-                        new_cfg.provider = p.to_string();
-                        new_cfg.model = m.to_string();
-                    }
-                }
-                if thinking_changed {
-                    new_cfg.thinking_level = live_thinking.clone();
-                }
-                if persona_changed {
-                    new_cfg.persona_name = live_persona.clone();
-                    new_cfg.persona_prompt = live_persona
-                        .as_ref()
-                        .and_then(|p| crate::persona::get_persona(p));
-                }
-                match create_agent(new_cfg.clone()).await {
-                    Ok(new_agent) => {
-                        agent = Some(new_agent);
-                        if model_changed {
-                            let model_id = new_cfg.qualified_model_id();
-                            recent_models.retain(|m| m != &model_id);
-                            recent_models.insert(0, model_id);
-                            save_recent_models(&recent_models);
-                        }
-                        config = new_cfg;
-                    }
-                    Err(e) => {
-                        let kind = if model_changed { "switch model" }
-                                   else if thinking_changed { "set thinking" }
-                                   else { "set persona" };
-                        config.output.display_text(
-                            &format!("Cannot {}: {}", kind, e)
-                        );
-                    }
-                }
+        // One rebuild attempt per distinct target: re-running a failed
+        // attempt would reprint the same error every cycle while the user
+        // digs back to the menu to fix it. Changing the target — or an
+        // explicit `/model` re-commit of the same model — arms the next
+        // attempt. (`create_agent` is local: key/config errors are final
+        // for a given target, so recovery really is "change the target".)
+        let target_fp = (
+            target.qualified_model_id(),
+            target.thinking_level.clone(),
+            target.persona_name.clone(),
+        );
+        // Re-arm = a *different* target than the last attempt (the old
+        // explicit-commit re-arm died with `model_commit`; re-selecting
+        // an identical target is a no-op by definition — target unchanged).
+        let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp);
+        if (model_changed || thinking_changed || persona_changed) && rebuild_armed {
+            last_attempted_target = Some(target_fp);
+            let mut new_cfg = config.clone();
+            if model_changed {
+                new_cfg.provider = target.provider.clone();
+                new_cfg.model = target.model.clone();
             }
-
-            // Session metadata recording. Runs AFTER the rebuild so `config`
-            // at this point matches the committed values exactly when the
-            // agent actually runs them (rebuild succeeded, or the commit
-            // equalled the running value and no rebuild was needed) — a
-            // failed rebuild records nothing. Model entries additionally
-            // require the explicit `/model` commit flag; the record helpers
-            // skip values the session already holds and fold metadata into
-            // the in-memory header instead of a file while the session is
-            // still unpersisted.
-            if let Some(ref committed) = model_commit {
-                if config.qualified_model_id() == *committed {
-                    if let Some(ref s) = session {
-                        record_model_change(s, committed).await;
-                    }
-                }
+            if thinking_changed {
+                new_cfg.thinking_level = target.thinking_level.clone();
             }
-            if thinking_changed && config.thinking_level == live_thinking {
-                if let Some(ref s) = session {
-                    record_thinking_change(s, live_thinking.as_deref().unwrap_or("off")).await;
+            if persona_changed {
+                new_cfg.persona_name = target.persona_name.clone();
+                new_cfg.persona_prompt = target
+                    .persona_name
+                    .as_ref()
+                    .and_then(|p| crate::persona::get_persona(p));
+            }
+            match create_agent(new_cfg.clone()).await {
+                Ok(new_agent) => {
+                    app_state.activate_agent(Arc::from(new_agent));
+                    if model_changed {
+                        let model_id = new_cfg.qualified_model_id();
+                        let updated = app_state.note_recent_model(&model_id);
+                        save_recent_models(&updated);
+                    }
+                    config = new_cfg;
+                }
+                Err(e) => {
+                    let kind = if model_changed { "switch model" }
+                               else if thinking_changed { "set thinking" }
+                               else { "set persona" };
+                    config.output.display_text(
+                        &format!("Cannot {}: {}", kind, e)
+                    );
                 }
             }
         }
-        // Dispatch async ops from v2.5 submit handlers.
-        if let Some(op) = pending_op.borrow_mut().take() {
-            match op {
-                crate::slash_menu_bridge::AsyncOp::Replay(arg) => {
-                    if let Some(ref s) = session {
-                        handle_replay(&arg, s, config.output.as_ref()).await;
-                    } else {
-                        config.output.display_text("No active session to replay");
-                    }
+
+        // Thinking metadata recording (the model entry moved inline: the
+        // /model node journals its explicit commit at submit time — its
+        // record helper skips values the session already holds and folds
+        // metadata into the in-memory header while the session is still
+        // unpersisted). Runs AFTER the rebuild so `config` matches the
+        // target when we record.
+        let recording_session = app_state.session();
+        if thinking_changed && config.thinking_level == target_thinking {
+            if let Some(ref s) = recording_session {
+                record_thinking_change(s, target_thinking.as_deref().unwrap_or("off")).await;
+            }
+        }
+        // Control appliers — each field's sole consumer. `take_control()`
+        // above already GC'd the one-shots; run-to-completion means at
+        // most one menu submit set them this cycle.
+
+        if let Some(op) = control.sandbox {
+            // Relocated v2.0 /sandbox handler: mutate the state
+            // store, then re-publish the merged config — BOTH
+            // `tools::set_sandbox` (live) AND `config.sandbox`
+            // (so the merge survives a lazy agent rebuild, which
+            // does `set_sandbox(config.sandbox.clone())`).
+            use crate::app_state::SandboxOp;
+            let result = match &op {
+                SandboxOp::Add {
+                    host_path,
+                    sandbox_path,
+                    mode,
+                } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
+                SandboxOp::Remove { sandbox_path } => {
+                    crate::sandbox_state::remove(sandbox_path)
                 }
-                crate::slash_menu_bridge::AsyncOp::Resume { session_id, replay_arg } => {
-                    let input = if replay_arg.is_empty() {
-                        format!("/session {} resume", session_id)
-                    } else {
-                        format!("/session {} resume {}", session_id, replay_arg)
-                    };
-                    let out = config.output.clone();
-                    match handle_session_command(
-                        &input, &mut session, &mut repo, &mut config, &out, settings,
-                    ).await {
-                        SessionCommandResult::Switched { id: new_id, prefill } => {
-                            current_session_id = new_id;
-                            if prefill.is_some() {
-                                pending_prefill = prefill;
-                            }
-                        }
-                        SessionCommandResult::Handled => {}
-                        other => {
-                            eprintln!("[v25] resume: unexpected result {:?}", std::mem::discriminant(&other));
-                        }
-                    }
+                SandboxOp::Exclude { sandbox_path } => {
+                    crate::sandbox_state::exclude(sandbox_path)
                 }
-                crate::slash_menu_bridge::AsyncOp::Fork { session_id } => {
-                    let input = format!("/session {} fork", session_id);
-                    let out = config.output.clone();
-                    match handle_session_command(
-                        &input, &mut session, &mut repo, &mut config, &out, settings,
-                    ).await {
-                        SessionCommandResult::Switched { id: new_id, .. } => {
-                            current_session_id = new_id;
-                        }
-                        SessionCommandResult::Handled => {}
-                        other => {
-                            eprintln!("[v25] fork: unexpected result {:?}", std::mem::discriminant(&other));
-                        }
-                    }
+                SandboxOp::Restore { sandbox_path } => {
+                    crate::sandbox_state::restore(sandbox_path)
                 }
-                crate::slash_menu_bridge::AsyncOp::Rename { session_id, new_name } => {
-                    let input = format!("/session {} rename {}", session_id, new_name);
-                    let out = config.output.clone();
-                    let result = handle_session_command(
-                        &input, &mut session, &mut repo, &mut config, &out, settings,
-                    ).await;
-                    if !matches!(result, SessionCommandResult::Handled) {
-                        eprintln!("[v25] rename: unexpected result {:?}", std::mem::discriminant(&result));
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::Delete { session_id } => {
-                    let input = format!("/session {} delete", session_id);
-                    let out = config.output.clone();
-                    match handle_session_command(
-                        &input, &mut session, &mut repo, &mut config, &out, settings,
-                    ).await {
-                        SessionCommandResult::Deleted => {
-                            if session.is_none() {
-                                current_session_id.clear();
-                            }
-                        }
-                        SessionCommandResult::Handled => {}
-                        other => {
-                            eprintln!("[v25] delete: unexpected result {:?}", std::mem::discriminant(&other));
-                        }
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::Quit => {
-                    break;
-                }
-                crate::slash_menu_bridge::AsyncOp::TreeSwitch { target_id } => {
-                    if let Some(ref s) = session {
-                        let old_leaf_id = s.get_leaf_id().await;
-                        if old_leaf_id.as_deref() != Some(target_id.as_str()) {
-                            let _ = s.move_leaf(Some(target_id.clone())).await;
-                        }
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::TreeCompact {
-                    target_id, mode, payload,
-                } => {
-                    let Some(ref s) = session else {
-                        config.output.display_text("Cannot compact: no active session");
-                        continue;
-                    };
-                    if s.get_entry(&target_id).await.is_none() {
-                        config.output.display_text(&format!(
-                            "Cannot compact: unknown tree entry {}",
-                            &target_id[..target_id.len().min(12)],
-                        ));
-                        continue;
-                    }
-                    let tokens_before = match s.build_context().await {
-                        Ok(ctx) => estimate_context_tokens(&ctx.messages),
-                        Err(_) => 0,
-                    };
-                    let resolved_mode = match mode {
-                        crate::slash_menu_bridge::CompactMode::Manual => {
-                            CompactSummaryMode::Manual
-                        }
-                        crate::slash_menu_bridge::CompactMode::TextOnly => {
-                            CompactSummaryMode::TextOnly
-                        }
-                        crate::slash_menu_bridge::CompactMode::Prompt => {
-                            CompactSummaryMode::Llm
-                        }
-                    };
-                    // LLM mode needs a live agent.
-                    if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
-                        match create_agent(config.clone()).await {
-                            Ok(a) => agent = Some(a),
-                            Err(e) => {
-                                config.output.display_text(
-                                    &format!("Cannot start agent: {}", e),
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    // LLM mode early-out: refuse if nothing to compact.
-                    if resolved_mode == CompactSummaryMode::Llm {
-                        let current_leaf = s.get_leaf_id().await;
-                        if let Some(leaf) = current_leaf.as_deref() {
-                            let index = s.index().lock().await;
-                            if find_predecessor_on_active_branch(&index, &target_id)
-                                .as_deref()
-                                == Some(leaf)
-                            {
-                                config.output.display_text(
-                                    "Cannot compact: nothing before the current position",
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    let review: Option<CompactionSummaryReview> =
-                        if let Some(g) = &guard {
-                            let g = g.clone();
-                            let out = config.output.clone();
-                            Some(Box::new(move |draft: &str| {
-                                crate::repl::review_compaction_summary(
-                                    &g, out.as_ref(), draft,
-                                )
-                            }))
-                        } else {
-                            None
-                        };
-                    match run_compaction(
-                        s,
-                        &agent,
-                        settings,
-                        CompactionTarget::AtPoint {
-                            target_id: target_id.clone(),
-                            tokens_before,
-                        },
-                        resolved_mode,
-                        &payload,
-                        config.output.as_ref(),
-                        review,
-                        &config.user_cancel,
-                        &config.cancel_notify,
-                    )
-                    .await
-                    {
-                        CompactionResult::Done => {}
-                        CompactionResult::Cancelled => {
-                            // User cancelled at the review step.
-                        }
-                        CompactionResult::Err(msg) => {
-                            config.output.display_text(&msg);
-                        }
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::New { name } => {
-                    session = None;
-                    ensure_session(
-                        &mut session,
-                        &repo,
-                        Some(config.provider.clone()),
-                        Some(config.model.clone()),
-                        config.thinking_level.clone(),
-                    ).await;
-                    current_session_id = session
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default();
-                    if !name.is_empty() {
-                        if let Some(ref s) = session {
-                            if let Err(e) = s.set_session_name(&name).await {
-                                config
-                                    .output
-                                    .display_text(&format!("Could not name session: {}", e));
-                            } else if let Some(ref r) = repo {
-                                r.invalidate_cache();
-                            }
-                        }
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::Clear { name } => {
-                    if let Some(ref s) = session {
-                        let id = s.get_session_id().to_string();
-                        if let Some(ref r) = repo {
-                            let cwd = std::env::current_dir().ok();
-                            let metas = r.list(cwd.as_deref()).await.unwrap_or_default();
-                            if let Some(meta) = metas.iter().find(|m| m.id == id) {
-                                let _ = r.delete(meta).await;
-                            }
-                        }
-                    }
-                    session = None;
-                    ensure_session(
-                        &mut session,
-                        &repo,
-                        Some(config.provider.clone()),
-                        Some(config.model.clone()),
-                        config.thinking_level.clone(),
-                    ).await;
-                    current_session_id = session
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default();
-                    if !name.is_empty() {
-                        if let Some(ref s) = session {
-                            if let Err(e) = s.set_session_name(&name).await {
-                                config
-                                    .output
-                                    .display_text(&format!("Could not name session: {}", e));
-                            } else if let Some(ref r) = repo {
-                                r.invalidate_cache();
-                            }
-                        }
-                    }
-                }
-                crate::slash_menu_bridge::AsyncOp::Sandbox(op) => {
-                    // Relocated v2.0 /sandbox handler: mutate the state
-                    // store, then re-publish the merged config — BOTH
-                    // `tools::set_sandbox` (live) AND `config.sandbox`
-                    // (so the merge survives a lazy agent rebuild, which
-                    // does `set_sandbox(config.sandbox.clone())`).
-                    use crate::slash_menu_bridge::SandboxOp;
-                    let result = match &op {
+            };
+            match result {
+                Ok(()) => {
+                    let mut merged = config.sandbox.clone().unwrap_or_default();
+                    crate::sandbox_state::merge_into(&mut merged);
+                    crate::tools::set_sandbox(Some(merged.clone()));
+                    config.sandbox = Some(merged.clone());
+                    // Keep the target snapshot in sync — this applier is the
+                    // one that *applies* sandbox state.
+                    app_state.update_config(|c| c.sandbox = Some(merged));
+                    let msg = match &op {
                         SandboxOp::Add {
                             host_path,
                             sandbox_path,
                             mode,
-                        } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
+                        } => {
+                            let m = if *mode == crate::config::BindMode::Rw {
+                                "add_rw"
+                            } else {
+                                "add_ro"
+                            };
+                            if sandbox_path.is_empty() {
+                                format!("sandbox: {} {} (ok)", m, host_path)
+                            } else {
+                                format!(
+                                    "sandbox: {} {} → {} (ok)",
+                                    m, host_path, sandbox_path
+                                )
+                            }
+                        }
                         SandboxOp::Remove { sandbox_path } => {
-                            crate::sandbox_state::remove(sandbox_path)
+                            format!("sandbox: removed {} (ok)", sandbox_path)
                         }
                         SandboxOp::Exclude { sandbox_path } => {
-                            crate::sandbox_state::exclude(sandbox_path)
+                            format!("sandbox: excluded {} (ok)", sandbox_path)
                         }
                         SandboxOp::Restore { sandbox_path } => {
-                            crate::sandbox_state::restore(sandbox_path)
+                            format!("sandbox: restored {} (ok)", sandbox_path)
                         }
                     };
-                    match result {
-                        Ok(()) => {
-                            let mut merged = config.sandbox.clone().unwrap_or_default();
-                            crate::sandbox_state::merge_into(&mut merged);
-                            crate::tools::set_sandbox(Some(merged.clone()));
-                            config.sandbox = Some(merged);
-                            let msg = match &op {
-                                SandboxOp::Add {
-                                    host_path,
-                                    sandbox_path,
-                                    mode,
-                                } => {
-                                    let m = if *mode == crate::config::BindMode::Rw {
-                                        "add_rw"
-                                    } else {
-                                        "add_ro"
-                                    };
-                                    if sandbox_path.is_empty() {
-                                        format!("sandbox: {} {} (ok)", m, host_path)
-                                    } else {
-                                        format!(
-                                            "sandbox: {} {} → {} (ok)",
-                                            m, host_path, sandbox_path
-                                        )
-                                    }
-                                }
-                                SandboxOp::Remove { sandbox_path } => {
-                                    format!("sandbox: removed {} (ok)", sandbox_path)
-                                }
-                                SandboxOp::Exclude { sandbox_path } => {
-                                    format!("sandbox: excluded {} (ok)", sandbox_path)
-                                }
-                                SandboxOp::Restore { sandbox_path } => {
-                                    format!("sandbox: restored {} (ok)", sandbox_path)
-                                }
-                            };
-                            config.output.display_text(&msg);
-                        }
-                        Err(e) => {
-                            config.output.display_text(&format!("sandbox error: {}", e));
-                        }
-                    }
+                    config.output.display_text(&msg);
+                }
+                Err(e) => {
+                    config.output.display_text(&format!("sandbox error: {}", e));
                 }
             }
-            continue;
         }
         match action {
             InputAction::MenuDone => {
-                // v2.5 menu committed: the node already wrote to shared state.
-                // `menu_submitted` (LiveState sync) and `pending_op` (async
-                // dispatch) are processed after this match.
+                // v2.5 menu committed: the node already wrote to `AppState`
+                // (target config / control fields); the convergence step
+                // above applied them. No-op arm.
             }
             InputAction::Submit(input) => {
                 if input.is_empty() {
@@ -4258,17 +4156,19 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // and skip every `append_message` (gated on `session.is_some()`),
                 // losing turn-to-turn memory and never writing the new session
                 // to disk. Cheap when the session is already populated.
-                ensure_session(
-                    &mut session,
+                let guarded = ensure_session(
+                    app_state.session(),
                     &repo,
                     Some(config.provider.clone()),
                     Some(config.model.clone()),
                     config.thinking_level.clone(),
-                ).await;
-                current_session_id = session
+                )
+                .await;
+                let guarded_id = guarded
                     .as_ref()
                     .map(|s| s.get_session_id().to_string())
                     .unwrap_or_default();
+                app_state.activate_session(guarded, guarded_id);
                 // User-initiated shell command. `!cmd` runs `cmd` in the
                 // sandbox and captures its output into the session context (so
                 // the LLM sees it on the next turn); `!!cmd` runs and displays
@@ -4318,7 +4218,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                     let msg = Message::user(format!(
                                         "Ran shell command: {cmd}"
                                     ));
-                                    if let Some(ref s) = session {
+                                    if let Some(s) = app_state.session() {
                                         let _ = s.append_message(&msg).await;
                                         let reply = Message::Assistant {
                                             id: None,
@@ -4354,7 +4254,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
 
                     match action {
                         TreeAction::Switch => {
-                            if let Some(ref s) = session {
+                            if let Some(s) = app_state.session() {
                                 let old_leaf_id = s.get_leaf_id().await;
                                 if old_leaf_id.as_deref() != Some(target_id.as_str()) {
                                     // Summarize the abandoned branch if requested.
@@ -4385,9 +4285,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                                 // build the agent on demand and
                                                 // store it for the next prompt
                                                 // to reuse.
+                                                let mut agent = app_state.agent();
                                                 if agent.is_none() {
                                                     match create_agent(config.clone()).await {
-                                                        Ok(a) => agent = Some(a),
+                                                        Ok(a) => {
+                                                            app_state.activate_agent(Arc::from(a));
+                                                            agent = app_state.agent();
+                                                        }
                                                         Err(e) => {
                                                             config.output.display_text(&format!(
                                                                 "Cannot start agent: {}",
@@ -4443,7 +4347,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             }
                         }
                         TreeAction::Compact => {
-                            let Some(ref s) = session else {
+                            let Some(s) = app_state.session() else {
                                 config.output.display_text("Cannot compact: no active session");
                                 continue;
                             };
@@ -4491,9 +4395,13 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             // the lazy first-prompt creation below. Manual /
                             // TextOnly never touch the agent, so they stay
                             // network-free regardless.
+                            let mut agent = app_state.agent();
                             if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
                                 match create_agent(config.clone()).await {
-                                    Ok(a) => agent = Some(a),
+                                    Ok(a) => {
+                                        app_state.activate_agent(Arc::from(a));
+                                        agent = app_state.agent();
+                                    }
                                     Err(e) => {
                                         config
                                             .output
@@ -4551,9 +4459,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 };
 
                             match run_compaction(
-                                s,
+                                &s,
                                 &agent,
-                                settings,
+                                &app_state.settings(),
                                 CompactionTarget::AtPoint {
                                     target_id: target_id.clone(),
                                     tokens_before,
@@ -4572,7 +4480,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                                 // prompt line to the editor so they can switch
                                 // methods or tune the LLM prompt.
                                 CompactionResult::Cancelled => {
-                                    pending_prefill = Some(input.clone());
+                                    app_state.set_prefill(input.clone());
                                 }
                                 CompactionResult::Err(msg) => {
                                     config.output.display_text(&msg);
@@ -4592,29 +4500,32 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // Handle `/session <name> <action>` commands.
                 if input.starts_with("/session") {
                     let out = config.output.clone();
-                    match handle_session_command(
+                    let mut sess = app_state.session();
+                    let result = handle_session_command(
                         &input,
-                        &mut session,
+                        &mut sess,
                         &mut repo,
                         &mut config,
                         &out,
-                        settings,
-                    ).await {
+                        &app_state.settings(),
+                    ).await;
+                    app_state.set_session(sess);
+                    match result {
                         SessionCommandResult::NotSession => {
                             // Not a session command — fall through to normal prompt.
                         }
                         SessionCommandResult::Switched { id: new_id, prefill } => {
-                            current_session_id = new_id;
+                            app_state.set_current_session_id(new_id);
                             // Resume returned a model-restore prefill (e.g.
                             // `/model <provider>:<model_id>`). Surface it on the
                             // next prompt instead of letting the user type it
                             // themselves; clearing the buffer would force them to
                             // retype the model they just resumed into. The
-                            // prefill is consumed once — `pending_prefill` is
-                            // reset at the top of the next loop iteration so a
+                            // prefill is consumed once — the slot register is
+                            // taken at the top of the next loop iteration so a
                             // subsequent prompt starts empty.
-                            if prefill.is_some() {
-                                pending_prefill = prefill;
+                            if let Some(p) = prefill {
+                                app_state.set_prefill(p);
                             }
                             continue;
                         }
@@ -4629,7 +4540,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // first turn onward (instead of needing a follow-up rename).
                 if input == "/clear" || input.starts_with("/clear ") {
                     let new_name = input["/clear".len()..].trim().to_string();
-                    if let Some(ref s) = session {
+                    if let Some(s) = app_state.session() {
                         let id = s.get_session_id().to_string();
                         if let Some(ref r) = repo {
                             // Find the session meta to delete it.
@@ -4640,25 +4551,27 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                             }
                         }
                     }
-                    session = None;
                     // Create a fresh session for the next prompt so context
                     // carries across turns AND the new turns get persisted.
                     // `repo.create()` defers the header write to the first
                     // `append_message`, so a user that quits immediately
-                    // still produces no empty `.jsonl` file.
-                    ensure_session(
-                        &mut session,
+                    // still produces no empty `.jsonl` file. (`None` drops
+                    // the in-memory session — ensure keeps a `Some` as-is.)
+                    let fresh = ensure_session(
+                        None,
                         &repo,
                         Some(config.provider.clone()),
                         Some(config.model.clone()),
                         config.thinking_level.clone(),
-                    ).await;
-                    current_session_id = session
+                    )
+                    .await;
+                    let fresh_id = fresh
                         .as_ref()
                         .map(|s| s.get_session_id().to_string())
                         .unwrap_or_default();
+                    app_state.activate_session(fresh.clone(), fresh_id);
                     if !new_name.is_empty() {
-                        if let Some(ref s) = session {
+                        if let Some(ref s) = fresh {
                             if let Err(e) = s.set_session_name(&new_name).await {
                                 config
                                     .output
@@ -4680,25 +4593,26 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // names the new session (same rationale as `/clear <name>`).
                 if input == "/new" || input.starts_with("/new ") {
                     let new_name = input["/new".len()..].trim().to_string();
-                    session = None;
-                    // See `/clear` above: without this call, the next prompt
-                    // would run with `session = None` — losing prior context
+                    // See `/clear` above: without the fresh ensure, the next
+                    // prompt would run with no session — losing prior context
                     // and skipping every `append_message` (since they're gated
-                    // on `session.is_some()`), so the new "session" wouldn't
-                    // be saved.
-                    ensure_session(
-                        &mut session,
+                    // on the session being present), so the new "session"
+                    // wouldn't be saved. (`None` drops the in-memory session.)
+                    let fresh = ensure_session(
+                        None,
                         &repo,
                         Some(config.provider.clone()),
                         Some(config.model.clone()),
                         config.thinking_level.clone(),
-                    ).await;
-                    current_session_id = session
+                    )
+                    .await;
+                    let fresh_id = fresh
                         .as_ref()
                         .map(|s| s.get_session_id().to_string())
                         .unwrap_or_default();
+                    app_state.activate_session(fresh.clone(), fresh_id);
                     if !new_name.is_empty() {
-                        if let Some(ref s) = session {
+                        if let Some(ref s) = fresh {
                             if let Err(e) = s.set_session_name(&new_name).await {
                                 config
                                     .output
@@ -4719,9 +4633,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 // replays all the way to the beginning; only the agent context
                 // is prefix-limited at the compaction scope.
                 if input == "/replay" || input.starts_with("/replay ") {
-                    if let Some(ref s) = session {
+                    if let Some(s) = app_state.session() {
                         let arg = input["/replay".len()..].trim();
-                        handle_replay(arg, s, config.output.as_ref()).await;
+                        handle_replay(arg, &s, config.output.as_ref()).await;
                     } else {
                         config.output.display_text("No active session to replay");
                     }
@@ -4736,10 +4650,11 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                 config.output.display_plain(&input);
                 // Separator between the user's prompt and the agent response.
                 config.output.display_separator();
-                // Normal prompt — create the agent lazily on first use.
-                if agent.is_none() {
+                // Normal prompt — create the agent lazily on first use
+                // (loop-side, applied config; published to the slot).
+                if app_state.agent().is_none() {
                     match create_agent(config.clone()).await {
-                        Ok(a) => agent = Some(a),
+                        Ok(a) => app_state.activate_agent(Arc::from(a)),
                         Err(e) => {
                             config
                                 .output
@@ -4748,6 +4663,9 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         }
                     }
                 }
+                // Clone-out for this turn (lock rule 3: no guard across await).
+                let agent = app_state.agent();
+                let session = app_state.session();
                 // Single attempt + auto-retry, with the in-flight reader
                 // (if any) spanning the whole window. `Esc` during the
                 // retry's back-off sleep returns `Cancelled`; `Esc` during
@@ -4794,7 +4712,7 @@ pub async fn run_interactive(config: AgentConfig, settings: &mut SettingsStore, 
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&next_input, session.as_ref(), &turn)
+                            .prompt(&next_input, session.as_deref(), &turn)
                             .await;
                         match prompt_result {
                             Ok(text) => break Ok(text),
@@ -5140,6 +5058,111 @@ impl CodeAgent {
             usage: Mutex::new(SessionUsage::default()),
         }
     }
+}
+
+/// Test helper: a temp-dir repo holding one session file (header + user
+/// message + leaf, written directly so listings see it immediately).
+/// Returns `(repo, session id, base dir)`; leaks the dir unless the
+/// caller removes it.
+#[cfg(test)]
+pub(crate) fn test_repo_with_session() -> (
+    crate::session::repo::JsonlSessionRepo,
+    String,
+    std::path::PathBuf,
+) {
+    use crate::session::repo::JsonlSessionRepo;
+    use crate::session::types::{encode_cwd, session_filename, SessionHeader};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "picocode-repo-test-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    let cwd = std::path::Path::new("/tmp/v25-cwd");
+    let dir = base.join(encode_cwd(cwd));
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = SessionHeader::new(cwd);
+    let uuid = header.id.clone();
+    let path = dir.join(session_filename(&chrono::Utc::now()));
+    let user_entry = serde_json::json!({
+        "id": "e1",
+        "timestamp": "2025-01-01T00:00:00.000Z",
+        "type": "message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello world"}]},
+    });
+    let leaf = serde_json::json!({
+        "id": "leaf1",
+        "timestamp": "2025-01-01T00:00:01.000Z",
+        "type": "leaf",
+        "targetId": "e1",
+    });
+    let contents = format!(
+        "{}\n{}\n{}\n",
+        serde_json::to_string(&header).unwrap(),
+        serde_json::to_string(&user_entry).unwrap(),
+        serde_json::to_string(&leaf).unwrap(),
+    );
+    std::fs::write(&path, contents).unwrap();
+    let repo = JsonlSessionRepo::new(base.clone());
+    (repo, uuid, base)
+}
+
+/// Test helper: drive a future on a fresh current-thread tokio runtime.
+/// Node submits touch `tokio::fs`/the blocking pool, which futures'
+/// plain `block_on` cannot host — use this for any test that awaits
+/// repo/session IO.
+#[cfg(test)]
+pub(crate) fn block_on_test<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(f)
+}
+
+/// Test helper: a writable session built from `entries` (temp dir,
+/// header written, leaf set to the last entry) wrapped in an `Arc` —
+/// for tests that need a session in the AppState slot. Sync facade with
+/// an internal current-thread runtime (`tokio::fs` needs one); leaks its
+/// temp dir (same policy as the in-module compaction helper).
+#[cfg(test)]
+pub(crate) fn test_session_with_entries(
+    entries: Vec<crate::session::SessionEntry>,
+) -> Arc<Session> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    rt.block_on(async move {
+        use crate::session::storage::JsonlSessionStorage;
+        use crate::session::types::session_filename;
+        let dir = std::env::temp_dir().join(format!(
+            "picocode-slot-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join(session_filename(&chrono::Utc::now()));
+        let storage = JsonlSessionStorage::open_or_create(path)
+            .await
+            .expect("create storage");
+        let header = crate::session::SessionHeader::new(std::path::Path::new("/test"));
+        storage.write_header(&header).await.expect("write header");
+        for entry in &entries {
+            storage.append_entry(entry).await.expect("append");
+        }
+        if let Some(last) = entries.last() {
+            let leaf = crate::session::SessionEntry::new_leaf(Some(last.id.clone()), None);
+            storage.append_entry(&leaf).await.expect("append leaf");
+        }
+        let index = storage.build_index().await.expect("build index");
+        Arc::new(Session::new_persisted(storage, index))
+    })
 }
 
 #[cfg(test)]
@@ -6934,12 +6957,12 @@ mod tests {
             message_log_path: None,
             sessions_dir: Some(sessions_dir.clone()),
         };
-        let mut settings = SettingsStore::from_agent_config(&config, None);
+        let settings = SettingsStore::from_agent_config(&config, None);
 
         // No normal prompt is ever submitted, so the agent is never created and
         // `create_agent` (and its `set_sandbox`) is never called — exactly the
         // pre-fix condition where `!` would otherwise run unsandboxed.
-        super::run_interactive(config, &mut settings, false)
+        super::run_interactive(config, settings, false)
             .await
             .unwrap();
 

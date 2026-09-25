@@ -11,13 +11,15 @@
 //! `SandboxMappingNode` plays the `TreeListNode` dual role: at the
 //! `/sandbox` level it emits one row per merged binding (id = sandbox
 //! path); drilled into it shows `header()` + the single action child.
-//! Mutations go through `AsyncOp::Sandbox(SandboxOp)` — the agent loop
-//! owns `config`, so it performs the mutation + re-publish.
+//! Mutations go through the `sandbox` control target (`SandboxOp`) — the
+//! agent loop owns the applied `config`, so it performs the mutation +
+//! re-publish at the cycle point.
+use std::sync::Arc;
 
 use std::rc::Rc;
 
+use crate::app_state::{AppState, SandboxOp};
 use crate::config::BindMode;
-use crate::slash_menu_bridge::{AsyncOp, MenuShared, SandboxOp};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext,
@@ -94,8 +96,9 @@ pub fn sandbox_fields() -> Vec<FieldSpec> {
 /// child (`SandboxRemoveNode`) is shown.
 pub struct SandboxMappingNode;
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxMappingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let rows = crate::sandbox_state::combined_list()
             .into_iter()
             .map(|b| {
@@ -115,7 +118,7 @@ impl SlashDotNode for SandboxMappingNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         match find_binding(&path_args.ids) {
             None => vec!["Mapping not found.".to_string()],
             Some(b) => vec![
@@ -129,17 +132,18 @@ impl SlashDotNode for SandboxMappingNode {
 }
 
 // ---------------------------------------------------------------------------
-// SandboxRemoveNode — action leaf (confirm → AsyncOp)
+// SandboxRemoveNode — action leaf (confirm → control target)
 // ---------------------------------------------------------------------------
 
 /// Action leaf: remove a session binding, exclude a config binding, or
 /// restore an excluded one. Two-phase confirm via `prepare()`.
 pub struct SandboxRemoveNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxRemoveNode {
-    fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         let row = match find_binding(&path_args.ids) {
             None => Row::new("remove").desc("mapping not found"),
             Some(b) if b.is_excluded => Row::new("restore").desc("re-enable this mapping"),
@@ -152,7 +156,7 @@ impl SlashDotNode for SandboxRemoveNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let Some(b) = find_binding(&path_args.ids) else {
             let id = path_args.ids.get(1).cloned().unwrap_or_default();
             return vec![format!("Mapping not found: {}", id)];
@@ -181,11 +185,11 @@ impl SlashDotNode for SandboxRemoveNode {
         lines
     }
 
-    fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         SubmitResult::Prepared
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let Some(b) = find_binding(&path_args.ids) else {
             let id = path_args.ids.get(1).cloned().unwrap_or_default();
             return SubmitResult::Error(format!("mapping not found: {}", id));
@@ -200,7 +204,7 @@ impl SlashDotNode for SandboxRemoveNode {
         } else {
             SandboxOp::Exclude { sandbox_path }
         };
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Sandbox(op));
+        self.app_state.request_sandbox(op);
         SubmitResult::Done(None)
     }
 }
@@ -226,7 +230,7 @@ fn completable(word: &str) -> bool {
 /// with an L2 `Rc` cache keyed by (arg, word) that
 /// `path_complete::listing_stale` invalidates.
 pub struct AddSandboxMappingNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
     /// L2: (arg position, word) → rows. Same `Rc` on unchanged-word
     /// frames ⇒ `ptr_eq` skips the view re-derive; rebuilt when the
     /// word/arg changes or the L1 listing goes stale.
@@ -234,16 +238,17 @@ pub struct AddSandboxMappingNode {
 }
 
 impl AddSandboxMappingNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
+    pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            shared,
+            app_state,
             last_rows: None,
         }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for AddSandboxMappingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![
                 Row::new("ro").desc("read only mapping"),
@@ -253,7 +258,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let mode = path_args.ids.last().map(String::as_str).unwrap_or("?");
         let mode_desc = if mode == "rw" { "read-write" } else { "read-only" };
         vec![
@@ -262,7 +267,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         ]
     }
 
-    fn complete_parameter(
+    async fn complete_parameter(
         &mut self,
         args: &PathArgs,
         cursor_pos: usize,
@@ -315,7 +320,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         Ok(rc)
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let raw: Vec<&str> = path_args.args().collect();
         if raw.is_empty() {
             return SubmitResult::Error("host path required".to_string());
@@ -338,11 +343,11 @@ impl SlashDotNode for AddSandboxMappingNode {
         if let Err(e) = crate::path_util::resolve_canonical(raw[0]) {
             return SubmitResult::Error(e);
         }
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Sandbox(SandboxOp::Add {
+        self.app_state.request_sandbox(SandboxOp::Add {
             host_path: raw[0].to_string(),
             sandbox_path: raw.get(1).map(|s| s.to_string()).unwrap_or_default(),
             mode,
-        }));
+        });
         SubmitResult::Done(None)
     }
 }
@@ -358,7 +363,7 @@ impl SlashDotNode for AddSandboxMappingNode {
 /// it tops the default listing) and `SandboxMappingNode` are the
 /// children.
 pub fn build_sandbox_node(
-    shared: &Rc<MenuShared>,
+    app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -375,12 +380,12 @@ pub fn build_sandbox_node(
         "Add a path mapping to the sandbox",
     )])
     .into();
-    add_node.add_child(AddSandboxMappingNode::new(shared.clone()).into());
+    add_node.add_child(AddSandboxMappingNode::new(app_state.clone()).into());
     listing.add_child(add_node);
 
     let mut map_node: SlashDotMenuNode = SandboxMappingNode.into();
     map_node.add_child(SandboxRemoveNode {
-        shared: shared.clone(),
+        app_state: app_state.clone(),
     }
     .into());
     listing.add_child(map_node);
@@ -415,14 +420,21 @@ mod tests {
         }
     }
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(test_settings(), None))
+    /// Returns an `AppState` (binding kept as `app_state` in tests below).
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
     }
 
-    fn sandbox_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn sandbox_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_sandbox_node(shared));
+        root.add_child(build_sandbox_node(app_state));
         SlashDotMenu::from_root_node(root)
+    }
+
+    /// Drain the sandbox control target (sole-consumer GC — `take_control`
+    /// clears it, so no explicit reset is needed between assertions).
+    fn take_sandbox_op(app_state: &Arc<AppState>) -> Option<SandboxOp> {
+        app_state.take_control().sandbox
     }
 
     /// Reset the process-global sandbox state (session binds,
@@ -472,10 +484,10 @@ mod tests {
         let host = std::fs::canonicalize(td.path()).unwrap();
         crate::sandbox_state::add(&host.to_string_lossy(), "", BindMode::Rw).unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
 
         // Table headers render UPPERCASE (table.rs).
         let th = header_of(&plan).to_uppercase();
@@ -499,12 +511,12 @@ mod tests {
         crate::sandbox_state::set_base(Some(base_config()));
         crate::sandbox_state::exclude("/cfg-ro").unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Root listing: source cell shows the disabled marker.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("cfg [DISABLED]")),
@@ -512,7 +524,7 @@ mod tests {
         );
 
         // Drilled mapping level: the action row is `restore`.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox /cfg-ro ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-ro ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("re-enable this mapping")),
@@ -531,24 +543,24 @@ mod tests {
         let host = std::fs::canonicalize(td.path()).unwrap();
         crate::sandbox_state::add(&host.to_string_lossy(), "", BindMode::Ro).unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Config binding: exclude note + restore mention.
         let (plan, _) =
-            expect_continue(h.eval_prompt("sandbox /cfg-rw remove ", HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-rw remove ", HostKey::None, 100)));
         let detail = detail_of(&plan).join("\n");
         assert!(detail.contains("excludes it"), "{detail:?}");
         assert!(detail.contains("restore"), "{detail:?}");
 
         // Session binding: session note, no config wording.
         let host_s = host.to_string_lossy().into_owned();
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox {} remove ", host_s),
             HostKey::None,
             100,
-        ));
+        )));
         let detail = detail_of(&plan).join("\n");
         assert!(detail.contains("Session binding"), "{detail:?}");
     }
@@ -563,9 +575,9 @@ mod tests {
         let host_s = host.to_string_lossy().into_owned();
         crate::sandbox_state::add(&host_s, "", BindMode::Ro).unwrap();
 
-        let shared = make_shared();
+        let app_state = test_app_state();
         let mut node = SandboxRemoveNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         };
         let pa = |path: &str| PathArgs {
             ids: vec!["sandbox".into(), path.to_string(), "remove".into()],
@@ -574,42 +586,39 @@ mod tests {
         };
 
         // Session bind → Remove.
-        assert!(matches!(node.prepare(1, &pa(&host_s)), SubmitResult::Prepared));
+        assert!(matches!(futures::executor::block_on(node.prepare(1, &pa(&host_s))), SubmitResult::Prepared));
         assert!(matches!(
-            node.submit(1, &pa(&host_s)),
+            futures::executor::block_on(node.submit(1, &pa(&host_s))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Remove { sandbox_path })) if sandbox_path == &host_s
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Remove { sandbox_path }) if sandbox_path == host_s
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Active config bind → Exclude.
         assert!(matches!(
-            node.submit(1, &pa("/cfg-ro")),
+            futures::executor::block_on(node.submit(1, &pa("/cfg-ro"))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Exclude { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Excluded config bind → Restore.
         crate::sandbox_state::exclude("/cfg-ro").unwrap();
         assert!(matches!(
-            node.submit(1, &pa("/cfg-ro")),
+            futures::executor::block_on(node.submit(1, &pa("/cfg-ro"))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Restore { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Restore { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Unknown binding → stay-open error.
-        match node.submit(1, &pa("/no/such/binding")) {
+        match futures::executor::block_on(node.submit(1, &pa("/no/such/binding"))) {
             SubmitResult::Error(msg) => assert!(msg.contains("mapping not found"), "{msg}"),
             _other => panic!("expected Error, got non-error result"),
         }
@@ -621,25 +630,25 @@ mod tests {
         setup();
         crate::sandbox_state::set_base(Some(base_config()));
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Enter #1: drill into `remove` + arm the confirm (Prepared).
         // The arming step is a prompt-only rewrite; resolving it (as
         // repl::v25_eval does) re-derives the rendered confirm frame
         // from the rewritten prompt.
-        let (_, prompt) = expect_continue(h.eval_prompt_resolved(
+        let (_, prompt) = expect_continue(futures::executor::block_on(h.eval_prompt_resolved(
             "sandbox /cfg-ro remove",
             HostKey::Enter,
             100,
-        ));
+        )));
         assert_eq!(prompt, "sandbox /cfg-ro remove ", "{prompt:?}");
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "first Enter must only arm the confirm"
         );
-        let (plan, _) = expect_continue(h.eval_prompt(&prompt, HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(&prompt, HostKey::None, 100)));
         assert!(
             detail_of(&plan).join("\n").contains("excludes it"),
             "confirm frame must show the header: {:?}",
@@ -647,15 +656,15 @@ mod tests {
         );
 
         // Enter #2: submit → Exclude op.
-        let result = h.eval_prompt(&prompt, HostKey::Enter, 100);
+        let result = futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 100));
         assert!(
             matches!(result, MenuResult::DoneSuccess(..)),
             "second Enter should submit: {:?}",
             result
         );
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Exclude { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
     }
 
@@ -663,11 +672,11 @@ mod tests {
     #[serial_test::serial]
     fn add_level_shows_mode_rows() {
         setup();
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox add ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(rows.iter().any(|r| r.contains("ro")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("rw")), "{rows:?}");
@@ -679,8 +688,8 @@ mod tests {
     #[serial_test::serial]
     fn add_submit_validation_and_op() {
         setup();
-        let shared = make_shared();
-        let mut node = AddSandboxMappingNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = AddSandboxMappingNode::new(app_state.clone());
 
         let mk = |ids_last: &str, suffix: &str| -> (PathArgs, Vec<std::ops::Range<usize>>) {
             // Word ranges over `suffix` (skip the leading space).
@@ -703,26 +712,26 @@ mod tests {
 
         // 0 args → drill guard.
         let (pa, _) = mk("ro", "");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert_eq!(msg, "host path required"),
             _other => panic!("expected Error for empty args"),
         }
 
         // ≥3 args → rejected.
         let (pa, _) = mk("ro", " a b c");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert!(msg.contains("expected:"), "{msg}"),
             _other => panic!("expected Error for 3 args"),
         }
 
         // Nonexistent host → stay-open error.
         let (pa, _) = mk("ro", " /nonexistent-picocode-xyz-123");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert!(msg.contains("does not exist"), "{msg}"),
             _other => panic!("expected Error for missing host"),
         }
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "no op may be queued on validation failure"
         );
 
@@ -731,23 +740,22 @@ mod tests {
         let host_s = td.path().to_string_lossy().into_owned();
         let suffix = format!(" {}", host_s);
         let (pa, _) = mk("rw", &suffix);
-        assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
+        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path.is_empty() && *mode == BindMode::Rw
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path.is_empty() && mode == BindMode::Rw
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Two args → both carried through.
         let dst = "/some/sandbox/dst".to_string();
         let suffix = format!(" {} {}", host_s, dst);
         let (pa, _) = mk("ro", &suffix);
-        assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
+        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path == &dst && *mode == BindMode::Ro
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));
     }
 
@@ -755,14 +763,14 @@ mod tests {
     #[serial_test::serial]
     fn drill_arrival_shows_error_above_header() {
         setup();
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Enter on the bare `ro` id drills into the param leaf with an
         // empty suffix → submit guard fires → stay-open error frame.
         let (plan, prompt) =
-            expect_continue(h.eval_prompt("sandbox add ro", HostKey::Enter, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro", HostKey::Enter, 100)));
         assert_eq!(prompt, "sandbox add ro ", "{prompt:?}");
         let detail = detail_of(&plan);
         assert_eq!(detail.len(), 3, "{detail:?}"); // error + two header lines
@@ -770,7 +778,7 @@ mod tests {
         assert!(detail[1].contains("Specify host path"), "{detail:?}");
         assert!(detail[2].contains("Mode: ro"), "{detail:?}");
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "drill arrival must not queue an op"
         );
     }
@@ -786,13 +794,13 @@ mod tests {
         let p1 = td1.path().to_string_lossy().into_owned();
         let p2 = td2.path().to_string_lossy().into_owned();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Arg 1 → host listing, "Host path" label.
         let (plan, _) =
-            expect_continue(h.eval_prompt(&format!("sandbox add ro {}/", p1), HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {}/", p1), HostKey::None, 100)));
         let th = header_of(&plan).to_uppercase();
         assert!(!th.is_empty(), "arg-1 completion must open a dialog");
         assert!(th.contains("HOST PATH"), "{th:?}");
@@ -801,11 +809,11 @@ mod tests {
 
         // Arg 2 → sandbox-routed completion, "Sandbox path" label
         // (no sandbox configured ⇒ host fallback, serial setup).
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox add ro {p1} {p2}/"),
             HostKey::None,
             100,
-        ));
+        )));
         let th = header_of(&plan).to_uppercase();
         assert!(th.contains("SANDBOX PATH"), "{th:?}");
         let rows = rows_of(&plan);
@@ -815,11 +823,11 @@ mod tests {
         );
 
         // ≥2 committed → inert (no dialog).
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox add ro {p1} {p2}/ extra"),
             HostKey::None,
             100,
-        ));
+        )));
         assert!(header_of(&plan).is_empty(), "3rd arg must be inert");
     }
 
@@ -831,13 +839,13 @@ mod tests {
         std::fs::write(td.path().join("solo.txt"), "x").unwrap();
         let p = td.path().to_string_lossy().into_owned();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Non-exact stem → dialog with the file.
         let (plan, _) =
-            expect_continue(h.eval_prompt(&format!("sandbox add ro {p}/so"), HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/so"), HostKey::None, 100)));
         assert!(
             header_of(&plan).to_uppercase().contains("HOST PATH"),
             "dialog expected"
@@ -850,7 +858,7 @@ mod tests {
 
         // Exact file → all candidates exact → no dialog (header only).
         let (plan, _) = expect_continue(
-            h.eval_prompt(&format!("sandbox add ro {p}/solo.txt"), HostKey::None, 100),
+            futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/solo.txt"), HostKey::None, 100)),
         );
         assert!(
             header_of(&plan).is_empty(),
@@ -864,12 +872,12 @@ mod tests {
 
         // Gate: ordinary bare word → inert, no dialog.
         let (plan, _) =
-            expect_continue(h.eval_prompt("sandbox add ro plainword", HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro plainword", HostKey::None, 100)));
         assert!(header_of(&plan).is_empty(), "bare word must be inert");
 
         // Gate: dot-word is attempted (cwd listing — may be empty, but
         // must not error); a definitely-gated word never is.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox add ro ..", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro ..", HostKey::None, 100)));
         let _ = plan; // ".." may or may not match cwd entries — just no panic.
     }
 
@@ -881,21 +889,21 @@ mod tests {
         let host_s = td.path().to_string_lossy().into_owned();
         let dst = "/mapped/dst".to_string();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         let line = format!("sandbox add ro {host_s} {dst}");
-        let result = h.eval_prompt(&line, HostKey::Enter, 100);
+        let result = futures::executor::block_on(h.eval_prompt(&line, HostKey::Enter, 100));
         assert!(
             matches!(result, MenuResult::DoneSuccess(..)),
             "two-path add should submit: {:?}",
             result
         );
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path == &dst && *mode == BindMode::Ro
+            take_sandbox_op(&app_state),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));
     }
 }

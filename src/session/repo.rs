@@ -86,6 +86,7 @@ pub struct JsonlSessionRepo {
 // ---------------------------------------------------------------------------
 
 /// Cached metadata for one session directory (one encoded-CWD subdirectory).
+#[derive(Clone)]
 struct CachedDir {
     /// Per-file mtime for each `.jsonl` in this directory.
     file_mtimes: HashMap<PathBuf, SystemTime>,
@@ -234,6 +235,8 @@ impl JsonlSessionRepo {
     /// Quick-read metadata from a single JSONL file (header only) — sync version.
     /// Does NOT populate `last_prompt_text` — use `read_metadata_detail`
     /// for the full detail (called once when viewing a single session).
+    /// Test-only: the eval path uses the async `read_metadata`.
+    #[cfg(test)]
     fn read_metadata_sync(path: &Path) -> Option<SessionMetadata> {
         let content = std::fs::read_to_string(path).ok()?;
         let first_line = content.lines().next()?;
@@ -423,8 +426,8 @@ impl SessionRepo for JsonlSessionRepo {
 
     async fn delete(&self, meta: &SessionMetadata) -> crate::Result<()> {
         tokio::fs::remove_file(&meta.path).await?;
-        // Drop the sync-listing cache immediately: the `/session` overlay
-        // reads via `list_sessions_sync()` (2s mtime-debounce cache), which
+        // Drop the listing cache immediately: the `/session` overlay reads
+        // through `list_sessions_overlay` (2s mtime-debounce cache), which
         // would otherwise keep showing the deleted session as a ghost for
         // up to 2 seconds — looking like the delete never happened.
         self.invalidate_cache();
@@ -449,6 +452,11 @@ impl SessionRepo for JsonlSessionRepo {
         let orig_header: SessionHeader = serde_json::from_str(lines[0])?;
 
         let new_path = self.session_file_path(cwd);
+        // The target cwd's session dir may not exist yet (first fork into
+        // a fresh directory) — `File::create` below would fail with ENOENT.
+        if let Some(parent) = new_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         match mode {
             ForkMode::FullTree => {
@@ -551,12 +559,11 @@ impl JsonlSessionRepo {
         Ok(dirs)
     }
 
-    /// Synchronously list all session metadata, optionally filtered by CWD.
-    /// Mirrors the async `SessionRepo::list` but uses std::fs for direct use
-    /// in the overlay (avoiding async machinery on each keystroke).
-    ///
-    /// Uses a 2-second debounced cache validated by directory + file mtimes.
-    /// Within the debounce window, returns cached results with zero I/O.
+    /// Test-support sync listing (optionally filtered by CWD). Production
+    /// eval uses [`Self::list_sessions_overlay`] — the same
+    /// 2-second-debounced, mtime-validated cache — so tests and prod see
+    /// identical results.
+    #[cfg(test)]
     pub(crate) fn list_sessions_sync(&self, cwd: Option<&Path>) -> Vec<SessionMetadata> {
         // Resolve directories to scan.
         let dirs: Vec<PathBuf> = if let Some(cwd) = cwd {
@@ -648,6 +655,113 @@ impl JsonlSessionRepo {
             );
         }
 
+        cache.get_sessions(&dirs)
+    }
+
+    /// Async overlay listing for the eval path: consults the shared
+    /// 2-second-debounced cache first (warm = zero IO, pure memory); a
+    /// stale cache triggers a `tokio::fs` scan so the eval task never
+    /// blocks a runtime worker on std::fs. Mirrors `list_sessions_sync`
+    /// semantics (per-file mtime reuse). The cache lock is never held
+    /// across an await (lock rule 3).
+    pub async fn list_sessions_overlay(&self, cwd: Option<&Path>) -> Vec<SessionMetadata> {
+        // Resolve directories (async).
+        let dirs: Vec<PathBuf> = if let Some(cwd) = cwd {
+            let dir = self.session_dir(cwd);
+            if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+                vec![dir]
+            } else {
+                return Vec::new();
+            }
+        } else {
+            let mut dirs = Vec::new();
+            if let Ok(mut read_dir) = tokio::fs::read_dir(&self.base_dir).await {
+                while let Ok(Some(entry)) = read_dir.next_entry().await {
+                    let path = entry.path();
+                    if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                        dirs.push(path);
+                    }
+                }
+            }
+            dirs
+        };
+        if dirs.is_empty() {
+            return Vec::new();
+        }
+
+        // Debounce fast path — cached, zero IO.
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(ref cache) = *cache {
+                if cache.last_validated_at.elapsed() < Duration::from_secs(2) {
+                    return cache.get_sessions(&dirs);
+                }
+            }
+        }
+
+        // Snapshot prior per-dir state for mtime-based reuse (short lock).
+        let prior: HashMap<PathBuf, CachedDir> = {
+            let cache = self.cache.lock().unwrap();
+            cache
+                .as_ref()
+                .map(|c| c.dirs.clone())
+                .unwrap_or_default()
+        };
+
+        // Async scan — one tokio::fs pass per directory.
+        let mut scanned: HashMap<PathBuf, CachedDir> = HashMap::new();
+        for dir in &dirs {
+            let mut sessions = Vec::new();
+            let mut file_mtimes: HashMap<PathBuf, SystemTime> = HashMap::new();
+            if let Ok(mut read_dir) = tokio::fs::read_dir(dir).await {
+                while let Ok(Some(entry)) = read_dir.next_entry().await {
+                    let path = entry.path();
+                    if !path.extension().map_or(false, |e| e == "jsonl") {
+                        continue;
+                    }
+                    let file_mtime =
+                        entry.metadata().await.ok().and_then(|m| m.modified().ok());
+
+                    // Reuse cached metadata when the file mtime is unchanged.
+                    if let Some(file_mt) = file_mtime {
+                        let hit = prior.get(dir).and_then(|c| {
+                            if c.file_mtimes.get(&path) == Some(&file_mt) {
+                                c.sessions.iter().find(|s| s.path == path).cloned()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(old) = hit {
+                            sessions.push(old);
+                            file_mtimes.insert(path, file_mt);
+                            continue;
+                        }
+                    }
+
+                    // Cache miss or changed file: re-read metadata.
+                    if let Some(meta) = Self::read_metadata(&path).await {
+                        if let Some(mt) = file_mtime {
+                            file_mtimes.insert(path, mt);
+                        }
+                        sessions.push(meta);
+                    }
+                }
+            }
+            sessions.sort_by(|a, b| {
+                let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
+                let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
+                b_ts.cmp(a_ts)
+            });
+            scanned.insert(dir.clone(), CachedDir { file_mtimes, sessions });
+        }
+
+        // Store + return (short lock).
+        let mut cache_guard = self.cache.lock().unwrap();
+        let cache: &mut SessionMetaCache = cache_guard.get_or_insert_with(SessionMetaCache::new);
+        cache.last_validated_at = Instant::now();
+        for (dir, cd) in scanned {
+            cache.dirs.insert(dir, cd);
+        }
         cache.get_sessions(&dirs)
     }
 }

@@ -8,3 +8,7 @@ description = "Data-driven slash-menu engine: descriptors, path grammar, filter/
 [dependencies]
 fuzzy-matcher = "0.3"
 unicode-width = "0.1"
+async-trait = "0.1"
+
+[dev-dependencies]
+futures = "0.3"

@@ -18,7 +18,7 @@ mod tests {
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does:
         // tests observe frames, never half-completed rewrites.
-        h.eval_prompt_resolved(prompt, key, 80)
+        futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
 
     // -----------------------------------------------------------------------
@@ -26,12 +26,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     struct ThinkingEnumNode {
-        shared: Rc<RefCell<Option<String>>>,
+        app_state: Rc<RefCell<Option<String>>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ThinkingEnumNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            let current = self.shared.borrow();
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            let current = self.app_state.borrow();
             let active = current.as_deref().unwrap_or("off").to_string();
             let rows = ["off", "low", "med", "high"].iter()
                 .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
@@ -42,9 +43,9 @@ mod tests {
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             let level = path_args.ids.last().cloned().unwrap_or_default();
-            *self.shared.borrow_mut() = Some(level);
+            *self.app_state.borrow_mut() = Some(level);
             SubmitResult::Done(None)
         }
     }
@@ -59,7 +60,7 @@ mod tests {
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "set thinking level"),
         ]).into();
-        tl.add_child(ThinkingEnumNode { shared: state.clone() }.into());
+        tl.add_child(ThinkingEnumNode { app_state: state.clone() }.into());
         root.add_child(tl);
         SlashDotMenu::from_root_node(root)
     }
@@ -290,17 +291,18 @@ mod persona_tests {
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does.
-        h.eval_prompt_resolved(prompt, key, 80)
+        futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
 
     /// Single node returning all persona rows + "none".
     struct PersonaEnumNode {
-        shared: Rc<RefCell<Option<String>>>,
+        app_state: Rc<RefCell<Option<String>>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for PersonaEnumNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-            let current = self.shared.borrow();
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            let current = self.app_state.borrow();
             let names = ["architect", "strict", "security", "none"];
             let mut rows = Vec::new();
             let mut active_ids = Vec::new();
@@ -318,10 +320,10 @@ mod persona_tests {
             Ok(Rc::new(DataResponse { rows, active_ids }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             let name = path_args.ids.last().cloned().unwrap_or_default();
             let val = if name == "none" { None } else { Some(name) };
-            *self.shared.borrow_mut() = val;
+            *self.app_state.borrow_mut() = val;
             SubmitResult::Done(None)
         }
     }
@@ -332,7 +334,7 @@ mod persona_tests {
         let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
         ]).into();
-        pl.add_child(PersonaEnumNode { shared: state.clone() }.into());
+        pl.add_child(PersonaEnumNode { app_state: state.clone() }.into());
         root.add_child(pl);
         SlashDotMenu::from_root_node(root)
     }

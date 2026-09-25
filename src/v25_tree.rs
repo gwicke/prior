@@ -5,12 +5,13 @@
 //! body and the static action children (switch, compact) are shown.
 //!
 //! `TreeSwitchNode`: leaf node that moves the session leaf pointer to
-//! the selected entry via `AsyncOp::TreeSwitch`.
+//! the selected entry via the `tree_switch` control target.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::slash_menu_bridge::{AsyncOp, CompactMode, MenuShared};
+use crate::app_state::{CompactMode, AppState};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
@@ -561,19 +562,19 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
 /// `header()` renders the full message body and the static action children
 /// are shown.
 pub struct TreeListNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
     /// Cached data response — reused via Rc::ptr_eq when the tree hasn't
     /// changed.
     cached_data: Option<Rc<DataResponse>>,
-    /// The Rc we last built rows from (for freshness check).
-    cached_tree_rc: Option<Rc<Vec<SessionTreeNode>>>,
+    /// The Arc we last built rows from (for freshness check).
+    cached_tree_rc: Option<Arc<Vec<SessionTreeNode>>>,
     cached_leaf_id: Option<String>,
 }
 
 impl TreeListNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
+    pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            shared,
+            app_state,
             cached_data: None,
             cached_tree_rc: None,
             cached_leaf_id: None,
@@ -587,17 +588,18 @@ impl TreeListNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeListNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        // Read the shared tree (Rc — O(1) clone, no deep copy).
-        let tree_rc = self.shared.raw_tree.borrow().clone();
-        let leaf = self.shared.leaf_id.borrow().clone();
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        // Read the app_state tree (Arc — O(1) clone, no deep copy).
+        let tree_rc = self.app_state.raw_tree();
+        let leaf = self.app_state.leaf_id();
 
-        // Freshness check: same Rc pointer + same leaf = cached data is valid.
+        // Freshness check: same Arc pointer + same leaf = cached data is valid.
         let same_tree = self
             .cached_tree_rc
             .as_ref()
-            .map_or(false, |old| Rc::ptr_eq(old, &tree_rc));
+            .map_or(false, |old| Arc::ptr_eq(old, &tree_rc));
         let same_leaf = self.cached_leaf_id == leaf;
 
         if same_tree && same_leaf {
@@ -683,7 +685,7 @@ impl SlashDotNode for TreeListNode {
         tree_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(entry_id) = Self::drilled_entry_id(path_args) else {
             return vec!["Select a tree entry, then choose an action.".to_string()];
         };
@@ -691,7 +693,7 @@ impl SlashDotNode for TreeListNode {
         // Refresh the cache (cheap Rc::ptr_eq when unchanged) and render
         // from the row — the same data the listing and fuzzy search use
         // (design: "header() → entry detail from the same cached row data").
-        let Ok(resp) = self.data(0, path_args) else {
+        let Ok(resp) = self.data(0, path_args).await else {
             return vec![format!("Entry not found: {}", entry_id)];
         };
         let Some(row) = resp.rows.iter().find(|r| r.id == entry_id) else {
@@ -736,11 +738,12 @@ impl SlashDotNode for TreeListNode {
 
 /// Leaf node: moves the session leaf pointer to the selected entry.
 pub struct TreeSwitchNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeSwitchNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("switch")
                 .desc("continue from this entry")],
@@ -748,7 +751,7 @@ impl SlashDotNode for TreeSwitchNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -759,7 +762,7 @@ impl SlashDotNode for TreeSwitchNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         // In the action node's own context, the path is
         // ["tree", "<entry-id>", "switch"]. The entry ID is the
         // second-to-last element (matching SessionResumeNode's pattern).
@@ -771,8 +774,15 @@ impl SlashDotNode for TreeSwitchNode {
                 String::new()
             }
         };
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeSwitch { target_id });
+        // Data-plane inline: move the leaf directly — the session is
+        // reachable via the slot. No session → nothing to move (same as
+        // the old applier's silent no-op).
+        if let Some(s) = self.app_state.session() {
+            let old_leaf_id = s.get_leaf_id().await;
+            if old_leaf_id.as_deref() != Some(target_id.as_str()) {
+                let _ = s.move_leaf(Some(target_id.clone())).await;
+            }
+        }
         SubmitResult::Done(None)
     }
 }
@@ -785,18 +795,19 @@ impl SlashDotNode for TreeSwitchNode {
 /// session leaf (message ID) and redirects to `/tree <id> compact `
 /// so the compact modes are listed.
 pub struct CompactNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for CompactNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("compact").desc("summarize conversation up to the current point")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -807,15 +818,15 @@ impl SlashDotNode for CompactNode {
         ]
     }
 
-    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // Look up the current session leaf ID and redirect.
-        let leaf_id = self.shared.leaf_id.borrow().clone()?;
+        let leaf_id = self.app_state.leaf_id()?;
         Some(format!("tree {} compact ", leaf_id))
     }
 
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         // Enter (without drill) should also redirect — treat as drill.
-        match self.shared.leaf_id.borrow().clone() {
+        match self.app_state.leaf_id() {
             Some(leaf_id) => SubmitResult::NewPath(format!("tree {} compact ", leaf_id)),
             None => SubmitResult::Done(Some("No active session leaf to compact.".to_string())),
         }
@@ -827,28 +838,29 @@ impl SlashDotNode for CompactNode {
 // ---------------------------------------------------------------------------
 
 /// Leaf node: compact with manual (touched-files) mode.
-/// `prepare()` opens $EDITOR with a template; `submit()` dispatches
-/// `AsyncOp::TreeCompact { mode: Manual }`.
+/// `prepare()` opens $EDITOR with a template; `submit()` writes the
+/// `tree_compact` control target (`mode: Manual`).
 pub struct TreeCompactManualNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactManualNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared, edited: std::cell::RefCell::new(None) }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state, edited: std::cell::RefCell::new(None) }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactManualNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("manual").desc("user-editable file list")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -864,12 +876,22 @@ impl SlashDotNode for TreeCompactManualNode {
     // then return Prepared → confirm → submit. Requires session access
     // to compute drafts, which the node doesn't have.
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Manual, payload: draft });
-        SubmitResult::Done(None)
+        // Data-plane inline: session/agent/guard/output are all reachable
+        // via the slot; errors come back as the stay-open message.
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::Manual,
+            &draft,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -879,27 +901,28 @@ impl SlashDotNode for TreeCompactManualNode {
 
 /// Leaf node: compact with text-only mode.
 /// `prepare()` opens $EDITOR with extracted conversation text; `submit()`
-/// dispatches `AsyncOp::TreeCompact { mode: TextOnly }`.
+/// writes the `tree_compact` control target (`mode: TextOnly`).
 pub struct TreeCompactTextNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactTextNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared, edited: std::cell::RefCell::new(None) }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state, edited: std::cell::RefCell::new(None) }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactTextNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("text-only").desc("extracted conversation text")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -910,12 +933,20 @@ impl SlashDotNode for TreeCompactTextNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::TextOnly, payload: draft });
-        SubmitResult::Done(None)
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::TextOnly,
+            &draft,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -925,27 +956,28 @@ impl SlashDotNode for TreeCompactTextNode {
 
 /// Leaf node: compact with LLM prompt mode.
 /// `submit()` reads the custom prompt from `path_args.suffix` and
-/// dispatches `AsyncOp::TreeCompact { mode: Prompt, payload: suffix }`.
-/// The LLM call happens in the agent loop handler.
+/// writes the `tree_compact` control target (`mode: Prompt`).
+/// The LLM call happens in the agent loop's applier.
 pub struct TreeCompactPromptNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
 impl TreeCompactPromptNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactPromptNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("prompt").desc("LLM-generated summary")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let prompt = &path_args.suffix;
         if prompt.is_empty() {
             vec![
@@ -960,18 +992,26 @@ impl SlashDotNode for TreeCompactPromptNode {
         }
     }
 
-    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the default compaction prompt.
         // ids are ["tree", "<id>", "compact", "prompt"].
         Some(path_args.prompt_with("Summarize the conversation up to this point."))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let prompt = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Prompt, payload: prompt });
-        SubmitResult::Done(None)
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::Prompt,
+            &prompt,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -997,7 +1037,7 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
 pub fn build_tree_node(
-    shared: &Rc<MenuShared>,
+    app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
     use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
@@ -1011,9 +1051,9 @@ pub fn build_tree_node(
     .into();
 
     let mut tree_node: SlashDotMenuNode =
-        TreeListNode::new(shared.clone()).into();
+        TreeListNode::new(app_state.clone()).into();
     tree_node.add_child(TreeSwitchNode {
-        shared: shared.clone(),
+        app_state: app_state.clone(),
     }
     .into());
 
@@ -1023,9 +1063,9 @@ pub fn build_tree_node(
         "summarize entries before this point",
     )])
     .into();
-    compact_node.add_child(TreeCompactManualNode::new(shared.clone()).into());
-    compact_node.add_child(TreeCompactTextNode::new(shared.clone()).into());
-    compact_node.add_child(TreeCompactPromptNode::new(shared.clone()).into());
+    compact_node.add_child(TreeCompactManualNode::new(app_state.clone()).into());
+    compact_node.add_child(TreeCompactTextNode::new(app_state.clone()).into());
+    compact_node.add_child(TreeCompactPromptNode::new(app_state.clone()).into());
 
     tree_node.add_child(compact_node);
 
@@ -1040,7 +1080,6 @@ pub fn build_tree_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
         MenuResult, PathArgs, StaticListingNode,
@@ -1063,8 +1102,9 @@ mod tests {
         }
     }
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(test_settings(), None))
+    /// Fresh app state for tests (binding kept as `app_state` in tests below).
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
     }
 
     fn make_entry(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
@@ -1089,16 +1129,16 @@ mod tests {
         }
     }
 
-    /// Build a shared with a pre-populated tree.
-    fn shared_with_tree(tree: Vec<SessionTreeNode>) -> Rc<MenuShared> {
-        let shared = make_shared();
-        *shared.raw_tree.borrow_mut() = Rc::new(tree);
-        shared
+    /// Build app state with a pre-populated tree.
+    fn app_state_with_tree(tree: Vec<SessionTreeNode>) -> Arc<AppState> {
+        let app_state = test_app_state();
+        app_state.set_raw_tree(Arc::new(tree));
+        app_state
     }
 
-    fn build_tree_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_tree_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_tree_node(shared));
+        root.add_child(build_tree_node(app_state));
         SlashDotMenu::from_root_node(root)
     }
 
@@ -1106,10 +1146,10 @@ mod tests {
 
     #[test]
     fn empty_tree_shows_empty_listing() {
-        let shared = make_shared();
-        let mut menu = build_tree_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.rows.is_empty(), "empty tree → empty listing");
@@ -1132,10 +1172,10 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2, "should have user + assistant rows");
@@ -1175,27 +1215,27 @@ mod tests {
                 node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
             ],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Filtered leaf overview: u1 is a branch parent (no `tags`
         //    field → dropped); only u2/u3 survive.
         let (plan, prompt) =
-            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80)));
         assert_eq!(plan.rows.len(), 2, "filter must show only leaves: {:?}", plan.rows);
         assert_eq!(prompt, "tree .tags:leaf");
 
         // 2. Cursor to the second leaf, Tab drills into it.
-        let _ = handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80);
+        let _ = futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80));
         let (_, prompt) =
-            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80)));
         assert_eq!(prompt, "tree u3 ", "drill appends cursored id + space");
 
         // 3. Esc drills out: §5.1 step 1 restores the stored filter in
         //    the prompt (not a bare id) with the cursor back on u3.
         let (plan, prompt) =
-            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80)));
         assert_eq!(prompt, "tree .tags:leaf",
             "Esc must restore the filter view_args into the prompt");
         assert_eq!(plan.rows.len(), 2,
@@ -1207,7 +1247,7 @@ mod tests {
         // 4. A cursor move after the restore stays in the filtered
         //    view (the bug: it fell back to the full listing).
         let (plan, _) =
-            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80)));
         assert_eq!(plan.rows.len(), 2,
             "filtered view must survive cursor moves: {:?}", plan.rows);
     }
@@ -1220,8 +1260,8 @@ mod tests {
             make_entry("u1", None, "user", "test"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec![],
@@ -1229,8 +1269,8 @@ mod tests {
             args: Default::default(),
         };
 
-        let r1 = tree_node.data(1, &path_args).unwrap();
-        let r2 = tree_node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
+        let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         assert!(Rc::ptr_eq(&r1, &r2),
             "same tree + same leaf should return same Rc");
     }
@@ -1241,8 +1281,8 @@ mod tests {
             make_entry("u1", None, "user", "test"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec![],
@@ -1250,16 +1290,16 @@ mod tests {
             args: Default::default(),
         };
 
-        let r1 = tree_node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
 
         // Change the tree.
         let new_tree = vec![
             node(make_entry("u1", None, "user", "test"), vec![]),
             node(make_entry("u2", None, "user", "new entry"), vec![]),
         ];
-        *shared.raw_tree.borrow_mut() = Rc::new(new_tree);
+        app_state.set_raw_tree(Arc::new(new_tree));
 
-        let r2 = tree_node.data(1, &path_args).unwrap();
+        let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         assert!(!Rc::ptr_eq(&r1, &r2),
             "changed tree should return new Rc");
         assert_eq!(r2.rows.len(), 2, "new tree has two entries");
@@ -1273,8 +1313,8 @@ mod tests {
             make_entry("u1", None, "user", "hello\nworld"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into()],
@@ -1283,9 +1323,9 @@ mod tests {
         };
 
         // Trigger data() first to populate the cache.
-        let _ = tree_node.data(0, &path_args);
+        let _ = futures::executor::block_on(tree_node.data(0, &path_args));
 
-        let header = tree_node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(tree_node.header(&path_args, &RenderContext { term_width: 80 }));
         let joined = header.join("\n");
         assert!(joined.contains("hello"), "header should contain message text: {}", joined);
         assert!(joined.contains("world"), "header should contain full text: {}", joined);
@@ -1315,9 +1355,9 @@ mod tests {
             make_entry("u1", None, "user", "hello\nworld"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let row = resp
             .rows
             .iter()
@@ -1342,9 +1382,9 @@ mod tests {
                 node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
             ],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
@@ -1371,9 +1411,9 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
@@ -1402,11 +1442,11 @@ mod tests {
             make_entry("u1", None, "user", "kept context line"),
             vec![node(compaction, vec![])],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         // Desc carries the truncated "from" context AND the summary.
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let row = resp.rows.iter().find(|r| r.id == "c1").expect("c1 row");
         let desc = row.description.clone().unwrap_or_default();
         assert!(desc.contains("[COMPACT] from kept context line"),
@@ -1416,8 +1456,8 @@ mod tests {
 
         // Header renders from that row: marker with timestamp, then
         // from-context, then summary.
-        let header = tree_node.header(&tree_path(&["tree", "c1"]),
-            &RenderContext { term_width: 120 });
+        let header = futures::executor::block_on(tree_node.header(&tree_path(&["tree", "c1"]),
+            &RenderContext { term_width: 120 }));
         let joined = header.join("\n");
         assert!(joined.contains("[COMPACT 2025-01-02"),
             "header timestamped marker: {}", joined);
@@ -1430,23 +1470,29 @@ mod tests {
     // --- Switch ---
 
     #[test]
-    fn tree_switch_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut tree_node = TreeSwitchNode { shared: shared.clone() };
+    fn tree_switch_submit_moves_leaf() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "some-entry",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
+        let mut tree_node = TreeSwitchNode { app_state: app_state.clone() };
         // Action node path: ["tree", "<entry-id>", "switch"]
         let path_args = PathArgs {
             ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = tree_node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeSwitch { target_id }) => {
-                assert_eq!(target_id, "some-entry");
-            }
-            other => panic!("expected TreeSwitch, got {:?}", other),
-        }
+        let _ = futures::executor::block_on(tree_node.submit(1, &path_args));
+        let leaf = futures::executor::block_on(session.get_leaf_id());
+        assert_eq!(
+            leaf.as_deref(),
+            Some("some-entry"),
+            "submit must move the session leaf directly"
+        );
     }
 
     // --- Full traversal ---
@@ -1462,12 +1508,19 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "first message",
+        )]);
+        app_state.set_session(Some(session.clone()));
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Listing shows entries.
-        let listing = handle.eval_prompt("tree ", HostKey::None, 80);
+        let listing = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match &listing {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.rows.is_empty(), "tree listing should have rows");
@@ -1476,22 +1529,21 @@ mod tests {
         }
 
         // 2. Drill into u1.
-        let r = handle.eval_prompt("tree u1 ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into entry");
 
         // 3. Drill into switch.
-        let r = handle.eval_prompt("tree u1 switch ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into switch");
 
         // 4. Enter → submit.
-        let _ = handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeSwitch { target_id }) => {
-                assert_eq!(target_id, "u1", "switch op must carry the entry ID");
-            }
-            other => panic!("expected TreeSwitch, got {:?}", other),
-        }
+        let _ = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
+        let leaf = futures::executor::block_on(session.get_leaf_id());
+        assert_eq!(
+            leaf.as_deref(),
+            Some("u1"),
+            "switch must move the session leaf to the entry ID"
+        );
     }
 
     // --- Label rendering ---
@@ -1511,10 +1563,10 @@ mod tests {
             children: vec![],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 1);
@@ -1545,10 +1597,10 @@ mod tests {
             children: vec![],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.rows.is_empty(),
@@ -1565,15 +1617,15 @@ mod tests {
             node(make_entry("u1", None, "user", "first"), vec![]),
             node(make_entry("u2", None, "user", "second"), vec![]),
         ];
-        let shared = shared_with_tree(tree);
-        *shared.leaf_id.borrow_mut() = Some("u2".into());
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(Some("u2".into()));
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
             "active_ids should contain the leaf entry");
     }
@@ -1593,15 +1645,15 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        *shared.leaf_id.borrow_mut() = Some("u2".into());
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(Some("u2".into()));
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
             "active_ids should find leaf deep in tree");
     }
@@ -1609,89 +1661,107 @@ mod tests {
     // --- Compact: mode submit tests ---
 
     #[test]
-    fn compact_manual_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactManualNode::new(shared.clone());
+    fn compact_manual_submit_appends_compaction() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = TreeCompactManualNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Manual);
-                assert!(payload.is_empty(), "manual draft is empty by default");
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "manual compact must append a Compaction entry");
     }
 
     #[test]
-    fn compact_text_only_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactTextNode::new(shared.clone());
+    fn compact_text_only_submit_appends_compaction() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = TreeCompactTextNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::TextOnly);
-                assert!(payload.is_empty());
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "text-only compact must append a Compaction entry");
     }
 
     #[test]
-    fn compact_prompt_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+    fn compact_prompt_unknown_entry_errors() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "other",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session));
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: "summarize the key decisions".into(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Prompt);
-                assert_eq!(payload, "summarize the key decisions");
+        // Guarded before any agent/LLM work: unknown target stays open
+        // with the message (the Llm path itself needs a live model).
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("unknown tree entry"), "msg: {msg}")
             }
-            other => panic!("expected TreeCompact, got {:?}", other),
+            other => panic!("expected stay-open unknown-entry error, got {:?}", std::mem::discriminant(&other)),
         }
     }
 
     #[test]
-    fn compact_prompt_empty_suffix_uses_default() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+    fn compact_prompt_without_session_reports_error() {
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { payload, mode, .. }) => {
-                assert_eq!(*mode, CompactMode::Prompt);
-                assert!(payload.is_empty(), "empty suffix = empty payload");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("no active session"), "msg: {msg}")
             }
-            other => panic!("expected TreeCompact, got {:?}", other),
+            other => panic!("expected stay-open no-session error, got {:?}", std::mem::discriminant(&other)),
         }
     }
 
@@ -1708,78 +1778,89 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "first message",
+        )]);
+        app_state.set_session(Some(session.clone()));
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Listing.
-        let listing = handle.eval_prompt("tree ", HostKey::None, 80);
+        let listing = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         assert!(matches!(listing, MenuResult::Continue(_, _)));
 
         // 2. Drill into u1.
-        let r = handle.eval_prompt("tree u1 ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 3. Drill into compact.
-        let r = handle.eval_prompt("tree u1 compact ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 4. Drill into manual.
-        let r = handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
-        // 5. Enter → submit.
-        let _ = handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, .. }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Manual);
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        // 5. Enter → submit (inline compact drives session IO — tokio
+        // driver; review is None without a term guard → non-interactive
+        // append).
+        let _ = crate::agent::block_on_test(handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80));
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "traversal must end in an appended Compaction");
     }
 
     // --- Compact: header tests ---
 
     #[test]
     fn compact_manual_header_shows_description() {
-        let shared = make_shared();
-        let mut node = TreeCompactManualNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactManualNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(!header.is_empty());
         assert!(header[0].contains("Manual"), "header mentions manual: {}", header[0]);
     }
 
     #[test]
     fn compact_prompt_header_shows_prompt_when_present() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: "my custom prompt".into(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(header.iter().any(|l| l.contains("my custom prompt")),
             "header should contain the prompt text: {:?}", header);
     }
 
     #[test]
     fn compact_prompt_header_shows_default_when_empty() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(header.iter().any(|l| l.contains("default")),
             "header should mention default: {:?}", header);
     }
@@ -1809,14 +1890,14 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.rows.len(), 6, "should have 6 visible entries");
 
         let mut flat = Vec::new();
@@ -1854,10 +1935,10 @@ mod tests {
                 vec![],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
@@ -1894,10 +1975,10 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 6);
@@ -1967,14 +2048,14 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec!["tree".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         eprintln!("=== DataResponse rows ===");
         for (i, row) in resp.rows.iter().enumerate() {
             let desc = row.description.clone().unwrap_or_default();
@@ -2051,10 +2132,10 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // Print for debugging
@@ -2115,14 +2196,14 @@ mod tests {
                 }],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
 
         let mut flat = Vec::new();
         for row in resp.rows.iter() {
@@ -2238,14 +2319,14 @@ mod tests {
             ],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         // Only 2 visible rows: user + assistant
         assert_eq!(resp.rows.len(), 2, "should have 2 visible entries");
         let u1_desc = resp.rows[0].description.clone().unwrap_or_default();
@@ -2260,31 +2341,31 @@ mod tests {
 
     #[test]
     fn compact_node_drill_rewrite_redirects_to_tree() {
-        let shared = make_shared();
-        *shared.leaf_id.borrow_mut() = Some("msg-42".into());
-        let mut node = CompactNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_leaf_id(Some("msg-42".into()));
+        let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
     }
 
     #[test]
     fn compact_node_no_leaf_returns_none() {
-        let shared = make_shared();
+        let app_state = test_app_state();
         // leaf_id is None (no session).
-        let mut node = CompactNode { shared: shared.clone() };
+        let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, None);
     }
 
     #[test]
     fn compact_prompt_drill_rewrite_fills_default() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path = vec!["tree".to_string(), "msg-1".to_string(),
                         "compact".to_string(), "prompt".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some(
             "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
         ));

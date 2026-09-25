@@ -1,11 +1,13 @@
 //! v2.5 `SlashDotNode` implementations for `/persona`.
 //!
 //! A single `PersonaEnumNode` returns all persona names + "none" from
-//! `data()`. Active marker from `LiveState.persona` (transient session
-//! state), write on submit. `/set default_persona` will use a separate
-//! node that reads/writes `SettingsStore`.
+//! `data()`. Active marker from the target config's persona (runtime
+//! target in `AppState`), write on submit. `/set default_persona` uses a
+//! separate node that reads/writes the `SettingsStore`.
+use std::sync::Arc;
 
-use std::cell::RefCell;
+use crate::app_state::AppState;
+
 use std::rc::Rc;
 
 use crate::slashdot_menu::node_impl::{
@@ -24,8 +26,9 @@ pub struct PersonaEnumNode {
     pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for PersonaEnumNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let current = (self.active_fn)().unwrap_or_default();
         let mut rows = Vec::new();
         let mut active_ids = Vec::new();
@@ -43,7 +46,7 @@ impl SlashDotNode for PersonaEnumNode {
         Ok(Rc::new(DataResponse { rows, active_ids }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.ids.last().cloned().unwrap_or_default();
         match (self.submit_fn)(&name) {
             Ok(()) => SubmitResult::Done(None),
@@ -57,17 +60,14 @@ impl SlashDotNode for PersonaEnumNode {
 // ---------------------------------------------------------------------------
 
 /// Add `/persona` child to a listing `SlashDotMenuNode`.
-pub fn add_persona_child(
-    listing: &mut SlashDotMenuNode,
-    live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
-) {
-    let ls = live_state.clone();
-    let ls2 = live_state.clone();
+pub fn add_persona_child(listing: &mut SlashDotMenuNode, app_state: &Arc<AppState>) {
+    let reader = app_state.clone();
+    let writer = app_state.clone();
     listing.add_child(PersonaEnumNode {
-        active_fn: Box::new(move || ls.borrow().persona.clone()),
+        active_fn: Box::new(move || reader.persona()),
         submit_fn: Box::new(move |name| {
             let val = if name == "none" { None } else { Some(name.to_string()) };
-            ls2.borrow_mut().persona = val;
+            writer.set_persona(val);
             Ok(())
         }),
     }.into());
@@ -76,12 +76,12 @@ pub fn add_persona_child(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
+    use crate::app_state::AppState;
     use crate::slashdot_menu::menu::SlashDotMenu;
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
     use crate::slashdot_menu::HostKey;
 
-    fn test_shared() -> Rc<MenuShared> {
+    fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -94,17 +94,17 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        Rc::new(MenuShared::new(settings, None))
+        crate::app_state::AppState::for_test(settings)
     }
 
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
-    /// "persona" → `PersonaEnumNode` bound to `LiveState`.
-    fn build_persona_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    /// "persona" → `PersonaEnumNode` bound to the target config.
+    fn build_persona_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
         ])
         .into();
-        add_persona_child(&mut pl, &shared.live_state);
+        add_persona_child(&mut pl, app_state);
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(pl);
         SlashDotMenu::from_root_node(root)
@@ -113,10 +113,10 @@ mod tests {
     /// Root listing shows the `persona` command row.
     #[test]
     fn persona_root_row_present() {
-        let shared = test_shared();
-        let mut menu = build_persona_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_persona_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
                 assert!(
@@ -128,16 +128,16 @@ mod tests {
         }
     }
 
-    /// Tab selects a row (persona name or "none"), Enter commits it to
-    /// `LiveState.persona` (`none` → None).
+    /// Tab selects a row (persona name or "none"), Enter commits it to the
+    /// target config's persona (`none` → None).
     #[test]
-    fn persona_submit_sets_live_state() {
-        let shared = test_shared();
+    fn persona_submit_sets_target_config() {
+        let app_state = test_app_state();
         // Pre-set a persona that is not a row, so any selection is observable.
-        shared.live_state.borrow_mut().persona = Some("definitely-not-a-persona".into());
-        let mut menu = build_persona_menu(&shared);
+        app_state.set_persona(Some("definitely-not-a-persona".into()));
+        let mut menu = build_persona_menu(&app_state);
         let mut h = menu.get_handle();
-        let prompt = match h.eval_prompt_resolved("persona ", HostKey::Tab, 80) {
+        let prompt = match futures::executor::block_on(h.eval_prompt_resolved("persona ", HostKey::Tab, 80)) {
             MenuResult::Continue(_, prompt) => prompt,
             other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
         };
@@ -146,11 +146,11 @@ mod tests {
             .last()
             .expect("Tab should append the selected persona row")
             .to_string();
-        match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+        match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
         }
         let expect = if sel == "none" { None } else { Some(sel) };
-        assert_eq!(shared.live_state.borrow().persona, expect);
+        assert_eq!(app_state.persona(), expect);
     }
 }

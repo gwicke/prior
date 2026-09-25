@@ -188,13 +188,14 @@ pub enum MenuResult {
 ///
 /// All methods have default implementations (no-op / empty). Override only
 /// what the node needs.
+#[async_trait::async_trait(?Send)]
 pub trait SlashDotNode {
     /// The rows this node contributes to its parent's listing.  *All* leaf
     /// nodes need to implement this, and should return one or more rows with an `id` and
     /// `description`. 
     /// Handled automatically for `StaticListingNode`, so higher levels of the hierarchy which have
     /// leaf nodes as children.
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(std::rc::Rc::new(DataResponse {
             rows: Vec::new(),
             active_ids: Vec::new(),
@@ -203,7 +204,7 @@ pub trait SlashDotNode {
 
     /// The leaf accept behavior. Called on Enter when this node is the
     /// selected leaf. Default: `Done(None)`.
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         SubmitResult::Done(None)
     }
 
@@ -216,14 +217,14 @@ pub trait SlashDotNode {
     /// Override **only** for genuine two-phase workflows (commit/prepare →
     /// edit/accept, or confirm dialogs).  Do **not** override just to
     /// show a header — use `header()` for that.
-    fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        self.submit(epoch, path_args)
+    async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        self.submit(epoch, path_args).await
     }
 
     /// Non-selectable header lines (replaces v2 DetailProvider).
     /// Default: empty. The engine truncates based on terminal size.
     /// `render_ctx` carries display metrics (terminal width) for layout.
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -242,7 +243,7 @@ pub trait SlashDotNode {
     /// `Rc` until the response changes — the engine skips its view
     /// re-derive on `Rc::ptr_eq`. Default: empty (the common case;
     /// every node is called on every passive frame).
-    fn complete_parameter(
+    async fn complete_parameter(
         &mut self,
         _args: &PathArgs,
         _cursor_pos: usize,
@@ -280,10 +281,10 @@ pub trait SlashDotNode {
     /// build the rewritten prompt from `path_args.ids`.
     ///
     /// `&mut self` provides full access to shared state (e.g.
-    /// `MenuShared` for session tree queries, settings for pre-fills).
+    /// `AppState` for session tree queries, settings for pre-fills).
     ///
     /// **Default:** `None` — no rewrite.
-    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         None
     }
 }
@@ -403,8 +404,9 @@ impl StaticListingNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for StaticListingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let rows: Vec<Row> = self
             .rows
             .iter()
@@ -417,7 +419,7 @@ impl SlashDotNode for StaticListingNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,

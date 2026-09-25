@@ -1,23 +1,25 @@
-//! `AppShared` / `AppState` — the single source of truth for menu-visible
+//! `AppState` / `State` — the single source of truth for menu-visible
 //! application state (design: `doc/slashdot/state_and_async.md`, "Context
 //! shape (decided): A″").
 //!
 //! This replaces `MenuShared` + `LiveState` + the pre-eval snapshot copies:
-//! one coarse `parking_lot::Mutex<AppState>` behind one `Arc`, injected into
-//! node instances. Nodes hold `Arc<AppShared>` (background tasks clone the
+//! one coarse `parking_lot::Mutex<State>` behind one `Arc`, injected into
+//! node instances. Nodes hold `Arc<AppState>` (background tasks clone the
 //! `Arc`); the engine never sees it.
 //!
 //! # Lock rules (review-enforced — see the design doc)
 //!
 //! 1. **Encapsulated handle only** — no public cells; all access goes through
 //!    the methods below. Otherwise this is `MenuShared` again.
-//! 2. **Lock once per public method** — private helpers take `&mut AppState`.
+//! 2. **Lock once per public method** — private helpers take `&mut State`.
 //!    The mutex is *not* re-entrant: an inner re-lock deadlocks.
 //! 3. **Never hold a guard across `.await`** — clone the handle/value out,
 //!    drop the guard, await, relock to write. (This module is sync-only for
 //!    that reason; async facades layer on top later.)
 //! 4. **Whole read-modify-write in one acquisition** — a lock fixes data
-//!    races, not lost updates split across critical sections.
+//!    races, not lost updates split across critical sections. No sync
+//!    file IO under the lock either: `set_setting` applies in-lock,
+//!    clones, and writes outside.
 //! 5. **Single source of truth** — no mirrors, no snapshots. `control` target
 //!    fields are written by eval, read + GC'd only by their sole consumer
 //!    (the loop's convergence step).
@@ -26,10 +28,10 @@
 //!
 //! # Target vs applied
 //!
-//! `AppState.config` is the **runtime target** (directives: what should be in
+//! `State.config` is the **runtime target** (directives: what should be in
 //! effect); the loop's local `AgentConfig` is the **applied** layer, converged
 //! to the target at the cycle point. The durable target is `SettingsStore`
-//! (written through [`AppShared::set_setting`], persisted by the store).
+//! (written through [`AppState::set_setting`], persisted by the store).
 //! The active `Session` object itself is the loop's applied layer; the menu
 //! sees [`SessionSlot`] (`repo` handle + current id) only.
 
@@ -37,9 +39,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::agent::SessionUsage;
+use crate::agent::{PicoAgent, SessionUsage};
 use crate::session::repo::JsonlSessionRepo;
-use crate::session::SessionTreeNode;
+use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
 use crate::AgentConfig;
 
@@ -48,26 +50,7 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-/// Replay request: `""`, `"5t"`, `"10l"` … — consumed by the loop's replay
-/// applier (needs the active session + output, both loop-owned).
-#[derive(Debug, Clone)]
-pub struct ReplayIntent {
-    pub arg: String,
-}
 
-/// Resume a session by id, optionally replaying the last N turns.
-#[derive(Debug, Clone)]
-pub struct ResumeIntent {
-    pub session_id: String,
-    pub replay_arg: String,
-}
-
-/// Rename a session (empty `new_name` clears the name).
-#[derive(Debug, Clone)]
-pub struct RenameIntent {
-    pub session_id: String,
-    pub new_name: String,
-}
 
 /// Compact mode for `tree_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,14 +63,6 @@ pub enum CompactMode {
     Prompt,
 }
 
-/// Compact the session at a given entry (LLM mode needs the agent — loop or
-/// agent-side consumption).
-#[derive(Debug, Clone)]
-pub struct TreeCompactIntent {
-    pub target_id: String,
-    pub mode: CompactMode,
-    pub payload: String,
-}
 
 /// Sandbox path-mapping mutation requested by the v2.5 `/sandbox` nodes.
 /// The applier owns the merge + re-publish (it owns the applied config).
@@ -109,35 +84,20 @@ pub enum SandboxOp {
 
 /// Declarative control targets: handlers write; each field's sole consumer
 /// (the loop's convergence step) applies at its application point. One-shot
-/// fields are taken (GC'd) by [`AppShared::take_control`]; `quit` latches and
+/// fields are taken (GC'd) by [`AppState::take_control`]; `quit` latches and
 /// is never cleared. Idempotent re-application is safe by design.
 #[derive(Debug, Clone, Default)]
 pub struct ControlConfig {
     /// Latching: the loop exits when it observes `true` (never cleared).
     pub quit: bool,
-    /// `/new` (and `/clear`): create a fresh session, optionally named.
-    pub new_session: Option<String>,
-    /// `/session <id> resume [replay]` — load + swap + prefill.
-    pub resume: Option<ResumeIntent>,
-    /// `/replay <arg>` — replay from the active session.
-    pub replay: Option<ReplayIntent>,
-    /// `/session <id> fork`.
-    pub fork: Option<String>,
-    /// `/session <id> rename <name>`.
-    pub rename: Option<RenameIntent>,
-    /// Sessions that should not exist (idempotent deletes; `/clear` pushes
-    /// the outgoing current id alongside `new_session`).
-    pub delete_session_ids_after: Vec<String>,
-    /// `/tree <id>` — move the session leaf.
-    pub tree_switch: Option<String>,
-    /// `/tree <id> compact …`.
-    pub tree_compact: Option<TreeCompactIntent>,
+
+
+
+
+
     /// `/sandbox` mutations (applier merges + re-publishes).
     pub sandbox: Option<SandboxOp>,
-    /// Explicit `/model` row commit — the loop's convergence step records a
-    /// session `ModelChange` only for this id, and only when the *applied*
-    /// config ends up running it (failed rebuild records nothing).
-    pub model_commit: Option<String>,
+
 }
 
 impl ControlConfig {
@@ -146,16 +106,11 @@ impl ControlConfig {
     fn take_one_shots(&mut self) -> ControlConfig {
         ControlConfig {
             quit: self.quit,
-            new_session: self.new_session.take(),
-            resume: self.resume.take(),
-            replay: self.replay.take(),
-            fork: self.fork.take(),
-            rename: self.rename.take(),
-            delete_session_ids_after: std::mem::take(&mut self.delete_session_ids_after),
-            tree_switch: self.tree_switch.take(),
-            tree_compact: self.tree_compact.take(),
+
+
+
             sandbox: self.sandbox.take(),
-            model_commit: self.model_commit.take(),
+
         }
     }
 }
@@ -170,16 +125,26 @@ impl ControlConfig {
 pub struct SessionSlot {
     pub(crate) repo: Option<JsonlSessionRepo>,
     pub(crate) current_id: String,
+    /// The active session — shared handle (all methods `&self`; internals
+    /// are `Arc<AsyncMutex>` by design). Swapped atomically with
+    /// `current_id` via `activate_session` so the menu never sees a
+    /// half-applied activation. The loop clones it out for turns; menu
+    /// handlers clone it out for direct data-plane work.
+    pub(crate) session: Option<Arc<Session>>,
+    /// The running agent — `Send + Sync`, all methods `&self`. Created
+    /// and rebuilt **loop-side from the applied config** (convergence),
+    /// published via `activate_agent`; handlers only consume the `Arc`.
+    pub(crate) agent: Option<Arc<dyn PicoAgent>>,
 }
 
 // ---------------------------------------------------------------------------
-// AppState
+// State
 // ---------------------------------------------------------------------------
 
 /// Coarse-grained app state: a few reasonably-sized pieces, one source of
 /// truth, one lock. Fields are `pub(crate)` — external access goes through
-/// [`AppShared`] methods (lock rule 1).
-pub struct AppState {
+/// [`AppState`] methods (lock rule 1).
+pub struct State {
     /// Runtime **target** config: model, persona, thinking, sandbox …
     /// (`LiveState` folded in here). The loop converges its applied config
     /// to this at the cycle point. Durable target stays `SettingsStore`.
@@ -200,35 +165,45 @@ pub struct AppState {
     pub(crate) context_tokens: u64,
     /// Declarative control targets (see [`ControlConfig`]).
     pub(crate) control: ControlConfig,
+    /// One-shot prompt prefill (resume's `/model …` model decision, the
+    /// auto-resume seed, the typed compact-cancel restore): written by
+    /// handlers/appliers/the loop, **taken by the loop** right before
+    /// the next `read_input` (sole consumer).
+    pub(crate) prefill: Option<String>,
+    /// REPL raw-mode guard — a service handle published once at startup;
+    /// the compaction review closure clones it out to suspend raw mode
+    /// around `$EDITOR` (same pattern as the Ctrl-E path).
+    pub(crate) term_guard: Option<Arc<crate::repl::TermGuard>>,
 }
 
 // ---------------------------------------------------------------------------
-// AppShared — the injected handle
+// AppState — the injected handle
 // ---------------------------------------------------------------------------
 
 /// The single injected handle — `MenuShared`'s replacement. Nodes hold
-/// `Arc<AppShared>`; the REPL loop clones the same `Arc`.
-pub struct AppShared {
-    state: Mutex<AppState>,
+/// `Arc<AppState>`; the REPL loop clones the same `Arc`.
+pub struct AppState {
+    state: Mutex<State>,
 }
 
-pub type SharedApp = Arc<AppShared>;
 
-impl AppShared {
+impl AppState {
     /// Wrap the startup-resolved state. `config` is both the initial target
     /// and (cloned by the loop) the initial applied layer.
     pub fn new(
         config: AgentConfig,
         settings: SettingsStore,
         repo: Option<JsonlSessionRepo>,
-    ) -> SharedApp {
-        Arc::new(AppShared {
-            state: Mutex::new(AppState {
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            state: Mutex::new(State {
                 config,
                 settings,
                 session: SessionSlot {
                     repo,
                     current_id: String::new(),
+                    session: None,
+                    agent: None,
                 },
                 recent_models: Vec::new(),
                 raw_tree: Arc::new(Vec::new()),
@@ -236,6 +211,8 @@ impl AppShared {
                 session_usage: SessionUsage::default(),
                 context_tokens: 0,
                 control: ControlConfig::default(),
+                prefill: None,
+                term_guard: None,
             }),
         })
     }
@@ -296,11 +273,18 @@ impl AppShared {
         f(&self.state.lock().settings)
     }
 
-    /// Mutate + persist a setting (validates, applies, saves — same behavior
-    /// as the old menu cell, but on the canonical copy).
+    /// Mutate + persist a setting. Validate + in-memory apply under the
+    /// lock; the TOML write runs **outside** it — the coarse lock is
+    /// never held across file IO (an async facade was considered and
+    /// dropped as low value: this is a tiny, user-paced write and the
+    /// frame waits for it either way).
     pub fn set_setting(&self, key: SettingKey, value: &str) -> Result<(), String> {
-        let mut st = self.state.lock();
-        st.settings.set_value(key, value)
+        let snapshot = {
+            let mut st = self.state.lock();
+            st.settings.apply_value(key, value)?;
+            st.settings.clone()
+        };
+        snapshot.save().map_err(|e| e.to_string())
     }
 
     /// Snapshot of the settings store for read-only use across `.await`s
@@ -330,6 +314,40 @@ impl AppShared {
         self.state.lock().session.current_id = id;
     }
 
+    // --- shared session/agent handles (clone out → drop guard → await) ---
+
+    /// Clone-out of the active session handle (rule 3: the guard is never
+    /// held across an await; the returned `Arc` keeps the session alive).
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.state.lock().session.session.clone()
+    }
+
+    /// Write the session slot (id untouched) — callers write back
+    /// unconditionally right after a helper that may have swapped it.
+    pub fn set_session(&self, session: Option<Arc<Session>>) {
+        self.state.lock().session.session = session;
+    }
+
+    /// Bundle activation: session + current id in ONE acquisition —
+    /// the menu can never observe a half-applied switch.
+    pub fn activate_session(&self, session: Option<Arc<Session>>, current_id: String) {
+        let mut st = self.state.lock();
+        st.session.session = session;
+        st.session.current_id = current_id;
+    }
+
+    /// Clone-out of the running agent (created/rebuilt loop-side from the
+    /// applied config; handlers only consume).
+    pub fn agent(&self) -> Option<Arc<dyn PicoAgent>> {
+        self.state.lock().session.agent.clone()
+    }
+
+    /// Publish a freshly created/rebuilt agent (convergence, lazy first
+    /// prompt, compact's Llm fallback — all loop-side).
+    pub fn activate_agent(&self, agent: Arc<dyn PicoAgent>) {
+        self.state.lock().session.agent = Some(agent);
+    }
+
     // --- display snapshots (loop writes at cycle build; menu reads) ---
 
     /// One acquisition for the whole per-cycle view so the menu can never see
@@ -356,6 +374,17 @@ impl AppShared {
 
     pub fn leaf_id(&self) -> Option<String> {
         self.state.lock().leaf_id.clone()
+    }
+
+    /// Single-field tree write (incremental updates; the loop's per-cycle
+    /// write goes through [`update_cycle_view`] for atomicity).
+    pub fn set_raw_tree(&self, tree: Arc<Vec<SessionTreeNode>>) {
+        self.state.lock().raw_tree = tree;
+    }
+
+    /// Single-field leaf write (same caveat as [`set_raw_tree`]).
+    pub fn set_leaf_id(&self, leaf_id: Option<String>) {
+        self.state.lock().leaf_id = leaf_id;
     }
 
     pub fn session_usage(&self) -> SessionUsage {
@@ -405,72 +434,16 @@ impl AppShared {
         self.state.lock().control.quit
     }
 
-    pub fn request_new(&self, name: String) {
-        self.state.lock().control.new_session = Some(name);
-    }
 
-    /// `/clear`: start fresh *and* delete the outgoing session afterwards —
-    /// declarative transaction intent (`applier`: create → swap → delete).
-    pub fn request_clear(&self, name: String, outgoing_session_id: String) {
-        let mut st = self.state.lock();
-        st.control.new_session = Some(name);
-        if !outgoing_session_id.is_empty()
-            && !st.control.delete_session_ids_after.contains(&outgoing_session_id)
-        {
-            st.control.delete_session_ids_after.push(outgoing_session_id);
-        }
-    }
 
-    pub fn request_resume(&self, session_id: String, replay_arg: String) {
-        self.state.lock().control.resume = Some(ResumeIntent {
-            session_id,
-            replay_arg,
-        });
-    }
 
-    pub fn request_replay(&self, arg: String) {
-        self.state.lock().control.replay = Some(ReplayIntent { arg });
-    }
 
-    pub fn request_fork(&self, session_id: String) {
-        self.state.lock().control.fork = Some(session_id);
-    }
 
-    pub fn request_rename(&self, session_id: String, new_name: String) {
-        self.state.lock().control.rename = Some(RenameIntent {
-            session_id,
-            new_name,
-        });
-    }
-
-    pub fn request_delete(&self, session_id: String) {
-        let mut st = self.state.lock();
-        if !session_id.is_empty()
-            && !st.control.delete_session_ids_after.contains(&session_id)
-        {
-            st.control.delete_session_ids_after.push(session_id);
-        }
-    }
-
-    pub fn request_tree_switch(&self, target_id: String) {
-        self.state.lock().control.tree_switch = Some(target_id);
-    }
-
-    pub fn request_tree_compact(&self, target_id: String, mode: CompactMode, payload: String) {
-        self.state.lock().control.tree_compact = Some(TreeCompactIntent {
-            target_id,
-            mode,
-            payload,
-        });
-    }
 
     pub fn request_sandbox(&self, op: SandboxOp) {
         self.state.lock().control.sandbox = Some(op);
     }
 
-    pub fn set_model_commit(&self, qualified_id: String) {
-        self.state.lock().control.model_commit = Some(qualified_id);
-    }
 
     /// Sole-consumer drain: clone out + GC every one-shot control field in a
     /// single acquisition (`quit` latches). Run by the loop's convergence
@@ -479,15 +452,47 @@ impl AppShared {
         self.state.lock().control.take_one_shots()
     }
 
+    /// Write the one-shot prompt prefill (handlers/appliers/the loop).
+    pub fn set_prefill(&self, prefill: String) {
+        self.state.lock().prefill = Some(prefill);
+    }
+
+    /// Sole-consumer take: the loop pops the prefill right before the
+    /// next `read_input`.
+    pub fn take_prefill(&self) -> Option<String> {
+        self.state.lock().prefill.take()
+    }
+
+    /// Publish the REPL's term guard (set once at startup).
+    pub fn set_term_guard(&self, guard: Arc<crate::repl::TermGuard>) {
+        self.state.lock().term_guard = Some(guard);
+    }
+
+    /// Clone-out of the term guard (rule 3 — the review closure holds it
+    /// across the editor, outside any lock).
+    pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
+        self.state.lock().term_guard.clone()
+    }
+
     // --- test constructor ---
 
-    /// Minimal state bundle for in-crate tests (no-op output, no repo).
+    /// Minimal state bundle for in-crate tests (no repo).
     #[cfg(test)]
-    pub fn for_test(settings: SettingsStore) -> SharedApp {
+    pub fn for_test(settings: SettingsStore) -> Arc<AppState> {
+        Self::for_test_with_output(settings, Arc::new(crate::output::NoOutput))
+    }
+
+    /// Like [`for_test`], with a caller-chosen output — tests assert on
+    /// captured display lines via `RecordingOutput`.
+    #[cfg(test)]
+    pub fn for_test_with_output(
+        settings: SettingsStore,
+        output: Arc<dyn crate::output::Output>,
+    ) -> Arc<AppState> {
         let config = AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
-            output: Arc::new(crate::output::NoOutput),
+            output,
             yolo: false,
             quiet: true,
             thinking_level: None,
@@ -538,80 +543,66 @@ mod tests {
 
     #[test]
     fn app_shared_is_send_sync() {
-        assert_send_sync::<AppShared>();
         assert_send_sync::<AppState>();
+        assert_send_sync::<State>();
     }
 
     #[test]
     fn model_target_roundtrip_splits_only_first_colon() {
-        let app = AppShared::for_test(test_settings());
-        app.set_model("openrouter:tencent/hy3:free");
-        assert_eq!(app.model(), "openrouter:tencent/hy3:free");
-        assert_eq!(app.with_config(|c| c.provider.clone()), "openrouter");
-        assert_eq!(app.with_config(|c| c.model.clone()), "tencent/hy3:free");
+        let app_state = AppState::for_test(test_settings());
+        app_state.set_model("openrouter:tencent/hy3:free");
+        assert_eq!(app_state.model(), "openrouter:tencent/hy3:free");
+        assert_eq!(app_state.with_config(|c| c.provider.clone()), "openrouter");
+        assert_eq!(app_state.with_config(|c| c.model.clone()), "tencent/hy3:free");
     }
 
     #[test]
     fn control_take_gc_one_shots_but_quit_latches() {
-        let app = AppShared::for_test(test_settings());
-        app.request_resume("abc".into(), "5t".into());
-        app.request_clear("fresh".into(), "outgoing-id".into());
-        app.set_model_commit("test:model".into());
-        app.request_quit();
+        let app_state = AppState::for_test(test_settings());
+        app_state.request_sandbox(SandboxOp::Remove {
+            sandbox_path: "/x".into(),
+        });
+        app_state.request_quit();
 
-        let taken = app.take_control();
-        assert_eq!(taken.resume.as_ref().unwrap().session_id, "abc");
-        assert_eq!(taken.new_session.as_deref(), Some("fresh"));
-        assert_eq!(
-            taken.delete_session_ids_after,
-            vec!["outgoing-id".to_string()]
-        );
-        assert_eq!(taken.model_commit.as_deref(), Some("test:model"));
+        let taken = app_state.take_control();
+        assert!(matches!(
+            taken.sandbox,
+            Some(SandboxOp::Remove { ref sandbox_path }) if sandbox_path == "/x"
+        ));
         assert!(taken.quit);
 
         // GC: one-shots gone, quit still latching.
-        let taken2 = app.take_control();
-        assert!(taken2.resume.is_none());
-        assert!(taken2.new_session.is_none());
-        assert!(taken2.delete_session_ids_after.is_empty());
-        assert!(taken2.model_commit.is_none());
-        assert!(app.should_quit(), "quit is latching — never cleared");
+        let taken2 = app_state.take_control();
+        assert!(taken2.sandbox.is_none());
+        assert!(app_state.should_quit(), "quit is latching — never cleared");
     }
 
     #[test]
     fn recent_models_lru_touch_is_single_acquisition() {
-        let app = AppShared::for_test(test_settings());
-        app.seed_recent_model("a:m1");
-        app.seed_recent_model("a:m2");
-        assert_eq!(app.recent_models(), vec!["a:m1", "a:m2"]);
-        let updated = app.note_recent_model("a:m1");
+        let app_state = AppState::for_test(test_settings());
+        app_state.seed_recent_model("a:m1");
+        app_state.seed_recent_model("a:m2");
+        assert_eq!(app_state.recent_models(), vec!["a:m1", "a:m2"]);
+        let updated = app_state.note_recent_model("a:m1");
         assert_eq!(updated, vec!["a:m1", "a:m2"]);
         // Duplicate ids are deduped (no second entry).
-        app.seed_recent_model("a:m1");
-        assert_eq!(app.recent_models(), vec!["a:m1", "a:m2"]);
+        app_state.seed_recent_model("a:m1");
+        assert_eq!(app_state.recent_models(), vec!["a:m1", "a:m2"]);
     }
 
     #[test]
     fn cycle_view_updates_together() {
-        let app = AppShared::for_test(test_settings());
-        app.update_cycle_view(
+        let app_state = AppState::for_test(test_settings());
+        app_state.update_cycle_view(
             "sess-1".into(),
             SessionUsage::default(),
             42_000,
             Arc::new(vec![]),
             Some("leaf-1".into()),
         );
-        assert_eq!(app.current_session_id(), "sess-1");
-        assert_eq!(app.context_tokens(), 42_000);
-        assert_eq!(app.leaf_id().as_deref(), Some("leaf-1"));
+        assert_eq!(app_state.current_session_id(), "sess-1");
+        assert_eq!(app_state.context_tokens(), 42_000);
+        assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
     }
 
-    #[test]
-    fn clear_composes_new_plus_delete() {
-        let app = AppShared::for_test(test_settings());
-        app.request_clear("".into(), "old".into());
-        let taken = app.take_control();
-        assert_eq!(taken.new_session.as_deref(), Some(""));
-        assert_eq!(taken.delete_session_ids_after, vec!["old".to_string()]);
-    }
 }

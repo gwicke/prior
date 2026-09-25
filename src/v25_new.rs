@@ -1,22 +1,24 @@
 //! v2.5 `SlashDotNode` implementation for `/new`.
 //!
-//! Leaf node: submit() sets `AsyncOp::New` on `MenuShared` so the agent
-//! loop starts a fresh session.
+//! Leaf node: submit() creates and activates a fresh session **inline**
+//! (stamped from the target config — recorded judgment in the plan).
+use std::sync::Arc;
 
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::{AsyncOp, MenuShared};
+use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct NewNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for NewNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("new")
                 .desc("start a new session")],
@@ -24,7 +26,7 @@ impl SlashDotNode for NewNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -37,9 +39,11 @@ impl SlashDotNode for NewNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::New { name });
+        // Data-plane inline: drop + create + activate, now — no control
+        // field, no loop round-trip.
+        crate::agent::start_fresh_session(&self.app_state, &name).await;
         SubmitResult::Done(None)
     }
 }
@@ -53,36 +57,33 @@ mod tests {
     };
     use crate::slashdot_menu::HostKey;
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(
-            crate::settings::SettingsStore {
-                default_model: String::new(),
-                security_mode: String::new(),
-                tool_call_limit: 0,
-                default_persona: None,
-                default_thinking_level: String::new(),
-                show_reasoning: String::new(),
-                reasoning_in_context: false,
-                session_resume_replay_turns: 0,
-                llm_compact_prompt: String::new(),
-                path: None,
-            },
-            None,
-        ))
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_thinking_level: String::new(),
+            show_reasoning: String::new(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            path: None,
+        })
     }
 
-    fn build_new_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_new_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(NewNode { shared: shared.clone() }.into());
+        root.add_child(NewNode { app_state: app_state.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn new_shows_in_listing() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("", HostKey::None, 80);
+        let result = crate::agent::block_on_test(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -96,30 +97,33 @@ mod tests {
     }
 
     #[test]
-    fn new_submit_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+    fn new_submit_creates_fresh_session() {
+        let app_state = test_app_state();
+        let (repo, outgoing, base) = crate::agent::test_repo_with_session();
+        app_state.set_repo(Some(repo));
+        let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("new ", HostKey::None, 80);
-        let _ = handle.eval_prompt("new ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::New { name }) => assert_eq!(name, ""),
-            other => panic!("expected New, got {:?}", other),
-        }
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        assert_ne!(s.get_session_id(), outgoing, "must be a different session");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn new_with_name_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+    fn new_with_name_names_session() {
+        let app_state = test_app_state();
+        let (repo, _outgoing, base) = crate::agent::test_repo_with_session();
+        app_state.set_repo(Some(repo));
+        let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("new my-session ", HostKey::None, 80);
-        let _ = handle.eval_prompt("new my-session ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::New { name }) => assert_eq!(name, "my-session"),
-            other => panic!("expected New with name, got {:?}", other),
-        }
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
+        let s = app_state.session().expect("fresh session activated");
+        let name =
+            crate::agent::block_on_test(async { s.index().lock().await.session_name.clone() });
+        assert_eq!(name.as_deref(), Some("my-session"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

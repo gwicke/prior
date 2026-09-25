@@ -12,13 +12,10 @@
 //! escape-sequence emission touches the terminal.
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use std::cell::RefCell;
-use std::rc::Rc;
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crate::output::{term_width, wrap, Output};
 use crate::model_catalog;
-use crate::slash_menu_bridge::MenuShared;
-use crate::settings::SettingsStore;
+use crate::app_state::AppState;
 use crate::session::SessionTreeNode;
 use crate::agent::SessionUsage;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -244,10 +241,10 @@ pub fn active_model_id(settings: &crate::settings::SettingsStore) -> Option<Stri
 pub enum InputAction {
     /// Submit a normal prompt (text may be empty when the line was cancelled).
     Submit(String),
-    /// A v2.5 menu committed a value (wrote to shared state / pending_op).
-    /// The agent loop processes `menu_submitted` (LiveState sync) and any
-    /// `pending_op` after the match; this variant is a no-op so the
-    /// committed text is never treated as a prompt.
+    /// A v2.5 menu committed a value (node wrote to `AppState` — the
+    /// runtime-target config and/or control fields). The agent loop's
+    /// convergence step applies targets at the cycle point; this variant
+    /// is a no-op so the committed text is never treated as a prompt.
     MenuDone,
 }
 
@@ -273,8 +270,9 @@ pub struct ReplCtx {
     /// for user messages in the current session's branch.
     pub branch_messages: Vec<(String, String)>,
     /// Pre-built session entry tree (empty if no session), used by `/tree`.
-    /// Shared via Rc with MenuShared — no deep clone on sync.
-    pub tree: std::rc::Rc<Vec<SessionTreeNode>>,
+    /// Copied into `AppState` (`update_cycle_view`) — the one source the
+    /// menu reads; no snapshot copies per activation.
+    pub tree: std::sync::Arc<Vec<SessionTreeNode>>,
     /// Current leaf entry ID (for highlighting in the tree).
     pub leaf_id: Option<String>,
     /// Estimated tokens of the current (compaction-scoped) context. Shown in
@@ -606,39 +604,30 @@ impl Repl {
     /// confined to the input row and below, so the greeter / status / divider /
     /// session content above the input is never touched (plan §3.7). The pop-up
     /// uses at most 2/3 of the terminal height (≥ 1 line).
-    pub fn read_input(
+    pub async fn read_input(
         &mut self,
         prompt: &str,
         initial_buffer: Option<&str>,
         history: &mut History,
         ctx: &ReplCtx,
-        settings: &mut SettingsStore,
-        menu_submitted: &mut bool,
-        pending_op: &Rc<RefCell<Option<crate::slash_menu_bridge::AsyncOp>>>,
-        live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
+        app_state: &Arc<AppState>,
         initial_row: usize,
         output: &dyn Output,
     ) -> Option<InputAction> {
-        // Step 2 (Phase 6.7): engine providers come from shared live state.
-        // Build a `MenuShared` handle bundle for this activation; it shares
-        // the same SettingsStore the loop / run_interactive mutate, the
-        // session repo, and the current-session/tree sync mirrors.
-        let mut shared = MenuShared::new(
-            settings.clone(),
-            ctx.repo.clone(),
+        // Refresh the menu-facing view from this cycle's context. The loop
+        // is the sole writer of these display fields (one acquisition);
+        // menu nodes read them live through the same handle — no snapshot
+        // copies, no sync flags.
+        app_state.update_cycle_view(
+            ctx.current_session_id.clone(),
+            ctx.session_usage,
+            ctx.context_tokens,
+            ctx.tree.clone(),
+            ctx.leaf_id.clone(),
         );
-        // Share the caller's LiveState Rc so menu writes are visible to
-        // run_interactive after read_input returns.
-        shared.live_state = live_state.clone();
-        *shared.current_session_id.borrow_mut() = ctx.current_session_id.clone();
-        *shared.recent_models.borrow_mut() = ctx.recent.clone();
-        *shared.raw_tree.borrow_mut() = ctx.tree.clone();
-        *shared.leaf_id.borrow_mut() = ctx.leaf_id.clone();
-        *shared.session_usage.borrow_mut() = ctx.session_usage;
-        *shared.context_tokens.borrow_mut() = ctx.context_tokens;
-        // Share the pending_op cell with the caller so async ops are
-        // visible after read_input returns.
-        shared.pending_op = pending_op.clone();
+        // Repo handle: refresh in case the loop replaced its local Option
+        // (clone-shared Arc cache — same listing state either way).
+        app_state.set_repo(ctx.repo.clone());
         let mut editor = LineEditor::new();
         // Seed the editor with a prefill string if one was provided. Used by
         // `/session <id> resume` to surface the resumed session's stored model
@@ -659,10 +648,7 @@ impl Repl {
         // The menu lives for the entire prompt session; the handle is
         // created when the prompt starts with `/` and dropped when it
         // no longer does. All `/` dispatch goes through `eval_prompt`.
-        let mut v25_menu = {
-            let shared_rc = std::rc::Rc::new(shared.clone_shared());
-            crate::v25_menu::build_menu(&shared.live_state, &shared.settings, &shared_rc)
-        };
+        let mut v25_menu = crate::v25_menu::build_menu(app_state);
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // Engine key queued by the dispatch below for the *next*
         // iteration's eval (eval → display → wait loop shape). `None`
@@ -826,7 +812,7 @@ impl Repl {
                 }
                 let result = {
                     let handle = v25_handle.as_mut().unwrap();
-                    Self::v25_eval(handle, &buf_text, editor.cursor, key)
+                    Self::v25_eval(handle, &buf_text, editor.cursor, key).await
                 };
                 match result {
                     V25Frame::Continue(plan, prompt) => {
@@ -843,9 +829,9 @@ impl Repl {
                     V25Frame::DoneSuccess(msg, prompt)
                         if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
                     {
-                        // The node's submit() wrote to shared state
-                        // (LiveState for `/thinking`/`/model`/…, or
-                        // `pending_op` for `/session`/`/replay`). Use the
+                        // The node's submit() wrote to `AppState` (target
+                        // config for `/thinking`/`/model`/…, control fields
+                        // for `/session`/`/replay`/…). Use the
                         // engine-provided self-documenting prompt
                         // (e.g. "/thinking low").
                         let committed = format!("/{}", prompt);
@@ -856,12 +842,9 @@ impl Repl {
                         if let Some(text) = msg {
                             output.display_text(&text);
                         }
-                        // Dismiss the overlay and hand control back to
-                        // the agent loop, which processes
-                        // `menu_submitted` (LiveState sync) and any
-                        // `pending_op` (async dispatch) before the
-                        // next prompt.
-                        *menu_submitted = true;
+                        // Dismiss the overlay and hand control back to the
+                        // agent loop, whose convergence step applies the
+                        // targets written during this eval.
                         return Some(InputAction::MenuDone);
                     }
                     V25Frame::DoneError(err, prompt)
@@ -1480,7 +1463,7 @@ impl Repl {
     /// report the chain on stderr (debugging detail) and bail out with
     /// `DoneError` carrying the same message — never spin, never
     /// synthesize a plan.
-    fn v25_eval(
+    async fn v25_eval(
         handle: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         buf: &str,
         cursor_char: usize,
@@ -1502,7 +1485,9 @@ impl Repl {
                 .map(|(b, _)| b)
                 .unwrap_or(buf.len());
             let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
-            match handle.eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+            match handle
+                .eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+                .await
             {
                 MenuResult::ContinuePrompt(new_prompt) => {
                     chain.push(format!("/{}", new_prompt));
@@ -1587,6 +1572,13 @@ impl Repl {
         next_input: &str,
         sep: bool,
     ) {
+        // Re-anchor to the real cursor BEFORE drawing: an external editor
+        // ($EDITOR via `review_compaction_summary`, which runs mid-eval for
+        // menu-driven compaction) may have repainted the screen since the
+        // last frame. `cursor_row()` does a live DSR query — the same
+        // pattern the Ctrl-E path uses after `guard.start()` — and falls
+        // back to the tracked value when the terminal doesn't answer.
+        *input_row = output.cursor_row().max(1);
         redraw(&LineEditor::new(), &[], sel, input_row);
         output.display_plain(line);
         if sep {

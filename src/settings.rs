@@ -422,10 +422,19 @@ impl SettingsStore {
         }
     }
 
-    /// Validate, apply, and persist a new value for `key`.
-    pub fn set_value(&mut self, key: SettingKey, value: &str) -> Result<(), String> {
+    /// Validate and apply a new value for `key` **without persisting** —
+    /// for callers that must not hold a lock across file IO (the
+    /// `AppState` coarse mutex): apply under the lock, clone the store,
+    /// save outside it.
+    pub fn apply_value(&mut self, key: SettingKey, value: &str) -> Result<(), String> {
         Self::validate(key, value)?;
         self.apply(key, value.trim());
+        Ok(())
+    }
+
+    /// Validate, apply, and persist a new value for `key`.
+    pub fn set_value(&mut self, key: SettingKey, value: &str) -> Result<(), String> {
+        self.apply_value(key, value)?;
         self.save().map_err(|e| e.to_string())
     }
 

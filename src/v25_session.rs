@@ -6,10 +6,13 @@
 //!
 //! Action nodes are in this same file since they are small and tightly
 //! coupled to `SessionListNode`.
+use std::sync::Arc;
 
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::{AsyncOp, MenuShared};
+use crate::app_state::AppState;
+use crate::session::repo::SessionRepo;
+use crate::session::Session;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
@@ -125,13 +128,15 @@ fn action_session_id(path_args: &PathArgs) -> Option<&str> {
     }
 }
 
-/// Find session metadata by UUID from the repo.
-fn find_session(
-    shared: &MenuShared,
+/// Find session metadata by UUID from the repo (async overlay listing —
+/// cache-first; see `list_sessions_overlay`).
+async fn find_session(
+    app_state: &AppState,
     session_id: &str,
 ) -> Option<crate::repl::SessionMeta> {
-    let repo = shared.repo.as_ref()?;
-    repo.list_sessions_sync(None)
+    let repo = app_state.repo()?;
+    repo.list_sessions_overlay(None)
+        .await
         .into_iter()
         .map(crate::repl::session_meta_from)
         .find(|m| m.id == session_id)
@@ -194,8 +199,9 @@ pub fn session_fields() -> Vec<FieldSpec> {
 /// `.path:.` filter on drill). `SessionListNode` is its dynamic child.
 pub struct SessionListingNode;
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionListingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("session")
                 .desc("list, rename, resume, fork, or delete sessions")],
@@ -211,7 +217,7 @@ impl SlashDotNode for SessionListingNode {
         session_fields()
     }
 
-    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // On drill, add a default path filter to show only sessions
         // relevant to the current working directory.
         Some("session .path:.".to_string())
@@ -226,17 +232,19 @@ impl SlashDotNode for SessionListingNode {
 /// from the repo. When drilled into (a UUID selected), `header()` renders
 /// the session info table, and the static action children are shown.
 pub struct SessionListNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionListNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         use crate::slashdot_menu::value::Value;
 
-        let current_id = self.shared.current_session_id.borrow().clone();
-        let mut sessions: Vec<crate::repl::SessionMeta> = match &self.shared.repo {
+        let current_id = self.app_state.current_session_id();
+        let mut sessions: Vec<crate::repl::SessionMeta> = match self.app_state.repo() {
             Some(repo) => repo
-                .list_sessions_sync(None)
+                .list_sessions_overlay(None)
+                .await
                 .into_iter()
                 .map(crate::repl::session_meta_from)
                 .collect(),
@@ -291,17 +299,17 @@ impl SlashDotNode for SessionListNode {
         session_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(session_id) = drilled_session_id(path_args) else {
             return vec!["Select a session, then choose an action.".to_string()];
         };
 
-        let meta = match find_session(&self.shared, session_id) {
+        let meta = match find_session(&self.app_state, session_id).await {
             Some(m) => m,
             None => return vec![format!("Session not found: {}", session_id)],
         };
 
-        let is_current = meta.id == *self.shared.current_session_id.borrow();
+        let is_current = meta.id == self.app_state.current_session_id();
         let ts = format_session_timestamp(&meta.timestamp);
         let name = meta.name.as_deref().unwrap_or(&meta.id);
         let marker = if is_current { "◉ " } else { "  " };
@@ -380,14 +388,15 @@ impl SlashDotNode for SessionListNode {
 
 /// Resume action leaf. Hidden when viewing the current session.
 pub struct SessionResumeNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionResumeNode {
-    fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         // Guard: hidden for the current session.
         if let Some(sid) = drilled_session_id(path_args) {
-            if sid == self.shared.current_session_id.borrow().as_str() {
+            if sid == self.app_state.current_session_id() {
                 return Ok(Rc::new(DataResponse {
                     rows: Vec::new(),
                     active_ids: Vec::new(),
@@ -400,7 +409,7 @@ impl SlashDotNode for SessionResumeNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -415,31 +424,62 @@ impl SlashDotNode for SessionResumeNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         let replay_arg = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::Resume { session_id, replay_arg });
-        SubmitResult::Done(None)
+        // Data-plane inline: load/migrate/replay + activate in one slot
+        // write; the model decision rides the prefill register (qualified
+        // id from the TARGET config — same target-stamp judgment as
+        // session creation).
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let found = repo
+            .list_sessions_overlay(None)
+            .await
+            .into_iter()
+            .find(|m| m.id == session_id);
+        let Some(meta) = found else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let default = self.app_state.with_settings(|s| s.session_resume_replay_turns);
+        let replay = if replay_arg.is_empty() {
+            (default, false)
+        } else {
+            crate::agent::parse_replay_len_arg(&replay_arg, default)
+        };
+        let out = self.app_state.with_config(|c| c.output.clone());
+        let qualified = self.app_state.with_config(|c| c.qualified_model_id());
+        match crate::agent::resume_session(&repo, &meta, replay, out.as_ref(), &qualified).await {
+            Ok((new_session, id, prefill)) => {
+                self.app_state.activate_session(Some(new_session), id);
+                if let Some(p) = prefill {
+                    self.app_state.set_prefill(p);
+                }
+                SubmitResult::Done(None)
+            }
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
 /// Fork action leaf.
 pub struct SessionForkNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionForkNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("fork").desc("branch from this point")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -450,33 +490,57 @@ impl SlashDotNode for SessionForkNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Fork { session_id });
-        SubmitResult::Done(None)
+        // Data-plane inline: resolve the meta by id, fork, and activate —
+        // the slot write bundles session + current id (same effect as the
+        // old Switched path).
+        let found = match self.app_state.repo() {
+            Some(repo) => repo
+                .list_sessions_overlay(None)
+                .await
+                .into_iter()
+                .find(|m| m.id == session_id)
+                .map(|m| (repo, m)),
+            None => None,
+        };
+        let Some((repo, meta)) = found else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        match crate::agent::fork_session_at(&repo, &meta).await {
+            Ok((new_session, id)) => {
+                self.app_state.activate_session(Some(new_session), id);
+                SubmitResult::Done(None)
+            }
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
 /// Rename action leaf.
 pub struct SessionRenameNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionRenameNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("rename").desc("rename the session")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
-        let current_name = action_session_id(path_args)
-            .and_then(|sid| find_session(&self.shared, sid))
-            .and_then(|m| m.name)
-            .unwrap_or_else(|| "(unnamed)".to_string());
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+        let current_name = match action_session_id(path_args) {
+            Some(sid) => find_session(&self.app_state, sid)
+                .await
+                .and_then(|m| m.name)
+                .unwrap_or_else(|| "(unnamed)".to_string()),
+            None => "(unnamed)".to_string(),
+        };
         vec![
             "Rename the session. Type the new name and press Enter.".to_string(),
             "Leave empty to clear the name.".to_string(),
@@ -484,11 +548,12 @@ impl SlashDotNode for SessionRenameNode {
         ]
     }
 
-    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the current session name. ids are
         // ["session", "<uuid>", "rename"].
         let sid = path_args.ids.get(1).map(|s| s.as_str()).unwrap_or_default();
-        let current_name = find_session(&self.shared, sid)
+        let current_name = find_session(&self.app_state, sid)
+            .await
             .and_then(|m| m.name)
             .unwrap_or_default();
         // Rebuild the full prompt: "session <uuid> rename <name>"
@@ -497,31 +562,65 @@ impl SlashDotNode for SessionRenameNode {
         Some(path_args.prompt_with(&format!(" {}", current_name)))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
         let new_name = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::Rename { session_id, new_name });
-        SubmitResult::Done(None)
+        if new_name.is_empty() {
+            return SubmitResult::Done(Some(
+                "Usage: /session <name> rename <newname>".to_string(),
+            ));
+        }
+        // Data-plane inline: the active session renames in place; any
+        // other id goes through the repo (open → set → invalidate).
+        if let Some(s) = self.app_state.session() {
+            if s.get_session_id() == session_id {
+                let _ = s.set_session_name(&new_name).await;
+                if let Some(repo) = self.app_state.repo() {
+                    repo.invalidate_cache();
+                }
+                return SubmitResult::Done(None);
+            }
+        }
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let meta = repo
+            .list_sessions_overlay(None)
+            .await
+            .into_iter()
+            .find(|m| m.id == session_id);
+        match meta {
+            Some(meta) => match repo.open(&meta).await {
+                Ok((storage, index)) => {
+                    let s = Session::new_persisted(storage, index);
+                    let _ = s.set_session_name(&new_name).await;
+                    repo.invalidate_cache();
+                    SubmitResult::Done(None)
+                }
+                Err(e) => SubmitResult::Done(Some(format!("Cannot open session: {}", e))),
+            },
+            None => SubmitResult::Done(Some(format!("Session not found: {}", session_id))),
+        }
     }
 }
 
 /// Delete action leaf with two-phase confirm.
 pub struct SessionDeleteNode {
-    pub shared: Rc<MenuShared>,
+    pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionDeleteNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("delete").desc("delete from disk")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -532,10 +631,10 @@ impl SlashDotNode for SessionDeleteNode {
         ]
     }
 
-    fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         // Guard: cannot delete the current session.
         if let Some(sid) = action_session_id(path_args) {
-            if sid == self.shared.current_session_id.borrow().as_str() {
+            if sid == self.app_state.current_session_id() {
                 return SubmitResult::Done(Some(
                     "Cannot delete the current session.".to_string(),
                 ));
@@ -544,12 +643,31 @@ impl SlashDotNode for SessionDeleteNode {
         SubmitResult::Prepared
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Delete { session_id });
-        SubmitResult::Done(None)
+        // Data-plane inline: locate the meta by id, keep the current-
+        // session guard (mirrors `prepare()`), delete via the repo
+        // (which invalidates the listing cache itself).
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let meta = repo
+            .list_sessions_overlay(None)
+            .await
+            .into_iter()
+            .find(|m| m.id == session_id);
+        let Some(meta) = meta else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        if self.app_state.current_session_id() == session_id {
+            return SubmitResult::Done(Some("Cannot delete the current session".to_string()));
+        }
+        match repo.delete(&meta).await {
+            Ok(()) => SubmitResult::Done(None),
+            Err(e) => SubmitResult::Done(Some(format!("Cannot delete session: {}", e))),
+        }
     }
 }
 
@@ -563,19 +681,19 @@ impl SlashDotNode for SessionDeleteNode {
 /// fields, and `drill_rewrite`. `SessionListNode` (its child) provides
 /// dynamic session rows; action nodes are grandchildren.
 pub fn build_session_node(
-    shared: &Rc<MenuShared>,
+    app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
     let mut listing: SlashDotMenuNode = SessionListingNode.into();
 
     let mut session_node: SlashDotMenuNode =
-        SessionListNode { shared: shared.clone() }.into();
-    session_node.add_child(SessionResumeNode { shared: shared.clone() }.into());
-    session_node.add_child(SessionForkNode { shared: shared.clone() }.into());
-    session_node.add_child(SessionRenameNode { shared: shared.clone() }.into());
+        SessionListNode { app_state: app_state.clone() }.into();
+    session_node.add_child(SessionResumeNode { app_state: app_state.clone() }.into());
+    session_node.add_child(SessionForkNode { app_state: app_state.clone() }.into());
+    session_node.add_child(SessionRenameNode { app_state: app_state.clone() }.into());
     session_node.add_child(
-        SessionDeleteNode { shared: shared.clone() }.into(),
+        SessionDeleteNode { app_state: app_state.clone() }.into(),
     );
 
     listing.add_child(session_node);
@@ -608,19 +726,21 @@ mod tests {
         }
     }
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(test_settings(), None))
+    /// Returns an `AppState` (binding kept as `app_state` in tests below —
+    /// it is the injected source-of-truth handle).
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
     }
 
-    fn build_session_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_session_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_session_node(shared));
+        root.add_child(build_session_node(app_state));
         SlashDotMenu::from_root_node(root)
     }
 
     /// Write a minimal session `.jsonl` (header + one user message) into a
-    /// fresh temp repo, returning `(shared, uuid, temp_dir)`.
-    fn temp_repo_with_session() -> (Rc<MenuShared>, String, std::path::PathBuf) {
+    /// fresh temp repo, returning `(app_state, uuid, temp_dir)`.
+    fn temp_repo_with_session() -> (Arc<AppState>, String, std::path::PathBuf) {
         use crate::session::types::{encode_cwd, session_filename, SessionHeader};
 
         let nanos = std::time::SystemTime::now()
@@ -656,24 +776,25 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
 
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
-        let shared = Rc::new(MenuShared::new(test_settings(), Some(repo)));
-        (shared, uuid, base)
+        let app_state = crate::app_state::AppState::for_test(test_settings());
+        app_state.set_repo(Some(repo));
+        (app_state, uuid, base)
     }
 
     /// End-to-end traversal: `/session ` listing → drill into the session →
-    /// drill into `resume` → Enter → `submit()` sets an `AsyncOp::Resume`
-    /// carrying the drilled UUID (not the action name).
+    /// drill into `resume` → Enter → `submit()` writes the `resume`
+    /// control target carrying the drilled UUID (not the action name).
     #[test]
     fn session_resume_full_traversal_sets_op_with_uuid() {
-        let (shared, uuid, base) = temp_repo_with_session();
+        let (app_state, uuid, base) = temp_repo_with_session();
         // Not the current session, so resume is visible.
-        *shared.current_session_id.borrow_mut() = String::new();
+        app_state.set_current_session_id(String::new());
 
-        let mut menu = build_session_menu(&shared);
+        let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Parent listing shows the session row.
-        let listing = handle.eval_prompt("session ", HostKey::None, 80);
+        let listing = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match &listing {
             MenuResult::Continue(plan, _) => {
                 assert!(
@@ -686,34 +807,43 @@ mod tests {
 
         // 2. Drill into the session (bare-id entry with trailing space).
         let line = format!("session {} ", uuid);
-        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        let r = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into session");
 
         // 3. Drill into `resume`.
         let line = format!("session {} resume ", uuid);
-        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        let r = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into resume");
 
-        // 4. Enter → submit.
-        let _ = handle.eval_prompt(&line, HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Resume { session_id, .. }) => {
-                assert_eq!(session_id, &uuid, "resume op must carry the session UUID");
-            }
-            other => panic!("expected AsyncOp::Resume, got {:?}", other),
-        }
-        drop(op);
+        // 4. Enter → submit (inline resume drives repo IO — tokio-backed
+        // driver required). The fixture lives under a foreign cwd, so
+        // resume takes the fork-migration path: original deleted, a
+        // migrated session activated under the process cwd.
+        let _ = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::Enter, 80));
+        let s = app_state.session().expect("resume activates a session");
+        assert!(!s.get_session_id().is_empty());
+        assert_eq!(
+            app_state.current_session_id(),
+            s.get_session_id(),
+            "slot id tracks the activated session"
+        );
+        assert_eq!(
+            app_state.repo().unwrap().list_sessions_sync(None).len(),
+            1,
+            "migration: original deleted, one session remains"
+        );
+        // The (migrated) header records no model → no `/model` prefill.
+        assert!(app_state.take_prefill().is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn session_listing_shows_session_row() {
-        let shared = make_shared();
-        let mut menu = build_session_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("session ", HostKey::None, 80);
+        let result = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, listing should be empty.
@@ -725,10 +855,10 @@ mod tests {
 
     #[test]
     fn session_node_columns() {
-        let shared = make_shared();
-        let mut menu = build_session_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("session ", HostKey::None, 80);
+        let result = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, the table header row should still render
@@ -744,16 +874,16 @@ mod tests {
 
     #[test]
     fn session_resume_hidden_for_current() {
-        let shared = make_shared();
-        *shared.current_session_id.borrow_mut() = "test-uuid".to_string();
-        let mut node = SessionResumeNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_current_session_id("test-uuid".to_string());
+        let mut node = SessionResumeNode { app_state: app_state.clone() };
         // data() is called from the parent's context: path = ["session", uuid].
         let path_args = PathArgs {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args).unwrap();
+        let result = crate::agent::block_on_test(node.data(1, &path_args)).unwrap();
         assert!(
             result.rows.is_empty(),
             "resume should be hidden for current session"
@@ -762,109 +892,116 @@ mod tests {
 
     #[test]
     fn session_resume_visible_for_other() {
-        let shared = make_shared();
-        *shared.current_session_id.borrow_mut() = "other-uuid".to_string();
-        let mut node = SessionResumeNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_current_session_id("other-uuid".to_string());
+        let mut node = SessionResumeNode { app_state: app_state.clone() };
         let path_args = PathArgs {
             ids: vec!["session".to_string(), "test-uuid".to_string()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args).unwrap();
+        let result = crate::agent::block_on_test(node.data(1, &path_args)).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].id, "resume");
     }
 
     #[test]
-    fn session_resume_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = SessionResumeNode { shared: shared.clone() };
+    fn session_resume_submit_switches_session() {
+        let (app_state, uuid, base) = temp_repo_with_session();
+        let mut node = SessionResumeNode { app_state: app_state.clone() };
         // submit() sees the node's own path: ["session", uuid, "resume"].
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "resume".into()],
+            ids: vec!["session".into(), uuid.clone(), "resume".into()],
             suffix: " 10t ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Resume { session_id, replay_arg }) => {
-                assert_eq!(session_id, "some-uuid");
-                assert_eq!(replay_arg, "10t");
-            }
-            other => panic!("expected Resume, got {:?}", other),
-        }
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "resume must succeed");
+        let s = app_state.session().expect("activated");
+        // Foreign-cwd fixture → fork migration: activated id differs from
+        // the original, and the slot id tracks it.
+        assert_ne!(s.get_session_id(), uuid, "migrated session has its own id");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn session_fork_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = SessionForkNode { shared: shared.clone() };
+    fn session_fork_submit_switches_to_fork() {
+        let (app_state, uuid, base) = temp_repo_with_session();
+        let mut node = SessionForkNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "fork".into()],
+            ids: vec!["session".into(), uuid.clone(), "fork".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Fork { session_id }) => {
-                assert_eq!(session_id, "some-uuid");
-            }
-            other => panic!("expected Fork, got {:?}", other),
-        }
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "fork must succeed");
+        let s = app_state.session().expect("fork activated into the slot");
+        assert_ne!(s.get_session_id(), uuid, "a fork is a new session");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        // Source file (encoded fixture dir) + fork (encoded process-cwd
+        // dir) both under the temp base.
+        assert_eq!(
+            app_state.repo().unwrap().list_sessions_sync(None).len(),
+            2,
+            "source + fork on disk"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn session_rename_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = SessionRenameNode { shared: shared.clone() };
+    fn session_rename_submit_renames_active_session() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![]);
+        let sid = session.get_session_id().to_string();
+        app_state.set_session(Some(session.clone()));
+        let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
+            ids: vec!["session".into(), sid, "rename".into()],
             suffix: " my-name ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Rename { session_id, new_name }) => {
-                assert_eq!(session_id, "some-uuid");
-                assert_eq!(new_name, "my-name");
-            }
-            other => panic!("expected Rename, got {:?}", other),
-        }
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let name = crate::agent::block_on_test(async {
+            session.index().lock().await.session_name.clone()
+        });
+        assert_eq!(
+            name.as_deref(),
+            Some("my-name"),
+            "rename must set the session's name in place"
+        );
     }
 
     #[test]
-    fn session_rename_empty_clears() {
-        let shared = make_shared();
-        let mut node = SessionRenameNode { shared: shared.clone() };
+    fn session_rename_empty_shows_usage() {
+        let app_state = test_app_state();
+        let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path_args = PathArgs {
             ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
             suffix: "  ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Rename { new_name, .. }) => {
-                assert!(new_name.is_empty(), "empty suffix should clear name");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("Usage: /session"), "usage message: {msg}")
             }
-            other => panic!("expected Rename, got {:?}", other),
+            _ => panic!("expected Done(usage message)"),
         }
     }
 
     #[test]
     fn session_delete_prepare_blocks_current() {
-        let shared = make_shared();
-        *shared.current_session_id.borrow_mut() = "test-uuid".to_string();
-        let mut node = SessionDeleteNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_current_session_id("test-uuid".to_string());
+        let mut node = SessionDeleteNode { app_state: app_state.clone() };
         let path_args = PathArgs {
             ids: vec!["session".into(), "test-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.prepare(1, &path_args);
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         match result {
             SubmitResult::Done(Some(msg)) => {
                 assert!(msg.contains("Cannot delete"));
@@ -875,15 +1012,15 @@ mod tests {
 
     #[test]
     fn session_delete_prepare_allows_other() {
-        let shared = make_shared();
-        *shared.current_session_id.borrow_mut() = "other-uuid".to_string();
-        let mut node = SessionDeleteNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_current_session_id("other-uuid".to_string());
+        let mut node = SessionDeleteNode { app_state: app_state.clone() };
         let path_args = PathArgs {
             ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.prepare(1, &path_args);
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         assert!(
             matches!(result, SubmitResult::Prepared),
             "should allow delete of non-current session"
@@ -891,22 +1028,23 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = SessionDeleteNode { shared: shared.clone() };
+    fn session_delete_submit_removes_file() {
+        let (app_state, uuid, base) = temp_repo_with_session();
+        let repo = app_state.repo().expect("fixture repo in the slot");
+        assert_eq!(repo.list_sessions_sync(None).len(), 1, "fixture present");
+        let mut node = SessionDeleteNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
+            ids: vec!["session".into(), uuid, "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Delete { session_id }) => {
-                assert_eq!(session_id, "some-uuid");
-            }
-            other => panic!("expected Delete, got {:?}", other),
-        }
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "delete must succeed");
+        assert!(
+            repo.list_sessions_sync(None).is_empty(),
+            "the file must be gone from disk"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1031,7 +1169,7 @@ mod tests {
         use crate::slashdot_menu::node_impl::SlashDotNode;
         let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session .path:.".to_string()));
     }
 
@@ -1039,10 +1177,10 @@ mod tests {
     fn session_rename_drill_rewrite_prefills_name() {
         use crate::slashdot_menu::node_impl::SlashDotNode;
         // No repo → find_session returns None → empty name.
-        let shared = make_shared();
-        let mut node = SessionRenameNode { shared: shared.clone() };
+        let app_state = test_app_state();
+        let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

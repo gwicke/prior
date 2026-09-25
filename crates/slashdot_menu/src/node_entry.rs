@@ -185,21 +185,28 @@ impl NodeEntry {
     /// populated by `refresh_data()`). `self.inner.data()` provides only the
     /// static rows (ids/descriptions for the parent); dynamic values come
     /// from the refreshed cache, not from `data()`.
-    fn node_data(
-        &mut self,
+    // Manual `Box::pin` future: `node_data` → `refresh_data` → child
+    // `node_data` is a genuine async cycle — unboxed futures would be
+    // infinitely sized (E0733). Boxing breaks it; everything else on the
+    // chain stays a plain `async fn`.
+    fn node_data<'a>(
+        &'a mut self,
         epoch: u64,
-        path_args: &PathArgs,
-    ) -> crate::node_impl::DataResult {
+        path_args: &'a PathArgs,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::node_impl::DataResult> + 'a>,
+    > {
+        Box::pin(async move {
         if !self.value_forwarding {
-            return self.inner.data(epoch, path_args);
+            return self.inner.data(epoch, path_args).await;
         }
 
         // Static rows from the inner node (id + description for parent).
-        let response = self.inner.data(epoch, path_args)?;
+        let response = self.inner.data(epoch, path_args).await?;
 
         // Populate our children's data cache — same mechanism the listing
         // view uses. This is on `self`, never on a child.
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
 
         // Collect active IDs from the refreshed cache.
         let mut all_active = Vec::new();
@@ -236,6 +243,7 @@ impl NodeEntry {
             rows: enriched_rows,
             active_ids: response.active_ids.clone(),
         }))
+        })
     }
 
     // --- Main entry point ---
@@ -247,7 +255,7 @@ impl NodeEntry {
     /// on drill). `prompt_suffix` is this node's section of the prompt
     /// (everything after the parent's matched ID, or the full prompt at root).
     /// `render_ctx` carries display metrics (threaded by reference).
-    pub fn node_traverse(
+    pub async fn node_traverse(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -257,6 +265,7 @@ impl NodeEntry {
     ) -> MenuResult {
         let cursor_pos = prompt_suffix.len();
         self.node_traverse_at(epoch, key, path, prompt_suffix, cursor_pos, render_ctx)
+            .await
     }
 
     /// Like [`node_traverse`](Self::node_traverse) with an explicit
@@ -265,15 +274,19 @@ impl NodeEntry {
     /// completion unless `cursor_pos == prompt_suffix.len()`, so a
     /// mid-line cursor can never complete a different word than the
     /// user edits.
-    pub fn node_traverse_at(
-        &mut self,
+    // Manual `Box::pin` future: `node_traverse_at` → `handle_listing` →
+    // child `node_traverse` is a genuine async cycle (E0733 without
+    // boxing). Same treatment as `node_data`.
+    pub fn node_traverse_at<'a>(
+        &'a mut self,
         epoch: u64,
         key: HostKey,
         path: Vec<String>,
-        prompt_suffix: &str,
+        prompt_suffix: &'a str,
         cursor_pos: usize,
-        render_ctx: &RenderContext,
-    ) -> MenuResult {
+        render_ctx: &'a RenderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MenuResult> + 'a>> {
+        Box::pin(async move {
         // Phase 0: Epoch gate — reset per-node epoch state on new activation.
         if epoch != self.cache_epoch {
             self.epoch = EpochState::default();
@@ -291,14 +304,14 @@ impl NodeEntry {
         // prompt and restart from root. Runs before refresh: at drill
         // time the suffix is " " and needs no row data.
         if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
-            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args) {
+            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args).await {
                 return MenuResult::ContinuePrompt(new_prompt);
             }
         }
 
         // Phase 1: Refresh data from children — `row_index` is fresh
         // for the single parse pass below (no re-parse needed).
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
 
         // Phase 2: Parse section — fills `path_args.args` with byte
         // ranges into its own suffix; wraps it for dispatch.
@@ -330,7 +343,8 @@ impl NodeEntry {
                     None,
                     None,
                     render_ctx,
-                );
+                )
+                .await;
                 return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
             }
         }
@@ -339,7 +353,7 @@ impl NodeEntry {
 
         // Leaf node (no children).
         if self.children.is_empty() {
-            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx);
+            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx).await;
         }
 
         // Listing node: matched child with non-empty tail → recurse.
@@ -364,19 +378,21 @@ impl NodeEntry {
                     child_suffix,
                     child_cursor,
                     render_ctx,
-                );
+                )
+                .await;
             }
             // Matched child, empty tail, no restore → bare ID render (§2.5).
             // Fall through to show listing with cursor on the ID's row.
         }
 
         // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx)
+        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx).await
+        })
     }
 
     // --- Leaf handling ---
 
-    fn handle_leaf(
+    async fn handle_leaf(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -398,7 +414,7 @@ impl NodeEntry {
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -409,21 +425,25 @@ impl NodeEntry {
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
                     self.epoch.confirm_pending = false;
-                    match self.inner.submit(epoch, pa) {
+                    match self.inner.submit(epoch, pa).await {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
                         SubmitResult::Prepared => Self::build_continue(pa),
-                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
+                        SubmitResult::Error(msg) => {
+                            self.error_continue(parsed, &msg, render_ctx).await
+                        }
                     }
                 } else {
-                    match self.inner.prepare(epoch, pa) {
+                    match self.inner.prepare(epoch, pa).await {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::Prepared => {
                             self.epoch.confirm_pending = true;
                             Self::build_continue(pa)
                         }
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
-                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
+                        SubmitResult::Error(msg) => {
+                            self.error_continue(parsed, &msg, render_ctx).await
+                        }
                     }
                 }
             }
@@ -440,7 +460,8 @@ impl NodeEntry {
                 // Tab-drill or bare entry: show header/listing.
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             _ => Self::build_continue(pa),
@@ -451,20 +472,20 @@ impl NodeEntry {
     /// with `[ERROR]: …` above `header()`. Direct render — the returned
     /// plan *is* the frame; nothing is stored, so the next eval
     /// re-derives without the error.
-    fn error_continue(
+    async fn error_continue(
         &mut self,
         parsed: &ParsedSection,
         error: &str,
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let rows = self.ensure_rows(&parsed.path_args);
-        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx);
+        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx).await;
         MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
     }
 
     // --- Listing handling ---
 
-    fn handle_listing(
+    async fn handle_listing(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -489,7 +510,7 @@ impl NodeEntry {
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -500,13 +521,15 @@ impl NodeEntry {
             HostKey::MoveCursor(delta) => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             HostKey::Tab | HostKey::Enter => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 let Some(row) = out.cursor_row else {
                     return Self::build_continue(pa);
                 };
@@ -533,12 +556,14 @@ impl NodeEntry {
                     " ",
                     render_ctx,
                 )
+                .await
             }
             HostKey::Esc => Self::handle_esc(parsed),
             _ => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
         }
@@ -573,7 +598,7 @@ impl NodeEntry {
     /// path for parent→child data access (design §3.2). It may augment
     /// the response (e.g. value forwarding). Bypassing it breaks the
     /// encapsulation that `NodeEntry` provides over `SlashDotNode`.
-    fn refresh_data(&mut self, epoch: u64, path: &[String], tail: &str) -> bool {
+    async fn refresh_data(&mut self, epoch: u64, path: &[String], tail: &str) -> bool {
         // Children's `data()` receives this node's path + tail; this
         // node's `Args` are irrelevant to them (they describe *this*
         // node's section only) — hence two plain slices, not `&PathArgs`.
@@ -584,7 +609,7 @@ impl NodeEntry {
 
         for (i, child) in self.children.iter_mut().enumerate() {
             // One shared `&PathArgs` for every child — built once above.
-            match child.node_data(epoch, &path_args) {
+            match child.node_data(epoch, &path_args).await {
                 Ok(response) => {
                     let same = match self.content.data_rc.get(i) {
                         Some(Some(prev)) => Rc::ptr_eq(prev, &response),
@@ -749,7 +774,7 @@ impl NodeEntry {
     /// `SubmitResult::Error`) — never stored. Drill arms call this too
     /// and discard the returned plan (one `header()` + assembly on an
     /// unchanged view — rows Rc reused).
-    fn view_plan(
+    async fn view_plan(
         &mut self,
         parsed: &ParsedSection,
         pin: Option<&str>,
@@ -771,6 +796,7 @@ impl NodeEntry {
         detail.extend(
             self.inner
                 .header(path_args, render_ctx)
+                .await
                 .into_iter()
                 .map(LogicalLine::new),
         );
@@ -799,7 +825,7 @@ impl NodeEntry {
     /// default). v1 guards: cursor at the end of this level's section,
     /// and a word directly before it (a space dismisses — nothing to
     /// complete).
-    fn completion_pass(
+    async fn completion_pass(
         &mut self,
         parsed: &ParsedSection,
         cursor_pos: usize,
@@ -819,7 +845,7 @@ impl NodeEntry {
             }
         };
         let result = if self.children.is_empty() {
-            self.inner.complete_parameter(pa, cursor_pos)
+            self.inner.complete_parameter(pa, cursor_pos).await
         } else {
             self.default_complete(parsed, cursor_pos)
         };
@@ -854,6 +880,7 @@ impl NodeEntry {
         let detail: Vec<LogicalLine> = self
             .inner
             .header(pa, render_ctx)
+            .await
             .into_iter()
             .map(LogicalLine::new)
             .collect();
@@ -892,7 +919,7 @@ impl NodeEntry {
                     &self.content.row_index,
                 );
                 let rerun = if self.children.is_empty() {
-                    self.inner.complete_parameter(&reparsed.path_args, cursor2)
+                    self.inner.complete_parameter(&reparsed.path_args, cursor2).await
                 } else {
                     self.default_complete(&reparsed, cursor2)
                 };
@@ -1266,8 +1293,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for CmdNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: self.active.clone(),
@@ -1288,15 +1316,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for LeafNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("leaf")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() = Some(
                 path_args
                     .args()
@@ -1313,8 +1342,9 @@ mod tests {
         rows: Vec<crate::fields::Row>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for DynamicNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
@@ -1351,7 +1381,7 @@ mod tests {
         let mut suffix = suffix.to_string();
         let mut key = key;
         for _ in 0..MAX_REWRITES {
-            match root.node_traverse(ep(), key, Vec::new(), &suffix, &rctx()) {
+            match futures::executor::block_on(root.node_traverse(ep(), key, Vec::new(), &suffix, &rctx())) {
                 MenuResult::ContinuePrompt(new) => {
                     suffix = new;
                     key = HostKey::None;
@@ -1365,8 +1395,8 @@ mod tests {
     #[test]
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "");
@@ -1383,8 +1413,8 @@ mod tests {
     #[test]
     fn fuzzy_filter_at_root() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1399,8 +1429,8 @@ mod tests {
     #[test]
     fn bare_id_shows_parent_listing() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", &rctx()));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "alpha");
@@ -1414,9 +1444,9 @@ mod tests {
     #[test]
     fn tab_drills_into_child() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
-        root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
         match result {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, "alpha "),
             other => panic!("expected ContinuePrompt drill, got {:?}", other),
@@ -1426,14 +1456,14 @@ mod tests {
     #[test]
     fn move_cursor_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
-        root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(1)),
             other => panic!("expected Continue, got {:?}", other),
         }
-        let result = root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1443,18 +1473,18 @@ mod tests {
     #[test]
     fn move_cursor_clamps_not_wraps() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
-        root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         // Move past last row: should clamp to last, not wrap to 0.
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", &rctx());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(2)),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Move before first row: should clamp to 0, not wrap.
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", &rctx());
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1467,8 +1497,8 @@ mod tests {
             CmdNode::new("a"),
             CmdNode::with_active("b", "b"),
         ]);
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.active_rows, vec![1]);
@@ -1480,8 +1510,8 @@ mod tests {
     #[test]
     fn esc_at_root_closes() {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", &rctx()));
         assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
     }
 
@@ -1491,14 +1521,15 @@ mod tests {
         header_text: String,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for HeadedRoot {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
             }))
         }
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -1515,8 +1546,8 @@ mod tests {
         }));
         // Give it a child so it's a listing node (not a leaf).
         root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let headers: Vec<&str> = plan.detail.iter().map(|l| l.0.as_str())
@@ -1661,12 +1692,12 @@ mod tests {
     #[test]
     fn epoch_reset_clears_cursor() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
-        root.refresh_data(ep(), &[], "");
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
-        let _ = root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx()));
         assert_eq!(root.view.cursor_idx, 1);
         // New epoch resets.
-        let _ = root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", &rctx());
+        let _ = futures::executor::block_on(root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", &rctx()));
         assert_eq!(root.view.cursor_idx, 0);
     }
 
@@ -1681,9 +1712,9 @@ mod tests {
                 crate::fields::Row::new("m2").desc("second option"),
             ],
         })));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // "first" is in m1's description but not a row ID → fuzzy filter.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "first", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "first", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_count = plan.rows.len();
@@ -1712,8 +1743,8 @@ mod tests {
                 crate::fields::Row::new("p:gpt4-mini").desc("GPT-4 mini fast"),
             ],
         })));
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1742,14 +1773,15 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RecordingLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("action")],
                 active_ids: Vec::new(),
             }))
         }
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.submitted_via.borrow_mut() =
                 Some(path_args.ids.last().cloned().unwrap_or_default());
             SubmitResult::Done(None)
@@ -1772,10 +1804,10 @@ mod tests {
             ],
         })));
 
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Both children's rows should appear in the listing.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1818,26 +1850,26 @@ mod tests {
 
         root.children.push(add_cmd);
         root.children.push(bind_cmd);
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Tab on "add" → drills into add_cmd → shows "action" leaf row.
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         // Move cursor to "add" (it's first) and Tab.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Now at "add ", the add_cmd node shows its leaf child "action".
         // Tab into the leaf.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", &rctx()));
         match result {
             MenuResult::ContinuePrompt(prompt) =>
                 assert!(prompt.starts_with("add action ")),
             other => panic!("expected ContinuePrompt drill, got {:?}", other),
         }
         // Enter on "add action " → submit.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", &rctx()));
         match result {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -1861,10 +1893,10 @@ mod tests {
                 crate::fields::Row::new("bind2").desc("binding two"),
             ],
         })));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // "bind" fuzzy-matches both binding rows but not "add".
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "bind", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1887,10 +1919,10 @@ mod tests {
                 crate::fields::Row::new("valid").desc("has id"),
             ],
         })));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Only "valid" should appear.
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
@@ -1907,15 +1939,16 @@ mod tests {
         prefill: String,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RewriteLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("rename").desc("rename session")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -1923,7 +1956,7 @@ mod tests {
             vec!["rename header".into()]
         }
 
-        fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+        async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
             Some(format!("abc rename {}", self.prefill))
         }
     }
@@ -1941,10 +1974,10 @@ mod tests {
     #[test]
     fn drill_rewrite_fires_on_drill_enter() {
         let mut root = rewrite_root("MySession");
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // User presses Enter at root listing → drills into "rename" leaf
         // with DrillEnter → leaf's drill_rewrite fires.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx()));
         match result {
             MenuResult::ContinuePrompt(prompt) =>
                 assert_eq!(prompt, "abc rename MySession"),
@@ -1955,8 +1988,8 @@ mod tests {
     #[test]
     fn drill_rewrite_fires_on_drill_tab() {
         let mut root = rewrite_root("TabFill");
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
         match result {
             MenuResult::ContinuePrompt(prompt) =>
                 assert_eq!(prompt, "abc rename TabFill"),
@@ -1967,15 +2000,15 @@ mod tests {
     #[test]
     fn drill_rewrite_does_not_fire_on_manual_enter() {
         let mut root = rewrite_root("MySession");
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // User types "rename " and presses Enter — suffix routes through
         // node recursion with HostKey::Enter (not DrillEnter).
         // drill_rewrite should NOT fire; leaf submits normally.
-        let result = root.node_traverse(
+        let result = futures::executor::block_on(root.node_traverse(
             ep(), HostKey::Enter,
             Vec::new(),
             "rename ", &rctx(),
-        );
+        ));
         match result {
             MenuResult::DoneSuccess(_, _) => {
                 // Leaf submitted without drill_rewrite intercepting.
@@ -1990,9 +2023,9 @@ mod tests {
         // through to normal leaf submit.
         let mut root = NodeEntry::new_root();
         root.children.push(NodeEntry::new_child(Box::new(LeafNode::new())));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // User presses Enter at root → drills into leaf with DrillEnter.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx()));
         match result {
             MenuResult::DoneSuccess(_, _) => { /* leaf submitted */ }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -2005,8 +2038,9 @@ mod tests {
     /// id, description, tier: string, price: number + injected sort).
     struct FieldedNode;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for FieldedNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![
                     Row::new("m1")
@@ -2045,8 +2079,8 @@ mod tests {
     #[test]
     fn completion_key_mode_lists_field_names() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(ep(), HostKey::None, Vec::new(), ".t", &rctx());
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), ".t", &rctx()));
         let dialog = match &result {
             MenuResult::Continue(plan, _) => {
                 // Dialog discriminator: candidates render with the fixed
@@ -2067,14 +2101,14 @@ mod tests {
     #[test]
     fn completion_bare_dot_lists_every_key() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".",
             &rctx(),
-        ));
+        )));
         for k in [".id:", ".description:", ".tier:", ".price:", ".sort:"] {
             assert!(rows.iter().any(|r| r.contains(k)), "missing {k}: {rows:?}");
         }
@@ -2084,14 +2118,14 @@ mod tests {
     #[test]
     fn completion_ignores_plain_words() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             "m1",
             &rctx(),
-        ));
+        )));
         // No dialog: the normal fuzzy listing renders.
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
@@ -2100,25 +2134,25 @@ mod tests {
     #[test]
     fn completion_value_mode_string_field() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".tier:fr",
             &rctx(),
-        ));
+        )));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].contains(".tier:free"), "{rows:?}");
 
         // Empty prefix: every distinct value (dataset-derived, D7).
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".tier:",
             &rctx(),
-        ));
+        )));
         assert!(rows.iter().any(|r| r.contains(".tier:free")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains(".tier:paid")), "{rows:?}");
     }
@@ -2126,16 +2160,16 @@ mod tests {
     #[test]
     fn completion_exact_match_closes_dialog() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // `.tier:free` is an exact unique match → no dialog; the normal
         // listing renders (filtered by the modifier to m1/m3).
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".tier:free",
             &rctx(),
-        ));
+        )));
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("m1")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("m3")), "{rows:?}");
@@ -2145,15 +2179,15 @@ mod tests {
     #[test]
     fn completion_number_and_unknown_keys_stay_inert() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         for suffix in [".price:1", ".nope:x", "..", "./src"] {
-            let rows = rows_of(root.node_traverse(
+            let rows = rows_of(futures::executor::block_on(root.node_traverse(
                 ep(),
                 HostKey::None,
                 Vec::new(),
                 suffix,
                 &rctx(),
-            ));
+            )));
             assert!(
                 !rows.iter().any(|r| r.starts_with('.')),
                 "{suffix}: dialog must stay down: {rows:?}"
@@ -2166,31 +2200,31 @@ mod tests {
         // The accepted behavior delta: an invalid-key dot word is a
         // fuzzy term, not a silently-ignored modifier.
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".srot:price",
             &rctx(),
-        ));
+        )));
         assert!(rows.is_empty(), "fuzzy '.srot:price' matches nothing: {rows:?}");
     }
 
     #[test]
     fn completion_mid_cursor_suppressed() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // v1: cursor mid-line → completion suppressed (EOL guard), even
         // though the word under the cursor would otherwise complete.
-        let result = root.node_traverse_at(
+        let result = futures::executor::block_on(root.node_traverse_at(
             ep(),
             HostKey::None,
             Vec::new(),
             ".tier:fr",
             3,
             &rctx(),
-        );
+        ));
         let rows = rows_of(result);
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
     }
@@ -2198,28 +2232,28 @@ mod tests {
     #[test]
     fn completion_space_dismisses() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".tier:free ",
             &rctx(),
-        ));
+        )));
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
     }
 
     #[test]
     fn completion_dialog_cursor_moves_and_persists() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
-        let sel_of = |root: &mut NodeEntry, key: HostKey| match root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let sel_of = |root: &mut NodeEntry, key: HostKey| match futures::executor::block_on(root.node_traverse(
             ep(),
             key,
             Vec::new(),
             ".t",
             &rctx(),
-        ) {
+        )) {
             MenuResult::Continue(plan, _) => plan.selected,
             other => panic!("expected Continue, got {:?}", other),
         };
@@ -2229,34 +2263,34 @@ mod tests {
         // even though the default completer mints a fresh Rc per call).
         assert_eq!(sel_of(&mut root, HostKey::None), Some(1));
         // Dismiss (space): dialog down, listing cursor untouched.
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".t ",
             &rctx(),
-        ));
+        )));
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
     }
 
     #[test]
     fn completion_tab_expands_key_and_progresses_to_values() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // `.so` → prefix match `.sort:` ranked first; `.description:`
         // (subsequence s…o) follows in the fuzzy tier.
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".so",
             &rctx(),
-        ));
+        )));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows[0].contains(".sort:"), "prefix must rank first: {rows:?}");
         // Tab: in-place expansion, NO trailing space — the same-turn
         // re-run lands in value mode (non-empty) and keeps going.
-        let result = root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx()));
         match result {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".sort:"),
             other => panic!("expected ContinuePrompt expansion, got {:?}", other),
@@ -2266,16 +2300,16 @@ mod tests {
     #[test]
     fn completion_tab_final_value_appends_trailing_space() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // `.tier:fr` → Tab expands to `.tier:free`; the same-turn
         // re-run is an exact/final match (empty) → trailing space.
-        let result = root.node_traverse(
+        let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::Tab,
             Vec::new(),
             ".tier:fr",
             &rctx(),
-        );
+        ));
         match result {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".tier:free "),
             other => panic!("expected ContinuePrompt expansion, got {:?}", other),
@@ -2285,17 +2319,17 @@ mod tests {
     #[test]
     fn completion_confirm_pending_suppresses_dialog() {
         let mut root = fielded_root();
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // Init epoch state at this epoch.
-        let _ = root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx());
+        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
         root.epoch.confirm_pending = true;
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".t",
             &rctx(),
-        ));
+        )));
         assert!(!rows.iter().any(|r| r.starts_with('.')), "{rows:?}");
     }
 
@@ -2319,15 +2353,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for PathLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("pathpick").desc("pick a path")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn complete_parameter(
+        async fn complete_parameter(
             &mut self,
             _args: &PathArgs,
             _cursor_pos: usize,
@@ -2341,7 +2376,7 @@ mod tests {
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() =
                 Some(path_args.args().next().unwrap_or_default().to_string());
             SubmitResult::Done(None)
@@ -2353,7 +2388,7 @@ mod tests {
         let leaf = PathLeaf::new();
         let rec = Rc::clone(&leaf.last_submit);
         root.children.push(NodeEntry::new_child(Box::new(leaf)));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         (root, rec)
     }
 
@@ -2361,13 +2396,13 @@ mod tests {
     fn leaf_completion_dialog_and_enter_bypasses_to_submit() {
         let (mut root, rec) = leaf_root();
         // Resolved INTO the leaf (matched id + tail): trait completion.
-        let result = root.node_traverse(
+        let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             "pathpick /h",
             &rctx(),
-        );
+        ));
         match &result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.table_header.is_some(), "dialog columns expected");
@@ -2378,13 +2413,13 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("/home/x/proj")), "{rows:?}");
 
         // Enter bypasses the dialog entirely: submits the RAW word.
-        let result = root.node_traverse(
+        let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::Enter,
             Vec::new(),
             "pathpick /h",
             &rctx(),
-        );
+        ));
         match result {
             MenuResult::DoneSuccess(_, _) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -2398,14 +2433,14 @@ mod tests {
         let mut leaf = PathLeaf::new();
         leaf.err = Some("boom".to_string());
         root.children.push(NodeEntry::new_child(Box::new(leaf)));
-        root.refresh_data(ep(), &[], "");
-        let result = root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             "pathpick /h",
             &rctx(),
-        );
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.detail.len(), 1, "{:?}", plan.detail);
@@ -2420,15 +2455,16 @@ mod tests {
     /// drill guard) and succeeds with one.
     struct ParamLeaf;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ParamLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("param").desc("needs an arg")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -2436,7 +2472,7 @@ mod tests {
             vec!["Specify a host path.".to_string()]
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             if path_args.args().next().is_none() {
                 SubmitResult::Error("host path required".to_string())
             } else {
@@ -2448,7 +2484,7 @@ mod tests {
     fn param_root() -> NodeEntry {
         let mut root = NodeEntry::new_root();
         root.children.push(NodeEntry::new_child(Box::new(ParamLeaf)));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         root
     }
 
@@ -2457,7 +2493,7 @@ mod tests {
         let mut root = param_root();
         // Drill arrival: Enter on the bare id forwards DrillEnter into
         // the leaf with an empty suffix → submit sees no args → Error.
-        let result = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx());
+        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx()));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "param ", "{prompt:?}");
@@ -2480,11 +2516,11 @@ mod tests {
     #[test]
     fn submit_error_is_one_shot() {
         let mut root = param_root();
-        let first = root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx());
+        let first = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx()));
         assert!(matches!(first, MenuResult::Continue(..)), "{:?}", first);
         // The next frame over the SAME prompt re-derives without the
         // error: nothing was stored (direct render, stateless).
-        let second = root.node_traverse(ep(), HostKey::None, Vec::new(), "param ", &rctx());
+        let second = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "param ", &rctx()));
         match second {
             MenuResult::Continue(plan, _) => {
                 assert!(
@@ -2507,7 +2543,7 @@ mod tests {
     fn submit_with_arg_succeeds() {
         let mut root = param_root();
         let result =
-            root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param /home/gab", &rctx());
+            futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param /home/gab", &rctx()));
         match result {
             MenuResult::DoneSuccess(_, prompt) => assert_eq!(prompt, "param /home/gab"),
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -2519,13 +2555,13 @@ mod tests {
         let (mut root, _rec) = leaf_root();
         // Trailing space (just drilled in): no word directly before the
         // cursor → nothing to complete; the leaf header renders instead.
-        let result = root.node_traverse(
+        let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             "pathpick /h ",
             &rctx(),
-        );
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.rows.is_empty(), "{:?}", plan.rows);
@@ -2540,8 +2576,9 @@ mod tests {
     /// ignore field order and rank prefix/length first.
     struct RankedFieldsNode;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RankedFieldsNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("run")
                     .field("price_input", Value::Num(1.0))
@@ -2565,29 +2602,29 @@ mod tests {
         let mut root = NodeEntry::new_root();
         root.children
             .push(NodeEntry::new_child(Box::new(RankedFieldsNode)));
-        root.refresh_data(ep(), &[], "");
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // `.pri` → prefix tier, shortest first, ignoring declaration
         // order: price, price_input, price_output.
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".pri",
             &rctx(),
-        ));
+        )));
         assert_eq!(
             first_tok(&rows),
             vec![".price:", ".price_input:", ".price_output:"],
             "{rows:?}"
         );
         // `.so` → prefix `.sort:` first, fuzzy tier after.
-        let rows = rows_of(root.node_traverse(
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             ".so",
             &rctx(),
-        ));
+        )));
         let ids = first_tok(&rows);
         assert_eq!(ids[0], ".sort:", "prefix must rank first: {ids:?}");
         assert!(ids.contains(&".reasoning:"), "fuzzy tier: {ids:?}");
@@ -2607,14 +2644,14 @@ mod tests {
                 Row::new("models").desc("plural"),
             ],
         })));
-        root.refresh_data(ep(), &[], "");
-        let rows = rows_of(root.node_traverse(
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,
             Vec::new(),
             "mod",
             &rctx(),
-        ));
+        )));
         let ids = first_tok(&rows);
         assert_eq!(
             ids,

@@ -4,10 +4,11 @@
 //! node caches its `Rc<DataResponse>` keyed by the catalog's generation
 //! counter — when the catalog hasn't refreshed, the engine's `Rc::ptr_eq`
 //! check skips the full re-derive (filter → fuzzy → sort → render).
+use std::sync::Arc;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::app_state::AppState;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
@@ -24,8 +25,11 @@ pub struct ModelNode {
     active_fn: Box<dyn Fn() -> String>,
     /// Write the selected model id on submit. `Ok(())` on success.
     submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-    /// Recent model ids for ordering (only for `/model`, None for `/set`).
-    recent: Option<Rc<RefCell<Vec<String>>>>,
+    /// The live `/model` node's app handle: recency ordering in `data()`
+    /// AND the journal record in `submit()`. `None` for
+    /// `/set default_model` — a settings write is not a model change and
+    /// must not journal a `ModelChange`.
+    live: Option<Arc<AppState>>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
@@ -37,20 +41,21 @@ impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
         submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-        recent: Option<Rc<RefCell<Vec<String>>>>,
+        live: Option<Arc<AppState>>,
     ) -> Self {
         ModelNode {
             active_fn,
             submit_fn,
-            recent,
+            live,
             cached_response: None,
             cached_generation: u64::MAX, // force first rebuild
         }
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ModelNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let gen = crate::model_catalog::catalog_generation();
         if let Some(ref cached) = self.cached_response {
             if self.cached_generation == gen {
@@ -62,8 +67,8 @@ impl SlashDotNode for ModelNode {
         let entries = crate::model_catalog::catalog_cached();
         let active_id = (self.active_fn)();
         let active = if active_id.is_empty() { None } else { Some(active_id) };
-        let recent: Vec<String> = self.recent.as_ref()
-            .map(|r| r.borrow().clone())
+        let recent: Vec<String> = self.live.as_ref()
+            .map(|r| r.recent_models())
             .unwrap_or_default();
 
         // Build rows in the same order as the legacy ModelProvider:
@@ -87,13 +92,26 @@ impl SlashDotNode for ModelNode {
         Ok(response)
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let qualified = path_args.ids.last().cloned().unwrap_or_default();
         if qualified.is_empty() {
             return SubmitResult::Done(None);
         }
         match (self.submit_fn)(&qualified) {
-            Ok(()) => SubmitResult::Done(None),
+            Ok(()) => {
+                // Live `/model` node: the explicit commit is journaled NOW —
+                // target-stamp judgment (recorded in the plan): the entry
+                // lands even if the next cycle's rebuild fails; a later
+                // `ModelChange` record corrects the journal. The record
+                // helper skips a value the session already holds, so
+                // re-commits stay idempotent.
+                if let Some(app) = self.live.as_ref() {
+                    if let Some(s) = app.session() {
+                        crate::agent::record_model_change(&s, &qualified).await;
+                    }
+                }
+                SubmitResult::Done(None)
+            }
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
     }
@@ -281,9 +299,7 @@ pub fn model_columns() -> Vec<ColumnDef> {
 ///
 /// The listing node carries column definitions and field metadata;
 /// the `ModelNode` child provides dynamic catalog rows.
-pub fn build_model_node(
-    shared: &Rc<crate::slash_menu_bridge::MenuShared>,
-) -> crate::slashdot_menu::menu::SlashDotMenuNode {
+pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::fields::{FieldSpec, SortDir};
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -313,22 +329,17 @@ pub fn build_model_node(
         FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
         FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
     ]).into();
-    // Live session model: reads from LiveState, writes to LiveState.
-    let ls = shared.live_state.clone();
-    let ls2 = shared.live_state.clone();
-    let recent = Some(shared.recent_models.clone());
+    // Live session model: reads the runtime-target config, writes it, and
+    // records the explicit user commit in one place.
+    let reader = app_state.clone();
+    let writer = app_state.clone();
     node.add_child(ModelNode::new(
-        Box::new(move || ls.borrow().model.clone()),
+        Box::new(move || reader.model()),
         Box::new(move |model| {
-            let mut ls = ls2.borrow_mut();
-            ls.model = model.to_string();
-            // Explicit user commit of this model (Enter on the row): the
-            // agent loop's menu sync consumes this flag to decide whether a
-            // `ModelChange` entry may be appended to the session.
-            ls.model_commit = Some(model.to_string());
+            writer.set_model(model);
             Ok(())
         }),
-        recent,
+        Some(app_state.clone()),
     ).into());
     node
 }
@@ -343,10 +354,10 @@ mod tests {
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does.
-        h.eval_prompt_resolved(prompt, key, 80)
+        futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
 
-    fn test_shared() -> Rc<crate::slash_menu_bridge::MenuShared> {
+    fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -359,19 +370,18 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let shared = Rc::new(crate::slash_menu_bridge::MenuShared::new(settings, None));
-        shared.live_state.borrow_mut().model = "anthropic:claude-3-5-sonnet-20241022".into();
-        shared
+        let app_state = crate::app_state::AppState::for_test(settings);
+        app_state.set_model("anthropic:claude-3-5-sonnet-20241022");
+        app_state
     }
 
-    fn test_model_node(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> ModelNode {
-        let ls = shared.live_state.clone();
-        let ls2 = shared.live_state.clone();
-        let recent = Some(shared.recent_models.clone());
+    fn test_model_node(app_state: &Arc<AppState>) -> ModelNode {
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         ModelNode::new(
-            Box::new(move || ls.borrow().model.clone()),
-            Box::new(move |model| { ls2.borrow_mut().model = model.to_string(); Ok(()) }),
-            recent,
+            Box::new(move || reader.model()),
+            Box::new(move |model| { writer.set_model(model); Ok(()) }),
+            Some(app_state.clone()),
         )
     }
 
@@ -420,36 +430,36 @@ mod tests {
 
     #[test]
     fn model_node_returns_rows() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args);
+        let result = futures::executor::block_on(node.data(1, &path_args));
         assert!(result.is_ok(), "data() should not error");
     }
 
     #[test]
     fn model_node_caches_rc() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
             args: Default::default(),
         };
-        let r1 = node.data(1, &path_args).unwrap();
-        let r2 = node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
+        let r2 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         // Same generation → same Rc.
         assert!(Rc::ptr_eq(&r1, &r2));
     }
 
     #[test]
     fn model_node_columns() {
-        let shared = test_shared();
-        let node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let node = test_model_node(&app_state);
         let cols = node.columns();
         assert_eq!(cols.len(), 6);
         assert!(cols.iter().any(|c| c.header == "Price in"));
@@ -457,8 +467,8 @@ mod tests {
 
     #[test]
     fn model_node_fields() {
-        let shared = test_shared();
-        let node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let node = test_model_node(&app_state);
         let fields = node.fields();
         assert!(fields.iter().any(|f| f.name == "context"));
         assert!(fields.iter().any(|f| f.name == "price"));
@@ -467,28 +477,56 @@ mod tests {
 
     #[test]
     fn model_node_submit_writes_settings() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: vec!["model".into(), "openai:gpt-4o".into()],
             suffix: " ".into(),
             args: Default::default(),
         };
-        match node.submit(1, &path_args) {
+        match futures::executor::block_on(node.submit(1, &path_args)) {
             SubmitResult::Done(_) => {}
             _ => panic!("expected Done"),
         }
-        // Live state, not persistent settings.
-        assert_eq!(shared.live_state.borrow().model, "openai:gpt-4o");
+        // Runtime-target config, not persistent settings.
+        assert_eq!(app_state.model(), "openai:gpt-4o");
     }
 
-    fn build_test_menu(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> crate::slashdot_menu::SlashDotMenu {
+    /// The live `/model` node journals its explicit commit at submit time
+    /// (target-stamp: no `model_commit` register, no loop round-trip).
+    #[test]
+    fn model_submit_records_model_change_inline() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = test_model_node(&app_state);
+        let path_args = PathArgs {
+            ids: vec!["model".into(), "openai:gpt-4o".into()],
+            suffix: " ".into(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let recorded = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::ModelChange { provider, model_id }
+                        if provider == "openai" && model_id == "gpt-4o"
+                )
+            })
+        });
+        assert!(recorded, "the commit must land in the journal inline");
+    }
+
+    fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("model", "select a model"),
         ]).into();
-        ml.add_child(test_model_node(shared).into());
+        ml.add_child(test_model_node(app_state).into());
         root.add_child(ml);
         crate::slashdot_menu::SlashDotMenu::from_root_node(root)
     }
@@ -497,8 +535,8 @@ mod tests {
     /// Tab into a catalog entry → Enter submits.
     #[test]
     fn model_full_traversal() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
 
         let mut h = menu.get_handle();
         // Root listing: shows the "model" row.
@@ -529,9 +567,9 @@ mod tests {
                             "should drill into a model entry, got: {}", prompt);
                         match eval(&mut h, &prompt, crate::slashdot_menu::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                                let model = shared.live_state.borrow().model.clone();
+                                let model = app_state.model();
                                 assert!(!model.is_empty(),
-                                    "live_state should have a model after submit");
+                                    "target config should have a model after submit");
                             }
                             other => panic!("expected DoneSuccess on model Enter, got {:?}", other),
                         }
@@ -545,8 +583,8 @@ mod tests {
     /// Model fuzzy filter: typing a partial model name narrows the listing.
     #[test]
     fn model_fuzzy_filter() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
 
         let mut h = menu.get_handle();
         // Unfiltered count.
@@ -573,8 +611,8 @@ mod tests {
     /// plus the model field keys.
     #[test]
     fn model_dot_modifier_opens_completion_dialog() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         match eval(&mut h, "model .", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {

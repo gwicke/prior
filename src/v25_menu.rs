@@ -1,28 +1,21 @@
 //! v2.5 root menu builder — constructs the `SlashDotMenu` tree with all
 //! ported commands. Called once at REPL startup.
+use std::sync::Arc;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use crate::slash_menu_bridge::{LiveState, MenuShared};
-use crate::settings::SettingsStore;
+use crate::app_state::AppState;
 use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
 
 use crate::v25_thinking::ThinkingEnumNode;
 
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
-pub fn build_menu(
-    live_state: &Rc<RefCell<LiveState>>,
-    settings: &Rc<RefCell<SettingsStore>>,
-    shared: &Rc<MenuShared>,
-) -> SlashDotMenu {
+pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
     let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
 
     // Thinking: listing + single enum node (returns all levels via data()).
     {
-        let ls = live_state.clone();
-        let ls2 = live_state.clone();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
         ]).with_columns(vec![
@@ -31,11 +24,10 @@ pub fn build_menu(
         ]).into();
         tl.add_child(ThinkingEnumNode {
             active_fn: Box::new(move || {
-                let ls = ls.borrow();
-                ls.thinking_level.clone().unwrap_or_else(|| "off".to_string())
+                reader.thinking().unwrap_or_else(|| "off".to_string())
             }),
             submit_fn: Box::new(move |level| {
-                ls2.borrow_mut().thinking_level = Some(level.to_string());
+                writer.set_thinking(Some(level.to_string()));
                 Ok(())
             }),
         }.into());
@@ -50,19 +42,19 @@ pub fn build_menu(
             crate::slashdot_menu::ColumnDef::new("id", "Persona"),
             crate::slashdot_menu::ColumnDef::new("description", "Description"),
         ]).into();
-        crate::v25_persona::add_persona_child(&mut pl, live_state);
+        crate::v25_persona::add_persona_child(&mut pl, app_state);
         root.add_child(pl);
     }
 
     // Model
     {
-        let ml: SlashDotMenuNode = crate::v25_model::build_model_node(shared);
+        let ml: SlashDotMenuNode = crate::v25_model::build_model_node(app_state);
         root.add_child(ml);
     }
 
     // Settings (/set)
     {
-        let sn: SlashDotMenuNode = crate::v25_set::build_set_node(settings);
+        let sn: SlashDotMenuNode = crate::v25_set::build_set_node(app_state);
         root.add_child(sn);
     }
 
@@ -70,7 +62,7 @@ pub fn build_menu(
     // data() returns the row for the root listing; header() shows stats.
     {
         root.add_child(crate::v25_stat::StatNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
@@ -78,51 +70,51 @@ pub fn build_menu(
     // data() returns the row for the root listing; header() shows help.
     {
         root.add_child(crate::v25_replay::ReplayNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
     // Session (/session) — dynamic listing with action children.
     {
-        root.add_child(crate::v25_session::build_session_node(shared));
+        root.add_child(crate::v25_session::build_session_node(app_state));
     }
 
-    // New (/new) — leaf node; sets AsyncOp::New.
+    // New (/new) — leaf node; sets the `new_session` control target.
     {
         root.add_child(crate::v25_new::NewNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
-    // Clear (/clear) — leaf node; sets AsyncOp::Clear.
+    // Clear (/clear) — leaf node; composes new + delete-ids targets.
     {
         root.add_child(crate::v25_clear::ClearNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
     // Compact (/compact) — leaf node; redirects to /tree <id> compact.
     {
         root.add_child(crate::v25_tree::CompactNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
     // Tree (/tree) — dynamic listing with action children.
     {
-        root.add_child(crate::v25_tree::build_tree_node(shared));
+        root.add_child(crate::v25_tree::build_tree_node(app_state));
     }
 
     // Sandbox (/sandbox) — path mappings: static add + dynamic mapping
     // listing with remove/restore actions.
     {
-        root.add_child(crate::v25_sandbox::build_sandbox_node(shared));
+        root.add_child(crate::v25_sandbox::build_sandbox_node(app_state));
     }
 
-    // Quit (/quit) — leaf node; sets AsyncOp::Quit.
+    // Quit (/quit) — leaf node; latches the `quit` control target.
     {
         root.add_child(crate::v25_quit::QuitNode {
-            shared: shared.clone(),
+            app_state: app_state.clone(),
         }.into());
     }
 
@@ -135,8 +127,8 @@ mod tests {
     use crate::slashdot_menu::node_impl::MenuResult;
     use crate::slashdot_menu::HostKey;
 
-    fn test_shared() -> Rc<MenuShared> {
-        let settings = SettingsStore {
+    fn test_app_state() -> Arc<AppState> {
+        let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
             tool_call_limit: 10,
@@ -148,17 +140,17 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        Rc::new(MenuShared::new(settings, None))
+        crate::app_state::AppState::for_test(settings)
     }
 
     /// The root listing lists every command, and `help` is **absent**
     /// (codifies the deliberate removal of the help overlay).
     #[test]
     fn root_listing_lists_all_commands_without_help() {
-        let shared = test_shared();
-        let mut menu = build_menu(&shared.live_state, &shared.settings, &shared);
+        let app_state = test_app_state();
+        let mut menu = build_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let ids: Vec<&str> = plan
                     .rows
