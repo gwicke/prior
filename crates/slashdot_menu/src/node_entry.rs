@@ -1033,14 +1033,13 @@ impl NodeEntry {
                 if !names.iter().any(|n| n == "sort") {
                     names.push("sort".to_string());
                 }
-                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = names
-                    .iter()
-                    .map(|n| {
-                        let owned: String = n.clone();
-                        (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
-                    })
-                    .collect();
-                let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
+                // Match against the *rendered* row id (`.name:`) so highlight
+                // offsets line up with the dialog's `id` column.
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
+                    ("id".to_string(), Box::new(|k: &String| format!(".{}:", k))
+                        as Box<dyn for<'a> Fn(&'a String) -> String>),
+                ];
+                let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                     &names,
                     prefix,
                     |k| k.to_string(),
@@ -1048,20 +1047,19 @@ impl NodeEntry {
                     &field_extractors,
                 );
                 let rows: Vec<Row> = ranked
-                    .into_iter()
+                    .iter()
                     .map(|k| Row::new(format!(".{}:", k)).desc(field_desc(k)))
                     .collect();
-                let match_indices = if !rows.is_empty() {
+                let match_indices = if rows.is_empty() {
+                    None
+                } else {
                     let mut map = HashMap::new();
-                    for (idx, name) in names.iter().enumerate() {
-                        let ptr = name as *const String;
-                        if let Some(indices) = match_indices_map.get(&ptr) {
-                            map.insert(idx, indices.clone());
+                    for (idx, fm) in match_by_rank.into_iter().enumerate() {
+                        if !fm.is_empty() {
+                            map.insert(idx, fm);
                         }
                     }
                     Some(map)
-                } else {
-                    None
                 };
                 return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
             }
@@ -1071,14 +1069,12 @@ impl NodeEntry {
                 // `.sort:` → field names as values (contains filter).
                 if key == "sort" {
                     let names: Vec<String> = field_space.names(true).into_iter().map(|s| s.to_string()).collect();
-                    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = names
-                        .iter()
-                        .map(|n| {
-                            let owned: String = n.clone();
-                            (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
-                        })
-                        .collect();
-                    let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
+                    // Match against the rendered row id (`.sort:name`).
+                    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
+                        ("id".to_string(), Box::new(|f: &String| format!(".sort:{}", f))
+                            as Box<dyn for<'a> Fn(&'a String) -> String>),
+                    ];
+                    let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                         &names,
                         value,
                         |f| f.to_string(),
@@ -1086,20 +1082,19 @@ impl NodeEntry {
                         &field_extractors,
                     );
                     let rows: Vec<Row> = ranked
-                        .into_iter()
+                        .iter()
                         .map(|f| Row::new(format!(".sort:{}", f)).desc(field_desc(f)))
                         .collect();
-                    let match_indices = if !rows.is_empty() {
+                    let match_indices = if rows.is_empty() {
+                        None
+                    } else {
                         let mut map = HashMap::new();
-                        for (idx, name) in names.iter().enumerate() {
-                            let ptr = name as *const String;
-                            if let Some(indices) = match_indices_map.get(&ptr) {
-                                map.insert(idx, indices.clone());
+                        for (idx, fm) in match_by_rank.into_iter().enumerate() {
+                            if !fm.is_empty() {
+                                map.insert(idx, fm);
                             }
                         }
                         Some(map)
-                    } else {
-                        None
                     };
                     return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
                 }
@@ -1126,14 +1121,13 @@ impl NodeEntry {
                         }
                     }
                 }
-                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = values
-                    .iter()
-                    .map(|v| {
-                        let owned: String = v.clone();
-                        (owned.clone(), Box::new(move |s: &String| s.clone()) as Box<dyn for<'a> Fn(&'a String) -> String>)
-                    })
-                    .collect();
-                let (ranked, match_indices_map): (Vec<&String>, HashMap<*const String, HashMap<String, Vec<usize>>>) = crate::fuzzy::rank_candidates(
+                // Match against the rendered row id (`.key:value`).
+                let key_owned = key.to_string();
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
+                    ("id".to_string(), Box::new(move |v: &String| format!(".{}:{}", key_owned, v))
+                        as Box<dyn for<'a> Fn(&'a String) -> String>),
+                ];
+                let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                     &values,
                     value,
                     |s| s.clone(),
@@ -1141,27 +1135,23 @@ impl NodeEntry {
                     &field_extractors,
                 );
                 let rows: Vec<Row> = ranked
-                    .into_iter()
+                    .iter()
                     .map(|v| Row::new(format!(".{}:{}", key, v)).desc("string"))
                     .collect();
                 // Exact match check: if all rows have the same id as the typed word, return empty (closes dialog).
                 let all_exact = !rows.is_empty() && rows.iter().all(|r| r.id == word);
                 let (final_rows, final_match_indices) = if all_exact {
                     (Vec::new(), None)
+                } else if rows.is_empty() {
+                    (rows, None)
                 } else {
-                    let match_indices = if !rows.is_empty() {
-                        let mut map = HashMap::new();
-                        for (idx, val) in values.iter().enumerate() {
-                            let ptr = val as *const String;
-                            if let Some(indices) = match_indices_map.get(&ptr) {
-                                map.insert(idx, indices.clone());
-                            }
+                    let mut map = HashMap::new();
+                    for (idx, fm) in match_by_rank.into_iter().enumerate() {
+                        if !fm.is_empty() {
+                            map.insert(idx, fm);
                         }
-                        Some(map)
-                    } else {
-                        None
-                    };
-                    (rows, match_indices)
+                    }
+                    (rows, Some(map))
                 };
                 return Ok(Rc::new(CompletionRows { rows: final_rows, labels: None, match_indices: final_match_indices }));
             }
