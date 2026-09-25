@@ -424,10 +424,10 @@ pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMe
 
 // ── Option A: ActiveOverlay enum ───────────────────────────────────────
 
-/// The input-region overlay currently shown: none, the v2.5 menu frame, or
-/// the prompt-line path-completion popup. Each variant carries its own
-/// pre-computed display data so Tab/Enter/Esc handlers never need to
-/// re-query the buffer.
+/// The input-region overlay currently shown: none, the v2.5 menu frame,
+/// or the prompt-line (prose) completion dialog. Both plan-carrying
+/// variants are pure display snapshots — key dispatch routes through the
+/// engine that produced the plan (slash handle / prose completer).
 pub(crate) enum ActiveOverlay {
     None,
 
@@ -439,9 +439,12 @@ pub(crate) enum ActiveOverlay {
         plan: crate::slashdot_menu::render::RenderPlan,
     },
 
+    /// Prose completion dialog: a `RenderPlan` from
+    /// `prompt_complete::PromptCompletion::eval`. Tab splices the
+    /// cursor row's id through the prose layer; Enter/Esc bypass
+    /// (submit the raw line / no-op — stateless dismissal).
     PathComplete {
-        completions: Vec<String>,
-        completion_pos: Option<(usize, usize)>,
+        plan: crate::slashdot_menu::render::RenderPlan,
     },
 }
 
@@ -459,86 +462,29 @@ impl ActiveOverlay {
         (opts, plan.active_rows.first().copied())
     }
 
-    /// Display parameters: `(title, logical options, active index, wrap_opts)`.
-    /// The caller feeds these to `Repl::overlay_lines` for final rendering.
-    fn display_rows(&self) -> (&str, Vec<String>, Option<usize>, bool) {
+    /// Display parameters: `(logical options, active index)` for
+    /// cursor/focus math. Both plan-carrying variants decompose the
+    /// same way; painting goes through `paint_plan` directly.
+    fn display_rows(&self) -> (Vec<String>, Option<usize>) {
         match self {
-            ActiveOverlay::None => ("", vec![], None, false),
-            ActiveOverlay::V25Menu { plan, .. } => {
+            ActiveOverlay::None => (vec![], None),
+            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
                 if plan.rows.is_empty() {
-                    return ("", vec!["(no results)".into()], None, false);
+                    return (vec!["(no results)".into()], None);
                 }
-                let (opts, active) = Self::plan_rows(plan);
-                ("", opts, active, false)
-            }
-            ActiveOverlay::PathComplete { completions, .. } => {
-                ("Path completions  (up/down, Tab/Enter select, Esc dismiss)",
-                 completions.clone(), None, false)
+                Self::plan_rows(plan)
             }
         }
     }
 
-    /// The engine-owned cursor row for this overlay, if backed by the
-    /// v2.5 engine. `None` for host-cursor overlays (PathComplete).
+    /// The engine-owned cursor row for this overlay (both variants are
+    /// plan-backed). `None` for no overlay / a plan without rows.
     pub fn cursor_row(&self) -> Option<usize> {
         match self {
-            ActiveOverlay::V25Menu { plan } => plan.selected,
-            _ => None,
-        }
-    }
-
-    /// Handle Tab on a selected row.  Mutates the editor in-place.
-    fn handle_tab(
-        &self,
-        sel: usize,
-        editor: &mut LineEditor,
-        path_completions: &mut Vec<String>,
-        completion_pos: &mut Option<(usize, usize)>,
-    ) {
-        match self {
-            ActiveOverlay::PathComplete { completions, completion_pos: pos } => {
-                if let Some(c) = completions.get(sel) {
-                    let buf = editor.text();
-                    if let Some((start, end)) = pos {
-                        editor.replace_range(*start, *end, c);
-                    } else {
-                        editor.set(&Repl::replace_last_token(&buf, c));
-                    }
-                    path_completions.clear();
-                    *completion_pos = None;
-                }
+            ActiveOverlay::None => None,
+            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+                plan.selected
             }
-            _ => {}
-        }
-    }
-
-    /// Handle Enter on a selected row: apply the path completion (the
-    /// v2.5 overlay routes Enter through the engine before this).
-    fn handle_enter(&self, sel: usize, editor: &mut LineEditor) {
-        if let ActiveOverlay::PathComplete { completions, completion_pos: pos } = self {
-            if let Some(c) = completions.get(sel) {
-                let buf = editor.text();
-                if let Some((start, end)) = pos {
-                    editor.replace_range(*start, *end, c);
-                } else {
-                    editor.set(&Repl::replace_last_token(&buf, c));
-                }
-            }
-        }
-    }
-
-    /// Handle Escape.
-    fn handle_esc(
-        &self,
-        path_completions: &mut Vec<String>,
-        completion_pos: &mut Option<(usize, usize)>,
-    ) {
-        match self {
-            ActiveOverlay::PathComplete { .. } => {
-                path_completions.clear();
-                *completion_pos = None;
-            }
-            _ => {}
         }
     }
 
@@ -641,8 +587,6 @@ impl Repl {
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
         let mut sel: usize = 0;
-        let mut path_completions: Vec<String> = Vec::new();
-        let mut completion_pos: Option<(usize, usize)> = None;
         let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
         // v2.5 engine: persistent menu tree + guard-like handle.
         // The menu lives for the entire prompt session; the handle is
@@ -650,6 +594,10 @@ impl Repl {
         // no longer does. All `/` dispatch goes through `eval_prompt`.
         let mut v25_menu = crate::v25_menu::build_menu(app_state);
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
+        // Prose (non-`/`) completion: one instance for the prompt
+        // session, parallel to the slash handle. Spawns its FS worker;
+        // the worker exits when this (and its `Sender`) drops.
+        let mut prose = crate::prompt_complete::PromptCompletion::new();
         // Engine key queued by the dispatch below for the *next*
         // iteration's eval (eval → display → wait loop shape). `None`
         // = passive frame (buffer edits, first iteration). Consumed
@@ -877,20 +825,25 @@ impl Repl {
                         ActiveOverlay::None
                     }
                 }
-            } else if !path_completions.is_empty() {
-                v25_handle = None;
-                ActiveOverlay::PathComplete {
-                    completions: path_completions.to_vec(),
-                    completion_pos: None,
-                }
             } else {
                 // Drop the v25 handle when prompt leaves `/`.
                 v25_handle = None;
-                ActiveOverlay::None
+                // Prose frames: one eval drives the word gate, the
+                // debounce, and the dialog. Idle ⇒ no overlay (stateless
+                // dismissal: the next frame re-derives from the buffer).
+                let ctx = crate::slashdot_menu::RenderContext {
+                    term_width: crate::output::term_width().max(1),
+                };
+                match prose.eval(&mut editor, key, ctx) {
+                    crate::prompt_complete::Frame::Idle => ActiveOverlay::None,
+                    crate::prompt_complete::Frame::Dialog(plan) => {
+                        ActiveOverlay::PathComplete { plan }
+                    }
+                }
             };
             // Hoisted before the sel-reset so `active` (the menu's
             // default/current-state row) can drive the cursor policy below.
-            let (title, raw_opts, active, wrap) = overlay.display_rows();
+            let (raw_opts, active) = overlay.display_rows();
             let cur_disc = overlay.overlay_disc();
             if overlay.cursor_row().is_some() {
                 // Engine-owned cursor: `sel` IS the engine's cursor row
@@ -908,7 +861,6 @@ impl Repl {
             if cur_disc != last_disc {
                 last_disc = cur_disc;
             }
-            let title = title.to_string();
             let opts = raw_opts;
             let max_sel = opts.len().saturating_sub(1);
             if sel > max_sel {
@@ -916,73 +868,9 @@ impl Repl {
             }
             let overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
-                ActiveOverlay::V25Menu { plan } => {
-                    let tw = crate::output::term_width().max(1);
-                    let mut result: Vec<String> = Vec::new();
-
-                    // --- Space allocation ---
-                    // `cur_h` is the full terminal height; 2/3 is the overlay budget.
-                    let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                    let table_header_lines = if plan.table_header.is_some() { 1 } else { 0 };
-                    let min_rows = 3usize;
-
-                    // Count visual lines each detail item occupies (LogicalLine
-                    // may contain embedded \n for wrapped sub-lines).
-                    let detail_visual: Vec<usize> = plan.detail.iter()
-                        .map(|d| d.0.split('\n').count())
-                        .collect();
-                    let total_detail_vis: usize = detail_visual.iter().sum();
-                    let total_rows = plan.rows.len();
-
-                    let (detail_budget, data_budget) =
-                        Self::compute_space_budget(max_pop, table_header_lines,
-                            total_detail_vis, total_rows, min_rows);
-
-                    // 1. Detail (header() output — no background, stands out).
-                    let mut detail_vis_used = 0usize;
-                    for (d, &vis) in plan.detail.iter().zip(&detail_visual) {
-                        if detail_vis_used + vis > detail_budget { break; }
-                        result.push(Self::render_logical_line(d, tw, false, false, false));
-                        detail_vis_used += vis;
-                    }
-
-                    // 2. Table header (column labels, grey background).
-                    if let Some(ref th) = plan.table_header {
-                        result.push(Self::render_logical_line(th, tw, false, false, true));
-                    }
-
-                    // 3. Data rows, windowed around `selected` (visual-line-aware).
-                    let total = plan.rows.len();
-                    if total > 0 {
-                        let sel_idx = plan.selected.unwrap_or(0);
-                        let (win_start, win_count) =
-                            Self::visual_row_window(&plan.rows, sel_idx, data_budget);
-                        for i in win_start..(win_start + win_count).min(total) {
-                            let is_selected = plan.selected == Some(i);
-                            let is_active = plan.active_rows.contains(&i);
-                            let row = &plan.rows[i];
-                            let sub_lines: Vec<&str> = row.0.split('\n').collect();
-                            for (j, sub) in sub_lines.iter().enumerate() {
-                                let first = j == 0;
-                                let marker = if first {
-                                    if is_active { "* " }
-                                    else if is_selected { "> " }
-                                    else { "  " }
-                                } else {
-                                    "  "
-                                };
-                                let bg = if is_selected { "\x1b[48;5;239m" } else { "\x1b[48;5;235m" };
-                                let fg = if is_selected { "\x1b[1;36m" } else { "" };
-                                let content = format!("{}{}", marker, sub);
-                                let vis = crate::slashdot_menu::table::display_width(&content);
-                                let pad = tw.saturating_sub(vis);
-                                result.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
-                            }
-                        }
-                    }
-                    result.join("\n")
+                ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
+                    Self::paint_plan(plan, cur_h)
                 }
-                _ => Self::overlay_lines(title.as_str(), &opts, None, sel, active, wrap),
             };
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
             let focus = {
@@ -992,8 +880,26 @@ impl Repl {
             redraw(&editor, &overlay_vec, focus, &mut input_row);
             prev_term_h.set(cur_h);
 
-            // --- Read and dispatch one key. ---
-            match event::read() {
+            // --- Wait for a key (or a prose-completion wake). While a
+            // prose request is armed/in flight, poll with a deadline so
+            // the dialog can open (or the debounce fire) without a
+            // keystroke; otherwise block as before. Slash frames block —
+            // prose state is not consulted while `/` owns the buffer. ---
+            let prose_wait = if editor.chars().first() == Some(&'/') {
+                None
+            } else {
+                prose.poll_timeout()
+            };
+            let ev = match prose_wait {
+                Some(d) => match event::poll(d) {
+                    Ok(true) => event::read(),
+                    Ok(false) => continue, // wake: re-eval (drain / arm)
+                    Err(_) => return None,
+                },
+                None => event::read(),
+            };
+            // --- Dispatch one key. ---
+            match ev {
                 Ok(Event::Key(key)) => {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
@@ -1047,11 +953,11 @@ impl Repl {
                     if !matches!(overlay, ActiveOverlay::None) {
                         match key.code {
                             KeyCode::Down | KeyCode::Up => {
-                                // v2.5: queue the cursor move for the next
-                                // eval — the loop applies the result (plan
-                                // + prompt) in one place. Host-cursor
-                                // overlays (PathComplete) move `sel`
-                                // directly.
+                                // Engine-owned cursor (slash handle or prose
+                                // completer): queue the delta for the next
+                                // eval — it applies the result in one place.
+                                // The host-`sel` fallback below is for the
+                                // empty-plan V25Menu case only.
                                 if overlay.cursor_row().is_some() {
                                     let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
                                     pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
@@ -1064,38 +970,35 @@ impl Repl {
                                 }
                             }
                             KeyCode::PageDown | KeyCode::PageUp => {
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
-                                    // V25Menu: visual-line-aware page scroll through engine.
-                                    // (Handle must exist: a V25Menu overlay
-                                    // was just produced by an eval on it.)
-                                    if v25_handle.is_some() {
-                                        // Get current selected from the plan.
-                                        let cur_sel = match &overlay {
-                                            ActiveOverlay::V25Menu { plan } => plan.selected.unwrap_or(0),
-                                            _ => 0,
-                                        };
-                                        // Compute page budget (same formula as overlay rendering).
-                                        let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
-                                        let cur_h = cur_h.max(1) as usize;
-                                        let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                                        let (plan_rows, detail_vis, th_lines) = match &overlay {
-                                            ActiveOverlay::V25Menu { plan } => {
-                                                let dv: usize = plan.detail.iter()
-                                                    .map(|d| d.0.split('\n').count())
-                                                    .sum();
-                                                (&plan.rows, dv, if plan.table_header.is_some() { 1 } else { 0 })
-                                            }
-                                            _ => unreachable!(),
-                                        };
-                                        let (_, data_budget) = Self::compute_space_budget(
-                                            max_pop, th_lines, detail_vis,
-                                            plan_rows.len(), 3,
-                                        );
-                                        let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
-                                        let delta = Self::page_delta(plan_rows, cur_sel, data_budget, direction);
-                                        if delta != 0 {
-                                            pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
-                                        }
+                                // Plan-carrying overlays: visual-line-aware
+                                // page scroll through the engine that owns
+                                // the cursor (slash handle / prose).
+                                let plan = match &overlay {
+                                    ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => Some(plan),
+                                    ActiveOverlay::None => None,
+                                };
+                                if let Some(plan) = plan {
+                                    if !matches!(overlay, ActiveOverlay::PathComplete { .. })
+                                        && v25_handle.is_none()
+                                    {
+                                        continue; // V25 overlay without its handle
+                                    }
+                                    let cur_sel = plan.selected.unwrap_or(0);
+                                    // Compute page budget (same formula as overlay rendering).
+                                    let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    let cur_h = cur_h.max(1) as usize;
+                                    let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                                    let dv: usize = plan.detail.iter()
+                                        .map(|d| d.0.split('\n').count())
+                                        .sum();
+                                    let th_lines = if plan.table_header.is_some() { 1 } else { 0 };
+                                    let (_, data_budget) = Self::compute_space_budget(
+                                        max_pop, th_lines, dv, plan.rows.len(), 3,
+                                    );
+                                    let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
+                                    let delta = Self::page_delta(&plan.rows, cur_sel, data_budget, direction);
+                                    if delta != 0 {
+                                        pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     }
                                     continue;
                                 }
@@ -1110,44 +1013,55 @@ impl Repl {
                                 }
                             }
                             KeyCode::Tab => {
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                // Both plan-carrying overlays route Tab
+                                // through the engine that produced the plan:
+                                // slash drills/expands, prose splices the
+                                // selected id over the word.
+                                if matches!(overlay, ActiveOverlay::V25Menu { .. }
+                                    | ActiveOverlay::PathComplete { .. })
+                                {
                                     pending_key = Some(crate::slashdot_menu::HostKey::Tab);
-                                } else {
-                                    overlay.handle_tab(sel, &mut editor,
-                                        &mut path_completions, &mut completion_pos);
                                 }
                             }
                             KeyCode::Enter => {
-                                if !key.modifiers.contains(KeyModifiers::SHIFT) {
-                                    // v2.5 path: queue the key; the next
-                                    // iteration's eval handles submit
-                                    // (commit + return) or rewrite inline.
-                                    if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
+                                    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        // Slash: queue the key; the next
+                                        // iteration's eval handles submit
+                                        // (commit + return) or rewrite inline.
                                         pending_key = Some(crate::slashdot_menu::HostKey::Enter);
-                                        continue;
                                     }
-                                    overlay.handle_enter(sel, &mut editor);
+                                    continue;
                                 }
+                                // Prose dialog: Enter bypasses completion —
+                                // submit the raw line (Shift+Enter inserts a
+                                // newline). Tab is the only expansion key.
+                                if let Some(a) = Self::edit_key(
+                                    key, &mut editor, history, &mut nav, &mut draft, prompt)
+                                {
+                                    if let InputAction::Submit(_) = &a {
+                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                    }
+                                    return Some(a);
+                                }
+                                continue;
                             }
                             KeyCode::Esc => {
-                                // Phase 6.6 item 3: engine-backed overlays
-                                // route Esc through the engine's per-level
-                                // ladder (frame replay + esc()); legacy
-                                // overlays keep their bespoke rewrites until
-                                // they migrate.
+                                // Slash engine-backed overlays route Esc
+                                // through the engine's per-level ladder
+                                // (frame replay + esc()). Prose: Esc is a
+                                // no-op — dismissal is buffer-driven
+                                // (stateless); in plain editing Esc is a
+                                // no-op too, so this is uniform.
                                 if matches!(overlay, ActiveOverlay::V25Menu { .. }) {
                                     pending_key = Some(crate::slashdot_menu::HostKey::Esc);
                                     continue;
                                 }
-                                overlay.handle_esc(&mut path_completions, &mut completion_pos);
                             }
                             _ => {
-                                // Editing key while path-completion overlay is active
-                                // dismisses it (user is typing something else).
-                                if matches!(overlay, ActiveOverlay::PathComplete { .. }) {
-                                    path_completions.clear();
-                                    completion_pos = None;
-                                }
+                                // Editing keys pass through in both cases;
+                                // dismissal is stateless — the next eval
+                                // re-derives the dialog from the buffer.
                                 if let Some(a) = Self::edit_key(
                                     key, &mut editor, history, &mut nav, &mut draft, prompt)
                                 {
@@ -1160,33 +1074,9 @@ impl Repl {
                         }
                         continue;
                     }
-                    // No overlay: normal editing.
-                    // Tab: file-path completion on the token at the cursor.
-                    if let KeyCode::Tab = key.code {
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && !key.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            let buf = editor.text();
-                            let cursor = editor.cursor;
-                            let buf_chars: Vec<char> = buf.chars().collect();
-                            let (tok_start, tok_end, token) =
-                                Self::token_at_cursor(&buf_chars, cursor);
-                            if !token.is_empty() {
-                                // Complete using sandbox-aware listing when
-                                // the sandbox is active; falls back to the
-                                // host filesystem otherwise.
-                                let completions = Self::complete_path_prefix_sandbox(&token);
-                                if completions.len() == 1 {
-                                    editor.replace_range(tok_start, tok_end, &completions[0]);
-                                } else if !completions.is_empty() {
-                                    path_completions = completions;
-                                    completion_pos = Some((tok_start, tok_end));
-                                    sel = 0;
-                                }
-                            }
-                            continue;
-                        }
-                    }
+                    // No overlay: normal editing (Tab with no dialog is
+                    // inert — implicit open means the dialog is already up
+                    // whenever there is anything to complete).
                     if let Some(a) =
                         Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                     {
@@ -1444,6 +1334,83 @@ impl Repl {
             }
         }
         delta
+    }
+
+    /// Paint an engine `RenderPlan` to ANSI overlay text: detail lines,
+    /// table header, then data rows windowed around `selected` within
+    /// the 2/3-height overlay budget. Shared by the plan-carrying
+    /// overlay variants (slash `V25Menu`, prose `PathComplete`) — the
+    /// one place a `RenderPlan` becomes display lines. Height is a
+    /// parameter; width is read from the terminal like the other
+    /// render helpers.
+    pub fn paint_plan(
+        plan: &crate::slashdot_menu::render::RenderPlan,
+        term_h: usize,
+    ) -> String {
+        let tw = crate::output::term_width().max(1);
+        let mut result: Vec<String> = Vec::new();
+
+        // --- Space allocation ---
+        // `term_h` is the full terminal height; 2/3 is the overlay budget.
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        let table_header_lines = if plan.table_header.is_some() { 1 } else { 0 };
+        let min_rows = 3usize;
+
+        // Count visual lines each detail item occupies (LogicalLine
+        // may contain embedded \n for wrapped sub-lines).
+        let detail_visual: Vec<usize> = plan.detail.iter()
+            .map(|d| d.0.split('\n').count())
+            .collect();
+        let total_detail_vis: usize = detail_visual.iter().sum();
+        let total_rows = plan.rows.len();
+
+        let (detail_budget, data_budget) =
+            Self::compute_space_budget(max_pop, table_header_lines,
+                total_detail_vis, total_rows, min_rows);
+
+        // 1. Detail (header() output — no background, stands out).
+        let mut detail_vis_used = 0usize;
+        for (d, &vis) in plan.detail.iter().zip(&detail_visual) {
+            if detail_vis_used + vis > detail_budget { break; }
+            result.push(Self::render_logical_line(d, tw, false, false, false));
+            detail_vis_used += vis;
+        }
+
+        // 2. Table header (column labels, grey background).
+        if let Some(ref th) = plan.table_header {
+            result.push(Self::render_logical_line(th, tw, false, false, true));
+        }
+
+        // 3. Data rows, windowed around `selected` (visual-line-aware).
+        let total = plan.rows.len();
+        if total > 0 {
+            let sel_idx = plan.selected.unwrap_or(0);
+            let (win_start, win_count) =
+                Self::visual_row_window(&plan.rows, sel_idx, data_budget);
+            for i in win_start..(win_start + win_count).min(total) {
+                let is_selected = plan.selected == Some(i);
+                let is_active = plan.active_rows.contains(&i);
+                let row = &plan.rows[i];
+                let sub_lines: Vec<&str> = row.0.split('\n').collect();
+                for (j, sub) in sub_lines.iter().enumerate() {
+                    let first = j == 0;
+                    let marker = if first {
+                        if is_active { "* " }
+                        else if is_selected { "> " }
+                        else { "  " }
+                    } else {
+                        "  "
+                    };
+                    let bg = if is_selected { "\x1b[48;5;239m" } else { "\x1b[48;5;235m" };
+                    let fg = if is_selected { "\x1b[1;36m" } else { "" };
+                    let content = format!("{}{}", marker, sub);
+                    let vis = crate::slashdot_menu::table::display_width(&content);
+                    let pad = tw.saturating_sub(vis);
+                    result.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+                }
+            }
+        }
+        result.join("\n")
     }
 
     /// Evaluate one menu key event (editor's real cursor: char index →
@@ -1718,144 +1685,6 @@ impl Repl {
         out
     }
 
-    /// Replace the last whitespace-delimited token of `s` with `repl`.
-    fn replace_last_token(s: &str, repl: &str) -> String {
-        if let Some(idx) = s.rfind(' ') {
-            format!("{} {}", &s[..idx], repl)
-        } else {
-            repl.to_string()
-        }
-    }
-
-    /// Find the whitespace-delimited token at or near `cursor` (char index
-    /// into `buf`). Returns `(start_byte, end_byte, token_text)`.
-    ///
-    /// Strategy, in priority order:
-    /// 1. Cursor at/beyond end-of-buffer → last whitespace-delimited token.
-    /// 2. Cursor *on* a non-WS character → the word containing that position.
-    /// 3. Cursor *on* whitespace → word *before* cursor (the token the user
-    ///    just typed and wants to Tab-complete).  If none, empty.
-    ///
-    /// Returns `(0, 0, "")` when there is no word.
-    fn token_at_cursor(buf: &[char], cursor: usize) -> (usize, usize, String) {
-        let len = buf.len();
-        if len == 0 || cursor == 0 {
-            return (0, 0, String::new());
-        }
-        let pos = cursor.min(len);
-
-        // 1. Past end or on trailing WS → last word.
-        if pos >= len || (pos == len - 1 && buf[pos].is_whitespace()) {
-            let mut end = len;
-            while end > 0 && buf[end - 1].is_whitespace() {
-                end -= 1;
-            }
-            if end == 0 {
-                return (0, 0, String::new());
-            }
-            let mut start = end;
-            while start > 0 && !buf[start - 1].is_whitespace() {
-                start -= 1;
-            }
-            return (start, end, buf[start..end].iter().collect());
-        }
-
-        // 2. Cursor on a non-WS char → chars of that word *before* the cursor.
-        if !buf[pos].is_whitespace() {
-            let mut start = pos;
-            while start > 0 && !buf[start - 1].is_whitespace() {
-                start -= 1;
-            }
-            if start < cursor {
-                return (start, cursor, buf[start..cursor].iter().collect());
-            }
-            // Cursor at word start with nothing typed → no completion.
-            return (0, 0, String::new());
-        }
-
-        // 3. Cursor on whitespace → word *before* cursor (the token the user
-        //    just typed and wants to complete).
-        let mut start_before = pos;
-        while start_before > 0 && !buf[start_before - 1].is_whitespace() {
-            start_before -= 1;
-        }
-        if start_before < pos {
-            return (start_before, pos, buf[start_before..pos].iter().collect());
-        }
-        // Nothing before cursor on this line → no completion.
-        (0, 0, String::new())
-    }
-
-    /// Complete a file path prefix, preferring sandbox-aware listing when the
-    /// sandbox is active.
-    ///
-    /// When the sandbox has explicit bindings, runs `ls -1p` *inside* the
-    /// sandbox (via bwrap) so completions reflect exactly what the agent would
-    /// see.  Falls back to the host filesystem only when no sandbox is
-    /// configured at all; when the sandbox IS active but a directory doesn't
-    /// exist inside it, returns empty so non-sandbox paths are never suggested.
-    fn complete_path_prefix_sandbox(prefix: &str) -> Vec<String> {
-        if prefix.is_empty() {
-            return Vec::new();
-        }
-
-        // Detect `~` prefix so we can round-trip results back to `~`.
-        let uses_tilde = prefix.starts_with('~');
-        let expanded = expand_tilde(prefix);
-        let path = std::path::Path::new(&expanded);
-
-        let (dir, filter) = if expanded.ends_with('/') || path.is_dir() {
-            let d = expanded.trim_end_matches('/');
-            if d.is_empty() {
-                ("/".to_string(), String::new())
-            } else {
-                (d.to_string(), String::new())
-            }
-        } else {
-            let parent = path.parent().unwrap_or(std::path::Path::new("."));
-            let stem = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            (parent.to_string_lossy().to_string(), stem)
-        };
-
-        let sandbox_active = crate::tools::sandbox_config()
-            .as_ref()
-            .as_ref()
-            .is_some();
-
-        if let Some(mut entries) = crate::tools::sandbox_list_dir(&dir) {
-            entries.retain(|name| name != "./" && name != "../");
-            let home = if uses_tilde {
-                let h = std::env::var("HOME").unwrap_or_default();
-                if h.ends_with('/') { h } else { format!("{}/", h) }
-            } else {
-                String::new()
-            };
-            let mut results: Vec<String> = entries
-                .into_iter()
-                .filter(|name| name.starts_with(&filter))
-                .map(|name| {
-                    let full = format!("{}/{}", dir, name);
-                    if uses_tilde {
-                        if let Some(rest) = full.strip_prefix(&home) {
-                            return format!("~/{}", rest);
-                        }
-                    }
-                    full
-                })
-                .collect();
-            results.sort();
-            return results;
-        }
-
-        if sandbox_active {
-            return Vec::new();
-        }
-        complete_path_prefix_impl(&expanded)
-    }
-
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
     /// only for terminal actions (Enter submits, Esc cancels the line,
     /// Ctrl-C exits). All other keys mutate `editor` and return `None`. History
@@ -2097,74 +1926,6 @@ pub(crate) fn review_compaction_summary(
 }
 
 
-/// Expand `~` and `~/` prefix to the home directory.  Leaves other paths
-/// unchanged.  Used by path completion to resolve `~` before calling `ls`
-/// inside the sandbox (which doesn't do shell expansion).
-fn expand_tilde(path: &str) -> String {
-    crate::path_util::expand_tilde(path).to_string_lossy().into_owned()
-}
-
-/// Generic file-path prefix completion. Lists the parent directory of `prefix`
-/// and returns entries whose file name starts with the stem of `prefix`.
-/// Directories get a trailing `/`.
-///
-/// When `prefix` is an existing directory (or ends with `/`), lists the full
-/// contents of that directory (no stem filtering).  This makes `/tmp<tab>`
-/// show everything under `/tmp`, not just entries starting with `"tmp"`.
-///
-/// This is a public free function so it can be used by the regular prompt input
-/// (e.g. when the user types `/tmp/foo<tab>` in the prompt text) as well as
-/// slash-command overlays.
-pub fn complete_path_prefix_impl(prefix: &str) -> Vec<String> {
-    if prefix.is_empty() {
-        return Vec::new();
-    }
-
-    let path = std::path::Path::new(prefix);
-
-    // If the prefix is an existing directory (or ends with /), list its
-    // full contents rather than filtering by the directory name as a stem.
-    // This makes `/tmp<tab>` show everything under /tmp, not just entries
-    // starting with "tmp".
-    if prefix.ends_with('/') || path.is_dir() {
-        return list_dir_entries(path, "");
-    }
-
-    let parent = path.parent().unwrap_or(std::path::Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    // When the stem is empty (e.g. prefix is just "/"), list all.
-    if stem.is_empty() {
-        list_dir_entries(parent, "")
-    } else {
-        list_dir_entries(parent, &stem)
-    }
-}
-
-/// List entries in `dir`, filtering by `filter` (empty = all).
-/// Directories get a trailing `/`.
-fn list_dir_entries(dir: &std::path::Path, filter: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(filter) {
-                let full = dir.join(&name);
-                let display = full.to_string_lossy().to_string();
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    results.push(format!("{}/", display));
-                } else {
-                    results.push(display);
-                }
-            }
-        }
-    }
-    results.sort();
-    results
-}
-
 /// A flat character buffer + cursor for multi-line editing. All methods are pure
 /// (no terminal access) and unit-tested in [`tests`].
 #[derive(Default)]
@@ -2202,6 +1963,17 @@ impl LineEditor {
     /// Current buffer as a `String` (newlines preserved).
     pub fn text(&self) -> String {
         self.buf.iter().collect()
+    }
+
+    /// The buffer as a char slice (no copy) — word extraction for the
+    /// prose completion layer, which works entirely in char space.
+    pub fn chars(&self) -> &[char] {
+        &self.buf
+    }
+
+    /// Current cursor position (char index into the buffer).
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     pub fn insert(&mut self, c: char) {
@@ -2820,14 +2592,6 @@ mod tests {
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
 
-
-    #[test]
-    fn replace_last_token_replaces_tail() {
-        assert_eq!(Repl::replace_last_token("/set default_model x:y", "ABC"), "/set default_model ABC");
-        assert_eq!(Repl::replace_last_token("/model gpt", "gpt-4"), "/model gpt-4");
-        // no space -> whole string replaced
-        assert_eq!(Repl::replace_last_token("/set", "X"), "X");
-    }
 
 
 
@@ -3481,89 +3245,6 @@ mod tests {
 
 
     #[test]
-    fn token_at_cursor_handles_various_positions() {
-        // Empty buffer
-        assert_eq!(Repl::token_at_cursor(&[], 0), (0, 0, String::new()));
-
-        // "hello world foo"
-        //  h=0 e=1 l=2 l=3 o=4  =5 w=6 o=7 r=8 l=9 d=10  =11 f=12 o=13 o=14
-        let buf: Vec<char> = "hello world foo".chars().collect();
-        // Cursor at start (0) → empty
-        assert_eq!(Repl::token_at_cursor(&buf, 0), (0, 0, String::new()));
-        // Cursor at position 1 (after 'h') → chars before: "h"
-        let (s, e, w) = Repl::token_at_cursor(&buf, 1);
-        assert_eq!(&w, "h", "cursor after 'h': got {:?}", &w);
-        assert_eq!(s, 0);
-        assert_eq!(e, 1);
-        // Cursor at position 5 (on the space after "hello") → word *before*: "hello"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 5);
-        assert_eq!(&w, "hello", "cursor on space after hello: {:?}", &w);
-        // Cursor at position 8 (after "wo" in "world") → chars before: "wo"
-        let (s, e, w) = Repl::token_at_cursor(&buf, 8);
-        assert_eq!(&w, "wo", "cursor after 'wo' in 'world': got {:?}", &w);
-        assert_eq!(s, 6);
-        assert_eq!(e, 8);
-        // Cursor at position 11 (the space after "world") → word *before*: "world"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 11);
-        assert_eq!(&w, "world", "cursor on space after world: {:?}", &w);
-        // Cursor after last word (at end) → last word "foo"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
-        assert_eq!(&w, "foo", "cursor at end: last word");
-    }
-
-    #[test]
-    fn token_at_cursor_empty_at_whitespace_start() {
-        let buf: Vec<char> = "   abc".chars().collect();
-        // Cursor at position 0 (start, before any word) → empty
-        assert_eq!(Repl::token_at_cursor(&buf, 0), (0, 0, String::new()));
-        // Cursor at position 2 (on leading whitespace) → no word before → empty
-        assert_eq!(Repl::token_at_cursor(&buf, 2), (0, 0, String::new()), "cursor on leading whitespace");
-        // Cursor at position 4 (on 'b' in "abc") → chars before: "a"
-        let (s, e, w) = Repl::token_at_cursor(&buf, 4);
-        assert_eq!(&w, "a", "cursor on 'b' in 'abc': chars before is {:?}", &w);
-        assert_eq!(s, 3);
-        assert_eq!(e, 4);
-    }
-
-    #[test]
-    fn token_at_cursor_middle_of_sentence() {
-        // Cursor in the middle of a sentence
-        let buf: Vec<char> = "write_file src/foo.rs src/bar.rs".chars().collect();
-        // Cursor at position 21 (the space between the two paths)
-        // → word BEFORE cursor: "src/foo.rs"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 21);
-        assert_eq!(&w, "src/foo.rs", "cursor on space: word before: {:?}", &w);
-        // Cursor at position 20 (on the 's' at end of "src/foo.rs")
-        // → chars before cursor: "src/foo.r"
-        let (s, e, w) = Repl::token_at_cursor(&buf, 20);
-        assert_eq!(&w, "src/foo.r", "cursor on 's' in src/foo.rs: chars before: {:?}", &w);
-        assert_eq!(s, 11);
-        assert_eq!(e, 20);
-        // Cursor at position 22 (on 's' at start of "src/bar.rs")
-        // → cursor at word start, no chars before → empty (no completion)
-        assert_eq!(Repl::token_at_cursor(&buf, 22), (0, 0, String::new()), "cursor at start of src/bar.rs");
-    }
-
-    #[test]
-    fn token_at_cursor_trailing_whitespace() {
-        // Cursor past trailing whitespace → last word
-        let buf: Vec<char> = "write_file src/ ".chars().collect();
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, buf.len());
-        assert_eq!(&w, "src/", "trailing ws: last word");
-    }
-
-    #[test]
-    fn token_at_cursor_single_word() {
-        let buf: Vec<char> = "hello".chars().collect();
-        // Cursor at end of buffer
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 5);
-        assert_eq!(&w, "hello");
-        // Cursor at 1 (after 'h') → chars before: "h"
-        let (_s, _e, w) = Repl::token_at_cursor(&buf, 1);
-        assert_eq!(&w, "h");
-    }
-
-    #[test]
     fn replace_range_tests() {
         let mut e = LineEditor::from_text("hello world foo");
         // Replace "world" with "there" in the middle
@@ -3860,13 +3541,39 @@ mod tests {
 
     #[test]
     fn fuzz_path_completion_preserves_layout() {
+        // Ported to the new edit path: `word_at_cursor` finds the range,
+        // `LineEditor::replace_range` splices the completion (the prose
+        // layer does exactly this on Tab).
+        use crate::prompt_complete::word_at_cursor;
         let tests = [("/home/user", "/home/user/project"), ("/tmp", "/tmp/data"), ("foo", "foobar")];
         for (buf, replacement) in &tests {
-            let result = Repl::replace_last_token(buf, replacement);
+            let chars: Vec<char> = buf.chars().collect();
+            let range = word_at_cursor(&chars, chars.len())
+                .unwrap_or(0..0);
             let mut e = LineEditor::new();
-            e.insert_str(&result);
+            e.insert_str(buf);
+            e.replace_range(range.start, range.end, replacement);
             check_layout(&e, 80, "> ");
         }
+    }
+
+    /// Paint precedence: an active row shows `*` even when it is also the
+    /// cursor row (`>` loses to `*`, Marker contract).
+    #[test]
+    fn paint_plan_active_marker_beats_cursor() {
+        use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
+        use std::rc::Rc;
+        let plan = RenderPlan {
+            rows: Rc::new(vec![LogicalLine::new("x")]),
+            selected: Some(0),
+            active_rows: vec![0],
+            ..Default::default()
+        };
+        let painted = Repl::paint_plan(&plan, 40);
+        assert!(
+            painted.contains("* x"),
+            "shared row shows `*`, not `>`: {painted:?}"
+        );
     }
 
     // ===== vt100 terminal-emulator tests =====

@@ -27,8 +27,8 @@ pub mod prompt;
 pub mod render;
 pub mod table;
 pub mod value;
+pub mod view;
 pub mod wrap;
-mod view;
 
 // Re-export public types for convenience.
 pub use menu::{SlashDotMenu, SlashDotHandle, SlashDotMenuNode};
@@ -37,3 +37,4 @@ pub use node_impl::{SlashDotNode, MenuResult, PathArgs, RenderContext, Completio
 pub use fields::ColumnDef;
 pub use render::LogicalLine;
 pub use table::{Align, Table};
+pub use view::{RowView, ViewPlan, ViewRequest, ViewRows};

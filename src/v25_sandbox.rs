@@ -213,13 +213,6 @@ impl SlashDotNode for SandboxRemoveNode {
 // AddSandboxMappingNode — parameter leaf (ro/rw rows, fs completion)
 // ---------------------------------------------------------------------------
 
-/// Gate: complete only path-shaped words — contains `/`, or starts
-/// with `~` or `.`. Ordinary bare words are inert (v1 never completed
-/// them either); a dot-word matching nothing shows no dialog.
-fn completable(word: &str) -> bool {
-    word.contains('/') || word.starts_with('~') || word.starts_with('.')
-}
-
 /// Parameter leaf under `/sandbox add`. `data()` returns the `ro`/`rw`
 /// mode rows; the drilled mode is `ids.last()`; the paths are the flat
 /// `args` (host path, optional sandbox destination).
@@ -282,7 +275,7 @@ impl SlashDotNode for AddSandboxMappingNode {
             return Ok(empty());
         };
         let word = args.suffix[word_range].to_string();
-        if !completable(&word) {
+        if !crate::path_complete::completable(&word) {
             return Ok(empty());
         }
         let arg_idx = args.committed(cursor_pos).count();

@@ -31,6 +31,7 @@ pub mod sandbox_state;
 pub mod settings;
 pub mod path_util;
 pub mod path_complete;
+pub mod prompt_complete;
 pub mod session;
 
 // Table + fuzzy primitives moved into the `slashdot_menu` crate; re-exported

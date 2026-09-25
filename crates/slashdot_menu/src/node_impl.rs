@@ -131,7 +131,10 @@ pub struct DataError {
 pub type DataResult = Result<std::rc::Rc<DataResponse>, DataError>;
 
 /// Completion payload (implicit-open auto-complete): candidate rows +
-/// optional dialog column labels for (id, description).
+/// optional dialog column labels for (id, description). Plain owned
+/// data — `Clone`/`Send`, so it can cross the prose-completion worker
+/// thread by value (the `Rc` is built on the receiving side).
+#[derive(Debug, Clone)]
 pub struct CompletionRows {
     pub rows: Vec<Row>,
     pub labels: Option<(String, String)>,
