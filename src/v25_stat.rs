@@ -46,7 +46,7 @@ impl SlashDotNode for StatNode {
             if session_id.is_empty() {
                 None
             } else if let Some(repo) = self.app_state.repo() {
-                let all = repo.list_sessions_sync(None);
+                let all = repo.list_sessions_overlay(None).await;
                 all.into_iter().find(|m| m.id == session_id).map(|meta| {
                     let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
                     crate::agent::SessionStatsInfo {

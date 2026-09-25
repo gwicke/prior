@@ -17,7 +17,9 @@
 //!    drop the guard, await, relock to write. (This module is sync-only for
 //!    that reason; async facades layer on top later.)
 //! 4. **Whole read-modify-write in one acquisition** — a lock fixes data
-//!    races, not lost updates split across critical sections.
+//!    races, not lost updates split across critical sections. No sync
+//!    file IO under the lock either: `set_setting` applies in-lock,
+//!    clones, and writes outside.
 //! 5. **Single source of truth** — no mirrors, no snapshots. `control` target
 //!    fields are written by eval, read + GC'd only by their sole consumer
 //!    (the loop's convergence step).
@@ -271,11 +273,18 @@ impl AppState {
         f(&self.state.lock().settings)
     }
 
-    /// Mutate + persist a setting (validates, applies, saves — same behavior
-    /// as the old menu cell, but on the canonical copy).
+    /// Mutate + persist a setting. Validate + in-memory apply under the
+    /// lock; the TOML write runs **outside** it — the coarse lock is
+    /// never held across file IO (an async facade was considered and
+    /// dropped as low value: this is a tiny, user-paced write and the
+    /// frame waits for it either way).
     pub fn set_setting(&self, key: SettingKey, value: &str) -> Result<(), String> {
-        let mut st = self.state.lock();
-        st.settings.set_value(key, value)
+        let snapshot = {
+            let mut st = self.state.lock();
+            st.settings.apply_value(key, value)?;
+            st.settings.clone()
+        };
+        snapshot.save().map_err(|e| e.to_string())
     }
 
     /// Snapshot of the settings store for read-only use across `.await`s

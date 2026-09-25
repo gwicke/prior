@@ -128,13 +128,15 @@ fn action_session_id(path_args: &PathArgs) -> Option<&str> {
     }
 }
 
-/// Find session metadata by UUID from the repo.
-fn find_session(
+/// Find session metadata by UUID from the repo (async overlay listing —
+/// cache-first; see `list_sessions_overlay`).
+async fn find_session(
     app_state: &AppState,
     session_id: &str,
 ) -> Option<crate::repl::SessionMeta> {
     let repo = app_state.repo()?;
-    repo.list_sessions_sync(None)
+    repo.list_sessions_overlay(None)
+        .await
         .into_iter()
         .map(crate::repl::session_meta_from)
         .find(|m| m.id == session_id)
@@ -241,7 +243,8 @@ impl SlashDotNode for SessionListNode {
         let current_id = self.app_state.current_session_id();
         let mut sessions: Vec<crate::repl::SessionMeta> = match self.app_state.repo() {
             Some(repo) => repo
-                .list_sessions_sync(None)
+                .list_sessions_overlay(None)
+                .await
                 .into_iter()
                 .map(crate::repl::session_meta_from)
                 .collect(),
@@ -301,7 +304,7 @@ impl SlashDotNode for SessionListNode {
             return vec!["Select a session, then choose an action.".to_string()];
         };
 
-        let meta = match find_session(&self.app_state, session_id) {
+        let meta = match find_session(&self.app_state, session_id).await {
             Some(m) => m,
             None => return vec![format!("Session not found: {}", session_id)],
         };
@@ -434,10 +437,10 @@ impl SlashDotNode for SessionResumeNode {
             return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
         };
         let found = repo
-            .list(None)
+            .list_sessions_overlay(None)
             .await
-            .ok()
-            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+            .into_iter()
+            .find(|m| m.id == session_id);
         let Some(meta) = found else {
             return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
         };
@@ -496,10 +499,10 @@ impl SlashDotNode for SessionForkNode {
         // old Switched path).
         let found = match self.app_state.repo() {
             Some(repo) => repo
-                .list(None)
+                .list_sessions_overlay(None)
                 .await
-                .ok()
-                .and_then(|metas| metas.into_iter().find(|m| m.id == session_id))
+                .into_iter()
+                .find(|m| m.id == session_id)
                 .map(|m| (repo, m)),
             None => None,
         };
@@ -531,10 +534,13 @@ impl SlashDotNode for SessionRenameNode {
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
-        let current_name = action_session_id(path_args)
-            .and_then(|sid| find_session(&self.app_state, sid))
-            .and_then(|m| m.name)
-            .unwrap_or_else(|| "(unnamed)".to_string());
+        let current_name = match action_session_id(path_args) {
+            Some(sid) => find_session(&self.app_state, sid)
+                .await
+                .and_then(|m| m.name)
+                .unwrap_or_else(|| "(unnamed)".to_string()),
+            None => "(unnamed)".to_string(),
+        };
         vec![
             "Rename the session. Type the new name and press Enter.".to_string(),
             "Leave empty to clear the name.".to_string(),
@@ -547,6 +553,7 @@ impl SlashDotNode for SessionRenameNode {
         // ["session", "<uuid>", "rename"].
         let sid = path_args.ids.get(1).map(|s| s.as_str()).unwrap_or_default();
         let current_name = find_session(&self.app_state, sid)
+            .await
             .and_then(|m| m.name)
             .unwrap_or_default();
         // Rebuild the full prompt: "session <uuid> rename <name>"
@@ -580,10 +587,10 @@ impl SlashDotNode for SessionRenameNode {
             return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
         };
         let meta = repo
-            .list(None)
+            .list_sessions_overlay(None)
             .await
-            .ok()
-            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+            .into_iter()
+            .find(|m| m.id == session_id);
         match meta {
             Some(meta) => match repo.open(&meta).await {
                 Ok((storage, index)) => {
@@ -647,10 +654,10 @@ impl SlashDotNode for SessionDeleteNode {
             return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
         };
         let meta = repo
-            .list(None)
+            .list_sessions_overlay(None)
             .await
-            .ok()
-            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+            .into_iter()
+            .find(|m| m.id == session_id);
         let Some(meta) = meta else {
             return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
         };
@@ -787,7 +794,7 @@ mod tests {
         let mut handle = menu.get_handle();
 
         // 1. Parent listing shows the session row.
-        let listing = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
+        let listing = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match &listing {
             MenuResult::Continue(plan, _) => {
                 assert!(
@@ -800,12 +807,12 @@ mod tests {
 
         // 2. Drill into the session (bare-id entry with trailing space).
         let line = format!("session {} ", uuid);
-        let r = futures::executor::block_on(handle.eval_prompt(&line, HostKey::None, 80));
+        let r = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into session");
 
         // 3. Drill into `resume`.
         let line = format!("session {} resume ", uuid);
-        let r = futures::executor::block_on(handle.eval_prompt(&line, HostKey::None, 80));
+        let r = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into resume");
 
         // 4. Enter → submit (inline resume drives repo IO — tokio-backed
@@ -836,7 +843,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
+        let result = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, listing should be empty.
@@ -851,7 +858,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
+        let result = crate::agent::block_on_test(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, the table header row should still render
@@ -876,7 +883,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.data(1, &path_args)).unwrap();
+        let result = crate::agent::block_on_test(node.data(1, &path_args)).unwrap();
         assert!(
             result.rows.is_empty(),
             "resume should be hidden for current session"
@@ -893,7 +900,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.data(1, &path_args)).unwrap();
+        let result = crate::agent::block_on_test(node.data(1, &path_args)).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].id, "resume");
     }
@@ -956,7 +963,7 @@ mod tests {
         };
         let result = crate::agent::block_on_test(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
-        let name = futures::executor::block_on(async {
+        let name = crate::agent::block_on_test(async {
             session.index().lock().await.session_name.clone()
         });
         assert_eq!(
@@ -994,7 +1001,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.prepare(1, &path_args));
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         match result {
             SubmitResult::Done(Some(msg)) => {
                 assert!(msg.contains("Cannot delete"));
@@ -1013,7 +1020,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.prepare(1, &path_args));
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         assert!(
             matches!(result, SubmitResult::Prepared),
             "should allow delete of non-current session"
@@ -1162,7 +1169,7 @@ mod tests {
         use crate::slashdot_menu::node_impl::SlashDotNode;
         let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
-        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
+        let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session .path:.".to_string()));
     }
 
@@ -1173,7 +1180,7 @@ mod tests {
         let app_state = test_app_state();
         let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
-        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
+        let result = crate::agent::block_on_test(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

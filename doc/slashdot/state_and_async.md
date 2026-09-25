@@ -390,9 +390,17 @@ still sync); the async conversion rides on top.
    slot's published `TermGuard`). Mid-eval `$EDITOR` is safe via
    **`emit_commit`'s live-DSR re-anchor** of `input_row` before redraw
    (the Ctrl-E post-`guard.start()` pattern, applied unconditionally).
-   Optional follow-ups (not blocking): cache-preserving async `list`
-   for listings, settings `save()` async facade — in-submit sync IO
-   stays bounded by the 2s mtime cache.
+   Async-IO follow-ups **[done]**: `JsonlSessionRepo::
+  list_sessions_overlay` — cache-first (the same 2s mtime debounce;
+  warm = zero IO), `tokio::fs` cold scan, cache lock never held across
+  an await. Production callers migrated (session listing, `find_session`,
+  `/stat` header, the inline rename/delete/fork/resume meta lookups);
+  `list_sessions_sync` is now `#[cfg(test)]` (same cache, same
+  results). Settings save: async facade **dropped as low value** — a
+  tiny user-paced write the frame waits on regardless; the real defect
+  was holding the coarse lock across the TOML write, fixed as
+  apply-under-lock → clone → write-outside (`SettingsStore::
+  apply_value`), with the rule recorded in the module doc.
    Judgment recorded and applied: session creation, the model journal,
    AND compact's Llm-agent creation stamp from the **target** config
    handler-side (divergence only in the failed-rebuild state; a later

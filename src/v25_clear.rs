@@ -99,7 +99,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = futures::executor::block_on(handle.eval_prompt("", HostKey::None, 80));
+        let result = crate::agent::block_on_test(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -120,7 +120,7 @@ mod tests {
         app_state.set_current_session_id(outgoing.clone());
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = futures::executor::block_on(handle.eval_prompt("clear ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("clear ", HostKey::None, 80));
         let _ = crate::agent::block_on_test(handle.eval_prompt("clear ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
         assert_ne!(s.get_session_id(), outgoing, "fresh session replaces the outgoing one");
@@ -143,7 +143,7 @@ mod tests {
         app_state.set_repo(Some(repo));
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = futures::executor::block_on(handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80));
         let _ = crate::agent::block_on_test(handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
         let name =

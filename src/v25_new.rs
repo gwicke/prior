@@ -83,7 +83,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = futures::executor::block_on(handle.eval_prompt("", HostKey::None, 80));
+        let result = crate::agent::block_on_test(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -103,7 +103,7 @@ mod tests {
         app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = futures::executor::block_on(handle.eval_prompt("new ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new ", HostKey::None, 80));
         let _ = crate::agent::block_on_test(handle.eval_prompt("new ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
         assert_ne!(s.get_session_id(), outgoing, "must be a different session");
@@ -118,7 +118,7 @@ mod tests {
         app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = futures::executor::block_on(handle.eval_prompt("new my-session ", HostKey::None, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::None, 80));
         let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
         let name =
