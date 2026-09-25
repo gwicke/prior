@@ -390,15 +390,25 @@ impl RowView {
                 let field_name = col_field_names.get(col_idx).cloned().unwrap_or_default();
                 let cell_width = display_width(&cell);
                 let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
+                
+                // Determine if this column wraps: explicit ColumnDef.wrap or default false
+                let is_wrapping = if !columns.is_empty() {
+                    columns.get(col_idx).map(|c| c.wrap).unwrap_or(false)
+                } else {
+                    false // default columns don't wrap
+                };
+                
                 let snippet = if !columns.is_empty() {
                     // Only apply highlighting/snippet for explicitly defined columns.
-                    // Default columns (id, description) keep raw text to avoid test breakage.
+                    // Default columns (id, description) keep raw text for test compatibility.
                     if let Some(indices_map) = match_indices {
                         if let Some(indices) = indices_map.get(&field_name) {
-                            let should_snippet = cell_width > col_w && col_w > 0;
+                            // Only apply snippet extraction for non-wrapping columns that would truncate
+                            let should_snippet = cell_width > col_w && col_w > 0 && !is_wrapping;
                             if should_snippet {
                                 extract_snippet(&cell, indices, col_w)
                             } else {
+                                // For wrapping columns or cells that fit: apply highlighting
                                 highlight_matches(&cell, indices)
                             }
                         } else {
