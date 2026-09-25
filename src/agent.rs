@@ -425,9 +425,14 @@ impl PicoAgent for CodeAgent {
                                         let mut t = transcript
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        if t.has_progress() {
+                                        let has_progress = t.has_progress();
+                                        if has_progress {
                                             partial.extend(t.finalize());
-                                        } else if !output.is_empty() || !reasoning_buffer.is_empty() {
+                                        }
+                                        // Always include current turn's partial content (text + reasoning)
+                                        // even when there was prior progress. This captures reasoning
+                                        // from the current incomplete turn (e.g., after a tool call).
+                                        if !output.is_empty() || !reasoning_buffer.is_empty() {
                                             let mut content = Vec::new();
                                             if !output.is_empty() {
                                                 content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
@@ -595,9 +600,14 @@ impl PicoAgent for CodeAgent {
                             let mut t = transcript
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if t.has_progress() {
+                            let has_progress = t.has_progress();
+                            if has_progress {
                                 partial.extend(t.finalize());
-                            } else if !output.is_empty() || !reasoning_buffer.is_empty() {
+                            }
+                            // Always include current turn's partial content (text + reasoning)
+                            // even when there was prior progress. This captures reasoning
+                            // from the current incomplete turn (e.g., after a tool call).
+                            if !output.is_empty() || !reasoning_buffer.is_empty() {
                                 let mut content = Vec::new();
                                 if !output.is_empty() {
                                     content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
