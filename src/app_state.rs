@@ -61,14 +61,6 @@ pub enum CompactMode {
     Prompt,
 }
 
-/// Compact the session at a given entry (LLM mode needs the agent — loop or
-/// agent-side consumption).
-#[derive(Debug, Clone)]
-pub struct TreeCompactIntent {
-    pub target_id: String,
-    pub mode: CompactMode,
-    pub payload: String,
-}
 
 /// Sandbox path-mapping mutation requested by the v2.5 `/sandbox` nodes.
 /// The applier owns the merge + re-publish (it owns the applied config).
@@ -101,8 +93,6 @@ pub struct ControlConfig {
 
 
 
-    /// `/tree <id> compact …`.
-    pub tree_compact: Option<TreeCompactIntent>,
     /// `/sandbox` mutations (applier merges + re-publishes).
     pub sandbox: Option<SandboxOp>,
 
@@ -116,7 +106,7 @@ impl ControlConfig {
             quit: self.quit,
 
 
-            tree_compact: self.tree_compact.take(),
+
             sandbox: self.sandbox.take(),
 
         }
@@ -440,13 +430,6 @@ impl AppState {
 
 
 
-    pub fn request_tree_compact(&self, target_id: String, mode: CompactMode, payload: String) {
-        self.state.lock().control.tree_compact = Some(TreeCompactIntent {
-            target_id,
-            mode,
-            payload,
-        });
-    }
 
     pub fn request_sandbox(&self, op: SandboxOp) {
         self.state.lock().control.sandbox = Some(op);
@@ -566,19 +549,21 @@ mod tests {
     #[test]
     fn control_take_gc_one_shots_but_quit_latches() {
         let app_state = AppState::for_test(test_settings());
-        app_state.request_tree_compact("u1".into(), CompactMode::Manual, String::new());
+        app_state.request_sandbox(SandboxOp::Remove {
+            sandbox_path: "/x".into(),
+        });
         app_state.request_quit();
 
         let taken = app_state.take_control();
-        assert_eq!(
-            taken.tree_compact.as_ref().map(|c| c.target_id.as_str()),
-            Some("u1")
-        );
+        assert!(matches!(
+            taken.sandbox,
+            Some(SandboxOp::Remove { ref sandbox_path }) if sandbox_path == "/x"
+        ));
         assert!(taken.quit);
 
         // GC: one-shots gone, quit still latching.
         let taken2 = app_state.take_control();
-        assert!(taken2.tree_compact.is_none());
+        assert!(taken2.sandbox.is_none());
         assert!(app_state.should_quit(), "quit is latching — never cleared");
     }
 

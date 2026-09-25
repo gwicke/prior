@@ -879,8 +879,19 @@ impl SlashDotNode for TreeCompactManualNode {
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        self.app_state.request_tree_compact(target_id, CompactMode::Manual, draft);
-        SubmitResult::Done(None)
+        // Data-plane inline: session/agent/guard/output are all reachable
+        // via the slot; errors come back as the stay-open message.
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::Manual,
+            &draft,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -925,8 +936,17 @@ impl SlashDotNode for TreeCompactTextNode {
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        self.app_state.request_tree_compact(target_id, CompactMode::TextOnly, draft);
-        SubmitResult::Done(None)
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::TextOnly,
+            &draft,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -981,8 +1001,17 @@ impl SlashDotNode for TreeCompactPromptNode {
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let prompt = path_args.suffix.trim().to_string();
-        self.app_state.request_tree_compact(target_id, CompactMode::Prompt, prompt);
-        SubmitResult::Done(None)
+        match crate::agent::compact_inline(
+            &self.app_state,
+            &target_id,
+            CompactMode::Prompt,
+            &prompt,
+        )
+        .await
+        {
+            None => SubmitResult::Done(None),
+            Some(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -1632,61 +1661,94 @@ mod tests {
     // --- Compact: mode submit tests ---
 
     #[test]
-    fn compact_manual_submit_sets_async_op() {
+    fn compact_manual_submit_appends_compaction() {
         let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactManualNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.submit(1, &path_args));
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = app_state.take_control();
-        let c = taken.tree_compact.as_ref().expect("tree_compact target");
-        assert_eq!(c.target_id, "u1");
-        assert_eq!(c.mode, CompactMode::Manual);
-        assert!(c.payload.is_empty(), "manual draft is empty by default");
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "manual compact must append a Compaction entry");
     }
 
     #[test]
-    fn compact_text_only_submit_sets_async_op() {
+    fn compact_text_only_submit_appends_compaction() {
         let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactTextNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.submit(1, &path_args));
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = app_state.take_control();
-        let c = taken.tree_compact.as_ref().expect("tree_compact target");
-        assert_eq!(c.target_id, "u1");
-        assert_eq!(c.mode, CompactMode::TextOnly);
-        assert!(c.payload.is_empty());
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "text-only compact must append a Compaction entry");
     }
 
     #[test]
-    fn compact_prompt_submit_sets_async_op() {
+    fn compact_prompt_unknown_entry_errors() {
         let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "other",
+            None,
+            "user",
+            "hi",
+        )]);
+        app_state.set_session(Some(session));
         let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: "summarize the key decisions".into(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.submit(1, &path_args));
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = app_state.take_control();
-        let c = taken.tree_compact.as_ref().expect("tree_compact target");
-        assert_eq!(c.target_id, "u1");
-        assert_eq!(c.mode, CompactMode::Prompt);
-        assert_eq!(c.payload, "summarize the key decisions");
+        // Guarded before any agent/LLM work: unknown target stays open
+        // with the message (the Llm path itself needs a live model).
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("unknown tree entry"), "msg: {msg}")
+            }
+            other => panic!("expected stay-open unknown-entry error, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]
-    fn compact_prompt_empty_suffix_uses_default() {
+    fn compact_prompt_without_session_reports_error() {
         let app_state = test_app_state();
         let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
@@ -1694,12 +1756,13 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = futures::executor::block_on(node.submit(1, &path_args));
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = app_state.take_control();
-        let c = taken.tree_compact.as_ref().expect("tree_compact target");
-        assert_eq!(c.mode, CompactMode::Prompt);
-        assert!(c.payload.is_empty(), "empty suffix = empty payload");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("no active session"), "msg: {msg}")
+            }
+            other => panic!("expected stay-open no-session error, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     // --- Compact: full traversal ---
@@ -1716,6 +1779,13 @@ mod tests {
             ),
         ];
         let app_state = app_state_with_tree(tree);
+        let session = crate::agent::test_session_with_entries(vec![make_entry(
+            "u1",
+            None,
+            "user",
+            "first message",
+        )]);
+        app_state.set_session(Some(session.clone()));
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
@@ -1735,12 +1805,20 @@ mod tests {
         let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
-        // 5. Enter → submit.
-        let _ = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        let c = taken.tree_compact.as_ref().expect("tree_compact target");
-        assert_eq!(c.target_id, "u1");
-        assert_eq!(c.mode, CompactMode::Manual);
+        // 5. Enter → submit (inline compact drives session IO — tokio
+        // driver; review is None without a term guard → non-interactive
+        // append).
+        let _ = crate::agent::block_on_test(handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80));
+        let appended = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::Compaction { .. }
+                )
+            })
+        });
+        assert!(appended, "traversal must end in an appended Compaction");
     }
 
     // --- Compact: header tests ---

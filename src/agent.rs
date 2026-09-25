@@ -3039,7 +3039,7 @@ fn find_predecessor(branch: &[crate::session::SessionEntry], target_id: &str) ->
 }
 
 /// Find the predecessor of `target_id` on the session's active branch.
-fn find_predecessor_on_active_branch(
+pub(crate) fn find_predecessor_on_active_branch(
     index: &crate::session::SessionIndex,
     target_id: &str,
 ) -> Option<String> {
@@ -3198,6 +3198,94 @@ pub(crate) async fn run_compaction(
             let _ = common_ancestor_id;
             CompactionResult::Err("abandoned-branch summary not yet wired up".to_string())
         }
+    }
+}
+
+/// Run a compaction from an inline menu node — session/agent/output/
+/// guard/settings all reachable via the slot (mirrors the old
+/// `control.tree_compact` applier). Returns the message to display;
+/// `None` = Done/Cancelled are silent (the review gate prints its own
+/// cancel notice). The Llm-mode agent is created here from the TARGET
+/// config — same target-stamp judgment as session creation.
+pub(crate) async fn compact_inline(
+    app_state: &AppState,
+    target_id: &str,
+    mode: crate::app_state::CompactMode,
+    payload: &str,
+) -> Option<String> {
+    let Some(s) = app_state.session() else {
+        return Some("Cannot compact: no active session".to_string());
+    };
+    if s.get_entry(target_id).await.is_none() {
+        return Some(format!(
+            "Cannot compact: unknown tree entry {}",
+            &target_id[..target_id.len().min(12)]
+        ));
+    }
+    let tokens_before = match s.build_context().await {
+        Ok(ctx) => estimate_context_tokens(&ctx.messages),
+        Err(_) => 0,
+    };
+    let resolved_mode = match mode {
+        crate::app_state::CompactMode::Manual => CompactSummaryMode::Manual,
+        crate::app_state::CompactMode::TextOnly => CompactSummaryMode::TextOnly,
+        crate::app_state::CompactMode::Prompt => CompactSummaryMode::Llm,
+    };
+    // LLM mode needs a live agent (slot is the source).
+    let mut agent = app_state.agent();
+    if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
+        let cfg = app_state.config_snapshot();
+        match create_agent(cfg).await {
+            Ok(a) => {
+                let a: Arc<dyn PicoAgent> = Arc::from(a);
+                app_state.activate_agent(a.clone());
+                agent = Some(a);
+            }
+            Err(e) => return Some(format!("Cannot start agent: {}", e)),
+        }
+    }
+    // LLM mode early-out: refuse if nothing to compact.
+    if resolved_mode == CompactSummaryMode::Llm {
+        let current_leaf = s.get_leaf_id().await;
+        if let Some(leaf) = current_leaf.as_deref() {
+            let index = s.index().lock().await;
+            if find_predecessor_on_active_branch(&index, target_id).as_deref() == Some(leaf) {
+                return Some("Cannot compact: nothing before the current position".to_string());
+            }
+        }
+    }
+    // Editor review: the term guard + output clone out of the slot; the
+    // closure suspends raw mode around $EDITOR (overlay-agnostic —
+    // `emit_commit` re-anchors the row via DSR afterwards).
+    let review: Option<CompactionSummaryReview> = app_state.term_guard().map(|g| {
+        let out = app_state.with_config(|c| c.output.clone());
+        Box::new(move |draft: &str| {
+            crate::repl::review_compaction_summary(&g, out.as_ref(), draft)
+        }) as CompactionSummaryReview
+    });
+    let output = app_state.with_config(|c| c.output.clone());
+    let settings = app_state.settings();
+    let (user_cancel, cancel_notify) =
+        app_state.with_config(|c| (c.user_cancel.clone(), c.cancel_notify.clone()));
+    match run_compaction(
+        &s,
+        &agent,
+        &settings,
+        CompactionTarget::AtPoint {
+            target_id: target_id.to_string(),
+            tokens_before,
+        },
+        resolved_mode,
+        payload,
+        output.as_ref(),
+        review,
+        &user_cancel,
+        &cancel_notify,
+    )
+    .await
+    {
+        CompactionResult::Done | CompactionResult::Cancelled => None,
+        CompactionResult::Err(msg) => Some(msg),
     }
 }
 
@@ -3973,105 +4061,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // above already GC'd the one-shots; run-to-completion means at
         // most one menu submit set them this cycle.
 
-        if let Some(tc) = control.tree_compact {
-            let (target_id, mode, payload) = (tc.target_id, tc.mode, tc.payload);
-            let Some(s) = app_state.session() else {
-                config.output.display_text("Cannot compact: no active session");
-                continue;
-            };
-            if s.get_entry(&target_id).await.is_none() {
-                config.output.display_text(&format!(
-                    "Cannot compact: unknown tree entry {}",
-                    &target_id[..target_id.len().min(12)],
-                ));
-                continue;
-            }
-            let tokens_before = match s.build_context().await {
-                Ok(ctx) => estimate_context_tokens(&ctx.messages),
-                Err(_) => 0,
-            };
-            let resolved_mode = match mode {
-                crate::app_state::CompactMode::Manual => {
-                    CompactSummaryMode::Manual
-                }
-                crate::app_state::CompactMode::TextOnly => {
-                    CompactSummaryMode::TextOnly
-                }
-                crate::app_state::CompactMode::Prompt => {
-                    CompactSummaryMode::Llm
-                }
-            };
-            // LLM mode needs a live agent (slot is the source; created
-            // loop-side from the applied config).
-            let mut agent = app_state.agent();
-            if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
-                match create_agent(config.clone()).await {
-                    Ok(a) => {
-                        app_state.activate_agent(Arc::from(a));
-                        agent = app_state.agent();
-                    }
-                    Err(e) => {
-                        config.output.display_text(
-                            &format!("Cannot start agent: {}", e),
-                        );
-                        continue;
-                    }
-                }
-            }
-            // LLM mode early-out: refuse if nothing to compact.
-            if resolved_mode == CompactSummaryMode::Llm {
-                let current_leaf = s.get_leaf_id().await;
-                if let Some(leaf) = current_leaf.as_deref() {
-                    let index = s.index().lock().await;
-                    if find_predecessor_on_active_branch(&index, &target_id)
-                        .as_deref()
-                        == Some(leaf)
-                    {
-                        config.output.display_text(
-                            "Cannot compact: nothing before the current position",
-                        );
-                        continue;
-                    }
-                }
-            }
-            let review: Option<CompactionSummaryReview> =
-                if let Some(g) = &guard {
-                    let g = g.clone();
-                    let out = config.output.clone();
-                    Some(Box::new(move |draft: &str| {
-                        crate::repl::review_compaction_summary(
-                            &g, out.as_ref(), draft,
-                        )
-                    }))
-                } else {
-                    None
-                };
-            match run_compaction(
-                &s,
-                &agent,
-                &app_state.settings(),
-                CompactionTarget::AtPoint {
-                    target_id: target_id.clone(),
-                    tokens_before,
-                },
-                resolved_mode,
-                &payload,
-                config.output.as_ref(),
-                review,
-                &config.user_cancel,
-                &config.cancel_notify,
-            )
-            .await
-            {
-                CompactionResult::Done => {}
-                CompactionResult::Cancelled => {
-                    // User cancelled at the review step.
-                }
-                CompactionResult::Err(msg) => {
-                    config.output.display_text(&msg);
-                }
-            }
-        }
         if let Some(op) = control.sandbox {
             // Relocated v2.0 /sandbox handler: mutate the state
             // store, then re-publish the merged config — BOTH
