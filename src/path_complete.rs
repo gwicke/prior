@@ -1,5 +1,7 @@
-//! Filesystem completion entries for menu parameter leaves (and, later,
-//! the in-prompt Tab complete — deferred).
+//! Filesystem completion entries for menu parameter leaves and the
+//! in-prompt (prose) completion — see
+//! `doc/slashdot/arg_and_modifier_autocomplete.md` §Prompt-line
+//! completion.
 //!
 //! Host listing ([`list_host`]) and sandbox-aware listing
 //! ([`list_sandbox`]: bwrap `ls -lap --time-style=+ISO` via
@@ -18,10 +20,22 @@
 //! with a TTL (a probe would be a bwrap spawn). See [`listing_stale`].
 
 use crate::fuzzy::rank_candidates;
+use crate::slashdot_menu::node_impl::CompletionRows;
+use crate::slashdot_menu::fields::Row;
 use chrono::TimeZone;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+/// Gate: complete only path-shaped words — contains `/`, or starts
+/// with `~` or `.`. Ordinary bare words are inert (the old prompt
+/// completer accepted them; the gate keeps prose frames cheap); a
+/// dot-word matching nothing shows no dialog. Shared by the sandbox
+/// leaf, the prose layer (which pre-gates before the thread hop), and
+/// [`FileCompleter`].
+pub fn completable(word: &str) -> bool {
+    word.contains('/') || word.starts_with('~') || word.starts_with('.')
+}
 
 /// One completable filesystem entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +147,74 @@ pub fn complete(prefix: &str, sandbox: bool) -> Vec<Entry> {
     }, |e| basename_of(&e.path).to_string());
     entries = ranked.into_iter().cloned().collect();
     entries
+}
+
+/// Prose (in-prompt) FS completer — the prose worker's unit of work
+/// (see `doc/slashdot/arg_and_modifier_autocomplete.md` §Prompt-line
+/// completion). Always the sandbox-aware mode ([`complete`] with
+/// `sandbox = true`: sandbox listing wins, host fallback only when no
+/// sandbox is configured). Applies the shared [`completable`] gate;
+/// the prose layer additionally pre-gates per keystroke so bare words
+/// never reach the worker.
+///
+/// L2 cache on `(word, listing_stale)`; rows are id = full display
+/// path, desc = [`Entry::description`]. Returns `CompletionRows`
+/// **by value** (owned, `Send`) so it can run on the worker thread —
+/// the caller wraps `Rc::new` after the channel hop. Empty rows = no
+/// dialog (gate miss, no match, or every match exact).
+///
+/// Labels (render path stays label-agnostic): id = `Sandbox path`
+/// when a sandbox is configured, else `Host path`; desc =
+/// `Description`.
+pub struct FileCompleter {
+    last: Option<(String, CompletionRows)>,
+}
+
+impl FileCompleter {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// Complete `word` against the FS (worker thread; may IO on an L1
+    /// miss — the prose layer never calls this on the input loop).
+    pub fn complete(&mut self, word: &str) -> CompletionRows {
+        let empty = || CompletionRows {
+            rows: Vec::new(),
+            labels: None,
+        };
+        if !completable(word) {
+            return empty();
+        }
+        // L2 hit: same word and the L1 listing still fresh.
+        if let Some((w, rows)) = &self.last {
+            if w == word && !listing_stale(true) {
+                return rows.clone();
+            }
+        }
+        let entries = complete(word, true);
+        // Exactness: every candidate byte-equal to the word ⇒ nothing
+        // left to complete (empty rows ⇒ no dialog; the engine appends
+        // the trailing space on Tab).
+        let all_exact = !entries.is_empty() && entries.iter().all(|e| e.path == word);
+        let rows: Vec<Row> = if all_exact {
+            Vec::new()
+        } else {
+            entries
+                .iter()
+                .map(|e| Row::new(&e.path).desc(e.description()))
+                .collect()
+        };
+        let sandbox = crate::tools::sandbox_config().is_some();
+        let out = CompletionRows {
+            rows,
+            labels: Some((
+                if sandbox { "Sandbox path" } else { "Host path" }.to_string(),
+                "Description".to_string(),
+            )),
+        };
+        self.last = Some((word.to_string(), out.clone()));
+        out
+    }
 }
 
 /// L1 validity window: sandbox side (a revalidation probe would be a
@@ -618,6 +700,108 @@ mod tests {
         // Either way: empty, never host entries.
         let entries = complete(&format!("{}/", dir.path().display()), true);
         assert!(entries.is_empty(), "must not leak host paths: {entries:?}");
+        crate::tools::set_sandbox(None);
+    }
+
+    // --- completable gate (shared: sandbox leaf + prose layer) ---
+
+    #[test]
+    fn completable_gate_path_shaped_words_only() {
+        // Bare words inert — the accepted prose regression (doc:
+        // "Bare relative words (`cat fo`) stay inert; `./` triggers").
+        assert!(!completable("cat"));
+        assert!(!completable("fo"));
+        assert!(completable("./fo"));
+        assert!(completable("a/b"));
+        assert!(completable("~"));
+        assert!(completable("~/x"));
+        assert!(completable(".gitignore"));
+        assert!(completable(".."));
+    }
+
+    // --- FileCompleter (prose worker unit of work) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_gate_miss_is_inert() {
+        crate::tools::set_sandbox(None);
+        let mut fc = FileCompleter::new();
+        let out = fc.complete("just some prose");
+        assert!(out.rows.is_empty());
+        assert!(out.labels.is_none(), "gate miss never reaches rows");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_rows_full_paths_and_host_labels() {
+        crate::tools::set_sandbox(None);
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("alpha"), "1");
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        let prefix = format!("{}/al", dir.path().display());
+
+        let mut fc = FileCompleter::new();
+        let out = fc.complete(&prefix);
+        assert_eq!(out.rows.len(), 1, "{out:?}");
+        assert!(out.rows[0].id.ends_with("/alpha"), "{out:?}");
+        assert_eq!(
+            out.labels,
+            Some(("Host path".to_string(), "Description".to_string()))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_exact_word_yields_empty() {
+        crate::tools::set_sandbox(None);
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("only"), "x");
+        let full = format!("{}/only", dir.path().display());
+
+        let mut fc = FileCompleter::new();
+        let out = fc.complete(&full);
+        assert!(out.rows.is_empty(), "exact match = nothing to complete: {out:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_l2_serves_cached_rows_within_ttl() {
+        crate::tools::set_sandbox(None);
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("first"), "1");
+        let prefix = format!("{}/", dir.path().display());
+
+        let mut fc = FileCompleter::new();
+        let rows1 = fc.complete(&prefix);
+        assert!(rows1.rows.iter().any(|r| r.id.ends_with("/first")));
+
+        // New file: the L1 slot is sandbox-mode (TTL, no mtime check),
+        // so a same-word L2 hit must NOT refetch — new file invisible.
+        write(&dir.path().join("second"), "2");
+        let rows2 = fc.complete(&prefix);
+        assert_eq!(rows1.rows.len(), rows2.rows.len(), "L2 must serve cache");
+        assert!(!rows2.rows.iter().any(|r| r.id.ends_with("/second")));
+
+        // Invalidate the L1 → next call refetches and sees the new file.
+        invalidate_listing();
+        let rows3 = fc.complete(&prefix);
+        assert!(rows3.rows.iter().any(|r| r.id.ends_with("/second")));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_completer_sandbox_label_when_configured() {
+        crate::tools::set_sandbox(Some(crate::config::SandboxConfig::default()));
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("f"), "x");
+        let mut fc = FileCompleter::new();
+        // Tempdir invisible under the default sandbox ⇒ rows empty, but
+        // the label choice is visible on the response.
+        let out = fc.complete(&format!("{}/", dir.path().display()));
+        assert_eq!(
+            out.labels,
+            Some(("Sandbox path".to_string(), "Description".to_string()))
+        );
         crate::tools::set_sandbox(None);
     }
 }

@@ -21,7 +21,7 @@ use crate::render::{LogicalLine, RenderPlan};
 /// collapses to one ptr_eq signal. Minted content-side only — fields
 /// private: storage (slots / RowRef / id set) is an implementation
 /// detail the render side never sees.
-pub(crate) struct ViewRows {
+pub struct ViewRows {
     slots: Vec<Option<Rc<DataResponse>>>,
     order: Vec<RowRef>,
     active_ids: HashSet<String>,
@@ -39,6 +39,27 @@ impl ViewRows {
             order,
             active_ids,
         }
+    }
+
+    /// Completion source → view: one slot, identity order, no active
+    /// markers. The public entry for a completer's `Vec<Row>` (host
+    /// prose completion and the engine's `wrap_completion` shape).
+    pub fn of(rows: Vec<Row>) -> Rc<ViewRows> {
+        let n = rows.len();
+        let resp = Some(Rc::new(DataResponse {
+            rows,
+            active_ids: Vec::new(),
+        }));
+        Rc::new(ViewRows::new(
+            vec![resp],
+            (0..n as u32)
+                .map(|i| RowRef {
+                    child_idx: 0,
+                    row_offset: i,
+                })
+                .collect(),
+            HashSet::new(),
+        ))
     }
 
     /// The render side's ONLY data surface: rows in display order with
@@ -72,22 +93,22 @@ struct RenderCache {
 }
 
 /// Everything per-frame that isn't the rows themselves.
-pub(crate) struct ViewRequest<'a> {
+pub struct ViewRequest<'a> {
     /// Listing: the node's `columns()`. Completion: two ColumnDefs
     /// built from the response labels.
-    pub(crate) columns: &'a [ColumnDef],
+    pub columns: &'a [ColumnDef],
     /// Fresh this frame: optional `[ERROR]` line + `header()`.
-    pub(crate) detail: Vec<LogicalLine>,
+    pub detail: Vec<LogicalLine>,
     /// Cursor reconcile target when the view changed (matched child id
     /// / restore target); `None` for completion.
-    pub(crate) seed_id: Option<&'a str>,
+    pub seed_id: Option<&'a str>,
     /// §5.1 restore only: force cursor without a view change.
-    pub(crate) pin: Option<&'a str>,
+    pub pin: Option<&'a str>,
     /// Applied after reconcile (MoveCursor / page keys).
-    pub(crate) cursor_delta: Option<i32>,
+    pub cursor_delta: Option<i32>,
     /// Full render context — row lines rebuild when it differs
     /// (`PartialEq`); future metrics land here without API changes.
-    pub(crate) render_ctx: RenderContext,
+    pub render_ctx: RenderContext,
 }
 
 impl<'a> Default for ViewRequest<'a> {
@@ -104,14 +125,14 @@ impl<'a> Default for ViewRequest<'a> {
 }
 
 /// What one frame needs: the rendered plan + the cursor target.
-pub(crate) struct ViewPlan {
+pub struct ViewPlan {
     /// Row under the cursor after reconcile/delta — the drill /
     /// expansion target. `None` when the view has no rows.
-    pub(crate) cursor_row: Option<Row>,
-    pub(crate) plan: RenderPlan,
+    pub cursor_row: Option<Row>,
+    pub plan: RenderPlan,
 }
 
-pub(crate) struct RowView {
+pub struct RowView {
     /// Last view passed to plan; ptr-diff vs incoming = dirty.
     last_view: Option<Rc<ViewRows>>,
     // --- cursor (per view; pub(crate) for cross-module tests) ---
@@ -124,7 +145,7 @@ pub(crate) struct RowView {
 }
 
 impl RowView {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         RowView {
             last_view: None,
             cursor_id: None,
@@ -141,7 +162,7 @@ impl RowView {
     /// is ptr/context driven and internal. `view` is taken by value
     /// (stored as `last_view`); the returned `cursor_row` covers
     /// drill/expand — callers need no second call.
-    pub(crate) fn plan(&mut self, view: Rc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
+    pub fn plan(&mut self, view: Rc<ViewRows>, req: &ViewRequest<'_>) -> ViewPlan {
         // 1. View changed → cursor reconcile (today's seed_or_keep).
         let changed = match &self.last_view {
             Some(prev) => !Rc::ptr_eq(prev, &view),
@@ -197,7 +218,7 @@ impl RowView {
     }
 
     /// Epoch gate / dialog close: drop view + cursor + caches.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.last_view = None;
         self.cursor_id = None;
         self.cursor_idx = 0;
@@ -456,5 +477,36 @@ mod tests {
         v.reset();
         assert_eq!(v.cursor_idx, 0);
         assert!(v.last_view.is_none());
+    }
+
+    #[test]
+    fn of_mints_identity_order_view() {
+        // Public completion entry: single slot, identity order, no
+        // active markers — the shape prose completion feeds to plan().
+        let view = ViewRows::of(vec![Row::new("a"), Row::new("b")]);
+        assert_eq!(view.len(), 2);
+        let ids: Vec<&str> = view.iter().map(|(r, a)| {
+            assert!(!a, "completion rows never carry active markers");
+            r.id.as_str()
+        }).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn plan_over_of_round_trips_selection() {
+        let mut v = RowView::new();
+        let out = v.plan(
+            ViewRows::of(vec![Row::new("x"), Row::new("y")]),
+            &req(),
+        );
+        assert_eq!(out.plan.selected, Some(0));
+        assert_eq!(out.cursor_row.map(|r| r.id), Some("x".to_string()));
+        let mut r = req();
+        r.cursor_delta = Some(1);
+        let out = v.plan(
+            ViewRows::of(vec![Row::new("x"), Row::new("y")]),
+            &r,
+        );
+        assert_eq!(out.cursor_row.map(|r| r.id), Some("y".to_string()));
     }
 }

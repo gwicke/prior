@@ -619,8 +619,10 @@ Rows(rc)     → out = completion_view.plan(wrap(rc), ViewRequest {
   (design §7: the enum set "constrains completion only") — as part of
   the field spec / column spec cleanup. Until then v1 is purely
   dataset-derived.
-- **Mid-line completion + mid-prompt file expansion** (future; see the
-  sketch's cursor_pos note).
+- **Mid-prompt file completion** — designed in the "Prompt-line
+  completion" section (host-side prose layer); a separate port, not part
+  of the slash engine's v1. The slash engine's own cursor stays
+  end-of-line-only (the sketch's `cursor_pos` note).
 - **Sandbox doc leftovers** (separate doc, non-blocking): mapping node
   `header()` text disagrees with the tree ("Press enter to remove…" vs
   "src/dst/mode/source info"); `prepare()`/`submit()` are written on the
@@ -632,142 +634,261 @@ Rows(rc)     → out = completion_view.plan(wrap(rc), ViewRequest {
 
 ---
 
-## Prompt-line completion (findings)
+## Prompt-line completion
 
-Background: this doc's Needs section already lists "file complete in
-regular prompt editing, outside of the slash menu context" as the
-longer-term third consumer, and the Rendering section anticipates it
-("dedicated instance for inline file complete"; "Host side: no
-`repl.rs` render changes — `V25Menu` already paints any plan"). These
-findings compare today's standalone prompt completer against the
-`AddSandboxMappingNode` completion just landed, to scope the port.
+Third consumer of the completion machinery (Needs line 12; the
+Rendering section's "dedicated instance for inline file complete"):
+completing path-shaped words in ordinary (non-`/`) prompt text, in
+place, at the cursor. Replaces the standalone Tab-triggered completer
+in `repl.rs`.
 
-### Current implementation (what would be replaced)
+### Layering
 
-Standalone `repl.rs` code, Tab-triggered, host-owned state:
+Split by generic vs. application-specific:
 
-- `token_at_cursor` → `complete_path_prefix_sandbox` (tilde
-  expand/round-trip, dir-vs-stem split, `tools::sandbox_config()`
-  gate → `sandbox_list_dir`, else `complete_path_prefix_impl` host
-  `read_dir`, dirs get trailing `/`, sorted, prefix-only filter) →
-  `Vec<String>`.
-- One match → inline `replace_range`. Many → `path_completions` +
-  `completion_pos` host state + `ActiveOverlay::PathComplete` (plain
-  `overlay_lines` list); Tab/Enter apply the selected row
-  (`handle_tab` @1273 / `handle_enter` @1553), editing keys dismiss
-  (@2619), Esc clears (@1719).
-- Quirks worth noting: completes **any** token (bare words against
-  cwd; prose words can pop matches); **Enter applies the completion**
-  instead of submitting the line; mid-line cursor works (host-side
-  `token_at_cursor` + `completion_pos` range) but layout coverage is
-  only `fuzz_path_completion_preserves_layout` over
-  `replace_last_token` (not the full flow).
+- **Shared (crate)** — the FS/sandbox completion (`path_complete`),
+  generic fuzzy ranking (`fuzzy::rank_candidates`), and rows →
+  render-plan creation (`view::RowView::plan` over a `ViewRows`).
+  Nothing else.
+- **Host (`repl`)** — word extraction, the syntactic gate, the
+  completer call, splicing, key routing, and cursor handling. The
+  editor is char-indexed, so the prose layer works entirely in char
+  space: **no byte offset enters the crate or crosses a boundary**.
+- The slash `NodeEntry` path is **not** reworked onto these pieces; its
+  wrap memo, labels, columns, and Tab arm stay as they are.
 
-### Transfers 1:1 (already landed — no new design needed)
+### Data flow (one host frame)
 
-- **Data side**: `path_complete::complete(prefix, sandbox)` is a
-  strict **superset** of the old completer — verified: `~`
-  round-trip (`tilde_map`), trailing `/` on dirs (`join_path`),
-  parent/stem split incl. bare-relative → `"."` (`split_prefix`),
-  sandbox listing wins / configured-but-invisible → empty / host
-  fallback only when no sandbox (old semantics verbatim), plus
-  prefix→fuzzy ranking, L1 listing cache (mtime + TTL revalidation)
-  and `listing_stale`/`invalidate_listing`.
-- **Gate pattern**: `completable()` in `v25_sandbox`
-  (`contains('/') || starts_with('~') || starts_with('.')`) is the
-  reference for a cheap syntactic gate living *inside* the completer
-  (no engine-level gate — the engine calls every passive frame).
-  Caveat below: the prompt needs its own gate decision.
-- **Word extraction**: `PathArgs::word_before(cursor)` already does
-  the space-delimited scan; for prose, extract it as a free fn and
-  share (the "only the word directly before cursor" decision in
-  Design sketch already settles the "feed every word" question —
-  earlier words are position context, not completer input).
-- **Rendering**: the extracted `view.rs` `RowView::plan` →
-  `ViewPlan` → `RenderPlan` formatter, dedicated completion instance,
-  labels override (`CompletionRows.labels`), `[ERROR]`/header detail
-  — identical to slash completion; the host paints any plan through
-  the existing `V25Menu` arm.
-- **Behavior contract**: exactness → no dialog; empty → no dialog;
-  Tab = replace word → same-turn re-run → re-run empty ⇒ trailing
-  space; space dismisses (no word before cursor); Enter/Esc bypass;
-  L2 `Rc` cache keyed on the word + `listing_stale`.
-- **Editing shape**: `MenuResult::Continue(plan, new_buffer)` is the
-  right engine-level edit for prose too: engine derives
-  `prompt[..word_start] + row.id + prompt[word_end..]` itself and the
-  host does `editor.set` — `completion_pos`/`path_completions` host
-  state disappears entirely.
+The host keeps one persistent prose-completion instance for the prompt
+session (parallel to the persistent slash handle). On every non-`/`
+frame:
 
-### Genuinely new work
+1. `word = word_at_cursor(buf, cursor)` (char range) — `None` when
+   there is no word before the cursor or the cursor is *inside* a token
+   (mid-word ⇒ inert).
+2. Gate: `completable(word)`, else inert. Cheap — runs every frame.
+3. `resp` = the word's rows: the L2 cache when this word's result is
+   already in; otherwise the async path below. While the word's request
+   is outstanding the frame is `Idle` (no stale dialog).
+4. Empty or all-exact ⇒ inert ⇒ `view.reset()` (a reopen starts at row
+   0). Else the word owns a live dialog.
+5. Dialog: `view = ViewRows::of(resp.rows)`; `RowView::plan(view, req)`
+   with columns from `resp.labels`, empty detail, and `cursor_delta`
+   from a `MoveCursor`. The returned `ViewPlan` drives both display and
+   Tab.
 
-1. **A prose completion entry point in the crate** — the doc's
-   "dedicated instance for inline file complete": a completion frame
-   over raw (non-slash) text {free-fn `word_before` → host-registered
-   completer → completion `RowView` → `Continue`}. Host-side, a
-   persistent instance lives next to `v25_menu` (NOT the slash handle:
-   prose frames must not create/drop the menu handle as they do
-   today).
-2. **Host key routing for prose** (the fiddly part):
-   - passive frames run the completion (implicit open); the gate
-     keeps ordinary prose at string-op cost, completable words hit
-     the L1 cache;
-   - dialog up ⇒ Up/Down/Page become `MoveCursor` deltas instead of
-     history/scrolling, Tab expands — same pattern as the `V25Menu`
-     arms;
-   - dismissal is stateless (next frame re-derives from the buffer).
-3. **Cursor semantics**: with the design's EOL guard, `Continue` +
-   `editor.set` (cursor → end) is correct for prose — the word ends
-   at the buffer end. Mid-line completion is exactly where
-   `MenuResult` would need a cursor/range hint (full-buffer rewrite
-   would otherwise yank a mid-line cursor to the end). The design
-   already defers mid-line ("pairs with mid-prompt file expansion
-   later"), and the old host-side mid-line support was untested —
-   accept EOL-only for v1, add the hint together with mid-line +
-   tests later.
+### Async completion (the loop never blocks)
 
-### Open decisions (prompt-specific)
+`path_complete` IO can be slow — host `read_dir` is milliseconds, the
+sandbox listing is a bwrap spawn (hundreds of ms) — and implicit open
+fires on every qualifying frame. Completion therefore runs off the
+input loop:
 
-- **Bare relative words** (`cat fo<Tab>` → cwd match). The old
-  prompt completer completed them; `completable()` makes them inert
-  (its comment "v1 never completed them" refers to *menu parameter*
-  context — prompt v1 did complete them). Strict gate = regression
-  on the most common prompt case; loose gate + implicit-open =
-  dialogs flickering while typing prose. Options:
-  (a) passive frames gate path-shaped words; **explicit Tab with an
-      empty dialog runs the completer ungated** (Tab = "complete
-      here") — recommended: no prose noise, bare-word Tab preserved;
-  (b) strict gate only — simplest, but drops bare-word completion;
-  (c) fully Tab-triggered like today — zero passive prose evals,
-      but deviates from implicit-open.
-- **Enter on a prose dialog**: today it *applies* the completion
-  (surprising); design says Enter bypasses. Recommend bypass (Enter
-  submits the raw line; Tab is the only expansion key).
-- **Dialog columns**: prompt rows via `Entry.description()` show
-  mtime + size (richer than the old prefix-list). Recommend keeping
-  the rich description (it's free) with labels
-  `Path` / `Description`.
+- **Worker**: one background thread per prompt session (spawns with
+  the prose layer; exits when its `Sender` drops). It owns the
+  `FileCompleter` and runs `complete(word)` — the only slow unit.
+  After each compute it *drains its inbox to the newest request*, so a
+  typing burst coalesces to at most one wasted listing.
+- **Coalescing / no duplicates**: `PromptCompletion` tracks the
+  outstanding word. Same word ⇒ never re-sent (the request would just
+  duplicate fs work); changed word ⇒ supersedes (old result dropped on
+  arrival by the match rule below).
+- **Debounce**: a new word is sent only after it has been stable for
+  `DEBOUNCE` (100 ms) — per-keystroke frames stay string-cost, one
+  listing fires after the pause.
+- **Display match**: every result is tagged with the word it was
+  computed for. It is wrapped/painted only if it still equals the word
+  under completion; otherwise dropped. Between a word change and its
+  matching result the frame is `Idle` — a dialog never shows rows for
+  a different word.
+- **Wakeup**: results do not arrive via a keypress. While a request is
+  outstanding or the debounce is armed, the input loop waits with
+  `event::poll(deadline)` instead of `event::read()`; on timeout it
+  re-evals (drains results / fires the debounce) and repaints if the
+  overlay changed. Keys behave exactly as before (`poll_timeout()`
+  reports which wait to use: `None` = block, `Some(d)` = poll).
+- `Tab` while pending is a no-op — the dialog appears when the result
+  lands (implicit open means Tab is rarely the first key).
+- Thread boundary: `CompletionRows`/`Row` are owned data, so they cross
+  the channel **by value**; the worker's L2 stores them by value and
+  the host builds the `Rc` after `recv`. (`Rc` is !Send.)
+- The slash engine's completion (sandbox leaf) stays synchronous — it
+  rides the engine's own eventual async conversion; out of scope here.
 
-### What the port orphans (deletion set, port step owns it)
+Keys while the dialog is up mirror the slash arms: `MoveCursor` →
+`cursor_delta`; `Tab` → expand; a text edit or space changes the word
+and re-derives; `Enter` bypasses (submits the raw line); `Esc` has no
+completion meaning. Dismissal is purely buffer-driven — the dialog is up
+iff the last frame produced rows.
 
-`complete_path_prefix_sandbox`, `complete_path_prefix`,
-`complete_path_prefix_impl` (+ `list_dir_entries`),
-`tools::sandbox_list_dir` (prompt is its last caller),
-`token_at_cursor` + tests, `completion_pos` / `path_completions`
-plumbing, `ActiveOverlay::PathComplete` + its
-display/tab/enter/esc/dissmiss arms, `replace_last_token` (its other
-callers die with the Settings/Mod arms in cleanup), and
-`fuzz_path_completion_preserves_layout` (port to the new edit path).
-End state: `ActiveOverlay = { None, V25Menu }`.
+**Tab** splices the cursor row's id over the word range
+(`LineEditor::replace_range`; the cursor lands after the id) and
+re-derives on the next frame — the same "expand → re-run → trailing
+space" shape as the slash Tab arm. Re-run empty ⇒ append one space.
 
-### Ordering vs final cleanup
+### Crate surface
 
-The old completer is standalone repl code — **not** menu v1/v2.0 —
-so it is outside `final_cleanup.md`'s charter; that plan's P2 shim
-(`path_complete::complete_prompt`) is dropped as throwaway under any
-engine-style port. Recommendation: run **cleanup first** as pure
-dead-code deletion (completion island explicitly untouched), then
-this port as its own step on the minimal repl — the host integration
-then has only the `V25Menu` pattern to copy, and finishes by deleting
-the island above. Porting first would also leave cleanup
-completion-free, but mixes a live-UX rewrite into a deletion arc for
-no cleanup benefit either way.
+Generic only; no completion-specific engine type.
+
+```rust
+// view.rs — module becomes `pub`; the four types are re-exported.
+impl ViewRows {
+    /// Completion source → view: one slot, identity order, no active.
+    pub fn of(rows: Vec<Row>) -> Rc<ViewRows>;
+}
+// `RowView` / `ViewRequest` / `ViewPlan` already reference only public
+// types; expose as-is. `ViewRows::iter` stays crate-private — the host
+// only hands a `ViewRows` to `plan` and reads `ViewPlan.cursor_row`.
+
+// path_complete.rs — the completion module.
+/// Cheap syntactic gate (moved from `v25_sandbox`), shared by the
+/// sandbox leaf and the prose layer.
+pub fn completable(word: &str) -> bool;
+
+/// Prose FS completer — the worker's unit of work. Gate-free (the
+/// caller gates); always the sandbox-aware mode (`complete(word,
+/// true)` — host fallback when no sandbox). L2 `(word,
+/// listing_stale)` cache. Rows: id = full path, desc =
+/// `Entry::description()`. Labels chosen here (the render path stays
+/// label-agnostic): id = `Sandbox path` when a sandbox is configured,
+/// else `Host path`; desc = `Description`.
+///
+/// Returns **by value** (owned, `Send`) so it can run on the worker
+/// thread; the host wraps `Rc::new` after the channel hop.
+pub struct FileCompleter { /* last: Option<(String, CompletionRows)> */ }
+impl FileCompleter {
+    pub fn complete(&mut self, word: &str) -> CompletionRows;
+}
+```
+
+`CompletionRows` (already public) stays the completer payload; the
+labels are chosen per completer and passed through `plan` — the sandbox
+leaf and the prose layer share no label coupling.
+
+### Host surface
+
+New module `src/prompt_complete.rs` (the FS cache, word fn, and splice
+justify a module over inlining in `repl.rs`):
+
+```rust
+/// Word directly before the char-index `cursor` (char range); `None` at
+/// a buffer start / after whitespace, or when the cursor is inside a
+/// token (mid-word ⇒ inert). Delimiter = whitespace (` ` / `\n` /
+/// `\t`), which scopes the word to the cursor's logical line for free.
+pub fn word_at_cursor(buf: &[char], cursor: usize) -> Option<Range<usize>>;
+
+pub struct PromptCompletion {
+    view: RowView,                        // dialog cursor
+    last: Option<(String,                 // word the rows belong to
+                  Rc<CompletionRows>,     // recv → Rc::new
+                  Rc<ViewRows>)>,         // ptr-keyed wrap memo
+    tx: Sender<String>,                   // word requests → worker
+    rx: Receiver<(String, CompletionRows)>, // (word, rows) results
+    outstanding: Option<String>,          // word in flight (dedupe)
+    armed: Option<(String, Instant)>,     // debounce: (word, stable_since)
+    expand: Option<String>,               // Tab-expanded id awaiting its
+                                          // re-run (empty ⇒ trailing space)
+    dead: bool,                           // worker died → stop send/poll
+}
+
+/// What the input loop should paint this frame. Splicing mutates the
+/// editor in place — no buffer or cursor crosses this boundary.
+pub enum Frame {
+    Idle,               // no dialog (inert word, or request pending)
+    Dialog(RenderPlan), // paint; buffer unchanged
+}
+
+impl PromptCompletion {
+    /// One passive / `MoveCursor` / `Tab` frame: drains results, fires
+    /// the debounce when the word held still, decides Idle/Dialog. On
+    /// `Tab` the selected id is spliced into `editor` in place
+    /// (whole-word replace via `LineEditor::replace_range`; the cursor
+    /// lands after the id) and re-derives next frame — re-run empty ⇒
+    /// trailing space. `Enter`/`Esc` never reach here.
+    pub fn eval(&mut self, editor: &mut LineEditor, key: HostKey,
+                ctx: RenderContext) -> Frame;
+    /// How long the input loop may sleep before re-evaluating:
+    /// `None` = block on `event::read()`; `Some(d)` = `event::poll(d)`
+    /// and re-eval on timeout (drain a landed result / fire the
+    /// debounce). `None` again once the worker is dead.
+    pub fn poll_timeout(&self) -> Option<Duration>;
+}
+```
+
+`eval` *is* the flow above. The wrap memo keys on the
+`Rc<CompletionRows>` so an unchanged word passes the same
+`Rc<ViewRows>` to `plan` — no reconcile, dialog cursor preserved.
+`read_input` gains a plan-carrying overlay variant for `Dialog` (painted
+via `paint_plan`); Tab splicing happens inside `eval`.
+
+### Decisions
+
+- Implicit open, stateless, prompt-is-the-state.
+- Completion is asynchronous: worker thread + word-tagged results +
+  100 ms debounce + inbox drain-to-newest; the loop wakes on
+  `event::poll` while pending, `event::read` when not. A dialog only
+  ever shows rows computed for the word under completion.
+- The gate pre-filters per keystroke; only gate-passing words reach the
+  L2 cache / FS. (Amends the engine's "no engine-level gate" note: that
+  rule covers the *slash* engine calling uniformly on passive frames;
+  the prose host is the key loop itself, so it gates first.)
+- Bare relative words (`cat fo`) stay inert; `./` triggers. Accepted
+  regression from the old completer.
+- Mid-word cursor ⇒ inert (no dialog).
+- `Enter` bypasses (submits the raw line); `Tab` is the only expand key.
+- Labels are per-completer (the render path stays agnostic): prose uses
+  `Sandbox path` / `Host path` (by sandbox config) + `Description`; the
+  richer `Entry::description()` (mtime + size) stays.
+- The word is replaced whole (the host owns the word).
+
+### Host paint sharing
+
+The host already paints `RenderPlan`s once (the `V25Menu` arm's
+detail/table-header/rows windowing). Extract it as
+`Repl::paint_plan(plan, term_h) -> String` next to its pure siblings
+(`render_logical_line`, `compute_space_budget`, `visual_row_window`);
+both plan-carrying overlay variants call it. Stays in `repl.rs` (call
+sites and helper family live there). The crate's `RenderPlan::paint`
+is a dead v2.0 leftover (no vertical budgeting) — deleted in the port.
+
+### Overlay shape
+
+Two plan-carrying variants — `V25Menu { plan }` (slash) and
+`PathComplete { plan }` (prose) — share paint, `cursor_row()`, and
+`MoveCursor`/page routing; they differ only in key dispatch, decided at
+key time by which branch produced the overlay: slash Enter/Esc queue
+through the engine, prose Enter submits the raw line and Esc is a
+**no-op** (stateless dismissal: the dialog exits only by space, moving
+off the word, or completing — an Esc-dismiss latch is explicitly out of
+scope). While the prose dialog is up, Up/Down drive the dialog cursor
+(Left/Right still move the text cursor and dismiss by moving off the
+word).
+
+### Implementation steps
+
+0. **Plan painter** — extract `Repl::paint_plan` from the `V25Menu`
+   arm; both callers use it. No behavior change.
+1. **Crate exposure** — `pub mod view` (+ re-exports), `ViewRows::of`;
+   move `completable` → `path_complete`, add `FileCompleter`. No host
+   changes; existing tests pin behavior.
+2. **Prose module** — `src/prompt_complete.rs`: `word_at_cursor`,
+   `PromptCompletion` (worker + debounce + word-match), `Frame` +
+   `poll_timeout()` + unit tests. Unwired.
+3. **Wiring** — `read_input`: prose eval at the top-of-loop eval site
+   (non-`/` branch); `PathComplete { plan }` variant; key routing
+   (Up/Down/Page → `MoveCursor`, Tab → eval+splice, Enter → submit,
+   Esc → no-op); wait = `event::poll(deadline)` while
+   `poll_timeout()` is `Some`, `event::read()` otherwise (timeout
+   re-evals + repaints);
+   `LineEditor` cursor accessor if needed.
+4. **Deletions** — verified against live callers at the time:
+   `complete_path_prefix_sandbox`, `complete_path_prefix`,
+   `complete_path_prefix_impl` (+ `list_dir_entries`),
+   `tools::sandbox_list_dir`, `token_at_cursor` + tests,
+   `completion_pos`/`path_completions` plumbing, the bespoke
+   `ActiveOverlay::PathComplete` payload, `replace_last_token` (its
+   only remaining callers are its own tests / the old fuzz test),
+   `RenderPlan::paint`, and `fuzz_path_completion_preserves_layout`
+   (ported to the new edit path).
+   End state: `ActiveOverlay = { None, V25Menu, PathComplete }`, with
+   both `V25Menu` and `PathComplete` carrying a `RenderPlan`.
