@@ -2143,12 +2143,31 @@ mod tests {
         root
     }
 
-    /// Rendered row texts from a Continue result.
+    /// Rendered row texts from a Continue result, with ANSI codes stripped.
     fn rows_of(result: MenuResult) -> Vec<String> {
         match result {
-            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| strip_ansi(&l.0)).collect(),
             other => panic!("expected Continue, got {:?}", other),
         }
+    }
+
+    /// Strip ANSI SGR escape sequences from a string.
+    fn strip_ansi(s: &str) -> String {
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip escape sequence
+                for e in chars.by_ref() {
+                    if e.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            result.push(c);
+        }
+        result
     }
 
     #[test]
