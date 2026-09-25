@@ -3039,7 +3039,7 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        let blob = "src/x.rs\n@@@OLD\na\n@@@DIV\nb\n@@@NEW";
+        let blob = "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END";
         session
             .append_message(&Message::Assistant {
                 id: None,

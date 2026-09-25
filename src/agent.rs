@@ -5191,7 +5191,7 @@ mod tests {
         assert!(edits.contains("src/x.rs"), "got: {edits}");
 
         // Idempotent: an already-block value is unchanged.
-        let already = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@DIV\nb\n@@@NEW"});
+        let already = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
         let Message::Assistant { content, .. } = &out2[0] else {
             panic!("expected assistant")

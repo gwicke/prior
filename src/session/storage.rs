@@ -362,7 +362,7 @@ mod tests {
         // Block string -> canonical array.
         let mut v = serde_json::json!({
             "path": "src/x.rs",
-            "edits": "@@@OLD\na\n@@@DIV\nb\n@@@NEW"
+            "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         });
         normalize_args_in_place("edit", &mut v);
         assert_eq!(
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(v, orig);
 
         // Malformed blob is left as-is (graceful degradation).
-        let orig = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW"});
+        let orig = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@END"});
         let mut v = orig.clone();
         normalize_args_in_place("edit", &mut v);
         assert_eq!(v, orig);

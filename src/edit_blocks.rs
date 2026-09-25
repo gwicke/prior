@@ -19,9 +19,9 @@ use serde_json::{json, Value};
 /// Opening marker of a SEARCH region.
 pub const SEARCH_MARKER: &str = "@@@OLD";
 /// Divider between the SEARCH and REPLACE regions.
-pub const DIVIDER: &str = "@@@DIV";
+pub const DIVIDER: &str = "@@@NEW";
 /// Closing marker of a REPLACE region.
-pub const REPLACE_MARKER: &str = "@@@NEW";
+pub const REPLACE_MARKER: &str = "@@@END";
 
 /// One parsed SEARCH/REPLACE block.
 #[derive(Debug, PartialEq, Clone)]
@@ -234,7 +234,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if j >= lines.len() {
             return Err(ParseError(format!(
-                "a {SEARCH_MARKER} block is missing its `{DIVIDER}` divider"
+                "an {SEARCH_MARKER} / {DIVIDER} block is missing its `{DIVIDER}` divider"
             )));
         }
 
@@ -247,14 +247,14 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if k >= lines.len() {
             return Err(ParseError(format!(
-                "a {SEARCH_MARKER} block is missing its `{REPLACE_MARKER}` closing marker"
+                "a {SEARCH_MARKER} block is missing its `{REPLACE_MARKER}` marker"
             )));
         }
 
         let old_text = search_lines.join("\n");
         if old_text.is_empty() {
             return Err(ParseError(
-                "a {SEARCH_MARKER} block has empty search text".to_string(),
+                "a {SEARCH_MARKER} block has empty OLD text".to_string(),
             ));
         }
         let new_text = replace_lines.join("\n");
@@ -268,7 +268,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     }
 
     if edits.is_empty() {
-        return Err(ParseError(format!("no `{SEARCH_MARKER}` blocks found")));
+        return Err(ParseError(format!("no `{SEARCH_MARKER}` / {DIVIDER} blocks found")));
     }
 
     let multi_file = distinct_headers.len() > 1;
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn parses_single_block_with_path() {
-        let text = "src/foo.py\n@@@OLD\ndef foo():\n    return 1\n@@@DIV\ndef foo():\n    return 2\n@@@NEW";
+        let text = "src/foo.py\n@@@OLD\ndef foo():\n    return 1\n@@@NEW\ndef foo():\n    return 2\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn parses_two_blocks_same_file_second_inherits() {
-        let text = "src/foo.py\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
+        let text = "src/foo.py\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -511,7 +511,7 @@ mod tests {
     fn header_line_anchor_is_captured_per_block() {
         // `path:LINE` on a header supplies that block's anchor; differing
         // anchors on the same file do NOT count as a multi-file attempt.
-        let text = "src/foo.py:10\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\nsrc/foo.py:42\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
+        let text = "src/foo.py:10\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\nsrc/foo.py:42\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn header_line_anchor_only_on_first_block() {
-        let text = "src/foo.py:7\n@@@OLD\na\n@@@DIV\nA\n@@@NEW\n\n@@@OLD\nb\n@@@DIV\nB\n@@@NEW";
+        let text = "src/foo.py:7\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.edits[0].start_line, Some(7));
         assert_eq!(p.edits[1].start_line, None);
@@ -534,20 +534,20 @@ mod tests {
         // SEARCH (e.g. `@@@OLD>` or `@@@OLD]`). Be lenient
         // for SEARCH only — the prefix must match exactly, only one char from
         // the set `>]})` is allowed, and nothing else may follow.
-        let text = "src/foo.py\n@@@OLD>\nold\n@@@DIV\nnew\n@@@NEW";
+        let text = "src/foo.py\n@@@OLD>\nold\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
 
-        let text2 = "src/foo.py\n@@@OLD]\nold\n@@@DIV\nnew\n@@@NEW";
+        let text2 = "src/foo.py\n@@@OLD]\nold\n@@@NEW\nnew\n@@@END";
         let p2 = parse_blocks(text2).unwrap();
         assert_eq!(p2.edits, vec![plain("old", "new")]);
 
-        let text3 = "src/foo.py\n@@@OLD}\nold\n@@@DIV\nnew\n@@@NEW";
+        let text3 = "src/foo.py\n@@@OLD}\nold\n@@@NEW\nnew\n@@@END";
         let p3 = parse_blocks(text3).unwrap();
         assert_eq!(p3.edits, vec![plain("old", "new")]);
 
-        let text4 = "src/foo.py\n@@@OLD)\nold\n@@@DIV\nnew\n@@@NEW";
+        let text4 = "src/foo.py\n@@@OLD)\nold\n@@@NEW\nnew\n@@@END";
         let p4 = parse_blocks(text4).unwrap();
         assert_eq!(p4.edits, vec![plain("old", "new")]);
     }
@@ -556,14 +556,14 @@ mod tests {
     fn lenient_search_marker_rejects_invalid_brackets() {
         // A char outside the allowed set, or a space before the bracket,
         // must NOT be accepted.
-        assert!(parse_blocks("@@@OLDX\nold\n@@@DIV\nnew\n@@@NEW").is_err());
-        assert!(parse_blocks("@@@OLD ]\nold\n@@@DIV\nnew\n@@@NEW").is_err());
+        assert!(parse_blocks("@@@OLDX\nold\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD ]\nold\n@@@NEW\nnew\n@@@END").is_err());
     }
 
     #[test]
     fn lenient_search_marker_splits_hallucinated_bracket_from_content() {
         // `<<<<<<< SEARCH>>` → treat as `<<<<<<< SEARCH\n>` (marker + content line ">")
-        let text = "@@@OLD>>\nold\n@@@DIV\nnew\n@@@NEW";
+        let text = "@@@OLD>>\nold\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.edits, vec![plain(">\nold", "new")]);
     }
@@ -571,25 +571,25 @@ mod tests {
     #[test]
     fn lenient_only_for_search_not_replace() {
         // The closing marker must remain exact — no leniency for REPLACE.
-        assert!(parse_blocks("@@@OLD\nold\n@@@DIV\nnew\n@@@NEW>").is_err());
-        assert!(parse_blocks("@@@OLD\nold\n@@@DIV\nnew\n@@@NEW]").is_err());
+        assert!(parse_blocks("@@@OLD\nold\n@@@NEW\nnew\n@@@END>").is_err());
+        assert!(parse_blocks("@@@OLD\nold\n@@@NEW\nnew\n@@@END]").is_err());
     }
 
     #[test]
     fn lenient_search_marker_accepts_content_on_same_line() {
         // When the bracket is followed directly by content (no newline), the
         // line is split and the content becomes the first SEARCH line.
-        let text = "src/foo.py\n@@@OLD>old\n@@@DIV\nnew\n@@@NEW";
+        let text = "src/foo.py\n@@@OLD>old\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
 
-        let text2 = "src/foo.py\n@@@OLD]old\n@@@DIV\nnew\n@@@NEW";
+        let text2 = "src/foo.py\n@@@OLD]old\n@@@NEW\nnew\n@@@END";
         let p2 = parse_blocks(text2).unwrap();
         assert_eq!(p2.edits, vec![plain("old", "new")]);
 
         // Multi-line content on the same line after the bracket.
-        let text3 = "src/foo.py\n@@@OLD>line 1\nline 2\n@@@DIV\nnew\n@@@NEW";
+        let text3 = "src/foo.py\n@@@OLD>line 1\nline 2\n@@@NEW\nnew\n@@@END";
         let p3 = parse_blocks(text3).unwrap();
         assert_eq!(p3.edits, vec![plain("line 1\nline 2", "new")]);
     }
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn lenient_search_marker_newline_style_still_works() {
         // The original `<<<<<<< SEARCH>\n` style still parses correctly.
-        let text = "src/foo.py\n@@@OLD>\nold\n@@@DIV\nnew\n@@@NEW";
+        let text = "src/foo.py\n@@@OLD>\nold\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn flags_multi_file_on_differing_headers() {
-        let text = "a.rs\n@@@OLD\nx\n@@@DIV\ny\n@@@NEW\n\nb.rs\n@@@OLD\np\n@@@DIV\nq\n@@@NEW";
+        let text = "a.rs\n@@@OLD\nx\n@@@NEW\ny\n@@@END\n\nb.rs\n@@@OLD\np\n@@@NEW\nq\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert!(p.multi_file);
         assert!(merge_path(Some("a.rs"), p).is_err());
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn strips_fences() {
-        let text = "```\nsrc/x.rs\n@@@OLD\na\n@@@DIV\nb\n@@@NEW\n```";
+        let text = "```\nsrc/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END\n```";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
         assert_eq!(p.edits, vec![plain("a", "b")]);
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn prose_before_block_is_not_a_header() {
-        let text = "Sure, here is the change:\n\n@@@OLD\na\n@@@DIV\nb\n@@@NEW";
+        let text = "Sure, here is the change:\n\n@@@OLD\na\n@@@NEW\nb\n@@@END";
         let p = parse_blocks(text).unwrap();
         // The immediate predecessor of SEARCH is blank → no header.
         assert_eq!(p.path, None);
@@ -661,19 +661,19 @@ mod tests {
 
     #[test]
     fn missing_divider_errors() {
-        let text = "@@@OLD\na\n@@@NEW";
+        let text = "@@@OLD\na\n@@@END";
         assert!(parse_blocks(text).is_err());
     }
 
     #[test]
     fn missing_replace_errors() {
-        let text = "@@@OLD\na\n@@@DIV\nb";
+        let text = "@@@OLD\na\n@@@NEW\nb";
         assert!(parse_blocks(text).is_err());
     }
 
     #[test]
     fn empty_search_errors() {
-        let text = "@@@OLD\n@@@DIV\nb\n@@@NEW";
+        let text = "@@@OLD\n@@@NEW\nb\n@@@END";
         assert!(parse_blocks(text).is_err());
     }
 
@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn canonicalize_blob_string() {
         let v =
-            json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@DIV\nb\n@@@NEW"});
+            json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let c = canonicalize_edit_value(&v);
         assert_eq!(
             c,
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn canonicalize_malformed_blob_is_identity() {
-        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW"});
+        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@END"});
         assert_eq!(canonicalize_edit_value(&v), v);
     }
 
