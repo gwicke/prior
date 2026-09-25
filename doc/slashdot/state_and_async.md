@@ -364,37 +364,39 @@ still sync); the async conversion rides on top.
    one atomic write). Loop call-sites become *lock → clone `Arc` out →
    drop guard → await*; creation/rebuild stays loop-side, from the
    **applied** config (handlers only ever consume the `Arc`s).
-5. **Data-plane inline — appliers collapse.** rename/delete/fork/
-   replay/resume/tree_switch/new/compact run in `submit().await`
-   (session + agent + output all reachable) **[started: `tree_switch`
-   inline and its `ControlConfig` field deleted — node submit does the
-   move, tests assert the leaf actually moved. Remaining, same pattern:
-   replay (needs an output-capture test helper), rename/delete (slot
-   session + repo; `/clear`'s composed delete goes inline too, removing
-   `delete_session_ids_after`), fork (extract a shared helper from
-   `handle_session_command`), resume/new (target-stamp judgment),
-   compact (needs the DSR resync), plus `/model` inline recording →
-   `model_commit` deletion.]** `/model` records
-   `ModelChange` inline → delete `model_commit` + the loop-side
-   detection. Editor review works mid-eval (`guard.stop` → editor →
-   `guard.start` → confirm — overlay-agnostic) but needs a **DSR cursor
-   resync after `guard.start()`** before `emit_commit`/redraw draw
-   against the pre-editor `input_row` (the Ctrl-E path's "only when no
-   overlay is active" gate is the known precedent). Judgment call
-   recorded: session creation stamps provider/model from the **target**
-   config handler-side (divergence only in the failed-rebuild state; a
-   later `ModelChange` record corrects the journal) — reject that and
-   `new`/`resume` stay thin loop-stamping appliers instead.
-   `ControlConfig` shrinks to `quit` + whatever loop-stamping remains.
-   Also: handler-internal sync IO → awaits, **cache-preserving** —
-   session listings + `find_session` move to an async `list` that
-   consults the shared 2s mtime cache first (warm = memory, stale =
-   `tokio::fs` scan; never a per-keystroke rescan — the naive swap to
-   the uncached async `list()` would be strictly worse); settings
-   `save()` gets an async facade (clone out → drop guard → await write).
-6. **Verify.** Full suite; E2E: the empty-session repro from the
-   model-change bug must stay dead; grep `MenuShared|LiveState|
-   pending_op|model_commit` → zero; smoke `/session` ops, quit,
+5. **Data-plane inline — appliers collapse** **[mostly done].** Inline
+   in `submit().await` (slot session/agent/output/repo reachable):
+   tree_switch, replay, rename, delete, new, clear (full transaction —
+   `agent::start_fresh_session` + outgoing delete, preserving the
+   applier's create→activate→delete order), fork
+   (`agent::fork_session_at`, shared with the typed path — also fixed
+   a latent bug: `repo.fork` never created the target cwd's dir, so the
+   first fork into a fresh directory failed with ENOENT), and `/model`'s
+   inline `ModelChange` journal (live-node role; `model_commit`
+   deleted; the rebuild-gate re-arm is fingerprint-change-only now).
+   `ControlConfig` = **quit, resume, tree_compact, sandbox** (from 12).
+   Tests assert side effects (leaf moved, rendered output captured via
+   `output::RecordingOutput`, index session_name, files gone/present,
+   journal entry), driven through `agent::block_on_test` (submits hit
+   `tokio::fs`) with the `test_session_with_entries` /
+   `test_repo_with_session` fixtures.
+   **Remaining:** resume (extract load+replay+prefill from
+   `handle_session_command`; prefill needs a slot register the loop
+   consumes) and compact (move `run_compaction` into the node +
+   **DSR cursor resync after `guard.start()`** so `emit_commit`/redraw
+   don't draw against the pre-editor `input_row` — review itself is
+   overlay-agnostic: guard.stop → editor → guard.start → confirm; the
+   Ctrl-E "only when no overlay is active" gate is the known
+   precedent). Optional: cache-preserving async `list` for listings and
+   the settings `save()` facade (in-submit sync IO stays bounded by the
+   2s mtime cache).
+   Judgment recorded and applied: session creation AND the model
+   journal stamp from the **target** config handler-side (divergence
+   only in the failed-rebuild state; a later `ModelChange` corrects).
+6. **Verify.** Full suite green **[done]** (782); stale-name grep
+   `MenuShared|LiveState|pending_op|model_commit|AsyncOp` → zero
+   **[done]**. Remaining: E2E the empty-session repro from the
+   model-change bug must stay dead; smoke `/session` ops, quit,
    resume + prefill, `/model`.
 
 ## Open questions / potential issues
