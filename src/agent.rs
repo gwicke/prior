@@ -3154,7 +3154,7 @@ impl From<CompactionResult> for std::result::Result<(), String> {
 /// when the user cancelled at the review step (no entry written),
 /// `CompactionResult::Err(msg)` on failure. The caller is responsible for
 /// handling `Cancelled` — typically by returning to the editor with the
-/// original prompt line pre-filled (e.g. via `pending_prefill`).
+/// original prompt line pre-filled (e.g. via the slot's prefill register).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     session: &Session,
@@ -3202,8 +3202,8 @@ pub(crate) async fn run_compaction(
 }
 
 /// Run a compaction from an inline menu node — session/agent/output/
-/// guard/settings all reachable via the slot (mirrors the old
-/// `control.tree_compact` applier). Returns the message to display;
+/// guard/settings all reachable via the slot (the loop-side applier it
+/// replaces did the same through its own locals). Returns the message to display;
 /// `None` = Done/Cancelled are silent (the review gate prints its own
 /// cancel notice). The Llm-mode agent is created here from the TARGET
 /// config — same target-stamp judgment as session creation.
@@ -3909,7 +3909,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // Enter once and goes through the exact same code path as a manual
     // `/session`, Tab, Enter: the REPL parses `/session <id> resume`, the
     // `handle_session_command` dispatch opens + replays the session, and the
-    // usual `/model …` prefill flows back into `pending_prefill` for the
+    // usual `/model …` prefill flows back into the slot's prefill
     // second prompt. This keeps the history and UX identical to a typed
     // resume (including the model-overlay catalog fetch that needs the
     // inter-keystroke time to land).

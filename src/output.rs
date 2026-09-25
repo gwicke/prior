@@ -260,8 +260,8 @@ impl Output for NoOutput {
 
 /// Test helper: an `Output` that captures every `display_text` line for
 /// assertions; everything else is a no-op (mirroring `NoOutput`).
-/// Construct the shared handle, then feed it into
-/// `AppShared::for_test_with_output`.
+/// Construct the handle, then feed it into
+/// `AppState::for_test_with_output`.
 #[cfg(test)]
 pub struct RecordingOutput {
     pub lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,

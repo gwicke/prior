@@ -364,7 +364,7 @@ still sync); the async conversion rides on top.
    one atomic write). Loop call-sites become *lock → clone `Arc` out →
    drop guard → await*; creation/rebuild stays loop-side, from the
    **applied** config (handlers only ever consume the `Arc`s).
-5. **Data-plane inline — appliers collapse** **[mostly done].** Inline
+5. **Data-plane inline — appliers collapse** **[done].** Inline
    in `submit().await` (slot session/agent/output/repo reachable):
    tree_switch, replay, rename, delete, new, clear (full transaction —
    `agent::start_fresh_session` + outgoing delete, preserving the
@@ -380,19 +380,25 @@ still sync); the async conversion rides on top.
    journal entry), driven through `agent::block_on_test` (submits hit
    `tokio::fs`) with the `test_session_with_entries` /
    `test_repo_with_session` fixtures.
-   **Remaining:** resume (extract load+replay+prefill from
-   `handle_session_command`; prefill needs a slot register the loop
-   consumes) and compact (move `run_compaction` into the node +
-   **DSR cursor resync after `guard.start()`** so `emit_commit`/redraw
-   don't draw against the pre-editor `input_row` — review itself is
-   overlay-agnostic: guard.stop → editor → guard.start → confirm; the
-   Ctrl-E "only when no overlay is active" gate is the known
-   precedent). Optional: cache-preserving async `list` for listings and
-   the settings `save()` facade (in-submit sync IO stays bounded by the
-   2s mtime cache).
-   Judgment recorded and applied: session creation AND the model
-   journal stamp from the **target** config handler-side (divergence
-   only in the failed-rebuild state; a later `ModelChange` corrects).
+   Also done: **resume** (`agent::resume_session` extracted from
+   `handle_session_command`, shared with the typed path — foreign-cwd
+   fork migration included; the model decision rides the new **prefill
+   register** in `AppState`, sole consumer the loop before
+   `read_input`, which replaced the `pending_prefill` local entirely)
+   and **compact** (`agent::compact_inline`: entry/tokens/early-out
+   guards, Llm agent from the TARGET config, review closure from the
+   slot's published `TermGuard`). Mid-eval `$EDITOR` is safe via
+   **`emit_commit`'s live-DSR re-anchor** of `input_row` before redraw
+   (the Ctrl-E post-`guard.start()` pattern, applied unconditionally).
+   Optional follow-ups (not blocking): cache-preserving async `list`
+   for listings, settings `save()` async facade — in-submit sync IO
+   stays bounded by the 2s mtime cache.
+   Judgment recorded and applied: session creation, the model journal,
+   AND compact's Llm-agent creation stamp from the **target** config
+   handler-side (divergence only in the failed-rebuild state; a later
+   `ModelChange` corrects). Final `ControlConfig`: **quit, sandbox**
+   (was 12 fields) — the convergence appliers are just the sandbox
+   merge/re-publish.
 6. **Verify.** Full suite green **[done]** (782); stale-name grep
    `MenuShared|LiveState|pending_op|model_commit|AsyncOp` → zero
    **[done]**. Remaining: E2E the empty-session repro from the
