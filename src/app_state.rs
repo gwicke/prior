@@ -112,10 +112,7 @@ pub struct ControlConfig {
     pub tree_compact: Option<TreeCompactIntent>,
     /// `/sandbox` mutations (applier merges + re-publishes).
     pub sandbox: Option<SandboxOp>,
-    /// Explicit `/model` row commit — the loop's convergence step records a
-    /// session `ModelChange` only for this id, and only when the *applied*
-    /// config ends up running it (failed rebuild records nothing).
-    pub model_commit: Option<String>,
+
 }
 
 impl ControlConfig {
@@ -128,7 +125,7 @@ impl ControlConfig {
 
             tree_compact: self.tree_compact.take(),
             sandbox: self.sandbox.take(),
-            model_commit: self.model_commit.take(),
+
         }
     }
 }
@@ -457,9 +454,6 @@ impl AppState {
         self.state.lock().control.sandbox = Some(op);
     }
 
-    pub fn set_model_commit(&self, qualified_id: String) {
-        self.state.lock().control.model_commit = Some(qualified_id);
-    }
 
     /// Sole-consumer drain: clone out + GC every one-shot control field in a
     /// single acquisition (`quit` latches). Run by the loop's convergence
@@ -553,18 +547,21 @@ mod tests {
     fn control_take_gc_one_shots_but_quit_latches() {
         let app_state = AppState::for_test(test_settings());
         app_state.request_resume("abc".into(), "5t".into());
-        app_state.set_model_commit("test:model".into());
+        app_state.request_tree_compact("u1".into(), CompactMode::Manual, String::new());
         app_state.request_quit();
 
         let taken = app_state.take_control();
         assert_eq!(taken.resume.as_ref().unwrap().session_id, "abc");
-        assert_eq!(taken.model_commit.as_deref(), Some("test:model"));
+        assert_eq!(
+            taken.tree_compact.as_ref().map(|c| c.target_id.as_str()),
+            Some("u1")
+        );
         assert!(taken.quit);
 
         // GC: one-shots gone, quit still latching.
         let taken2 = app_state.take_control();
         assert!(taken2.resume.is_none());
-        assert!(taken2.model_commit.is_none());
+        assert!(taken2.tree_compact.is_none());
         assert!(app_state.should_quit(), "quit is latching — never cleared");
     }
 

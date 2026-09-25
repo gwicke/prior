@@ -2612,7 +2612,7 @@ async fn session_recorded_thinking(session: &Session) -> Option<String> {
 /// alone must never create a session file (that is what littered the
 /// `/session` listing with header+marker-only "empty" sessions). The
 /// first real message persists the updated header.
-async fn record_model_change(session: &Session, qualified_id: &str) {
+pub(crate) async fn record_model_change(session: &Session, qualified_id: &str) {
     if session_recorded_model_id(session).await.as_deref() == Some(qualified_id) {
         return; // already recorded — no redundant entry
     }
@@ -3911,8 +3911,10 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             target.thinking_level.clone(),
             target.persona_name.clone(),
         );
-        let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp)
-            || control.model_commit.is_some();
+        // Re-arm = a *different* target than the last attempt (the old
+        // explicit-commit re-arm died with `model_commit`; re-selecting
+        // an identical target is a no-op by definition — target unchanged).
+        let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp);
         if (model_changed || thinking_changed || persona_changed) && rebuild_armed {
             last_attempted_target = Some(target_fp);
             let mut new_cfg = config.clone();
@@ -3951,26 +3953,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             }
         }
 
-        // Recording reads the active session (clone-out; read-only).
+        // Thinking metadata recording (the model entry moved inline: the
+        // /model node journals its explicit commit at submit time — its
+        // record helper skips values the session already holds and folds
+        // metadata into the in-memory header while the session is still
+        // unpersisted). Runs AFTER the rebuild so `config` matches the
+        // target when we record.
         let recording_session = app_state.session();
-        // Session metadata recording. Runs AFTER the rebuild so `config`
-        // at this point matches the committed values exactly when the
-        // agent actually runs them (rebuild succeeded, or the commit
-        // equalled the running value and no rebuild was needed) — a
-        // failed rebuild records nothing. Model entries additionally
-        // require the explicit `/model` target commit; the record helpers
-        // skip values the session already holds and fold metadata into
-        // the in-memory header instead of a file while the session is
-        // still unpersisted. A bare submit (quit, delete confirm, replay,
-        // …) never sets a commit, so it appends nothing — which also keeps
-        // `ensure_persisted` from creating header+marker "empty" sessions.
-        if let Some(ref committed) = control.model_commit {
-            if config.qualified_model_id() == *committed {
-                if let Some(ref s) = recording_session {
-                    record_model_change(s, committed).await;
-                }
-            }
-        }
         if thinking_changed && config.thinking_level == target_thinking {
             if let Some(ref s) = recording_session {
                 record_thinking_change(s, target_thinking.as_deref().unwrap_or("off")).await;

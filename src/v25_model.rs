@@ -25,8 +25,11 @@ pub struct ModelNode {
     active_fn: Box<dyn Fn() -> String>,
     /// Write the selected model id on submit. `Ok(())` on success.
     submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-    /// Recent model ids for ordering (only for `/model`, None for `/set`).
-    recent: Option<Arc<AppState>>,
+    /// The live `/model` node's app handle: recency ordering in `data()`
+    /// AND the journal record in `submit()`. `None` for
+    /// `/set default_model` — a settings write is not a model change and
+    /// must not journal a `ModelChange`.
+    live: Option<Arc<AppState>>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
@@ -38,12 +41,12 @@ impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
         submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-        recent: Option<Arc<AppState>>,
+        live: Option<Arc<AppState>>,
     ) -> Self {
         ModelNode {
             active_fn,
             submit_fn,
-            recent,
+            live,
             cached_response: None,
             cached_generation: u64::MAX, // force first rebuild
         }
@@ -64,7 +67,7 @@ impl SlashDotNode for ModelNode {
         let entries = crate::model_catalog::catalog_cached();
         let active_id = (self.active_fn)();
         let active = if active_id.is_empty() { None } else { Some(active_id) };
-        let recent: Vec<String> = self.recent.as_ref()
+        let recent: Vec<String> = self.live.as_ref()
             .map(|r| r.recent_models())
             .unwrap_or_default();
 
@@ -95,7 +98,20 @@ impl SlashDotNode for ModelNode {
             return SubmitResult::Done(None);
         }
         match (self.submit_fn)(&qualified) {
-            Ok(()) => SubmitResult::Done(None),
+            Ok(()) => {
+                // Live `/model` node: the explicit commit is journaled NOW —
+                // target-stamp judgment (recorded in the plan): the entry
+                // lands even if the next cycle's rebuild fails; a later
+                // `ModelChange` record corrects the journal. The record
+                // helper skips a value the session already holds, so
+                // re-commits stay idempotent.
+                if let Some(app) = self.live.as_ref() {
+                    if let Some(s) = app.session() {
+                        crate::agent::record_model_change(&s, &qualified).await;
+                    }
+                }
+                SubmitResult::Done(None)
+            }
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
     }
@@ -321,10 +337,6 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
         Box::new(move || reader.model()),
         Box::new(move |model| {
             writer.set_model(model);
-            // Explicit user commit of this model (Enter on the row): the
-            // loop's convergence step appends a `ModelChange` entry only for
-            // this id, and only when the applied config ends up running it.
-            writer.set_model_commit(model.to_string());
             Ok(())
         }),
         Some(app_state.clone()),
@@ -478,6 +490,34 @@ mod tests {
         }
         // Runtime-target config, not persistent settings.
         assert_eq!(app_state.model(), "openai:gpt-4o");
+    }
+
+    /// The live `/model` node journals its explicit commit at submit time
+    /// (target-stamp: no `model_commit` register, no loop round-trip).
+    #[test]
+    fn model_submit_records_model_change_inline() {
+        let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = test_model_node(&app_state);
+        let path_args = PathArgs {
+            ids: vec!["model".into(), "openai:gpt-4o".into()],
+            suffix: " ".into(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let recorded = crate::agent::block_on_test(async {
+            let idx = session.index().lock().await;
+            idx.entries.values().any(|e| {
+                matches!(
+                    &e.content,
+                    crate::session::SessionEntryContent::ModelChange { provider, model_id }
+                        if provider == "openai" && model_id == "gpt-4o"
+                )
+            })
+        });
+        assert!(recorded, "the commit must land in the journal inline");
     }
 
     fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
