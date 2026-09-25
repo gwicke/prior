@@ -3982,20 +3982,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 }
             }
         }
-        if let Some(ri) = control.rename {
-            let (session_id, new_name) = (ri.session_id, ri.new_name);
-            let input = format!("/session {} rename {}", session_id, new_name);
-            let out = config.output.clone();
-            let mut session = app_state.session();
-            let result = handle_session_command(
-                &input, &mut session, &mut repo, &mut config, &out,
-                &app_state.settings(),
-            ).await;
-            app_state.set_session(session);
-            if !matches!(result, SessionCommandResult::Handled) {
-                eprintln!("[v25] rename: unexpected result {:?}", std::mem::discriminant(&result));
-            }
-        }
         // Fresh session first: `/clear` composes `new_session` +
         // `delete_session_ids_after`, and this applier defines the order —
         // create → swap → delete (idempotent: a missing id is a no-op).
@@ -5141,6 +5127,19 @@ impl CodeAgent {
             usage: Mutex::new(SessionUsage::default()),
         }
     }
+}
+
+/// Test helper: drive a future on a fresh current-thread tokio runtime.
+/// Node submits touch `tokio::fs`/the blocking pool, which futures'
+/// plain `block_on` cannot host — use this for any test that awaits
+/// repo/session IO.
+#[cfg(test)]
+pub(crate) fn block_on_test<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(f)
 }
 
 /// Test helper: a writable session built from `entries` (temp dir,

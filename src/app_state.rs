@@ -55,12 +55,6 @@ pub struct ResumeIntent {
     pub replay_arg: String,
 }
 
-/// Rename a session (empty `new_name` clears the name).
-#[derive(Debug, Clone)]
-pub struct RenameIntent {
-    pub session_id: String,
-    pub new_name: String,
-}
 
 /// Compact mode for `tree_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,8 +108,7 @@ pub struct ControlConfig {
     pub resume: Option<ResumeIntent>,
     /// `/session <id> fork`.
     pub fork: Option<String>,
-    /// `/session <id> rename <name>`.
-    pub rename: Option<RenameIntent>,
+
     /// Sessions that should not exist (idempotent deletes; `/clear` pushes
     /// the outgoing current id alongside `new_session`).
     pub delete_session_ids_after: Vec<String>,
@@ -139,7 +132,7 @@ impl ControlConfig {
             new_session: self.new_session.take(),
             resume: self.resume.take(),
             fork: self.fork.take(),
-            rename: self.rename.take(),
+
             delete_session_ids_after: std::mem::take(&mut self.delete_session_ids_after),
 
             tree_compact: self.tree_compact.take(),
@@ -477,21 +470,6 @@ impl AppState {
         self.state.lock().control.fork = Some(session_id);
     }
 
-    pub fn request_rename(&self, session_id: String, new_name: String) {
-        self.state.lock().control.rename = Some(RenameIntent {
-            session_id,
-            new_name,
-        });
-    }
-
-    pub fn request_delete(&self, session_id: String) {
-        let mut st = self.state.lock();
-        if !session_id.is_empty()
-            && !st.control.delete_session_ids_after.contains(&session_id)
-        {
-            st.control.delete_session_ids_after.push(session_id);
-        }
-    }
 
 
     pub fn request_tree_compact(&self, target_id: String, mode: CompactMode, payload: String) {

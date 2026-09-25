@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::rc::Rc;
 
 use crate::app_state::AppState;
+use crate::session::repo::SessionRepo;
+use crate::session::Session;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
@@ -507,8 +509,42 @@ impl SlashDotNode for SessionRenameNode {
             .unwrap_or_default()
             .to_string();
         let new_name = path_args.suffix.trim().to_string();
-        self.app_state.request_rename(session_id, new_name);
-        SubmitResult::Done(None)
+        if new_name.is_empty() {
+            return SubmitResult::Done(Some(
+                "Usage: /session <name> rename <newname>".to_string(),
+            ));
+        }
+        // Data-plane inline: the active session renames in place; any
+        // other id goes through the repo (open → set → invalidate).
+        if let Some(s) = self.app_state.session() {
+            if s.get_session_id() == session_id {
+                let _ = s.set_session_name(&new_name).await;
+                if let Some(repo) = self.app_state.repo() {
+                    repo.invalidate_cache();
+                }
+                return SubmitResult::Done(None);
+            }
+        }
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let meta = repo
+            .list(None)
+            .await
+            .ok()
+            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+        match meta {
+            Some(meta) => match repo.open(&meta).await {
+                Ok((storage, index)) => {
+                    let s = Session::new_persisted(storage, index);
+                    let _ = s.set_session_name(&new_name).await;
+                    repo.invalidate_cache();
+                    SubmitResult::Done(None)
+                }
+                Err(e) => SubmitResult::Done(Some(format!("Cannot open session: {}", e))),
+            },
+            None => SubmitResult::Done(Some(format!("Session not found: {}", session_id))),
+        }
     }
 }
 
@@ -553,8 +589,27 @@ impl SlashDotNode for SessionDeleteNode {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
-        self.app_state.request_delete(session_id);
-        SubmitResult::Done(None)
+        // Data-plane inline: locate the meta by id, keep the current-
+        // session guard (mirrors `prepare()`), delete via the repo
+        // (which invalidates the listing cache itself).
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let meta = repo
+            .list(None)
+            .await
+            .ok()
+            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+        let Some(meta) = meta else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        if self.app_state.current_session_id() == session_id {
+            return SubmitResult::Done(Some("Cannot delete the current session".to_string()));
+        }
+        match repo.delete(&meta).await {
+            Ok(()) => SubmitResult::Done(None),
+            Err(e) => SubmitResult::Done(Some(format!("Cannot delete session: {}", e))),
+        }
     }
 }
 
@@ -813,23 +868,31 @@ mod tests {
     }
 
     #[test]
-    fn session_rename_submit_sets_control_target() {
+    fn session_rename_submit_renames_active_session() {
         let app_state = test_app_state();
+        let session = crate::agent::test_session_with_entries(vec![]);
+        let sid = session.get_session_id().to_string();
+        app_state.set_session(Some(session.clone()));
         let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "rename".into()],
+            ids: vec!["session".into(), sid, "rename".into()],
             suffix: " my-name ".to_string(),
             args: Default::default(),
         };
-        let _ = futures::executor::block_on(node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        let rename = taken.rename.as_ref().expect("rename target");
-        assert_eq!(rename.session_id, "some-uuid");
-        assert_eq!(rename.new_name, "my-name");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        let name = futures::executor::block_on(async {
+            session.index().lock().await.session_name.clone()
+        });
+        assert_eq!(
+            name.as_deref(),
+            Some("my-name"),
+            "rename must set the session's name in place"
+        );
     }
 
     #[test]
-    fn session_rename_empty_clears() {
+    fn session_rename_empty_shows_usage() {
         let app_state = test_app_state();
         let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path_args = PathArgs {
@@ -837,10 +900,13 @@ mod tests {
             suffix: "  ".to_string(),
             args: Default::default(),
         };
-        let _ = futures::executor::block_on(node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        let rename = taken.rename.as_ref().expect("rename target");
-        assert!(rename.new_name.is_empty(), "empty suffix should clear name");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("Usage: /session"), "usage message: {msg}")
+            }
+            _ => panic!("expected Done(usage message)"),
+        }
     }
 
     #[test]
@@ -880,20 +946,23 @@ mod tests {
     }
 
     #[test]
-    fn session_delete_submit_sets_control_target() {
-        let app_state = test_app_state();
+    fn session_delete_submit_removes_file() {
+        let (app_state, uuid, base) = temp_repo_with_session();
+        let repo = app_state.repo().expect("fixture repo in the slot");
+        assert_eq!(repo.list_sessions_sync(None).len(), 1, "fixture present");
         let mut node = SessionDeleteNode { app_state: app_state.clone() };
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "delete".into()],
+            ids: vec!["session".into(), uuid, "delete".into()],
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = futures::executor::block_on(node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        assert_eq!(
-            taken.delete_session_ids_after,
-            vec!["some-uuid".to_string()]
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "delete must succeed");
+        assert!(
+            repo.list_sessions_sync(None).is_empty(),
+            "the file must be gone from disk"
         );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
