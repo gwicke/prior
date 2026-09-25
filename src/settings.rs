@@ -133,6 +133,16 @@ impl ReasoningInContextMode {
             _ => None,
         }
     }
+
+    /// All enum variants with their canonical values and descriptions.
+    /// Used by `/set` menu for autocomplete and value selection.
+    pub fn variants() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("always", "keep all reasoning blocks in context"),
+            ("never", "drop reasoning from context to save tokens (default)"),
+            ("aborted_turns_only", "preserve reasoning only from aborted/errored turns"),
+        ]
+    }
 }
 
 impl std::str::FromStr for ReasoningInContextMode {

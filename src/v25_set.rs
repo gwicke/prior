@@ -122,10 +122,7 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
             ("indicator", "show only a Thinking… spinner"),
             ("content", "show the reasoning text (default)"),
         ],
-        SettingKey::ReasoningInContext => &[
-            ("true", "keep reasoning blocks in the session context"),
-            ("false", "drop reasoning from context to save tokens (default)"),
-        ],
+        SettingKey::ReasoningInContext => crate::settings::ReasoningInContextMode::variants(),
         _ => &[],
     }
 }
