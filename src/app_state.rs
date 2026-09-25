@@ -503,6 +503,7 @@ impl AppShared {
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
             reasoning_in_context: false,
             message_log_path: None,
+            sessions_dir: None,
         };
         Self::new(config, settings, None)
     }
