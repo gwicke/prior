@@ -195,8 +195,9 @@ pub fn session_fields() -> Vec<FieldSpec> {
 /// `.path:.` filter on drill). `SessionListNode` is its dynamic child.
 pub struct SessionListingNode;
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionListingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("session")
                 .desc("list, rename, resume, fork, or delete sessions")],
@@ -212,7 +213,7 @@ impl SlashDotNode for SessionListingNode {
         session_fields()
     }
 
-    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // On drill, add a default path filter to show only sessions
         // relevant to the current working directory.
         Some("session .path:.".to_string())
@@ -230,8 +231,9 @@ pub struct SessionListNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionListNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         use crate::slashdot_menu::value::Value;
 
         let current_id = self.app_state.current_session_id();
@@ -292,7 +294,7 @@ impl SlashDotNode for SessionListNode {
         session_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(session_id) = drilled_session_id(path_args) else {
             return vec!["Select a session, then choose an action.".to_string()];
         };
@@ -384,8 +386,9 @@ pub struct SessionResumeNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionResumeNode {
-    fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         // Guard: hidden for the current session.
         if let Some(sid) = drilled_session_id(path_args) {
             if sid == self.app_state.current_session_id() {
@@ -401,7 +404,7 @@ impl SlashDotNode for SessionResumeNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -416,7 +419,7 @@ impl SlashDotNode for SessionResumeNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
@@ -431,15 +434,16 @@ pub struct SessionForkNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionForkNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("fork").desc("branch from this point")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -450,7 +454,7 @@ impl SlashDotNode for SessionForkNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
@@ -464,15 +468,16 @@ pub struct SessionRenameNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionRenameNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("rename").desc("rename the session")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let current_name = action_session_id(path_args)
             .and_then(|sid| find_session(&self.app_state, sid))
             .and_then(|m| m.name)
@@ -484,7 +489,7 @@ impl SlashDotNode for SessionRenameNode {
         ]
     }
 
-    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the current session name. ids are
         // ["session", "<uuid>", "rename"].
         let sid = path_args.ids.get(1).map(|s| s.as_str()).unwrap_or_default();
@@ -497,7 +502,7 @@ impl SlashDotNode for SessionRenameNode {
         Some(path_args.prompt_with(&format!(" {}", current_name)))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();
@@ -512,15 +517,16 @@ pub struct SessionDeleteNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SessionDeleteNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("delete").desc("delete from disk")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -531,7 +537,7 @@ impl SlashDotNode for SessionDeleteNode {
         ]
     }
 
-    fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         // Guard: cannot delete the current session.
         if let Some(sid) = action_session_id(path_args) {
             if sid == self.app_state.current_session_id() {
@@ -543,7 +549,7 @@ impl SlashDotNode for SessionDeleteNode {
         SubmitResult::Prepared
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let session_id = action_session_id(path_args)
             .unwrap_or_default()
             .to_string();

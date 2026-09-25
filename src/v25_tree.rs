@@ -588,8 +588,9 @@ impl TreeListNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeListNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         // Read the app_state tree (Arc — O(1) clone, no deep copy).
         let tree_rc = self.app_state.raw_tree();
         let leaf = self.app_state.leaf_id();
@@ -684,7 +685,7 @@ impl SlashDotNode for TreeListNode {
         tree_fields()
     }
 
-    fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(entry_id) = Self::drilled_entry_id(path_args) else {
             return vec!["Select a tree entry, then choose an action.".to_string()];
         };
@@ -740,8 +741,9 @@ pub struct TreeSwitchNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeSwitchNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("switch")
                 .desc("continue from this entry")],
@@ -749,7 +751,7 @@ impl SlashDotNode for TreeSwitchNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -760,7 +762,7 @@ impl SlashDotNode for TreeSwitchNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         // In the action node's own context, the path is
         // ["tree", "<entry-id>", "switch"]. The entry ID is the
         // second-to-last element (matching SessionResumeNode's pattern).
@@ -788,15 +790,16 @@ pub struct CompactNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for CompactNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("compact").desc("summarize conversation up to the current point")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -807,13 +810,13 @@ impl SlashDotNode for CompactNode {
         ]
     }
 
-    fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // Look up the current session leaf ID and redirect.
         let leaf_id = self.app_state.leaf_id()?;
         Some(format!("tree {} compact ", leaf_id))
     }
 
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         // Enter (without drill) should also redirect — treat as drill.
         match self.app_state.leaf_id() {
             Some(leaf_id) => SubmitResult::NewPath(format!("tree {} compact ", leaf_id)),
@@ -840,15 +843,16 @@ impl TreeCompactManualNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactManualNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("manual").desc("user-editable file list")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -864,7 +868,7 @@ impl SlashDotNode for TreeCompactManualNode {
     // then return Prepared → confirm → submit. Requires session access
     // to compute drafts, which the node doesn't have.
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
         self.app_state.request_tree_compact(target_id, CompactMode::Manual, draft);
@@ -890,15 +894,16 @@ impl TreeCompactTextNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactTextNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("text-only").desc("extracted conversation text")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -909,7 +914,7 @@ impl SlashDotNode for TreeCompactTextNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
         self.app_state.request_tree_compact(target_id, CompactMode::TextOnly, draft);
@@ -935,15 +940,16 @@ impl TreeCompactPromptNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for TreeCompactPromptNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![Row::new("prompt").desc("LLM-generated summary")],
             active_ids: Vec::new(),
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let prompt = &path_args.suffix;
         if prompt.is_empty() {
             vec![
@@ -958,13 +964,13 @@ impl SlashDotNode for TreeCompactPromptNode {
         }
     }
 
-    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the default compaction prompt.
         // ids are ["tree", "<id>", "compact", "prompt"].
         Some(path_args.prompt_with("Summarize the conversation up to this point."))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let prompt = path_args.suffix.trim().to_string();
         self.app_state.request_tree_compact(target_id, CompactMode::Prompt, prompt);

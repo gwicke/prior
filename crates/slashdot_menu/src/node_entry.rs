@@ -185,21 +185,28 @@ impl NodeEntry {
     /// populated by `refresh_data()`). `self.inner.data()` provides only the
     /// static rows (ids/descriptions for the parent); dynamic values come
     /// from the refreshed cache, not from `data()`.
-    fn node_data(
-        &mut self,
+    // Manual `Box::pin` future: `node_data` → `refresh_data` → child
+    // `node_data` is a genuine async cycle — unboxed futures would be
+    // infinitely sized (E0733). Boxing breaks it; everything else on the
+    // chain stays a plain `async fn`.
+    fn node_data<'a>(
+        &'a mut self,
         epoch: u64,
-        path_args: &PathArgs,
-    ) -> crate::node_impl::DataResult {
+        path_args: &'a PathArgs,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::node_impl::DataResult> + 'a>,
+    > {
+        Box::pin(async move {
         if !self.value_forwarding {
-            return self.inner.data(epoch, path_args);
+            return self.inner.data(epoch, path_args).await;
         }
 
         // Static rows from the inner node (id + description for parent).
-        let response = self.inner.data(epoch, path_args)?;
+        let response = self.inner.data(epoch, path_args).await?;
 
         // Populate our children's data cache — same mechanism the listing
         // view uses. This is on `self`, never on a child.
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
 
         // Collect active IDs from the refreshed cache.
         let mut all_active = Vec::new();
@@ -236,6 +243,7 @@ impl NodeEntry {
             rows: enriched_rows,
             active_ids: response.active_ids.clone(),
         }))
+        })
     }
 
     // --- Main entry point ---
@@ -247,7 +255,7 @@ impl NodeEntry {
     /// on drill). `prompt_suffix` is this node's section of the prompt
     /// (everything after the parent's matched ID, or the full prompt at root).
     /// `render_ctx` carries display metrics (threaded by reference).
-    pub fn node_traverse(
+    pub async fn node_traverse(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -257,6 +265,7 @@ impl NodeEntry {
     ) -> MenuResult {
         let cursor_pos = prompt_suffix.len();
         self.node_traverse_at(epoch, key, path, prompt_suffix, cursor_pos, render_ctx)
+            .await
     }
 
     /// Like [`node_traverse`](Self::node_traverse) with an explicit
@@ -265,15 +274,19 @@ impl NodeEntry {
     /// completion unless `cursor_pos == prompt_suffix.len()`, so a
     /// mid-line cursor can never complete a different word than the
     /// user edits.
-    pub fn node_traverse_at(
-        &mut self,
+    // Manual `Box::pin` future: `node_traverse_at` → `handle_listing` →
+    // child `node_traverse` is a genuine async cycle (E0733 without
+    // boxing). Same treatment as `node_data`.
+    pub fn node_traverse_at<'a>(
+        &'a mut self,
         epoch: u64,
         key: HostKey,
         path: Vec<String>,
-        prompt_suffix: &str,
+        prompt_suffix: &'a str,
         cursor_pos: usize,
-        render_ctx: &RenderContext,
-    ) -> MenuResult {
+        render_ctx: &'a RenderContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MenuResult> + 'a>> {
+        Box::pin(async move {
         // Phase 0: Epoch gate — reset per-node epoch state on new activation.
         if epoch != self.cache_epoch {
             self.epoch = EpochState::default();
@@ -291,14 +304,14 @@ impl NodeEntry {
         // prompt and restart from root. Runs before refresh: at drill
         // time the suffix is " " and needs no row data.
         if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
-            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args) {
+            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args).await {
                 return MenuResult::ContinuePrompt(new_prompt);
             }
         }
 
         // Phase 1: Refresh data from children — `row_index` is fresh
         // for the single parse pass below (no re-parse needed).
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix);
+        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
 
         // Phase 2: Parse section — fills `path_args.args` with byte
         // ranges into its own suffix; wraps it for dispatch.
@@ -330,7 +343,8 @@ impl NodeEntry {
                     None,
                     None,
                     render_ctx,
-                );
+                )
+                .await;
                 return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
             }
         }
@@ -339,7 +353,7 @@ impl NodeEntry {
 
         // Leaf node (no children).
         if self.children.is_empty() {
-            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx);
+            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx).await;
         }
 
         // Listing node: matched child with non-empty tail → recurse.
@@ -364,19 +378,21 @@ impl NodeEntry {
                     child_suffix,
                     child_cursor,
                     render_ctx,
-                );
+                )
+                .await;
             }
             // Matched child, empty tail, no restore → bare ID render (§2.5).
             // Fall through to show listing with cursor on the ID's row.
         }
 
         // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx)
+        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx).await
+        })
     }
 
     // --- Leaf handling ---
 
-    fn handle_leaf(
+    async fn handle_leaf(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -398,7 +414,7 @@ impl NodeEntry {
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -409,21 +425,25 @@ impl NodeEntry {
                 if self.epoch.confirm_pending {
                     // Confirm dialog: yea → submit.
                     self.epoch.confirm_pending = false;
-                    match self.inner.submit(epoch, pa) {
+                    match self.inner.submit(epoch, pa).await {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
                         SubmitResult::Prepared => Self::build_continue(pa),
-                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
+                        SubmitResult::Error(msg) => {
+                            self.error_continue(parsed, &msg, render_ctx).await
+                        }
                     }
                 } else {
-                    match self.inner.prepare(epoch, pa) {
+                    match self.inner.prepare(epoch, pa).await {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::Prepared => {
                             self.epoch.confirm_pending = true;
                             Self::build_continue(pa)
                         }
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
-                        SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx),
+                        SubmitResult::Error(msg) => {
+                            self.error_continue(parsed, &msg, render_ctx).await
+                        }
                     }
                 }
             }
@@ -440,7 +460,8 @@ impl NodeEntry {
                 // Tab-drill or bare entry: show header/listing.
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             _ => Self::build_continue(pa),
@@ -451,20 +472,20 @@ impl NodeEntry {
     /// with `[ERROR]: …` above `header()`. Direct render — the returned
     /// plan *is* the frame; nothing is stored, so the next eval
     /// re-derives without the error.
-    fn error_continue(
+    async fn error_continue(
         &mut self,
         parsed: &ParsedSection,
         error: &str,
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let rows = self.ensure_rows(&parsed.path_args);
-        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx);
+        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx).await;
         MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
     }
 
     // --- Listing handling ---
 
-    fn handle_listing(
+    async fn handle_listing(
         &mut self,
         epoch: u64,
         key: HostKey,
@@ -489,7 +510,7 @@ impl NodeEntry {
                 HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
             )
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx) {
+            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -500,13 +521,15 @@ impl NodeEntry {
             HostKey::MoveCursor(delta) => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             HostKey::Tab | HostKey::Enter => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 let Some(row) = out.cursor_row else {
                     return Self::build_continue(pa);
                 };
@@ -533,12 +556,14 @@ impl NodeEntry {
                     " ",
                     render_ctx,
                 )
+                .await
             }
             HostKey::Esc => Self::handle_esc(parsed),
             _ => {
                 let rows = self.ensure_rows(&parsed.path_args);
                 let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx);
+                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                        .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
         }
@@ -573,7 +598,7 @@ impl NodeEntry {
     /// path for parent→child data access (design §3.2). It may augment
     /// the response (e.g. value forwarding). Bypassing it breaks the
     /// encapsulation that `NodeEntry` provides over `SlashDotNode`.
-    fn refresh_data(&mut self, epoch: u64, path: &[String], tail: &str) -> bool {
+    async fn refresh_data(&mut self, epoch: u64, path: &[String], tail: &str) -> bool {
         // Children's `data()` receives this node's path + tail; this
         // node's `Args` are irrelevant to them (they describe *this*
         // node's section only) — hence two plain slices, not `&PathArgs`.
@@ -584,7 +609,7 @@ impl NodeEntry {
 
         for (i, child) in self.children.iter_mut().enumerate() {
             // One shared `&PathArgs` for every child — built once above.
-            match child.node_data(epoch, &path_args) {
+            match child.node_data(epoch, &path_args).await {
                 Ok(response) => {
                     let same = match self.content.data_rc.get(i) {
                         Some(Some(prev)) => Rc::ptr_eq(prev, &response),
@@ -749,7 +774,7 @@ impl NodeEntry {
     /// `SubmitResult::Error`) — never stored. Drill arms call this too
     /// and discard the returned plan (one `header()` + assembly on an
     /// unchanged view — rows Rc reused).
-    fn view_plan(
+    async fn view_plan(
         &mut self,
         parsed: &ParsedSection,
         pin: Option<&str>,
@@ -771,6 +796,7 @@ impl NodeEntry {
         detail.extend(
             self.inner
                 .header(path_args, render_ctx)
+                .await
                 .into_iter()
                 .map(LogicalLine::new),
         );
@@ -799,7 +825,7 @@ impl NodeEntry {
     /// default). v1 guards: cursor at the end of this level's section,
     /// and a word directly before it (a space dismisses — nothing to
     /// complete).
-    fn completion_pass(
+    async fn completion_pass(
         &mut self,
         parsed: &ParsedSection,
         cursor_pos: usize,
@@ -819,7 +845,7 @@ impl NodeEntry {
             }
         };
         let result = if self.children.is_empty() {
-            self.inner.complete_parameter(pa, cursor_pos)
+            self.inner.complete_parameter(pa, cursor_pos).await
         } else {
             self.default_complete(parsed, cursor_pos)
         };
@@ -854,6 +880,7 @@ impl NodeEntry {
         let detail: Vec<LogicalLine> = self
             .inner
             .header(pa, render_ctx)
+            .await
             .into_iter()
             .map(LogicalLine::new)
             .collect();
@@ -892,7 +919,7 @@ impl NodeEntry {
                     &self.content.row_index,
                 );
                 let rerun = if self.children.is_empty() {
-                    self.inner.complete_parameter(&reparsed.path_args, cursor2)
+                    self.inner.complete_parameter(&reparsed.path_args, cursor2).await
                 } else {
                     self.default_complete(&reparsed, cursor2)
                 };
@@ -1266,8 +1293,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for CmdNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: self.active.clone(),
@@ -1288,15 +1316,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for LeafNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("leaf")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() = Some(
                 path_args
                     .args()
@@ -1313,8 +1342,9 @@ mod tests {
         rows: Vec<crate::fields::Row>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for DynamicNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
@@ -1491,14 +1521,15 @@ mod tests {
         header_text: String,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for HeadedRoot {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: self.rows.clone(),
                 active_ids: Vec::new(),
             }))
         }
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -1742,14 +1773,15 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RecordingLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("action")],
                 active_ids: Vec::new(),
             }))
         }
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.submitted_via.borrow_mut() =
                 Some(path_args.ids.last().cloned().unwrap_or_default());
             SubmitResult::Done(None)
@@ -1907,15 +1939,16 @@ mod tests {
         prefill: String,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RewriteLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![crate::fields::Row::new("rename").desc("rename session")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -1923,7 +1956,7 @@ mod tests {
             vec!["rename header".into()]
         }
 
-        fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
+        async fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
             Some(format!("abc rename {}", self.prefill))
         }
     }
@@ -2005,8 +2038,9 @@ mod tests {
     /// id, description, tier: string, price: number + injected sort).
     struct FieldedNode;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for FieldedNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![
                     Row::new("m1")
@@ -2319,15 +2353,16 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for PathLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("pathpick").desc("pick a path")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn complete_parameter(
+        async fn complete_parameter(
             &mut self,
             _args: &PathArgs,
             _cursor_pos: usize,
@@ -2341,7 +2376,7 @@ mod tests {
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             *self.last_submit.borrow_mut() =
                 Some(path_args.args().next().unwrap_or_default().to_string());
             SubmitResult::Done(None)
@@ -2420,15 +2455,16 @@ mod tests {
     /// drill guard) and succeeds with one.
     struct ParamLeaf;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ParamLeaf {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("param").desc("needs an arg")],
                 active_ids: Vec::new(),
             }))
         }
 
-        fn header(
+        async fn header(
             &mut self,
             _path_args: &PathArgs,
             _render_ctx: &RenderContext,
@@ -2436,7 +2472,7 @@ mod tests {
             vec!["Specify a host path.".to_string()]
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             if path_args.args().next().is_none() {
                 SubmitResult::Error("host path required".to_string())
             } else {
@@ -2540,8 +2576,9 @@ mod tests {
     /// ignore field order and rank prefix/length first.
     struct RankedFieldsNode;
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for RankedFieldsNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             Ok(Rc::new(DataResponse {
                 rows: vec![Row::new("run")
                     .field("price_input", Value::Num(1.0))

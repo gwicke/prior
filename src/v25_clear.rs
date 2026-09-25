@@ -18,8 +18,9 @@ pub struct ClearNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ClearNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("clear")
                 .desc("delete session and start fresh")],
@@ -27,7 +28,7 @@ impl SlashDotNode for ClearNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -39,7 +40,7 @@ impl SlashDotNode for ClearNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
         let outgoing = self.app_state.current_session_id();
         self.app_state.request_clear(name, outgoing);

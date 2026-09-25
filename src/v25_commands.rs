@@ -29,8 +29,9 @@ mod tests {
         app_state: Rc<RefCell<Option<String>>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for ThinkingEnumNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.app_state.borrow();
             let active = current.as_deref().unwrap_or("off").to_string();
             let rows = ["off", "low", "med", "high"].iter()
@@ -42,7 +43,7 @@ mod tests {
             }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             let level = path_args.ids.last().cloned().unwrap_or_default();
             *self.app_state.borrow_mut() = Some(level);
             SubmitResult::Done(None)
@@ -298,8 +299,9 @@ mod persona_tests {
         app_state: Rc<RefCell<Option<String>>>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl SlashDotNode for PersonaEnumNode {
-        fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.app_state.borrow();
             let names = ["architect", "strict", "security", "none"];
             let mut rows = Vec::new();
@@ -318,7 +320,7 @@ mod persona_tests {
             Ok(Rc::new(DataResponse { rows, active_ids }))
         }
 
-        fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
             let name = path_args.ids.last().cloned().unwrap_or_default();
             let val = if name == "none" { None } else { Some(name) };
             *self.app_state.borrow_mut() = val;

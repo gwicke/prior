@@ -17,8 +17,9 @@ pub struct ReplayNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ReplayNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("replay")
                 .desc("history replay; optional limits 10 (turns) 10t (turns) 10l (lines)")],
@@ -26,7 +27,7 @@ impl SlashDotNode for ReplayNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -43,7 +44,7 @@ impl SlashDotNode for ReplayNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let arg = path_args.suffix.trim().to_string();
         self.app_state.request_replay(arg);
         SubmitResult::Done(None)

@@ -29,8 +29,9 @@ struct EnumSettingNode {
     app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for EnumSettingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let current = self.app_state.with_settings(|s| s.value(self.key));
         let rows = self.values.iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
@@ -41,7 +42,7 @@ impl SlashDotNode for EnumSettingNode {
         }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let val = path_args.ids.last().cloned().unwrap_or_default();
         match self.app_state.set_setting(self.key, &val) {
             Ok(()) => SubmitResult::Done(None),
@@ -59,8 +60,9 @@ pub struct SettingLeafNode {
     app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SettingLeafNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
         let val = self.app_state.with_settings(|s| s.value(self.key));
         let rows = vec![Row::new(meta.name)
@@ -72,7 +74,7 @@ impl SlashDotNode for SettingLeafNode {
         }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let val = path_args.suffix.trim();
         if val.is_empty() {
             // Return NewPath to re-enter the leaf and show header().
@@ -85,7 +87,7 @@ impl SlashDotNode for SettingLeafNode {
         }
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -95,7 +97,7 @@ impl SlashDotNode for SettingLeafNode {
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
     }
 
-    fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
+    async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
         // Pre-fill the current value. ids are ["set", "<setting-name>"].
         // The leading space keeps the trailing-space behavior of the old
         // `format!("{} {}", prefix, val)` (empty value → trailing space).

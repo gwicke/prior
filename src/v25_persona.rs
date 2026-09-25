@@ -26,8 +26,9 @@ pub struct PersonaEnumNode {
     pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for PersonaEnumNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let current = (self.active_fn)().unwrap_or_default();
         let mut rows = Vec::new();
         let mut active_ids = Vec::new();
@@ -45,7 +46,7 @@ impl SlashDotNode for PersonaEnumNode {
         Ok(Rc::new(DataResponse { rows, active_ids }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.ids.last().cloned().unwrap_or_default();
         match (self.submit_fn)(&name) {
             Ok(()) => SubmitResult::Done(None),

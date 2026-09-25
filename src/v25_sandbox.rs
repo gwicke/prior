@@ -96,8 +96,9 @@ pub fn sandbox_fields() -> Vec<FieldSpec> {
 /// child (`SandboxRemoveNode`) is shown.
 pub struct SandboxMappingNode;
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxMappingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let rows = crate::sandbox_state::combined_list()
             .into_iter()
             .map(|b| {
@@ -117,7 +118,7 @@ impl SlashDotNode for SandboxMappingNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         match find_binding(&path_args.ids) {
             None => vec!["Mapping not found.".to_string()],
             Some(b) => vec![
@@ -140,8 +141,9 @@ pub struct SandboxRemoveNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxRemoveNode {
-    fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
         let row = match find_binding(&path_args.ids) {
             None => Row::new("remove").desc("mapping not found"),
             Some(b) if b.is_excluded => Row::new("restore").desc("re-enable this mapping"),
@@ -154,7 +156,7 @@ impl SlashDotNode for SandboxRemoveNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let Some(b) = find_binding(&path_args.ids) else {
             let id = path_args.ids.get(1).cloned().unwrap_or_default();
             return vec![format!("Mapping not found: {}", id)];
@@ -183,11 +185,11 @@ impl SlashDotNode for SandboxRemoveNode {
         lines
     }
 
-    fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         SubmitResult::Prepared
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let Some(b) = find_binding(&path_args.ids) else {
             let id = path_args.ids.get(1).cloned().unwrap_or_default();
             return SubmitResult::Error(format!("mapping not found: {}", id));
@@ -244,8 +246,9 @@ impl AddSandboxMappingNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for AddSandboxMappingNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![
                 Row::new("ro").desc("read only mapping"),
@@ -255,7 +258,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         }))
     }
 
-    fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
+    async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let mode = path_args.ids.last().map(String::as_str).unwrap_or("?");
         let mode_desc = if mode == "rw" { "read-write" } else { "read-only" };
         vec![
@@ -264,7 +267,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         ]
     }
 
-    fn complete_parameter(
+    async fn complete_parameter(
         &mut self,
         args: &PathArgs,
         cursor_pos: usize,
@@ -317,7 +320,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         Ok(rc)
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let raw: Vec<&str> = path_args.args().collect();
         if raw.is_empty() {
             return SubmitResult::Error("host path required".to_string());

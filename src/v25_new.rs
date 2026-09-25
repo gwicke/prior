@@ -16,8 +16,9 @@ pub struct NewNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for NewNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("new")
                 .desc("start a new session")],
@@ -25,7 +26,7 @@ impl SlashDotNode for NewNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -38,7 +39,7 @@ impl SlashDotNode for NewNode {
         ]
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
         self.app_state.request_new(name);
         SubmitResult::Done(None)

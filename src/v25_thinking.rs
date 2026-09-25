@@ -24,8 +24,9 @@ pub struct ThinkingEnumNode {
     pub submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ThinkingEnumNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let active = (self.active_fn)();
         let levels: &[(&str, &str)] = &[
             ("off", "no extra reasoning"),
@@ -42,7 +43,7 @@ impl SlashDotNode for ThinkingEnumNode {
         }))
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let level = path_args.ids.last().cloned().unwrap_or_default();
         match (self.submit_fn)(&level) {
             Ok(()) => SubmitResult::Done(None),

@@ -50,8 +50,9 @@ impl ModelNode {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for ModelNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let gen = crate::model_catalog::catalog_generation();
         if let Some(ref cached) = self.cached_response {
             if self.cached_generation == gen {
@@ -88,7 +89,7 @@ impl SlashDotNode for ModelNode {
         Ok(response)
     }
 
-    fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let qualified = path_args.ids.last().cloned().unwrap_or_default();
         if qualified.is_empty() {
             return SubmitResult::Done(None);

@@ -17,8 +17,9 @@ pub struct QuitNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for QuitNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("quit")
                 .desc("quit the session")],
@@ -26,7 +27,7 @@ impl SlashDotNode for QuitNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -34,7 +35,7 @@ impl SlashDotNode for QuitNode {
         vec!["Quit the session.".to_string()]
     }
 
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         self.app_state.request_quit();
         SubmitResult::Done(None)
     }

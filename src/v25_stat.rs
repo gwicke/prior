@@ -15,8 +15,9 @@ pub struct StatNode {
     pub app_state: Arc<AppState>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl SlashDotNode for StatNode {
-    fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+    async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
             rows: vec![crate::slashdot_menu::fields::Row::new("stat")
                 .desc("session stats: context window, usage, cost, cache hit")],
@@ -24,7 +25,7 @@ impl SlashDotNode for StatNode {
         }))
     }
 
-    fn header(
+    async fn header(
         &mut self,
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
@@ -70,7 +71,7 @@ impl SlashDotNode for StatNode {
         )
     }
 
-    fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+    async fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         // Navigate to empty root path — closes the menu.
         SubmitResult::NewPath(String::new())
     }
