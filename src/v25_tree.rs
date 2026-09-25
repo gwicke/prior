@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::app_state::{CompactMode, SharedApp};
+use crate::app_state::{CompactMode, AppState};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
@@ -562,7 +562,7 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
 /// `header()` renders the full message body and the static action children
 /// are shown.
 pub struct TreeListNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
     /// Cached data response — reused via Rc::ptr_eq when the tree hasn't
     /// changed.
     cached_data: Option<Rc<DataResponse>>,
@@ -572,9 +572,9 @@ pub struct TreeListNode {
 }
 
 impl TreeListNode {
-    pub fn new(app: SharedApp) -> Self {
+    pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            app,
+            app_state,
             cached_data: None,
             cached_tree_rc: None,
             cached_leaf_id: None,
@@ -591,8 +591,8 @@ impl TreeListNode {
 impl SlashDotNode for TreeListNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         // Read the shared tree (Arc — O(1) clone, no deep copy).
-        let tree_rc = self.app.raw_tree();
-        let leaf = self.app.leaf_id();
+        let tree_rc = self.app_state.raw_tree();
+        let leaf = self.app_state.leaf_id();
 
         // Freshness check: same Arc pointer + same leaf = cached data is valid.
         let same_tree = self
@@ -737,7 +737,7 @@ impl SlashDotNode for TreeListNode {
 
 /// Leaf node: moves the session leaf pointer to the selected entry.
 pub struct TreeSwitchNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for TreeSwitchNode {
@@ -772,7 +772,7 @@ impl SlashDotNode for TreeSwitchNode {
                 String::new()
             }
         };
-        self.app.request_tree_switch(target_id);
+        self.app_state.request_tree_switch(target_id);
         SubmitResult::Done(None)
     }
 }
@@ -785,7 +785,7 @@ impl SlashDotNode for TreeSwitchNode {
 /// session leaf (message ID) and redirects to `/tree <id> compact `
 /// so the compact modes are listed.
 pub struct CompactNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for CompactNode {
@@ -809,13 +809,13 @@ impl SlashDotNode for CompactNode {
 
     fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // Look up the current session leaf ID and redirect.
-        let leaf_id = self.app.leaf_id()?;
+        let leaf_id = self.app_state.leaf_id()?;
         Some(format!("tree {} compact ", leaf_id))
     }
 
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         // Enter (without drill) should also redirect — treat as drill.
-        match self.app.leaf_id() {
+        match self.app_state.leaf_id() {
             Some(leaf_id) => SubmitResult::NewPath(format!("tree {} compact ", leaf_id)),
             None => SubmitResult::Done(Some("No active session leaf to compact.".to_string())),
         }
@@ -830,13 +830,13 @@ impl SlashDotNode for CompactNode {
 /// `prepare()` opens $EDITOR with a template; `submit()` writes the
 /// `tree_compact` control target (`mode: Manual`).
 pub struct TreeCompactManualNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactManualNode {
-    pub fn new(app: SharedApp) -> Self {
-        Self { app, edited: std::cell::RefCell::new(None) }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state, edited: std::cell::RefCell::new(None) }
     }
 }
 
@@ -867,7 +867,7 @@ impl SlashDotNode for TreeCompactManualNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        self.app.request_tree_compact(target_id, CompactMode::Manual, draft);
+        self.app_state.request_tree_compact(target_id, CompactMode::Manual, draft);
         SubmitResult::Done(None)
     }
 }
@@ -880,13 +880,13 @@ impl SlashDotNode for TreeCompactManualNode {
 /// `prepare()` opens $EDITOR with extracted conversation text; `submit()`
 /// writes the `tree_compact` control target (`mode: TextOnly`).
 pub struct TreeCompactTextNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactTextNode {
-    pub fn new(app: SharedApp) -> Self {
-        Self { app, edited: std::cell::RefCell::new(None) }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state, edited: std::cell::RefCell::new(None) }
     }
 }
 
@@ -912,7 +912,7 @@ impl SlashDotNode for TreeCompactTextNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        self.app.request_tree_compact(target_id, CompactMode::TextOnly, draft);
+        self.app_state.request_tree_compact(target_id, CompactMode::TextOnly, draft);
         SubmitResult::Done(None)
     }
 }
@@ -926,12 +926,12 @@ impl SlashDotNode for TreeCompactTextNode {
 /// writes the `tree_compact` control target (`mode: Prompt`).
 /// The LLM call happens in the agent loop's applier.
 pub struct TreeCompactPromptNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl TreeCompactPromptNode {
-    pub fn new(app: SharedApp) -> Self {
-        Self { app }
+    pub fn new(app_state: Arc<AppState>) -> Self {
+        Self { app_state }
     }
 }
 
@@ -967,7 +967,7 @@ impl SlashDotNode for TreeCompactPromptNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let prompt = path_args.suffix.trim().to_string();
-        self.app.request_tree_compact(target_id, CompactMode::Prompt, prompt);
+        self.app_state.request_tree_compact(target_id, CompactMode::Prompt, prompt);
         SubmitResult::Done(None)
     }
 }
@@ -994,7 +994,7 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
 pub fn build_tree_node(
-    shared: &SharedApp,
+    app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
     use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
@@ -1008,9 +1008,9 @@ pub fn build_tree_node(
     .into();
 
     let mut tree_node: SlashDotMenuNode =
-        TreeListNode::new(shared.clone()).into();
+        TreeListNode::new(app_state.clone()).into();
     tree_node.add_child(TreeSwitchNode {
-        app: shared.clone(),
+        app_state: app_state.clone(),
     }
     .into());
 
@@ -1020,9 +1020,9 @@ pub fn build_tree_node(
         "summarize entries before this point",
     )])
     .into();
-    compact_node.add_child(TreeCompactManualNode::new(shared.clone()).into());
-    compact_node.add_child(TreeCompactTextNode::new(shared.clone()).into());
-    compact_node.add_child(TreeCompactPromptNode::new(shared.clone()).into());
+    compact_node.add_child(TreeCompactManualNode::new(app_state.clone()).into());
+    compact_node.add_child(TreeCompactTextNode::new(app_state.clone()).into());
+    compact_node.add_child(TreeCompactPromptNode::new(app_state.clone()).into());
 
     tree_node.add_child(compact_node);
 
@@ -1060,8 +1060,8 @@ mod tests {
     }
 
     /// Fresh app state for tests (binding kept as `shared` in tests below).
-    fn make_shared() -> SharedApp {
-        crate::app_state::AppShared::for_test(test_settings())
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
     }
 
     fn make_entry(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
@@ -1087,15 +1087,15 @@ mod tests {
     }
 
     /// Build app state with a pre-populated tree.
-    fn shared_with_tree(tree: Vec<SessionTreeNode>) -> SharedApp {
-        let shared = make_shared();
-        shared.set_raw_tree(Arc::new(tree));
-        shared
+    fn app_state_with_tree(tree: Vec<SessionTreeNode>) -> Arc<AppState> {
+        let app_state = test_app_state();
+        app_state.set_raw_tree(Arc::new(tree));
+        app_state
     }
 
-    fn build_tree_menu(shared: &SharedApp) -> SlashDotMenu {
+    fn build_tree_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_tree_node(shared));
+        root.add_child(build_tree_node(app_state));
         SlashDotMenu::from_root_node(root)
     }
 
@@ -1103,8 +1103,8 @@ mod tests {
 
     #[test]
     fn empty_tree_shows_empty_listing() {
-        let shared = make_shared();
-        let mut menu = build_tree_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1129,8 +1129,8 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1172,8 +1172,8 @@ mod tests {
                 node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
             ],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Filtered leaf overview: u1 is a branch parent (no `tags`
@@ -1217,8 +1217,8 @@ mod tests {
             make_entry("u1", None, "user", "test"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec![],
@@ -1238,8 +1238,8 @@ mod tests {
             make_entry("u1", None, "user", "test"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec![],
@@ -1254,7 +1254,7 @@ mod tests {
             node(make_entry("u1", None, "user", "test"), vec![]),
             node(make_entry("u2", None, "user", "new entry"), vec![]),
         ];
-        shared.set_raw_tree(Arc::new(new_tree));
+        app_state.set_raw_tree(Arc::new(new_tree));
 
         let r2 = tree_node.data(1, &path_args).unwrap();
         assert!(!Rc::ptr_eq(&r1, &r2),
@@ -1270,8 +1270,8 @@ mod tests {
             make_entry("u1", None, "user", "hello\nworld"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into()],
@@ -1312,8 +1312,8 @@ mod tests {
             make_entry("u1", None, "user", "hello\nworld"),
             vec![],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
         let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
         let row = resp
             .rows
@@ -1339,8 +1339,8 @@ mod tests {
                 node(make_entry("u3", Some("u1"), "user", "child b"), vec![]),
             ],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
         let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
         let tags = |id: &str| {
             resp.rows
@@ -1368,8 +1368,8 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
         let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
         let tags = |id: &str| {
             resp.rows
@@ -1399,8 +1399,8 @@ mod tests {
             make_entry("u1", None, "user", "kept context line"),
             vec![node(compaction, vec![])],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared.clone());
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state.clone());
 
         // Desc carries the truncated "from" context AND the summary.
         let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
@@ -1428,8 +1428,8 @@ mod tests {
 
     #[test]
     fn tree_switch_submit_sets_control_target() {
-        let shared = make_shared();
-        let mut tree_node = TreeSwitchNode { app: shared.clone() };
+        let app_state = test_app_state();
+        let mut tree_node = TreeSwitchNode { app_state: app_state.clone() };
         // Action node path: ["tree", "<entry-id>", "switch"]
         let path_args = PathArgs {
             ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
@@ -1437,7 +1437,7 @@ mod tests {
             args: Default::default(),
         };
         let _ = tree_node.submit(1, &path_args);
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         assert_eq!(taken.tree_switch.as_deref(), Some("some-entry"));
     }
 
@@ -1454,8 +1454,8 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Listing shows entries.
@@ -1477,7 +1477,7 @@ mod tests {
 
         // 4. Enter → submit.
         let _ = handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80);
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         assert_eq!(
             taken.tree_switch.as_deref(),
             Some("u1"),
@@ -1502,8 +1502,8 @@ mod tests {
             children: vec![],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1536,8 +1536,8 @@ mod tests {
             children: vec![],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1556,9 +1556,9 @@ mod tests {
             node(make_entry("u1", None, "user", "first"), vec![]),
             node(make_entry("u2", None, "user", "second"), vec![]),
         ];
-        let shared = shared_with_tree(tree);
-        shared.set_leaf_id(Some("u2".into()));
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(Some("u2".into()));
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -1584,9 +1584,9 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        shared.set_leaf_id(Some("u2".into()));
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(Some("u2".into()));
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -1601,8 +1601,8 @@ mod tests {
 
     #[test]
     fn compact_manual_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactManualNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactManualNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
             suffix: String::new(),
@@ -1610,7 +1610,7 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.target_id, "u1");
         assert_eq!(c.mode, CompactMode::Manual);
@@ -1619,8 +1619,8 @@ mod tests {
 
     #[test]
     fn compact_text_only_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactTextNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactTextNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
             suffix: String::new(),
@@ -1628,7 +1628,7 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.target_id, "u1");
         assert_eq!(c.mode, CompactMode::TextOnly);
@@ -1637,8 +1637,8 @@ mod tests {
 
     #[test]
     fn compact_prompt_submit_sets_async_op() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: "summarize the key decisions".into(),
@@ -1646,7 +1646,7 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.target_id, "u1");
         assert_eq!(c.mode, CompactMode::Prompt);
@@ -1655,8 +1655,8 @@ mod tests {
 
     #[test]
     fn compact_prompt_empty_suffix_uses_default() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
             suffix: String::new(),
@@ -1664,7 +1664,7 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.mode, CompactMode::Prompt);
         assert!(c.payload.is_empty(), "empty suffix = empty payload");
@@ -1683,8 +1683,8 @@ mod tests {
                 )],
             ),
         ];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
 
         // 1. Listing.
@@ -1705,7 +1705,7 @@ mod tests {
 
         // 5. Enter → submit.
         let _ = handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80);
-        let taken = shared.take_control();
+        let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.target_id, "u1");
         assert_eq!(c.mode, CompactMode::Manual);
@@ -1715,8 +1715,8 @@ mod tests {
 
     #[test]
     fn compact_manual_header_shows_description() {
-        let shared = make_shared();
-        let mut node = TreeCompactManualNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactManualNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -1729,8 +1729,8 @@ mod tests {
 
     #[test]
     fn compact_prompt_header_shows_prompt_when_present() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: "my custom prompt".into(),
@@ -1743,8 +1743,8 @@ mod tests {
 
     #[test]
     fn compact_prompt_header_shows_default_when_empty() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared);
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -1780,8 +1780,8 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -1825,8 +1825,8 @@ mod tests {
                 vec![],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1865,8 +1865,8 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -1938,8 +1938,8 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec!["tree".into()],
             suffix: String::new(),
@@ -2022,8 +2022,8 @@ mod tests {
                 )],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut menu = build_tree_menu(&shared);
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("tree ", HostKey::None, 80);
         match result {
@@ -2086,8 +2086,8 @@ mod tests {
                 }],
             )],
         )];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -2209,8 +2209,8 @@ mod tests {
             ],
             label: None,
         }];
-        let shared = shared_with_tree(tree);
-        let mut tree_node = TreeListNode::new(shared);
+        let app_state = app_state_with_tree(tree);
+        let mut tree_node = TreeListNode::new(app_state);
         let path_args = PathArgs {
             ids: vec![],
             suffix: String::new(),
@@ -2231,9 +2231,9 @@ mod tests {
 
     #[test]
     fn compact_node_drill_rewrite_redirects_to_tree() {
-        let shared = make_shared();
-        shared.set_leaf_id(Some("msg-42".into()));
-        let mut node = CompactNode { app: shared.clone() };
+        let app_state = test_app_state();
+        app_state.set_leaf_id(Some("msg-42".into()));
+        let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
@@ -2241,9 +2241,9 @@ mod tests {
 
     #[test]
     fn compact_node_no_leaf_returns_none() {
-        let shared = make_shared();
+        let app_state = test_app_state();
         // leaf_id is None (no session).
-        let mut node = CompactNode { app: shared.clone() };
+        let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, None);
@@ -2251,8 +2251,8 @@ mod tests {
 
     #[test]
     fn compact_prompt_drill_rewrite_fills_default() {
-        let shared = make_shared();
-        let mut node = TreeCompactPromptNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path = vec!["tree".to_string(), "msg-1".to_string(),
                         "compact".to_string(), "prompt".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));

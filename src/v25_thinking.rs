@@ -54,12 +54,12 @@ impl SlashDotNode for ThinkingEnumNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::SharedApp;
+    use crate::app_state::AppState;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
     use crate::slashdot_menu::HostKey;
 
-    fn test_app() -> SharedApp {
+    fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -72,14 +72,14 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        crate::app_state::AppShared::for_test(settings)
+        crate::app_state::AppState::for_test(settings)
     }
 
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
     /// "thinking" → `ThinkingEnumNode` bound to the target config.
-    fn build_thinking_menu(app: &SharedApp) -> SlashDotMenu {
-        let reader = app.clone();
-        let writer = app.clone();
+    fn build_thinking_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
         ])
@@ -110,8 +110,8 @@ mod tests {
     /// Root listing shows the `thinking` command row.
     #[test]
     fn thinking_root_row_present() {
-        let app = test_app();
-        let mut menu = build_thinking_menu(&app);
+        let app_state = test_app_state();
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
         match h.eval_prompt("", HostKey::None, 80) {
             MenuResult::Continue(plan, _) => {
@@ -129,9 +129,9 @@ mod tests {
     /// the row whose id is the active level.
     #[test]
     fn thinking_active_marker_on_current_level() {
-        let app = test_app();
-        app.set_thinking(Some("med".to_string()));
-        let mut menu = build_thinking_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_thinking(Some("med".to_string()));
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
         match h.eval_prompt("thinking ", HostKey::None, 80) {
             MenuResult::Continue(plan, _) => {
@@ -153,8 +153,8 @@ mod tests {
     /// Tab selects a level, Enter submits it → the target config's thinking.
     #[test]
     fn thinking_submit_sets_target_config() {
-        let app = test_app();
-        let mut menu = build_thinking_menu(&app);
+        let app_state = test_app_state();
+        let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
         let prompt = match h.eval_prompt_resolved("thinking ", HostKey::Tab, 80) {
             MenuResult::Continue(_, prompt) => prompt,
@@ -169,6 +169,6 @@ mod tests {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
         }
-        assert_eq!(app.thinking().as_deref(), Some(sel.as_str()));
+        assert_eq!(app_state.thinking().as_deref(), Some(sel.as_str()));
     }
 }

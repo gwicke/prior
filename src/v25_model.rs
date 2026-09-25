@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::app_state::SharedApp;
+use crate::app_state::AppState;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
@@ -25,7 +25,7 @@ pub struct ModelNode {
     /// Write the selected model id on submit. `Ok(())` on success.
     submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
     /// Recent model ids for ordering (only for `/model`, None for `/set`).
-    recent: Option<SharedApp>,
+    recent: Option<Arc<AppState>>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
@@ -37,7 +37,7 @@ impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
         submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-        recent: Option<SharedApp>,
+        recent: Option<Arc<AppState>>,
     ) -> Self {
         ModelNode {
             active_fn,
@@ -281,7 +281,7 @@ pub fn model_columns() -> Vec<ColumnDef> {
 ///
 /// The listing node carries column definitions and field metadata;
 /// the `ModelNode` child provides dynamic catalog rows.
-pub fn build_model_node(app: &SharedApp) -> crate::slashdot_menu::menu::SlashDotMenuNode {
+pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::fields::{FieldSpec, SortDir};
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -313,8 +313,8 @@ pub fn build_model_node(app: &SharedApp) -> crate::slashdot_menu::menu::SlashDot
     ]).into();
     // Live session model: reads the runtime-target config, writes it, and
     // records the explicit user commit in one place.
-    let reader = app.clone();
-    let writer = app.clone();
+    let reader = app_state.clone();
+    let writer = app_state.clone();
     node.add_child(ModelNode::new(
         Box::new(move || reader.model()),
         Box::new(move |model| {
@@ -325,7 +325,7 @@ pub fn build_model_node(app: &SharedApp) -> crate::slashdot_menu::menu::SlashDot
             writer.set_model_commit(model.to_string());
             Ok(())
         }),
-        Some(app.clone()),
+        Some(app_state.clone()),
     ).into());
     node
 }
@@ -343,7 +343,7 @@ mod tests {
         h.eval_prompt_resolved(prompt, key, 80)
     }
 
-    fn test_shared() -> SharedApp {
+    fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -356,18 +356,18 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let app = crate::app_state::AppShared::for_test(settings);
-        app.set_model("anthropic:claude-3-5-sonnet-20241022");
-        app
+        let app_state = crate::app_state::AppState::for_test(settings);
+        app_state.set_model("anthropic:claude-3-5-sonnet-20241022");
+        app_state
     }
 
-    fn test_model_node(shared: &SharedApp) -> ModelNode {
-        let reader = shared.clone();
-        let writer = shared.clone();
+    fn test_model_node(app_state: &Arc<AppState>) -> ModelNode {
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         ModelNode::new(
             Box::new(move || reader.model()),
             Box::new(move |model| { writer.set_model(model); Ok(()) }),
-            Some(shared.clone()),
+            Some(app_state.clone()),
         )
     }
 
@@ -416,8 +416,8 @@ mod tests {
 
     #[test]
     fn model_node_returns_rows() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
@@ -429,8 +429,8 @@ mod tests {
 
     #[test]
     fn model_node_caches_rc() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: Vec::new(),
             suffix: String::new(),
@@ -444,8 +444,8 @@ mod tests {
 
     #[test]
     fn model_node_columns() {
-        let shared = test_shared();
-        let node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let node = test_model_node(&app_state);
         let cols = node.columns();
         assert_eq!(cols.len(), 6);
         assert!(cols.iter().any(|c| c.header == "Price in"));
@@ -453,8 +453,8 @@ mod tests {
 
     #[test]
     fn model_node_fields() {
-        let shared = test_shared();
-        let node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let node = test_model_node(&app_state);
         let fields = node.fields();
         assert!(fields.iter().any(|f| f.name == "context"));
         assert!(fields.iter().any(|f| f.name == "price"));
@@ -463,8 +463,8 @@ mod tests {
 
     #[test]
     fn model_node_submit_writes_settings() {
-        let shared = test_shared();
-        let mut node = test_model_node(&shared);
+        let app_state = test_app_state();
+        let mut node = test_model_node(&app_state);
         let path_args = PathArgs {
             ids: vec!["model".into(), "openai:gpt-4o".into()],
             suffix: " ".into(),
@@ -475,16 +475,16 @@ mod tests {
             _ => panic!("expected Done"),
         }
         // Runtime-target config, not persistent settings.
-        assert_eq!(shared.model(), "openai:gpt-4o");
+        assert_eq!(app_state.model(), "openai:gpt-4o");
     }
 
-    fn build_test_menu(shared: &SharedApp) -> crate::slashdot_menu::SlashDotMenu {
+    fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("model", "select a model"),
         ]).into();
-        ml.add_child(test_model_node(shared).into());
+        ml.add_child(test_model_node(app_state).into());
         root.add_child(ml);
         crate::slashdot_menu::SlashDotMenu::from_root_node(root)
     }
@@ -493,8 +493,8 @@ mod tests {
     /// Tab into a catalog entry → Enter submits.
     #[test]
     fn model_full_traversal() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
 
         let mut h = menu.get_handle();
         // Root listing: shows the "model" row.
@@ -525,7 +525,7 @@ mod tests {
                             "should drill into a model entry, got: {}", prompt);
                         match eval(&mut h, &prompt, crate::slashdot_menu::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                                let model = shared.model();
+                                let model = app_state.model();
                                 assert!(!model.is_empty(),
                                     "target config should have a model after submit");
                             }
@@ -541,8 +541,8 @@ mod tests {
     /// Model fuzzy filter: typing a partial model name narrows the listing.
     #[test]
     fn model_fuzzy_filter() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
 
         let mut h = menu.get_handle();
         // Unfiltered count.
@@ -569,8 +569,8 @@ mod tests {
     /// plus the model field keys.
     #[test]
     fn model_dot_modifier_opens_completion_dialog() {
-        let shared = test_shared();
-        let mut menu = build_test_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         match eval(&mut h, "model .", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {

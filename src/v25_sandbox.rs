@@ -17,7 +17,7 @@
 
 use std::rc::Rc;
 
-use crate::app_state::{SharedApp, SandboxOp};
+use crate::app_state::{AppState, SandboxOp};
 use crate::config::BindMode;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
@@ -136,7 +136,7 @@ impl SlashDotNode for SandboxMappingNode {
 /// Action leaf: remove a session binding, exclude a config binding, or
 /// restore an excluded one. Two-phase confirm via `prepare()`.
 pub struct SandboxRemoveNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for SandboxRemoveNode {
@@ -201,7 +201,7 @@ impl SlashDotNode for SandboxRemoveNode {
         } else {
             SandboxOp::Exclude { sandbox_path }
         };
-        self.app.request_sandbox(op);
+        self.app_state.request_sandbox(op);
         SubmitResult::Done(None)
     }
 }
@@ -227,7 +227,7 @@ fn completable(word: &str) -> bool {
 /// with an L2 `Rc` cache keyed by (arg, word) that
 /// `path_complete::listing_stale` invalidates.
 pub struct AddSandboxMappingNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
     /// L2: (arg position, word) → rows. Same `Rc` on unchanged-word
     /// frames ⇒ `ptr_eq` skips the view re-derive; rebuilt when the
     /// word/arg changes or the L1 listing goes stale.
@@ -235,9 +235,9 @@ pub struct AddSandboxMappingNode {
 }
 
 impl AddSandboxMappingNode {
-    pub fn new(app: SharedApp) -> Self {
+    pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            app,
+            app_state,
             last_rows: None,
         }
     }
@@ -339,7 +339,7 @@ impl SlashDotNode for AddSandboxMappingNode {
         if let Err(e) = crate::path_util::resolve_canonical(raw[0]) {
             return SubmitResult::Error(e);
         }
-        self.app.request_sandbox(SandboxOp::Add {
+        self.app_state.request_sandbox(SandboxOp::Add {
             host_path: raw[0].to_string(),
             sandbox_path: raw.get(1).map(|s| s.to_string()).unwrap_or_default(),
             mode,
@@ -359,7 +359,7 @@ impl SlashDotNode for AddSandboxMappingNode {
 /// it tops the default listing) and `SandboxMappingNode` are the
 /// children.
 pub fn build_sandbox_node(
-    shared: &SharedApp,
+    app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -376,12 +376,12 @@ pub fn build_sandbox_node(
         "Add a path mapping to the sandbox",
     )])
     .into();
-    add_node.add_child(AddSandboxMappingNode::new(shared.clone()).into());
+    add_node.add_child(AddSandboxMappingNode::new(app_state.clone()).into());
     listing.add_child(add_node);
 
     let mut map_node: SlashDotMenuNode = SandboxMappingNode.into();
     map_node.add_child(SandboxRemoveNode {
-        app: shared.clone(),
+        app_state: app_state.clone(),
     }
     .into());
     listing.add_child(map_node);
@@ -416,21 +416,21 @@ mod tests {
         }
     }
 
-    /// Returns an `AppShared` (binding kept as `shared` in tests below).
-    fn make_shared() -> SharedApp {
-        crate::app_state::AppShared::for_test(test_settings())
+    /// Returns an `AppState` (binding kept as `shared` in tests below).
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
     }
 
-    fn sandbox_menu(shared: &SharedApp) -> SlashDotMenu {
+    fn sandbox_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_sandbox_node(shared));
+        root.add_child(build_sandbox_node(app_state));
         SlashDotMenu::from_root_node(root)
     }
 
     /// Drain the sandbox control target (sole-consumer GC — `take_control`
     /// clears it, so no explicit reset is needed between assertions).
-    fn take_sandbox_op(shared: &SharedApp) -> Option<SandboxOp> {
-        shared.take_control().sandbox
+    fn take_sandbox_op(app_state: &Arc<AppState>) -> Option<SandboxOp> {
+        app_state.take_control().sandbox
     }
 
     /// Reset the process-global sandbox state (session binds,
@@ -480,8 +480,8 @@ mod tests {
         let host = std::fs::canonicalize(td.path()).unwrap();
         crate::sandbox_state::add(&host.to_string_lossy(), "", BindMode::Rw).unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
         let (plan, _) = expect_continue(h.eval_prompt("sandbox ", HostKey::None, 100));
 
@@ -507,8 +507,8 @@ mod tests {
         crate::sandbox_state::set_base(Some(base_config()));
         crate::sandbox_state::exclude("/cfg-ro").unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Root listing: source cell shows the disabled marker.
@@ -539,8 +539,8 @@ mod tests {
         let host = std::fs::canonicalize(td.path()).unwrap();
         crate::sandbox_state::add(&host.to_string_lossy(), "", BindMode::Ro).unwrap();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Config binding: exclude note + restore mention.
@@ -571,9 +571,9 @@ mod tests {
         let host_s = host.to_string_lossy().into_owned();
         crate::sandbox_state::add(&host_s, "", BindMode::Ro).unwrap();
 
-        let shared = make_shared();
+        let app_state = test_app_state();
         let mut node = SandboxRemoveNode {
-            app: shared.clone(),
+            app_state: app_state.clone(),
         };
         let pa = |path: &str| PathArgs {
             ids: vec!["sandbox".into(), path.to_string(), "remove".into()],
@@ -588,7 +588,7 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Remove { sandbox_path }) if sandbox_path == host_s
         ));
 
@@ -598,7 +598,7 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
 
@@ -609,7 +609,7 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Restore { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
 
@@ -626,8 +626,8 @@ mod tests {
         setup();
         crate::sandbox_state::set_base(Some(base_config()));
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Enter #1: drill into `remove` + arm the confirm (Prepared).
@@ -641,7 +641,7 @@ mod tests {
         ));
         assert_eq!(prompt, "sandbox /cfg-ro remove ", "{prompt:?}");
         assert!(
-            take_sandbox_op(&shared).is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "first Enter must only arm the confirm"
         );
         let (plan, _) = expect_continue(h.eval_prompt(&prompt, HostKey::None, 100));
@@ -659,7 +659,7 @@ mod tests {
             result
         );
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
     }
@@ -668,8 +668,8 @@ mod tests {
     #[serial_test::serial]
     fn add_level_shows_mode_rows() {
         setup();
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         let (plan, _) = expect_continue(h.eval_prompt("sandbox add ", HostKey::None, 100));
@@ -684,8 +684,8 @@ mod tests {
     #[serial_test::serial]
     fn add_submit_validation_and_op() {
         setup();
-        let shared = make_shared();
-        let mut node = AddSandboxMappingNode::new(shared.clone());
+        let app_state = test_app_state();
+        let mut node = AddSandboxMappingNode::new(app_state.clone());
 
         let mk = |ids_last: &str, suffix: &str| -> (PathArgs, Vec<std::ops::Range<usize>>) {
             // Word ranges over `suffix` (skip the leading space).
@@ -727,7 +727,7 @@ mod tests {
             _other => panic!("expected Error for missing host"),
         }
         assert!(
-            take_sandbox_op(&shared).is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "no op may be queued on validation failure"
         );
 
@@ -738,7 +738,7 @@ mod tests {
         let (pa, _) = mk("rw", &suffix);
         assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
                 host_path == host_s && sandbox_path.is_empty() && mode == BindMode::Rw
         ));
@@ -749,7 +749,7 @@ mod tests {
         let (pa, _) = mk("ro", &suffix);
         assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
                 host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));
@@ -759,8 +759,8 @@ mod tests {
     #[serial_test::serial]
     fn drill_arrival_shows_error_above_header() {
         setup();
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Enter on the bare `ro` id drills into the param leaf with an
@@ -774,7 +774,7 @@ mod tests {
         assert!(detail[1].contains("Specify host path"), "{detail:?}");
         assert!(detail[2].contains("Mode: ro"), "{detail:?}");
         assert!(
-            take_sandbox_op(&shared).is_none(),
+            take_sandbox_op(&app_state).is_none(),
             "drill arrival must not queue an op"
         );
     }
@@ -790,8 +790,8 @@ mod tests {
         let p1 = td1.path().to_string_lossy().into_owned();
         let p2 = td2.path().to_string_lossy().into_owned();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Arg 1 → host listing, "Host path" label.
@@ -835,8 +835,8 @@ mod tests {
         std::fs::write(td.path().join("solo.txt"), "x").unwrap();
         let p = td.path().to_string_lossy().into_owned();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         // Non-exact stem → dialog with the file.
@@ -885,8 +885,8 @@ mod tests {
         let host_s = td.path().to_string_lossy().into_owned();
         let dst = "/mapped/dst".to_string();
 
-        let shared = make_shared();
-        let mut menu = sandbox_menu(&shared);
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
         let line = format!("sandbox add ro {host_s} {dst}");
@@ -897,7 +897,7 @@ mod tests {
             result
         );
         assert!(matches!(
-            take_sandbox_op(&shared),
+            take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
                 host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));

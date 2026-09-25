@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use crate::app_state::SharedApp;
+use crate::app_state::AppState;
 use crate::settings::{SettingKey, SETTINGS, ValueKind};
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::menu::SlashDotMenuNode;
@@ -25,12 +25,12 @@ use crate::slashdot_menu::node_impl::{
 struct EnumSettingNode {
     key: SettingKey,
     values: &'static [(&'static str, &'static str)],
-    app: SharedApp,
+    app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for EnumSettingNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let current = self.app.with_settings(|s| s.value(self.key));
+        let current = self.app_state.with_settings(|s| s.value(self.key));
         let rows = self.values.iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
@@ -42,7 +42,7 @@ impl SlashDotNode for EnumSettingNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let val = path_args.ids.last().cloned().unwrap_or_default();
-        match self.app.set_setting(self.key, &val) {
+        match self.app_state.set_setting(self.key, &val) {
             Ok(()) => SubmitResult::Done(None),
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
@@ -55,13 +55,13 @@ impl SlashDotNode for EnumSettingNode {
 
 pub struct SettingLeafNode {
     key: SettingKey,
-    app: SharedApp,
+    app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for SettingLeafNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
-        let val = self.app.with_settings(|s| s.value(self.key));
+        let val = self.app_state.with_settings(|s| s.value(self.key));
         let rows = vec![Row::new(meta.name)
             .desc(meta.description)
             .field("value", crate::slashdot_menu::value::Value::Str(val))];
@@ -78,7 +78,7 @@ impl SlashDotNode for SettingLeafNode {
             let path = path_args.ids.join(" ");
             return SubmitResult::NewPath(format!("{} ", path));
         }
-        match self.app.set_setting(self.key, val) {
+        match self.app_state.set_setting(self.key, val) {
             Ok(()) => SubmitResult::Done(None),
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
@@ -90,7 +90,7 @@ impl SlashDotNode for SettingLeafNode {
         _render_ctx: &RenderContext,
     ) -> Vec<String> {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
-        let val = self.app.with_settings(|s| s.value(self.key));
+        let val = self.app_state.with_settings(|s| s.value(self.key));
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
     }
 
@@ -98,7 +98,7 @@ impl SlashDotNode for SettingLeafNode {
         // Pre-fill the current value. ids are ["set", "<setting-name>"].
         // The leading space keeps the trailing-space behavior of the old
         // `format!("{} {}", prefix, val)` (empty value → trailing space).
-        let val = self.app.with_settings(|s| s.value(self.key));
+        let val = self.app_state.with_settings(|s| s.value(self.key));
         Some(path_args.prompt_with(&format!(" {}", val)))
     }
 }
@@ -132,7 +132,7 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
 // ---------------------------------------------------------------------------
 
 /// Build the `/set` subtree as a `SlashDotMenuNode`.
-pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
+pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
     use crate::slashdot_menu::fields::ColumnDef;
 
     let mut set_node: SlashDotMenuNode = StaticListingNode::new(&[
@@ -147,8 +147,8 @@ pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
 
     // --- default_model ---
     {
-        let reader = app.clone();
-        let writer = app.clone();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let child = crate::v25_model::ModelNode::new(
             Box::new(move || reader.with_settings(|s| s.default_model.clone())),
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
@@ -164,8 +164,8 @@ pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
 
     // --- default_persona ---
     {
-        let reader = app.clone();
-        let writer = app.clone();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let child = crate::v25_persona::PersonaEnumNode {
             active_fn: Box::new(move || reader.with_settings(|s| s.default_persona.clone())),
             submit_fn: Box::new(move |name| {
@@ -183,8 +183,8 @@ pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
 
     // --- default_thinking_level ---
     {
-        let reader = app.clone();
-        let writer = app.clone();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
         let child = crate::v25_thinking::ThinkingEnumNode {
             active_fn: Box::new(move || {
                 reader.with_settings(|s| s.default_thinking_level.clone())
@@ -218,7 +218,7 @@ pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
                 let child = EnumSettingNode {
                     key: meta.key,
                     values: descs,
-                    app: app.clone(),
+                    app_state: app_state.clone(),
                 };
                 let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
                     StaticRow::new(meta.name, meta.description),
@@ -230,7 +230,7 @@ pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
             ValueKind::Int | ValueKind::FreeText => {
                 let leaf = SettingLeafNode {
                     key: meta.key,
-                    app: app.clone(),
+                    app_state: app_state.clone(),
                 };
                 set_node.add_child(crate::slashdot_menu::SlashDotMenuNode::new(leaf));
             }
@@ -252,10 +252,10 @@ mod tests {
     use super::*;
     use crate::slashdot_menu::HostKey;
 
-    /// Returns an `AppShared` whose settings store starts at these values
+    /// Returns an `AppState` whose settings store starts at these values
     /// (binding kept as `settings` in tests below — it *is* the settings view).
-    fn test_settings() -> SharedApp {
-        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
             tool_call_limit: 50,
@@ -269,7 +269,7 @@ mod tests {
         })
     }
 
-    fn build_test_menu(settings: &SharedApp) -> crate::slashdot_menu::SlashDotMenu {
+    fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_set_node(settings));
@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn set_listing_shows_settings() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Root listing shows the "set" row.
         match h.eval_prompt("", HostKey::None, 80) {
@@ -293,8 +293,8 @@ mod tests {
 
     #[test]
     fn set_drill_shows_settings_table() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Tab into /set → should show settings with value column.
         match h.eval_prompt("", HostKey::Tab, 80) {
@@ -318,8 +318,8 @@ mod tests {
 
     #[test]
     fn set_enum_submit_persists() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Drill into security_mode.
         let result = h.eval_prompt("set security_mode ", HostKey::None, 80);
@@ -339,7 +339,7 @@ mod tests {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         // The active value was resubmitted (confirm).
                         assert_eq!(
-                            settings.with_settings(|s| s.security_mode.clone()),
+                            app_state.with_settings(|s| s.security_mode.clone()),
                             "confirm"
                         );
                     }
@@ -352,8 +352,8 @@ mod tests {
 
     #[test]
     fn set_enum_change_persists() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Move cursor to "yolo" (Down from "confirm" position).
         let _ = h.eval_prompt("set security_mode ", HostKey::None, 80);
@@ -363,7 +363,7 @@ mod tests {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                        assert_eq!(settings.with_settings(|s| s.security_mode.clone()), "yolo");
+                        assert_eq!(app_state.with_settings(|s| s.security_mode.clone()), "yolo");
                     }
                     other => panic!("expected DoneSuccess, got {:?}", other),
                 }
@@ -374,13 +374,13 @@ mod tests {
 
     #[test]
     fn set_leaf_submit_persists() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Type a value for tool_call_limit directly.
         match h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                assert_eq!(settings.with_settings(|s| s.tool_call_limit), 42);
+                assert_eq!(app_state.with_settings(|s| s.tool_call_limit), 42);
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
@@ -388,15 +388,15 @@ mod tests {
 
     #[test]
     fn set_leaf_invalid_shows_error() {
-        let settings = test_settings();
-        let mut menu = build_test_menu(&settings);
+        let app_state = test_app_state();
+        let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Invalid value for tool_call_limit.
         match h.eval_prompt("set tool_call_limit 0", HostKey::Enter, 80) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, _) => {
                 assert!(msg.unwrap_or_default().contains("greater than 0"),
                     "should show validation error");
-                assert_eq!(settings.with_settings(|s| s.tool_call_limit), 50);
+                assert_eq!(app_state.with_settings(|s| s.tool_call_limit), 50);
             }
             other => panic!("expected DoneSuccess with error, got {:?}", other),
         }
@@ -405,10 +405,10 @@ mod tests {
     #[test]
     fn setting_leaf_drill_rewrite_prefills_value() {
         use crate::slashdot_menu::node_impl::SlashDotNode;
-        let settings = test_settings();
+        let app_state = test_app_state();
         let mut node = SettingLeafNode {
             key: SettingKey::ToolCallLimit,
-            app: settings.clone(),
+            app_state: app_state.clone(),
         };
         let path = vec!["set".to_string(), "tool_call_limit".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));

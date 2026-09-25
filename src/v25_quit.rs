@@ -1,19 +1,19 @@
 //! v2.5 `SlashDotNode` implementation for `/quit`.
 //!
-//! Leaf node: submit() latches the `quit` control target on `AppShared`
+//! Leaf node: submit() latches the `quit` control target on `AppState`
 //! (declarative — never cleared); the agent loop observes it at the cycle
 //! point and breaks.
 
 use std::rc::Rc;
 
-use crate::app_state::SharedApp;
+use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct QuitNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for QuitNode {
@@ -34,7 +34,7 @@ impl SlashDotNode for QuitNode {
     }
 
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-        self.app.request_quit();
+        self.app_state.request_quit();
         SubmitResult::Done(None)
     }
 }
@@ -48,8 +48,8 @@ mod tests {
     };
     use crate::slashdot_menu::HostKey;
 
-    fn make_app() -> SharedApp {
-        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(crate::settings::SettingsStore {
             default_model: String::new(),
             security_mode: String::new(),
             tool_call_limit: 0,
@@ -63,16 +63,16 @@ mod tests {
         })
     }
 
-    fn build_quit_menu(app: &SharedApp) -> SlashDotMenu {
+    fn build_quit_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(QuitNode { app: app.clone() }.into());
+        root.add_child(QuitNode { app_state: app_state.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn quit_shows_in_listing() {
-        let app = make_app();
-        let mut menu = build_quit_menu(&app);
+        let app_state = test_app_state();
+        let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("", HostKey::None, 80);
         match result {
@@ -89,22 +89,22 @@ mod tests {
 
     #[test]
     fn quit_submit_latches_quit_target() {
-        let app = make_app();
-        let mut menu = build_quit_menu(&app);
+        let app_state = test_app_state();
+        let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("quit ", HostKey::None, 80);
         let _ = handle.eval_prompt("quit ", HostKey::Enter, 80);
-        assert!(app.should_quit(), "submit must latch the quit target");
+        assert!(app_state.should_quit(), "submit must latch the quit target");
         // Latching: a GC drain never clears it.
-        let taken = app.take_control();
+        let taken = app_state.take_control();
         assert!(taken.quit);
-        assert!(app.should_quit());
+        assert!(app_state.should_quit());
     }
 
     #[test]
     fn quit_header_text() {
-        let app = make_app();
-        let mut menu = build_quit_menu(&app);
+        let app_state = test_app_state();
+        let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("quit ", HostKey::None, 80);
         match handle.eval_prompt("quit ", HostKey::None, 80) {

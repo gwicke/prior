@@ -4,14 +4,14 @@
 
 use std::rc::Rc;
 
-use crate::app_state::SharedApp;
+use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct StatNode {
-    pub app: SharedApp,
+    pub app_state: Arc<AppState>,
 }
 
 impl SlashDotNode for StatNode {
@@ -30,20 +30,20 @@ impl SlashDotNode for StatNode {
     ) -> Vec<String> {
         // Read achieved state directly — direct accessor calls (no timing
         // constraint; these fields are written by the loop between evals).
-        let model = self.app.model();
+        let model = self.app_state.model();
         let (provider, model) = if let Some((p, m)) = model.split_once(':') {
             (p.to_string(), m.to_string())
         } else {
             (String::new(), model)
         };
 
-        let usage = self.app.session_usage();
+        let usage = self.app_state.session_usage();
 
         let session_info = {
-            let session_id = self.app.current_session_id();
+            let session_id = self.app_state.current_session_id();
             if session_id.is_empty() {
                 None
-            } else if let Some(repo) = self.app.repo() {
+            } else if let Some(repo) = self.app_state.repo() {
                 let all = repo.list_sessions_sync(None);
                 all.into_iter().find(|m| m.id == session_id).map(|meta| {
                     let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
@@ -65,7 +65,7 @@ impl SlashDotNode for StatNode {
             &model,
             usage,
             session_info,
-            self.app.context_tokens(),
+            self.app_state.context_tokens(),
         )
     }
 
@@ -78,7 +78,7 @@ impl SlashDotNode for StatNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::SharedApp;
+    use crate::app_state::AppState;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
         MenuResult, StaticListingNode,
@@ -86,8 +86,8 @@ mod tests {
     use crate::slashdot_menu::HostKey;
     use std::sync::Arc;
 
-    fn make_app() -> SharedApp {
-        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(crate::settings::SettingsStore {
             default_model: String::new(),
             security_mode: String::new(),
             tool_call_limit: 0,
@@ -101,17 +101,17 @@ mod tests {
         })
     }
 
-    fn build_stat_menu(app: &SharedApp) -> SlashDotMenu {
+    fn build_stat_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(StatNode { app: app.clone() }.into());
+        root.add_child(StatNode { app_state: app_state.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn stat_shows_model_in_header() {
-        let app = make_app();
-        app.set_model("openai:gpt-4o");
-        let mut menu = build_stat_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_model("openai:gpt-4o");
+        let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill into stat leaf (trailing space).
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
@@ -130,9 +130,9 @@ mod tests {
 
     #[test]
     fn stat_empty_session_shows_unavailable() {
-        let app = make_app();
-        app.set_model("test:model");
-        let mut menu = build_stat_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_model("test:model");
+        let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
         match result {
@@ -151,10 +151,10 @@ mod tests {
 
     #[test]
     fn stat_header_shows_estimated_context_tokens() {
-        let app = make_app();
-        app.set_model("openai:gpt-4o");
-        app.update_cycle_view(String::new(), Default::default(), 42_000, Arc::new(Vec::new()), None);
-        let mut menu = build_stat_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_model("openai:gpt-4o");
+        app_state.update_cycle_view(String::new(), Default::default(), 42_000, Arc::new(Vec::new()), None);
+        let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
         match result {
@@ -173,9 +173,9 @@ mod tests {
 
     #[test]
     fn stat_enter_clears() {
-        let app = make_app();
-        app.set_model("test:model");
-        let mut menu = build_stat_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_model("test:model");
+        let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill into leaf first.
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
@@ -187,9 +187,9 @@ mod tests {
 
     #[test]
     fn stat_esc_goes_back() {
-        let app = make_app();
-        app.set_model("test:model");
-        let mut menu = build_stat_menu(&app);
+        let app_state = test_app_state();
+        app_state.set_model("test:model");
+        let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
         let result = handle.eval_prompt_resolved("stat ", HostKey::Esc, 80);
