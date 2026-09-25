@@ -2031,7 +2031,7 @@ fn guard<T: Tool>(
 /// Returns `(sessions list, branch message previews, session tree, leaf_id,
 /// context_tokens)`.
 async fn build_session_ctx(
-    session: &Option<Session>,
+    session: &Option<Arc<Session>>,
 ) -> (
     Vec<crate::repl::SessionMeta>,
     Vec<(String, String)>,
@@ -2676,7 +2676,7 @@ async fn compute_resume_model_prefill(
 /// decision in the user's hands.
 async fn handle_session_command(
     input: &str,
-    session: &mut Option<Session>,
+    session: &mut Option<Arc<Session>>,
     repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
     config: &mut AgentConfig,
     output: &Arc<dyn Output>,
@@ -2834,7 +2834,7 @@ async fn handle_session_command(
                     compute_resume_model_prefill(&new_session, &config.qualified_model_id())
                         .await;
 
-                *session = Some(new_session);
+                *session = Some(Arc::new(new_session));
 
                 SessionCommandResult::Switched { id, prefill }
             } else {
@@ -2865,7 +2865,7 @@ async fn handle_session_command(
                         });
                         let new_session = Session::new_persisted(new_storage, index);
                         let id = new_session.get_session_id().to_string();
-                        *session = Some(new_session);
+                        *session = Some(Arc::new(new_session));
                         SessionCommandResult::Switched { id, prefill: None }
                     }
                     Err(e) => {
@@ -3553,23 +3553,27 @@ where
 
 /// Ensure a session exists, creating one lazily if needed.
 /// Called on first actual turn (Submit or ! command), not at startup.
+/// Pure-ish transform: returns `current` unchanged when it is `Some`,
+/// otherwise creates a fresh session. The caller writes the result back
+/// into the AppState slot (`set_session`/`activate_session`) — helpers
+/// never touch the slot themselves.
 pub(crate) async fn ensure_session(
-    session: &mut Option<Session>,
+    current: Option<Arc<Session>>,
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
     provider: Option<String>,
     model: Option<String>,
     thinking_level: Option<String>,
-) {
-    if session.is_some() {
-        return;
+) -> Option<Arc<Session>> {
+    if current.is_some() {
+        return current;
     }
     let repo = match repo {
         Some(r) => r,
-        None => return,
+        None => return None,
     };
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return None,
     };
     match repo.create(&cwd).await {
         Ok(storage) => {
@@ -3583,10 +3587,11 @@ pub(crate) async fn ensure_session(
                     children: std::collections::HashMap::new(),
                     session_name: None,
                 });
-            *session = Some(Session::new(storage, index));
+            Some(Arc::new(Session::new(storage, index)))
         }
         Err(e) => {
             eprintln!("Warning: cannot create session: {}", e);
+            None
         }
     }
 }
@@ -3686,7 +3691,8 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // to avoid empty sessions.
     let sessions_dir = crate::platform::app_config_dir().map(|d| d.join("sessions"));
     let cwd = std::env::current_dir().ok();
-    let (mut session, mut repo) = if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
+    let mut repo: Option<crate::session::repo::JsonlSessionRepo> =
+        if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
         let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
         // Repo is created eagerly (just a path); the session object is also
         // created unconditionally here so the `/session` overlay can mark the
@@ -3696,17 +3702,10 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // file is created if the user never takes a turn. Creating up front
         // removes the mid-loop `ensure_session` calls (in the first-turn and
         // `!`/`!!` paths).
-        (None, Some(repo))
+        Some(repo)
     } else {
-        (None, None)
+        None
     };
-    ensure_session(
-        &mut session,
-        &repo,
-        Some(config.provider.clone()),
-        Some(config.model.clone()),
-        config.thinking_level.clone(),
-    ).await;
     let mut line_history = crate::repl::History::load();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
@@ -3723,16 +3722,27 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // flags); the loop's local `config` remains the applied layer that
     // converges to it. Settings move in as the one durable copy.
     let app_state = AppState::new(config.clone(), settings, repo.clone());
+    // First session — created up front so the `/session` overlay can mark
+    // it from the start (the file itself is written lazily on the first
+    // `append_message`, so no empty session is created for a user who
+    // never takes a turn).
+    let first = ensure_session(
+        app_state.session(),
+        &repo,
+        Some(config.provider.clone()),
+        Some(config.model.clone()),
+        config.thinking_level.clone(),
+    )
+    .await;
+    let first_id = first
+        .as_ref()
+        .map(|s| s.get_session_id().to_string())
+        .unwrap_or_default();
+    app_state.activate_session(first, first_id);
     app_state.set_recent_models(load_recent_models());
     // Seed the model switch from the configured default model so it appears
     // in the recent list on first run (if present and available).
     app_state.seed_recent_model(&config.qualified_model_id());
-    app_state.set_current_session_id(
-        session
-            .as_ref()
-            .map(|s| s.get_session_id().to_string())
-            .unwrap_or_default(),
-    );
     // Rebuild gate state: fingerprint of the last target we ATTEMPTED to
     // apply. A failed attempt (bad id, missing key) stays silent and
     // un-retried until the target changes — one error per distinct target,
@@ -3781,7 +3791,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
 
                 // Build session context data for REPL overlays.
                 let (_sessions, branch_messages, tree, leaf_id, context_tokens) =
-                    build_session_ctx(&session).await;
+                    build_session_ctx(&app_state.session()).await;
 
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
@@ -3897,6 +3907,8 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             }
         }
 
+        // Recording reads the active session (clone-out; read-only).
+        let recording_session = app_state.session();
         // Session metadata recording. Runs AFTER the rebuild so `config`
         // at this point matches the committed values exactly when the
         // agent actually runs them (rebuild succeeded, or the commit
@@ -3910,13 +3922,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // `ensure_persisted` from creating header+marker "empty" sessions.
         if let Some(ref committed) = control.model_commit {
             if config.qualified_model_id() == *committed {
-                if let Some(ref s) = session {
+                if let Some(ref s) = recording_session {
                     record_model_change(s, committed).await;
                 }
             }
         }
         if thinking_changed && config.thinking_level == target_thinking {
-            if let Some(ref s) = session {
+            if let Some(ref s) = recording_session {
                 record_thinking_change(s, target_thinking.as_deref().unwrap_or("off")).await;
             }
         }
@@ -3924,8 +3936,8 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // above already GC'd the one-shots; run-to-completion means at
         // most one menu submit set them this cycle.
         if let Some(ri) = control.replay {
-            if let Some(ref s) = session {
-                handle_replay(&ri.arg, s, config.output.as_ref()).await;
+            if let Some(s) = app_state.session() {
+                handle_replay(&ri.arg, &s, config.output.as_ref()).await;
             } else {
                 config.output.display_text("No active session to replay");
             }
@@ -3938,10 +3950,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 format!("/session {} resume {}", session_id, replay_arg)
             };
             let out = config.output.clone();
-            match handle_session_command(
+            let mut session = app_state.session();
+            let result = handle_session_command(
                 &input, &mut session, &mut repo, &mut config, &out,
                 &app_state.settings(),
-            ).await {
+            ).await;
+            app_state.set_session(session);
+            match result {
                 SessionCommandResult::Switched { id: new_id, prefill } => {
                     app_state.set_current_session_id(new_id);
                     if prefill.is_some() {
@@ -3957,10 +3972,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         if let Some(session_id) = control.fork {
             let input = format!("/session {} fork", session_id);
             let out = config.output.clone();
-            match handle_session_command(
+            let mut session = app_state.session();
+            let result = handle_session_command(
                 &input, &mut session, &mut repo, &mut config, &out,
                 &app_state.settings(),
-            ).await {
+            ).await;
+            app_state.set_session(session);
+            match result {
                 SessionCommandResult::Switched { id: new_id, .. } => {
                     app_state.set_current_session_id(new_id);
                 }
@@ -3974,10 +3992,12 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             let (session_id, new_name) = (ri.session_id, ri.new_name);
             let input = format!("/session {} rename {}", session_id, new_name);
             let out = config.output.clone();
+            let mut session = app_state.session();
             let result = handle_session_command(
                 &input, &mut session, &mut repo, &mut config, &out,
                 &app_state.settings(),
             ).await;
+            app_state.set_session(session);
             if !matches!(result, SessionCommandResult::Handled) {
                 eprintln!("[v25] rename: unexpected result {:?}", std::mem::discriminant(&result));
             }
@@ -3986,22 +4006,23 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // `delete_session_ids_after`, and this applier defines the order —
         // create → swap → delete (idempotent: a missing id is a no-op).
         if let Some(name) = control.new_session {
-            session = None;
-            ensure_session(
-                &mut session,
+            // `/new` drops the in-memory session — pass `None` explicitly
+            // (ensure would keep a `Some` as-is), then activate atomically.
+            let fresh = ensure_session(
+                None,
                 &repo,
                 Some(config.provider.clone()),
                 Some(config.model.clone()),
                 config.thinking_level.clone(),
-            ).await;
-            app_state.set_current_session_id(
-                session
-                    .as_ref()
-                    .map(|s| s.get_session_id().to_string())
-                    .unwrap_or_default(),
-            );
+            )
+            .await;
+            let fresh_id = fresh
+                .as_ref()
+                .map(|s| s.get_session_id().to_string())
+                .unwrap_or_default();
+            app_state.activate_session(fresh.clone(), fresh_id);
             if !name.is_empty() {
-                if let Some(ref s) = session {
+                if let Some(ref s) = fresh {
                     if let Err(e) = s.set_session_name(&name).await {
                         config
                             .output
@@ -4015,12 +4036,16 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         for session_id in control.delete_session_ids_after {
             let input = format!("/session {} delete", session_id);
             let out = config.output.clone();
-            match handle_session_command(
-                &input, &mut session, &mut repo, &mut config, &out,
+            let mut sess = app_state.session();
+            let result = handle_session_command(
+                &input, &mut sess, &mut repo, &mut config, &out,
                 &app_state.settings(),
-            ).await {
+            ).await;
+            let became_none = sess.is_none();
+            app_state.set_session(sess);
+            match result {
                 SessionCommandResult::Deleted => {
-                    if session.is_none() {
+                    if became_none {
                         app_state.set_current_session_id(String::new());
                     }
                 }
@@ -4031,7 +4056,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             }
         }
         if let Some(target_id) = control.tree_switch {
-            if let Some(ref s) = session {
+            if let Some(s) = app_state.session() {
                 let old_leaf_id = s.get_leaf_id().await;
                 if old_leaf_id.as_deref() != Some(target_id.as_str()) {
                     let _ = s.move_leaf(Some(target_id.clone())).await;
@@ -4040,7 +4065,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         }
         if let Some(tc) = control.tree_compact {
             let (target_id, mode, payload) = (tc.target_id, tc.mode, tc.payload);
-            let Some(ref s) = session else {
+            let Some(s) = app_state.session() else {
                 config.output.display_text("Cannot compact: no active session");
                 continue;
             };
@@ -4112,7 +4137,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     None
                 };
             match run_compaction(
-                s,
+                &s,
                 &agent,
                 &app_state.settings(),
                 CompactionTarget::AtPoint {
@@ -4227,19 +4252,19 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // and skip every `append_message` (gated on `session.is_some()`),
                 // losing turn-to-turn memory and never writing the new session
                 // to disk. Cheap when the session is already populated.
-                ensure_session(
-                    &mut session,
+                let guarded = ensure_session(
+                    app_state.session(),
                     &repo,
                     Some(config.provider.clone()),
                     Some(config.model.clone()),
                     config.thinking_level.clone(),
-                ).await;
-                app_state.set_current_session_id(
-                    session
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default(),
-                );
+                )
+                .await;
+                let guarded_id = guarded
+                    .as_ref()
+                    .map(|s| s.get_session_id().to_string())
+                    .unwrap_or_default();
+                app_state.activate_session(guarded, guarded_id);
                 // User-initiated shell command. `!cmd` runs `cmd` in the
                 // sandbox and captures its output into the session context (so
                 // the LLM sees it on the next turn); `!!cmd` runs and displays
@@ -4289,7 +4314,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                     let msg = Message::user(format!(
                                         "Ran shell command: {cmd}"
                                     ));
-                                    if let Some(ref s) = session {
+                                    if let Some(s) = app_state.session() {
                                         let _ = s.append_message(&msg).await;
                                         let reply = Message::Assistant {
                                             id: None,
@@ -4325,7 +4350,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
 
                     match action {
                         TreeAction::Switch => {
-                            if let Some(ref s) = session {
+                            if let Some(s) = app_state.session() {
                                 let old_leaf_id = s.get_leaf_id().await;
                                 if old_leaf_id.as_deref() != Some(target_id.as_str()) {
                                     // Summarize the abandoned branch if requested.
@@ -4418,7 +4443,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             }
                         }
                         TreeAction::Compact => {
-                            let Some(ref s) = session else {
+                            let Some(s) = app_state.session() else {
                                 config.output.display_text("Cannot compact: no active session");
                                 continue;
                             };
@@ -4530,7 +4555,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 };
 
                             match run_compaction(
-                                s,
+                                &s,
                                 &agent,
                                 &app_state.settings(),
                                 CompactionTarget::AtPoint {
@@ -4571,14 +4596,17 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // Handle `/session <name> <action>` commands.
                 if input.starts_with("/session") {
                     let out = config.output.clone();
-                    match handle_session_command(
+                    let mut sess = app_state.session();
+                    let result = handle_session_command(
                         &input,
-                        &mut session,
+                        &mut sess,
                         &mut repo,
                         &mut config,
                         &out,
                         &app_state.settings(),
-                    ).await {
+                    ).await;
+                    app_state.set_session(sess);
+                    match result {
                         SessionCommandResult::NotSession => {
                             // Not a session command — fall through to normal prompt.
                         }
@@ -4608,7 +4636,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // first turn onward (instead of needing a follow-up rename).
                 if input == "/clear" || input.starts_with("/clear ") {
                     let new_name = input["/clear".len()..].trim().to_string();
-                    if let Some(ref s) = session {
+                    if let Some(s) = app_state.session() {
                         let id = s.get_session_id().to_string();
                         if let Some(ref r) = repo {
                             // Find the session meta to delete it.
@@ -4619,27 +4647,27 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             }
                         }
                     }
-                    session = None;
                     // Create a fresh session for the next prompt so context
                     // carries across turns AND the new turns get persisted.
                     // `repo.create()` defers the header write to the first
                     // `append_message`, so a user that quits immediately
-                    // still produces no empty `.jsonl` file.
-                    ensure_session(
-                        &mut session,
+                    // still produces no empty `.jsonl` file. (`None` drops
+                    // the in-memory session — ensure keeps a `Some` as-is.)
+                    let fresh = ensure_session(
+                        None,
                         &repo,
                         Some(config.provider.clone()),
                         Some(config.model.clone()),
                         config.thinking_level.clone(),
-                    ).await;
-                    app_state.set_current_session_id(
-                        session
-                            .as_ref()
-                            .map(|s| s.get_session_id().to_string())
-                            .unwrap_or_default(),
-                    );
+                    )
+                    .await;
+                    let fresh_id = fresh
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
+                    app_state.activate_session(fresh.clone(), fresh_id);
                     if !new_name.is_empty() {
-                        if let Some(ref s) = session {
+                        if let Some(ref s) = fresh {
                             if let Err(e) = s.set_session_name(&new_name).await {
                                 config
                                     .output
@@ -4661,27 +4689,26 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // names the new session (same rationale as `/clear <name>`).
                 if input == "/new" || input.starts_with("/new ") {
                     let new_name = input["/new".len()..].trim().to_string();
-                    session = None;
-                    // See `/clear` above: without this call, the next prompt
-                    // would run with `session = None` — losing prior context
+                    // See `/clear` above: without the fresh ensure, the next
+                    // prompt would run with no session — losing prior context
                     // and skipping every `append_message` (since they're gated
-                    // on `session.is_some()`), so the new "session" wouldn't
-                    // be saved.
-                    ensure_session(
-                        &mut session,
+                    // on the session being present), so the new "session"
+                    // wouldn't be saved. (`None` drops the in-memory session.)
+                    let fresh = ensure_session(
+                        None,
                         &repo,
                         Some(config.provider.clone()),
                         Some(config.model.clone()),
                         config.thinking_level.clone(),
-                    ).await;
-                    app_state.set_current_session_id(
-                        session
-                            .as_ref()
-                            .map(|s| s.get_session_id().to_string())
-                            .unwrap_or_default(),
-                    );
+                    )
+                    .await;
+                    let fresh_id = fresh
+                        .as_ref()
+                        .map(|s| s.get_session_id().to_string())
+                        .unwrap_or_default();
+                    app_state.activate_session(fresh.clone(), fresh_id);
                     if !new_name.is_empty() {
-                        if let Some(ref s) = session {
+                        if let Some(ref s) = fresh {
                             if let Err(e) = s.set_session_name(&new_name).await {
                                 config
                                     .output
@@ -4702,9 +4729,9 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // replays all the way to the beginning; only the agent context
                 // is prefix-limited at the compaction scope.
                 if input == "/replay" || input.starts_with("/replay ") {
-                    if let Some(ref s) = session {
+                    if let Some(s) = app_state.session() {
                         let arg = input["/replay".len()..].trim();
-                        handle_replay(arg, s, config.output.as_ref()).await;
+                        handle_replay(arg, &s, config.output.as_ref()).await;
                     } else {
                         config.output.display_text("No active session to replay");
                     }
@@ -4734,6 +4761,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 }
                 // Clone-out for this turn (lock rule 3: no guard across await).
                 let agent = app_state.agent();
+                let session = app_state.session();
                 // Single attempt + auto-retry, with the in-flight reader
                 // (if any) spanning the whole window. `Esc` during the
                 // retry's back-off sleep returns `Cancelled`; `Esc` during
@@ -4780,7 +4808,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                         let prompt_result = agent
                             .as_ref()
                             .unwrap()
-                            .prompt(&next_input, session.as_ref(), &turn)
+                            .prompt(&next_input, session.as_deref(), &turn)
                             .await;
                         match prompt_result {
                             Ok(text) => break Ok(text),
