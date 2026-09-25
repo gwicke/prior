@@ -631,3 +631,20 @@ anchor, tie-is-ambiguous, tolerance scaling, header anchor capture,
 `split_line_anchor` forms, top-level `startLine` ignored in blob form,
 `path:LINE` single-edit anchor + conflict, suffix stripped in blob form,
 success-string location hint. Green.
+
+## Notes / follow ups
+- Explore multi-file support that splits edits into single-file batches
+  *before* execution. Makes failure domain per-file, and preserves pi session
+  compatibility, but might be surprising for agents to see one batch split up
+  into sub-edits? Would need to test.
+- Refine line anchor tolerance not based on context size, but based on
+  uniqueness between two closest matches, with high absolute upper bound.
+  Basically, accept relatively large deviations in line position (10s of
+  lines) if the ratio of distance between the two closest candidates is
+  sufficiently skewed towards the strongest candidate. Avoid resolving a
+  close-tie with large deviation.
+- Line anchored vs. un-anchored candidate disambiguation: In several cases,
+  the model omitted the line anchor at the first block, assuming that making
+  other blocks un-ambiguous would only leave one match for the first block.
+  Consider matching line-anchored blocks first, and accepting an un-anchored
+  block if it matches a position not overlapping with any previous matches.
