@@ -399,11 +399,20 @@ still sync); the async conversion rides on top.
    `ModelChange` corrects). Final `ControlConfig`: **quit, sandbox**
    (was 12 fields) — the convergence appliers are just the sandbox
    merge/re-publish.
-6. **Verify.** Full suite green **[done]** (782); stale-name grep
+6. **Verify.** Full suite green **[done]**; stale-name grep
    `MenuShared|LiveState|pending_op|model_commit|AsyncOp` → zero
-   **[done]**. Remaining: E2E the empty-session repro from the
-   model-change bug must stay dead; smoke `/session` ops, quit,
-   resume + prefill, `/model`.
+   **[done]**. E2E pty tests **[done]** — `tests/e2e_session_state.rs`
+   (isolated XDG + temp cwd + seeded sessions, real binary, no network):
+   `menu_traffic_never_creates_empty_session_files` = THE empty-session
+   repro (menu delete + thinking switch → convergence → journal record
+   against an unpersisted session must not mint files) plus
+   `/session`-listing/delete/quit smokes; `resume_replays_history_and_
+   seeds_model_prefill` = resume replay + `/model` prefill smoke. Both
+   green. `/model`-overlay switch itself stays unit-covered (the static
+   catalog has no llamacpp rows without network — E2E uses `/thinking`
+   for the same convergence/record surface). Harness notes: reply to
+   DSR scans before every keystroke (`cursor_row`'s 60ms window eats
+   bytes) and clear the input line before typing over a prefill.
 
 ## Open questions / potential issues
 
