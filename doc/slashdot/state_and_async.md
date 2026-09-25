@@ -356,7 +356,7 @@ still sync); the async conversion rides on top.
    in `#[cfg(test)]` regions are wrapped in `futures::executor::block_on`
    (scripted, paren-balanced, one descending insertion pass) — 242
    wraps; test bodies and helpers unchanged.
-4. **Slot exposure.** `SessionSlot` gains the two shared handles —
+4. **Slot exposure** **[done].** `SessionSlot` gains the two shared handles —
    `session: Option<Arc<Session>>` (all methods `&self`; internals are
    `Arc<AsyncMutex>` by design) and `agent: Option<Arc<dyn PicoAgent>>`
    (`Send + Sync`, all methods `&self`) — plus `activate_session(id)` /
