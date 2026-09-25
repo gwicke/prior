@@ -1,18 +1,20 @@
 //! v2.5 `SlashDotNode` implementation for `/clear`.
 //!
-//! Leaf node: submit() sets `AsyncOp::Clear` on `MenuShared` so the agent
-//! loop deletes the current session and starts fresh.
+//! Leaf node: submit() composes the `/clear` target declaratively — start a
+//! fresh session AND delete the outgoing one afterwards
+//! (`new_session` + `delete_session_ids_after`); the loop's applier defines
+//! the order (create → swap → delete), idempotence makes replays safe.
 
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::{AsyncOp, MenuShared};
+use crate::app_state::SharedApp;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct ClearNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for ClearNode {
@@ -38,7 +40,8 @@ impl SlashDotNode for ClearNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Clear { name });
+        let outgoing = self.app.current_session_id();
+        self.app.request_clear(name, outgoing);
         SubmitResult::Done(None)
     }
 }
@@ -52,34 +55,31 @@ mod tests {
     };
     use crate::slashdot_menu::HostKey;
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(
-            crate::settings::SettingsStore {
-                default_model: String::new(),
-                security_mode: String::new(),
-                tool_call_limit: 0,
-                default_persona: None,
-                default_thinking_level: String::new(),
-                show_reasoning: String::new(),
-                reasoning_in_context: false,
-                session_resume_replay_turns: 0,
-                llm_compact_prompt: String::new(),
-                path: None,
-            },
-            None,
-        ))
+    fn make_app() -> SharedApp {
+        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_thinking_level: String::new(),
+            show_reasoning: String::new(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            path: None,
+        })
     }
 
-    fn build_clear_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_clear_menu(app: &SharedApp) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(ClearNode { shared: shared.clone() }.into());
+        root.add_child(ClearNode { app: app.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn clear_shows_in_listing() {
-        let shared = make_shared();
-        let mut menu = build_clear_menu(&shared);
+        let app = make_app();
+        let mut menu = build_clear_menu(&app);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("", HostKey::None, 80);
         match result {
@@ -95,30 +95,28 @@ mod tests {
     }
 
     #[test]
-    fn clear_submit_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_clear_menu(&shared);
+    fn clear_submit_composes_new_plus_delete_targets() {
+        let app = make_app();
+        app.set_current_session_id("outgoing-1".into());
+        let mut menu = build_clear_menu(&app);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("clear ", HostKey::None, 80);
         let _ = handle.eval_prompt("clear ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Clear { name }) => assert_eq!(name, ""),
-            other => panic!("expected Clear, got {:?}", other),
-        }
+        let taken = app.take_control();
+        assert_eq!(taken.new_session.as_deref(), Some(""));
+        assert_eq!(taken.delete_session_ids_after, vec!["outgoing-1".to_string()]);
     }
 
     #[test]
-    fn clear_with_name_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_clear_menu(&shared);
+    fn clear_with_name_composes_targets() {
+        let app = make_app();
+        let mut menu = build_clear_menu(&app);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80);
         let _ = handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::Clear { name }) => assert_eq!(name, "my-fresh-start"),
-            other => panic!("expected Clear with name, got {:?}", other),
-        }
+        let taken = app.take_control();
+        assert_eq!(taken.new_session.as_deref(), Some("my-fresh-start"));
+        // No current session id → nothing to delete.
+        assert!(taken.delete_session_ids_after.is_empty());
     }
 }

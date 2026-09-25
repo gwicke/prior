@@ -57,17 +57,14 @@ impl SlashDotNode for PersonaEnumNode {
 // ---------------------------------------------------------------------------
 
 /// Add `/persona` child to a listing `SlashDotMenuNode`.
-pub fn add_persona_child(
-    listing: &mut SlashDotMenuNode,
-    live_state: &Rc<RefCell<crate::slash_menu_bridge::LiveState>>,
-) {
-    let ls = live_state.clone();
-    let ls2 = live_state.clone();
+pub fn add_persona_child(listing: &mut SlashDotMenuNode, app: &crate::app_state::SharedApp) {
+    let reader = app.clone();
+    let writer = app.clone();
     listing.add_child(PersonaEnumNode {
-        active_fn: Box::new(move || ls.borrow().persona.clone()),
+        active_fn: Box::new(move || reader.persona()),
         submit_fn: Box::new(move |name| {
             let val = if name == "none" { None } else { Some(name.to_string()) };
-            ls2.borrow_mut().persona = val;
+            writer.set_persona(val);
             Ok(())
         }),
     }.into());
@@ -76,12 +73,12 @@ pub fn add_persona_child(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
+    use crate::app_state::SharedApp;
     use crate::slashdot_menu::menu::SlashDotMenu;
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
     use crate::slashdot_menu::HostKey;
 
-    fn test_shared() -> Rc<MenuShared> {
+    fn test_app() -> SharedApp {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -94,17 +91,17 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        Rc::new(MenuShared::new(settings, None))
+        crate::app_state::AppShared::for_test(settings)
     }
 
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
-    /// "persona" → `PersonaEnumNode` bound to `LiveState`.
-    fn build_persona_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    /// "persona" → `PersonaEnumNode` bound to the target config.
+    fn build_persona_menu(app: &SharedApp) -> SlashDotMenu {
         let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
             StaticRow::new("persona", "set runtime persona"),
         ])
         .into();
-        add_persona_child(&mut pl, &shared.live_state);
+        add_persona_child(&mut pl, app);
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(pl);
         SlashDotMenu::from_root_node(root)
@@ -113,8 +110,8 @@ mod tests {
     /// Root listing shows the `persona` command row.
     #[test]
     fn persona_root_row_present() {
-        let shared = test_shared();
-        let mut menu = build_persona_menu(&shared);
+        let app = test_app();
+        let mut menu = build_persona_menu(&app);
         let mut h = menu.get_handle();
         match h.eval_prompt("", HostKey::None, 80) {
             MenuResult::Continue(plan, _) => {
@@ -128,14 +125,14 @@ mod tests {
         }
     }
 
-    /// Tab selects a row (persona name or "none"), Enter commits it to
-    /// `LiveState.persona` (`none` → None).
+    /// Tab selects a row (persona name or "none"), Enter commits it to the
+    /// target config's persona (`none` → None).
     #[test]
-    fn persona_submit_sets_live_state() {
-        let shared = test_shared();
+    fn persona_submit_sets_target_config() {
+        let app = test_app();
         // Pre-set a persona that is not a row, so any selection is observable.
-        shared.live_state.borrow_mut().persona = Some("definitely-not-a-persona".into());
-        let mut menu = build_persona_menu(&shared);
+        app.set_persona(Some("definitely-not-a-persona".into()));
+        let mut menu = build_persona_menu(&app);
         let mut h = menu.get_handle();
         let prompt = match h.eval_prompt_resolved("persona ", HostKey::Tab, 80) {
             MenuResult::Continue(_, prompt) => prompt,
@@ -151,6 +148,6 @@ mod tests {
             other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
         }
         let expect = if sel == "none" { None } else { Some(sel) };
-        assert_eq!(shared.live_state.borrow().persona, expect);
+        assert_eq!(app.persona(), expect);
     }
 }

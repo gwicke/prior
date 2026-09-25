@@ -7,10 +7,10 @@
 //! column. Enum settings use the same pattern with `EnumSettingNode`.
 //! Leaf settings (int, freetext) return their value directly in `data()`.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::settings::{SettingKey, SettingsStore, SETTINGS, ValueKind};
+use crate::app_state::SharedApp;
+use crate::settings::{SettingKey, SETTINGS, ValueKind};
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
@@ -25,13 +25,12 @@ use crate::slashdot_menu::node_impl::{
 struct EnumSettingNode {
     key: SettingKey,
     values: &'static [(&'static str, &'static str)],
-    settings: Rc<RefCell<SettingsStore>>,
+    app: SharedApp,
 }
 
 impl SlashDotNode for EnumSettingNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        let s = self.settings.borrow();
-        let current = s.value(self.key);
+        let current = self.app.with_settings(|s| s.value(self.key));
         let rows = self.values.iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
@@ -43,7 +42,7 @@ impl SlashDotNode for EnumSettingNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let val = path_args.ids.last().cloned().unwrap_or_default();
-        match self.settings.borrow_mut().set_value(self.key, &val) {
+        match self.app.set_setting(self.key, &val) {
             Ok(()) => SubmitResult::Done(None),
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
@@ -56,13 +55,13 @@ impl SlashDotNode for EnumSettingNode {
 
 pub struct SettingLeafNode {
     key: SettingKey,
-    settings: Rc<RefCell<SettingsStore>>,
+    app: SharedApp,
 }
 
 impl SlashDotNode for SettingLeafNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
-        let val = self.settings.borrow().value(self.key);
+        let val = self.app.with_settings(|s| s.value(self.key));
         let rows = vec![Row::new(meta.name)
             .desc(meta.description)
             .field("value", crate::slashdot_menu::value::Value::Str(val))];
@@ -79,7 +78,7 @@ impl SlashDotNode for SettingLeafNode {
             let path = path_args.ids.join(" ");
             return SubmitResult::NewPath(format!("{} ", path));
         }
-        match self.settings.borrow_mut().set_value(self.key, val) {
+        match self.app.set_setting(self.key, val) {
             Ok(()) => SubmitResult::Done(None),
             Err(msg) => SubmitResult::Done(Some(msg)),
         }
@@ -91,7 +90,7 @@ impl SlashDotNode for SettingLeafNode {
         _render_ctx: &RenderContext,
     ) -> Vec<String> {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
-        let val = self.settings.borrow().value(self.key);
+        let val = self.app.with_settings(|s| s.value(self.key));
         vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
     }
 
@@ -99,7 +98,7 @@ impl SlashDotNode for SettingLeafNode {
         // Pre-fill the current value. ids are ["set", "<setting-name>"].
         // The leading space keeps the trailing-space behavior of the old
         // `format!("{} {}", prefix, val)` (empty value → trailing space).
-        let val = self.settings.borrow().value(self.key);
+        let val = self.app.with_settings(|s| s.value(self.key));
         Some(path_args.prompt_with(&format!(" {}", val)))
     }
 }
@@ -133,9 +132,7 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
 // ---------------------------------------------------------------------------
 
 /// Build the `/set` subtree as a `SlashDotMenuNode`.
-pub fn build_set_node(
-    settings: &Rc<RefCell<SettingsStore>>,
-) -> SlashDotMenuNode {
+pub fn build_set_node(app: &SharedApp) -> SlashDotMenuNode {
     use crate::slashdot_menu::fields::ColumnDef;
 
     let mut set_node: SlashDotMenuNode = StaticListingNode::new(&[
@@ -150,13 +147,11 @@ pub fn build_set_node(
 
     // --- default_model ---
     {
-        let settings_clone = settings.clone();
-        let settings_clone2 = settings.clone();
+        let reader = app.clone();
+        let writer = app.clone();
         let child = crate::v25_model::ModelNode::new(
-            Box::new(move || settings_clone.borrow().default_model.clone()),
-            Box::new(move |model| {
-                settings_clone2.borrow_mut().set_value(SettingKey::DefaultModel, model)
-            }),
+            Box::new(move || reader.with_settings(|s| s.default_model.clone())),
+            Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
             None, // no recent models for /set
         );
         let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
@@ -169,13 +164,13 @@ pub fn build_set_node(
 
     // --- default_persona ---
     {
-        let settings_clone = settings.clone();
-        let settings_clone2 = settings.clone();
+        let reader = app.clone();
+        let writer = app.clone();
         let child = crate::v25_persona::PersonaEnumNode {
-            active_fn: Box::new(move || settings_clone.borrow().default_persona.clone()),
+            active_fn: Box::new(move || reader.with_settings(|s| s.default_persona.clone())),
             submit_fn: Box::new(move |name| {
                 let val = if name == "none" { "" } else { name };
-                settings_clone2.borrow_mut().set_value(SettingKey::DefaultPersona, val)
+                writer.set_setting(SettingKey::DefaultPersona, val)
             }),
         };
         let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
@@ -188,14 +183,14 @@ pub fn build_set_node(
 
     // --- default_thinking_level ---
     {
-        let settings_clone = settings.clone();
-        let settings_clone2 = settings.clone();
+        let reader = app.clone();
+        let writer = app.clone();
         let child = crate::v25_thinking::ThinkingEnumNode {
             active_fn: Box::new(move || {
-                settings_clone.borrow().default_thinking_level.clone()
+                reader.with_settings(|s| s.default_thinking_level.clone())
             }),
             submit_fn: Box::new(move |level| {
-                settings_clone2.borrow_mut().set_value(SettingKey::DefaultThinking, level)
+                writer.set_setting(SettingKey::DefaultThinking, level)
             }),
         };
         let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
@@ -220,11 +215,10 @@ pub fn build_set_node(
         match meta.kind {
             ValueKind::Enum(_) => {
                 let descs = enum_value_descs(meta.key);
-                let settings_clone = settings.clone();
                 let child = EnumSettingNode {
                     key: meta.key,
                     values: descs,
-                    settings: settings_clone,
+                    app: app.clone(),
                 };
                 let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
                     StaticRow::new(meta.name, meta.description),
@@ -234,10 +228,9 @@ pub fn build_set_node(
                 set_node.add_child(wrapper);
             }
             ValueKind::Int | ValueKind::FreeText => {
-                let settings_clone = settings.clone();
                 let leaf = SettingLeafNode {
                     key: meta.key,
-                    settings: settings_clone,
+                    app: app.clone(),
                 };
                 set_node.add_child(crate::slashdot_menu::SlashDotMenuNode::new(leaf));
             }
@@ -259,8 +252,10 @@ mod tests {
     use super::*;
     use crate::slashdot_menu::HostKey;
 
-    fn test_settings() -> Rc<RefCell<SettingsStore>> {
-        Rc::new(RefCell::new(SettingsStore {
+    /// Returns an `AppShared` whose settings store starts at these values
+    /// (binding kept as `settings` in tests below — it *is* the settings view).
+    fn test_settings() -> SharedApp {
+        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
             tool_call_limit: 50,
@@ -271,10 +266,10 @@ mod tests {
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
             path: None,
-        }))
+        })
     }
 
-    fn build_test_menu(settings: &Rc<RefCell<SettingsStore>>) -> crate::slashdot_menu::SlashDotMenu {
+    fn build_test_menu(settings: &SharedApp) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_set_node(settings));
@@ -343,7 +338,10 @@ mod tests {
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         // The active value was resubmitted (confirm).
-                        assert_eq!(settings.borrow().security_mode, "confirm");
+                        assert_eq!(
+                            settings.with_settings(|s| s.security_mode.clone()),
+                            "confirm"
+                        );
                     }
                     other => panic!("expected DoneSuccess, got {:?}", other),
                 }
@@ -365,7 +363,7 @@ mod tests {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
                 match h.eval_prompt(&prompt, HostKey::Enter, 80) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                        assert_eq!(settings.borrow().security_mode, "yolo");
+                        assert_eq!(settings.with_settings(|s| s.security_mode.clone()), "yolo");
                     }
                     other => panic!("expected DoneSuccess, got {:?}", other),
                 }
@@ -382,7 +380,7 @@ mod tests {
         // Type a value for tool_call_limit directly.
         match h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                assert_eq!(settings.borrow().tool_call_limit, 42);
+                assert_eq!(settings.with_settings(|s| s.tool_call_limit), 42);
             }
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
@@ -398,7 +396,7 @@ mod tests {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, _) => {
                 assert!(msg.unwrap_or_default().contains("greater than 0"),
                     "should show validation error");
-                assert_eq!(settings.borrow().tool_call_limit, 50);
+                assert_eq!(settings.with_settings(|s| s.tool_call_limit), 50);
             }
             other => panic!("expected DoneSuccess with error, got {:?}", other),
         }
@@ -410,7 +408,7 @@ mod tests {
         let settings = test_settings();
         let mut node = SettingLeafNode {
             key: SettingKey::ToolCallLimit,
-            settings: settings.clone(),
+            app: settings.clone(),
         };
         let path = vec!["set".to_string(), "tool_call_limit".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));

@@ -5,9 +5,9 @@
 //! counter — when the catalog hasn't refreshed, the engine's `Rc::ptr_eq`
 //! check skips the full re-derive (filter → fuzzy → sort → render).
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::app_state::SharedApp;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
@@ -25,7 +25,7 @@ pub struct ModelNode {
     /// Write the selected model id on submit. `Ok(())` on success.
     submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
     /// Recent model ids for ordering (only for `/model`, None for `/set`).
-    recent: Option<Rc<RefCell<Vec<String>>>>,
+    recent: Option<SharedApp>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
@@ -37,7 +37,7 @@ impl ModelNode {
     pub fn new(
         active_fn: Box<dyn Fn() -> String>,
         submit_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
-        recent: Option<Rc<RefCell<Vec<String>>>>,
+        recent: Option<SharedApp>,
     ) -> Self {
         ModelNode {
             active_fn,
@@ -63,7 +63,7 @@ impl SlashDotNode for ModelNode {
         let active_id = (self.active_fn)();
         let active = if active_id.is_empty() { None } else { Some(active_id) };
         let recent: Vec<String> = self.recent.as_ref()
-            .map(|r| r.borrow().clone())
+            .map(|r| r.recent_models())
             .unwrap_or_default();
 
         // Build rows in the same order as the legacy ModelProvider:
@@ -281,9 +281,7 @@ pub fn model_columns() -> Vec<ColumnDef> {
 ///
 /// The listing node carries column definitions and field metadata;
 /// the `ModelNode` child provides dynamic catalog rows.
-pub fn build_model_node(
-    shared: &Rc<crate::slash_menu_bridge::MenuShared>,
-) -> crate::slashdot_menu::menu::SlashDotMenuNode {
+pub fn build_model_node(app: &SharedApp) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::fields::{FieldSpec, SortDir};
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -313,22 +311,21 @@ pub fn build_model_node(
         FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
         FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
     ]).into();
-    // Live session model: reads from LiveState, writes to LiveState.
-    let ls = shared.live_state.clone();
-    let ls2 = shared.live_state.clone();
-    let recent = Some(shared.recent_models.clone());
+    // Live session model: reads the runtime-target config, writes it, and
+    // records the explicit user commit in one place.
+    let reader = app.clone();
+    let writer = app.clone();
     node.add_child(ModelNode::new(
-        Box::new(move || ls.borrow().model.clone()),
+        Box::new(move || reader.model()),
         Box::new(move |model| {
-            let mut ls = ls2.borrow_mut();
-            ls.model = model.to_string();
+            writer.set_model(model);
             // Explicit user commit of this model (Enter on the row): the
-            // agent loop's menu sync consumes this flag to decide whether a
-            // `ModelChange` entry may be appended to the session.
-            ls.model_commit = Some(model.to_string());
+            // loop's convergence step appends a `ModelChange` entry only for
+            // this id, and only when the applied config ends up running it.
+            writer.set_model_commit(model.to_string());
             Ok(())
         }),
-        recent,
+        Some(app.clone()),
     ).into());
     node
 }
@@ -346,7 +343,7 @@ mod tests {
         h.eval_prompt_resolved(prompt, key, 80)
     }
 
-    fn test_shared() -> Rc<crate::slash_menu_bridge::MenuShared> {
+    fn test_shared() -> SharedApp {
         let settings = crate::settings::SettingsStore {
             default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
             security_mode: "confirm".into(),
@@ -359,19 +356,18 @@ mod tests {
             llm_compact_prompt: String::new(),
             path: None,
         };
-        let shared = Rc::new(crate::slash_menu_bridge::MenuShared::new(settings, None));
-        shared.live_state.borrow_mut().model = "anthropic:claude-3-5-sonnet-20241022".into();
-        shared
+        let app = crate::app_state::AppShared::for_test(settings);
+        app.set_model("anthropic:claude-3-5-sonnet-20241022");
+        app
     }
 
-    fn test_model_node(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> ModelNode {
-        let ls = shared.live_state.clone();
-        let ls2 = shared.live_state.clone();
-        let recent = Some(shared.recent_models.clone());
+    fn test_model_node(shared: &SharedApp) -> ModelNode {
+        let reader = shared.clone();
+        let writer = shared.clone();
         ModelNode::new(
-            Box::new(move || ls.borrow().model.clone()),
-            Box::new(move |model| { ls2.borrow_mut().model = model.to_string(); Ok(()) }),
-            recent,
+            Box::new(move || reader.model()),
+            Box::new(move |model| { writer.set_model(model); Ok(()) }),
+            Some(shared.clone()),
         )
     }
 
@@ -478,11 +474,11 @@ mod tests {
             SubmitResult::Done(_) => {}
             _ => panic!("expected Done"),
         }
-        // Live state, not persistent settings.
-        assert_eq!(shared.live_state.borrow().model, "openai:gpt-4o");
+        // Runtime-target config, not persistent settings.
+        assert_eq!(shared.model(), "openai:gpt-4o");
     }
 
-    fn build_test_menu(shared: &Rc<crate::slash_menu_bridge::MenuShared>) -> crate::slashdot_menu::SlashDotMenu {
+    fn build_test_menu(shared: &SharedApp) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
@@ -529,9 +525,9 @@ mod tests {
                             "should drill into a model entry, got: {}", prompt);
                         match eval(&mut h, &prompt, crate::slashdot_menu::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
-                                let model = shared.live_state.borrow().model.clone();
+                                let model = shared.model();
                                 assert!(!model.is_empty(),
-                                    "live_state should have a model after submit");
+                                    "target config should have a model after submit");
                             }
                             other => panic!("expected DoneSuccess on model Enter, got {:?}", other),
                         }

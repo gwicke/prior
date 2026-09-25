@@ -1,18 +1,18 @@
 //! v2.5 `SlashDotNode` implementation for `/new`.
 //!
-//! Leaf node: submit() sets `AsyncOp::New` on `MenuShared` so the agent
-//! loop starts a fresh session.
+//! Leaf node: submit() writes the `new_session` control target on
+//! `AppShared`; the agent loop converges (fresh session) at the cycle point.
 
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::{AsyncOp, MenuShared};
+use crate::app_state::SharedApp;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct NewNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for NewNode {
@@ -39,7 +39,7 @@ impl SlashDotNode for NewNode {
 
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let name = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::New { name });
+        self.app.request_new(name);
         SubmitResult::Done(None)
     }
 }
@@ -53,34 +53,31 @@ mod tests {
     };
     use crate::slashdot_menu::HostKey;
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(
-            crate::settings::SettingsStore {
-                default_model: String::new(),
-                security_mode: String::new(),
-                tool_call_limit: 0,
-                default_persona: None,
-                default_thinking_level: String::new(),
-                show_reasoning: String::new(),
-                reasoning_in_context: false,
-                session_resume_replay_turns: 0,
-                llm_compact_prompt: String::new(),
-                path: None,
-            },
-            None,
-        ))
+    fn make_app() -> SharedApp {
+        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_thinking_level: String::new(),
+            show_reasoning: String::new(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            path: None,
+        })
     }
 
-    fn build_new_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_new_menu(app: &SharedApp) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(NewNode { shared: shared.clone() }.into());
+        root.add_child(NewNode { app: app.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn new_shows_in_listing() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+        let app = make_app();
+        let mut menu = build_new_menu(&app);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("", HostKey::None, 80);
         match result {
@@ -96,30 +93,24 @@ mod tests {
     }
 
     #[test]
-    fn new_submit_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+    fn new_submit_sets_new_session_target() {
+        let app = make_app();
+        let mut menu = build_new_menu(&app);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("new ", HostKey::None, 80);
         let _ = handle.eval_prompt("new ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::New { name }) => assert_eq!(name, ""),
-            other => panic!("expected New, got {:?}", other),
-        }
+        let taken = app.take_control();
+        assert_eq!(taken.new_session.as_deref(), Some(""));
     }
 
     #[test]
-    fn new_with_name_sets_pending_op() {
-        let shared = make_shared();
-        let mut menu = build_new_menu(&shared);
+    fn new_with_name_sets_new_session_target() {
+        let app = make_app();
+        let mut menu = build_new_menu(&app);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("new my-session ", HostKey::None, 80);
         let _ = handle.eval_prompt("new my-session ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::New { name }) => assert_eq!(name, "my-session"),
-            other => panic!("expected New with name, got {:?}", other),
-        }
+        let taken = app.take_control();
+        assert_eq!(taken.new_session.as_deref(), Some("my-session"));
     }
 }

@@ -4,14 +4,14 @@
 
 use std::rc::Rc;
 
-use crate::slash_menu_bridge::MenuShared;
+use crate::app_state::SharedApp;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
     SubmitResult,
 };
 
 pub struct StatNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for StatNode {
@@ -28,25 +28,24 @@ impl SlashDotNode for StatNode {
         _path_args: &PathArgs,
         _render_ctx: &RenderContext,
     ) -> Vec<String> {
-        let shared = &self.shared;
-        let ls = shared.live_state.borrow();
-        // Parse provider:model from LiveState.
-        let (provider, model) = if let Some((p, m)) = ls.model.split_once(':') {
+        // Read achieved state directly — direct accessor calls (no timing
+        // constraint; these fields are written by the loop between evals).
+        let model = self.app.model();
+        let (provider, model) = if let Some((p, m)) = model.split_once(':') {
             (p.to_string(), m.to_string())
         } else {
-            (String::new(), ls.model.clone())
+            (String::new(), model)
         };
-        drop(ls);
 
-        let usage = shared.session_usage.borrow().clone();
+        let usage = self.app.session_usage();
 
         let session_info = {
-            let session_id = shared.current_session_id.borrow();
+            let session_id = self.app.current_session_id();
             if session_id.is_empty() {
                 None
-            } else if let Some(ref repo) = shared.repo {
+            } else if let Some(repo) = self.app.repo() {
                 let all = repo.list_sessions_sync(None);
-                all.into_iter().find(|m| m.id == *session_id).map(|meta| {
+                all.into_iter().find(|m| m.id == session_id).map(|meta| {
                     let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
                     crate::agent::SessionStatsInfo {
                         display_name,
@@ -66,7 +65,7 @@ impl SlashDotNode for StatNode {
             &model,
             usage,
             session_info,
-            *shared.context_tokens.borrow(),
+            self.app.context_tokens(),
         )
     }
 
@@ -79,42 +78,40 @@ impl SlashDotNode for StatNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
+    use crate::app_state::SharedApp;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
         MenuResult, StaticListingNode,
     };
     use crate::slashdot_menu::HostKey;
+    use std::sync::Arc;
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(
-            crate::settings::SettingsStore {
-                default_model: String::new(),
-                security_mode: String::new(),
-                tool_call_limit: 0,
-                default_persona: None,
-                default_thinking_level: String::new(),
-                show_reasoning: String::new(),
-                reasoning_in_context: false,
-                session_resume_replay_turns: 0,
-                llm_compact_prompt: String::new(),
-                path: None,
-            },
-            None,
-        ))
+    fn make_app() -> SharedApp {
+        crate::app_state::AppShared::for_test(crate::settings::SettingsStore {
+            default_model: String::new(),
+            security_mode: String::new(),
+            tool_call_limit: 0,
+            default_persona: None,
+            default_thinking_level: String::new(),
+            show_reasoning: String::new(),
+            reasoning_in_context: false,
+            session_resume_replay_turns: 0,
+            llm_compact_prompt: String::new(),
+            path: None,
+        })
     }
 
-    fn build_stat_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_stat_menu(app: &SharedApp) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(StatNode { shared: shared.clone() }.into());
+        root.add_child(StatNode { app: app.clone() }.into());
         SlashDotMenu::from_root_node(root)
     }
 
     #[test]
     fn stat_shows_model_in_header() {
-        let shared = make_shared();
-        shared.live_state.borrow_mut().model = "openai:gpt-4o".to_string();
-        let mut menu = build_stat_menu(&shared);
+        let app = make_app();
+        app.set_model("openai:gpt-4o");
+        let mut menu = build_stat_menu(&app);
         let mut handle = menu.get_handle();
         // Drill into stat leaf (trailing space).
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
@@ -133,9 +130,9 @@ mod tests {
 
     #[test]
     fn stat_empty_session_shows_unavailable() {
-        let shared = make_shared();
-        shared.live_state.borrow_mut().model = "test:model".to_string();
-        let mut menu = build_stat_menu(&shared);
+        let app = make_app();
+        app.set_model("test:model");
+        let mut menu = build_stat_menu(&app);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
         match result {
@@ -154,10 +151,10 @@ mod tests {
 
     #[test]
     fn stat_header_shows_estimated_context_tokens() {
-        let shared = make_shared();
-        shared.live_state.borrow_mut().model = "openai:gpt-4o".to_string();
-        *shared.context_tokens.borrow_mut() = 42_000;
-        let mut menu = build_stat_menu(&shared);
+        let app = make_app();
+        app.set_model("openai:gpt-4o");
+        app.update_cycle_view(String::new(), Default::default(), 42_000, Arc::new(Vec::new()), None);
+        let mut menu = build_stat_menu(&app);
         let mut handle = menu.get_handle();
         let result = handle.eval_prompt("stat ", HostKey::None, 80);
         match result {
@@ -176,9 +173,9 @@ mod tests {
 
     #[test]
     fn stat_enter_clears() {
-        let shared = make_shared();
-        shared.live_state.borrow_mut().model = "test:model".to_string();
-        let mut menu = build_stat_menu(&shared);
+        let app = make_app();
+        app.set_model("test:model");
+        let mut menu = build_stat_menu(&app);
         let mut handle = menu.get_handle();
         // Drill into leaf first.
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
@@ -190,9 +187,9 @@ mod tests {
 
     #[test]
     fn stat_esc_goes_back() {
-        let shared = make_shared();
-        shared.live_state.borrow_mut().model = "test:model".to_string();
-        let mut menu = build_stat_menu(&shared);
+        let app = make_app();
+        app.set_model("test:model");
+        let mut menu = build_stat_menu(&app);
         let mut handle = menu.get_handle();
         let _ = handle.eval_prompt("stat ", HostKey::None, 80);
         let result = handle.eval_prompt_resolved("stat ", HostKey::Esc, 80);

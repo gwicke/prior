@@ -11,13 +11,14 @@
 //! `SandboxMappingNode` plays the `TreeListNode` dual role: at the
 //! `/sandbox` level it emits one row per merged binding (id = sandbox
 //! path); drilled into it shows `header()` + the single action child.
-//! Mutations go through `AsyncOp::Sandbox(SandboxOp)` — the agent loop
-//! owns `config`, so it performs the mutation + re-publish.
+//! Mutations go through the `sandbox` control target (`SandboxOp`) — the
+//! agent loop owns the applied `config`, so it performs the mutation +
+//! re-publish at the cycle point.
 
 use std::rc::Rc;
 
+use crate::app_state::{SharedApp, SandboxOp};
 use crate::config::BindMode;
-use crate::slash_menu_bridge::{AsyncOp, MenuShared, SandboxOp};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext,
@@ -129,13 +130,13 @@ impl SlashDotNode for SandboxMappingNode {
 }
 
 // ---------------------------------------------------------------------------
-// SandboxRemoveNode — action leaf (confirm → AsyncOp)
+// SandboxRemoveNode — action leaf (confirm → control target)
 // ---------------------------------------------------------------------------
 
 /// Action leaf: remove a session binding, exclude a config binding, or
 /// restore an excluded one. Two-phase confirm via `prepare()`.
 pub struct SandboxRemoveNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for SandboxRemoveNode {
@@ -200,7 +201,7 @@ impl SlashDotNode for SandboxRemoveNode {
         } else {
             SandboxOp::Exclude { sandbox_path }
         };
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Sandbox(op));
+        self.app.request_sandbox(op);
         SubmitResult::Done(None)
     }
 }
@@ -226,7 +227,7 @@ fn completable(word: &str) -> bool {
 /// with an L2 `Rc` cache keyed by (arg, word) that
 /// `path_complete::listing_stale` invalidates.
 pub struct AddSandboxMappingNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
     /// L2: (arg position, word) → rows. Same `Rc` on unchanged-word
     /// frames ⇒ `ptr_eq` skips the view re-derive; rebuilt when the
     /// word/arg changes or the L1 listing goes stale.
@@ -234,9 +235,9 @@ pub struct AddSandboxMappingNode {
 }
 
 impl AddSandboxMappingNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
+    pub fn new(app: SharedApp) -> Self {
         Self {
-            shared,
+            app,
             last_rows: None,
         }
     }
@@ -338,11 +339,11 @@ impl SlashDotNode for AddSandboxMappingNode {
         if let Err(e) = crate::path_util::resolve_canonical(raw[0]) {
             return SubmitResult::Error(e);
         }
-        *self.shared.pending_op.borrow_mut() = Some(AsyncOp::Sandbox(SandboxOp::Add {
+        self.app.request_sandbox(SandboxOp::Add {
             host_path: raw[0].to_string(),
             sandbox_path: raw.get(1).map(|s| s.to_string()).unwrap_or_default(),
             mode,
-        }));
+        });
         SubmitResult::Done(None)
     }
 }
@@ -358,7 +359,7 @@ impl SlashDotNode for AddSandboxMappingNode {
 /// it tops the default listing) and `SandboxMappingNode` are the
 /// children.
 pub fn build_sandbox_node(
-    shared: &Rc<MenuShared>,
+    shared: &SharedApp,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
@@ -380,7 +381,7 @@ pub fn build_sandbox_node(
 
     let mut map_node: SlashDotMenuNode = SandboxMappingNode.into();
     map_node.add_child(SandboxRemoveNode {
-        shared: shared.clone(),
+        app: shared.clone(),
     }
     .into());
     listing.add_child(map_node);
@@ -415,14 +416,21 @@ mod tests {
         }
     }
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(test_settings(), None))
+    /// Returns an `AppShared` (binding kept as `shared` in tests below).
+    fn make_shared() -> SharedApp {
+        crate::app_state::AppShared::for_test(test_settings())
     }
 
-    fn sandbox_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn sandbox_menu(shared: &SharedApp) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_sandbox_node(shared));
         SlashDotMenu::from_root_node(root)
+    }
+
+    /// Drain the sandbox control target (sole-consumer GC — `take_control`
+    /// clears it, so no explicit reset is needed between assertions).
+    fn take_sandbox_op(shared: &SharedApp) -> Option<SandboxOp> {
+        shared.take_control().sandbox
     }
 
     /// Reset the process-global sandbox state (session binds,
@@ -565,7 +573,7 @@ mod tests {
 
         let shared = make_shared();
         let mut node = SandboxRemoveNode {
-            shared: shared.clone(),
+            app: shared.clone(),
         };
         let pa = |path: &str| PathArgs {
             ids: vec!["sandbox".into(), path.to_string(), "remove".into()],
@@ -580,10 +588,9 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Remove { sandbox_path })) if sandbox_path == &host_s
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Remove { sandbox_path }) if sandbox_path == host_s
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Active config bind → Exclude.
         assert!(matches!(
@@ -591,10 +598,9 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Exclude { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Excluded config bind → Restore.
         crate::sandbox_state::exclude("/cfg-ro").unwrap();
@@ -603,10 +609,9 @@ mod tests {
             SubmitResult::Done(None)
         ));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Restore { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Restore { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Unknown binding → stay-open error.
         match node.submit(1, &pa("/no/such/binding")) {
@@ -636,7 +641,7 @@ mod tests {
         ));
         assert_eq!(prompt, "sandbox /cfg-ro remove ", "{prompt:?}");
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&shared).is_none(),
             "first Enter must only arm the confirm"
         );
         let (plan, _) = expect_continue(h.eval_prompt(&prompt, HostKey::None, 100));
@@ -654,8 +659,8 @@ mod tests {
             result
         );
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Exclude { sandbox_path })) if sandbox_path == "/cfg-ro"
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
     }
 
@@ -722,7 +727,7 @@ mod tests {
             _other => panic!("expected Error for missing host"),
         }
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&shared).is_none(),
             "no op may be queued on validation failure"
         );
 
@@ -733,11 +738,10 @@ mod tests {
         let (pa, _) = mk("rw", &suffix);
         assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path.is_empty() && *mode == BindMode::Rw
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path.is_empty() && mode == BindMode::Rw
         ));
-        *shared.pending_op.borrow_mut() = None;
 
         // Two args → both carried through.
         let dst = "/some/sandbox/dst".to_string();
@@ -745,9 +749,9 @@ mod tests {
         let (pa, _) = mk("ro", &suffix);
         assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path == &dst && *mode == BindMode::Ro
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));
     }
 
@@ -770,7 +774,7 @@ mod tests {
         assert!(detail[1].contains("Specify host path"), "{detail:?}");
         assert!(detail[2].contains("Mode: ro"), "{detail:?}");
         assert!(
-            shared.pending_op.borrow().is_none(),
+            take_sandbox_op(&shared).is_none(),
             "drill arrival must not queue an op"
         );
     }
@@ -893,9 +897,9 @@ mod tests {
             result
         );
         assert!(matches!(
-            shared.pending_op.borrow().as_ref(),
-            Some(AsyncOp::Sandbox(SandboxOp::Add { host_path, sandbox_path, mode })) if
-                host_path == &host_s && sandbox_path == &dst && *mode == BindMode::Ro
+            take_sandbox_op(&shared),
+            Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
+                host_path == host_s && sandbox_path == dst && mode == BindMode::Ro
         ));
     }
 }

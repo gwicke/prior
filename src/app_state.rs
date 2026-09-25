@@ -358,6 +358,17 @@ impl AppShared {
         self.state.lock().leaf_id.clone()
     }
 
+    /// Single-field tree write (incremental updates; the loop's per-cycle
+    /// write goes through [`update_cycle_view`] for atomicity).
+    pub fn set_raw_tree(&self, tree: Arc<Vec<SessionTreeNode>>) {
+        self.state.lock().raw_tree = tree;
+    }
+
+    /// Single-field leaf write (same caveat as [`set_raw_tree`]).
+    pub fn set_leaf_id(&self, leaf_id: Option<String>) {
+        self.state.lock().leaf_id = leaf_id;
+    }
+
     pub fn session_usage(&self) -> SessionUsage {
         self.state.lock().session_usage
     }

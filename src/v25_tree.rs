@@ -5,12 +5,13 @@
 //! body and the static action children (switch, compact) are shown.
 //!
 //! `TreeSwitchNode`: leaf node that moves the session leaf pointer to
-//! the selected entry via `AsyncOp::TreeSwitch`.
+//! the selected entry via the `tree_switch` control target.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::slash_menu_bridge::{AsyncOp, CompactMode, MenuShared};
+use crate::app_state::{CompactMode, SharedApp};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
@@ -561,19 +562,19 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
 /// `header()` renders the full message body and the static action children
 /// are shown.
 pub struct TreeListNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
     /// Cached data response — reused via Rc::ptr_eq when the tree hasn't
     /// changed.
     cached_data: Option<Rc<DataResponse>>,
-    /// The Rc we last built rows from (for freshness check).
-    cached_tree_rc: Option<Rc<Vec<SessionTreeNode>>>,
+    /// The Arc we last built rows from (for freshness check).
+    cached_tree_rc: Option<Arc<Vec<SessionTreeNode>>>,
     cached_leaf_id: Option<String>,
 }
 
 impl TreeListNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
+    pub fn new(app: SharedApp) -> Self {
         Self {
-            shared,
+            app,
             cached_data: None,
             cached_tree_rc: None,
             cached_leaf_id: None,
@@ -589,15 +590,15 @@ impl TreeListNode {
 
 impl SlashDotNode for TreeListNode {
     fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
-        // Read the shared tree (Rc — O(1) clone, no deep copy).
-        let tree_rc = self.shared.raw_tree.borrow().clone();
-        let leaf = self.shared.leaf_id.borrow().clone();
+        // Read the shared tree (Arc — O(1) clone, no deep copy).
+        let tree_rc = self.app.raw_tree();
+        let leaf = self.app.leaf_id();
 
-        // Freshness check: same Rc pointer + same leaf = cached data is valid.
+        // Freshness check: same Arc pointer + same leaf = cached data is valid.
         let same_tree = self
             .cached_tree_rc
             .as_ref()
-            .map_or(false, |old| Rc::ptr_eq(old, &tree_rc));
+            .map_or(false, |old| Arc::ptr_eq(old, &tree_rc));
         let same_leaf = self.cached_leaf_id == leaf;
 
         if same_tree && same_leaf {
@@ -736,7 +737,7 @@ impl SlashDotNode for TreeListNode {
 
 /// Leaf node: moves the session leaf pointer to the selected entry.
 pub struct TreeSwitchNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for TreeSwitchNode {
@@ -771,8 +772,7 @@ impl SlashDotNode for TreeSwitchNode {
                 String::new()
             }
         };
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeSwitch { target_id });
+        self.app.request_tree_switch(target_id);
         SubmitResult::Done(None)
     }
 }
@@ -785,7 +785,7 @@ impl SlashDotNode for TreeSwitchNode {
 /// session leaf (message ID) and redirects to `/tree <id> compact `
 /// so the compact modes are listed.
 pub struct CompactNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl SlashDotNode for CompactNode {
@@ -809,13 +809,13 @@ impl SlashDotNode for CompactNode {
 
     fn drill_rewrite(&mut self, _path_args: &PathArgs) -> Option<String> {
         // Look up the current session leaf ID and redirect.
-        let leaf_id = self.shared.leaf_id.borrow().clone()?;
+        let leaf_id = self.app.leaf_id()?;
         Some(format!("tree {} compact ", leaf_id))
     }
 
     fn submit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
         // Enter (without drill) should also redirect — treat as drill.
-        match self.shared.leaf_id.borrow().clone() {
+        match self.app.leaf_id() {
             Some(leaf_id) => SubmitResult::NewPath(format!("tree {} compact ", leaf_id)),
             None => SubmitResult::Done(Some("No active session leaf to compact.".to_string())),
         }
@@ -827,16 +827,16 @@ impl SlashDotNode for CompactNode {
 // ---------------------------------------------------------------------------
 
 /// Leaf node: compact with manual (touched-files) mode.
-/// `prepare()` opens $EDITOR with a template; `submit()` dispatches
-/// `AsyncOp::TreeCompact { mode: Manual }`.
+/// `prepare()` opens $EDITOR with a template; `submit()` writes the
+/// `tree_compact` control target (`mode: Manual`).
 pub struct TreeCompactManualNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactManualNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared, edited: std::cell::RefCell::new(None) }
+    pub fn new(app: SharedApp) -> Self {
+        Self { app, edited: std::cell::RefCell::new(None) }
     }
 }
 
@@ -867,8 +867,7 @@ impl SlashDotNode for TreeCompactManualNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Manual, payload: draft });
+        self.app.request_tree_compact(target_id, CompactMode::Manual, draft);
         SubmitResult::Done(None)
     }
 }
@@ -879,15 +878,15 @@ impl SlashDotNode for TreeCompactManualNode {
 
 /// Leaf node: compact with text-only mode.
 /// `prepare()` opens $EDITOR with extracted conversation text; `submit()`
-/// dispatches `AsyncOp::TreeCompact { mode: TextOnly }`.
+/// writes the `tree_compact` control target (`mode: TextOnly`).
 pub struct TreeCompactTextNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
     edited: std::cell::RefCell<Option<String>>,
 }
 
 impl TreeCompactTextNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared, edited: std::cell::RefCell::new(None) }
+    pub fn new(app: SharedApp) -> Self {
+        Self { app, edited: std::cell::RefCell::new(None) }
     }
 }
 
@@ -913,8 +912,7 @@ impl SlashDotNode for TreeCompactTextNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::TextOnly, payload: draft });
+        self.app.request_tree_compact(target_id, CompactMode::TextOnly, draft);
         SubmitResult::Done(None)
     }
 }
@@ -925,15 +923,15 @@ impl SlashDotNode for TreeCompactTextNode {
 
 /// Leaf node: compact with LLM prompt mode.
 /// `submit()` reads the custom prompt from `path_args.suffix` and
-/// dispatches `AsyncOp::TreeCompact { mode: Prompt, payload: suffix }`.
-/// The LLM call happens in the agent loop handler.
+/// writes the `tree_compact` control target (`mode: Prompt`).
+/// The LLM call happens in the agent loop's applier.
 pub struct TreeCompactPromptNode {
-    pub shared: Rc<MenuShared>,
+    pub app: SharedApp,
 }
 
 impl TreeCompactPromptNode {
-    pub fn new(shared: Rc<MenuShared>) -> Self {
-        Self { shared }
+    pub fn new(app: SharedApp) -> Self {
+        Self { app }
     }
 }
 
@@ -969,8 +967,7 @@ impl SlashDotNode for TreeCompactPromptNode {
     fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let target_id = extract_target_id(path_args);
         let prompt = path_args.suffix.trim().to_string();
-        *self.shared.pending_op.borrow_mut() =
-            Some(AsyncOp::TreeCompact { target_id, mode: CompactMode::Prompt, payload: prompt });
+        self.app.request_tree_compact(target_id, CompactMode::Prompt, prompt);
         SubmitResult::Done(None)
     }
 }
@@ -997,7 +994,7 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
 pub fn build_tree_node(
-    shared: &Rc<MenuShared>,
+    shared: &SharedApp,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
     use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
@@ -1013,7 +1010,7 @@ pub fn build_tree_node(
     let mut tree_node: SlashDotMenuNode =
         TreeListNode::new(shared.clone()).into();
     tree_node.add_child(TreeSwitchNode {
-        shared: shared.clone(),
+        app: shared.clone(),
     }
     .into());
 
@@ -1040,7 +1037,6 @@ pub fn build_tree_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slash_menu_bridge::MenuShared;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{
         MenuResult, PathArgs, StaticListingNode,
@@ -1063,8 +1059,9 @@ mod tests {
         }
     }
 
-    fn make_shared() -> Rc<MenuShared> {
-        Rc::new(MenuShared::new(test_settings(), None))
+    /// Fresh app state for tests (binding kept as `shared` in tests below).
+    fn make_shared() -> SharedApp {
+        crate::app_state::AppShared::for_test(test_settings())
     }
 
     fn make_entry(id: &str, parent: Option<&str>, role: &str, text: &str) -> SessionEntry {
@@ -1089,14 +1086,14 @@ mod tests {
         }
     }
 
-    /// Build a shared with a pre-populated tree.
-    fn shared_with_tree(tree: Vec<SessionTreeNode>) -> Rc<MenuShared> {
+    /// Build app state with a pre-populated tree.
+    fn shared_with_tree(tree: Vec<SessionTreeNode>) -> SharedApp {
         let shared = make_shared();
-        *shared.raw_tree.borrow_mut() = Rc::new(tree);
+        shared.set_raw_tree(Arc::new(tree));
         shared
     }
 
-    fn build_tree_menu(shared: &Rc<MenuShared>) -> SlashDotMenu {
+    fn build_tree_menu(shared: &SharedApp) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_tree_node(shared));
         SlashDotMenu::from_root_node(root)
@@ -1257,7 +1254,7 @@ mod tests {
             node(make_entry("u1", None, "user", "test"), vec![]),
             node(make_entry("u2", None, "user", "new entry"), vec![]),
         ];
-        *shared.raw_tree.borrow_mut() = Rc::new(new_tree);
+        shared.set_raw_tree(Arc::new(new_tree));
 
         let r2 = tree_node.data(1, &path_args).unwrap();
         assert!(!Rc::ptr_eq(&r1, &r2),
@@ -1430,9 +1427,9 @@ mod tests {
     // --- Switch ---
 
     #[test]
-    fn tree_switch_submit_sets_async_op() {
+    fn tree_switch_submit_sets_control_target() {
         let shared = make_shared();
-        let mut tree_node = TreeSwitchNode { shared: shared.clone() };
+        let mut tree_node = TreeSwitchNode { app: shared.clone() };
         // Action node path: ["tree", "<entry-id>", "switch"]
         let path_args = PathArgs {
             ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
@@ -1440,13 +1437,8 @@ mod tests {
             args: Default::default(),
         };
         let _ = tree_node.submit(1, &path_args);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeSwitch { target_id }) => {
-                assert_eq!(target_id, "some-entry");
-            }
-            other => panic!("expected TreeSwitch, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        assert_eq!(taken.tree_switch.as_deref(), Some("some-entry"));
     }
 
     // --- Full traversal ---
@@ -1485,13 +1477,12 @@ mod tests {
 
         // 4. Enter → submit.
         let _ = handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeSwitch { target_id }) => {
-                assert_eq!(target_id, "u1", "switch op must carry the entry ID");
-            }
-            other => panic!("expected TreeSwitch, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        assert_eq!(
+            taken.tree_switch.as_deref(),
+            Some("u1"),
+            "switch target must carry the entry ID"
+        );
     }
 
     // --- Label rendering ---
@@ -1566,7 +1557,7 @@ mod tests {
             node(make_entry("u2", None, "user", "second"), vec![]),
         ];
         let shared = shared_with_tree(tree);
-        *shared.leaf_id.borrow_mut() = Some("u2".into());
+        shared.set_leaf_id(Some("u2".into()));
         let mut tree_node = TreeListNode::new(shared);
         let path_args = PathArgs {
             ids: vec![],
@@ -1594,7 +1585,7 @@ mod tests {
             )],
         )];
         let shared = shared_with_tree(tree);
-        *shared.leaf_id.borrow_mut() = Some("u2".into());
+        shared.set_leaf_id(Some("u2".into()));
         let mut tree_node = TreeListNode::new(shared);
         let path_args = PathArgs {
             ids: vec![],
@@ -1619,15 +1610,11 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Manual);
-                assert!(payload.is_empty(), "manual draft is empty by default");
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        let c = taken.tree_compact.as_ref().expect("tree_compact target");
+        assert_eq!(c.target_id, "u1");
+        assert_eq!(c.mode, CompactMode::Manual);
+        assert!(c.payload.is_empty(), "manual draft is empty by default");
     }
 
     #[test]
@@ -1641,15 +1628,11 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::TextOnly);
-                assert!(payload.is_empty());
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        let c = taken.tree_compact.as_ref().expect("tree_compact target");
+        assert_eq!(c.target_id, "u1");
+        assert_eq!(c.mode, CompactMode::TextOnly);
+        assert!(c.payload.is_empty());
     }
 
     #[test]
@@ -1663,15 +1646,11 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, payload }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Prompt);
-                assert_eq!(payload, "summarize the key decisions");
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        let c = taken.tree_compact.as_ref().expect("tree_compact target");
+        assert_eq!(c.target_id, "u1");
+        assert_eq!(c.mode, CompactMode::Prompt);
+        assert_eq!(c.payload, "summarize the key decisions");
     }
 
     #[test]
@@ -1685,14 +1664,10 @@ mod tests {
         };
         let result = node.submit(1, &path_args);
         assert!(matches!(result, SubmitResult::Done(None)));
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { payload, mode, .. }) => {
-                assert_eq!(*mode, CompactMode::Prompt);
-                assert!(payload.is_empty(), "empty suffix = empty payload");
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        let c = taken.tree_compact.as_ref().expect("tree_compact target");
+        assert_eq!(c.mode, CompactMode::Prompt);
+        assert!(c.payload.is_empty(), "empty suffix = empty payload");
     }
 
     // --- Compact: full traversal ---
@@ -1730,14 +1705,10 @@ mod tests {
 
         // 5. Enter → submit.
         let _ = handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80);
-        let op = shared.pending_op.borrow();
-        match op.as_ref() {
-            Some(AsyncOp::TreeCompact { target_id, mode, .. }) => {
-                assert_eq!(target_id, "u1");
-                assert_eq!(*mode, CompactMode::Manual);
-            }
-            other => panic!("expected TreeCompact, got {:?}", other),
-        }
+        let taken = shared.take_control();
+        let c = taken.tree_compact.as_ref().expect("tree_compact target");
+        assert_eq!(c.target_id, "u1");
+        assert_eq!(c.mode, CompactMode::Manual);
     }
 
     // --- Compact: header tests ---
@@ -2261,8 +2232,8 @@ mod tests {
     #[test]
     fn compact_node_drill_rewrite_redirects_to_tree() {
         let shared = make_shared();
-        *shared.leaf_id.borrow_mut() = Some("msg-42".into());
-        let mut node = CompactNode { shared: shared.clone() };
+        shared.set_leaf_id(Some("msg-42".into()));
+        let mut node = CompactNode { app: shared.clone() };
         let path = vec!["compact".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
@@ -2272,7 +2243,7 @@ mod tests {
     fn compact_node_no_leaf_returns_none() {
         let shared = make_shared();
         // leaf_id is None (no session).
-        let mut node = CompactNode { shared: shared.clone() };
+        let mut node = CompactNode { app: shared.clone() };
         let path = vec!["compact".to_string()];
         let result = node.drill_rewrite(&PathArgs::new(path, " "));
         assert_eq!(result, None);
