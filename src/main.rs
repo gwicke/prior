@@ -256,7 +256,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
-    let reasoning_in_context = config.reasoning_in_context.unwrap_or(false);
+    let reasoning_in_context = config
+        .reasoning_in_context
+        .unwrap_or_default();
     let output: Arc<dyn picocode::Output> = if quiet {
         Arc::new(picocode::QuietOutput::new(show_reasoning_handle.clone()))
     } else {

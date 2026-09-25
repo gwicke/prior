@@ -26,7 +26,7 @@ use rig_agent::completion::{Chat, CompletionError, PromptError};
 use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig_agent::tool::ToolContext;
 use rig_core::client::CompletionClient;
-use rig_core::message::{AssistantContent, Message, ReasoningContent, Text, ToolResultContent, UserContent};
+use rig_core::message::{AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolResultContent, UserContent};
 use futures::StreamExt;
 use rig_core::providers::{
     anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamacpp, mira,
@@ -286,6 +286,7 @@ impl PicoAgent for CodeAgent {
             .await;
 
         let mut output = String::new();
+        let mut reasoning_buffer = String::new(); // Accumulate reasoning for aborted/errored turns
         let mut final_history: Option<Vec<Message>> = None;
         // Captured when the run is cancelled via `<Esc>`; rig's error carries the
         // in-flight *full* history (prior turns + this turn's user prompt + any
@@ -318,11 +319,13 @@ impl PicoAgent for CodeAgent {
                             StreamedAssistantContent::Reasoning { reasoning, .. } => {
                                 let t = reasoning_text(&reasoning);
                                 if !t.is_empty() {
+                                    reasoning_buffer.push_str(&t); // Accumulate for partial persistence
                                     self.output.stream_thinking(&t);
                                 }
                             }
                             StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
                                 if !reasoning.is_empty() {
+                                    reasoning_buffer.push_str(&reasoning); // Accumulate for partial persistence
                                     self.output.stream_thinking(&reasoning);
                                 }
                             }
@@ -385,12 +388,14 @@ impl PicoAgent for CodeAgent {
                             // make the next LLM call fail with "assistant message with
                             // 'tool_calls' must be followed by tool messages".
                             //
-                            // Instead, persist only the user prompt and any partial
-                            // assistant TEXT that was streamed before the cancellation.
-                            // Tool calls are not accumulated in `output` (they arrive
-                            // as separate stream events), so the partial assistant
-                            // message is guaranteed to be text-only — safe for the
-                            // next turn's context.
+                            // Instead, persist the user prompt and any partial
+                            // assistant content (text + reasoning) that was streamed
+                            // before the cancellation. Tool calls are not accumulated
+                            // in `output` (they arrive as separate stream events), so
+                            // the partial assistant message is safe for the next turn's
+                            // context. When reasoning is enabled, include it so the
+                            // model can resume its train of thought on a steering
+                            // message (controlled by `reasoning_in_context` mode).
                             if let StreamingError::Prompt(prompt_err) = &e {
                                 if let PromptError::PromptCancelled { .. } = prompt_err.as_ref() {
                                     // Cancelled mid-run (Esc or a hook Stop).
@@ -398,7 +403,7 @@ impl PicoAgent for CodeAgent {
                                     // completed: the finalized transcript
                                     // (accepted turns + completed tool batches
                                     // + synthesized answers for interrupted
-                                    // calls), or the streamed text when no
+                                    // calls), or the streamed content when no
                                     // turn completed yet. The leading
                                     // `user(input)` is included only if this
                                     // turn's fresh dispatch isn't already in
@@ -422,8 +427,16 @@ impl PicoAgent for CodeAgent {
                                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                                         if t.has_progress() {
                                             partial.extend(t.finalize());
-                                        } else if !output.is_empty() {
-                                            partial.push(Message::assistant(&output));
+                                        } else if !output.is_empty() || !reasoning_buffer.is_empty() {
+                                            let mut content = Vec::new();
+                                            if !output.is_empty() {
+                                                content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
+                                            }
+                                            if !reasoning_buffer.is_empty() {
+                                                let reasoning_text = std::mem::take(&mut reasoning_buffer);
+                                                content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
+                                            }
+                                            partial.push(Message::Assistant { id: None, content }); // id:None marks aborted turn
                                         }
                                     }
                                     cancelled_history = Some(partial);
@@ -535,9 +548,17 @@ impl PicoAgent for CodeAgent {
                                         for m in &transcript_msgs {
                                             let _ = s.append_message(m).await;
                                         }
-                                    } else if !output.is_empty() {
+                                    } else if !output.is_empty() || !reasoning_buffer.is_empty() {
+                                        let mut content = Vec::new();
+                                        if !output.is_empty() {
+                                            content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
+                                        }
+                                        if !reasoning_buffer.is_empty() {
+                                            let reasoning_text = std::mem::take(&mut reasoning_buffer);
+                                            content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
+                                        }
                                         let _ = s
-                                            .append_message(&Message::assistant(&output))
+                                            .append_message(&Message::Assistant { id: None, content })
                                             .await;
                                     }
                                 }
@@ -567,7 +588,7 @@ impl PicoAgent for CodeAgent {
                         // killed by the watchdog (Phase 1a-d tool-cancel channel).
                         //
                         // Capture partial turn for persistence: user prompt +
-                        // finalized transcript (or streamed text when no
+                        // finalized transcript (or streamed text + reasoning when no
                         // turn completed).
                         let mut partial = vec![Message::user(input)];
                         {
@@ -576,8 +597,16 @@ impl PicoAgent for CodeAgent {
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if t.has_progress() {
                                 partial.extend(t.finalize());
-                            } else if !output.is_empty() {
-                                partial.push(Message::assistant(&output));
+                            } else if !output.is_empty() || !reasoning_buffer.is_empty() {
+                                let mut content = Vec::new();
+                                if !output.is_empty() {
+                                    content.push(AssistantContent::Text(Text::new(std::mem::take(&mut output))));
+                                }
+                                if !reasoning_buffer.is_empty() {
+                                    let reasoning_text = std::mem::take(&mut reasoning_buffer);
+                                    content.push(AssistantContent::Reasoning(Reasoning::new(&reasoning_text)));
+                                }
+                                partial.push(Message::Assistant { id: None, content }); // id:None marks aborted turn
                             }
                         }
                         cancelled_history = Some(partial);
@@ -1087,16 +1116,20 @@ fn assistant_content_is_visible(content: &[AssistantContent]) -> bool {
 /// Flatten a rig `Reasoning` payload into plain text. Provider-specific
 /// encrypted/redacted blocks are kept verbatim; other shapes are ignored.
 fn reasoning_text(r: &rig_core::message::Reasoning) -> String {
-    r.content
-        .iter()
-        .map(|c| match c {
-            ReasoningContent::Text { text, .. } => text.clone(),
-            ReasoningContent::Summary(s) => s.clone(),
-            ReasoningContent::Encrypted(s) => s.clone(),
-            ReasoningContent::Redacted { data } => data.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut result = String::new();
+    for c in &r.content {
+        let s = match c {
+            ReasoningContent::Text { text, .. } => text.as_str(),
+            ReasoningContent::Summary(s) => s.as_str(),
+            ReasoningContent::Encrypted(s) => s.as_str(),
+            ReasoningContent::Redacted { data } => data.as_str(),
+        };
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(s);
+    }
+    result
 }
 
 /// Render `edit` tool-call arguments in the model-facing block form.
@@ -1166,7 +1199,7 @@ fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
         history: &mut Option<&mut Vec<Message>>,
         final_history: Option<Vec<Message>>,
         cancelled_history: Option<Vec<Message>>,
-        reasoning_in_context: bool,
+        reasoning_in_context: crate::settings::ReasoningInContextMode,
         provider: &str,
         model: &str,
     ) {
@@ -1183,30 +1216,44 @@ fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
         }
     }
 
-    /// Strip `AssistantContent::Reasoning` blocks when reasoning should *not* be
-    /// kept in context. Returns the messages unchanged when `reasoning_in_context`
-    /// is `true` or the provider is Anthropic-family **and the turn contains tool
-    /// calls** (the thinking+tool_use replay contract). Assistant messages left
-    /// empty by the filter get a placeholder `Text` so the message stays
-    /// well-formed and user/assistant alternation holds.
+    /// Strip `AssistantContent::Reasoning` blocks based on the
+    /// `ReasoningInContextMode`. Returns messages unchanged when:
+    /// - Mode is `Always`
+    /// - Provider is Anthropic-family **and** the turn contains tool calls
+    ///   (the thinking+tool_use replay contract)
+    ///
+    /// When mode is `AbortedTurnsOnly`, reasoning is preserved for assistant
+    /// messages with `id: None` (aborted/errored turns created locally without
+    /// a provider responseId), but stripped from successful turns.
+    ///
+    /// Assistant messages left empty by the filter get a placeholder `Text` so
+    /// the message stays well-formed and user/assistant alternation holds.
     fn maybe_strip_reasoning(
         messages: Vec<Message>,
-        reasoning_in_context: bool,
+        reasoning_in_context: crate::settings::ReasoningInContextMode,
         provider: &str,
         model: &str,
     ) -> Vec<Message> {
-        if reasoning_in_context
-            || (is_anthropic_family(provider, model) && turn_has_tool_calls(&messages))
-        {
+        let keep_all = matches!(reasoning_in_context, crate::settings::ReasoningInContextMode::Always)
+            || (is_anthropic_family(provider, model) && turn_has_tool_calls(&messages));
+        if keep_all {
             return messages;
         }
+        let keep_aborted = matches!(reasoning_in_context, crate::settings::ReasoningInContextMode::AbortedTurnsOnly);
         messages
             .into_iter()
             .map(|m| match m {
                 Message::Assistant { id, content } => {
+                    let is_aborted = id.is_none(); // No provider responseId = aborted/errored turn
                     let kept: Vec<AssistantContent> = content
                         .into_iter()
-                        .filter(|c| !matches!(c, AssistantContent::Reasoning(_)))
+                        .filter(|c| {
+                            if keep_aborted && is_aborted && matches!(c, AssistantContent::Reasoning(_)) {
+                                true // Preserve reasoning for aborted turns
+                            } else {
+                                !matches!(c, AssistantContent::Reasoning(_))
+                            }
+                        })
                         .collect();
                     let content = if kept.is_empty() {
                         vec![AssistantContent::Text(Text::new("[reasoning stripped]"))]
@@ -1265,7 +1312,7 @@ pub struct CodeAgent {
     /// instead of polling with a sleep.
     cancel_notify: Arc<tokio::sync::Notify>,
     thinking_level: Option<String>,
-    reasoning_in_context: bool,
+    reasoning_in_context: crate::settings::ReasoningInContextMode,
     /// Optional path to JSONL file for logging raw messages sent/received.
     /// Passed as `Some(Arc<MessageLogger>)` to `LoggingHook` if set.
     message_logger: Option<Arc<MessageLogger>>,
@@ -1308,10 +1355,9 @@ pub struct AgentConfig {
     /// holds a clone and reads it on every thinking event, so `/set
     /// show_reasoning …` updates the rendering immediately (no agent rebuild).
     pub show_reasoning_handle: crate::settings::ShowReasoningHandle,
-    /// Whether reasoning blocks are kept in the stored session context. `false`
-    /// drops them at store time (cheap token savings); forced `true` for
-    /// Anthropic-family providers (thinking+tool_use replay contract).
-    pub reasoning_in_context: bool,
+    /// How reasoning blocks are kept in the LLM context. Default `Never`.
+    /// Forced `Always` for Anthropic-family providers (thinking+tool_use replay contract).
+    pub reasoning_in_context: crate::settings::ReasoningInContextMode,
     /// Optional path to JSONL file for logging raw messages sent/received.
     /// When Some, messages are appended to this file in JSONL format.
     pub message_log_path: Option<String>,
@@ -1672,7 +1718,7 @@ struct LoggingHook {
     output: Arc<dyn Output>,
     user_cancel: Arc<AtomicBool>,
     message_logger: Option<Arc<MessageLogger>>,
-    reasoning_in_context: bool,
+    reasoning_in_context: crate::settings::ReasoningInContextMode,
     provider: String,
     model: String,
     /// Run-scoped canonical transcript accumulator; see [`TurnTranscript`].
@@ -2984,7 +3030,7 @@ fn build_summary_prompt(entries: &[crate::session::SessionEntry]) -> String {
 /// would silently drop the whole conversation.
 async fn session_context_messages(
     session: &Session,
-    reasoning_in_context: bool,
+    reasoning_in_context: crate::settings::ReasoningInContextMode,
     provider: &str,
     model: &str,
 ) -> crate::Result<Vec<Message>> {
@@ -5039,7 +5085,7 @@ impl CodeAgent {
         user_cancel: Arc<AtomicBool>,
         cancel_notify: Arc<tokio::sync::Notify>,
         thinking_level: Option<String>,
-        reasoning_in_context: bool,
+        reasoning_in_context: crate::settings::ReasoningInContextMode,
         message_logger: Option<Arc<MessageLogger>>,
     ) -> Self {
         Self {
@@ -6003,7 +6049,7 @@ mod tests {
             default_persona: None,
             default_thinking_level: "off".into(),
             show_reasoning: "indicator".into(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::from("default prompt"),
             path: None,
@@ -6610,7 +6656,7 @@ mod tests {
                 output: Arc::new(crate::NoOutput),
                 user_cancel: Arc::new(AtomicBool::new(false)),
                 message_logger: Some(logger.clone()),
-                reasoning_in_context: false,
+                reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
                 transcript: Arc::new(std::sync::Mutex::new(super::TurnTranscript::default())),
@@ -6688,7 +6734,7 @@ mod tests {
                 Message::assistant("turn-2-reply"),
             ]),
             None,
-            true,
+            crate::settings::ReasoningInContextMode::Always,
             "openai",
             "",
         );
@@ -6719,7 +6765,8 @@ mod tests {
             Message::user("aborted-prompt"),
             Message::assistant("aborted-partial"),
         ];
-        persist_turn(&mut Some(&mut hist), None, Some(cancelled), true, "openai", "");
+        use crate::settings::ReasoningInContextMode;
+        persist_turn(&mut Some(&mut hist), None, Some(cancelled), ReasoningInContextMode::Always, "openai", "");
 
         // Replaced (not appended): exactly the in-flight full history, with no
         // duplicate of `prior-1`.
@@ -6732,13 +6779,14 @@ mod tests {
         assert!(hist.contains(&Message::assistant("aborted-partial")));
     }
 
-    // `reasoning_in_context=false` must drop reasoning blocks from assistant
+    // `reasoning_in_context=Never` must drop reasoning blocks from assistant
     // messages for non-Anthropic providers, while keeping text (and keeping
     // reasoning entirely for Anthropic-family turns that involve tool calls, or
-    // when the flag is true). On an Anthropic turn *without* tool calls, the
-    // flag is honored and reasoning is stripped.
+    // when the mode is Always). On an Anthropic turn *without* tool calls, the
+    // mode is honored and reasoning is stripped.
     #[test]
-    fn strips_reasoning_for_non_anthropic_when_disabled() {
+    fn strips_reasoning_for_non_anthropic_when_never() {
+        use crate::settings::ReasoningInContextMode;
         let assistant = Message::Assistant {
             id: None,
             content: vec![
@@ -6748,8 +6796,8 @@ mod tests {
         };
         let msgs = vec![Message::user("q"), assistant];
 
-        // Disabled + non-Anthropic: reasoning dropped, text preserved.
-        let out = maybe_strip_reasoning(msgs.clone(), false, "openai", "");
+        // Never + non-Anthropic: reasoning dropped, text preserved.
+        let out = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Never, "openai", "");
         if let Message::Assistant { content, .. } = &out[1] {
             assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
             assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
@@ -6757,22 +6805,65 @@ mod tests {
             panic!("expected assistant message");
         }
 
-        // Enabled: reasoning kept.
-        let kept = maybe_strip_reasoning(msgs.clone(), true, "openai", "");
+        // Always: reasoning kept.
+        let kept = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Always, "openai", "");
         if let Message::Assistant { content, .. } = &kept[1] {
             assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
         } else {
             panic!("expected assistant message");
         }
 
-        // Anthropic-family WITHOUT tool calls: flag honored, reasoning stripped.
-        let stripped = maybe_strip_reasoning(msgs.clone(), false, "anthropic", "claude-3-5-sonnet");
+        // Anthropic-family WITHOUT tool calls: mode honored, reasoning stripped.
+        let stripped = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Never, "anthropic", "claude-3-5-sonnet");
         if let Message::Assistant { content, .. } = &stripped[1] {
             assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
             assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
         } else {
             panic!("expected assistant message");
         }
+    }
+
+    /// Test AbortedTurnsOnly mode: preserves reasoning for aborted turns (id: None)
+    /// but strips from successful turns (id: Some).
+    #[test]
+    fn aborted_turns_only_preserves_reasoning_for_aborted() {
+        use crate::settings::ReasoningInContextMode;
+        // Successful turn: has responseId
+        let successful_assistant = Message::Assistant {
+            id: Some("resp-123".into()),
+            content: vec![
+                AssistantContent::Reasoning(Reasoning::new("successful thought")),
+                AssistantContent::Text(Text::new("successful answer")),
+            ],
+        };
+        // Aborted turn: no responseId
+        let aborted_assistant = Message::Assistant {
+            id: None,
+            content: vec![
+                AssistantContent::Reasoning(Reasoning::new("aborted thought")),
+                AssistantContent::Text(Text::new("aborted answer")),
+            ],
+        };
+        let msgs = vec![
+            Message::user("q1"),
+            successful_assistant,
+            Message::user("q2"),
+            aborted_assistant,
+        ];
+
+        // AbortedTurnsOnly: successful reasoning stripped, aborted reasoning kept
+        let out = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::AbortedTurnsOnly, "openai", "");
+        let contents: Vec<&Vec<AssistantContent>> = out.iter().filter_map(|m| match m {
+            Message::Assistant { content, .. } => Some(content),
+            _ => None,
+        }).collect();
+        assert_eq!(contents.len(), 2);
+        // First (successful) should have reasoning stripped
+        assert!(!contents[0].iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        assert!(contents[0].iter().any(|c| matches!(c, AssistantContent::Text(t) if t.text == "successful answer")));
+        // Second (aborted) should have reasoning preserved
+        assert!(contents[1].iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        assert!(contents[1].iter().any(|c| matches!(c, AssistantContent::Text(t) if t.text == "aborted answer")));
     }
 
     // Anthropic-family turn WITH a tool call: the leading reasoning must be
@@ -6795,7 +6886,7 @@ mod tests {
         };
         let msgs = vec![Message::user("q"), assistant];
 
-        let forced = maybe_strip_reasoning(msgs, false, "anthropic", "claude-3-5-sonnet");
+        let forced = maybe_strip_reasoning(msgs, crate::settings::ReasoningInContextMode::Never, "anthropic", "claude-3-5-sonnet");
         if let Message::Assistant { content, .. } = &forced[1] {
             assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
         } else {
@@ -6953,7 +7044,7 @@ mod tests {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             sandbox: Some(sandbox),
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             message_log_path: None,
             sessions_dir: Some(sessions_dir.clone()),
         };

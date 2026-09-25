@@ -95,6 +95,64 @@ pub const DEFAULT_LLM_COMPACT_PROMPT: &str = "Summarize the conversation in less
      Preserve the key documents, technical decisions, file paths, current \
      task state, and any unresolved questions.";
 
+/// How reasoning blocks are handled in the LLM context (conversation history).
+///
+/// * `Always` — keep all reasoning blocks in context (default for Anthropic-family).
+/// * `Never` — strip all reasoning blocks from context to save tokens.
+/// * `AbortedTurnsOnly` — strip reasoning from successful turns, but preserve
+///   reasoning from aborted/errored turns so the model can resume its train
+///   of thought when the user provides a steering message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningInContextMode {
+    /// Keep all reasoning in context.
+    Always,
+    /// Strip all reasoning from context.
+    #[default]
+    Never,
+    /// Preserve reasoning only from aborted/errored turns.
+    AbortedTurnsOnly,
+}
+
+impl ReasoningInContextMode {
+    /// Canonical lowercase name used for persistence and the `/set` menu.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningInContextMode::Always => "always",
+            ReasoningInContextMode::Never => "never",
+            ReasoningInContextMode::AbortedTurnsOnly => "aborted_turns_only",
+        }
+    }
+
+    /// Parse from string, case-insensitive. Returns `None` for unknown values.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "always" | "true" | "on" | "yes" => Some(ReasoningInContextMode::Always),
+            "never" | "false" | "off" | "no" => Some(ReasoningInContextMode::Never),
+            "aborted_turns_only" | "aborted" | "aborted_only" => Some(ReasoningInContextMode::AbortedTurnsOnly),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningInContextMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_opt(s).ok_or_else(|| {
+            format!(
+                "unknown reasoning_in_context value: '{}' (use always | never | aborted_turns_only)",
+                s.trim()
+            )
+        })
+    }
+}
+
+impl std::fmt::Display for ReasoningInContextMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A managed setting, keyed for selection/editing in the `/settings` overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKey {
@@ -110,7 +168,7 @@ pub enum SettingKey {
     DefaultThinking,
     /// `disabled` | `indicator` | `content`.
     ShowReasoning,
-    /// `true` | `false` — keep reasoning blocks in the session context.
+    /// `always` | `never` | `aborted_turns_only` — how reasoning blocks are kept in context.
     ReasoningInContext,
     /// positive integer — number of turns to replay on session resume.
     SessionResumeReplayTurns,
@@ -180,8 +238,8 @@ pub static SETTINGS: &[SettingMeta] = &[
     SettingMeta {
         key: SettingKey::ReasoningInContext,
         name: "reasoning_in_context",
-        description: "Keep reasoning in session context: true | false",
-        kind: ValueKind::Enum(&["true", "false"]),
+        description: "Keep reasoning in session context: always | never | aborted_turns_only",
+        kind: ValueKind::Enum(&["always", "never", "aborted_turns_only"]),
     },
     SettingMeta {
         key: SettingKey::SessionResumeReplayTurns,
@@ -208,9 +266,9 @@ pub struct SettingsStore {
     pub default_thinking_level: String,
     /// `disabled` | `indicator` | `content` (how reasoning is shown).
     pub show_reasoning: String,
-    /// `true` keeps reasoning blocks in the stored session context; `false`
-    /// (default) drops them to save tokens. Forced `true` for Anthropic models.
-    pub reasoning_in_context: bool,
+    /// How reasoning blocks are kept in the LLM context. Default `Never`.
+    /// Forced `Always` for Anthropic-family providers.
+    pub reasoning_in_context: ReasoningInContextMode,
     /// Number of most recent turns to replay on session resume.
     /// 0 = no replay. Default: 3.
     pub session_resume_replay_turns: usize,
@@ -273,7 +331,9 @@ impl SettingsStore {
                 .and_then(|s| ShowReasoning::parse_opt(&s))
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "content".to_string()),
-            reasoning_in_context: cfg.reasoning_in_context.unwrap_or(false),
+            reasoning_in_context: cfg
+                .reasoning_in_context
+                .unwrap_or_default(),
             session_resume_replay_turns: 3,
             llm_compact_prompt: cfg.llm_compact_prompt.clone().unwrap_or_default(),
             path: path.map(|p| p.to_path_buf()),
@@ -401,13 +461,11 @@ impl SettingsStore {
                 .parse::<ShowReasoning>()
                 .map(|_| ())
                 .map_err(|e| e),
-            SettingKey::ReasoningInContext => match value.trim().to_ascii_lowercase().as_str() {
-                "true" | "false" => Ok(()),
-                other => Err(format!(
-                    "reasoning_in_context must be true or false (got '{}')",
-                    other
-                )),
-            },
+            SettingKey::ReasoningInContext => value
+                .trim()
+                .parse::<ReasoningInContextMode>()
+                .map(|_| ())
+                .map_err(|e| e),
             SettingKey::SessionResumeReplayTurns => {
                 value
                     .trim()
@@ -502,7 +560,7 @@ impl SettingsStore {
         );
         table.insert(
             "reasoning_in_context",
-            toml_edit::value(self.reasoning_in_context),
+            toml_edit::value(self.reasoning_in_context.as_str()),
         );
         // llm_compact_prompt: only written when set (non-empty); an absent
         // key falls back to DEFAULT_LLM_COMPACT_PROMPT on load.
@@ -541,8 +599,10 @@ impl SettingsStore {
                 self.show_reasoning = normalize_show_reasoning(value).to_string()
             }
             SettingKey::ReasoningInContext => {
-                self.reasoning_in_context =
-                    matches!(value.trim().to_ascii_lowercase().as_str(), "true")
+                self.reasoning_in_context = value
+                    .trim()
+                    .parse::<ReasoningInContextMode>()
+                    .unwrap_or_default()
             }
             SettingKey::SessionResumeReplayTurns => {
                 self.session_resume_replay_turns = value.trim().parse().unwrap_or(self.session_resume_replay_turns)
@@ -588,7 +648,7 @@ mod tests {
             default_persona: Some("architect".into()),
             default_thinking_level: "off".into(),
             show_reasoning: "content".into(),
-            reasoning_in_context: false,
+            reasoning_in_context: ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
             path: Some(path.to_path_buf()),
@@ -642,6 +702,10 @@ mod tests {
 
     #[test]
     fn validate_reasoning_in_context() {
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "always").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "never").is_ok());
+        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "aborted_turns_only").is_ok());
+        // Legacy aliases
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "true").is_ok());
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "FALSE").is_ok());
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "bogus").is_err());
@@ -680,7 +744,7 @@ mod tests {
             cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             sandbox: None,
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             message_log_path: None,
             sessions_dir: None,
         };
@@ -692,7 +756,7 @@ mod tests {
         s.set_value(SettingKey::DefaultPersona, "architect").unwrap();
         s.set_value(SettingKey::DefaultThinking, "high").unwrap();
         s.set_value(SettingKey::ShowReasoning, "indicator").unwrap();
-        s.set_value(SettingKey::ReasoningInContext, "true").unwrap();
+        s.set_value(SettingKey::ReasoningInContext, "always").unwrap();
         s.apply_to_config(&mut cfg);
         assert_eq!(cfg.provider, "openrouter");
         assert_eq!(cfg.model, "tencent/hy3:free");
@@ -708,7 +772,7 @@ mod tests {
         );
 
         // reasoning_in_context is applied from the store value.
-        assert!(cfg.reasoning_in_context, "reasoning_in_context should be true after /set");
+        assert!(matches!(cfg.reasoning_in_context, crate::settings::ReasoningInContextMode::Always), "reasoning_in_context should be Always after /set");
 
         // "off" thinking level maps back to `None`.
         s.set_value(SettingKey::DefaultThinking, "off").unwrap();

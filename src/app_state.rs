@@ -506,7 +506,7 @@ impl AppState {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             sandbox: None,
             show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             message_log_path: None,
             sessions_dir: None,
         };
@@ -530,7 +530,7 @@ mod tests {
             default_persona: None,
             default_thinking_level: "off".into(),
             show_reasoning: "indicator".into(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
             path: None,

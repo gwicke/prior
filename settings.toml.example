@@ -9,7 +9,7 @@ tool_call_limit = 50
 default_persona = "architect"      # built-in name or file path; omit for none
 default_thinking_level = "off"     # off | low | med | high
 show_reasoning = "content"         # disabled | indicator | content
-reasoning_in_context = false       # keep reasoning in session context (true | false)
+reasoning_in_context = "never"     # always | never | aborted_turns_only
 # llm_compact_prompt = "Summarize the conversation in less than 2000 words. Preserve the key documents, technical decisions, file paths, current task state, and any unresolved questions." 
 # # prompt prepended to /tree <id> compact llm when no trailing text is given
 

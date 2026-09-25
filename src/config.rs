@@ -688,12 +688,13 @@ pub struct Config {
     pub show_reasoning: Option<String>,
     /// Whether reasoning content is included in the session context (the
     /// conversation history sent to the model). `false` (default) drops
-    /// `AssistantContent::Reasoning` blocks from stored history to save tokens;
-    /// `true` keeps them. Ignored/forced `true` for Anthropic-family providers,
-    /// which require reasoning to be replayed verbatim (thinking+tool_use
-    /// contract). See `doc/compaction.md`.
+    /// How reasoning blocks are kept in the LLM context.
+    /// `always` = keep all, `never` = strip all, `aborted_turns_only` = keep only
+    /// from aborted/errored turns. Default: `never`. Forced `always` for
+    /// Anthropic-family providers (thinking+tool_use replay contract).
+    /// See `doc/compaction.md`.
     #[serde(default)]
-    pub reasoning_in_context: Option<bool>,
+    pub reasoning_in_context: Option<crate::settings::ReasoningInContextMode>,
     /// Free-text instruction prepended to the dropped-span transcript when
     /// `/tree <id> compact llm` is run with no trailing text. When unset,
     /// the built-in `DEFAULT_LLM_COMPACT_PROMPT` is used.

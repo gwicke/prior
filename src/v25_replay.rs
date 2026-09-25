@@ -75,7 +75,7 @@ mod tests {
             default_persona: None,
             default_thinking_level: String::new(),
             show_reasoning: String::new(),
-            reasoning_in_context: false,
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 0,
             llm_compact_prompt: String::new(),
             path: None,
