@@ -48,12 +48,6 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-/// Resume a session by id, optionally replaying the last N turns.
-#[derive(Debug, Clone)]
-pub struct ResumeIntent {
-    pub session_id: String,
-    pub replay_arg: String,
-}
 
 
 /// Compact mode for `tree_compact`.
@@ -102,8 +96,7 @@ pub enum SandboxOp {
 pub struct ControlConfig {
     /// Latching: the loop exits when it observes `true` (never cleared).
     pub quit: bool,
-    /// `/session <id> resume [replay]` — load + swap + prefill.
-    pub resume: Option<ResumeIntent>,
+
 
 
 
@@ -121,7 +114,7 @@ impl ControlConfig {
     fn take_one_shots(&mut self) -> ControlConfig {
         ControlConfig {
             quit: self.quit,
-            resume: self.resume.take(),
+
 
             tree_compact: self.tree_compact.take(),
             sandbox: self.sandbox.take(),
@@ -180,6 +173,15 @@ pub struct State {
     pub(crate) context_tokens: u64,
     /// Declarative control targets (see [`ControlConfig`]).
     pub(crate) control: ControlConfig,
+    /// One-shot prompt prefill (resume's `/model …` model decision, the
+    /// auto-resume seed, the typed compact-cancel restore): written by
+    /// handlers/appliers/the loop, **taken by the loop** right before
+    /// the next `read_input` (sole consumer).
+    pub(crate) prefill: Option<String>,
+    /// REPL raw-mode guard — a service handle published once at startup;
+    /// the compaction review closure clones it out to suspend raw mode
+    /// around `$EDITOR` (same pattern as the Ctrl-E path).
+    pub(crate) term_guard: Option<Arc<crate::repl::TermGuard>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +219,8 @@ impl AppState {
                 session_usage: SessionUsage::default(),
                 context_tokens: 0,
                 control: ControlConfig::default(),
+                prefill: None,
+                term_guard: None,
             }),
         })
     }
@@ -432,12 +436,6 @@ impl AppState {
     }
 
 
-    pub fn request_resume(&self, session_id: String, replay_arg: String) {
-        self.state.lock().control.resume = Some(ResumeIntent {
-            session_id,
-            replay_arg,
-        });
-    }
 
 
 
@@ -460,6 +458,28 @@ impl AppState {
     /// step every cycle — a missed cycle only delays convergence.
     pub fn take_control(&self) -> ControlConfig {
         self.state.lock().control.take_one_shots()
+    }
+
+    /// Write the one-shot prompt prefill (handlers/appliers/the loop).
+    pub fn set_prefill(&self, prefill: String) {
+        self.state.lock().prefill = Some(prefill);
+    }
+
+    /// Sole-consumer take: the loop pops the prefill right before the
+    /// next `read_input`.
+    pub fn take_prefill(&self) -> Option<String> {
+        self.state.lock().prefill.take()
+    }
+
+    /// Publish the REPL's term guard (set once at startup).
+    pub fn set_term_guard(&self, guard: Arc<crate::repl::TermGuard>) {
+        self.state.lock().term_guard = Some(guard);
+    }
+
+    /// Clone-out of the term guard (rule 3 — the review closure holds it
+    /// across the editor, outside any lock).
+    pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
+        self.state.lock().term_guard.clone()
     }
 
     // --- test constructor ---
@@ -546,12 +566,10 @@ mod tests {
     #[test]
     fn control_take_gc_one_shots_but_quit_latches() {
         let app_state = AppState::for_test(test_settings());
-        app_state.request_resume("abc".into(), "5t".into());
         app_state.request_tree_compact("u1".into(), CompactMode::Manual, String::new());
         app_state.request_quit();
 
         let taken = app_state.take_control();
-        assert_eq!(taken.resume.as_ref().unwrap().session_id, "abc");
         assert_eq!(
             taken.tree_compact.as_ref().map(|c| c.target_id.as_str()),
             Some("u1")
@@ -560,7 +578,6 @@ mod tests {
 
         // GC: one-shots gone, quit still latching.
         let taken2 = app_state.take_control();
-        assert!(taken2.resume.is_none());
         assert!(taken2.tree_compact.is_none());
         assert!(app_state.should_quit(), "quit is latching — never cleared");
     }

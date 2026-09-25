@@ -426,8 +426,39 @@ impl SlashDotNode for SessionResumeNode {
             .unwrap_or_default()
             .to_string();
         let replay_arg = path_args.suffix.trim().to_string();
-        self.app_state.request_resume(session_id, replay_arg);
-        SubmitResult::Done(None)
+        // Data-plane inline: load/migrate/replay + activate in one slot
+        // write; the model decision rides the prefill register (qualified
+        // id from the TARGET config — same target-stamp judgment as
+        // session creation).
+        let Some(repo) = self.app_state.repo() else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let found = repo
+            .list(None)
+            .await
+            .ok()
+            .and_then(|metas| metas.into_iter().find(|m| m.id == session_id));
+        let Some(meta) = found else {
+            return SubmitResult::Done(Some(format!("Session not found: {}", session_id)));
+        };
+        let default = self.app_state.with_settings(|s| s.session_resume_replay_turns);
+        let replay = if replay_arg.is_empty() {
+            (default, false)
+        } else {
+            crate::agent::parse_replay_len_arg(&replay_arg, default)
+        };
+        let out = self.app_state.with_config(|c| c.output.clone());
+        let qualified = self.app_state.with_config(|c| c.qualified_model_id());
+        match crate::agent::resume_session(&repo, &meta, replay, out.as_ref(), &qualified).await {
+            Ok((new_session, id, prefill)) => {
+                self.app_state.activate_session(Some(new_session), id);
+                if let Some(p) = prefill {
+                    self.app_state.set_prefill(p);
+                }
+                SubmitResult::Done(None)
+            }
+            Err(msg) => SubmitResult::Done(Some(msg)),
+        }
     }
 }
 
@@ -777,14 +808,25 @@ mod tests {
         let r = futures::executor::block_on(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into resume");
 
-        // 4. Enter → submit.
-        let _ = futures::executor::block_on(handle.eval_prompt(&line, HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        let resume = taken
-            .resume
-            .as_ref()
-            .expect("resume control target must be set");
-        assert_eq!(resume.session_id, uuid, "resume must carry the session UUID");
+        // 4. Enter → submit (inline resume drives repo IO — tokio-backed
+        // driver required). The fixture lives under a foreign cwd, so
+        // resume takes the fork-migration path: original deleted, a
+        // migrated session activated under the process cwd.
+        let _ = crate::agent::block_on_test(handle.eval_prompt(&line, HostKey::Enter, 80));
+        let s = app_state.session().expect("resume activates a session");
+        assert!(!s.get_session_id().is_empty());
+        assert_eq!(
+            app_state.current_session_id(),
+            s.get_session_id(),
+            "slot id tracks the activated session"
+        );
+        assert_eq!(
+            app_state.repo().unwrap().list_sessions_sync(None).len(),
+            1,
+            "migration: original deleted, one session remains"
+        );
+        // The (migrated) header records no model → no `/model` prefill.
+        assert!(app_state.take_prefill().is_none());
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -857,20 +899,23 @@ mod tests {
     }
 
     #[test]
-    fn session_resume_submit_sets_control_target() {
-        let app_state = test_app_state();
+    fn session_resume_submit_switches_session() {
+        let (app_state, uuid, base) = temp_repo_with_session();
         let mut node = SessionResumeNode { app_state: app_state.clone() };
         // submit() sees the node's own path: ["session", uuid, "resume"].
         let path_args = PathArgs {
-            ids: vec!["session".into(), "some-uuid".into(), "resume".into()],
+            ids: vec!["session".into(), uuid.clone(), "resume".into()],
             suffix: " 10t ".to_string(),
             args: Default::default(),
         };
-        let _ = futures::executor::block_on(node.submit(1, &path_args));
-        let taken = app_state.take_control();
-        let resume = taken.resume.as_ref().expect("resume target");
-        assert_eq!(resume.session_id, "some-uuid");
-        assert_eq!(resume.replay_arg, "10t");
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)), "resume must succeed");
+        let s = app_state.session().expect("activated");
+        // Foreign-cwd fixture → fork migration: activated id differs from
+        // the original, and the slot id tracks it.
+        assert_ne!(s.get_session_id(), uuid, "migrated session has its own id");
+        assert_eq!(app_state.current_session_id(), s.get_session_id());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

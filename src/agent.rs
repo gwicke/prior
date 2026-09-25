@@ -2735,108 +2735,26 @@ async fn handle_session_command(
                     .as_deref()
                     .map(|s| crate::agent::parse_replay_len_arg(s, default))
                     .unwrap_or((default, false));
-
-                // Resume in a different directory -> fork the session to the new
-                // cwd and delete the original. This migrates the session file to
-                // the current location and sets the header's `cwd` field.
-                let cwd = match std::env::current_dir() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        config.output.display_text("Cannot determine current directory");
-                        return SessionCommandResult::Handled;
+                // Load/migrate/replay/prefill — shared with the inline
+                // resume node (`resume_session` owns the rationale).
+                match resume_session(
+                    repo.as_ref().unwrap(),
+                    &meta,
+                    (count, is_lines),
+                    output.as_ref(),
+                    &config.qualified_model_id(),
+                )
+                .await
+                {
+                    Ok((new_session, id, prefill)) => {
+                        *session = Some(new_session);
+                        SessionCommandResult::Switched { id, prefill }
                     }
-                };
-
-                let (storage, index) = if meta.cwd != cwd {
-                    let repo = repo.as_ref().unwrap();
-                    match repo.fork(&meta, "", &cwd, ForkMode::FullTree).await {
-                        Ok(forked_storage) => {
-                            let index = match forked_storage.build_index().await {
-                                Ok(i) => i,
-                                Err(e) => {
-                                    config.output.display_text(&format!("Cannot build session index: {}", e));
-                                    return SessionCommandResult::Handled;
-                                }
-                            };
-                            if let Err(e) = repo.delete(&meta).await {
-                                config.output.display_text(&format!("Cannot remove old session: {}", e));
-                                return SessionCommandResult::Handled;
-                            }
-                            (forked_storage, index)
-                        }
-                        Err(e) => {
-                            config.output.display_text(&format!("Cannot fork session: {}", e));
-                            return SessionCommandResult::Handled;
-                        }
-                    }
-                } else {
-                    match repo.as_ref().unwrap().open(&meta).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            config.output.display_text(&format!("Cannot resume session: {}", e));
-                            return SessionCommandResult::Handled;
-                        }
-                    }
-                };
-
-                // No silent restore of provider/model/thinking on resume: doing so
-                // would mutate `config` and rebuild the running agent behind the
-                // user's back, removing the chance to accept/abort/choose a model.
-                // The resumed session is loaded and replay is rendered below; the
-                // model/thinking decision is surfaced via `compute_resume_model_prefill`,
-                // which returns a `/model <provider>:<model_id>` prefill when the
-                // session records a model (branch `ModelChange` or header metadata)
-                // that DIFFERS from the running model; when they match — or the
-                // session records nothing — the prompt stays empty and the
-                // user is not nudged to switch. We only restore the model (not
-                // thinking level) -- they share the single input field, and silently
-                // setting `config.model` plus rebuilding the agent bypasses the
-                // user's chance to accept/abort/choose. Pending: a slug syntax
-                // that bundles model + thinking into one prefill (see
-                // doc/todo.md). The full `provider:model_id` form is what the
-                // v2.5 `/model` node resolves directly; Enter commits it to the
-                // target config in `AppState`; convergence rebuilds the agent.
-                //
-                // Computed BEFORE moving `new_session` into `*session` because
-                // `compute_resume_model_prefill` takes `&Session`.
-                let new_session = Session::new_persisted(storage, index);
-                let id = new_session.get_session_id().to_string();
-
-                if count > 0 {
-                    // Replay from the RAW branch so compaction entries render as
-                    // markers while the whole history is available; only the agent
-                    // context is scoped.
-                    let branch = new_session.get_branch().await;
-                    let units = build_replay_units(&branch);
-                    let total = count_turns(&units);
-                    output.display_separator();
-                    if is_lines {
-                        // Line-based: capture full replay via writer, tail lines.
-                        output.begin_capture();
-                        replay_units(output.as_ref(), &units, 0);
-                        let bytes = output.end_capture();
-                        let captured = String::from_utf8_lossy(&bytes);
-                        let lines: Vec<&str> = captured.lines().collect();
-                        let start = lines.len().saturating_sub(count);
-                        use std::io::Write as _;
-                        let stdout = std::io::stdout();
-                        let mut handle = stdout.lock();
-                        for line in &lines[start..] {
-                            let _ = writeln!(handle, "{}", line);
-                        }
-                        let _ = handle.flush();
-                    } else {
-                        replay_last_turns(output.as_ref(), &units, count.min(total));
+                    Err(msg) => {
+                        config.output.display_text(&msg);
+                        SessionCommandResult::Handled
                     }
                 }
-
-                let prefill =
-                    compute_resume_model_prefill(&new_session, &config.qualified_model_id())
-                        .await;
-
-                *session = Some(Arc::new(new_session));
-
-                SessionCommandResult::Switched { id, prefill }
             } else {
                 config.output.display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
@@ -3607,6 +3525,87 @@ pub(crate) async fn fork_session_at(
     }
 }
 
+/// Load a session by meta and switch to it (the `/session resume`
+/// action — shared by the typed path and the inline resume node).
+/// Migrates to the current cwd when the session lives elsewhere (fork
+/// + delete original), replays `(count, is_lines)` through `output`,
+/// and computes the `/model` prefill against `qualified_id`.
+///
+/// No silent restore of provider/model/thinking on resume: mutating
+/// config and rebuilding the agent behind the user's back would remove
+/// the chance to accept/abort/choose a model. The decision is surfaced
+/// via the returned prefill instead when the session records a model
+/// that DIFFERS from `qualified_id` (full `provider:model_id` form —
+/// what the v2.5 `/model` node resolves directly); when they match or
+/// the session records nothing, no prefill is returned. Errors are
+/// caller-displayed messages (same texts the old arm printed).
+pub(crate) async fn resume_session(
+    repo: &crate::session::repo::JsonlSessionRepo,
+    meta: &crate::session::SessionMetadata,
+    replay: (usize, bool),
+    output: &dyn Output,
+    qualified_id: &str,
+) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
+    use crate::session::repo::SessionRepo;
+    let (count, is_lines) = replay;
+    let cwd = std::env::current_dir()
+        .map_err(|_| "Cannot determine current directory".to_string())?;
+    let (storage, index) = if meta.cwd != cwd {
+        // Resume in a different directory → fork the session to the new
+        // cwd and delete the original (migrates the file, sets the
+        // header's `cwd` field).
+        match repo.fork(meta, "", &cwd, ForkMode::FullTree).await {
+            Ok(forked_storage) => {
+                let index = match forked_storage.build_index().await {
+                    Ok(i) => i,
+                    Err(e) => return Err(format!("Cannot build session index: {}", e)),
+                };
+                if let Err(e) = repo.delete(meta).await {
+                    return Err(format!("Cannot remove old session: {}", e));
+                }
+                (forked_storage, index)
+            }
+            Err(e) => return Err(format!("Cannot fork session: {}", e)),
+        }
+    } else {
+        match repo.open(meta).await {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Cannot resume session: {}", e)),
+        }
+    };
+    let new_session = Session::new_persisted(storage, index);
+    let id = new_session.get_session_id().to_string();
+    if count > 0 {
+        // Replay from the RAW branch so compaction entries render as
+        // markers while the whole history is available; only the agent
+        // context is scoped.
+        let branch = new_session.get_branch().await;
+        let units = build_replay_units(&branch);
+        let total = count_turns(&units);
+        output.display_separator();
+        if is_lines {
+            // Line-based: capture full replay via writer, tail lines.
+            output.begin_capture();
+            replay_units(output, &units, 0);
+            let bytes = output.end_capture();
+            let captured = String::from_utf8_lossy(&bytes);
+            let lines: Vec<&str> = captured.lines().collect();
+            let start = lines.len().saturating_sub(count);
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            for line in &lines[start..] {
+                let _ = writeln!(handle, "{}", line);
+            }
+            let _ = handle.flush();
+        } else {
+            replay_last_turns(output, &units, count.min(total));
+        }
+    }
+    let prefill = compute_resume_model_prefill(&new_session, qualified_id).await;
+    Ok((Arc::new(new_session), id, prefill))
+}
+
 /// Create a fresh session (dropping the in-memory one), activate it in
 /// the slot, and apply an optional name — shared by the inline `/new`
 /// and `/clear` nodes. Provider/model/thinking come from the **target**
@@ -3794,6 +3793,12 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     let mut last_attempted_target: Option<(String, Option<String>, Option<String>)> = None;
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
+    // Publish to the slot: the inline compact node's review closure
+    // suspends raw mode around `$EDITOR` with it (service handle,
+    // clone-out — never held behind the lock across the editor).
+    if let Some(g) = guard.clone() {
+        app_state.set_term_guard(g);
+    }
     if guard.is_some() {
         crate::repl::register_sigcont();
     }
@@ -3820,13 +3825,12 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // second prompt. This keeps the history and UX identical to a typed
     // resume (including the model-overlay catalog fetch that needs the
     // inter-keystroke time to land).
-    let mut pending_prefill: Option<String> = None;
     if auto_resume {
         // Pre-fill with the session listing for the current directory.
         // The user presses Enter to resume the top (most recent) session.
         // This is simpler than resolving the session ID upfront and avoids
         // any race conditions with the session repository listing.
-        pending_prefill = Some("/session .path:.".to_string());
+        app_state.set_prefill("/session .path:.".to_string());
     }
     loop {
         let action = match repl.as_mut() {
@@ -3860,7 +3864,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop
                 // iteration starts with `None`.
-                let prefill = pending_prefill.take();
+                let prefill = app_state.take_prefill();
                 let prefill_ref = prefill.as_deref();
                 r.read_input(
                     &prompt_str,
@@ -3969,33 +3973,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // above already GC'd the one-shots; run-to-completion means at
         // most one menu submit set them this cycle.
 
-        if let Some(ri) = control.resume {
-            let (session_id, replay_arg) = (ri.session_id, ri.replay_arg);
-            let input = if replay_arg.is_empty() {
-                format!("/session {} resume", session_id)
-            } else {
-                format!("/session {} resume {}", session_id, replay_arg)
-            };
-            let out = config.output.clone();
-            let mut session = app_state.session();
-            let result = handle_session_command(
-                &input, &mut session, &mut repo, &mut config, &out,
-                &app_state.settings(),
-            ).await;
-            app_state.set_session(session);
-            match result {
-                SessionCommandResult::Switched { id: new_id, prefill } => {
-                    app_state.set_current_session_id(new_id);
-                    if prefill.is_some() {
-                        pending_prefill = prefill;
-                    }
-                }
-                SessionCommandResult::Handled => {}
-                other => {
-                    eprintln!("[v25] resume: unexpected result {:?}", std::mem::discriminant(&other));
-                }
-            }
-        }
         if let Some(tc) = control.tree_compact {
             let (target_id, mode, payload) = (tc.target_id, tc.mode, tc.payload);
             let Some(s) = app_state.session() else {
@@ -4509,7 +4486,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 // prompt line to the editor so they can switch
                                 // methods or tune the LLM prompt.
                                 CompactionResult::Cancelled => {
-                                    pending_prefill = Some(input.clone());
+                                    app_state.set_prefill(input.clone());
                                 }
                                 CompactionResult::Err(msg) => {
                                     config.output.display_text(&msg);
@@ -4550,11 +4527,11 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             // next prompt instead of letting the user type it
                             // themselves; clearing the buffer would force them to
                             // retype the model they just resumed into. The
-                            // prefill is consumed once — `pending_prefill` is
-                            // reset at the top of the next loop iteration so a
+                            // prefill is consumed once — the slot register is
+                            // taken at the top of the next loop iteration so a
                             // subsequent prompt starts empty.
-                            if prefill.is_some() {
-                                pending_prefill = prefill;
+                            if let Some(p) = prefill {
+                                app_state.set_prefill(p);
                             }
                             continue;
                         }

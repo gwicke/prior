@@ -1572,6 +1572,13 @@ impl Repl {
         next_input: &str,
         sep: bool,
     ) {
+        // Re-anchor to the real cursor BEFORE drawing: an external editor
+        // ($EDITOR via `review_compaction_summary`, which runs mid-eval for
+        // menu-driven compaction) may have repainted the screen since the
+        // last frame. `cursor_row()` does a live DSR query — the same
+        // pattern the Ctrl-E path uses after `guard.start()` — and falls
+        // back to the tracked value when the terminal doesn't answer.
+        *input_row = output.cursor_row().max(1);
         redraw(&LineEditor::new(), &[], sel, input_row);
         output.display_plain(line);
         if sep {
