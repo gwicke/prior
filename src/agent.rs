@@ -3259,7 +3259,7 @@ impl From<CompactionResult> for std::result::Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_compaction(
     session: &Session,
-    agent: &Option<Box<dyn PicoAgent>>,
+    agent: &Option<Arc<dyn PicoAgent>>,
     settings: &SettingsStore,
     target: CompactionTarget,
     mode: CompactSummaryMode,
@@ -3307,7 +3307,7 @@ pub(crate) async fn run_compaction(
 #[allow(clippy::too_many_arguments)]
 async fn run_compaction_at_point(
     session: &Session,
-    agent: &Option<Box<dyn PicoAgent>>,
+    agent: &Option<Arc<dyn PicoAgent>>,
     settings: &SettingsStore,
     target_id: &str,
     tokens_before: u64,
@@ -3654,9 +3654,10 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // session (`apply_to_config` never touches it), so publishing once here is
     // sufficient.
     set_sandbox(config.sandbox.clone());
-    // Agent is created lazily on first use (or on /model, /thinking) so that
-    // commands like /help work without a network round-trip.
-    let mut agent: Option<Box<dyn PicoAgent>> = None;
+    // The agent lives in the AppState slot: created lazily on first use
+    // (or on /model, /thinking — commands like /help must work without a
+    // network round-trip), always **loop-side from the applied config**,
+    // published via `activate_agent`; every reader clones it out.
 
     // Empty prompt: the REPL input is left-aligned on every row (a `> ` prefix
     // would only indent the first line and leave wrapped/continuation lines
@@ -3789,8 +3790,8 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     persona: config.persona_name.clone(),
                     // Snapshot the agent's accumulated token usage so the `/stat`
                     // overlay can render without needing the agent directly.
-                    session_usage: agent
-                        .as_ref()
+                    session_usage: app_state
+                        .agent()
                         .map(|a| a.session_usage())
                         .unwrap_or_default(),
                     repo: repo.clone(),
@@ -3877,7 +3878,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             }
             match create_agent(new_cfg.clone()).await {
                 Ok(new_agent) => {
-                    agent = Some(new_agent);
+                    app_state.activate_agent(Arc::from(new_agent));
                     if model_changed {
                         let model_id = new_cfg.qualified_model_id();
                         let updated = app_state.note_recent_model(&model_id);
@@ -4065,10 +4066,15 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     CompactSummaryMode::Llm
                 }
             };
-            // LLM mode needs a live agent.
+            // LLM mode needs a live agent (slot is the source; created
+            // loop-side from the applied config).
+            let mut agent = app_state.agent();
             if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
                 match create_agent(config.clone()).await {
-                    Ok(a) => agent = Some(a),
+                    Ok(a) => {
+                        app_state.activate_agent(Arc::from(a));
+                        agent = app_state.agent();
+                    }
                     Err(e) => {
                         config.output.display_text(
                             &format!("Cannot start agent: {}", e),
@@ -4350,9 +4356,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                                 // build the agent on demand and
                                                 // store it for the next prompt
                                                 // to reuse.
+                                                let mut agent = app_state.agent();
                                                 if agent.is_none() {
                                                     match create_agent(config.clone()).await {
-                                                        Ok(a) => agent = Some(a),
+                                                        Ok(a) => {
+                                                            app_state.activate_agent(Arc::from(a));
+                                                            agent = app_state.agent();
+                                                        }
                                                         Err(e) => {
                                                             config.output.display_text(&format!(
                                                                 "Cannot start agent: {}",
@@ -4456,9 +4466,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             // the lazy first-prompt creation below. Manual /
                             // TextOnly never touch the agent, so they stay
                             // network-free regardless.
+                            let mut agent = app_state.agent();
                             if resolved_mode == CompactSummaryMode::Llm && agent.is_none() {
                                 match create_agent(config.clone()).await {
-                                    Ok(a) => agent = Some(a),
+                                    Ok(a) => {
+                                        app_state.activate_agent(Arc::from(a));
+                                        agent = app_state.agent();
+                                    }
                                     Err(e) => {
                                         config
                                             .output
@@ -4705,10 +4719,11 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                 config.output.display_plain(&input);
                 // Separator between the user's prompt and the agent response.
                 config.output.display_separator();
-                // Normal prompt — create the agent lazily on first use.
-                if agent.is_none() {
+                // Normal prompt — create the agent lazily on first use
+                // (loop-side, applied config; published to the slot).
+                if app_state.agent().is_none() {
                     match create_agent(config.clone()).await {
-                        Ok(a) => agent = Some(a),
+                        Ok(a) => app_state.activate_agent(Arc::from(a)),
                         Err(e) => {
                             config
                                 .output
@@ -4717,6 +4732,8 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                         }
                     }
                 }
+                // Clone-out for this turn (lock rule 3: no guard across await).
+                let agent = app_state.agent();
                 // Single attempt + auto-retry, with the in-flight reader
                 // (if any) spanning the whole window. `Esc` during the
                 // retry's back-off sleep returns `Cancelled`; `Esc` during
