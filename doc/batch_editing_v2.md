@@ -633,18 +633,232 @@ anchor, tie-is-ambiguous, tolerance scaling, header anchor capture,
 success-string location hint. Green.
 
 ## Notes / follow ups
-- Explore multi-file support that splits edits into single-file batches
-  *before* execution. Makes failure domain per-file, and preserves pi session
-  compatibility, but might be surprising for agents to see one batch split up
-  into sub-edits? Would need to test.
-- Refine line anchor tolerance not based on context size, but based on
-  uniqueness between two closest matches, with high absolute upper bound.
-  Basically, accept relatively large deviations in line position (10s of
-  lines) if the ratio of distance between the two closest candidates is
-  sufficiently skewed towards the strongest candidate. Avoid resolving a
-  close-tie with large deviation.
-- Line anchored vs. un-anchored candidate disambiguation: In several cases,
-  the model omitted the line anchor at the first block, assuming that making
-  other blocks un-ambiguous would only leave one match for the first block.
-  Consider matching line-anchored blocks first, and accepting an un-anchored
-  block if it matches a position not overlapping with any previous matches.
+
+Each idea below is evaluated against the current code (findings verified
+against rig rev `1c2f440` and a live probe of `edit_file`). Status: design
+discussion only — nothing here is implemented.
+
+### 1. Multi-file batches split into single-file batches (needs investigation)
+
+**Idea**: accept a multi-file blob, split into per-file batches *before*
+execution → per-file failure domain, preserved pi session compatibility; open
+question is whether the split is surprising to agents.
+
+**How does multi-file fail today?** `merge_path` rejects it
+("make one `edit` call per file"), surfaced as a tool error. The model then
+retries — one extra round trip, unless it had *pre-emptively* emitted several
+parallel `edit` calls in the same response (rig dispatches parallel tool
+calls; this path already works and costs nothing). On the persistence side the
+failed call is stored as the raw blob string (it cannot canonicalize to
+single-path `{path, edits:[…]}`), so **pi compatibility for multi-file is
+already degraded today** — any implementation is a strict improvement over the
+status quo, but the note's "preserves pi session compatibility" only holds for
+splitting that produces *separate stored calls*.
+
+**Three strategies, with the hook-surface constraint that rules some out:**
+
+| | A: split inside the tool | B: split into N stored tool calls | C: status quo (reject; model self-splits) |
+|---|---|---|---|
+| Failure domain | per file (needs explicit per-file partial apply; result must say which files landed, else atomicity is silently changed from all-or-nothing) | per call (= per file), natural | per call |
+| Stored / pi form | one call, multi-file args → raw blob (same degrade as today) | N canonical single-path calls → true pi compat | raw blob + error |
+| Agent-visible | one call, one (aggregated) result — no surprise | N synthetic calls with synthesized ids/results — the "surprising" case | model's own N calls (no surprise) |
+| Feasibility now | straightforward (`EditFile::call` groups by path, loops `edit_file`) | **no pre-dispatch hook exists** in rig `1c2f440`: `ToolCallAction` is `{Run, Rewrite, Skip, Stop}` (rewrites *one* call's args, never expands the call list), `on_completion_response`/`on_model_turn_finished` are observe/retry/stop only. The only path is post-hoc history surgery at `on_completion_call` (which already replaces the full history) + `append_message`, rewriting 1 call + 1 result into N paired calls + N results | nothing to build |
+
+Key mechanics for B, if pursued:
+
+- The rewrite must be **deterministic** (original id + file index → synthetic
+  ids) — it runs on *every* completion call, and non-deterministic history
+  rewrites would churn the prompt-cache prefix. Same bar the blob↔array
+  transform already meets.
+- The tool result must be **structured per-file** so it can be split into N
+  paired tool-result messages (each tool_call id needs its own result message;
+  providers reject unpaired ids).
+- Display vs. stored divergence already has precedent (blob args shown, array
+  persisted), but 1 displayed call → 3 stored calls is a bigger gap; live
+  display shows the model's call while the transcript shows N.
+
+**Semantics change to accept explicitly**: splitting converts
+all-or-nothing-per-call into partial-across-files. For a cross-file refactor
+the model may *want* atomicity; splitting silently voids that intent. The
+result string must enumerate per-file outcomes so the model knows exactly
+what landed — otherwise it may assume the whole batch applied.
+
+**Recommendation**: measure first, per the doc's gating philosophy — count
+how often models actually emit multi-file blobs (vs. following the error and
+emitting parallel calls). If rare, C already works and A's complexity is
+unwarranted. If common, A is the cheap 80% (failure domain + no round trip,
+pi stays status-quo-degraded); B is the only strategy that delivers the
+note's pi-compat promise but needs the surgery above — worth it only if
+pi-side rendering of multi-file sessions matters.
+
+### 2. Ratio-based anchor tolerance ✅ *implemented*
+
+**Idea**: tolerance based on the distance *ratio* between the two closest
+candidates rather than context size, with a high absolute cap; reject
+close-ties at large deviation.
+
+**Evaluation — the direction is right because context size is the wrong
+axis.** The anchor's only job is choosing among ≥2 exact candidates. Once
+≥2 candidates exist, how much context the block carries is irrelevant to
+*which* candidate is intended — what matters is how decisively the anchor
+favors one over the others. (Context scaling isn't wasted, though: with a
+*single* candidate the anchor is ignored entirely, so context only ever
+influenced the multi-candidate case, which is exactly where it's a proxy.)
+
+**Proposed rule** (additive to today's, so every currently-accepted call stays
+accepted):
+
+```
+accept nearest candidate iff
+    d1 ≤ tol_ctx(old_text)                       # current rule, kept as fast path
+    OR (d1 ≤ CAP AND d2 ≥ RATIO × d1)            # NEW: decisive-skew escape hatch
+and the nearest candidate is strictly unique      # d1 tie → ambiguous, as today
+```
+
+- `d1`/`d2` = distances from the anchor to the nearest / second-nearest
+  candidate. `RATIO ≈ 2–3`, `CAP ≈ 50–100` lines ("10s of lines" per the
+  note) — constants to tune with tests.
+- **Why additive**: the current `tol_ctx` fast path preserves today's
+  behavior exactly; the ratio path only *adds* accepts where the anchor is
+  stale (the model read the file earlier, subsequent edits shifted things)
+  but the near candidate is unambiguous. Nothing that passes today starts
+  failing, except close-ties at large deviation — which already fail today
+  (out of tolerance), so that's not a change either.
+- **Tie handling stays as-is**: equal distances → `anchor_ambiguous`. The
+  ratio rule naturally refuses ties (`RATIO > 1`), so no special case.
+- **Edge cases to pin in tests**: `d1 = 0` with a second candidate on the
+  *same line* (two matches on one line → tie at 0 → must stay ambiguous);
+  >2 candidates (only `d1` vs `d2` matter — a far third candidate is
+  irrelevant to the choice); `d1` measured to occurrence *start line* today —
+  consider min-distance to the occurrence's line *span* instead, so a model
+  anchoring mid-block isn't penalized by block length.
+- **Error message impact**: `anchor_out_of_tolerance` currently says "none
+  within N lines" — with the skew rule it should report `d1`, `d2`, and the
+  candidate lines so the model can see *why* the pick was refused ("nearest
+  at line 140 (40 away), next at 145 (45 away) — too close to call").
+- Existing tests (`anchor_out_of_tolerance`, tolerance scaling) need updating;
+  the current `anchor_tolerance` doc comment claims context size is the
+  rationale and would need a rewrite.
+
+**Verdict**: straightforward, orthogonal to 1 and 3, strictly better
+diagnosis. Implement alongside an update to 3's failure messages.
+
+**Decisions (implemented)**:
+
+- Rule shipped as `edit_match::anchor_accepts(d1, d2, tolerance)`:
+  `d1 <= tolerance || (d1 <= ANCHOR_SKEW_CAP && d2 >= ANCHOR_SKEW_RATIO * d1)`
+  with `RATIO = 3`, `CAP = 60` — additive to the old tolerance, so every
+  previously accepted call still passes. Ties (`d1 == d2`) can only pass via
+  the tolerance clause and are separately rejected, exactly as before.
+- `d1` remains distance-to-occurrence-start-line (the span refinement was
+  skipped for now — it complicates the ranking for a case the ratio rule
+  already tolerates; revisit if models are seen anchoring mid-block).
+- `anchor_out_of_tolerance` now reports `d1`, `d2`, both candidate lines, and
+  the rule's thresholds; the test asserting the old "none within" wording was
+  updated.
+
+### 3. Anchored-first, claim-based resolution ✅ *implemented* (with refinement)
+
+**Idea**: resolve line-anchored blocks first; accept an un-anchored block if
+its candidate set shrinks to positions not overlapping previous matches.
+
+**Evaluation — correct, and the investigation surfaced a missing invariant.**
+A probe against the current `edit_file` (since removed; not committed):
+
+```
+file: "hello world\n"
+edits: [{old: "hello", new: "bye"}, {old: "hello", new: "hi"}]   # same unique old_text
+→ result: "Replaced 2 block(s) … (matched lines 1, 1)"
+→ file:   "hiorld\n"          # CORRUPTED — both edits resolved to byte range 0..5
+```
+
+`EditOp` documents "must not overlap with any other edit's old_text in the
+same call", but **nothing enforces it**: each edit resolves independently,
+and the apply loop (sort by start desc, `replace_range` on the original
+offsets) is only sound for *disjoint* ranges — overlapping ranges silently
+corrupt (and depending on lengths can panic on a non-char-boundary offset).
+The failure mode needs no repeated text at all: two *different* `old_text`s
+that overlap in the file corrupt the same way.
+
+So this item is not only a disambiguation improvement — the claim-tracking it
+requires is the same machinery that enforces disjointness. It should ship
+**with** an overlap check, closing a correctness hole, not just a UX gap.
+
+**Implemented algorithm** — two passes, split by anchor (not by uniqueness),
+both in block order, all-or-nothing preserved:
+
+1. **Pass 1 — line-anchored blocks**, in block order. Resolution: unique match
+   short-circuits; otherwise nearest + item-2 rule (tolerance OR skew), ties
+   ambiguous. The chosen match's byte range is then checked against all
+   existing claims: **overlap → conflict, reject** — never silently re-aimed
+   to the next-nearest candidate (an anchor is a positive statement of
+   location; two anchors on one region is a model error worth surfacing).
+   On success the range is *claimed*.
+2. **Pass 2 — content-only blocks**, in block order. Partition candidates
+   against the accumulated claims (pass 1 + earlier pass 2):
+   - exactly one free → accept and claim (so later blocks see the new
+     constraint — narrowing chains transitively through pass 2 as well);
+   - zero free → `all_candidates_claimed` (names the claiming edits);
+   - ≥2 free → `non_unique` listing the *free* lines and the excluded count.
+   Never order-based guessing between 2+ free candidates — that would be a
+   coin flip the anchor refused to make.
+3. **Failures claim nothing.** A failed block (not-found, out-of-tolerance,
+   tie, conflict) adds no claim, so later un-anchored blocks still see its
+   region and report plain ambiguity — the diagnostic the model can fix by
+   anchoring. Both passes run to completion regardless of earlier failures
+   (full diagnostics in one response); failure list is sorted by block index
+   for stable, block-ordered output.
+4. Failures anywhere → nothing applied (unchanged).
+
+**Notes**:
+
+- The two-pass order (anchored first, *regardless of batch position*) is what
+  fixes the observed scenario — the model anchors blocks 2..n and leaves
+  block 1 un-anchored expecting elimination; pass 1 claims line-anchored
+  matches, pass 2's block 1 then sees only the remaining candidates.
+  Un-anchored *unique* matches live in pass 2: anchors are positive
+  statements of location and get first claim on contested regions;
+  uniqueness is a passive property.
+- A wrong anchor in pass 1 produces a wrong claim, which can cascade into a
+  wrong pass-2 acceptance. Accepted trade-off: batch editing with this risk
+  still vastly beats `sed` and friends, which is what models reach for when
+  batches get too finicky. Bounded by item 2's tolerance + disjointness +
+  all-or-nothing (any failure discards the whole batch → one retry), and
+  failure messages name the claiming edit ("already matched by edit(s) #1")
+  so the model can untangle it.
+- Overlap for *identical* `old_text` is exact-range identity (candidates from
+  one `match_indices` pass are non-overlapping by construction); for
+  *different* texts it's genuine range intersection. One predicate
+  (`start < other_end && other_start < end`) covers both.
+- **Failure-claims-nothing** (refinement): a failed block contributes no
+  claim, so later un-anchored blocks see its region and surface plain
+  ambiguity — the more productive diagnostic (anchor it) rather than
+  "everything is claimed". Both passes always run to completion; the
+  failure list is sorted by block index so diagnostics arrive in block order.
+- Interplay: this item's pass 2 makes item 2's error messages more load-bearing
+  (the model must understand anchors to fix pass-2 failures) — implemented
+  together, as recommended.
+
+**Verdict**: implemented with the refinement above; higher priority than it
+looked because it carries the disjointness bug fix (the probe's `"hiorld"`
+corruption is now a loud `overlapping`/`all-claimed` failure).
+
+**Decisions (implemented)**:
+
+- `resolve_edits()` in `src/tools.rs` owns both passes; claims are
+  `(edit_idx, byte_start, byte_end)` and only successful resolutions ever
+  push one.
+- Conflict on anchored overlap → `overlap_conflict` naming both edits and
+  both line ranges (`render_line_span`: `line N` / `lines A-B`).
+- Pass-2 zero-free → `all_candidates_claimed` (names claimers; single-
+  occurrence phrasing for the probe case); ≥2-free → `non_unique` with an
+  `excluded` count (message lists only *free* lines).
+- Diagnostics: `failures.sort_by_key(edit_index)` before batching; full
+  completion of both passes before the all-or-nothing gate.
+
+### Suggested order
+
+1. **3** (correctness bug fix rides along) and **2** (message improvements
+   shared with 3) — independent, small, same code region.
+2. **1**: telemetry gate first; A only if multi-file attempts are common; B
+   only if pi-side multi-file rendering matters.

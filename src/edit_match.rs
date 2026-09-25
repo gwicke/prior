@@ -30,6 +30,30 @@ const MIN_SIMILARITY: f64 = 0.5;
 /// Cap on the number of diff lines rendered into the model_view.
 const MAX_DIFF_LINES: usize = 30;
 
+/// Skew rule: for an anchor beyond the context tolerance, accept the nearest
+/// candidate only if it is at least this many times closer than the second
+/// candidate (`d2 >= RATIO * d1`). Ties never satisfy this for `RATIO > 1`.
+pub const ANCHOR_SKEW_RATIO: usize = 3;
+/// Skew rule hard cap: never accept a nearest candidate farther than this
+/// many lines from the anchor, however skewed the ratio is. Bounds the damage
+/// of a stale/garbage anchor on a large file.
+pub const ANCHOR_SKEW_CAP: usize = 60;
+
+/// Should an anchored nearest-match choice of distance `d1` (with second
+/// candidate at `d2`) be accepted, given the context-scaled `tolerance`?
+///
+/// Additive rule: inside the old tolerance window always; beyond it, only
+/// when the nearest candidate is both decisively closer than the second
+/// (`d2 >= [ANCHOR_SKEW_RATIO] * d1`) and within [`ANCHOR_SKEW_CAP`] lines —
+/// this rescues stale anchors (file shifted since the model read it) while
+/// refusing close calls at large deviation. Ties (`d1 == d2`) only pass via
+/// the tolerance clause, and callers separately reject ties.
+///
+/// Only meaningful with ≥ 2 candidates; callers short-circuit unique matches.
+pub fn anchor_accepts(d1: usize, d2: usize, tolerance: usize) -> bool {
+    d1 <= tolerance || (d1 <= ANCHOR_SKEW_CAP && d2 >= ANCHOR_SKEW_RATIO * d1)
+}
+
 /// Result of an edit-failure diagnosis. Rendered as a JSON string the
 /// model-and-UI split can parse.
 #[derive(Debug, Serialize)]
@@ -230,6 +254,16 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
     Some(EditFailure { ui_view, model_view })
 }
 
+/// Render a 1-based inclusive line span for messages: `line 7` when the span
+/// is a single line, `lines 7-9` otherwise.
+fn render_line_span((first, last): (usize, usize)) -> String {
+    if first == last {
+        format!("line {first}")
+    } else {
+        format!("lines {first}-{last}")
+    }
+}
+
 impl EditFailure {
     /// Construct a fallback for "oldText not found and no close match".
     /// Used both directly (single-edit call) and inside batch items.
@@ -247,28 +281,134 @@ impl EditFailure {
         EditFailure { ui_view, model_view }
     }
 
-    /// Construct a failure for "oldText appears N times but none close enough
-    /// to the anchor line". Used by anchor-mode matching when the nearest
-    /// occurrence is farther than the tolerance.
+    /// Construct a failure for an anchored choice that is neither within the
+    /// context tolerance nor decisively nearer than the second candidate (see
+    /// [`anchor_accepts`]).
+    ///
+    /// `candidates` are `(line, distance-from-anchor)` pairs sorted by
+    /// distance (≤10); at least two are expected (unique matches never get
+    /// here). Reporting `d1`/`d2` lets the model see exactly which clause of
+    /// the rule failed.
     pub fn anchor_out_of_tolerance(
         edit_index_1based: usize,
         old_text: &str,
         anchor: usize,
-        nearest_line: usize,
         tolerance: usize,
         count: usize,
+        candidates: &[(usize, usize)],
     ) -> Self {
+        let (nearest_line, d1) = candidates[0];
+        let second_clause = match candidates.get(1) {
+            Some(&(line2, d2)) => format!(
+                ", next-nearest at line {line2} is {d2} line(s) away \
+                 (needs ≥{ratio}× nearer to decide)",
+                ratio = ANCHOR_SKEW_RATIO,
+            ),
+            None => String::new(),
+        };
+        let line_list = candidates
+            .iter()
+            .map(|(l, _)| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let shown_more = if count > candidates.len() {
+            format!(" (...and {} more)", count - candidates.len())
+        } else {
+            String::new()
+        };
         let ui_view = format!(
-            "edit #{edit_index_1based} oldText appears {count} times; none within \
-             {tolerance} line(s) of anchor line {anchor} (nearest at line {nearest_line}).",
+            "edit #{edit_index_1based} oldText appears {count} times; nearest at line \
+             {nearest_line} is {d1} line(s) from anchor {anchor} (tol {tolerance}), not \
+             decisive{second_clause}.",
         );
         let model_view = format!(
-            "oldText appears {count} times but none is within {tolerance} line(s) \
-             of the anchor line {anchor}; the nearest is at line {nearest_line}. \
-             The anchor is a near-line hint, not a range, so it does not widen the \
-             search. Re-read the file (`read` gives line numbers) and either correct \
-             the `path:LINE`/`startLine` anchor or include more surrounding context \
-             in oldText so the match is unambiguous. Original oldText: '{}'.",
+            "oldText appears {count} times. Anchor line {anchor}: the nearest occurrence \
+             at line {nearest_line} is {d1} line(s) away; the next-nearest is {d2_clause}. \
+             An anchor is accepted only when the nearest is within {tolerance} line(s), or \
+             when it is at least {ratio}× closer than the next-nearest and within {cap} \
+             lines — this pick satisfies neither. All occurrences at lines: {line_list}\
+             {shown_more}. The anchor is a near-line hint, not a range. Re-read the file \
+             (`read` gives line numbers) and either correct the `path:LINE`/`startLine` \
+             anchor or include more surrounding context in oldText so the match is \
+             unambiguous. Original oldText: '{}'.",
+            old_text,
+            d2_clause = candidates.get(1).map(|(l, d)| format!("{d} line(s) (at line {l})"))
+                .unwrap_or_else(|| "not far enough behind".to_string()),
+            ratio = ANCHOR_SKEW_RATIO,
+            cap = ANCHOR_SKEW_CAP,
+        );
+        EditFailure { ui_view, model_view }
+    }
+
+    /// Construct a failure for two matches whose byte ranges overlap. Both
+    /// edits are named with their file line ranges so the model can see which
+    /// blocks to merge or reword. All matches in a batch are computed against
+    /// the original file, so overlapping regions would corrupt each other.
+    pub fn overlap_conflict(
+        edit_index_1based: usize,
+        old_text: &str,
+        my_lines: (usize, usize),
+        other_edit_index_1based: usize,
+        other_lines: (usize, usize),
+    ) -> Self {
+        let mine = render_line_span(my_lines);
+        let theirs = render_line_span(other_lines);
+        let ui_view = format!(
+            "edit #{edit_index_1based} ({mine}) overlaps edit #{other_edit_index_1based} \
+             ({theirs}); batch edits must not overlap.",
+        );
+        let model_view = format!(
+            "This edit's match ({mine}) overlaps edit #{other_edit_index_1based}'s match \
+             ({theirs}). Edits in one batch are all computed against the original \
+             file, so their regions must be disjoint — overlapping matches would corrupt \
+             each other. Merge the overlapping changes into a single block, or adjust \
+             oldText so the regions are disjoint. Original oldText: '{}'.",
+            old_text,
+        );
+        EditFailure { ui_view, model_view }
+    }
+
+    /// Construct a failure for an un-anchored block whose every candidate
+    /// overlaps a match already claimed by another edit in the same batch
+    /// (typically the same/overlapping oldText as an earlier block).
+    ///
+    /// `candidate_lines` are the occurrence lines (≤10), `claimer_edits` the
+    /// 1-based indices of the edits whose matches consumed them (deduped).
+    pub fn all_candidates_claimed(
+        edit_index_1based: usize,
+        old_text: &str,
+        count: usize,
+        candidate_lines: &[usize],
+        claimer_edits: &[usize],
+    ) -> Self {
+        let line_list = candidate_lines
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let claimer_list = claimer_edits
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ui_view = if count == 1 {
+            format!(
+                "edit #{edit_index_1based} oldText's only occurrence (line {line_list}) \
+                 already matched by edit(s) {claimer_list} in this batch.",
+            )
+        } else {
+            format!(
+                "edit #{edit_index_1based} oldText: all {count} occurrence(s) \
+                 (lines: {line_list}) already matched by edit(s) {claimer_list} in this batch.",
+            )
+        };
+        let model_view = format!(
+            "oldText occurs {count} time(s) in the file (lines: {line_list}), but every \
+             occurrence overlaps a match already claimed by edit(s) {claimer_list} in this \
+             batch — two blocks cannot target the same region (matches are computed against \
+             the original file). Either this block duplicates what the other edit already \
+             replaces — drop it — or give it distinct oldText/anchors. Original oldText: \
+             '{}'.",
             old_text,
         );
         EditFailure { ui_view, model_view }
@@ -300,16 +440,23 @@ impl EditFailure {
         EditFailure { ui_view, model_view }
     }
 
-    /// Construct a failure for "oldText appears N times" with line
-    /// numbers so the model can disambiguate.
+    /// Construct a failure for "oldText appears N times and is still
+    /// ambiguous after excluding claimed regions", listing the *free*
+    /// candidate lines so the model can disambiguate.
+    ///
+    /// `count` is the total occurrence count in the file; `excluded` how many
+    /// were already claimed by other matches in this batch (0 = no claims);
+    /// `line_numbers` the free candidate lines (≤10).
     pub fn non_unique(
         edit_index_1based: usize,
         old_text: &str,
         count: usize,
         line_numbers: &[usize],
+        excluded: usize,
     ) -> Self {
+        let free = count.saturating_sub(excluded);
         let shown = line_numbers.len();
-        let line_list = if count > shown {
+        let line_list = if free > shown {
             format!(
                 "{}, (...and {} more)",
                 line_numbers
@@ -317,7 +464,7 @@ impl EditFailure {
                     .map(|n| n.to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
-                count - shown,
+                free - shown,
             )
         } else {
             line_numbers
@@ -326,15 +473,20 @@ impl EditFailure {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let excluded_note = if excluded > 0 {
+            format!(" ({excluded} occurrence(s) already matched by other edits in this batch were excluded)")
+        } else {
+            String::new()
+        };
         let ui_view = format!(
-            "edit #{edit_index_1based} oldText appears {count} times \
-             (lines: {line_list}); anchor it with a `path:LINE` header.",
+            "edit #{edit_index_1based} oldText appears {count} times{excluded_note} \
+             (free lines: {line_list}); anchor it with a `path:LINE` header.",
         );
         let model_view = format!(
-            "oldText appears {count} times, so it is ambiguous. \
-             Occurrences at lines: {line_list}. To pick one, put a `path:LINE` \
+            "oldText appears {count} times{excluded_note}, so it is ambiguous. \
+             Free occurrences at lines: {line_list}. To pick one, put a `path:LINE` \
              header line just above that block's `{marker}` marker — e.g. use \
-             `...:{first}` to target the first occurrence — which anchors the \
+             `...:{first}` to target the first free occurrence — which anchors the \
              block to the nearest occurrence (line numbers come from `read`). \
              Alternatively, include more surrounding context in oldText (the \
              line(s) immediately before/after) so only one occurrence matches. \
@@ -535,7 +687,7 @@ mod tests {
 
     #[test]
     fn non_unique_lists_line_numbers() {
-        let f = EditFailure::non_unique(1, "foo", 3, &[1, 3, 5]);
+        let f = EditFailure::non_unique(1, "foo", 3, &[1, 3, 5], 0);
         assert!(f.ui_view.contains("lines: 1, 3, 5"));
         assert!(f.model_view.contains("lines: 1, 3, 5"));
         assert!(f.model_view.contains("foo"));
@@ -548,9 +700,69 @@ mod tests {
             "foo",
             15,
             &(1..=10).collect::<Vec<_>>(),
+            0,
         );
         assert!(f.ui_view.contains("(...and 5 more)"));
         assert!(f.ui_view.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10"));
+    }
+
+    #[test]
+    fn non_unique_reports_excluded_claims() {
+        // 5 total, 2 already claimed → 3 free; free = 5 - 2, shown = 3 → no
+        // truncation note, but the excluded count is called out.
+        let f = EditFailure::non_unique(2, "foo", 5, &[10, 20, 30], 2);
+        assert!(f.ui_view.contains("appears 5 times"));
+        assert!(f.ui_view.contains("2 occurrence(s) already matched"));
+        assert!(f.ui_view.contains("free lines: 10, 20, 30"));
+        assert!(!f.ui_view.contains("more"));
+    }
+
+    #[test]
+    fn non_unique_truncation_counts_only_free_candidates() {
+        // 15 total, 5 excluded → 10 free, all shown → no "...and more" note
+        // even though total (15) > shown (10).
+        let f = EditFailure::non_unique(1, "foo", 15, &(1..=10).collect::<Vec<_>>(), 5);
+        assert!(!f.ui_view.contains("more)"));
+    }
+
+    #[test]
+    fn overlap_conflict_names_both_edits_and_ranges() {
+        let f = EditFailure::overlap_conflict(2, "the text", (140, 143), 1, (141, 145));
+        assert!(f.ui_view.contains("edit #2"));
+        assert!(f.ui_view.contains("edit #1"));
+        assert!(f.ui_view.contains("140-143"));
+        assert!(f.ui_view.contains("141-145"));
+        assert!(f.model_view.contains("disjoint"));
+        assert!(f.model_view.contains("the text"));
+        // ui_view stays short, no file content
+        assert!(!f.ui_view.contains("the text"));
+    }
+
+    #[test]
+    fn all_candidates_claimed_lists_claimers() {
+        let f = EditFailure::all_candidates_claimed(3, "dup text", 2, &[7, 12], &[1, 2]);
+        assert!(f.ui_view.contains("edit #3"));
+        assert!(f.ui_view.contains("#1, #2"));
+        assert!(f.ui_view.contains("lines: 7, 12"));
+        assert!(f.model_view.contains("dup text"));
+        assert!(f.model_view.contains("drop it"));
+    }
+
+    #[test]
+    fn anchor_accepts_within_tolerance_or_decisive_skew() {
+        // Fast path: inside the context tolerance regardless of skew.
+        assert!(anchor_accepts(2, 3, 3));
+        assert!(anchor_accepts(0, 0, 0));
+        // Beyond tolerance, decisive skew and within cap → accept.
+        assert!(anchor_accepts(10, 40, 1));
+        assert!(anchor_accepts(1, 3, 0));
+        // Beyond tolerance, near-tie → reject.
+        assert!(!anchor_accepts(10, 20, 1));
+        // Ties never pass the skew clause (d2 == d1, ratio > 1).
+        assert!(!anchor_accepts(5, 5, 4));
+        // Far beyond the cap → reject even with huge skew.
+        assert!(!anchor_accepts(61, 10_000, 5));
+        assert!(anchor_accepts(60, 180, 5));
     }
 
     #[test]
@@ -562,7 +774,7 @@ mod tests {
             },
             BatchItem {
                 edit_index: 2,
-                failure: EditFailure::non_unique(3, "y", 2, &[4, 8]),
+                failure: EditFailure::non_unique(3, "y", 2, &[4, 8], 0),
             },
         ];
         let b = BatchEditFailure::build(3, items);

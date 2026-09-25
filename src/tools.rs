@@ -150,8 +150,10 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
 /// A single targeted text replacement within a file.
 #[derive(Deserialize, Serialize, JsonSchema, Default, Clone)]
 pub struct EditOp {
-    /// Exact text to replace. Must be unique in the file and must not
-    /// overlap with any other edit's old_text in the same call.
+    /// Exact text to replace. Must be unique in the file — or become unique
+    /// after matches claimed by other edits in the same batch are excluded —
+    /// and must not overlap any other edit's `old_text` in the same call
+    /// (overlaps are rejected, not silently re-aimed).
     #[serde(rename = "oldText")]
     pub old_text: String,
     /// Replacement text.
@@ -159,11 +161,12 @@ pub struct EditOp {
     pub new_text: String,
     /// Optional *anchor* line (1-indexed) in the original file. It does not
     /// restrict the search; it disambiguates. When `old_text` occurs more than
-    /// once, the occurrence whose start line is closest to this line is chosen,
-    /// provided it is within a small, context-scaled tolerance (see
-    /// [`anchor_tolerance`]); the `old_text` end is implied by its own length,
-    /// so there is no end line. A `path:LINE` block header supplies this
-    /// per-block in the blob form.
+    /// once, the occurrence whose start line is closest to this line is chosen
+    /// when within a small, context-scaled tolerance (see
+    /// [`anchor_tolerance`]) or — for a stale anchor — when decisively nearer
+    /// than the second candidate (see [`edit_match::anchor_accepts`]). The
+    /// `old_text` end is implied by its own length, so there is no end line.
+    /// A `path:LINE` block header supplies this per-block in the blob form.
     #[serde(rename = "startLine", default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<EditStartLine>,
 }
@@ -510,7 +513,7 @@ For single edits, the traditional OpenAI path / oldText / newText API is availab
                 },
                 "edits": {
                     "type": "string",
-                    "description": "One or more SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `@@@OLD` line, exact text, `@@@NEW`, replacement, `@@@END`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. HEADER-LESS BLOCKS REMAIN AMBIGUOUS: if such a block's text occurs more than once the call fails, so add a `path:LINE` header whenever the matched text is not unique. Preferred over `oldText`/`newText` when making multiple edits."
+                    "description": "One or more SEARCH/REPLACE blocks (single file), for multiple edits in one call. Format per block: `@@@OLD` line, exact text, `@@@NEW`, replacement, `@@@END`. To disambiguate a block whose text repeats, prefix it with a `path:LINE` header line — e.g. `src/foo.rs:120` — which anchors that block near line 120 (1-indexed); the line is a near-line hint, not a range, and each block may carry its own. Preferred over `oldText`/`newText` when making multiple edits."
                 }
             },
             "required": []
@@ -533,120 +536,159 @@ For single edits, the traditional OpenAI path / oldText / newText API is availab
 /// capped at 4 — so three context lines (a common one-before/one-after shape)
 /// enables a ±1 window, while a bare single-line SEARCH stays exact (`0`).
 ///
-/// Tolerance only matters when `old_text` occurs more than once; a globally
-/// unique match is applied regardless of the anchor.
+/// This is the *fast path* of the acceptance rule
+/// ([`edit_match::anchor_accepts`]): inside this window the nearest candidate
+/// always wins; beyond it the skew rule may still accept. Tolerance only
+/// matters when `old_text` occurs more than once — a globally unique match is
+/// applied regardless of the anchor.
 fn anchor_tolerance(old_text: &str) -> usize {
     (old_text.lines().count() / 3).min(4)
 }
 
-pub async fn edit_file(
-    path: String,
-    edits: Vec<EditOp>,
-) -> Result<String, ToolError> {
-    let p = get_path_with(&path, true)?;
-    let text = fs::read_to_string(&p).await?;
+/// Every occurrence of `old_text` in `text` as `(absolute byte offset,
+/// 1-based file line)`.
+fn occurrences_of(text: &str, old_text: &str) -> Vec<(usize, usize)> {
+    text.match_indices(old_text)
+        .map(|(off, _)| (off, crate::edit_match::count_lines(&text[..off]) + 1))
+        .collect()
+}
+
+/// 1-based line range `(first, last)` covered by the byte span `[start, end)`.
+fn span_line_range(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let first = crate::edit_match::count_lines(&text[..start]) + 1;
+    if end <= start {
+        return (first, first);
+    }
+    let mut newlines = crate::edit_match::count_lines(&text[start..end]);
+    // A span ending in a newline does not occupy the line after it.
+    if text[start..end].ends_with('\n') && newlines > 0 {
+        newlines -= 1;
+    }
+    (first, first + newlines)
+}
+
+/// Index of the first claim whose byte range overlaps `[start, end)`, if any.
+fn first_claim_overlap(
+    claims: &[(usize, usize, usize)], // (edit idx, start, end)
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    claims.iter().position(|&(_, cs, ce)| start < ce && cs < end)
+}
+
+/// The "oldText not found" failure, shared by both resolution passes.
+fn not_found_failure(
+    edit_index0: usize,
+    edit: &EditOp,
+    text: &str,
+) -> edit_match::BatchItem {
+    let edit_idx_1 = edit_index0 + 1;
+    let anchor_info = match edit.start_line.map(|l| l.0) {
+        Some(s) => format!(" (anchored near line {s})"),
+        None => String::new(),
+    };
+    let failure = match edit_match::diagnose(&edit.old_text, text) {
+        Some(mut f) => {
+            f.ui_view = format!(
+                "edit #{edit_idx_1} oldText not found.{anchor_info} {}",
+                f.ui_view
+            );
+            f
+        }
+        None => {
+            let mut msg = format!("edit #{edit_idx_1} oldText not found{anchor_info} ");
+            msg.push_str(
+                "No similar region in the file; re-read the file and re-anchor the edit.",
+            );
+            edit_match::EditFailure {
+                ui_view: msg,
+                model_view: format!(
+                    "oldText not found{anchor_info} No close-enough region in the file; \
+                     please re-read the file and re-anchor your edit. \
+                     Original oldText: '{}'.",
+                    edit.old_text
+                ),
+            }
+        }
+    };
+    edit_match::BatchItem {
+        edit_index: edit_index0,
+        failure,
+    }
+}
+
+/// Resolve the `edit` tool's matching in two passes over the original file:
+///
+/// 1. **Line-anchored blocks, in block order.** An anchor is a positive
+///    statement of location, so anchored matches resolve (and *claim* their
+///    byte range) first. The rule: nearest within [`anchor_tolerance`] always;
+///    beyond that only under the skew rule ([`edit_match::anchor_accepts`]);
+///    ties are ambiguous. A chosen match overlapping an earlier claim is a
+///    conflict — rejected, never silently re-aimed at another candidate.
+/// 2. **Content-only blocks, in block order.** Each candidate overlapping any
+///    claim is excluded; accept iff exactly one free candidate remains, then
+///    claim it (so later blocks see the new constraint — narrowing chains).
+///    Zero free → "all claimed"; ≥2 free → ambiguous (listing free lines and
+///    the excluded count).
+///
+/// Failures claim nothing (the batch applies all-or-nothing anyway), so a
+/// failed block never hides candidates from later diagnostics; both passes run
+/// to completion and every failure is reported together.
+///
+/// Returns `(claims, resolved)` where `resolved[i]` is the byte offset of the
+/// match for edit `i` — all `Some` when `failures` is empty.
+fn resolve_edits(
+    text: &str,
+    edits: &[EditOp],
+    failures: &mut Vec<edit_match::BatchItem>,
+) -> (Vec<(usize, usize, usize)>, Vec<Option<usize>>) {
     let total = edits.len();
-    let mut failures: Vec<edit_match::BatchItem> = Vec::new();
-    // Byte offset of the chosen match for each edit, in edit order. Fully
-    // populated only when validation succeeds for every edit.
-    let mut resolved: Vec<usize> = Vec::with_capacity(total);
+    let mut claims: Vec<(usize, usize, usize)> = Vec::new();
+    let mut resolved: Vec<Option<usize>> = vec![None; total];
 
+    // ---- Pass 1: line-anchored blocks, in block order --------------------
     for (i, edit) in edits.iter().enumerate() {
-        let start_line = edit.start_line.map(|l| l.0);
-
-        // The whole file is always searched. An anchor never narrows the
-        // search; it only disambiguates between repeated occurrences.
-        let search_text = text.as_str();
-
-        // Every occurrence of `oldText`, as
-        // `(absolute byte offset, 1-based file line)`.
-        let occs: Vec<(usize, usize)> = search_text
-            .match_indices(&edit.old_text)
-            .map(|(off, _)| {
-                (off, crate::edit_match::count_lines(&text[..off]) + 1)
-            })
-            .collect();
-
+        let Some(anchor) = edit.start_line.map(|l| l.0) else {
+            continue;
+        };
+        let occs = occurrences_of(text, &edit.old_text);
         if occs.is_empty() {
-            // No exact match anywhere. Check whether the text exists as a
-            // whitespace-drifted near-match for a better error message.
-            let edit_idx_1 = i + 1;
-            let anchor_info = match start_line {
-                Some(s) => format!(" (anchored near line {})", s),
-                None => String::new(),
-            };
-            let failure = match edit_match::diagnose(&edit.old_text, &text) {
-                Some(mut f) => {
-                    f.ui_view = format!(
-                        "edit #{} oldText not found.{}. {}",
-                        edit_idx_1,
-                        anchor_info,
-                        f.ui_view
-                    );
-                    f
-                }
-                None => {
-                    let mut msg = format!(
-                        "edit #{} oldText not found{}. ",
-                        edit_idx_1,
-                        anchor_info
-                    );
-                    msg.push_str(
-                        "No similar region in the file; re-read the file and re-anchor the edit.",
-                    );
-                    edit_match::EditFailure {
-                        ui_view: msg,
-                        model_view: format!(
-                            "oldText not found{}. No close-enough region in the file; \
-                             please re-read the file and re-anchor your edit. \
-                             Original oldText: '{}'.",
-                            anchor_info,
-                            edit.old_text
-                        ),
-                    }
-                }
-            };
-            failures.push(edit_match::BatchItem {
-                edit_index: i,
-                failure,
-            });
+            failures.push(not_found_failure(i, edit, text));
             continue;
         }
-
-        // Choose which occurrence to replace. Up to 10 candidate line
-        // numbers are collected for any ambiguity diagnostic.
-        let list_lines = |occs: &[(usize, usize)]| -> Vec<usize> {
-            occs.iter().take(10).map(|(_, l)| *l).collect()
-        };
         let chosen: usize = if occs.len() == 1 {
             // Globally unambiguous — the anchor plays no part.
             occs[0].0
-        } else if let Some(anchor) = start_line {
-            // Anchor: nearest occurrence, within a context-scaled tolerance.
+        } else {
             let tol = anchor_tolerance(&edit.old_text);
             let mut ranked: Vec<(usize, usize, usize)> = occs
                 .iter()
-                .map(|(byte, line)| (*byte, *line, line.abs_diff(anchor as usize)))
+                .map(|&(byte, line)| (byte, line, line.abs_diff(anchor as usize)))
                 .collect();
             ranked.sort_by_key(|(_, _, d)| *d);
-            let nearest_d = ranked[0].2;
-            let nearest_line = ranked[0].1;
-            if nearest_d > tol {
+            let (nearest_byte, _nearest_line, d1) = ranked[0];
+            let d2 = ranked[1].2;
+            if !edit_match::anchor_accepts(d1, d2, tol) {
+                let candidates: Vec<(usize, usize)> = ranked
+                    .iter()
+                    .take(10)
+                    .map(|&(_, l, d)| (l, d))
+                    .collect();
                 failures.push(edit_match::BatchItem {
                     edit_index: i,
                     failure: edit_match::EditFailure::anchor_out_of_tolerance(
                         i + 1,
                         &edit.old_text,
                         anchor as usize,
-                        nearest_line,
                         tol,
                         occs.len(),
+                        &candidates,
                     ),
                 });
                 continue;
             }
-            if ranked.iter().filter(|(_, _, d)| *d == nearest_d).count() > 1 {
-                let lines: Vec<usize> = ranked.iter().take(10).map(|(_, l, _)| *l).collect();
+            if ranked.iter().filter(|(_, _, d)| *d == d1).count() > 1 {
+                let lines: Vec<usize> = ranked.iter().take(10).map(|&(_, l, _)| l).collect();
                 failures.push(edit_match::BatchItem {
                     edit_index: i,
                     failure: edit_match::EditFailure::anchor_ambiguous(
@@ -658,22 +700,104 @@ pub async fn edit_file(
                 });
                 continue;
             }
-            ranked[0].0
-        } else {
-            // Repeated text with no anchor to disambiguate: refuse to guess.
+            nearest_byte
+        };
+        // Disjointness: reject (never re-aim) on overlap with an earlier
+        // anchored match.
+        let end = chosen + edit.old_text.len();
+        if let Some(ci) = first_claim_overlap(&claims, chosen, end) {
+            let (other_i, cs, ce) = claims[ci];
+            failures.push(edit_match::BatchItem {
+                edit_index: i,
+                failure: edit_match::EditFailure::overlap_conflict(
+                    i + 1,
+                    &edit.old_text,
+                    span_line_range(text, chosen, end),
+                    other_i + 1,
+                    span_line_range(text, cs, ce),
+                ),
+            });
+            continue;
+        }
+        claims.push((i, chosen, end));
+        resolved[i] = Some(chosen);
+    }
+
+    // ---- Pass 2: content-only blocks, in block order ----------------------
+    for (i, edit) in edits.iter().enumerate() {
+        if edit.start_line.is_some() {
+            continue; // handled (or failed) in pass 1
+        }
+        let occs = occurrences_of(text, &edit.old_text);
+        if occs.is_empty() {
+            failures.push(not_found_failure(i, edit, text));
+            continue;
+        }
+        let old_len = edit.old_text.len();
+        let mut free: Vec<(usize, usize)> = Vec::new(); // (byte, line)
+        let mut excluded = 0usize;
+        let mut claimers: Vec<usize> = Vec::new(); // 1-based edit indices
+        for &(byte, line) in &occs {
+            if let Some(ci) = first_claim_overlap(&claims, byte, byte + old_len) {
+                excluded += 1;
+                let editor = claims[ci].0 + 1;
+                if !claimers.contains(&editor) {
+                    claimers.push(editor);
+                }
+            } else {
+                free.push((byte, line));
+            }
+        }
+        claimers.sort_unstable();
+
+        if free.is_empty() {
+            let lines: Vec<usize> = occs.iter().take(10).map(|&(_, l)| l).collect();
+            failures.push(edit_match::BatchItem {
+                edit_index: i,
+                failure: edit_match::EditFailure::all_candidates_claimed(
+                    i + 1,
+                    &edit.old_text,
+                    occs.len(),
+                    &lines,
+                    &claimers,
+                ),
+            });
+            continue;
+        }
+        if free.len() > 1 {
+            let free_lines: Vec<usize> = free.iter().take(10).map(|&(_, l)| l).collect();
             failures.push(edit_match::BatchItem {
                 edit_index: i,
                 failure: edit_match::EditFailure::non_unique(
                     i + 1,
                     &edit.old_text,
                     occs.len(),
-                    &list_lines(&occs),
+                    &free_lines,
+                    excluded,
                 ),
             });
             continue;
-        };
-        resolved.push(chosen);
+        }
+        let (chosen, _line) = free[0];
+        claims.push((i, chosen, chosen + old_len));
+        resolved[i] = Some(chosen);
     }
+
+    // Stable, block-ordered diagnostics regardless of which pass produced them.
+    failures.sort_by_key(|f| f.edit_index);
+    (claims, resolved)
+}
+
+pub async fn edit_file(
+    path: String,
+    edits: Vec<EditOp>,
+) -> Result<String, ToolError> {
+    let p = get_path_with(&path, true)?;
+    let text = fs::read_to_string(&p).await?;
+    let total = edits.len();
+    let mut failures: Vec<edit_match::BatchItem> = Vec::new();
+
+    let (_claims, resolved) = resolve_edits(&text, &edits, &mut failures);
 
     if !failures.is_empty() {
         // All-or-nothing: do NOT apply any edits when the validation
@@ -685,8 +809,13 @@ pub async fn edit_file(
 
     // Compute all offsets against the original text first, then apply from end
     // to start. Edits target the original file, not the output of previous
-    // edits. `resolved` holds the validated match offset per edit.
+    // edits. `resolved` holds the validated match offset per edit (all Some
+    // when there were no failures).
     debug_assert_eq!(resolved.len(), edits.len());
+    let resolved: Vec<usize> = resolved
+        .into_iter()
+        .map(|o| o.expect("resolve_edits: no failures implies all resolved"))
+        .collect();
     let mut replacements: Vec<(usize, usize, String)> = Vec::new(); // (start, end, new_text)
     for (edit, abs_start) in edits.iter().zip(resolved.iter()) {
         let abs_start = *abs_start;
@@ -3177,14 +3306,17 @@ mod edit_args_wire_tests {
         tokio::fs::write("far.txt", "alpha\nbeta\ngamma\nzzz\nalpha\nbeta\ngamma\n")
             .await
             .unwrap();
-        // Anchor line 3 is >1 away from *both* occurrences (lines 1 and 5).
+        // Anchor line 3 is 2 lines from *both* occurrences (lines 1 and 5):
+        // outside the ±1 tolerance and not decisively nearer (d1 == d2, a tie).
         let blob = "far.txt:3\n@@@OLD\nalpha\nbeta\ngamma\n@@@NEW\nA\nB\nC\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "far.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(
-            out.contains("none within"),
+            out.contains("not decisive"),
             "expected out-of-tolerance failure, got: {out}",
         );
+        // The message must show both distances so the model can act on it.
+        assert!(out.contains("nearest at line"), "got: {out}");
         // Nothing was applied.
         assert_eq!(
             tokio::fs::read_to_string("far.txt").await.unwrap(),
@@ -3224,6 +3356,199 @@ mod edit_args_wire_tests {
         assert_eq!(super::anchor_tolerance("a\nb\nc\nd\ne\nf"), 2);
         assert_eq!(super::anchor_tolerance(&"l\n".repeat(12)), 4);
         assert_eq!(super::anchor_tolerance(&"l\n".repeat(120)), 4);
+    }
+
+    // ---- Skew rule (ratio-based anchor acceptance) ----
+
+    /// 52-line file with `alpha` on lines 1 and 50.
+    async fn write_alpha_lines_1_50() {
+        let mut lines: Vec<String> = (1..=52).map(|i| format!("line {i}")).collect();
+        lines[0] = "alpha".into(); // line 1
+        lines[49] = "alpha".into(); // line 50
+        tokio::fs::write("skew.txt", format!("{}\n", lines.join("\n")))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn anchor_skew_accepts_far_but_decisive() {
+        // Stale anchor: nearest is 2 lines away (tolerance is 0 for a
+        // single-line oldText) — the old rule rejected this, the skew rule
+        // accepts because the nearest is far decisively nearer than the
+        // second (2 vs 51 lines).
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        write_alpha_lines_1_50().await;
+        let blob = "skew.txt:52\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "skew.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(out.starts_with("Replaced"), "expected skew acceptance, got: {out}");
+        let after = tokio::fs::read_to_string("skew.txt").await.unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!(lines[49], "hit", "line 50 should be replaced");
+        assert_eq!(lines[0], "alpha", "line 1 must stay untouched");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn anchor_skew_rejects_near_tie_beyond_tolerance() {
+        // Occurrences on lines 40/45, anchor 43: d1=2, d2=3 — beyond the
+        // zero tolerance and NOT decisively skewed → reject, and the message
+        // must show both distances.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let mut lines: Vec<String> = (1..=50).map(|i| format!("line {i}")).collect();
+        lines[39] = "alpha".into(); // line 40
+        lines[44] = "alpha".into(); // line 45
+        tokio::fs::write("tie.txt", format!("{}\n", lines.join("\n")))
+            .await
+            .unwrap();
+        let blob = "tie.txt:43\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "tie.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(looks_like_edit_failure(&out), "near-tie must be rejected, got: {out}");
+        assert!(out.contains("next-nearest at line 40"), "d2 must be reported: {out}");
+        assert_eq!(
+            tokio::fs::read_to_string("tie.txt").await.unwrap().lines().nth(39).unwrap(),
+            "alpha",
+            "nothing applied",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn anchor_skew_respects_absolute_cap() {
+        // d1 = 65 lines (> cap 60) with a decisively skewed second candidate
+        // (d2 = 199) — still rejected: the cap bounds stale-anchor damage.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        let mut lines: Vec<String> = (1..=265).map(|i| format!("line {i}")).collect();
+        lines[0] = "alpha".into(); // line 1
+        lines[264] = "alpha".into(); // line 265
+        tokio::fs::write("cap.txt", format!("{}\n", lines.join("\n")))
+            .await
+            .unwrap();
+        let blob = "cap.txt:66\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "cap.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(looks_like_edit_failure(&out), "cap must reject, got: {out}");
+        assert!(out.contains("not decisive"), "got: {out}");
+        assert_eq!(
+            tokio::fs::read_to_string("cap.txt").await.unwrap().lines().next().unwrap(),
+            "alpha",
+            "nothing applied",
+        );
+    }
+
+    // ---- Claim-based two-pass resolution ----
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_unique_text_across_blocks_fails_loudly() {
+        // Regression probe: two blocks sharing one *unique* oldText used to
+        // both resolve to the same bytes and corrupt the file. Now the second
+        // block reports that its only candidate is already claimed.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("dup.txt", "hello world\n").await.unwrap();
+        let blob = "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "dup.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
+        assert!(
+            out.contains("already matched by edit(s) #1"),
+            "expected all-candidates-claimed diagnostic, got: {out}",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("dup.txt").await.unwrap(),
+            "hello world\n",
+            "file must be untouched",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn anchored_block_resolves_later_unanchored_duplicate() {
+        // The motivating scenario: the model anchors the SECOND block and
+        // leaves the first un-anchored, expecting elimination. Pass 1 claims
+        // line 3; pass 2's block 1 sees only line 1 free.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("mot.txt", "foo\nbar\nfoo\n").await.unwrap();
+        let blob = "mot.txt\n@@@OLD\nfoo\n@@@NEW\nAAA\n@@@END\n\nmot.txt:3\n@@@OLD\nfoo\n@@@NEW\nBBB\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "mot.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(out.starts_with("Replaced"), "expected success, got: {out}");
+        assert_eq!(
+            tokio::fs::read_to_string("mot.txt").await.unwrap(),
+            "AAA\nbar\nBBB\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pass2_claims_narrow_later_pass2_blocks() {
+        // Transitive narrowing among content-only blocks: block 1's unique
+        // match claims a region containing one of block 2's candidates,
+        // leaving block 2 exactly one free occurrence.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("chain.txt", "foo bar\nbaz\nbar\n").await.unwrap();
+        let blob = "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "chain.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(out.starts_with("Replaced"), "expected success, got: {out}");
+        assert_eq!(
+            tokio::fs::read_to_string("chain.txt").await.unwrap(),
+            "AAA\nbaz\nBBB\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn overlapping_anchored_matches_conflict() {
+        // Two anchored blocks whose chosen ranges intersect: the later one is
+        // rejected (block order), naming both edits and their line ranges.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("ov.txt", "hello world\n").await.unwrap();
+        let blob = "ov.txt:1\n@@@OLD\nhello\n@@@NEW\nA\n@@@END\n\nov.txt:1\n@@@OLD\nhello world\n@@@NEW\nB\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "ov.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(looks_like_edit_failure(&out), "must conflict, got: {out}");
+        assert!(
+            out.contains("overlaps edit #1"),
+            "expected overlap conflict naming edit #1, got: {out}",
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("ov.txt").await.unwrap(),
+            "hello world\n",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_block_claims_nothing_diagnostics_complete() {
+        // Pass-1 failure (anchor rejected) must NOT claim its region: the
+        // later un-anchored block still sees both occurrences free and reports
+        // plain ambiguity. Both diagnostics arrive in one response, in block
+        // order.
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("noclaim.txt", "dup\na\nb\nc\ndup\n").await.unwrap();
+        let blob = "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
+        let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "edits": blob})).await;
+        let out = result.output().render();
+        assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
+        // Pass-1 failure: anchor not decisive (d1=2 at line 1, d2=3 at line 5... anchor 3 → |3-1|=2, |3-5|=2 tie).
+        assert!(out.contains("edit #1"), "pass-1 diagnostic missing: {out}");
+        // Pass-2: no claims exist → plain ambiguity, explicitly NOT claimed.
+        assert!(out.contains("appears 2 times"), "pass-2 diagnostic missing: {out}");
+        assert!(
+            !out.contains("already matched"),
+            "failed block must not have claimed: {out}",
+        );
+        // Block order in the aggregated diagnostics.
+        let e1 = out.find("edit #1").expect("edit #1 present");
+        let e2 = out.find("edit #2").expect("edit #2 present");
+        assert!(e1 < e2, "diagnostics must be in block order: {out}");
+        assert_eq!(
+            tokio::fs::read_to_string("noclaim.txt").await.unwrap(),
+            "dup\na\nb\nc\ndup\n",
+        );
     }
 
     // ---- Schema advertisement ----
