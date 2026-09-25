@@ -46,7 +46,14 @@ impl SlashDotNode for ReplayNode {
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
         let arg = path_args.suffix.trim().to_string();
-        self.app_state.request_replay(arg);
+        // Data-plane inline: replay renders through the shared output
+        // handle; no active session → the same message the old applier
+        // showed. Session and output are both reachable via the slot.
+        let out = self.app_state.with_config(|c| c.output.clone());
+        match self.app_state.session() {
+            Some(s) => crate::agent::handle_replay(&arg, &s, out.as_ref()).await,
+            None => out.display_text("No active session to replay"),
+        }
         SubmitResult::Done(None)
     }
 }
@@ -60,8 +67,8 @@ mod tests {
     };
     use crate::slashdot_menu::HostKey;
 
-    fn test_app_state() -> Arc<AppState> {
-        crate::app_state::AppState::for_test(crate::settings::SettingsStore {
+    fn test_settings() -> crate::settings::SettingsStore {
+        crate::settings::SettingsStore {
             default_model: String::new(),
             security_mode: String::new(),
             tool_call_limit: 0,
@@ -72,7 +79,30 @@ mod tests {
             session_resume_replay_turns: 0,
             llm_compact_prompt: String::new(),
             path: None,
-        })
+        }
+    }
+
+    fn test_app_state() -> Arc<AppState> {
+        crate::app_state::AppState::for_test(test_settings())
+    }
+
+    fn test_app_state_with(output: Arc<dyn crate::output::Output>) -> Arc<AppState> {
+        crate::app_state::AppState::for_test_with_output(test_settings(), output)
+    }
+
+    /// One user message the replay assertions look for.
+    fn replay_entry() -> crate::session::SessionEntry {
+        crate::session::SessionEntry {
+            id: "e1".into(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: crate::session::SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello-replay"}]
+                }),
+            },
+        }
     }
 
     fn build_replay_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
@@ -103,25 +133,35 @@ mod tests {
     }
 
     #[test]
-    fn replay_submit_sets_replay_target() {
-        let app_state = test_app_state();
+    fn replay_submit_without_session_displays_message() {
+        let (out, lines) = crate::output::RecordingOutput::new();
+        let app_state = test_app_state_with(out);
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill in then Enter.
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.replay.as_ref().unwrap().arg, "");
+        let captured = crate::output::RecordingOutput::joined(&lines);
+        assert!(
+            captured.contains("No active session to replay"),
+            "expected the no-session message, got: {captured}"
+        );
     }
 
     #[test]
-    fn replay_with_suffix_sets_replay_target() {
-        let app_state = test_app_state();
+    fn replay_with_suffix_renders_history() {
+        let (out, lines) = crate::output::RecordingOutput::new();
+        let app_state = test_app_state_with(out);
+        let session = crate::agent::test_session_with_entries(vec![replay_entry()]);
+        app_state.set_session(Some(session));
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         let _ = futures::executor::block_on(handle.eval_prompt("replay 10t ", HostKey::Enter, 80));
-        let taken = app_state.take_control();
-        assert_eq!(taken.replay.as_ref().unwrap().arg, "10t");
+        let captured = crate::output::RecordingOutput::joined(&lines);
+        assert!(
+            captured.contains("hello-replay"),
+            "replay must render the session history, got: {captured}"
+        );
     }
 }

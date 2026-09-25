@@ -3935,13 +3935,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
         // Control appliers — each field's sole consumer. `take_control()`
         // above already GC'd the one-shots; run-to-completion means at
         // most one menu submit set them this cycle.
-        if let Some(ri) = control.replay {
-            if let Some(s) = app_state.session() {
-                handle_replay(&ri.arg, &s, config.output.as_ref()).await;
-            } else {
-                config.output.display_text("No active session to replay");
-            }
-        }
+
         if let Some(ri) = control.resume {
             let (session_id, replay_arg) = (ri.session_id, ri.replay_arg);
             let input = if replay_arg.is_empty() {

@@ -48,13 +48,6 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-/// Replay request: `""`, `"5t"`, `"10l"` … — consumed by the loop's replay
-/// applier (needs the active session + output, both loop-owned).
-#[derive(Debug, Clone)]
-pub struct ReplayIntent {
-    pub arg: String,
-}
-
 /// Resume a session by id, optionally replaying the last N turns.
 #[derive(Debug, Clone)]
 pub struct ResumeIntent {
@@ -119,8 +112,6 @@ pub struct ControlConfig {
     pub new_session: Option<String>,
     /// `/session <id> resume [replay]` — load + swap + prefill.
     pub resume: Option<ResumeIntent>,
-    /// `/replay <arg>` — replay from the active session.
-    pub replay: Option<ReplayIntent>,
     /// `/session <id> fork`.
     pub fork: Option<String>,
     /// `/session <id> rename <name>`.
@@ -147,7 +138,6 @@ impl ControlConfig {
             quit: self.quit,
             new_session: self.new_session.take(),
             resume: self.resume.take(),
-            replay: self.replay.take(),
             fork: self.fork.take(),
             rename: self.rename.take(),
             delete_session_ids_after: std::mem::take(&mut self.delete_session_ids_after),
@@ -483,10 +473,6 @@ impl AppState {
         });
     }
 
-    pub fn request_replay(&self, arg: String) {
-        self.state.lock().control.replay = Some(ReplayIntent { arg });
-    }
-
     pub fn request_fork(&self, session_id: String) {
         self.state.lock().control.fork = Some(session_id);
     }
@@ -533,13 +519,23 @@ impl AppState {
 
     // --- test constructor ---
 
-    /// Minimal state bundle for in-crate tests (no-op output, no repo).
+    /// Minimal state bundle for in-crate tests (no repo).
     #[cfg(test)]
     pub fn for_test(settings: SettingsStore) -> Arc<AppState> {
+        Self::for_test_with_output(settings, Arc::new(crate::output::NoOutput))
+    }
+
+    /// Like [`for_test`], with a caller-chosen output — tests assert on
+    /// captured display lines via `RecordingOutput`.
+    #[cfg(test)]
+    pub fn for_test_with_output(
+        settings: SettingsStore,
+        output: Arc<dyn crate::output::Output>,
+    ) -> Arc<AppState> {
         let config = AgentConfig {
             provider: "test".to_string(),
             model: "model".to_string(),
-            output: Arc::new(crate::output::NoOutput),
+            output,
             yolo: false,
             quiet: true,
             thinking_level: None,

@@ -258,6 +258,70 @@ impl Output for NoOutput {
     }
 }
 
+/// Test helper: an `Output` that captures every `display_text` line for
+/// assertions; everything else is a no-op (mirroring `NoOutput`).
+/// Construct the shared handle, then feed it into
+/// `AppShared::for_test_with_output`.
+#[cfg(test)]
+pub struct RecordingOutput {
+    pub lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl RecordingOutput {
+    pub fn new() -> (std::sync::Arc<Self>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            std::sync::Arc::new(RecordingOutput {
+                lines: lines.clone(),
+            }),
+            lines,
+        )
+    }
+
+    /// Joined contents of everything displayed so far.
+    pub fn joined(lines: &std::sync::Mutex<Vec<String>>) -> String {
+        lines.lock().unwrap().join("\n")
+    }
+}
+
+#[cfg(test)]
+impl Output for RecordingOutput {
+    fn display_text(&self, text: &str) {
+        self.lines.lock().unwrap().push(text.to_string());
+    }
+    fn display_markdown(&self, text: &str) {
+        self.lines.lock().unwrap().push(text.to_string());
+    }
+    fn display_plain(&self, text: &str) {
+        self.lines.lock().unwrap().push(text.to_string());
+    }
+    fn display_tool_call(&self, _name: &str, _args: &Value) {}
+    fn display_tool_result(&self, _result: &str) {}
+    fn get_user_input(&self) -> String {
+        String::new()
+    }
+    fn display_error(&self, _error: &str) {}
+    fn display_system(&self, text: &str) {
+        self.lines.lock().unwrap().push(text.to_string());
+    }
+    fn confirm(&self, _message: &str) -> Confirmation {
+        Confirmation::Yes
+    }
+    fn display_separator(&self) {}
+    fn display_thinking(&self, _message: &str) {}
+    fn stop_thinking(&self) {}
+    fn display_header(
+        &self,
+        _provider: &str,
+        _model: &str,
+        _yolo: bool,
+        _limit: usize,
+        _persona: Option<&str>,
+    ) {
+    }
+}
+
 pub struct LogOutput;
 
 impl Output for LogOutput {
