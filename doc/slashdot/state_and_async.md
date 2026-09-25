@@ -366,7 +366,15 @@ still sync); the async conversion rides on top.
    **applied** config (handlers only ever consume the `Arc`s).
 5. **Data-plane inline — appliers collapse.** rename/delete/fork/
    replay/resume/tree_switch/new/compact run in `submit().await`
-   (session + agent + output all reachable); `/model` records
+   (session + agent + output all reachable) **[started: `tree_switch`
+   inline and its `ControlConfig` field deleted — node submit does the
+   move, tests assert the leaf actually moved. Remaining, same pattern:
+   replay (needs an output-capture test helper), rename/delete (slot
+   session + repo; `/clear`'s composed delete goes inline too, removing
+   `delete_session_ids_after`), fork (extract a shared helper from
+   `handle_session_command`), resume/new (target-stamp judgment),
+   compact (needs the DSR resync), plus `/model` inline recording →
+   `model_commit` deletion.]** `/model` records
    `ModelChange` inline → delete `model_commit` + the loop-side
    detection. Editor review works mid-eval (`guard.stop` → editor →
    `guard.start` → confirm — overlay-agnostic) but needs a **DSR cursor
