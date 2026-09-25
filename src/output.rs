@@ -16,7 +16,7 @@ use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
 use libc;
 use crossterm::event::{self, Event, KeyCode};
-use crate::repl::Repl;
+use crate::repl::{Repl, current_term_width};
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
 
@@ -453,8 +453,13 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Terminal width in columns, or 80 if it cannot be determined.
+/// Terminal width in columns. Prefers the width tracked by the in-flight
+/// reader (updated on resize), falls back to querying the terminal, then 80.
 pub fn term_width() -> usize {
+    let w = crate::repl::current_term_width();
+    if w > 20 {
+        return w;
+    }
     crossterm::terminal::size()
         .map(|(w, _)| w as usize)
         .unwrap_or(80)
@@ -996,17 +1001,18 @@ impl ConsoleOutput {
         if live {
             // Reset the incremental parser/renderer for a fresh response and
             // print a leading blank to separate from the user prompt.
+            let current_width = current_term_width();
             let mut parser = self.parser.lock().unwrap();
             *parser = StreamParser::new_gfm_stream();
             let mut theme = Theme::default();
             theme.clickable_links = true; // real TTY path
             let mut renderer = self.renderer.lock().unwrap();
-            *renderer = Renderer::new(theme, term_width());
+            *renderer = Renderer::new(theme, current_width);
             // Reset the thinking parser/renderer and dim state for this response.
             let mut tparser = self.thinking_parser.lock().unwrap();
             *tparser = StreamParser::new_gfm_stream();
             let mut trenderer = self.thinking_renderer.lock().unwrap();
-            *trenderer = Renderer::new(Theme::dimmed(), term_width());
+            *trenderer = Renderer::new(Theme::dimmed(), current_width);
             *self.dim_on.lock().unwrap() = false;
             let mut w = self.writer.lock().unwrap();
             let _ = writeln!(w);
@@ -1459,6 +1465,19 @@ impl Output for ConsoleOutput {
             self.text_buffer.lock().unwrap().push_str(delta);
             return;
         }
+        // Sync terminal width (updated by in-flight reader on resize) so
+        // renderers reflow on the next feed.
+        let current_width = current_term_width();
+        {
+            let mut renderer = self.renderer.lock().unwrap();
+            if renderer.width() != current_width {
+                renderer.set_width(current_width);
+            }
+            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            if trenderer.width() != current_width {
+                trenderer.set_width(current_width);
+            }
+        }
         // While a turn is answer-held (reasoning-capable), buffer the answer so
         // it can be flushed *below* any reasoning that streams after it. The
         // buffer is emitted at the turn boundary (see `flush_held_answer`).
@@ -1522,6 +1541,15 @@ impl Output for ConsoleOutput {
             let _ = err.write_all(delta.as_bytes());
             return;
         }
+        // Sync terminal width (updated by in-flight reader on resize) so
+        // renderers reflow on the next feed.
+        let current_width = current_term_width();
+        {
+            let mut trenderer = self.thinking_renderer.lock().unwrap();
+            if trenderer.width() != current_width {
+                trenderer.set_width(current_width);
+            }
+        }
         // Always-dim inline: render thinking through its own incremental
         // renderer using a faded theme whose `reset` re-applies the dim SGR,
         // so inline formatting (bold/code) does not clear the fading. The
@@ -1566,9 +1594,10 @@ impl Output for ConsoleOutput {
                     // Committed answer text is content, not a blank separator.
                     self.set_blank(false);
                 }
+                let current_width = current_term_width();
                 let mut theme = Theme::default();
                 theme.clickable_links = true; // real TTY path
-                *renderer = Renderer::new(theme, term_width());
+                *renderer = Renderer::new(theme, current_width);
             }
             if !flushed {
                 // Commit thinking (the thinking renderer is kept — post-tool

@@ -23,7 +23,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -39,6 +39,17 @@ pub(crate) static RESUMED: AtomicBool = AtomicBool::new(false);
 /// thread context) or by `read_input`'s loop, which poll this flag.
 extern "C" fn on_sigcont(_sig: i32) {
     RESUMED.store(true, Ordering::SeqCst);
+}
+
+/// Current terminal width in columns, updated by the in-flight reader
+/// on `Event::Resize`. Defaults to 80; renderers read this to pick up
+/// size changes mid-stream.
+pub(crate) static TERMINAL_WIDTH: AtomicUsize = AtomicUsize::new(80);
+
+/// Get the current terminal width (updated by the in-flight reader).
+/// Falls back to 80 if not yet initialized.
+pub(crate) fn current_term_width() -> usize {
+    TERMINAL_WIDTH.load(Ordering::SeqCst).max(20)
 }
 
 /// Register the `SIGCONT` handler exactly once. Safe to call multiple
@@ -92,6 +103,11 @@ pub(crate) fn spawn_in_flight_reader(
         }
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
+                Ok(Event::Resize(w, _h)) => {
+                    // Update the shared terminal width so renderers pick up
+                    // the change on their next streaming call.
+                    TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                }
                 Ok(Event::Key(key)) => {
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
