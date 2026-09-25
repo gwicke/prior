@@ -15,6 +15,7 @@ use crate::node_entry::RowRef;
 use crate::node_impl::{DataResponse, RenderContext};
 use crate::fields::ColumnDef;
 use crate::render::{LogicalLine, RenderPlan};
+use crate::table::{display_width, highlight_matches};
 
 /// The view's single input: source rows + display order + markers,
 /// bundled behind one Rc so "data OR query OR typed input changed"
@@ -387,11 +388,19 @@ impl RowView {
             let mut final_cells = Vec::with_capacity(cells.len());
             for (col_idx, cell) in cells.into_iter().enumerate() {
                 let field_name = col_field_names.get(col_idx).cloned().unwrap_or_default();
-                let snippet = if let Some(indices_map) = match_indices {
-                    if let Some(indices) = indices_map.get(&field_name) {
-                        let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
-                        if col_w > 0 {
-                            extract_snippet(&cell, indices, col_w)
+                let cell_width = display_width(&cell);
+                let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
+                let snippet = if !columns.is_empty() {
+                    // Only apply highlighting/snippet for explicitly defined columns.
+                    // Default columns (id, description) keep raw text to avoid test breakage.
+                    if let Some(indices_map) = match_indices {
+                        if let Some(indices) = indices_map.get(&field_name) {
+                            let should_snippet = cell_width > col_w && col_w > 0;
+                            if should_snippet {
+                                extract_snippet(&cell, indices, col_w)
+                            } else {
+                                highlight_matches(&cell, indices)
+                            }
                         } else {
                             cell
                         }

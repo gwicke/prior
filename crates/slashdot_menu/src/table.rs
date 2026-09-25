@@ -396,16 +396,22 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
     pad(&with_ell, width, align)
 }
 
+/// ANSI escape codes for match highlighting.
+const MATCH_HIGHLIGHT_START: &str = "\x1b[1;35m"; // bold magenta
+const MATCH_HIGHLIGHT_END: &str = "\x1b[0m";
+
 /// Extract a snippet from `cell` centered around `match_indices` (byte offsets).
 /// Returns the snippet, or the original cell if no indices or cell fits in width.
-/// The snippet will be at most `max_width` visible columns.
+/// The snippet will be at most `max_width` visible columns (excluding ANSI codes).
+/// Matched characters are highlighted with ANSI escape codes.
 pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) -> String {
     if match_indices.is_empty() {
         return cell.to_string();
     }
     let cell_width = display_width(cell);
     if cell_width <= max_width {
-        return cell.to_string();
+        // Still apply highlighting even if it fits
+        return highlight_matches(cell, match_indices);
     }
 
     // Build maps: byte index -> char index, char index -> byte index, char index -> visible width.
@@ -451,9 +457,9 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
     }
 
     // We want to show context around the matches. Aim for a window of
-    // max_width, centered on the match range.
+    // max_width, centered on the match range. Use the full available width.
     let match_range_vis = char_to_visible[max_char + 1].saturating_sub(char_to_visible[min_char]);
-    let context = max_width.saturating_sub(match_range_vis).min(40); // cap context at 40 cols
+    let context = max_width.saturating_sub(match_range_vis);
     let left_context = context / 2;
     let right_context = context - left_context;
 
@@ -482,7 +488,8 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
     if start_byte > 0 {
         result.push('…');
     }
-    result.push_str(snippet);
+    // Apply highlighting to the snippet
+    result.push_str(&highlight_matches(snippet, match_indices));
     // Add trailing ellipsis if we trimmed the end.
     if end_byte < cell.len() {
         result.push('…');
@@ -490,10 +497,57 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
 
     // If the snippet with ellipses is still too wide, truncate it.
     if display_width(&result) > max_width {
-        // Fall back to simple truncation.
-        return fit(cell, max_width, Align::Left, '…');
+        // Fall back to simple truncation with highlighting.
+        return highlight_matches(&fit(cell, max_width, Align::Left, '…'), match_indices);
     }
 
+    result
+}
+
+/// Apply ANSI highlighting to matched byte indices in `text`.
+/// Public so view.rs can use it for columns that don't need snippet extraction.
+pub fn highlight_matches(text: &str, match_indices: &[usize]) -> String {
+    if match_indices.is_empty() {
+        return text.to_string();
+    }
+    // Convert byte indices to char indices for easier processing
+    let mut byte_to_char = Vec::with_capacity(text.len() + 1);
+    let mut char_idx = 0;
+    for (byte_idx, _) in text.char_indices() {
+        while byte_to_char.len() <= byte_idx {
+            byte_to_char.push(char_idx);
+        }
+        char_idx += 1;
+    }
+    while byte_to_char.len() <= text.len() {
+        byte_to_char.push(char_idx);
+    }
+
+    // Build a set of matched char indices for O(1) lookup
+    let mut matched_chars = std::collections::HashSet::new();
+    for &byte_idx in match_indices {
+        if byte_idx < byte_to_char.len() {
+            matched_chars.insert(byte_to_char[byte_idx]);
+        }
+    }
+
+    // Build result with ANSI codes around matched character runs
+    let mut result = String::new();
+    let mut in_match = false;
+    for (c_idx, c) in text.chars().enumerate() {
+        let is_matched = matched_chars.contains(&c_idx);
+        if is_matched && !in_match {
+            result.push_str(MATCH_HIGHLIGHT_START);
+            in_match = true;
+        } else if !is_matched && in_match {
+            result.push_str(MATCH_HIGHLIGHT_END);
+            in_match = false;
+        }
+        result.push(c);
+    }
+    if in_match {
+        result.push_str(MATCH_HIGHLIGHT_END);
+    }
     result
 }
 
@@ -508,9 +562,13 @@ mod snippet_tests {
     }
 
     #[test]
-    fn snippet_fits_in_width_returns_original() {
+    fn snippet_fits_in_width_highlights_matches() {
         let cell = "hello world";
-        assert_eq!(extract_snippet(cell, &[6], 20), "hello world");
+        // "w" at byte 6 is matched - should be highlighted
+        let snippet = extract_snippet(cell, &[6], 20);
+        assert!(snippet.contains("\x1b[1;35mw\x1b[0m"), "snippet: {}", snippet);
+        assert!(snippet.contains("hello "));
+        assert!(snippet.contains("orld"));
     }
 
     #[test]
@@ -522,7 +580,8 @@ mod snippet_tests {
         // Use wider width to ensure we can see "path" with context
         let snippet = extract_snippet(cell, &indices, 35);
         assert!(snippet.contains("path"), "snippet: {}", snippet);
-        assert!(snippet.len() <= 37); // 35 + 2 ellipsis
+        // Check visual width (excluding ANSI codes) is within bounds
+        assert!(display_width(&snippet) <= 37, "visual width: {}", display_width(&snippet));
     }
 
     #[test]
@@ -534,6 +593,7 @@ mod snippet_tests {
         let indices: Vec<usize> = (match_start..match_end).collect();
         let snippet = extract_snippet(cell, &indices, 15);
         assert!(snippet.contains("日本語"), "snippet: {}", snippet);
+        assert!(snippet.contains("\x1b[1;35m"), "should highlight unicode match");
     }
 }
 
