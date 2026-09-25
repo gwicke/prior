@@ -604,7 +604,7 @@ impl Repl {
     /// confined to the input row and below, so the greeter / status / divider /
     /// session content above the input is never touched (plan §3.7). The pop-up
     /// uses at most 2/3 of the terminal height (≥ 1 line).
-    pub fn read_input(
+    pub async fn read_input(
         &mut self,
         prompt: &str,
         initial_buffer: Option<&str>,
@@ -812,7 +812,7 @@ impl Repl {
                 }
                 let result = {
                     let handle = v25_handle.as_mut().unwrap();
-                    Self::v25_eval(handle, &buf_text, editor.cursor, key)
+                    Self::v25_eval(handle, &buf_text, editor.cursor, key).await
                 };
                 match result {
                     V25Frame::Continue(plan, prompt) => {
@@ -1463,7 +1463,7 @@ impl Repl {
     /// report the chain on stderr (debugging detail) and bail out with
     /// `DoneError` carrying the same message — never spin, never
     /// synthesize a plan.
-    fn v25_eval(
+    async fn v25_eval(
         handle: &mut crate::slashdot_menu::SlashDotHandle<'_>,
         buf: &str,
         cursor_char: usize,
@@ -1485,7 +1485,9 @@ impl Repl {
                 .map(|(b, _)| b)
                 .unwrap_or(buf.len());
             let cursor = byte_in_buf.saturating_sub(buf.len() - line.len());
-            match handle.eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+            match handle
+                .eval_prompt_with_cursor(&line, key, crate::output::term_width(), cursor)
+                .await
             {
                 MenuResult::ContinuePrompt(new_prompt) => {
                     chain.push(format!("/{}", new_prompt));

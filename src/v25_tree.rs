@@ -693,7 +693,7 @@ impl SlashDotNode for TreeListNode {
         // Refresh the cache (cheap Rc::ptr_eq when unchanged) and render
         // from the row — the same data the listing and fuzzy search use
         // (design: "header() → entry detail from the same cached row data").
-        let Ok(resp) = self.data(0, path_args) else {
+        let Ok(resp) = self.data(0, path_args).await else {
             return vec![format!("Entry not found: {}", entry_id)];
         };
         let Some(row) = resp.rows.iter().find(|r| r.id == entry_id) else {
@@ -1112,7 +1112,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.rows.is_empty(), "empty tree → empty listing");
@@ -1138,7 +1138,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2, "should have user + assistant rows");
@@ -1185,20 +1185,20 @@ mod tests {
         // 1. Filtered leaf overview: u1 is a branch parent (no `tags`
         //    field → dropped); only u2/u3 survive.
         let (plan, prompt) =
-            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80)));
         assert_eq!(plan.rows.len(), 2, "filter must show only leaves: {:?}", plan.rows);
         assert_eq!(prompt, "tree .tags:leaf");
 
         // 2. Cursor to the second leaf, Tab drills into it.
-        let _ = handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80);
+        let _ = futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80));
         let (_, prompt) =
-            expect_continue(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80)));
         assert_eq!(prompt, "tree u3 ", "drill appends cursored id + space");
 
         // 3. Esc drills out: §5.1 step 1 restores the stored filter in
         //    the prompt (not a bare id) with the cursor back on u3.
         let (plan, prompt) =
-            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80)));
         assert_eq!(prompt, "tree .tags:leaf",
             "Esc must restore the filter view_args into the prompt");
         assert_eq!(plan.rows.len(), 2,
@@ -1210,7 +1210,7 @@ mod tests {
         // 4. A cursor move after the restore stays in the filtered
         //    view (the bug: it fell back to the full listing).
         let (plan, _) =
-            expect_continue(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80));
+            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80)));
         assert_eq!(plan.rows.len(), 2,
             "filtered view must survive cursor moves: {:?}", plan.rows);
     }
@@ -1232,8 +1232,8 @@ mod tests {
             args: Default::default(),
         };
 
-        let r1 = tree_node.data(1, &path_args).unwrap();
-        let r2 = tree_node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
+        let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         assert!(Rc::ptr_eq(&r1, &r2),
             "same tree + same leaf should return same Rc");
     }
@@ -1253,7 +1253,7 @@ mod tests {
             args: Default::default(),
         };
 
-        let r1 = tree_node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
 
         // Change the tree.
         let new_tree = vec![
@@ -1262,7 +1262,7 @@ mod tests {
         ];
         app_state.set_raw_tree(Arc::new(new_tree));
 
-        let r2 = tree_node.data(1, &path_args).unwrap();
+        let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         assert!(!Rc::ptr_eq(&r1, &r2),
             "changed tree should return new Rc");
         assert_eq!(r2.rows.len(), 2, "new tree has two entries");
@@ -1286,9 +1286,9 @@ mod tests {
         };
 
         // Trigger data() first to populate the cache.
-        let _ = tree_node.data(0, &path_args);
+        let _ = futures::executor::block_on(tree_node.data(0, &path_args));
 
-        let header = tree_node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(tree_node.header(&path_args, &RenderContext { term_width: 80 }));
         let joined = header.join("\n");
         assert!(joined.contains("hello"), "header should contain message text: {}", joined);
         assert!(joined.contains("world"), "header should contain full text: {}", joined);
@@ -1320,7 +1320,7 @@ mod tests {
         )];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let row = resp
             .rows
             .iter()
@@ -1347,7 +1347,7 @@ mod tests {
         )];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
@@ -1376,7 +1376,7 @@ mod tests {
         )];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
@@ -1409,7 +1409,7 @@ mod tests {
         let mut tree_node = TreeListNode::new(app_state.clone());
 
         // Desc carries the truncated "from" context AND the summary.
-        let resp = tree_node.data(0, &tree_path(&["tree"])).expect("data");
+        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let row = resp.rows.iter().find(|r| r.id == "c1").expect("c1 row");
         let desc = row.description.clone().unwrap_or_default();
         assert!(desc.contains("[COMPACT] from kept context line"),
@@ -1419,8 +1419,8 @@ mod tests {
 
         // Header renders from that row: marker with timestamp, then
         // from-context, then summary.
-        let header = tree_node.header(&tree_path(&["tree", "c1"]),
-            &RenderContext { term_width: 120 });
+        let header = futures::executor::block_on(tree_node.header(&tree_path(&["tree", "c1"]),
+            &RenderContext { term_width: 120 }));
         let joined = header.join("\n");
         assert!(joined.contains("[COMPACT 2025-01-02"),
             "header timestamped marker: {}", joined);
@@ -1442,7 +1442,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = tree_node.submit(1, &path_args);
+        let _ = futures::executor::block_on(tree_node.submit(1, &path_args));
         let taken = app_state.take_control();
         assert_eq!(taken.tree_switch.as_deref(), Some("some-entry"));
     }
@@ -1465,7 +1465,7 @@ mod tests {
         let mut handle = menu.get_handle();
 
         // 1. Listing shows entries.
-        let listing = handle.eval_prompt("tree ", HostKey::None, 80);
+        let listing = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match &listing {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.rows.is_empty(), "tree listing should have rows");
@@ -1474,15 +1474,15 @@ mod tests {
         }
 
         // 2. Drill into u1.
-        let r = handle.eval_prompt("tree u1 ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into entry");
 
         // 3. Drill into switch.
-        let r = handle.eval_prompt("tree u1 switch ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into switch");
 
         // 4. Enter → submit.
-        let _ = handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(
             taken.tree_switch.as_deref(),
@@ -1511,7 +1511,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 1);
@@ -1545,7 +1545,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert!(plan.rows.is_empty(),
@@ -1570,7 +1570,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
             "active_ids should contain the leaf entry");
     }
@@ -1598,7 +1598,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.active_ids, vec!["u2".to_string()],
             "active_ids should find leaf deep in tree");
     }
@@ -1614,7 +1614,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = futures::executor::block_on(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
         let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
@@ -1632,7 +1632,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = futures::executor::block_on(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
         let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
@@ -1650,7 +1650,7 @@ mod tests {
             suffix: "summarize the key decisions".into(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = futures::executor::block_on(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
         let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
@@ -1668,7 +1668,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.submit(1, &path_args);
+        let result = futures::executor::block_on(node.submit(1, &path_args));
         assert!(matches!(result, SubmitResult::Done(None)));
         let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
@@ -1694,23 +1694,23 @@ mod tests {
         let mut handle = menu.get_handle();
 
         // 1. Listing.
-        let listing = handle.eval_prompt("tree ", HostKey::None, 80);
+        let listing = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         assert!(matches!(listing, MenuResult::Continue(_, _)));
 
         // 2. Drill into u1.
-        let r = handle.eval_prompt("tree u1 ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 3. Drill into compact.
-        let r = handle.eval_prompt("tree u1 compact ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 4. Drill into manual.
-        let r = handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 5. Enter → submit.
-        let _ = handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         let c = taken.tree_compact.as_ref().expect("tree_compact target");
         assert_eq!(c.target_id, "u1");
@@ -1728,7 +1728,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(!header.is_empty());
         assert!(header[0].contains("Manual"), "header mentions manual: {}", header[0]);
     }
@@ -1742,7 +1742,7 @@ mod tests {
             suffix: "my custom prompt".into(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(header.iter().any(|l| l.contains("my custom prompt")),
             "header should contain the prompt text: {:?}", header);
     }
@@ -1756,7 +1756,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = node.header(&path_args, &RenderContext { term_width: 80 });
+        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(header.iter().any(|l| l.contains("default")),
             "header should mention default: {:?}", header);
     }
@@ -1793,7 +1793,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.rows.len(), 6, "should have 6 visible entries");
 
         let mut flat = Vec::new();
@@ -1834,7 +1834,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
@@ -1874,7 +1874,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 6);
@@ -1951,7 +1951,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         eprintln!("=== DataResponse rows ===");
         for (i, row) in resp.rows.iter().enumerate() {
             let desc = row.description.clone().unwrap_or_default();
@@ -2031,7 +2031,7 @@ mod tests {
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("tree ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // Print for debugging
@@ -2099,7 +2099,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
 
         let mut flat = Vec::new();
         for row in resp.rows.iter() {
@@ -2222,7 +2222,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let resp = tree_node.data(0, &path_args).unwrap();
+        let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         // Only 2 visible rows: user + assistant
         assert_eq!(resp.rows.len(), 2, "should have 2 visible entries");
         let u1_desc = resp.rows[0].description.clone().unwrap_or_default();
@@ -2241,7 +2241,7 @@ mod tests {
         app_state.set_leaf_id(Some("msg-42".into()));
         let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
     }
 
@@ -2251,7 +2251,7 @@ mod tests {
         // leaf_id is None (no session).
         let mut node = CompactNode { app_state: app_state.clone() };
         let path = vec!["compact".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, None);
     }
 
@@ -2261,7 +2261,7 @@ mod tests {
         let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path = vec!["tree".to_string(), "msg-1".to_string(),
                         "compact".to_string(), "prompt".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some(
             "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
         ));

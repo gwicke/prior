@@ -3816,6 +3816,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     config.output.cursor_row(),
                     config.output.as_ref(),
                 )
+                .await
             }
             None => Some(InputAction::Submit(config.output.get_user_input())),
         };

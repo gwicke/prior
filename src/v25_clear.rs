@@ -83,7 +83,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -102,8 +102,8 @@ mod tests {
         app_state.set_current_session_id("outgoing-1".into());
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("clear ", HostKey::None, 80);
-        let _ = handle.eval_prompt("clear ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("clear ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("clear ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.new_session.as_deref(), Some(""));
         assert_eq!(taken.delete_session_ids_after, vec!["outgoing-1".to_string()]);
@@ -114,8 +114,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80);
-        let _ = handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.new_session.as_deref(), Some("my-fresh-start"));
         // No current session id → nothing to delete.

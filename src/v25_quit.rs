@@ -76,7 +76,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -94,8 +94,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("quit ", HostKey::None, 80);
-        let _ = handle.eval_prompt("quit ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("quit ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("quit ", HostKey::Enter, 80));
         assert!(app_state.should_quit(), "submit must latch the quit target");
         // Latching: a GC drain never clears it.
         let taken = app_state.take_control();
@@ -108,8 +108,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_quit_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("quit ", HostKey::None, 80);
-        match handle.eval_prompt("quit ", HostKey::None, 80) {
+        let _ = futures::executor::block_on(handle.eval_prompt("quit ", HostKey::None, 80));
+        match futures::executor::block_on(handle.eval_prompt("quit ", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let header: String = plan.detail.iter()
                     .map(|l| l.0.clone())

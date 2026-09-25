@@ -346,11 +346,16 @@ still sync); the async conversion rides on top.
    snapshots → `update_cycle_view` writes. Also landed: `repl`/`agent`
    wiring (convergence step + per-field control appliers),
    `slash_menu_bridge.rs` deleted. Tests green (639 + 2 ignored).
-3. **Async conversion.** `#[async_trait(?Send)]` on `SlashDotNode` (no
-   parameter change) + the eval path; `Repl::read_input` → `v25_eval`
-   become async (the only production chain — everything else is
-   `#[cfg(test)]`); test executor (`futures::executor::block_on`
-   dev-dep) + mechanical `.await`.
+3. **Async conversion** **[done].** `#[async_trait(?Send)]` on
+   `SlashDotNode` + all 38 impls (no signature change beyond `async`);
+   the whole engine eval path is async (`node_data`, `node_traverse*`,
+   `handle_leaf/listing`, `refresh_data`, `view_plan`, `completion_pass`,
+   `eval_prompt*`) with its two recursive cycles boxed (`Box::pin`, one
+   manual future each — E0733); `Repl::read_input` → `v25_eval` are
+   async (the only production chain). Sync tests stay sync: call sites
+   in `#[cfg(test)]` regions are wrapped in `futures::executor::block_on`
+   (scripted, paren-balanced, one descending insertion pass) — 242
+   wraps; test bodies and helpers unchanged.
 4. **Data-plane inline.** rename/delete/fork/replay/settings-save run in
    `submit().await`; `/model` records `ModelChange` inline → delete
    `model_commit` + the loop-side detection; delete the `AsyncOp`

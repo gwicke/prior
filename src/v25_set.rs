@@ -285,7 +285,7 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Root listing shows the "set" row.
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert!(texts.iter().any(|t| t.contains("set")));
@@ -300,14 +300,14 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Tab into /set → should show settings with value column.
-        match h.eval_prompt("", HostKey::Tab, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::Tab, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.starts_with("set"), "should drill into set, got: {}", prompt);
             }
             other => panic!("expected Continue after Tab, got {:?}", other),
         }
         // Now at /set — should show settings rows with values.
-        match h.eval_prompt("set ", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("set ", HostKey::None, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 assert!(!plan.rows.is_empty(), "/set should show settings rows");
                 // Check that value forwarding populated the value column.
@@ -325,7 +325,7 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Drill into security_mode.
-        let result = h.eval_prompt("set security_mode ", HostKey::None, 80);
+        let result = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::None, 80));
         if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) = result {
             // Should show yolo/confirm rows.
             let texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
@@ -334,11 +334,11 @@ mod tests {
         }
         // The cursor follows the active row ("confirm" is current).
         // Tab drills into the highlighted row; Enter on it persists.
-        match h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80) {
+        match futures::executor::block_on(h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("security_mode"),
                     "should drill into a value, got: {}", prompt);
-                match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+                match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         // The active value was resubmitted (confirm).
                         assert_eq!(
@@ -359,12 +359,12 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Move cursor to "yolo" (Down from "confirm" position).
-        let _ = h.eval_prompt("set security_mode ", HostKey::None, 80);
-        let _ = h.eval_prompt("set security_mode ", HostKey::MoveCursor(1), 80);
-        match h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80) {
+        let _ = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::None, 80));
+        let _ = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::MoveCursor(1), 80));
+        match futures::executor::block_on(h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
                 assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
-                match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+                match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         assert_eq!(app_state.with_settings(|s| s.security_mode.clone()), "yolo");
                     }
@@ -381,7 +381,7 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Type a value for tool_call_limit directly.
-        match h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80) {
+        match futures::executor::block_on(h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                 assert_eq!(app_state.with_settings(|s| s.tool_call_limit), 42);
             }
@@ -395,7 +395,7 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Invalid value for tool_call_limit.
-        match h.eval_prompt("set tool_call_limit 0", HostKey::Enter, 80) {
+        match futures::executor::block_on(h.eval_prompt("set tool_call_limit 0", HostKey::Enter, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, _) => {
                 assert!(msg.unwrap_or_default().contains("greater than 0"),
                     "should show validation error");
@@ -414,7 +414,7 @@ mod tests {
             app_state: app_state.clone(),
         };
         let path = vec!["set".to_string(), "tool_call_limit".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("set tool_call_limit 50".to_string()));
     }
 }

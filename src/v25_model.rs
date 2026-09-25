@@ -342,7 +342,7 @@ mod tests {
 
     fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does.
-        h.eval_prompt_resolved(prompt, key, 80)
+        futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
 
     fn test_app_state() -> Arc<AppState> {
@@ -425,7 +425,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args);
+        let result = futures::executor::block_on(node.data(1, &path_args));
         assert!(result.is_ok(), "data() should not error");
     }
 
@@ -438,8 +438,8 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let r1 = node.data(1, &path_args).unwrap();
-        let r2 = node.data(1, &path_args).unwrap();
+        let r1 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
+        let r2 = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         // Same generation → same Rc.
         assert!(Rc::ptr_eq(&r1, &r2));
     }
@@ -472,7 +472,7 @@ mod tests {
             suffix: " ".into(),
             args: Default::default(),
         };
-        match node.submit(1, &path_args) {
+        match futures::executor::block_on(node.submit(1, &path_args)) {
             SubmitResult::Done(_) => {}
             _ => panic!("expected Done"),
         }

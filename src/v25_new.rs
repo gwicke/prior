@@ -81,7 +81,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let text: String = plan.rows.iter()
@@ -99,8 +99,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("new ", HostKey::None, 80);
-        let _ = handle.eval_prompt("new ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("new ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("new ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.new_session.as_deref(), Some(""));
     }
@@ -110,8 +110,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("new my-session ", HostKey::None, 80);
-        let _ = handle.eval_prompt("new my-session ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("new my-session ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.new_session.as_deref(), Some("my-session"));
     }

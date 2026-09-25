@@ -86,7 +86,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("replay ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let header: String = plan.detail.iter()
@@ -108,8 +108,8 @@ mod tests {
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill in then Enter.
-        let _ = handle.eval_prompt("replay ", HostKey::None, 80);
-        let _ = handle.eval_prompt("replay ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.replay.as_ref().unwrap().arg, "");
     }
@@ -119,8 +119,8 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_replay_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("replay ", HostKey::None, 80);
-        let _ = handle.eval_prompt("replay 10t ", HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
+        let _ = futures::executor::block_on(handle.eval_prompt("replay 10t ", HostKey::Enter, 80));
         let taken = app_state.take_control();
         assert_eq!(taken.replay.as_ref().unwrap().arg, "10t");
     }

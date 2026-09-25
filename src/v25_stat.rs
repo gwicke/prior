@@ -116,7 +116,7 @@ mod tests {
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill into stat leaf (trailing space).
-        let result = handle.eval_prompt("stat ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let header_text: String = plan.detail.iter()
@@ -136,7 +136,7 @@ mod tests {
         app_state.set_model("test:model");
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("stat ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let header_text: String = plan.detail.iter()
@@ -158,7 +158,7 @@ mod tests {
         app_state.update_cycle_view(String::new(), Default::default(), 42_000, Arc::new(Vec::new()), None);
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("stat ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 let header_text: String = plan.detail.iter()
@@ -180,10 +180,10 @@ mod tests {
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
         // Drill into leaf first.
-        let _ = handle.eval_prompt("stat ", HostKey::None, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));
         // Enter → submit → NewPath("") → host re-derives from the
         // rewritten prompt (resolved here like repl::v25_eval does).
-        let r = handle.eval_prompt_resolved("stat ", HostKey::Enter, 80);
+        let r = futures::executor::block_on(handle.eval_prompt_resolved("stat ", HostKey::Enter, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
     }
 
@@ -193,8 +193,8 @@ mod tests {
         app_state.set_model("test:model");
         let mut menu = build_stat_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = handle.eval_prompt("stat ", HostKey::None, 80);
-        let result = handle.eval_prompt_resolved("stat ", HostKey::Esc, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt("stat ", HostKey::None, 80));
+        let result = futures::executor::block_on(handle.eval_prompt_resolved("stat ", HostKey::Esc, 80));
         assert!(matches!(result, MenuResult::Continue(_, _)));
     }
 }

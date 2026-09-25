@@ -150,7 +150,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let ids: Vec<&str> = plan
                     .rows

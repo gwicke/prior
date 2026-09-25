@@ -681,7 +681,7 @@ mod tests {
         let mut handle = menu.get_handle();
 
         // 1. Parent listing shows the session row.
-        let listing = handle.eval_prompt("session ", HostKey::None, 80);
+        let listing = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
         match &listing {
             MenuResult::Continue(plan, _) => {
                 assert!(
@@ -694,16 +694,16 @@ mod tests {
 
         // 2. Drill into the session (bare-id entry with trailing space).
         let line = format!("session {} ", uuid);
-        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into session");
 
         // 3. Drill into `resume`.
         let line = format!("session {} resume ", uuid);
-        let r = handle.eval_prompt(&line, HostKey::None, 80);
+        let r = futures::executor::block_on(handle.eval_prompt(&line, HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into resume");
 
         // 4. Enter → submit.
-        let _ = handle.eval_prompt(&line, HostKey::Enter, 80);
+        let _ = futures::executor::block_on(handle.eval_prompt(&line, HostKey::Enter, 80));
         let taken = app_state.take_control();
         let resume = taken
             .resume
@@ -719,7 +719,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("session ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, listing should be empty.
@@ -734,7 +734,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_session_menu(&app_state);
         let mut handle = menu.get_handle();
-        let result = handle.eval_prompt("session ", HostKey::None, 80);
+        let result = futures::executor::block_on(handle.eval_prompt("session ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
                 // With no repo, the table header row should still render
@@ -759,7 +759,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args).unwrap();
+        let result = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         assert!(
             result.rows.is_empty(),
             "resume should be hidden for current session"
@@ -776,7 +776,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.data(1, &path_args).unwrap();
+        let result = futures::executor::block_on(node.data(1, &path_args)).unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].id, "resume");
     }
@@ -791,7 +791,7 @@ mod tests {
             suffix: " 10t ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
+        let _ = futures::executor::block_on(node.submit(1, &path_args));
         let taken = app_state.take_control();
         let resume = taken.resume.as_ref().expect("resume target");
         assert_eq!(resume.session_id, "some-uuid");
@@ -807,7 +807,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
+        let _ = futures::executor::block_on(node.submit(1, &path_args));
         let taken = app_state.take_control();
         assert_eq!(taken.fork.as_deref(), Some("some-uuid"));
     }
@@ -821,7 +821,7 @@ mod tests {
             suffix: " my-name ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
+        let _ = futures::executor::block_on(node.submit(1, &path_args));
         let taken = app_state.take_control();
         let rename = taken.rename.as_ref().expect("rename target");
         assert_eq!(rename.session_id, "some-uuid");
@@ -837,7 +837,7 @@ mod tests {
             suffix: "  ".to_string(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
+        let _ = futures::executor::block_on(node.submit(1, &path_args));
         let taken = app_state.take_control();
         let rename = taken.rename.as_ref().expect("rename target");
         assert!(rename.new_name.is_empty(), "empty suffix should clear name");
@@ -853,7 +853,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.prepare(1, &path_args);
+        let result = futures::executor::block_on(node.prepare(1, &path_args));
         match result {
             SubmitResult::Done(Some(msg)) => {
                 assert!(msg.contains("Cannot delete"));
@@ -872,7 +872,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = node.prepare(1, &path_args);
+        let result = futures::executor::block_on(node.prepare(1, &path_args));
         assert!(
             matches!(result, SubmitResult::Prepared),
             "should allow delete of non-current session"
@@ -888,7 +888,7 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let _ = node.submit(1, &path_args);
+        let _ = futures::executor::block_on(node.submit(1, &path_args));
         let taken = app_state.take_control();
         assert_eq!(
             taken.delete_session_ids_after,
@@ -1018,7 +1018,7 @@ mod tests {
         use crate::slashdot_menu::node_impl::SlashDotNode;
         let mut node = SessionListingNode;
         let path = vec!["session".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session .path:.".to_string()));
     }
 
@@ -1029,7 +1029,7 @@ mod tests {
         let app_state = test_app_state();
         let mut node = SessionRenameNode { app_state: app_state.clone() };
         let path = vec!["session".to_string(), "abc123".to_string(), "rename".to_string()];
-        let result = node.drill_rewrite(&PathArgs::new(path, " "));
+        let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("session abc123 rename ".to_string()));
     }
 }

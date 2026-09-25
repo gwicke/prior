@@ -487,7 +487,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
 
         // Table headers render UPPERCASE (table.rs).
         let th = header_of(&plan).to_uppercase();
@@ -516,7 +516,7 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Root listing: source cell shows the disabled marker.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("cfg [DISABLED]")),
@@ -524,7 +524,7 @@ mod tests {
         );
 
         // Drilled mapping level: the action row is `restore`.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox /cfg-ro ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-ro ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("re-enable this mapping")),
@@ -549,18 +549,18 @@ mod tests {
 
         // Config binding: exclude note + restore mention.
         let (plan, _) =
-            expect_continue(h.eval_prompt("sandbox /cfg-rw remove ", HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-rw remove ", HostKey::None, 100)));
         let detail = detail_of(&plan).join("\n");
         assert!(detail.contains("excludes it"), "{detail:?}");
         assert!(detail.contains("restore"), "{detail:?}");
 
         // Session binding: session note, no config wording.
         let host_s = host.to_string_lossy().into_owned();
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox {} remove ", host_s),
             HostKey::None,
             100,
-        ));
+        )));
         let detail = detail_of(&plan).join("\n");
         assert!(detail.contains("Session binding"), "{detail:?}");
     }
@@ -586,9 +586,9 @@ mod tests {
         };
 
         // Session bind → Remove.
-        assert!(matches!(node.prepare(1, &pa(&host_s)), SubmitResult::Prepared));
+        assert!(matches!(futures::executor::block_on(node.prepare(1, &pa(&host_s))), SubmitResult::Prepared));
         assert!(matches!(
-            node.submit(1, &pa(&host_s)),
+            futures::executor::block_on(node.submit(1, &pa(&host_s))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
@@ -598,7 +598,7 @@ mod tests {
 
         // Active config bind → Exclude.
         assert!(matches!(
-            node.submit(1, &pa("/cfg-ro")),
+            futures::executor::block_on(node.submit(1, &pa("/cfg-ro"))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
@@ -609,7 +609,7 @@ mod tests {
         // Excluded config bind → Restore.
         crate::sandbox_state::exclude("/cfg-ro").unwrap();
         assert!(matches!(
-            node.submit(1, &pa("/cfg-ro")),
+            futures::executor::block_on(node.submit(1, &pa("/cfg-ro"))),
             SubmitResult::Done(None)
         ));
         assert!(matches!(
@@ -618,7 +618,7 @@ mod tests {
         ));
 
         // Unknown binding → stay-open error.
-        match node.submit(1, &pa("/no/such/binding")) {
+        match futures::executor::block_on(node.submit(1, &pa("/no/such/binding"))) {
             SubmitResult::Error(msg) => assert!(msg.contains("mapping not found"), "{msg}"),
             _other => panic!("expected Error, got non-error result"),
         }
@@ -638,17 +638,17 @@ mod tests {
         // The arming step is a prompt-only rewrite; resolving it (as
         // repl::v25_eval does) re-derives the rendered confirm frame
         // from the rewritten prompt.
-        let (_, prompt) = expect_continue(h.eval_prompt_resolved(
+        let (_, prompt) = expect_continue(futures::executor::block_on(h.eval_prompt_resolved(
             "sandbox /cfg-ro remove",
             HostKey::Enter,
             100,
-        ));
+        )));
         assert_eq!(prompt, "sandbox /cfg-ro remove ", "{prompt:?}");
         assert!(
             take_sandbox_op(&app_state).is_none(),
             "first Enter must only arm the confirm"
         );
-        let (plan, _) = expect_continue(h.eval_prompt(&prompt, HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(&prompt, HostKey::None, 100)));
         assert!(
             detail_of(&plan).join("\n").contains("excludes it"),
             "confirm frame must show the header: {:?}",
@@ -656,7 +656,7 @@ mod tests {
         );
 
         // Enter #2: submit → Exclude op.
-        let result = h.eval_prompt(&prompt, HostKey::Enter, 100);
+        let result = futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 100));
         assert!(
             matches!(result, MenuResult::DoneSuccess(..)),
             "second Enter should submit: {:?}",
@@ -676,7 +676,7 @@ mod tests {
         let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox add ", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ", HostKey::None, 100)));
         let rows = rows_of(&plan);
         assert!(rows.iter().any(|r| r.contains("ro")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("rw")), "{rows:?}");
@@ -712,21 +712,21 @@ mod tests {
 
         // 0 args → drill guard.
         let (pa, _) = mk("ro", "");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert_eq!(msg, "host path required"),
             _other => panic!("expected Error for empty args"),
         }
 
         // ≥3 args → rejected.
         let (pa, _) = mk("ro", " a b c");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert!(msg.contains("expected:"), "{msg}"),
             _other => panic!("expected Error for 3 args"),
         }
 
         // Nonexistent host → stay-open error.
         let (pa, _) = mk("ro", " /nonexistent-picocode-xyz-123");
-        match node.submit(1, &pa) {
+        match futures::executor::block_on(node.submit(1, &pa)) {
             SubmitResult::Error(msg) => assert!(msg.contains("does not exist"), "{msg}"),
             _other => panic!("expected Error for missing host"),
         }
@@ -740,7 +740,7 @@ mod tests {
         let host_s = td.path().to_string_lossy().into_owned();
         let suffix = format!(" {}", host_s);
         let (pa, _) = mk("rw", &suffix);
-        assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
+        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
         assert!(matches!(
             take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
@@ -751,7 +751,7 @@ mod tests {
         let dst = "/some/sandbox/dst".to_string();
         let suffix = format!(" {} {}", host_s, dst);
         let (pa, _) = mk("ro", &suffix);
-        assert!(matches!(node.submit(1, &pa), SubmitResult::Done(None)));
+        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
         assert!(matches!(
             take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
@@ -770,7 +770,7 @@ mod tests {
         // Enter on the bare `ro` id drills into the param leaf with an
         // empty suffix → submit guard fires → stay-open error frame.
         let (plan, prompt) =
-            expect_continue(h.eval_prompt("sandbox add ro", HostKey::Enter, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro", HostKey::Enter, 100)));
         assert_eq!(prompt, "sandbox add ro ", "{prompt:?}");
         let detail = detail_of(&plan);
         assert_eq!(detail.len(), 3, "{detail:?}"); // error + two header lines
@@ -800,7 +800,7 @@ mod tests {
 
         // Arg 1 → host listing, "Host path" label.
         let (plan, _) =
-            expect_continue(h.eval_prompt(&format!("sandbox add ro {}/", p1), HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {}/", p1), HostKey::None, 100)));
         let th = header_of(&plan).to_uppercase();
         assert!(!th.is_empty(), "arg-1 completion must open a dialog");
         assert!(th.contains("HOST PATH"), "{th:?}");
@@ -809,11 +809,11 @@ mod tests {
 
         // Arg 2 → sandbox-routed completion, "Sandbox path" label
         // (no sandbox configured ⇒ host fallback, serial setup).
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox add ro {p1} {p2}/"),
             HostKey::None,
             100,
-        ));
+        )));
         let th = header_of(&plan).to_uppercase();
         assert!(th.contains("SANDBOX PATH"), "{th:?}");
         let rows = rows_of(&plan);
@@ -823,11 +823,11 @@ mod tests {
         );
 
         // ≥2 committed → inert (no dialog).
-        let (plan, _) = expect_continue(h.eval_prompt(
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
             &format!("sandbox add ro {p1} {p2}/ extra"),
             HostKey::None,
             100,
-        ));
+        )));
         assert!(header_of(&plan).is_empty(), "3rd arg must be inert");
     }
 
@@ -845,7 +845,7 @@ mod tests {
 
         // Non-exact stem → dialog with the file.
         let (plan, _) =
-            expect_continue(h.eval_prompt(&format!("sandbox add ro {p}/so"), HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/so"), HostKey::None, 100)));
         assert!(
             header_of(&plan).to_uppercase().contains("HOST PATH"),
             "dialog expected"
@@ -858,7 +858,7 @@ mod tests {
 
         // Exact file → all candidates exact → no dialog (header only).
         let (plan, _) = expect_continue(
-            h.eval_prompt(&format!("sandbox add ro {p}/solo.txt"), HostKey::None, 100),
+            futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/solo.txt"), HostKey::None, 100)),
         );
         assert!(
             header_of(&plan).is_empty(),
@@ -872,12 +872,12 @@ mod tests {
 
         // Gate: ordinary bare word → inert, no dialog.
         let (plan, _) =
-            expect_continue(h.eval_prompt("sandbox add ro plainword", HostKey::None, 100));
+            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro plainword", HostKey::None, 100)));
         assert!(header_of(&plan).is_empty(), "bare word must be inert");
 
         // Gate: dot-word is attempted (cwd listing — may be empty, but
         // must not error); a definitely-gated word never is.
-        let (plan, _) = expect_continue(h.eval_prompt("sandbox add ro ..", HostKey::None, 100));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro ..", HostKey::None, 100)));
         let _ = plan; // ".." may or may not match cwd entries — just no panic.
     }
 
@@ -894,7 +894,7 @@ mod tests {
         let mut h = menu.get_handle();
 
         let line = format!("sandbox add ro {host_s} {dst}");
-        let result = h.eval_prompt(&line, HostKey::Enter, 100);
+        let result = futures::executor::block_on(h.eval_prompt(&line, HostKey::Enter, 100));
         assert!(
             matches!(result, MenuResult::DoneSuccess(..)),
             "two-path add should submit: {:?}",

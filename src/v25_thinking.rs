@@ -115,7 +115,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 assert!(
@@ -135,7 +135,7 @@ mod tests {
         app_state.set_thinking(Some("med".to_string()));
         let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        match h.eval_prompt("thinking ", HostKey::None, 80) {
+        match futures::executor::block_on(h.eval_prompt("thinking ", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 let idx = rows
@@ -158,7 +158,7 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        let prompt = match h.eval_prompt_resolved("thinking ", HostKey::Tab, 80) {
+        let prompt = match futures::executor::block_on(h.eval_prompt_resolved("thinking ", HostKey::Tab, 80)) {
             MenuResult::Continue(_, prompt) => prompt,
             other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
         };
@@ -167,7 +167,7 @@ mod tests {
             .last()
             .expect("Tab should append the selected level")
             .to_string();
-        match h.eval_prompt(&prompt, HostKey::Enter, 80) {
+        match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
         }
