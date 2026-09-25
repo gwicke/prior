@@ -1,9 +1,9 @@
 //! v2.5 `SlashDotNode` implementations for `/persona`.
 //!
 //! A single `PersonaEnumNode` returns all persona names + "none" from
-//! `data()`. Active marker from `LiveState.persona` (transient session
-//! state), write on submit. `/set default_persona` will use a separate
-//! node that reads/writes `SettingsStore`.
+//! `data()`. Active marker from the target config's persona (runtime
+//! target in `AppState`), write on submit. `/set default_persona` uses a
+//! separate node that reads/writes the `SettingsStore`.
 use std::sync::Arc;
 
 use crate::app_state::AppState;

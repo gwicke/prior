@@ -84,8 +84,8 @@
 ### Engine (`crates/slashdot_menu`) — async, no context parameter
 
 The crate stays app-agnostic and gains **no** type parameter: nodes carry
-their own `Arc<AppShared>` field exactly as today's nodes carry
-`Rc<MenuShared>`; the engine never sees it.
+their own `Arc<AppState>` field (where they used to carry
+`Rc<MenuShared>`); the engine never sees it.
 
 ```rust
 // node_impl.rs
@@ -96,7 +96,7 @@ pub trait SlashDotNode {
     fn columns(&self) -> Vec<ColumnDef> { Vec::new() }
 
     // State-touching — async; state comes from the node's own
-    // `Arc<AppShared>` field, not from parameters:
+    // `Arc<AppState>` field, not from parameters:
     async fn data(&mut self, epoch: u64, pa: &PathArgs) -> DataResult;
     async fn prepare(&mut self, epoch: u64, pa: &PathArgs) -> SubmitResult {
         self.submit(epoch, pa).await        // default still delegates
@@ -129,30 +129,32 @@ signature change. Pure fns (`parse_section`, `ensure_rows`,
 filter/rank/sort) stay sync. `NodeEntry`, `MenuResult`, `RenderPlan`,
 `HostKey`, `SubmitResult` are unchanged data.
 
-### Host (`src/`) — `AppShared` / `AppState`
+### Host (`src/`) — `AppState` (handle) / `State` (payload)
 
 The single injected handle — `MenuShared`'s replacement:
 
 ```rust
-pub struct AppShared {
-    state: parking_lot::Mutex<AppState>,   // one coarse lock, no poisoning
+pub struct AppState {
+    state: parking_lot::Mutex<State>,       // one coarse lock, no poisoning
 }
 
 /// Coarse-grained app state: a few reasonably-sized pieces, one source
 /// of truth, one lock. Accessor rules: see "Context shape".
-pub struct AppState {
+pub struct State {
     /// Runtime target config: model, persona, thinking, sandbox —
     /// `LiveState` folded in here. (Durable target stays `SettingsStore`.)
     pub config: AgentConfig,
-    /// Durable-target store. Async load/save via `AppShared` methods:
+    /// Durable-target store. Async load/save via `AppState` methods:
     /// clone out → drop guard → await → relock to write.
     pub settings: SettingsStore,
-    /// Session slot — swapped as ONE bundle (built across awaits, swapped
-    /// in a single acquisition → half-applied states unobservable).
+    /// Menu-facing session view. The active `Session` object itself is
+    /// the loop's applied layer (loop-local): activation builds it
+    /// across awaits, then writes `current_id` — the menu never sees a
+    /// half-applied state. `repo` is a clone-shared handle (Arc cache).
     pub session: SessionSlot,
     /// Former loose MenuShared cells, each with a single-writer owner:
     pub recent_models: Vec<String>,        // RMW inside one acquisition
-    pub raw_tree: Vec<SessionTreeNode>,
+    pub raw_tree: Arc<Vec<SessionTreeNode>>,
     pub leaf_id: Option<String>,
     pub session_usage: SessionUsage,
     pub context_tokens: u64,
@@ -163,25 +165,24 @@ pub struct AppState {
 }
 
 pub struct SessionSlot {
-    pub session: Option<Session>,
     pub repo: Option<JsonlSessionRepo>,
     pub current_id: String,
 }
 // `ControlConfig` membership = "direct call if the handler can finish
 // it, target field otherwise" (see Decisions).
 
-impl AppShared {
+impl AppState {
     // Accessors: lock ONCE, complete the whole read/write inside, and
     // return owned values — never return a guard.
     pub fn model(&self) -> String { /* lock → read → owned */ }
-    pub fn set_model(&self, id: String) { /* one acquisition, whole RMW */ }
-    pub fn session_slot(&self) -> SessionSlot { /* clone handles out */ }
+    pub fn set_model(&self, id: &str) { /* one acquisition, whole RMW */ }
+    pub fn take_control(&self) -> ControlConfig { /* sole-consumer GC */ }
 }
 
-// Nodes hold `Arc<AppShared>` (background tasks clone the Arc).
+// Nodes hold `Arc<AppState>` (background tasks clone the Arc).
 // Service handles that never change after startup (output, cancel
-// flags) stay outside the lock. AppState members must be `Send` for
-// the Arc to cover background tasks at all — Send check, plan phase 1.
+// flags) stay outside the lock. `State` members must be `Send` for the
+// Arc to cover background tasks — Send check passed (phase 1).
 ```
 
 What the shared async state kills directly:
@@ -259,11 +260,12 @@ set. Revisit only if a profile ever says otherwise (it will not).
 
 ## Context shape (decided): A″ — one coarse shared state
 
-**Decision:** a single coarse-grained `AppState` behind one
-`Arc<Mutex<AppState>>` (`parking_lot` — no poisoning), injected into node
-instances as the replacement for `MenuShared`. Nodes hold
-`Arc<AppShared>`; background tasks clone the `Arc`. The engine gets **no
-context type parameter**; its only change is going async.
+**Decision:** a single coarse-grained `AppState` — the injected handle,
+`pub struct AppState { state: parking_lot::Mutex<State> }` (no poisoning)
+— replacing `MenuShared`. Nodes hold `Arc<AppState>`; background tasks
+clone the `Arc`; the locked payload is `State` (target config, settings,
+slot, display snapshots, `ControlConfig`). The engine gets **no context
+type parameter**; its only change is going async.
 
 **Why it wins:** every historical bug was a *mirror* (`LiveState`), a
 *snapshot* (`ReplCtx`, pre-eval builds), a *data channel* (`pending_op`),
@@ -280,9 +282,9 @@ there is only ever one lock, so no lock-ordering problem.
 
 ### Rules (the price — review-enforced, not compiler-enforced)
 
-1. **Encapsulated handle only:** `AppShared` exposes methods; no pub
+1. **Encapsulated handle only:** `AppState` exposes methods; no pub
    cells — otherwise this is MenuShared again.
-2. **Lock once per public method** — private helpers take `&mut AppState`.
+2. **Lock once per public method** — private helpers take `&mut State`.
    The Mutex is *not* re-entrant: an inner re-lock deadlocks
    (unspecified behavior in std; RefCell's equivalent at least panicked).
 3. **Never hold a guard across `.await`** — clone handle/value out →
@@ -293,8 +295,9 @@ there is only ever one lock, so no lock-ordering problem.
    races, not lost updates split across critical sections.
 5. **Single source of truth:** no mirrors, no snapshots; `control`
    target fields are written by eval, read + GC'd only by their sole
-   consumer; session activation is a bundle swap (build across awaits,
-   swap the whole `SessionSlot` in one acquisition).
+   consumer. The active `Session` is the loop's applied layer: activation
+   builds it across awaits, then writes `SessionSlot::current_id` in one
+   acquisition — the menu sees only the slot, never a half-applied state.
 6. **Only prepare/submit mutate** — `data()`/`header()` are render-path
    reads. Convention only; the rejected threaded design could have
    encoded this as `&C` vs `&mut C` — accepted loss.
@@ -325,19 +328,21 @@ convert/wrap it or accept that tasks stay single-thread
 The main work is **source-of-truth migration** (phases 0–2, doable while
 still sync); the async conversion rides on top.
 
-0. **Audit.** Inventory every state location — MenuShared's cells,
-   `LiveState`, `ReplCtx` snapshots, `pending_op`, `model_commit`,
+0. **Audit** **[done].** Inventory every state location — MenuShared's
+   cells, `LiveState`, `ReplCtx` snapshots, `pending_op`, `model_commit`,
    `recent_models` sync, loop-locals the menu reads — and assign each a
    home in `AppState` or a deletion.
-1. **`AppShared`/`AppState` module** (still sync): struct, accessor
-   methods, lock rules in the module doc. **Send check:** verify members
-   (`Session`, repo, config services); convert, wrap, or scope tasks to
-   `spawn_local`.
-2. **Migrate to source of truth** (still sync): swap `Rc<MenuShared>` →
-   `Arc<AppShared>` in all `v25_*` nodes; delete `LiveState` + its loop
-   sync (handlers write `config` directly); `pending_op` →
-   `ControlConfig` target fields; menu-side ReplCtx snapshots →
-   `AppState` reads. Tests stay green (sync).
+1. **`AppState` module** (still sync) **[done].** Struct, accessor
+   methods, lock rules in the module doc; `ControlConfig` register types
+   moved in from `AsyncOp`. **Send check passed** (test asserts
+   `Send + Sync`).
+2. **Migrate to source of truth** (still sync) **[done].** Swap
+   `Rc<MenuShared>` → `Arc<AppState>` in all `v25_*` nodes; delete
+   `LiveState` + its loop sync (handlers write `config` directly);
+   `pending_op` → `ControlConfig` target fields; menu-side ReplCtx
+   snapshots → `update_cycle_view` writes. Also landed: `repl`/`agent`
+   wiring (convergence step + per-field control appliers),
+   `slash_menu_bridge.rs` deleted. Tests green (639 + 2 ignored).
 3. **Async conversion.** `#[async_trait(?Send)]` on `SlashDotNode` (no
    parameter change) + the eval path; `Repl::read_input` → `v25_eval`
    become async (the only production chain — everything else is

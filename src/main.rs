@@ -308,7 +308,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         reasoning_in_context,
         message_log_path: args.log_messages.clone(),
     };
-    let mut settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
+    let settings = SettingsStore::from_agent_config(&agent_config, settings_path.as_deref());
     match command {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;
@@ -344,7 +344,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", response);
                 }
             } else {
-                picocode::agent::run_interactive(agent_config, &mut settings, args.resume).await?;
+                picocode::agent::run_interactive(agent_config, settings, args.resume).await?;
             }
         }
     }

@@ -54,6 +54,7 @@ impl SlashDotNode for ThinkingEnumNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::app_state::AppState;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};

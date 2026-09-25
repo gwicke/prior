@@ -273,7 +273,7 @@ mod tests {
     fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(build_set_node(settings));
+        root.add_child(build_set_node(app_state));
         crate::slashdot_menu::SlashDotMenu::from_root_node(root)
     }
 
