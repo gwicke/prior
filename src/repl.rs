@@ -890,7 +890,7 @@ impl Repl {
             let overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                    Self::paint_plan(plan, cur_h)
+                    Self::paint_plan(plan, cur_h as usize)
                 }
             };
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();

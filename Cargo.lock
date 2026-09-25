@@ -312,10 +312,12 @@ dependencies = [
 [[package]]
 name = "codewandler-markdown-stream"
 version = "0.2.1"
+source = "git+https://github.com/gwicke/codewandler-markdown?rev=4b05869cc865f2f22dffefd9f66e5f4cde60e47d#4b05869cc865f2f22dffefd9f66e5f4cde60e47d"
 
 [[package]]
 name = "codewandler-markdown-terminal"
 version = "0.2.1"
+source = "git+https://github.com/gwicke/codewandler-markdown?rev=4b05869cc865f2f22dffefd9f66e5f4cde60e47d#4b05869cc865f2f22dffefd9f66e5f4cde60e47d"
 dependencies = [
  "codewandler-markdown-stream",
  "unicode-width 0.2.2",

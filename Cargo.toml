@@ -94,7 +94,8 @@ rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features =
 # (gated by Theme.clickable_links) and a faded `Theme::dimmed()` for streamed
 # thinking. Both crates are pinned to the same fork commit so
 # `markdown_stream::Event` resolves to one type across picocode and the patched
-# renderer. Pointing to local checkout for development.
+# renderer. Once the fork is pushed, `cargo build` updates Cargo.lock to the
+# git source. See doc/streaming_mode.md (§OSC 8 links, §Phase 5 thinking).
 [patch.crates-io]
-codewandler-markdown-terminal = { path = "/home/gabriel/src/codewandler-markdown/crates/markdown-terminal" }
-codewandler-markdown-stream = { path = "/home/gabriel/src/codewandler-markdown/crates/markdown-stream" }
+codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "4b05869cc865f2f22dffefd9f66e5f4cde60e47d" }
+codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "4b05869cc865f2f22dffefd9f66e5f4cde60e47d" }
