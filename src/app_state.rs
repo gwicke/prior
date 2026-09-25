@@ -37,9 +37,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::agent::SessionUsage;
+use crate::agent::{PicoAgent, SessionUsage};
 use crate::session::repo::JsonlSessionRepo;
-use crate::session::SessionTreeNode;
+use crate::session::{Session, SessionTreeNode};
 use crate::settings::{SettingKey, SettingsStore};
 use crate::AgentConfig;
 
@@ -170,6 +170,16 @@ impl ControlConfig {
 pub struct SessionSlot {
     pub(crate) repo: Option<JsonlSessionRepo>,
     pub(crate) current_id: String,
+    /// The active session — shared handle (all methods `&self`; internals
+    /// are `Arc<AsyncMutex>` by design). Swapped atomically with
+    /// `current_id` via `activate_session` so the menu never sees a
+    /// half-applied activation. The loop clones it out for turns; menu
+    /// handlers clone it out for direct data-plane work.
+    pub(crate) session: Option<Arc<Session>>,
+    /// The running agent — `Send + Sync`, all methods `&self`. Created
+    /// and rebuilt **loop-side from the applied config** (convergence),
+    /// published via `activate_agent`; handlers only consume the `Arc`.
+    pub(crate) agent: Option<Arc<dyn PicoAgent>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +238,8 @@ impl AppState {
                 session: SessionSlot {
                     repo,
                     current_id: String::new(),
+                    session: None,
+                    agent: None,
                 },
                 recent_models: Vec::new(),
                 raw_tree: Arc::new(Vec::new()),
@@ -327,6 +339,40 @@ impl AppState {
 
     pub fn set_current_session_id(&self, id: String) {
         self.state.lock().session.current_id = id;
+    }
+
+    // --- shared session/agent handles (clone out → drop guard → await) ---
+
+    /// Clone-out of the active session handle (rule 3: the guard is never
+    /// held across an await; the returned `Arc` keeps the session alive).
+    pub fn session(&self) -> Option<Arc<Session>> {
+        self.state.lock().session.session.clone()
+    }
+
+    /// Write the session slot (id untouched) — callers write back
+    /// unconditionally right after a helper that may have swapped it.
+    pub fn set_session(&self, session: Option<Arc<Session>>) {
+        self.state.lock().session.session = session;
+    }
+
+    /// Bundle activation: session + current id in ONE acquisition —
+    /// the menu can never observe a half-applied switch.
+    pub fn activate_session(&self, session: Option<Arc<Session>>, current_id: String) {
+        let mut st = self.state.lock();
+        st.session.session = session;
+        st.session.current_id = current_id;
+    }
+
+    /// Clone-out of the running agent (created/rebuilt loop-side from the
+    /// applied config; handlers only consume).
+    pub fn agent(&self) -> Option<Arc<dyn PicoAgent>> {
+        self.state.lock().session.agent.clone()
+    }
+
+    /// Publish a freshly created/rebuilt agent (convergence, lazy first
+    /// prompt, compact's Llm fallback — all loop-side).
+    pub fn activate_agent(&self, agent: Arc<dyn PicoAgent>) {
+        self.state.lock().session.agent = Some(agent);
     }
 
     // --- display snapshots (loop writes at cycle build; menu reads) ---
