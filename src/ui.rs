@@ -5,6 +5,12 @@
 //! simple spec, renders it via the crate's `paint_plan`, and handles key
 //! input via crossterm's blocking `event::read()` (compatible with the
 //! sync `Output::confirm` trait method).
+//!
+//! `frame` is the pure compose → allocate → render stage of the unified
+//! draw pipeline (`doc/ui_draw_v2.md`); its `apply` stage lives on
+//! `ConsoleOutput`.
+
+pub(crate) mod frame;
 
 use std::sync::Arc;
 

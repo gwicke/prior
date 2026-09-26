@@ -34,7 +34,7 @@
 - [ ] UI Draw v2 — unified frame composition (REPL + menus + dialogs)
       See: ./doc/ui_draw_v2.md
       - [x] P0: extract real emit path so vt100 tests pin production bytes
-      - [ ] P1: frame model (compose → allocate → render), input windowing
+      - [x] P1: frame model (compose → allocate → render), input windowing
       - [ ] P2: ConsoleOutput DrawCache + apply (scroll-then-paint, partial repaint)
       - [ ] P3: REPL redraw on the frame path; $EDITOR DSR wrapper
       - [ ] P4: dialogs on the frame path; commit frame for decision line

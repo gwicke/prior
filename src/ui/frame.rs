@@ -1,0 +1,572 @@
+//! Pure frame composition for the unified draw pipeline (plan
+//! `doc/ui_draw_v2.md` §3). The pipeline is compose → allocate → render →
+//! apply; this module owns the first three, all pure:
+//!
+//! * compose builds a list of [`Element`]s (the REPL draws
+//!   `[Input, Divider, Overlay]`, dialogs `[Divider?, Overlay]`),
+//! * [`allocate`] distributes the live-region budget ([`live_budget`], at
+//!   most 2/3 of terminal rows) over the elements' `(must, might)` extents,
+//! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
+//!   extents and element spans — ready for `apply` (P2:
+//!   `ConsoleOutput::draw_frame`).
+//!
+//! Nothing here touches a terminal. A frame's rows are self-contained: each
+//! carries the escapes needed to repaint itself in place (trailing `EL` or
+//! padding to `term_w`), so `apply` may rewrite any subset of rows
+//! unconditionally.
+#![allow(dead_code)] // Wired into the REPL/dialogs in ui_draw_v2 P3/P4.
+
+use std::ops::Range;
+
+use crate::slashdot_menu::table::display_width;
+
+/// Rows of context preferred above the caret when an [`Element::Input`]
+/// window must clip its wrapped height (plan §3.4).
+const INPUT_CONTEXT_ROWS: usize = 3;
+
+/// Live-region budget for a terminal of `term_h` rows: the frame may occupy
+/// at most this many rows; the rest of the screen is guaranteed scrollback
+/// (plan §2). Matches the pop-up cap used throughout v2.5 (`⌈2/3·term_h⌉`,
+/// at least 1).
+pub(crate) fn live_budget(term_h: usize) -> usize {
+    ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1)
+}
+
+/// Height demand of one element, in screen rows (plan §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Extent {
+    /// Floor: rows the element keeps before anything else is served.
+    pub must: usize,
+    /// Want: rows the element takes when space allows.
+    pub might: usize,
+}
+
+/// One drawable piece of a frame (plan §3.2).
+pub(crate) enum Element {
+    /// Prompt + editor content. `layout` is the editor's visual layout
+    /// (prompt rendered on row 0); the caret lives at `layout.cursor_row` /
+    /// `layout.cursor_col` — derived, not stored (plan's `caret` field).
+    Input {
+        layout: crate::repl::Layout,
+        prompt: String,
+    },
+    /// Dim horizontal rule spanning the full terminal width.
+    Divider,
+    /// Pre-painted overlay rows (from `paint_plan`), windowed around the
+    /// selection `focus`. Rows must be single-line and are padded to
+    /// `term_w` at render time.
+    Overlay { rows: Vec<String>, focus: usize },
+    /// Fixed text rows (commit lines, future status line). Never flexed;
+    /// truncated from the top when the budget cannot hold them all.
+    Lines(Vec<String>),
+}
+
+impl Element {
+    /// The `(must, might)` this element contributes to [`allocate`].
+    pub(crate) fn extent(&self) -> Extent {
+        match self {
+            // Input keeps one row always (the caret); wraps grow `might`.
+            Element::Input { layout, .. } => Extent {
+                must: 1,
+                might: layout.row_count.max(1),
+            },
+            // Dividers are all-or-nothing cosmetics.
+            Element::Divider => Extent { must: 1, might: 1 },
+            // A composed overlay is always meant to be seen (callers omit
+            // the element when there is nothing to show).
+            Element::Overlay { rows, .. } => Extent {
+                must: usize::from(!rows.is_empty()),
+                might: rows.len(),
+            },
+            // Fixed content: all rows or (under pressure) fewer.
+            Element::Lines(rows) => Extent {
+                must: rows.len(),
+                might: rows.len(),
+            },
+        }
+    }
+}
+
+/// Distribute `budget` rows over `extents`, honoring floors then splitting
+/// the surplus evenly among flexible elements (plan §3.2, OQ1–OQ2).
+///
+/// * If every element fits (`Σ might ≤ budget`) each gets its `might` —
+///   the frame is as tall as its content, never padded to the budget.
+/// * Otherwise every element first receives its `must`. If the floors
+///   themselves exceed `budget`, they are scaled down by the same even
+///   division, in element order (so the input's floor is served before a
+///   divider, which is served before an overlay).
+/// * The remaining rows are split evenly across elements still below their
+///   `might`; shares an element cannot use flow back and are re-split next
+///   round (max-min fairness).
+pub(crate) fn allocate(extents: &[Extent], budget: usize) -> Vec<usize> {
+    if extents.is_empty() {
+        return Vec::new();
+    }
+    let mights: Vec<usize> = extents.iter().map(|e| e.might).collect();
+    if mights.iter().sum::<usize>() <= budget {
+        return mights;
+    }
+    let musts: Vec<usize> = extents.iter().map(|e| e.must).collect();
+    let mut heights = vec![0usize; extents.len()];
+    fill(&mut heights, &musts, budget);
+    let granted: usize = heights.iter().sum();
+    fill(&mut heights, &mights, budget.saturating_sub(granted));
+    heights
+}
+
+/// Raise `heights` toward `targets`, distributing `pool` in even shares per
+/// round; unused shares fall back into the pool for the next round.
+fn fill(heights: &mut [usize], targets: &[usize], mut pool: usize) {
+    loop {
+        let pending: Vec<usize> = (0..heights.len())
+            .filter(|&i| heights[i] < targets[i])
+            .collect();
+        if pool == 0 || pending.is_empty() {
+            return;
+        }
+        let share = pool / pending.len();
+        if share == 0 {
+            // Pool smaller than the number of claimants: hand out one row
+            // each in element order until it runs out.
+            for &i in &pending {
+                if pool == 0 {
+                    return;
+                }
+                heights[i] += 1;
+                pool -= 1;
+            }
+            return;
+        }
+        for &i in &pending {
+            let take = share.min(targets[i] - heights[i]);
+            heights[i] += take;
+            pool -= take;
+        }
+    }
+}
+
+/// Start index of a window over `n` unit-height rows that keeps `focus`
+/// visible, preferring `prefer_context` rows of context above it (plan §3.4).
+/// Returns 0 when everything fits or `budget` is 0.
+pub(crate) fn window(n: usize, focus: usize, budget: usize, prefer_context: usize) -> usize {
+    if budget == 0 || n <= budget {
+        return 0;
+    }
+    let focus = focus.min(n - 1);
+    // Preferred start, then clamp into the range that keeps `focus` on
+    // screen: `start ≤ focus < start + budget`, `start + budget ≤ n`.
+    let want = focus.saturating_sub(prefer_context);
+    let min_start = (focus + 1).saturating_sub(budget);
+    let max_start = (n - budget).min(focus);
+    want.clamp(min_start, max_start)
+}
+
+/// What [`render`] produces (plan §3.3): one flat buffer, one extent per
+/// screen row, and the row range each element occupies.
+pub(crate) struct Frame {
+    /// Rows concatenated **without** separators; `extents[i]` delimits row
+    /// `i`. `apply` inserts line breaks (or absolute moves) as it sees fit.
+    pub(crate) buf: String,
+    /// Byte range of each screen row; contiguous, covering all of `buf`.
+    pub(crate) extents: Vec<Range<usize>>,
+    /// `(element index, row range)` — which element painted which rows.
+    pub(crate) spans: Vec<(usize, Range<usize>)>,
+    /// `(row, display_col)` — both 0-based; row is frame-relative, col is
+    /// the on-screen column (prompt included on row 0). `None` when no input
+    /// element is rendered or its caret fell outside the window.
+    pub(crate) caret: Option<(usize, usize)>,
+}
+
+impl Frame {
+    pub(crate) fn height(&self) -> usize {
+        self.extents.len()
+    }
+
+    /// Bytes of screen row `i`.
+    pub(crate) fn row(&self, i: usize) -> &str {
+        &self.buf[self.extents[i].clone()]
+    }
+}
+
+/// Render `elements` at their allocated `heights` into a [`Frame`]
+/// (plan §3.1). `heights` must have one entry per element — the output of
+/// [`allocate`] — and `term_w` is the terminal width in columns.
+pub(crate) fn render(elements: &[Element], heights: &[usize], term_w: usize) -> Frame {
+    debug_assert_eq!(
+        elements.len(),
+        heights.len(),
+        "render: one height per element"
+    );
+    let tw = term_w.max(1);
+    let mut buf = String::new();
+    let mut extents: Vec<Range<usize>> = Vec::new();
+    let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
+    let mut caret: Option<(usize, usize)> = None;
+
+    for (idx, (el, &h)) in elements.iter().zip(heights.iter()).enumerate() {
+        let first_row = extents.len();
+        match el {
+            Element::Input { layout, prompt } => {
+                let n = layout.row_count.max(1);
+                if h > 0 {
+                    let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
+                    let count = h.min(n.saturating_sub(start));
+                    for r in start..start + count {
+                        // Mirror `render_content`: the prompt renders on row
+                        // 0; later rows are content-only.
+                        let body = if r == 0 { prompt } else { "" };
+                        let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
+                        let mut content = String::with_capacity(body.len() + text.len() + 3);
+                        content.push_str(body);
+                        content.push_str(text);
+                        // `EL` only while there is something to erase —
+                        // after a full-width row the cursor is wrap-pending
+                        // and `CSI K` would eat the last written cell.
+                        if display_width(&content) < tw {
+                            content.push_str("\x1b[K");
+                        }
+                        push_row(&mut buf, &mut extents, &content);
+                    }
+                    if layout.cursor_row >= start && layout.cursor_row < start + count {
+                        caret = Some((first_row + layout.cursor_row - start, layout.cursor_col));
+                    }
+                }
+            }
+            Element::Divider => {
+                if h > 0 {
+                    let row = format!("\x1b[2m{}\x1b[0m", "─".repeat(tw));
+                    push_row(&mut buf, &mut extents, &row);
+                }
+            }
+            Element::Overlay { rows, focus } => {
+                if h > 0 && !rows.is_empty() {
+                    let start = window(rows.len(), *focus, h, h / 2);
+                    let count = h.min(rows.len().saturating_sub(start));
+                    for r in start..start + count {
+                        debug_assert!(
+                            !rows[r].contains('\n'),
+                            "overlay rows are single screen rows"
+                        );
+                        push_row(&mut buf, &mut extents, &pad_row(&rows[r], tw));
+                    }
+                }
+            }
+            Element::Lines(rows) => {
+                // Fixed content: show the first `h` rows (reading order).
+                for row in rows.iter().take(h) {
+                    debug_assert!(!row.contains('\n'), "line rows are single screen rows");
+                    let mut content = row.clone();
+                    if display_width(&content) < tw {
+                        content.push_str("\x1b[K");
+                    }
+                    push_row(&mut buf, &mut extents, &content);
+                }
+            }
+        }
+        spans.push((idx, first_row..extents.len()));
+    }
+
+    Frame {
+        buf,
+        extents,
+        spans,
+        caret,
+    }
+}
+
+/// Append one screen row to the buffer, recording its extent.
+fn push_row(buf: &mut String, extents: &mut Vec<Range<usize>>, row: &str) {
+    let start = buf.len();
+    buf.push_str(row);
+    extents.push(start..buf.len());
+}
+
+/// Pad a pre-painted row to `term_w` visible columns. Padding goes *before*
+/// a trailing reset so styled rows (menu backgrounds) extend to the right
+/// edge; rows already full width are returned unchanged.
+fn pad_row(row: &str, term_w: usize) -> String {
+    let w = display_width(row);
+    if w >= term_w {
+        return row.to_string();
+    }
+    let pad = " ".repeat(term_w - w);
+    match row.strip_suffix("\x1b[0m") {
+        Some(body) => format!("{body}{pad}\x1b[0m"),
+        None => format!("{row}{pad}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repl::LineEditor;
+
+    // ---- live_budget ----
+
+    #[test]
+    fn live_budget_caps_at_two_thirds() {
+        assert_eq!(live_budget(24), 16);
+        assert_eq!(live_budget(3), 2);
+        assert_eq!(live_budget(1), 1);
+        assert_eq!(live_budget(2), 2);
+    }
+
+    // ---- allocate ----
+
+    #[test]
+    fn allocate_full_fit_returns_mights_not_budget() {
+        // OQ1: content smaller than the budget renders to its natural size;
+        // the frame is never padded up to the budget.
+        let e = [
+            Extent { must: 1, might: 3 },
+            Extent { must: 1, might: 1 },
+            Extent { must: 1, might: 5 },
+        ];
+        assert_eq!(allocate(&e, 12), vec![3, 1, 5]);
+    }
+
+    #[test]
+    fn allocate_short_input_stays_single_row() {
+        // OQ2: a 1-row input has min=max=1; the flexible overlay takes the
+        // whole surplus.
+        let e = [
+            Extent { must: 1, might: 1 },  // short input
+            Extent { must: 1, might: 1 },  // divider
+            Extent { must: 1, might: 20 }, // menu
+        ];
+        assert_eq!(allocate(&e, 8), vec![1, 1, 6]);
+    }
+
+    #[test]
+    fn allocate_splits_surplus_evenly_then_spills() {
+        // Two flexible elements: even split first (3/3), then the input
+        // caps at its might and the overlay absorbs the leftover.
+        let e = [
+            Extent { must: 1, might: 4 },
+            Extent { must: 1, might: 1 },
+            Extent { must: 1, might: 10 },
+        ];
+        // Σ might = 15 > 10; floors = 3; pool = 7.
+        // Round 1: share 3 → input +3 (capped at 4), overlay +3 → pool 1.
+        // Round 2: overlay +1.
+        assert_eq!(allocate(&e, 10), vec![4, 1, 5]);
+    }
+
+    #[test]
+    fn allocate_even_split_without_caps() {
+        let e = [Extent { must: 1, might: 6 }, Extent { must: 1, might: 6 }];
+        // Σ might = 12 > 8; floors 2; pool 6 → 3/3.
+        assert_eq!(allocate(&e, 8), vec![4, 4]);
+    }
+
+    #[test]
+    fn allocate_scales_floors_evenly_when_they_overflow() {
+        // Fixed 5-row commit block plus input/divider floors in a 3-row
+        // budget: even division from zero caps each claimant at its floor,
+        // so the small floors survive and the big one truncates.
+        let e = [
+            Extent { must: 1, might: 1 },
+            Extent { must: 1, might: 1 },
+            Extent { must: 5, might: 5 },
+        ];
+        assert_eq!(allocate(&e, 3), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn allocate_crippled_budget_serves_elements_in_order() {
+        // Budget below the number of elements: one row each, element
+        // order wins — input first, overlay last (plan §3.2).
+        let e = [
+            Extent { must: 1, might: 1 },
+            Extent { must: 1, might: 1 },
+            Extent { must: 1, might: 40 },
+        ];
+        assert_eq!(allocate(&e, 2), vec![1, 1, 0]);
+        assert_eq!(allocate(&e, 1), vec![1, 0, 0]);
+        assert_eq!(allocate(&e, 0), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn allocate_empty_extents() {
+        assert!(allocate(&[], 10).is_empty());
+    }
+
+    // ---- window ----
+
+    #[test]
+    fn window_returns_zero_when_everything_fits() {
+        assert_eq!(window(5, 2, 10, 3), 0);
+        assert_eq!(window(5, 2, 5, 3), 0);
+    }
+
+    #[test]
+    fn window_keeps_focus_with_context_above() {
+        // 10 rows, 4 visible, caret at 5, want 3 of context → start 2.
+        assert_eq!(window(10, 5, 4, 3), 2);
+    }
+
+    #[test]
+    fn window_clamps_to_screen_ends() {
+        // Focus near the end: window pulled forward to stay in bounds.
+        assert_eq!(window(10, 9, 4, 3), 6);
+        // Focus on row 0: cannot show context that does not exist.
+        assert_eq!(window(10, 0, 4, 8), 0);
+        // Preferred context larger than the focus offset.
+        assert_eq!(window(10, 2, 4, 8), 0);
+    }
+
+    #[test]
+    fn window_zero_budget_and_degenerate_focus() {
+        assert_eq!(window(10, 5, 0, 3), 0);
+        // Focus clamped into range before clamping the start.
+        assert_eq!(window(4, 99, 2, 1), 2);
+    }
+
+    // ---- render ----
+
+    #[test]
+    fn render_input_row_prompt_and_caret() {
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        let layout = e.layout(20, "> ");
+        let els = [Element::Input {
+            layout,
+            prompt: "> ".to_string(),
+        }];
+        let f = render(&els, &[1], 20);
+        assert_eq!(f.height(), 1);
+        assert_eq!(f.row(0), "> hi\x1b[K");
+        // Prompt (2) + "hi" (2) = col 4; caret on the frame's only row.
+        assert_eq!(f.caret, Some((0, 4)));
+        assert_eq!(f.spans, vec![(0, 0..1)]);
+        assert_eq!(f.extents, vec![0..7]);
+    }
+
+    #[test]
+    fn render_windowed_input_keeps_caret_visible() {
+        // 6-row input squeezed into 3 rows with the caret on row 5:
+        // window keeps the caret with context above — rows 3..6.
+        let mut e = LineEditor::new();
+        e.insert_str("aa\nbb\ncc\ndd\nee\nff"); // caret ends at buffer end
+        let layout = e.layout(20, "> ");
+        assert_eq!(layout.row_count, 6);
+        assert_eq!(layout.cursor_row, 5);
+        let els = [Element::Input {
+            layout,
+            prompt: "> ".to_string(),
+        }];
+        let f = render(&els, &[3], 20);
+        assert_eq!(f.height(), 3);
+        // Prompt row scrolled out: no "> " on the first visible row.
+        assert_eq!(f.row(0), "dd\x1b[K");
+        assert_eq!(f.row(2), "ff\x1b[K");
+        // Caret at frame row 2, content col 2 (no prompt on this row).
+        assert_eq!(f.caret, Some((2, 2)));
+    }
+
+    #[test]
+    fn render_divider_spans_full_width() {
+        let f = render(&[Element::Divider], &[1], 8);
+        assert_eq!(f.row(0), "\x1b[2m────────\x1b[0m");
+        assert_eq!(f.caret, None);
+    }
+
+    #[test]
+    fn render_overlay_pads_short_rows_before_reset() {
+        let rows = vec!["ab".to_string()];
+        let els = [Element::Overlay { rows, focus: 0 }];
+        let f = render(&els, &[1], 5);
+        // Padding lands inside the styled span so backgrounds reach the edge.
+        assert_eq!(f.row(0), "ab   ");
+        // Full-width row passes through untouched.
+        let els = [Element::Overlay {
+            rows: vec!["abcde".to_string()],
+            focus: 0,
+        }];
+        let f = render(&els, &[1], 5);
+        assert_eq!(f.row(0), "abcde");
+    }
+
+    #[test]
+    fn render_overlay_windows_around_focus() {
+        let rows: Vec<String> = (0..20).map(|i| format!("item {i}")).collect();
+        let els = [Element::Overlay { rows, focus: 10 }];
+        let f = render(&els, &[4], 20);
+        assert_eq!(f.height(), 4);
+        // Centered: focus 10 with 4 visible → start 8 (prefer h/2 = 2).
+        assert_eq!(f.row(0).trim_end(), "item 8");
+        assert_eq!(f.row(3).trim_end(), "item 11");
+    }
+
+    #[test]
+    fn render_lines_truncate_from_top() {
+        let rows: Vec<String> = (1..=5).map(|i| format!("line {i}")).collect();
+        let f = render(&[Element::Lines(rows)], &[3], 20);
+        assert_eq!(f.height(), 3);
+        assert_eq!(f.row(0), "line 1\x1b[K");
+        assert_eq!(f.row(2), "line 3\x1b[K");
+        assert_eq!(f.caret, None);
+    }
+
+    #[test]
+    fn render_full_composition_extents_and_spans() {
+        // REPL composition: input + divider + overlay, allocated heights
+        // straight from `allocate`.
+        let mut e = LineEditor::new();
+        e.insert_str("ls -la");
+        let layout = e.layout(80, "> ");
+        let els = [
+            Element::Input {
+                layout,
+                prompt: "> ".to_string(),
+            },
+            Element::Divider,
+            Element::Overlay {
+                rows: vec!["one".to_string(), "two".to_string()],
+                focus: 0,
+            },
+        ];
+        let heights = allocate(
+            &els.iter().map(Element::extent).collect::<Vec<_>>(),
+            live_budget(24),
+        );
+        assert_eq!(heights, vec![1, 1, 2]); // all mights fit in 16
+        let f = render(&els, &heights, 80);
+
+        // Contiguous extents covering the buffer exactly.
+        let mut expect = 0;
+        for r in &f.extents {
+            assert_eq!(r.start, expect);
+            expect = r.end;
+        }
+        assert_eq!(expect, f.buf.len());
+        // Spans tile the frame in element order.
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..2), (2, 2..4)]);
+        assert_eq!(f.height(), 4);
+        assert_eq!(f.row(0), "> ls -la\x1b[K");
+        assert!(f.row(1).starts_with("\x1b[2m"));
+        assert_eq!(f.row(3).trim_end(), "two");
+        // Caret follows the input element, prompt-inclusive column.
+        assert_eq!(f.caret, Some((0, 8)));
+    }
+
+    #[test]
+    fn render_zero_height_element_contributes_no_rows() {
+        let els = [Element::Divider, Element::Divider];
+        let f = render(&els, &[1, 0], 4);
+        assert_eq!(f.height(), 1);
+        assert_eq!(f.spans, vec![(0, 0..1), (1, 1..1)]);
+    }
+
+    #[test]
+    fn pad_row_handles_styled_and_unstyled() {
+        assert_eq!(pad_row("x", 4), "x   ");
+        assert_eq!(pad_row("x\x1b[0m", 4), "x   \x1b[0m");
+        assert_eq!(
+            pad_row("\x1b[48;5;239mab\x1b[0m", 4),
+            "\x1b[48;5;239mab  \x1b[0m"
+        );
+        assert_eq!(pad_row("abcde", 4), "abcde"); // never truncates
+    }
+}
