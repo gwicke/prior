@@ -855,3 +855,8 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
   `excluded` count (message lists only *free* lines).
 - Diagnostics: `failures.sort_by_key(edit_index)` before batching; full
   completion of both passes before the all-or-nothing gate.
+
+### Suggested order — completed
+
+1. ✅ **3 + 2** (implemented in [`f05d078`](https://github.com/gwicke/picocode/commit/f05d078)) — the skew rule and claim-based resolver are live; 653 tests pass.
+2. **1** — multi-file batches: still gated on telemetry. Strategy A (split inside the tool) is cheap and keeps the status-quo pi degradation; strategy B (split into N stored calls) would deliver true pi-compat but requires post-hoc history surgery at `on_completion_call` + deterministic synthetic ids; both ruled by the telemetry gate.
