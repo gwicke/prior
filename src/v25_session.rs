@@ -273,9 +273,16 @@ impl SlashDotNode for SessionListNode {
                     .desc(&desc)
                     .field("path", Value::Str(session_path_display(m)))
                     .field("msgs", Value::Num(m.user_message_count as f64))
-                    .field("age", Value::Str(relative_time(
-                        m.last_prompt_timestamp.as_ref().unwrap_or(&m.timestamp),
-                    )))
+                    .field("age", Value::Num(
+                            m.last_prompt_timestamp.clone()
+                            .unwrap_or(m.timestamp.clone())
+                            .parse().unwrap_or(0.0))
+                    )
+                    .display_field(
+                        "age",
+                        relative_time(m.last_prompt_timestamp.as_ref().unwrap_or(&m.timestamp))
+                    )
+
             })
             .collect();
 
