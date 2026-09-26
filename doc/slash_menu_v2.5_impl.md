@@ -120,13 +120,13 @@ v2.5 engine.
 
 ### Deferred (not blocking, pick up as needed)
 
-**RenderPlan / rendering**
+**RenderPlan / rendering - DONE**
 - No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
   but no dialog text is rendered in the plan.
-- This might be done - TODO confirm
 
-**Row uniformity:**
-- Only enforces non-empty `id`. Description optional.
+**Row uniformity: - DONE**
+- Only enforces non-empty `id`. Description optional. Rendering tolerant of
+  missing fields.
 
 **Field space inference fallback, field spec cleanup**
 - When `SlashDotNode::fields()` returns empty, `infer_field_space()`
@@ -224,14 +224,14 @@ and with-keys - so this change should not cause regressions.
    `SlashDotMenuNode` API for bottom-up tree construction.
 5. **Settings - DONE** (`/set`) — Next command to port. Sub-steps:
 
-   0. **Fix `node_data()` deviation.** Design §3.2 specifies
+   0. **Fix `node_data()` deviation. DONE** Design §3.2 specifies
       `NodeEntry::node_data()` as the only way parent nodes access child
       data. Implementation calls `child.inner.data()` directly in
       `refresh_data()`. Fix: add `node_data()` on `NodeEntry`, route
       `refresh_data()` through it. Add protective comments on `inner`
       and in `refresh_data()`.
 
-   1. **Value forwarding in `node_data()`.** Add `value_forwarding: bool`
+   1. **Value forwarding in `node_data()`. DONE** Add `value_forwarding: bool`
       flag on `NodeEntry`, exposed via `SlashDotMenuNode::with_value_forwarding()`.
       When true, `node_data()` calls own `inner.data()` for rows, then
       queries children's `node_data()` for `active_ids`, injects them as

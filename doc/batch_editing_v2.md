@@ -855,10 +855,3 @@ corruption is now a loud `overlapping`/`all-claimed` failure).
   `excluded` count (message lists only *free* lines).
 - Diagnostics: `failures.sort_by_key(edit_index)` before batching; full
   completion of both passes before the all-or-nothing gate.
-
-### Suggested order
-
-1. **3** (correctness bug fix rides along) and **2** (message improvements
-   shared with 3) — independent, small, same code region.
-2. **1**: telemetry gate first; A only if multi-file attempts are common; B
-   only if pi-side multi-file rendering matters.

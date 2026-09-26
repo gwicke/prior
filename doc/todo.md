@@ -16,3 +16,17 @@
       `/resume-config <slug>` once the need arises.)
 - [ ] Address resume stack overflow in debug builds:
   ./doc/resume_stack_overflow_audit.md.
+- [ ] table rendering and filtering: dynamic columns
+  - Include filter / sort columns in layout (.columns)
+  - Less misleading / confusing modifier value auto-complete - headers
+    currently say MODIFIER | DESCRIPTION, with the description being just
+    "string". Should be "Column values" or similar
+  - Quoted string / space support
+  - refine match types: fuzzy for string, sort into divider
+    - `.sort>column`, `.sort:column` (default)
+    - `.column:test` (fuzzy), `.column=test` (exact, needed for `.path=.` for
+      example), `.column>2`
+  - sorting on string columns: case insensitive by default?
+  - fuzzy matching: `test data` very different result from `test_data` -
+    surprising
+- [ ] per-turn /thinking overrides, esp. at end of turn message
