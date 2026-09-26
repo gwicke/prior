@@ -6,6 +6,9 @@
 
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -172,11 +175,49 @@ impl JsonlSessionStorage {
     }
 
     /// Ensure the write handle is open, creating the file if needed.
+    ///
+    /// Also checks if the file's inode has changed (e.g., due to atomic rename
+    /// from another process or our own `update_session_header`). If the inode
+    /// differs from the cached handle's inode, the handle is closed and the
+    /// file is reopened.
     async fn ensure_open(
         &self,
     ) -> crate::Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
         let mut guard = self.file.lock().await;
-        if guard.is_none() {
+
+        // Check if file exists and get its current inode
+        let current_inode = tokio::fs::metadata(&self.path).await.ok().and_then(|m| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                Some(m.ino())
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        });
+
+        let mut should_reopen = guard.is_none();
+
+        if let Some(file) = guard.as_ref() {
+            // Compare inode of cached handle with current file
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = file.metadata().await {
+                    should_reopen = current_inode != Some(meta.ino());
+                } else {
+                    should_reopen = true; // Can't stat handle, reopen to be safe
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-unix, can't check inode; rely on explicit invalidation
+            }
+        }
+
+        if should_reopen {
             if let Some(parent) = self.path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
@@ -189,6 +230,15 @@ impl JsonlSessionStorage {
             *guard = Some(file);
         }
         Ok(guard)
+    }
+
+    /// Close the cached file handle so the next write reopens the file.
+    ///
+    /// Call this after an atomic file replacement (e.g., `update_session_header`)
+    /// to ensure subsequent appends write to the new file, not the old inode.
+    pub async fn invalidate_file_handle(&self) {
+        let mut guard = self.file.lock().await;
+        *guard = None;
     }
 
     /// The path to the session file.
@@ -208,6 +258,83 @@ impl JsonlSessionStorage {
             tokio::io::AsyncWriteExt::write_all(file, line.as_bytes()).await?;
             tokio::io::AsyncWriteExt::flush(file).await?;
         }
+        Ok(())
+    }
+
+    /// Atomically update the session header while preserving file mtime.
+    ///
+    /// This reads the full file, replaces the first line (header) with the new
+    /// header, writes to a temp file in the same directory, preserves the
+    /// original file's mtime (which should correspond to the last message's
+    /// timestamp), and atomically renames the temp file to the session file.
+    ///
+    /// This is used for updating `name` and `cwd` in the header without
+    /// rewriting the full session history.
+    pub async fn update_session_header(&self, new_header: &SessionHeader) -> crate::Result<()> {
+        // Read the full current content
+        let content = tokio::fs::read_to_string(&self.path).await?;
+
+        // Split into lines, replace the first line (header)
+        let mut lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() {
+            return Err(crate::PicocodeError::Other(
+                "Session file is empty, cannot update header".into(),
+            ));
+        }
+
+        // Replace header line
+        let new_header_line = serde_json::to_string(new_header)?;
+        lines[0] = &new_header_line;
+
+        // Write to temp file in same directory (for atomic rename on same filesystem)
+        let parent_dir = self.path.parent().ok_or_else(|| {
+            crate::PicocodeError::Other("Session file has no parent directory".into())
+        })?;
+
+        let temp_path = parent_dir.join(format!(".{}.tmp", Uuid::now_v7().to_string()));
+
+        // Write new content to temp file
+        {
+            let mut temp_file = fs::File::create(&temp_path)?;
+            for (_i, line) in lines.iter().enumerate() {
+                temp_file.write_all(line.as_bytes())?;
+                temp_file.write_all(b"\n")?;
+            }
+            temp_file.flush()?;
+        }
+
+        // Get the original file's mtime to preserve it
+        let original_metadata = fs::metadata(&self.path)?;
+        let original_mtime = original_metadata.mtime();
+        let original_mtime_nsec = original_metadata.mtime_nsec();
+
+        // Atomically rename temp file to session file
+        fs::rename(&temp_path, &self.path)?;
+
+        // Restore the original mtime (using utimensat for nanosecond precision)
+        let times = [
+            libc::timespec {
+                tv_sec: original_mtime,
+                tv_nsec: original_mtime_nsec,
+            },
+            libc::timespec {
+                tv_sec: original_mtime,
+                tv_nsec: original_mtime_nsec,
+            },
+        ];
+
+        // Use unsafe to call utimensat for precise mtime restoration
+        let path_cstr = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes())
+            .map_err(|e| crate::PicocodeError::Other(format!("Invalid path for CString: {}", e)))?;
+        unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                path_cstr.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            );
+        }
+
         Ok(())
     }
 

@@ -374,23 +374,42 @@ pub struct SessionMeta {
     pub last_prompt_timestamp: Option<String>,
     /// Path to the `.jsonl` file on disk.
     pub path: Option<std::path::PathBuf>,
+    /// File size in bytes (for display and sorting in listing).
+    pub file_size: u64,
+    /// File modification time (for age display).
+    pub file_mtime: Option<std::time::SystemTime>,
 }
 
 /// Map a repo `SessionMetadata` listing entry to the lightweight
 /// [`SessionMeta`] used by the menu providers and the `/session` overlay.
 pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMeta {
+    // Extract detail fields if present
+    let (message_count, user_message_count, last_prompt_text, last_prompt_timestamp) =
+        if let Some(d) = m.detail {
+            (
+                d.message_count,
+                d.user_message_count,
+                d.last_prompt_text,
+                d.last_prompt_timestamp,
+            )
+        } else {
+            (0, 0, None, None)
+        };
+
     SessionMeta {
         id: m.id,
         name: m.name,
         timestamp: m.timestamp,
         cwd: m.cwd,
         parent_session: m.parent_session.map(|p| p.display().to_string()),
-        message_count: m.message_count,
-        user_message_count: m.user_message_count,
+        message_count,
+        user_message_count,
         first_prompt_preview: m.first_prompt_preview,
-        last_prompt_text: m.last_prompt_text,
-        last_prompt_timestamp: m.last_prompt_timestamp,
+        last_prompt_text,
+        last_prompt_timestamp,
         path: Some(m.path),
+        file_size: m.file_size,
+        file_mtime: m.file_mtime,
     }
 }
 
