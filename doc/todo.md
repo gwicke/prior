@@ -31,9 +31,19 @@
     surprising
 - [ ] per-turn /thinking overrides, esp. at end of turn message
 
-- [ ] v2.5 Cleanup Pass 2 — repl.rs visibility reductions + confirmation dialog porting
+- [ ] UI Draw v2 — unified frame composition (REPL + menus + dialogs)
+      See: ./doc/ui_draw_v2.md
+      - [ ] P0: extract real emit path so vt100 tests pin production bytes
+      - [ ] P1: frame model (compose → allocate → render), input windowing
+      - [ ] P2: ConsoleOutput DrawCache + apply (scroll-then-paint, partial repaint)
+      - [ ] P3: REPL redraw on the frame path; $EDITOR DSR wrapper
+      - [ ] P4: dialogs on the frame path; commit frame for decision line
+      - [ ] P5: retire overlay_lines, fold next_input_row/clear_rows_to into apply
+
+- [x] v2.5 Cleanup Pass 2 — repl.rs visibility reductions + confirmation dialog porting
       See: ./doc/v25_cleanup_pass_2.md
-      - [ ] Immediate: reduce public API surface in repl.rs (9 items)
-      - [ ] Backlog: port tool confirmation dialog to v2.5 menu
-      - [ ] Backlog: port compaction review dialog to v2.5 menu
-      - [ ] Backlog: retire overlay_lines entirely
+      - [x] Immediate: reduce public API surface in repl.rs (9 items) — `6c70b9f`
+      - [x] Phase 1: move plan painter into crate — `927cedc`
+      - [x] Phase 2: shared confirm driver in src/ui.rs — `72107ff`
+      - [ ] Backlog: Phase 3 (retire overlay_lines) — folded into UI Draw v2 P5
+      - [ ] Backlog: Phase 4 (async review_compaction_summary) — superseded by UI Draw v2 P3/P4
