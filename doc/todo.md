@@ -30,3 +30,10 @@
   - fuzzy matching: `test data` very different result from `test_data` -
     surprising
 - [ ] per-turn /thinking overrides, esp. at end of turn message
+
+- [ ] v2.5 Cleanup Pass 2 — repl.rs visibility reductions + confirmation dialog porting
+      See: ./doc/v25_cleanup_pass_2.md
+      - [ ] Immediate: reduce public API surface in repl.rs (9 items)
+      - [ ] Backlog: port tool confirmation dialog to v2.5 menu
+      - [ ] Backlog: port compaction review dialog to v2.5 menu
+      - [ ] Backlog: retire overlay_lines entirely

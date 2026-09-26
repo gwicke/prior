@@ -350,52 +350,6 @@ impl ModelFilter {
             ..Default::default()
         }
     }
-
-    /// Generate a display string for the overlay title.
-    pub fn title_suffix(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(s) = &self.sort {
-            parts.push(format!("sort:{}", s));
-        }
-        if let Some(p) = self.price_input {
-            if p == 0.0 {
-                parts.push("free".to_string());
-            } else {
-                parts.push(format!("in:${:.2}/M", p));
-            }
-        }
-        if let Some(p) = self.price_output {
-            parts.push(format!("out:${:.2}/M", p));
-        }
-        if let Some(p) = self.price {
-            if p == 0.0 {
-                parts.push("free".to_string());
-            } else {
-                parts.push(format!("${:.2}/M", p));
-            }
-        }
-        if let Some(v) = self.min_coding_index {
-            parts.push(format!("coding>={}", v));
-        }
-        if let Some(v) = self.min_intelligence_index {
-            parts.push(format!("intel>={}", v));
-        }
-        if let Some(v) = self.min_agentic_index {
-            parts.push(format!("agentic>={}", v));
-        }
-        if let Some(v) = self.max_age_days {
-            parts.push(format!("age<={}d", v));
-        }
-        if let Some(v) = self.min_context {
-            parts.push(format!("ctx>={}", v));
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", parts.join(" "))
-        }
-    }
-
 }
 /// Lightweight session metadata for the `/session` overlay.
 #[derive(Clone)]
@@ -495,7 +449,7 @@ impl ActiveOverlay {
 
     /// The engine-owned cursor row for this overlay (both variants are
     /// plan-backed). `None` for no overlay / a plan without rows.
-    pub fn cursor_row(&self) -> Option<usize> {
+    fn cursor_row(&self) -> Option<usize> {
         match self {
             ActiveOverlay::None => None,
             ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
@@ -1212,7 +1166,7 @@ impl Repl {
     /// Render a LogicalLine as a single ANSI-styled string. Used for
     /// table_header and detail lines (not data rows, which are rendered
     /// inline with markers). Splits on `\n` for multi-line logical lines.
-    pub fn render_logical_line(
+    fn render_logical_line(
         line: &crate::slashdot_menu::render::LogicalLine,
         tw: usize,
         is_selected: bool,
@@ -1244,7 +1198,7 @@ impl Repl {
     /// When both sections overflow, they split available space 50:50.
     /// If one section fits in its half, the other gets the surplus.
     /// Rows always get at least `min_rows` (capped at `total_rows`).
-    pub fn compute_space_budget(
+    fn compute_space_budget(
         overlay_budget: usize,   // total overlay lines (e.g. 2/3 terminal)
         table_header_lines: usize,
         total_detail_vis: usize, // visual lines all detail items consume
@@ -1283,7 +1237,7 @@ impl Repl {
     /// Compute the window of row indices to render, accounting for multi-line
     /// `LogicalLine` rows.  Returns `(start, count)` — the first row index and
     /// how many logical rows to render.  `budget` is in visual lines.
-    pub fn visual_row_window(
+    fn visual_row_window(
         rows: &[crate::slashdot_menu::render::LogicalLine],
         selected: usize,
         budget: usize,
@@ -1346,7 +1300,7 @@ impl Repl {
 
     /// start index into the full overlay. Extracted so it can be unit-tested
     /// without a TTY.
-    pub fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
+    pub(crate) fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
         if overlay_len <= avail || avail == 0 {
             0
         } else {
@@ -1358,7 +1312,7 @@ impl Repl {
     /// accounting for multi-line (wrapped) rows. Returns a signed delta
     /// (positive = down, negative = up) that moves `selected` by at most
     /// `budget` visual lines, clamped to [0, total_rows).
-    pub fn page_delta(
+    pub(crate) fn page_delta(
         rows: &[crate::slashdot_menu::render::LogicalLine],
         selected: usize,
         budget: usize,
@@ -1405,7 +1359,7 @@ impl Repl {
     /// one place a `RenderPlan` becomes display lines. Height is a
     /// parameter; width is read from the terminal like the other
     /// render helpers.
-    pub fn paint_plan(
+    fn paint_plan(
         plan: &crate::slashdot_menu::render::RenderPlan,
         term_h: usize,
     ) -> String {
@@ -1648,7 +1602,7 @@ impl Repl {
     /// `options` (entries past the end fall back to the default BG; a
     /// `None` entry also falls back). The cursor-selected row always uses
     /// BG_SEL regardless of `row_bgs` so the selection stays distinct.
-    pub fn overlay_lines_with_bgs(
+    pub(crate) fn overlay_lines_with_bgs(
         title: &str,
         options: &[String],
         header: Option<&[String]>,
