@@ -299,7 +299,7 @@ impl PicoAgent for CodeAgent {
         // arriving *after* the answer (an occasional OpenRouter streaming order)
         // is still shown above it instead of leaking below. See `output.rs`
         // `answer_held` / `flush_held_answer`.
-        let reasoning_expected = self
+        let _reasoning_expected = self
             .thinking_level
             .as_deref()
             .and_then(|s| s.parse::<thinking::ThinkingLevel>().ok())
