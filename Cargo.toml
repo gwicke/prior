@@ -97,5 +97,5 @@ rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features =
 # renderer. Once the fork is pushed, `cargo build` updates Cargo.lock to the
 # git source. See doc/streaming_mode.md (§OSC 8 links, §Phase 5 thinking).
 [patch.crates-io]
-codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "4b05869cc865f2f22dffefd9f66e5f4cde60e47d" }
-codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "4b05869cc865f2f22dffefd9f66e5f4cde60e47d" }
+codewandler-markdown-terminal = { git = "https://github.com/gwicke/codewandler-markdown", rev = "5443b57252f73816c49d3363538b9c899b12d320" }
+codewandler-markdown-stream = { git = "https://github.com/gwicke/codewandler-markdown", rev = "5443b57252f73816c49d3363538b9c899b12d320" }
