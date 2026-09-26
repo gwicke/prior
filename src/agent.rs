@@ -305,7 +305,7 @@ impl PicoAgent for CodeAgent {
             .and_then(|s| s.parse::<thinking::ThinkingLevel>().ok())
             .map(|l| l != thinking::ThinkingLevel::Off)
             .unwrap_or(false);
-        self.output.set_answer_hold(reasoning_expected);
+        // self.output.set_answer_hold(reasoning_expected);
         loop {
             tokio::select! {
                 item = stream.next() => {
