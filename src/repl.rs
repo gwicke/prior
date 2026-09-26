@@ -769,6 +769,25 @@ impl Repl {
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
             if cur_h != prev_term_h.get() || cur_w != prev_term_w.get() {
+                // Key-triggered repaint after a size change. A *width*
+                // change makes a reflowing terminal (wezterm) re-wrap the
+                // painted frame, stacking wrapped copies of the input and
+                // overlay that no clear can locate precisely. Instead:
+                // wipe everything from the cursor down (the reflow leaves
+                // it at the end of the content — the best possible
+                // starting point), replay the last turn through the normal
+                // scrollback (pushing any corruption above the fold), then
+                // re-anchor; the usual redraw below repaints the input.
+                // Skipped without a session — nothing to replay and usually
+                // nothing to clear up. Height-only changes don't re-wrap,
+                // so they keep the cheap re-anchor path.
+                if cur_w != prev_term_w.get() {
+                    if let Some(s) = app_state.session() {
+                        let _ = io::stdout().write_all(b"\x1b[0J");
+                        let _ = io::stdout().flush();
+                        crate::agent::replay_last_turn_silent(&s, output).await;
+                    }
+                }
                 input_row = output.cursor_row();
             }
             // Keep the shared width in sync (covers width changes even without
@@ -817,6 +836,7 @@ impl Repl {
                         Repl::emit_commit(
                             output, &mut editor, &redraw, sel,
                             &mut input_row, &committed, "", false,
+                            history,
                         );
                         if let Some(text) = msg {
                             output.display_text(&text);
@@ -833,6 +853,7 @@ impl Repl {
                         Repl::emit_commit(
                             output, &mut editor, &redraw, sel,
                             &mut input_row, &committed, "", false,
+                            history,
                         );
                         output.display_text(&err);
                         return Some(InputAction::MenuDone);
@@ -1579,7 +1600,13 @@ impl Repl {
         line: &str,
         next_input: &str,
         sep: bool,
+        history: &mut History,
     ) {
+        // v2.5 menu commits (`/replay 1`, `/thinking low`, …) return
+        // `MenuDone` and never pass through the `Submit` arm in agent.rs
+        // where typed input is recorded — record the committed line here
+        // so recall (Up/Down) sees every command the user actually ran.
+        history.add(line);
         // Re-anchor to the real cursor BEFORE drawing: an external editor
         // ($EDITOR via `review_compaction_summary`, which runs mid-eval for
         // menu-driven compaction) may have repainted the screen since the

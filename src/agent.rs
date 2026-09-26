@@ -2636,6 +2636,30 @@ pub(crate) async fn handle_replay(
     }
 }
 
+/// Quiet `/replay 1`: separator + the last turn only — no status messages,
+/// and a no-op when the session has no turns yet. Used by the key-driven
+/// resize repaint in `read_input`, which wipes the old frame and replays
+/// the last turn to push reflow corruption out of view; that path must
+/// stay silent (a session exists from startup, long before it has any
+/// turns to replay).
+pub(crate) async fn replay_last_turn_silent(
+    session: &crate::session::Session,
+    output: &dyn Output,
+) {
+    let branch = session.get_branch().await;
+    let units = build_replay_units(&branch);
+    if count_turns(&units) == 0 {
+        return;
+    }
+    output.display_separator();
+    replay_last_turns(output, &units, 1);
+    // Trailing rule: manual `/replay 1` leaves the echoed command line
+    // between the replayed content and the input; the silent path skips
+    // the echo, so paint the divider ourselves — otherwise the repainted
+    // input sits flush against the replayed turn.
+    output.display_separator();
+}
+
 /// The canonical `provider:model` id a session has recorded, or `None`
 /// when it records no model at all. Branch first (a `ModelChange` entry is
 /// authoritative for mid-session `/model` switches), then the session
@@ -4680,20 +4704,6 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 r.invalidate_cache();
                             }
                         }
-                    }
-                    continue;
-                }
-                // Handle `/replay [N[t|l]]`: re-render session history.
-                // Replay walks the RAW branch (via `build_replay_units`) so
-                // compaction entries render as markers while the full history
-                // replays all the way to the beginning; only the agent context
-                // is prefix-limited at the compaction scope.
-                if input == "/replay" || input.starts_with("/replay ") {
-                    if let Some(s) = app_state.session() {
-                        let arg = input["/replay".len()..].trim();
-                        handle_replay(arg, &s, config.output.as_ref()).await;
-                    } else {
-                        config.output.display_text("No active session to replay");
                     }
                     continue;
                 }
