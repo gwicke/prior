@@ -87,6 +87,10 @@ required-features = ["test-utils"]
 tempfile = "3.24.0"
 portable-pty = "0.8"
 vt100 = "0.16"
+# wezterm's own terminal emulator core, used by `tests/resize_wezterm.rs`.
+# Unlike vt100 (and xterm), wezterm *reflows* scrollback on width changes, which
+# is where the resize duplication reproduced. Local checkout: path dep.
+wezterm-term = { path = "../wezterm/term" }
 serial_test = "3.1"
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["test-utils"] }
 
