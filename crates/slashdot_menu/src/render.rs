@@ -66,7 +66,11 @@ impl Marker {
     pub fn as_str(&self) -> &'static str {
         match self {
             Marker::Cursor | Marker::None => {
-                if matches!(self, Marker::Cursor) { "> " } else { "  " }
+                if matches!(self, Marker::Cursor) {
+                    "> "
+                } else {
+                    "  "
+                }
             }
             Marker::Active | Marker::CursorActive => "* ",
         }

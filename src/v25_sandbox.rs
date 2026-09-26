@@ -20,14 +20,14 @@ use std::rc::Rc;
 
 use crate::app_state::{AppState, SandboxOp};
 use crate::config::BindMode;
+use crate::sandbox_state::CombinedBind;
+use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
-    CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext,
-    SlashDotNode, StaticListingNode, StaticRow, SubmitResult,
+    CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
+    StaticListingNode, StaticRow, SubmitResult,
 };
-use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::value::Value;
-use crate::sandbox_state::CombinedBind;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -72,10 +72,19 @@ fn find_binding(ids: &[String]) -> Option<CombinedBind> {
 //  it blank — only the id is required.
 pub fn sandbox_listing_columns() -> Vec<ColumnDef> {
     vec![
-        ColumnDef::new("host", "Host path").min(8).prio(3).wrap(false),
-        ColumnDef::new("id", "Sandbox path").min(8).prio(3).wrap(false),
+        ColumnDef::new("host", "Host path")
+            .min(8)
+            .prio(3)
+            .wrap(false),
+        ColumnDef::new("id", "Sandbox path")
+            .min(8)
+            .prio(3)
+            .wrap(false),
         ColumnDef::new("mode", "Mode").min(4).prio(1).wrap(false),
-        ColumnDef::new("source", "Source").min(7).prio(1).wrap(false),
+        ColumnDef::new("source", "Source")
+            .min(7)
+            .prio(1)
+            .wrap(false),
     ]
 }
 
@@ -83,7 +92,10 @@ pub fn sandbox_listing_columns() -> Vec<ColumnDef> {
 /// mode + source; host/sandbox paths are reachable via `id` /
 /// `description`).
 pub fn sandbox_fields() -> Vec<FieldSpec> {
-    vec![FieldSpec::new("mode", false), FieldSpec::new("source", false)]
+    vec![
+        FieldSpec::new("mode", false),
+        FieldSpec::new("source", false),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -170,8 +182,7 @@ impl SlashDotNode for SandboxRemoveNode {
         lines.push(String::new());
         if b.is_excluded {
             lines.push(
-                "This config binding is currently excluded — restore re-enables it."
-                    .to_string(),
+                "This config binding is currently excluded — restore re-enables it.".to_string(),
             );
         } else if !b.is_session {
             lines.push(
@@ -196,9 +207,7 @@ impl SlashDotNode for SandboxRemoveNode {
         };
         let sandbox_path = path_str(&b.sandbox_path);
         let op = if b.is_excluded {
-            SandboxOp::Restore {
-                sandbox_path,
-            }
+            SandboxOp::Restore { sandbox_path }
         } else if b.is_session {
             SandboxOp::Remove { sandbox_path }
         } else {
@@ -253,7 +262,11 @@ impl SlashDotNode for AddSandboxMappingNode {
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let mode = path_args.ids.last().map(String::as_str).unwrap_or("?");
-        let mode_desc = if mode == "rw" { "read-write" } else { "read-only" };
+        let mode_desc = if mode == "rw" {
+            "read-write"
+        } else {
+            "read-only"
+        };
         vec![
             "Specify host path and optionally sandbox destination path.".to_string(),
             format!("Mode: {} ({})", mode, mode_desc),
@@ -309,7 +322,11 @@ impl SlashDotNode for AddSandboxMappingNode {
             if sandbox { "Sandbox path" } else { "Host path" }.to_string(),
             "Description".to_string(),
         ));
-        let rc = Rc::new(CompletionRows { rows, labels, match_indices: None });
+        let rc = Rc::new(CompletionRows {
+            rows,
+            labels,
+            match_indices: None,
+        });
         self.last_rows = Some((arg_idx, word, Rc::clone(&rc)));
         Ok(rc)
     }
@@ -361,27 +378,25 @@ pub fn build_sandbox_node(
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
 
-    let mut listing: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "sandbox",
-        "Manage sandbox path mappings",
-    )])
-    .with_columns(sandbox_listing_columns())
-    .with_fields(sandbox_fields())
-    .into();
+    let mut listing: SlashDotMenuNode =
+        StaticListingNode::new(&[StaticRow::new("sandbox", "Manage sandbox path mappings")])
+            .with_columns(sandbox_listing_columns())
+            .with_fields(sandbox_fields())
+            .into();
 
-    let mut add_node: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "add",
-        "Add a path mapping to the sandbox",
-    )])
-    .into();
+    let mut add_node: SlashDotMenuNode =
+        StaticListingNode::new(&[StaticRow::new("add", "Add a path mapping to the sandbox")])
+            .into();
     add_node.add_child(AddSandboxMappingNode::new(app_state.clone()).into());
     listing.add_child(add_node);
 
     let mut map_node: SlashDotMenuNode = SandboxMappingNode.into();
-    map_node.add_child(SandboxRemoveNode {
-        app_state: app_state.clone(),
-    }
-    .into());
+    map_node.add_child(
+        SandboxRemoveNode {
+            app_state: app_state.clone(),
+        }
+        .into(),
+    );
     listing.add_child(map_node);
 
     listing
@@ -481,7 +496,11 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox ",
+            HostKey::None,
+            100,
+        )));
 
         // Table headers render UPPERCASE (table.rs).
         let th = header_of(&plan).to_uppercase();
@@ -510,7 +529,11 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Root listing: source cell shows the disabled marker.
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox ", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox ",
+            HostKey::None,
+            100,
+        )));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("cfg [DISABLED]")),
@@ -518,7 +541,11 @@ mod tests {
         );
 
         // Drilled mapping level: the action row is `restore`.
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-ro ", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox /cfg-ro ",
+            HostKey::None,
+            100,
+        )));
         let rows = rows_of(&plan);
         assert!(
             rows.iter().any(|r| r.contains("re-enable this mapping")),
@@ -542,8 +569,11 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Config binding: exclude note + restore mention.
-        let (plan, _) =
-            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox /cfg-rw remove ", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox /cfg-rw remove ",
+            HostKey::None,
+            100,
+        )));
         let detail = detail_of(&plan).join("\n");
         assert!(detail.contains("excludes it"), "{detail:?}");
         assert!(detail.contains("restore"), "{detail:?}");
@@ -580,7 +610,10 @@ mod tests {
         };
 
         // Session bind → Remove.
-        assert!(matches!(futures::executor::block_on(node.prepare(1, &pa(&host_s))), SubmitResult::Prepared));
+        assert!(matches!(
+            futures::executor::block_on(node.prepare(1, &pa(&host_s))),
+            SubmitResult::Prepared
+        ));
         assert!(matches!(
             futures::executor::block_on(node.submit(1, &pa(&host_s))),
             SubmitResult::Done(None)
@@ -642,7 +675,11 @@ mod tests {
             take_sandbox_op(&app_state).is_none(),
             "first Enter must only arm the confirm"
         );
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(&prompt, HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            &prompt,
+            HostKey::None,
+            100,
+        )));
         assert!(
             detail_of(&plan).join("\n").contains("excludes it"),
             "confirm frame must show the header: {:?}",
@@ -670,7 +707,11 @@ mod tests {
         let mut menu = sandbox_menu(&app_state);
         let mut h = menu.get_handle();
 
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox add ",
+            HostKey::None,
+            100,
+        )));
         let rows = rows_of(&plan);
         assert!(rows.iter().any(|r| r.contains("ro")), "{rows:?}");
         assert!(rows.iter().any(|r| r.contains("rw")), "{rows:?}");
@@ -734,7 +775,10 @@ mod tests {
         let host_s = td.path().to_string_lossy().into_owned();
         let suffix = format!(" {}", host_s);
         let (pa, _) = mk("rw", &suffix);
-        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
+        assert!(matches!(
+            futures::executor::block_on(node.submit(1, &pa)),
+            SubmitResult::Done(None)
+        ));
         assert!(matches!(
             take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
@@ -745,7 +789,10 @@ mod tests {
         let dst = "/some/sandbox/dst".to_string();
         let suffix = format!(" {} {}", host_s, dst);
         let (pa, _) = mk("ro", &suffix);
-        assert!(matches!(futures::executor::block_on(node.submit(1, &pa)), SubmitResult::Done(None)));
+        assert!(matches!(
+            futures::executor::block_on(node.submit(1, &pa)),
+            SubmitResult::Done(None)
+        ));
         assert!(matches!(
             take_sandbox_op(&app_state),
             Some(SandboxOp::Add { host_path, sandbox_path, mode }) if
@@ -763,12 +810,18 @@ mod tests {
 
         // Enter on the bare `ro` id drills into the param leaf with an
         // empty suffix → submit guard fires → stay-open error frame.
-        let (plan, prompt) =
-            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro", HostKey::Enter, 100)));
+        let (plan, prompt) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox add ro",
+            HostKey::Enter,
+            100,
+        )));
         assert_eq!(prompt, "sandbox add ro ", "{prompt:?}");
         let detail = detail_of(&plan);
         assert_eq!(detail.len(), 3, "{detail:?}"); // error + two header lines
-        assert!(detail[0].contains("[ERROR]: host path required"), "{detail:?}");
+        assert!(
+            detail[0].contains("[ERROR]: host path required"),
+            "{detail:?}"
+        );
         assert!(detail[1].contains("Specify host path"), "{detail:?}");
         assert!(detail[2].contains("Mode: ro"), "{detail:?}");
         assert!(
@@ -793,8 +846,11 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Arg 1 → host listing, "Host path" label.
-        let (plan, _) =
-            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {}/", p1), HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            &format!("sandbox add ro {}/", p1),
+            HostKey::None,
+            100,
+        )));
         let th = header_of(&plan).to_uppercase();
         assert!(!th.is_empty(), "arg-1 completion must open a dialog");
         assert!(th.contains("HOST PATH"), "{th:?}");
@@ -838,8 +894,11 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Non-exact stem → dialog with the file.
-        let (plan, _) =
-            expect_continue(futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/so"), HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            &format!("sandbox add ro {p}/so"),
+            HostKey::None,
+            100,
+        )));
         assert!(
             header_of(&plan).to_uppercase().contains("HOST PATH"),
             "dialog expected"
@@ -851,9 +910,11 @@ mod tests {
         );
 
         // Exact file → all candidates exact → no dialog (header only).
-        let (plan, _) = expect_continue(
-            futures::executor::block_on(h.eval_prompt(&format!("sandbox add ro {p}/solo.txt"), HostKey::None, 100)),
-        );
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            &format!("sandbox add ro {p}/solo.txt"),
+            HostKey::None,
+            100,
+        )));
         assert!(
             header_of(&plan).is_empty(),
             "exact-only match must not open a dialog"
@@ -865,13 +926,20 @@ mod tests {
         );
 
         // Gate: ordinary bare word → inert, no dialog.
-        let (plan, _) =
-            expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro plainword", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox add ro plainword",
+            HostKey::None,
+            100,
+        )));
         assert!(header_of(&plan).is_empty(), "bare word must be inert");
 
         // Gate: dot-word is attempted (cwd listing — may be empty, but
         // must not error); a definitely-gated word never is.
-        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt("sandbox add ro ..", HostKey::None, 100)));
+        let (plan, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            "sandbox add ro ..",
+            HostKey::None,
+            100,
+        )));
         let _ = plan; // ".." may or may not match cwd entries — just no panic.
     }
 

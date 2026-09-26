@@ -4,16 +4,16 @@
 //! sessions are stored under `base_dir/<cwd-encoded>/<timestamp>_<uuid>.jsonl`.
 //! The CWD-based directory structure groups sessions by working directory.
 
+use async_trait::async_trait;
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use async_trait::async_trait;
-use chrono::Utc;
 use tokio::io::AsyncWriteExt;
 
-use crate::session::types::*;
 use crate::session::storage::*;
+use crate::session::types::*;
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -39,7 +39,10 @@ pub trait SessionRepo: Send + Sync {
     async fn create(&self, cwd: &Path) -> crate::Result<JsonlSessionStorage>;
 
     /// Open an existing session by metadata, building its full in-memory index.
-    async fn open(&self, meta: &SessionMetadata) -> crate::Result<(JsonlSessionStorage, SessionIndex)>;
+    async fn open(
+        &self,
+        meta: &SessionMetadata,
+    ) -> crate::Result<(JsonlSessionStorage, SessionIndex)>;
 
     /// List all sessions for a given CWD (or all CWDs if `None`).
     async fn list(&self, cwd: Option<&Path>) -> crate::Result<Vec<SessionMetadata>>;
@@ -48,7 +51,7 @@ pub trait SessionRepo: Send + Sync {
     async fn delete(&self, meta: &SessionMetadata) -> crate::Result<()>;
 
     /// Fork a session from a specific entry.
-    /// 
+    ///
     /// - `fork_entry_id` empty → FullTree fork (entire session, all branches)
     /// - `fork_entry_id` set + `ForkMode::ActivePath` → path-only fork (for /tree)
     /// - `fork_entry_id` set + `ForkMode::FullTree` → full tree + new Leaf at fork_entry_id
@@ -141,7 +144,10 @@ impl JsonlSessionRepo {
     /// Create a new repo rooted at `base_dir` (typically
     /// `~/.picocode/sessions/`).
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir, cache: Arc::new(Mutex::new(None)) }
+        Self {
+            base_dir,
+            cache: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// The absolute base directory for session storage.
@@ -445,7 +451,9 @@ impl SessionRepo for JsonlSessionRepo {
         let source_content = tokio::fs::read_to_string(&source.path).await?;
         let lines: Vec<&str> = source_content.lines().collect();
         if lines.is_empty() {
-            return Err(crate::PicocodeError::Other("Source session file is empty".into()));
+            return Err(crate::PicocodeError::Other(
+                "Source session file is empty".into(),
+            ));
         }
 
         // Parse the original header to carry forward metadata.
@@ -619,10 +627,14 @@ impl JsonlSessionRepo {
 
                     // Reuse cached metadata if file mtime matches.
                     if let Some(file_mt) = file_mtime {
-                        let cached_mt = cache.dirs.get(dir)
+                        let cached_mt = cache
+                            .dirs
+                            .get(dir)
                             .and_then(|c| c.file_mtimes.get(&path).copied());
                         if Some(file_mt) == cached_mt {
-                            if let Some(old) = cache.dirs.get(dir)
+                            if let Some(old) = cache
+                                .dirs
+                                .get(dir)
                                 .and_then(|c| c.sessions.iter().find(|s| s.path == path))
                             {
                                 sessions.push(old.clone());
@@ -651,7 +663,10 @@ impl JsonlSessionRepo {
             });
             cache.dirs.insert(
                 dir.clone(),
-                CachedDir { file_mtimes, sessions },
+                CachedDir {
+                    file_mtimes,
+                    sessions,
+                },
             );
         }
 
@@ -702,10 +717,7 @@ impl JsonlSessionRepo {
         // Snapshot prior per-dir state for mtime-based reuse (short lock).
         let prior: HashMap<PathBuf, CachedDir> = {
             let cache = self.cache.lock().unwrap();
-            cache
-                .as_ref()
-                .map(|c| c.dirs.clone())
-                .unwrap_or_default()
+            cache.as_ref().map(|c| c.dirs.clone()).unwrap_or_default()
         };
 
         // Async scan — one tokio::fs pass per directory.
@@ -719,8 +731,7 @@ impl JsonlSessionRepo {
                     if !path.extension().map_or(false, |e| e == "jsonl") {
                         continue;
                     }
-                    let file_mtime =
-                        entry.metadata().await.ok().and_then(|m| m.modified().ok());
+                    let file_mtime = entry.metadata().await.ok().and_then(|m| m.modified().ok());
 
                     // Reuse cached metadata when the file mtime is unchanged.
                     if let Some(file_mt) = file_mtime {
@@ -752,7 +763,13 @@ impl JsonlSessionRepo {
                 let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
                 b_ts.cmp(a_ts)
             });
-            scanned.insert(dir.clone(), CachedDir { file_mtimes, sessions });
+            scanned.insert(
+                dir.clone(),
+                CachedDir {
+                    file_mtimes,
+                    sessions,
+                },
+            );
         }
 
         // Store + return (short lock).
@@ -778,7 +795,10 @@ mod tests {
     /// Create a session via repo.create() and immediately persist it (write header).
     /// repo.create() no longer writes the header — it's deferred to Session's
     /// first append. Tests that need listing/reading must persist explicitly.
-    async fn create_persisted(repo: &JsonlSessionRepo, cwd: &Path) -> crate::session::storage::JsonlSessionStorage {
+    async fn create_persisted(
+        repo: &JsonlSessionRepo,
+        cwd: &Path,
+    ) -> crate::session::storage::JsonlSessionStorage {
         let storage = repo.create(cwd).await.unwrap();
         let header = crate::session::SessionHeader::new(cwd);
         storage.write_header(&header).await.unwrap();
@@ -935,7 +955,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
 
         // Fork from e1 (before e2, so we get only the first message) - ActivePath mode
-        let fork_storage = repo.fork(&sessions[0], "e1", cwd, ForkMode::ActivePath).await.unwrap();
+        let fork_storage = repo
+            .fork(&sessions[0], "e1", cwd, ForkMode::ActivePath)
+            .await
+            .unwrap();
         let fork_index = fork_storage.build_index().await.unwrap();
 
         // Fork should have the header + e1 = 1 entry (header is separate).
@@ -1002,7 +1025,10 @@ mod tests {
         assert_eq!(sessions.len(), 1);
 
         // FullTree fork (empty fork_entry_id) - should preserve ALL entries including the branch
-        let fork_storage = repo.fork(&sessions[0], "", cwd, ForkMode::FullTree).await.unwrap();
+        let fork_storage = repo
+            .fork(&sessions[0], "", cwd, ForkMode::FullTree)
+            .await
+            .unwrap();
         let fork_index = fork_storage.build_index().await.unwrap();
 
         // FullTree fork should have ALL 3 entries (e1, e2, e3) + Leaf = 4 entries
@@ -1061,7 +1087,10 @@ mod tests {
 
         // FullTree fork WITH a specific fork_entry_id - should preserve all entries
         // AND add a new Leaf pointing to e1
-        let fork_storage = repo.fork(&sessions[0], "e1", cwd, ForkMode::FullTree).await.unwrap();
+        let fork_storage = repo
+            .fork(&sessions[0], "e1", cwd, ForkMode::FullTree)
+            .await
+            .unwrap();
         let fork_index = fork_storage.build_index().await.unwrap();
 
         // Should have all entries + original Leaf + new Leaf = 4 entries

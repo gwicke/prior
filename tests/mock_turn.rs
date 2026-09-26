@@ -43,10 +43,7 @@ impl MockLlm {
                 });
             }
         });
-        MockLlm {
-            port,
-            requests,
-        }
+        MockLlm { port, requests }
     }
 
     fn base_url(&self) -> String {
@@ -84,7 +81,12 @@ fn serve(
 
     if scenario == 3 && n >= 2 {
         let json = r#"{"error":{"message":"Rate limit exceeded: mock","code":429}}"#;
-        return write_response(stream, "429 Too Many Requests", "application/json", json.as_bytes());
+        return write_response(
+            stream,
+            "429 Too Many Requests",
+            "application/json",
+            json.as_bytes(),
+        );
     }
 
     // Scenario 2: single text-only turn, no tool call.
@@ -124,9 +126,7 @@ fn serve(
     write_response(stream, "200 OK", "text/event-stream", sse.as_bytes())
 }
 
-fn read_http_request(
-    stream: &mut std::net::TcpStream,
-) -> std::io::Result<(String, Vec<u8>)> {
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
@@ -142,7 +142,10 @@ fn read_http_request(
             break;
         }
     }
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(buf.len());
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut body = buf[header_end + 4..].to_vec();
     let clen: usize = head
@@ -234,7 +237,14 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
         .expect("open pty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
-    let mut args: Vec<String> = vec!["-p".into(), "llamacpp".into(), "-m".into(), "test".into(), "--yolo".into(), "true".into()];
+    let mut args: Vec<String> = vec![
+        "-p".into(),
+        "llamacpp".into(),
+        "-m".into(),
+        "test".into(),
+        "--yolo".into(),
+        "true".into(),
+    ];
     let _cfg_keep;
     let _config_tempdir;
     if thinking {
@@ -252,10 +262,7 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
     // Keep the tempdir alive for the duration of the run.
     _config_tempdir = Some(config_tempdir);
 
@@ -287,7 +294,8 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
 
     let data = bytes.lock().unwrap().clone();
     std::fs::write(format!("/tmp/mock_turn_{label}.bin"), &data).unwrap();
-    let tail: String = String::from_utf8_lossy(&data[data.len().saturating_sub(3000)..]).to_string();
+    let tail: String =
+        String::from_utf8_lossy(&data[data.len().saturating_sub(3000)..]).to_string();
     eprintln!("[{label}] raw tail = {:?}", tail);
     let mut p = Parser::new(ROWS, COLS, 1000);
     p.process(&data);

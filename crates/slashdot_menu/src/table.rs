@@ -494,7 +494,11 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
             let s = ms.saturating_sub(slack / 2);
             let e = (me + (slack - (ms - s))).min(cell_width);
             let s = s.saturating_sub(max_width.saturating_sub(e - s));
-            let e = if e < cell_width { (s + max_width).min(cell_width) } else { e };
+            let e = if e < cell_width {
+                (s + max_width).min(cell_width)
+            } else {
+                e
+            };
             (s, e)
         };
         // Reserve a column per ellipsis.
@@ -512,9 +516,22 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
                 w_end = w_end.saturating_sub(over);
             }
         }
-        let start_char = char_to_visible.iter().position(|&v| v >= w_start).unwrap_or(0);
-        let end_char = char_to_visible.iter().position(|&v| v >= w_end).unwrap_or(n_chars);
-        let (s, e) = tighten(&chars, &matched, start_char, end_char, start_char > 0, end_char < n_chars);
+        let start_char = char_to_visible
+            .iter()
+            .position(|&v| v >= w_start)
+            .unwrap_or(0);
+        let end_char = char_to_visible
+            .iter()
+            .position(|&v| v >= w_end)
+            .unwrap_or(n_chars);
+        let (s, e) = tighten(
+            &chars,
+            &matched,
+            start_char,
+            end_char,
+            start_char > 0,
+            end_char < n_chars,
+        );
         let mut out = String::new();
         if s > 0 {
             out.push('…');
@@ -566,10 +583,8 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
     loop {
         let leading = (segs[0].0 > 0) as usize;
         let trailing = (segs[segs.len() - 1].1 < n_chars) as usize;
-        let total: usize = segs.iter().map(|&s| seg_w(s)).sum::<usize>()
-            + interior
-            + leading
-            + trailing;
+        let total: usize =
+            segs.iter().map(|&s| seg_w(s)).sum::<usize>() + interior + leading + trailing;
         if total <= max_width {
             break;
         }
@@ -687,7 +702,11 @@ fn single_extent_snippet(
         let s = ms.saturating_sub(slack / 2);
         let e = (me + (slack - (ms - s))).min(cell_width);
         let s = s.saturating_sub(max_width.saturating_sub(e - s));
-        let e = if e < cell_width { (s + max_width).min(cell_width) } else { e };
+        let e = if e < cell_width {
+            (s + max_width).min(cell_width)
+        } else {
+            e
+        };
         (s, e)
     };
     loop {
@@ -704,9 +723,22 @@ fn single_extent_snippet(
             w_end = w_end.saturating_sub(over);
         }
     }
-    let start_char = char_to_visible.iter().position(|&v| v >= w_start).unwrap_or(0);
-    let end_char = char_to_visible.iter().position(|&v| v >= w_end).unwrap_or(n_chars);
-    let (s, e) = tighten(chars, matched, start_char, end_char, start_char > 0, end_char < n_chars);
+    let start_char = char_to_visible
+        .iter()
+        .position(|&v| v >= w_start)
+        .unwrap_or(0);
+    let end_char = char_to_visible
+        .iter()
+        .position(|&v| v >= w_end)
+        .unwrap_or(n_chars);
+    let (s, e) = tighten(
+        chars,
+        matched,
+        start_char,
+        end_char,
+        start_char > 0,
+        end_char < n_chars,
+    );
     let mut out = String::new();
     if s > 0 {
         out.push('…');
@@ -780,7 +812,11 @@ mod snippet_tests {
         let cell = "hello world";
         // "w" at byte 6 is matched - should be highlighted.
         let snippet = extract_snippet(cell, &[6], 20);
-        assert!(snippet.contains("\x1b[1;35mw\x1b[22;39m"), "snippet: {:?}", snippet);
+        assert!(
+            snippet.contains("\x1b[1;35mw\x1b[22;39m"),
+            "snippet: {:?}",
+            snippet
+        );
         assert!(snippet.contains("hello "));
         assert!(snippet.contains("orld"));
     }
@@ -792,7 +828,11 @@ mod snippet_tests {
         let indices = (path_start..path_start + 4).collect::<Vec<_>>();
         let snippet = extract_snippet(cell, &indices, 35);
         assert!(snippet.contains("path"), "snippet: {}", snippet);
-        assert!(display_width(&snippet) <= 35, "visual width: {}", display_width(&snippet));
+        assert!(
+            display_width(&snippet) <= 35,
+            "visual width: {}",
+            display_width(&snippet)
+        );
     }
 
     #[test]
@@ -802,7 +842,11 @@ mod snippet_tests {
         let cell = "model_with_a_very_long_suffix_indeed";
         let indices = vec![0, 1, 2, 3, 4];
         let snippet = extract_snippet(cell, &indices, 20);
-        assert!(snippet.starts_with("\x1b[1;35mmodel\x1b[22;39m"), "snippet: {:?}", snippet);
+        assert!(
+            snippet.starts_with("\x1b[1;35mmodel\x1b[22;39m"),
+            "snippet: {:?}",
+            snippet
+        );
         // No leading ellipsis (nothing trimmed at the start) and full width used.
         assert!(!snippet.starts_with('…'));
         assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
@@ -814,7 +858,11 @@ mod snippet_tests {
         let m = cell.find("model").unwrap();
         let indices: Vec<usize> = (m..m + 5).collect();
         let snippet = extract_snippet(cell, &indices, 20);
-        assert!(snippet.ends_with("model\x1b[22;39m"), "snippet: {:?}", snippet);
+        assert!(
+            snippet.ends_with("model\x1b[22;39m"),
+            "snippet: {:?}",
+            snippet
+        );
         assert!(snippet.starts_with('…'));
         assert_eq!(display_width(&snippet), 20, "snippet: {:?}", snippet);
     }
@@ -826,8 +874,16 @@ mod snippet_tests {
         let t = cell.find("TARGET").unwrap();
         let indices: Vec<usize> = (t..t + 6).collect();
         let snippet = extract_snippet(cell, &indices, 16);
-        assert!(!snippet.contains("… "), "leading space after ellipsis: {:?}", snippet);
-        assert!(!snippet.contains(" …"), "space before ellipsis: {:?}", snippet);
+        assert!(
+            !snippet.contains("… "),
+            "leading space after ellipsis: {:?}",
+            snippet
+        );
+        assert!(
+            !snippet.contains(" …"),
+            "space before ellipsis: {:?}",
+            snippet
+        );
         assert!(snippet.contains("TARGET"), "{:?}", snippet);
     }
 
@@ -844,7 +900,11 @@ mod snippet_tests {
         assert!(snippet.contains("omega"), "snippet: {:?}", snippet);
         // The interior gap is elided (an interior ellipsis is present).
         assert!(snippet.matches('…').count() >= 1, "snippet: {:?}", snippet);
-        assert!(display_width(&snippet) <= 30, "w={}", display_width(&snippet));
+        assert!(
+            display_width(&snippet) <= 30,
+            "w={}",
+            display_width(&snippet)
+        );
     }
 
     #[test]
@@ -855,7 +915,10 @@ mod snippet_tests {
         let indices: Vec<usize> = (match_start..match_end).collect();
         let snippet = extract_snippet(cell, &indices, 15);
         assert!(snippet.contains("日本語"), "snippet: {}", snippet);
-        assert!(snippet.contains("\x1b[1;35m"), "should highlight unicode match");
+        assert!(
+            snippet.contains("\x1b[1;35m"),
+            "should highlight unicode match"
+        );
     }
 }
 
@@ -911,7 +974,11 @@ mod tests {
         }
         // The Model column (highest priority) should keep the most width.
         let widths: Vec<usize> = rows[0].split(' ').map(display_width).collect();
-        assert!(widths[0] >= widths[2], "model col kept wider: {:?}", rows[0]);
+        assert!(
+            widths[0] >= widths[2],
+            "model col kept wider: {:?}",
+            rows[0]
+        );
     }
 
     #[test]
@@ -926,9 +993,21 @@ mod tests {
         // Split on the 2-space gap.
         let parts: Vec<&str> = r.split("  ").collect();
         assert_eq!(parts.len(), 3);
-        assert!(parts[0].ends_with('…'), "left ellipsis at end: {:?}", parts[0]);
-        assert!(parts[1].starts_with('…'), "right ellipsis at start: {:?}", parts[1]);
-        assert!(parts[2].contains('…'), "center ellipsis inside: {:?}", parts[2]);
+        assert!(
+            parts[0].ends_with('…'),
+            "left ellipsis at end: {:?}",
+            parts[0]
+        );
+        assert!(
+            parts[1].starts_with('…'),
+            "right ellipsis at start: {:?}",
+            parts[1]
+        );
+        assert!(
+            parts[2].contains('…'),
+            "center ellipsis inside: {:?}",
+            parts[2]
+        );
         for p in &parts {
             assert_eq!(display_width(p), 5, "part width: {:?}", p);
         }
@@ -955,8 +1034,8 @@ mod tests {
         t.add_row(&["beta", "22"]);
         let out = t.render_with_header(80);
         assert_eq!(out.len(), 4); // header + sep + 2 rows
-        // Column widths: Name=5, N grows to fill the slack => every line is
-        // width 80 (Name=5, gap=2, N=73).
+                                  // Column widths: Name=5, N grows to fill the slack => every line is
+                                  // width 80 (Name=5, gap=2, N=73).
         for line in &out {
             assert_eq!(display_width(line), 80);
         }

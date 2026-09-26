@@ -11,18 +11,20 @@
 //! the cursor. All editor *logic* is pure and unit-tested; only the final
 //! escape-sequence emission touches the terminal.
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-use crate::output::{term_width, wrap, Output};
-use crate::model_catalog;
-use crate::app_state::AppState;
-use crate::session::SessionTreeNode;
 use crate::agent::SessionUsage;
+use crate::app_state::AppState;
+use crate::model_catalog;
+use crate::output::{term_width, wrap, Output};
+use crate::session::SessionTreeNode;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -173,9 +175,9 @@ impl TermGuard {
         // editing, no echo). `disable_raw_mode` restores the original mode.
         enable_output_processing();
         Self::csi("?2004h")?; // bracketed paste on
-        // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
-        // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
-        // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
+                              // Kitty keyboard protocol: disambiguate keys + report all keys as CSI u,
+                              // so Shift+Enter arrives as Enter+SHIFT (newline) and Alt+Letter as a
+                              // distinct Alt-modified char. Honored by wezterm/alacritty/kitty.
         crossterm::execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(
@@ -426,9 +428,7 @@ impl ActiveOverlay {
     /// (they are non-selectable); the caller's paint arm renders them.
     /// The loop uses the returned opts only for cursor/focus math.
     fn plan_rows(plan: &crate::slashdot_menu::render::RenderPlan) -> (Vec<String>, Option<usize>) {
-        let opts: Vec<String> = plan.rows.iter()
-            .map(|l| l.0.clone())
-            .collect();
+        let opts: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
         (opts, plan.active_rows.first().copied())
     }
 
@@ -452,9 +452,7 @@ impl ActiveOverlay {
     fn cursor_row(&self) -> Option<usize> {
         match self {
             ActiveOverlay::None => None,
-            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                plan.selected
-            }
+            ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => plan.selected,
         }
     }
 
@@ -558,10 +556,10 @@ impl Repl {
         let mut draft = String::new();
         let mut sel: usize = 0;
         let mut last_disc: u8 = 0; // overlay discriminant for sel-reset tracking
-        // v2.5 engine: persistent menu tree + guard-like handle.
-        // The menu lives for the entire prompt session; the handle is
-        // created when the prompt starts with `/` and dropped when it
-        // no longer does. All `/` dispatch goes through `eval_prompt`.
+                                   // v2.5 engine: persistent menu tree + guard-like handle.
+                                   // The menu lives for the entire prompt session; the handle is
+                                   // created when the prompt starts with `/` and dropped when it
+                                   // no longer does. All `/` dispatch goes through `eval_prompt`.
         let mut v25_menu = crate::v25_menu::build_menu(app_state);
         let mut v25_handle: Option<crate::slashdot_menu::menu::SlashDotHandle<'_>> = None;
         // Prose (non-`/`) completion: one instance for the prompt
@@ -617,93 +615,93 @@ impl Repl {
         // scrollback (session preserved); `input_row` is adjusted by the scroll
         // delta so the next redraw clears/writes at the right place (no
         // duplication). See plan §3.7.
-        let redraw = |editor: &LineEditor, overlay: &[&str], sel: usize,
-                      current_row: &mut usize| {
-            let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let w = w as usize;
-            let term_h = h.max(1) as usize;
-            // Lower bound for the clear below: the *previous* screen bottom when
-            // the terminal just grew, so a maximize that reveals scrollback
-            // below the old bottom is not erased. `prev_term_h` is advanced only
-            // after the redraw (see the loop), and `input_row` is re-anchored to
-            // the real cursor before the redraw, so this is safe on both the
-            // top- and bottom-anchored reflow models.
-            let clear_to = prev_term_h.get().min(term_h);
-            let row = (*current_row).max(1).min(term_h);
-            let layout = editor.layout(w, prompt);
-            let er = layout.row_count.max(1);
-            // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
-            // the terminal height (≥ 1 line); the terminal scrolls on overflow.
-            let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-            let n = overlay.len().min(max_pop);
-            // Window the (possibly long) overlay around the selection.
-            let win = Self::overlay_window(overlay.len(), n, sel);
-            let mut s = String::new();
-            // Position at the input block's top row, then clear the rows the
-            // input + overlay will occupy — bounded at `clear_to` (the previous
-            // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
-            // bottom and wipe the scrollback a maximized window just revealed.
-            s.push_str(&format!("\x1b[{};1H", row));
-            s.push_str(&Self::clear_rows_to(row, clear_to));
-            s.push_str(&format!("\x1b[{};1H", row));
-            s.push_str(&render_content(&layout, prompt));
-            s.push_str(&cursor_positioning(&layout, prompt));
-            if n > 0 {
-                // Move *below* the input block using a relative down-move. An absolute
-                // address would be out of range when the input sits on the bottom
-                // row (and get silently ignored, overwriting the input); a relative
-                // move scrolls the screen instead, which is the desired behavior.
-                // `below` is the number of rows from the (caret) cursor row to just
-                // past the last input row.
-                let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
-                let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(w));
-                // Step below the input block with line feeds rather than a
-                // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
-                // the cursor to the bottom margin and never scrolls, so when the
-                // input sits on the bottom row the divider was emitted on the
-                // input's own row, overwriting it (see bug report: two stacked
-                // dividers, no input line). A bare `\n` is translated to `\r\n`
-                // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
-                // returns to column 0 and *scrolls* when the cursor is on the
-                // bottom row — exactly the move we need. Emitting `below` of
-                // them lands just past the last input row and makes the real
-                // scroll count match `next_input_row`'s `er + n` assumption.
-                for _ in 0..below {
-                    s.push('\n');
-                }
-                s.push('\r');
-                s.push_str(&divider);
-                s.push('\n');
-                for i in 0..n {
-                    s.push_str(overlay[win + i]);
-                    if i + 1 < n {
+        let redraw =
+            |editor: &LineEditor, overlay: &[&str], sel: usize, current_row: &mut usize| {
+                let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let w = w as usize;
+                let term_h = h.max(1) as usize;
+                // Lower bound for the clear below: the *previous* screen bottom when
+                // the terminal just grew, so a maximize that reveals scrollback
+                // below the old bottom is not erased. `prev_term_h` is advanced only
+                // after the redraw (see the loop), and `input_row` is re-anchored to
+                // the real cursor before the redraw, so this is safe on both the
+                // top- and bottom-anchored reflow models.
+                let clear_to = prev_term_h.get().min(term_h);
+                let row = (*current_row).max(1).min(term_h);
+                let layout = editor.layout(w, prompt);
+                let er = layout.row_count.max(1);
+                // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
+                // the terminal height (≥ 1 line); the terminal scrolls on overflow.
+                let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                let n = overlay.len().min(max_pop);
+                // Window the (possibly long) overlay around the selection.
+                let win = Self::overlay_window(overlay.len(), n, sel);
+                let mut s = String::new();
+                // Position at the input block's top row, then clear the rows the
+                // input + overlay will occupy — bounded at `clear_to` (the previous
+                // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
+                // bottom and wipe the scrollback a maximized window just revealed.
+                s.push_str(&format!("\x1b[{};1H", row));
+                s.push_str(&Self::clear_rows_to(row, clear_to));
+                s.push_str(&format!("\x1b[{};1H", row));
+                s.push_str(&render_content(&layout, prompt));
+                s.push_str(&cursor_positioning(&layout, prompt));
+                if n > 0 {
+                    // Move *below* the input block using a relative down-move. An absolute
+                    // address would be out of range when the input sits on the bottom
+                    // row (and get silently ignored, overwriting the input); a relative
+                    // move scrolls the screen instead, which is the desired behavior.
+                    // `below` is the number of rows from the (caret) cursor row to just
+                    // past the last input row.
+                    let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
+                    let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(w));
+                    // Step below the input block with line feeds rather than a
+                    // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
+                    // the cursor to the bottom margin and never scrolls, so when the
+                    // input sits on the bottom row the divider was emitted on the
+                    // input's own row, overwriting it (see bug report: two stacked
+                    // dividers, no input line). A bare `\n` is translated to `\r\n`
+                    // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
+                    // returns to column 0 and *scrolls* when the cursor is on the
+                    // bottom row — exactly the move we need. Emitting `below` of
+                    // them lands just past the last input row and makes the real
+                    // scroll count match `next_input_row`'s `er + n` assumption.
+                    for _ in 0..below {
                         s.push('\n');
                     }
+                    s.push('\r');
+                    s.push_str(&divider);
+                    s.push('\n');
+                    for i in 0..n {
+                        s.push_str(overlay[win + i]);
+                        if i + 1 < n {
+                            s.push('\n');
+                        }
+                    }
+                    // Reposition the cursor back on the input line after drawing
+                    // the overlay below it.  The cursor was placed at
+                    // `(row + cursor_row, cursor_col)` by `cursor_positioning`
+                    // above; the overlay moved it down as it drew.  Rather than
+                    // a relative move that breaks when the terminal scrolls,
+                    // compute the *visual* row after the scroll and use an
+                    // absolute position.
+                    //
+                    // The cursor after the overlay is at viewport row
+                    // `row + er + n` (er = total input rows, n = overlay count).
+                    // Anything past `term_h` causes the terminal to scroll,
+                    // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
+                    let delta = (row + er + n).saturating_sub(term_h);
+                    let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
+                    s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
                 }
-                // Reposition the cursor back on the input line after drawing
-                // the overlay below it.  The cursor was placed at
-                // `(row + cursor_row, cursor_col)` by `cursor_positioning`
-                // above; the overlay moved it down as it drew.  Rather than
-                // a relative move that breaks when the terminal scrolls,
-                // compute the *visual* row after the scroll and use an
-                // absolute position.
-                //
-                // The cursor after the overlay is at viewport row
-                // `row + er + n` (er = total input rows, n = overlay count).
-                // Anything past `term_h` causes the terminal to scroll,
-                // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
-                let delta = (row + er + n).saturating_sub(term_h);
-                let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
-                s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
-            }
-            let _ = io::stdout().write_all(s.as_bytes());
-            let _ = io::stdout().flush();
-            // Follow the terminal's native scroll: if this write pushed the input
-            // up, remember the new visible row so the next redraw clears/writes
-            // at the correct place (prevents the duplication seen when a tall
-            // pop-up shrinks but the screen has not scrolled back down).
-            *current_row = Self::next_input_row(row, term_h, er, n);
-        };
+                let _ = io::stdout().write_all(s.as_bytes());
+                let _ = io::stdout().flush();
+                // Follow the terminal's native scroll: if this write pushed the input
+                // up, remember the new visible row so the next redraw clears/writes
+                // at the correct place (prevents the duplication seen when a tall
+                // pop-up shrinks but the screen has not scrolled back down).
+                *current_row = Self::next_input_row(row, term_h, er, n);
+            };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
             // is not running then), re-enter raw mode so the next keystroke is
@@ -754,7 +752,9 @@ impl Repl {
             // applied to the buffer AND its plan rendered, so a §5.1
             // keyless restore lands both in the same frame — no window
             // for a racing edit between them. ---
-            let key = pending_key.take().unwrap_or(crate::slashdot_menu::HostKey::None);
+            let key = pending_key
+                .take()
+                .unwrap_or(crate::slashdot_menu::HostKey::None);
             let buf_text = editor.text();
             let overlay = if buf_text.starts_with('/') {
                 // All `/` commands route through the v2.5 engine.
@@ -788,8 +788,14 @@ impl Repl {
                         // (e.g. "/thinking low").
                         let committed = format!("/{}", prompt);
                         Repl::emit_commit(
-                            output, &mut editor, &redraw, sel,
-                            &mut input_row, &committed, "", false,
+                            output,
+                            &mut editor,
+                            &redraw,
+                            sel,
+                            &mut input_row,
+                            &committed,
+                            "",
+                            false,
                             history,
                         );
                         if let Some(text) = msg {
@@ -805,8 +811,14 @@ impl Repl {
                     {
                         let committed = format!("/{}", prompt);
                         Repl::emit_commit(
-                            output, &mut editor, &redraw, sel,
-                            &mut input_row, &committed, "", false,
+                            output,
+                            &mut editor,
+                            &redraw,
+                            sel,
+                            &mut input_row,
+                            &committed,
+                            "",
+                            false,
                             history,
                         );
                         output.display_text(&err);
@@ -860,7 +872,9 @@ impl Repl {
                     .cursor_row()
                     .unwrap_or(active.unwrap_or(0))
                     .min(raw_opts.len().saturating_sub(1));
-                if cur_disc != last_disc { last_disc = cur_disc; }
+                if cur_disc != last_disc {
+                    last_disc = cur_disc;
+                }
             } else {
                 sel = Self::cursor_sel_policy(cur_disc != last_disc, sel);
             }
@@ -881,7 +895,10 @@ impl Repl {
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
             let focus = {
                 let sc = sel.min(opts.len());
-                1 + opts[..sc].iter().map(|o| o.matches('\n').count() + 1).sum::<usize>()
+                1 + opts[..sc]
+                    .iter()
+                    .map(|o| o.matches('\n').count() + 1)
+                    .sum::<usize>()
             };
             redraw(&editor, &overlay_vec, focus, &mut input_row);
             prev_term_h.set(cur_h as usize);
@@ -965,7 +982,7 @@ impl Repl {
                                 }
                                 Err(e) => {
                                     let _ = io::stdout().write_all(
-                                        format!("\r\neditor error: {}\r\n", e).as_bytes()
+                                        format!("\r\neditor error: {}\r\n", e).as_bytes(),
                                     );
                                 }
                             }
@@ -988,13 +1005,18 @@ impl Repl {
                                 // empty-plan V25Menu case only.
                                 if overlay.cursor_row().is_some() {
                                     let delta: i32 = if key.code == KeyCode::Down { 1 } else { -1 };
-                                    pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                                    pending_key =
+                                        Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     continue;
                                 }
                                 if key.code == KeyCode::Down {
-                                    if sel + 1 < opts.len() { sel += 1; }
+                                    if sel + 1 < opts.len() {
+                                        sel += 1;
+                                    }
                                 } else {
-                                    if sel > 0 { sel -= 1; }
+                                    if sel > 0 {
+                                        sel -= 1;
+                                    }
                                 }
                             }
                             KeyCode::PageDown | KeyCode::PageUp => {
@@ -1002,7 +1024,8 @@ impl Repl {
                                 // page scroll through the engine that owns
                                 // the cursor (slash handle / prose).
                                 let plan = match &overlay {
-                                    ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => Some(plan),
+                                    ActiveOverlay::V25Menu { plan }
+                                    | ActiveOverlay::PathComplete { plan } => Some(plan),
                                     ActiveOverlay::None => None,
                                 };
                                 if let Some(plan) = plan {
@@ -1013,20 +1036,35 @@ impl Repl {
                                     }
                                     let cur_sel = plan.selected.unwrap_or(0);
                                     // Compute page budget (same formula as overlay rendering).
-                                    let (cur_h, _) = crossterm::terminal::size().unwrap_or((80, 24));
+                                    let (cur_h, _) =
+                                        crossterm::terminal::size().unwrap_or((80, 24));
                                     let cur_h = cur_h.max(1) as usize;
-                                    let max_pop = ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                                    let dv: usize = plan.detail.iter()
-                                        .map(|d| d.0.split('\n').count())
-                                        .sum();
+                                    let max_pop =
+                                        ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+                                    let dv: usize =
+                                        plan.detail.iter().map(|d| d.0.split('\n').count()).sum();
                                     let th_lines = if plan.table_header.is_some() { 1 } else { 0 };
                                     let (_, data_budget) = Self::compute_space_budget(
-                                        max_pop, th_lines, dv, plan.rows.len(), 3,
+                                        max_pop,
+                                        th_lines,
+                                        dv,
+                                        plan.rows.len(),
+                                        3,
                                     );
-                                    let direction = if matches!(key.code, KeyCode::PageDown) { 1 } else { -1 };
-                                    let delta = Self::page_delta(&plan.rows, cur_sel, data_budget, direction);
+                                    let direction = if matches!(key.code, KeyCode::PageDown) {
+                                        1
+                                    } else {
+                                        -1
+                                    };
+                                    let delta = Self::page_delta(
+                                        &plan.rows,
+                                        cur_sel,
+                                        data_budget,
+                                        direction,
+                                    );
                                     if delta != 0 {
-                                        pending_key = Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
+                                        pending_key =
+                                            Some(crate::slashdot_menu::HostKey::MoveCursor(delta));
                                     }
                                     continue;
                                 }
@@ -1045,9 +1083,11 @@ impl Repl {
                                 // through the engine that produced the plan:
                                 // slash drills/expands, prose splices the
                                 // selected id over the word.
-                                if matches!(overlay, ActiveOverlay::V25Menu { .. }
-                                    | ActiveOverlay::PathComplete { .. })
-                                {
+                                if matches!(
+                                    overlay,
+                                    ActiveOverlay::V25Menu { .. }
+                                        | ActiveOverlay::PathComplete { .. }
+                                ) {
                                     pending_key = Some(crate::slashdot_menu::HostKey::Tab);
                                 }
                             }
@@ -1065,8 +1105,13 @@ impl Repl {
                                 // submit the raw line (Shift+Enter inserts a
                                 // newline). Tab is the only expansion key.
                                 if let Some(a) = Self::edit_key(
-                                    key, &mut editor, history, &mut nav, &mut draft, prompt)
-                                {
+                                    key,
+                                    &mut editor,
+                                    history,
+                                    &mut nav,
+                                    &mut draft,
+                                    prompt,
+                                ) {
                                     if let InputAction::Submit(_) = &a {
                                         redraw(&LineEditor::new(), &[], sel, &mut input_row);
                                     }
@@ -1091,8 +1136,13 @@ impl Repl {
                                 // dismissal is stateless — the next eval
                                 // re-derives the dialog from the buffer.
                                 if let Some(a) = Self::edit_key(
-                                    key, &mut editor, history, &mut nav, &mut draft, prompt)
-                                {
+                                    key,
+                                    &mut editor,
+                                    history,
+                                    &mut nav,
+                                    &mut draft,
+                                    prompt,
+                                ) {
                                     if let InputAction::Submit(_) = &a {
                                         redraw(&LineEditor::new(), &[], sel, &mut input_row);
                                     }
@@ -1123,7 +1173,6 @@ impl Repl {
         }
     }
 
-
     /// Compute the input row for the *next* redraw after emitting `er` input rows
     /// plus an `n`-line pop-up, given the current input row and terminal height.
     /// When the pop-up overflows the bottom, the terminal scrolls up by the
@@ -1131,7 +1180,11 @@ impl Repl {
     /// its own, so a shrinking pop-up leaves the input where the tallest pop-up
     /// put it. Pure + unit-tested (see `tests`).
     fn next_input_row(start: usize, term_h: usize, er: usize, n: usize) -> usize {
-        let end_row = if n > 0 { start + er + n } else { start + er - 1 };
+        let end_row = if n > 0 {
+            start + er + n
+        } else {
+            start + er - 1
+        };
         let delta = end_row.saturating_sub(term_h);
         if delta > 0 {
             start.saturating_sub(delta).max(1)
@@ -1173,21 +1226,38 @@ impl Repl {
         is_active: bool,
         is_header: bool,
     ) -> String {
-        let bg = if is_header { "\x1b[48;5;237m" }
-                 else if is_selected { "\x1b[48;5;239m" }
-                 else { "" };
+        let bg = if is_header {
+            "\x1b[48;5;237m"
+        } else if is_selected {
+            "\x1b[48;5;239m"
+        } else {
+            ""
+        };
         let fg = if is_selected { "\x1b[1;36m" } else { "" };
         let mut parts = Vec::new();
         for (j, sub) in line.0.split('\n').enumerate() {
             let marker = if j == 0 {
-                if is_active { "* " }
-                else if is_selected { "> " }
-                else { "  " }
-            } else { "  " };
+                if is_active {
+                    "* "
+                } else if is_selected {
+                    "> "
+                } else {
+                    "  "
+                }
+            } else {
+                "  "
+            };
             let content = format!("{}{}", marker, sub);
             let vis = crate::slashdot_menu::table::display_width(&content);
             let pad = tw.saturating_sub(vis);
-            parts.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+            parts.push(format!(
+                "{}{}{}{}{}",
+                bg,
+                fg,
+                content,
+                " ".repeat(pad),
+                "\x1b[0m"
+            ));
         }
         parts.join("\n")
     }
@@ -1199,7 +1269,7 @@ impl Repl {
     /// If one section fits in its half, the other gets the surplus.
     /// Rows always get at least `min_rows` (capped at `total_rows`).
     fn compute_space_budget(
-        overlay_budget: usize,   // total overlay lines (e.g. 2/3 terminal)
+        overlay_budget: usize, // total overlay lines (e.g. 2/3 terminal)
         table_header_lines: usize,
         total_detail_vis: usize, // visual lines all detail items consume
         total_rows: usize,
@@ -1226,7 +1296,9 @@ impl Repl {
         // shows `min(total, budget)` anyway, but a tighter budget is
         // clearer for callers).
         let rows_budget = if total_rows > half {
-            available.saturating_sub(detail_budget).max(min_rows_guaranteed)
+            available
+                .saturating_sub(detail_budget)
+                .max(min_rows_guaranteed)
         } else {
             total_rows
         };
@@ -1246,7 +1318,8 @@ impl Repl {
         if total == 0 || budget == 0 {
             return (0, 0);
         }
-        let heights: Vec<usize> = rows.iter()
+        let heights: Vec<usize> = rows
+            .iter()
             .map(|r| r.0.split('\n').count().max(1))
             .collect();
         let total_vis: usize = heights.iter().sum();
@@ -1359,10 +1432,7 @@ impl Repl {
     /// one place a `RenderPlan` becomes display lines. Height is a
     /// parameter; width is read from the terminal like the other
     /// render helpers.
-    fn paint_plan(
-        plan: &crate::slashdot_menu::render::RenderPlan,
-        term_h: usize,
-    ) -> String {
+    fn paint_plan(plan: &crate::slashdot_menu::render::RenderPlan, term_h: usize) -> String {
         let tw = crate::output::term_width().max(1);
         let mut result: Vec<String> = Vec::new();
 
@@ -1374,20 +1444,28 @@ impl Repl {
 
         // Count visual lines each detail item occupies (LogicalLine
         // may contain embedded \n for wrapped sub-lines).
-        let detail_visual: Vec<usize> = plan.detail.iter()
+        let detail_visual: Vec<usize> = plan
+            .detail
+            .iter()
             .map(|d| d.0.split('\n').count())
             .collect();
         let total_detail_vis: usize = detail_visual.iter().sum();
         let total_rows = plan.rows.len();
 
-        let (detail_budget, data_budget) =
-            Self::compute_space_budget(max_pop, table_header_lines,
-                total_detail_vis, total_rows, min_rows);
+        let (detail_budget, data_budget) = Self::compute_space_budget(
+            max_pop,
+            table_header_lines,
+            total_detail_vis,
+            total_rows,
+            min_rows,
+        );
 
         // 1. Detail (header() output — no background, stands out).
         let mut detail_vis_used = 0usize;
         for (d, &vis) in plan.detail.iter().zip(&detail_visual) {
-            if detail_vis_used + vis > detail_budget { break; }
+            if detail_vis_used + vis > detail_budget {
+                break;
+            }
             result.push(Self::render_logical_line(d, tw, false, false, false));
             detail_vis_used += vis;
         }
@@ -1401,8 +1479,7 @@ impl Repl {
         let total = plan.rows.len();
         if total > 0 {
             let sel_idx = plan.selected.unwrap_or(0);
-            let (win_start, win_count) =
-                Self::visual_row_window(&plan.rows, sel_idx, data_budget);
+            let (win_start, win_count) = Self::visual_row_window(&plan.rows, sel_idx, data_budget);
             for i in win_start..(win_start + win_count).min(total) {
                 let is_selected = plan.selected == Some(i);
                 let is_active = plan.active_rows.contains(&i);
@@ -1411,18 +1488,33 @@ impl Repl {
                 for (j, sub) in sub_lines.iter().enumerate() {
                     let first = j == 0;
                     let marker = if first {
-                        if is_active { "* " }
-                        else if is_selected { "> " }
-                        else { "  " }
+                        if is_active {
+                            "* "
+                        } else if is_selected {
+                            "> "
+                        } else {
+                            "  "
+                        }
                     } else {
                         "  "
                     };
-                    let bg = if is_selected { "\x1b[48;5;239m" } else { "\x1b[48;5;235m" };
+                    let bg = if is_selected {
+                        "\x1b[48;5;239m"
+                    } else {
+                        "\x1b[48;5;235m"
+                    };
                     let fg = if is_selected { "\x1b[1;36m" } else { "" };
                     let content = format!("{}{}", marker, sub);
                     let vis = crate::slashdot_menu::table::display_width(&content);
                     let pad = tw.saturating_sub(vis);
-                    result.push(format!("{}{}{}{}{}", bg, fg, content, " ".repeat(pad), "\x1b[0m"));
+                    result.push(format!(
+                        "{}{}{}{}{}",
+                        bg,
+                        fg,
+                        content,
+                        " ".repeat(pad),
+                        "\x1b[0m"
+                    ));
                 }
             }
         }
@@ -1523,7 +1615,11 @@ impl Repl {
     /// cursor as the user types a fuzzy search term, whereas the tree action
     /// sub-menus seed and follow.
     fn cursor_sel_policy(disc_changed: bool, sel: usize) -> usize {
-        if disc_changed { 0 } else { sel }
+        if disc_changed {
+            0
+        } else {
+            sel
+        }
     }
 
     /// Echo a committed-invocation `line` to the transcript (a record of the
@@ -1635,9 +1731,8 @@ impl Repl {
                 rows.push((i, line, j == 0));
             }
         }
-        let bg_line = |s: &str, bg: &str| -> String {
-            format!("{}{:<width$}{}", bg, s, C_RESET, width = tw)
-        };
+        let bg_line =
+            |s: &str, bg: &str| -> String { format!("{}{:<width$}{}", bg, s, C_RESET, width = tw) };
         let mut out = String::new();
         if !title.is_empty() {
             out.push_str(&bg_line(title, BG));
@@ -1649,7 +1744,13 @@ impl Repl {
                     if !out.is_empty() {
                         out.push('\n');
                     }
-                    out.push_str(&format!("{}{:<width$}{}", BG_HEADER, subline, C_RESET, width = tw));
+                    out.push_str(&format!(
+                        "{}{:<width$}{}",
+                        BG_HEADER,
+                        subline,
+                        C_RESET,
+                        width = tw
+                    ));
                 }
             }
         }
@@ -1946,7 +2047,6 @@ pub(crate) fn review_compaction_summary(
         None
     }
 }
-
 
 /// A flat character buffer + cursor for multi-line editing. All methods are pure
 /// (no terminal access) and unit-tested in [`tests`].
@@ -2477,11 +2577,7 @@ fn cursor_positioning(layout: &Layout, prompt: &str) -> String {
     let rc = layout.row_count.max(1);
     let pcols = prompt.chars().count();
     let last_row_len = if rc == 1 {
-        layout
-            .rows
-            .first()
-            .map(|x| x.chars().count())
-            .unwrap_or(0)
+        layout.rows.first().map(|x| x.chars().count()).unwrap_or(0)
     } else {
         layout.rows.last().map(|x| x.chars().count()).unwrap_or(0)
     };
@@ -2559,7 +2655,11 @@ impl History {
                 let _ = std::fs::create_dir_all(parent);
             }
             use std::io::Write;
-            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            if let Ok(mut fh) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(f)
+            {
                 let _ = fh.write_all(line.as_bytes());
                 let _ = fh.write_all(b"\n");
             }
@@ -2567,7 +2667,12 @@ impl History {
     }
 
     /// Step backward through history; first call stashes `current` as the draft.
-    pub fn prev(&self, current: &str, nav: &mut Option<usize>, draft: &mut String) -> Option<String> {
+    pub fn prev(
+        &self,
+        current: &str,
+        nav: &mut Option<usize>,
+        draft: &mut String,
+    ) -> Option<String> {
         let n = self.entries.len();
         if n == 0 {
             return None;
@@ -2614,75 +2719,11 @@ mod tests {
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ---- `/compact` overlay resolution ----
-
-
-
-
 
     // ------------------------------------------------------------------
     // /tree list rendering: turn grouping, no tools, compaction scope
     // ------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn overlay_lines_selected_active_uses_star_marker() {
@@ -2691,10 +2732,7 @@ mod tests {
         // cursor itself is still visible via the row highlight).
         let opts = vec!["one".to_string(), "two".to_string()];
         let out = Repl::overlay_lines("title", &opts, None, 1, Some(1), true);
-        let line_with_two = out
-            .lines()
-            .find(|l| l.contains("two"))
-            .unwrap_or("");
+        let line_with_two = out.lines().find(|l| l.contains("two")).unwrap_or("");
         assert!(
             line_with_two.contains("* two"),
             "selected active row must use `* ` not `> `: {line_with_two:?}"
@@ -2709,10 +2747,7 @@ mod tests {
         // 2-char prefix, no separate indicator column).
         let opts = vec!["one".to_string(), "two".to_string()];
         let out = Repl::overlay_lines("title", &opts, None, 0, Some(1), true);
-        let line_with_two = out
-            .lines()
-            .find(|l| l.contains("two"))
-            .unwrap_or("");
+        let line_with_two = out.lines().find(|l| l.contains("two")).unwrap_or("");
         assert!(line_with_two.contains("* two"), "got: {line_with_two:?}");
     }
 
@@ -2722,21 +2757,9 @@ mod tests {
         // bluish-grey. Selected row keeps BG_SEL regardless of the
         // override.
         let opts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-        let bgs: Vec<Option<&str>> = vec![
-            None,
-            Some("\x1b[48;5;180m"),
-            Some("\x1b[48;5;240m"),
-        ];
+        let bgs: Vec<Option<&str>> = vec![None, Some("\x1b[48;5;180m"), Some("\x1b[48;5;240m")];
         // sel = 0 → row 0 uses BG_SEL, others use their override.
-        let out = Repl::overlay_lines_with_bgs(
-            "title",
-            &opts,
-            None,
-            0,
-            None,
-            true,
-            Some(&bgs),
-        );
+        let out = Repl::overlay_lines_with_bgs("title", &opts, None, 0, None, true, Some(&bgs));
         // Selected row uses BG_SEL (\x1b[48;5;239m) and *not* the row's
         // BG override (which is None here, so BG_SEL is also the
         // fallback).
@@ -2749,14 +2772,6 @@ mod tests {
         let line2 = out.lines().nth(3).unwrap_or("");
         assert!(line2.contains("\x1b[48;5;240m"), "got: {line2:?}");
     }
-
-
-
-
-
-
-
-
 
     #[test]
     fn insert_and_text() {
@@ -2982,7 +2997,7 @@ mod tests {
         // Leading spaces (indentation) must be counted toward the cursor column
         // and not silently dropped — otherwise the caret lands inside the indent.
         let e = LineEditor::from_text("  ab"); // 2-space indent
-        // cursor at end of buffer (after "ab")
+                                               // cursor at end of buffer (after "ab")
         let layout = e.layout(80, "");
         assert_eq!(layout.rows, vec!["  ab"]);
         assert_eq!((layout.cursor_row, layout.cursor_col), (0, 4));
@@ -3060,8 +3075,14 @@ mod tests {
         h.add("second");
         let mut nav: Option<usize> = None;
         let mut draft = String::new();
-        assert_eq!(h.prev("draft", &mut nav, &mut draft), Some("second".to_string()));
-        assert_eq!(h.prev("draft", &mut nav, &mut draft), Some("first".to_string()));
+        assert_eq!(
+            h.prev("draft", &mut nav, &mut draft),
+            Some("second".to_string())
+        );
+        assert_eq!(
+            h.prev("draft", &mut nav, &mut draft),
+            Some("first".to_string())
+        );
         assert_eq!(h.prev("draft", &mut nav, &mut draft), None);
         // stepping forward restores the stashed draft past the newest entry
         assert_eq!(h.next(&mut nav, &mut draft), Some("second".to_string()));
@@ -3089,7 +3110,11 @@ mod tests {
         editor.end();
         let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
-        assert_eq!(editor.text(), "in progress", "Up must not clobber the unsubmitted prompt");
+        assert_eq!(
+            editor.text(),
+            "in progress",
+            "Up must not clobber the unsubmitted prompt"
+        );
         assert!(nav.is_none(), "history navigation must not have started");
         assert!(draft.is_empty(), "no draft should have been stashed");
     }
@@ -3110,7 +3135,11 @@ mod tests {
         let mut editor = LineEditor::new();
         let key = event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         let _ = Repl::edit_key(key, &mut editor, &mut h, &mut nav, &mut draft, "");
-        assert_eq!(editor.text(), "second", "empty buffer should load latest history entry");
+        assert_eq!(
+            editor.text(),
+            "second",
+            "empty buffer should load latest history entry"
+        );
         assert!(nav.is_some());
         assert!(draft.is_empty());
     }
@@ -3187,7 +3216,9 @@ mod tests {
     fn page_delta_skips_rows_by_visual_height() {
         use crate::slashdot_menu::render::LogicalLine;
         // Single-line rows: page_delta(4 budget) from row 0 down should skip 4 rows.
-        let rows: Vec<LogicalLine> = (0..10).map(|i| LogicalLine::new(format!("row {}", i))).collect();
+        let rows: Vec<LogicalLine> = (0..10)
+            .map(|i| LogicalLine::new(format!("row {}", i)))
+            .collect();
         assert_eq!(Repl::page_delta(&rows, 0, 4, 1), 4);
         // PageUp from row 9 with budget 4: skip 4 rows back to row 5.
         assert_eq!(Repl::page_delta(&rows, 9, 4, -1), -4);
@@ -3235,7 +3266,11 @@ mod tests {
         // that reveal.
         let seq = Repl::clear_rows_to(10, 24);
         assert!(!seq.contains("\x1b[0J"), "must not clear to end of screen");
-        assert_eq!(seq.matches("\x1b[K").count(), 15, "one erase per row 10..=24");
+        assert_eq!(
+            seq.matches("\x1b[K").count(),
+            15,
+            "one erase per row 10..=24"
+        );
         // Each line is stepped to the next (col 1) except after the last row.
         assert_eq!(seq.matches("\x1b[1E").count(), 14);
         // Nothing below the old bottom (row 25) is referenced.
@@ -3264,7 +3299,6 @@ mod tests {
     fn clear_rows_to_single_row() {
         assert_eq!(Repl::clear_rows_to(5, 5), "\x1b[K");
     }
-
 
     #[test]
     fn replace_range_tests() {
@@ -3303,7 +3337,9 @@ mod tests {
         assert!(
             layout.cursor_row < rc,
             "cursor_row {} >= row_count {} (text={:?})",
-            layout.cursor_row, rc, e.text()
+            layout.cursor_row,
+            rc,
+            e.text()
         );
         if layout.cursor_row < layout.rows.len() {
             let content_col = if layout.cursor_row == 0 {
@@ -3315,7 +3351,11 @@ mod tests {
             assert!(
                 content_col <= row_len,
                 "content_col {} > row_len {} in rows={:?}, text={:?}, cursor={}",
-                content_col, row_len, layout.rows, e.text(), e.cursor
+                content_col,
+                row_len,
+                layout.rows,
+                e.text(),
+                e.cursor
             );
         }
     }
@@ -3324,17 +3364,37 @@ mod tests {
 
     fn apply_step(e: &mut LineEditor, step: usize, width: usize, prompt: &str) {
         match step % STEP_KINDS {
-            0 => { e.insert('a'); }
-            1 => { e.insert(' '); }
-            2 => { e.insert('\n'); }
-            3 => { e.backspace(); }
-            4 => { e.left(); }
-            5 => { e.right(); }
-            6 => { e.home(); }
-            7 => { e.end(); }
-            8 => { e.insert('-'); }
-            9 => { e.insert_newline(); }
-            _ => unreachable!()
+            0 => {
+                e.insert('a');
+            }
+            1 => {
+                e.insert(' ');
+            }
+            2 => {
+                e.insert('\n');
+            }
+            3 => {
+                e.backspace();
+            }
+            4 => {
+                e.left();
+            }
+            5 => {
+                e.right();
+            }
+            6 => {
+                e.home();
+            }
+            7 => {
+                e.end();
+            }
+            8 => {
+                e.insert('-');
+            }
+            9 => {
+                e.insert_newline();
+            }
+            _ => unreachable!(),
         }
         check_layout(e, width, prompt);
     }
@@ -3342,12 +3402,29 @@ mod tests {
     #[test]
     fn fuzz_deterministic_sweep() {
         let params: Vec<(usize, &str)> = vec![
-            (5, ""), (8, ""), (10, ""), (12, ""), (15, ""), (20, ""),
-            (40, ""), (80, ""),
-            (5, "> "), (8, "> "), (10, "> "), (12, "> "), (15, "> "),
-            (20, "> "), (40, "> "), (80, "> "),
-            (5, "$ "), (10, "$ "), (15, "$ "), (20, "$ "),
-            (5, ">>>"), (10, ">>>"), (20, ">>>"),
+            (5, ""),
+            (8, ""),
+            (10, ""),
+            (12, ""),
+            (15, ""),
+            (20, ""),
+            (40, ""),
+            (80, ""),
+            (5, "> "),
+            (8, "> "),
+            (10, "> "),
+            (12, "> "),
+            (15, "> "),
+            (20, "> "),
+            (40, "> "),
+            (80, "> "),
+            (5, "$ "),
+            (10, "$ "),
+            (15, "$ "),
+            (20, "$ "),
+            (5, ">>>"),
+            (10, ">>>"),
+            (20, ">>>"),
         ];
         let seeds = [1usize, 3, 7, 11, 13, 17, 19, 23, 29, 31];
         let steps = 250;
@@ -3384,7 +3461,11 @@ mod tests {
             ("abc def ghi", 8, "> "),
             ("abc def ghi jkl", 10, "> "),
             ("- item 1\n- item 2", 80, ""),
-            ("Multi-line input: There are still bugs that affect cursor", 20, "> "),
+            (
+                "Multi-line input: There are still bugs that affect cursor",
+                20,
+                "> ",
+            ),
             ("  indented\n  too", 10, ""),
             ("abc \ndef", 80, ""),
             ("abc\n", 80, ""),
@@ -3395,7 +3476,11 @@ mod tests {
             ("abc def ghi jkl mno pqr stu vwx yz", 12, ""),
             ("- [ ] task\n- [x] done", 80, "> "),
             ("a\nb\nc\nd\ne\nf\ng", 80, ""),
-            ("    fn main() {\n        println!(\"hello\");\n    }", 30, ""),
+            (
+                "    fn main() {\n        println!(\"hello\");\n    }",
+                30,
+                "",
+            ),
             ("   ", 80, ""),
             ("   \n   ", 80, ""),
             ("abc def\n\nghi", 15, ""),
@@ -3412,12 +3497,19 @@ mod tests {
         let w = 80usize;
         let prompt = "> ";
         let mut e = LineEditor::new();
-        for c in "abc def ghi".chars() { e.insert(c); }
+        for c in "abc def ghi".chars() {
+            e.insert(c);
+        }
         e.insert_newline();
-        for c in "jk lm".chars() { e.insert(c); }
+        for c in "jk lm".chars() {
+            e.insert(c);
+        }
         assert_eq!(e.text(), "abc def ghi\njk lm");
         assert!(e.visual_up(w, prompt), "visual_up");
-        while e.cursor > 0 { e.left(); check_layout(&e, w, prompt); }
+        while e.cursor > 0 {
+            e.left();
+            check_layout(&e, w, prompt);
+        }
         assert_eq!(e.cursor, 0, "cursor must reach position 0");
         let before = e.text();
         e.backspace();
@@ -3429,9 +3521,13 @@ mod tests {
         let w = 80usize;
         let prompt = "> ";
         let mut e = LineEditor::new();
-        for c in "some text and more".chars() { e.insert(c); }
+        for c in "some text and more".chars() {
+            e.insert(c);
+        }
         e.insert_newline();
-        for c in "and even more text in this line".chars() { e.insert(c); }
+        for c in "and even more text in this line".chars() {
+            e.insert(c);
+        }
         assert_eq!(e.cursor, 50, "cursor at buffer end");
         assert!(e.visual_up(w, prompt), "visual_up");
         while e.cursor > 0 {
@@ -3446,11 +3542,18 @@ mod tests {
         let w = 15usize;
         let prompt = "> ";
         let mut e = LineEditor::new();
-        for c in "abc def ghi jkl mno".chars() { e.insert(c); }
+        for c in "abc def ghi jkl mno".chars() {
+            e.insert(c);
+        }
         e.insert_newline();
-        for c in "stu vwx".chars() { e.insert(c); }
+        for c in "stu vwx".chars() {
+            e.insert(c);
+        }
         assert!(e.visual_up(w, prompt), "visual_up");
-        while e.cursor > 0 { e.left(); check_layout(&e, w, prompt); }
+        while e.cursor > 0 {
+            e.left();
+            check_layout(&e, w, prompt);
+        }
         assert_eq!(e.cursor, 0, "cursor at position 0");
     }
 
@@ -3463,13 +3566,17 @@ mod tests {
             e.cursor = pos;
             let home_pos = {
                 let mut i = e.cursor;
-                while i > 0 && e.buf[i - 1] != '\n' { i -= 1; }
+                while i > 0 && e.buf[i - 1] != '\n' {
+                    i -= 1;
+                }
                 i
             };
             let end_pos = {
                 let n = text.len();
                 let mut i = e.cursor;
-                while i < n && e.buf[i] != '\n' { i += 1; }
+                while i < n && e.buf[i] != '\n' {
+                    i += 1;
+                }
                 i
             };
             e.home();
@@ -3516,8 +3623,14 @@ mod tests {
     #[test]
     fn fuzz_insert_delete_patterns() {
         let mut e = LineEditor::new();
-        for c in "hello world".chars() { e.insert(c); check_layout(&e, 80, "> "); }
-        for _ in 0.."hello world".len() { e.backspace(); check_layout(&e, 80, "> "); }
+        for c in "hello world".chars() {
+            e.insert(c);
+            check_layout(&e, 80, "> ");
+        }
+        for _ in 0.."hello world".len() {
+            e.backspace();
+            check_layout(&e, 80, "> ");
+        }
         assert_eq!(e.text(), "");
         e.insert_str("abc");
         e.home();
@@ -3528,7 +3641,13 @@ mod tests {
 
     #[test]
     fn fuzz_line_delete_keeps_invariants() {
-        let tests = ["abc def ghi", "abc def ghi\njk lm", "\nhello", "hello\n", "a\nb\nc"];
+        let tests = [
+            "abc def ghi",
+            "abc def ghi\njk lm",
+            "\nhello",
+            "hello\n",
+            "a\nb\nc",
+        ];
         for text in &tests {
             let mut e = LineEditor::new();
             e.insert_str(text);
@@ -3567,11 +3686,14 @@ mod tests {
         // `LineEditor::replace_range` splices the completion (the prose
         // layer does exactly this on Tab).
         use crate::prompt_complete::word_at_cursor;
-        let tests = [("/home/user", "/home/user/project"), ("/tmp", "/tmp/data"), ("foo", "foobar")];
+        let tests = [
+            ("/home/user", "/home/user/project"),
+            ("/tmp", "/tmp/data"),
+            ("foo", "foobar"),
+        ];
         for (buf, replacement) in &tests {
             let chars: Vec<char> = buf.chars().collect();
-            let range = word_at_cursor(&chars, chars.len())
-                .unwrap_or(0..0);
+            let range = word_at_cursor(&chars, chars.len()).unwrap_or(0..0);
             let mut e = LineEditor::new();
             e.insert_str(buf);
             e.replace_range(range.start, range.end, replacement);
@@ -3606,8 +3728,8 @@ mod tests {
     // strongest test possible without a real TTY.
     #[cfg(test)]
     mod vt100_tests {
-        use vt100::Parser;
         use crate::repl::LineEditor;
+        use vt100::Parser;
 
         // Build the escape sequence the production `redraw` emits for the
         // input region, minus the clear-down (which uses `\x1b[1E` that the
@@ -3616,8 +3738,13 @@ mod tests {
         // 1. `\x1b[{input_row};1H` — jump to input top row
         // 2. `render_content(prompt)` — write prompt + rows with `\n` separators
         // 3. `cursor_positioning(prompt)` — fine-tune cursor to the right cell
-        fn build_render(editor: &LineEditor, width: usize, prompt: &str,
-                        term_rows: usize, input_row: usize) -> Vec<u8> {
+        fn build_render(
+            editor: &LineEditor,
+            width: usize,
+            prompt: &str,
+            term_rows: usize,
+            input_row: usize,
+        ) -> Vec<u8> {
             let row = input_row.max(1).min(term_rows);
             let layout = editor.layout(width, prompt);
             let mut s = String::new();
@@ -3630,9 +3757,15 @@ mod tests {
             // 2. Render content (use \r\n because the real terminal has
             // OPOST/ONLCR which converts bare \n to \r\n)
             for r in 0..rc {
-                if r > 0 { s.push_str("\r\n"); }
-                if r == 0 { s.push_str(prompt); }
-                if r < layout.rows.len() { s.push_str(&layout.rows[r]); }
+                if r > 0 {
+                    s.push_str("\r\n");
+                }
+                if r == 0 {
+                    s.push_str(prompt);
+                }
+                if r < layout.rows.len() {
+                    s.push_str(&layout.rows[r]);
+                }
             }
 
             // 3. cursor_positioning (same logic as the real function)
@@ -3649,17 +3782,28 @@ mod tests {
                     s.push_str(&format!("\x1b[{}C", layout.cursor_col));
                 }
             } else {
-                let effective_end_col = if rc == 1 { pcols + last_row_len } else { last_row_len };
+                let effective_end_col = if rc == 1 {
+                    pcols + last_row_len
+                } else {
+                    last_row_len
+                };
                 let d = effective_end_col.saturating_sub(layout.cursor_col);
-                if d > 0 { s.push_str(&format!("\x1b[{}D", d)); }
+                if d > 0 {
+                    s.push_str(&format!("\x1b[{}D", d));
+                }
             }
 
             s.into_bytes()
         }
 
-        fn render_through_vt100(editor: &LineEditor, width: usize, prompt: &str,
-                                term_rows: usize, term_cols: usize,
-                                input_row: usize) -> (usize, usize, Vec<String>) {
+        fn render_through_vt100(
+            editor: &LineEditor,
+            width: usize,
+            prompt: &str,
+            term_rows: usize,
+            term_cols: usize,
+            input_row: usize,
+        ) -> (usize, usize, Vec<String>) {
             let bytes = build_render(editor, width, prompt, term_rows, input_row);
             let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
             p.process(&bytes);
@@ -3669,7 +3813,15 @@ mod tests {
                 .map(|r| {
                     let mut s = String::new();
                     for c in 0..term_cols {
-                        s.push(screen.cell(r as u16, c as u16).map(|cell| cell.contents()).unwrap_or(" ").chars().next().unwrap_or(' '));
+                        s.push(
+                            screen
+                                .cell(r as u16, c as u16)
+                                .map(|cell| cell.contents())
+                                .unwrap_or(" ")
+                                .chars()
+                                .next()
+                                .unwrap_or(' '),
+                        );
                     }
                     s.trim_end().to_string()
                 })
@@ -3694,7 +3846,11 @@ mod tests {
             e.insert_str("abc def ghi\njk lm");
             e.cursor = 0;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
-            assert_eq!((cr, cc), (9, 2), "cursor at start of multi-line should be row 9 col 2");
+            assert_eq!(
+                (cr, cc),
+                (9, 2),
+                "cursor at start of multi-line should be row 9 col 2"
+            );
             assert!(rows[9].starts_with("> abc"), "row 9: {:?}", rows[9]);
         }
 
@@ -3715,23 +3871,44 @@ mod tests {
             e.cursor = 12;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor on second visual row (row 10 0-indexed), col 0
-            assert_eq!((cr, cc), (10, 0), "cursor at start of second line should be row 10 col 0");
+            assert_eq!(
+                (cr, cc),
+                (10, 0),
+                "cursor at start of second line should be row 10 col 0"
+            );
             assert!(rows[10].starts_with("jk lm"), "row 10: {:?}", rows[10]);
         }
 
         #[test]
         fn vt100_user_exact_text_cursor_at_start() {
             let mut e = LineEditor::new();
-            for c in "some text and more".chars() { e.insert(c); }
+            for c in "some text and more".chars() {
+                e.insert(c);
+            }
             e.insert_newline();
-            for c in "and even more text in this line".chars() { e.insert(c); }
+            for c in "and even more text in this line".chars() {
+                e.insert(c);
+            }
             e.cursor = 0;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
             // cursor_row=0 in layout → 0-indexed vt100 row = 9 + 0 = 9
-            assert_eq!((cr, cc), (9, 2),
-                "cursor at start should be (9,2), got ({},{})", cr, cc);
-            assert!(rows[9].starts_with("> some text and more"), "row 9: {:?}", rows[9]);
-            assert!(rows[10].starts_with("and even more text"), "row 10: {:?}", rows[10]);
+            assert_eq!(
+                (cr, cc),
+                (9, 2),
+                "cursor at start should be (9,2), got ({},{})",
+                cr,
+                cc
+            );
+            assert!(
+                rows[9].starts_with("> some text and more"),
+                "row 9: {:?}",
+                rows[9]
+            );
+            assert!(
+                rows[10].starts_with("and even more text"),
+                "row 10: {:?}",
+                rows[10]
+            );
         }
 
         #[test]
@@ -3748,10 +3925,17 @@ mod tests {
                 // vt100 rows are 0-indexed; input_row=10 1-indexed = 9 0-indexed
                 let expected_row = 9 + layout.cursor_row;
                 assert_eq!(
-                    (cr, cc), (expected_row, layout.cursor_col),
+                    (cr, cc),
+                    (expected_row, layout.cursor_col),
                     "pos {}: expected ({},{}), got ({},{}); layout=({},{}), rows={:?}",
-                    pos, expected_row, layout.cursor_col, cr, cc,
-                    layout.cursor_row, layout.cursor_col, layout.rows
+                    pos,
+                    expected_row,
+                    layout.cursor_col,
+                    cr,
+                    cc,
+                    layout.cursor_row,
+                    layout.cursor_col,
+                    layout.rows
                 );
             }
         }
@@ -3770,9 +3954,13 @@ mod tests {
                         let (cr, cc, _) = render_through_vt100(&e, *w, "> ", 24, 80, 5);
                         // input_row=5 1-indexed = 4 0-indexed
                         assert_eq!(
-                            (cr, cc), (4 + layout.cursor_row, layout.cursor_col),
+                            (cr, cc),
+                            (4 + layout.cursor_row, layout.cursor_col),
                             "text={:?}, w={}, pos={}: rows={:?}",
-                            text, w, pos, layout.rows
+                            text,
+                            w,
+                            pos,
+                            layout.rows
                         );
                     }
                 }
@@ -3786,7 +3974,11 @@ mod tests {
             e.cursor = 0;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "", 24, 80, 5);
             // input_row=5 1-indexed = 4 0-indexed. No prompt, so col=0.
-            assert_eq!((cr, cc), (4, 0), "cursor at start without prompt should be row 4 col 0");
+            assert_eq!(
+                (cr, cc),
+                (4, 0),
+                "cursor at start without prompt should be row 4 col 0"
+            );
             assert!(rows[4].starts_with("Hello"), "row 4: {:?}", rows[4]);
         }
     }
@@ -3805,42 +3997,48 @@ mod tests {
     /// Save and restore environment variables around a test closure.
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let _guard = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(String, Option<String>)> = vars.iter().map(|(k, _)| {
-            (k.to_string(), std::env::var(k).ok())
-        }).collect();
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
         for (k, v) in vars {
             match v {
-                Some(val) => unsafe { std::env::set_var(k, val); }
-                None => unsafe { std::env::remove_var(k); }
+                Some(val) => unsafe {
+                    std::env::set_var(k, val);
+                },
+                None => unsafe {
+                    std::env::remove_var(k);
+                },
             }
         }
         f();
         for (k, v) in saved {
             match v {
-                Some(val) => unsafe { std::env::set_var(&k, &val); }
-                None => unsafe { std::env::remove_var(&k); }
+                Some(val) => unsafe {
+                    std::env::set_var(&k, &val);
+                },
+                None => unsafe {
+                    std::env::remove_var(&k);
+                },
             }
         }
     }
 
     #[test]
     fn resolve_editor_prefers_visual() {
-        with_env(&[
-            ("VISUAL", Some("myeditor")),
-            ("EDITOR", Some("other")),
-        ], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "myeditor", "VISUAL must take priority");
-            assert!(args.is_empty(), "no flags: {:?}", args);
-        });
+        with_env(
+            &[("VISUAL", Some("myeditor")), ("EDITOR", Some("other"))],
+            || {
+                let (cmd, args) = super::resolve_editor();
+                assert_eq!(cmd, "myeditor", "VISUAL must take priority");
+                assert!(args.is_empty(), "no flags: {:?}", args);
+            },
+        );
     }
 
     #[test]
     fn resolve_editor_falls_back_to_editor() {
-        with_env(&[
-            ("VISUAL", None),
-            ("EDITOR", Some("nano")),
-        ], || {
+        with_env(&[("VISUAL", None), ("EDITOR", Some("nano"))], || {
             let (cmd, args) = super::resolve_editor();
             assert_eq!(cmd, "nano", "EDITOR fallback");
             assert!(args.is_empty());
@@ -3849,10 +4047,7 @@ mod tests {
 
     #[test]
     fn resolve_editor_defaults_to_vim() {
-        with_env(&[
-            ("VISUAL", None),
-            ("EDITOR", None),
-        ], || {
+        with_env(&[("VISUAL", None), ("EDITOR", None)], || {
             let (cmd, args) = super::resolve_editor();
             assert_eq!(cmd, "vim", "default to vim");
             assert!(args.is_empty());
@@ -3861,14 +4056,17 @@ mod tests {
 
     #[test]
     fn resolve_editor_splits_flags() {
-        with_env(&[
-            ("VISUAL", Some("emacs -nw --no-site-file")),
-            ("EDITOR", None),
-        ], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "emacs");
-            assert_eq!(args, vec!["-nw", "--no-site-file"]);
-        });
+        with_env(
+            &[
+                ("VISUAL", Some("emacs -nw --no-site-file")),
+                ("EDITOR", None),
+            ],
+            || {
+                let (cmd, args) = super::resolve_editor();
+                assert_eq!(cmd, "emacs");
+                assert_eq!(args, vec!["-nw", "--no-site-file"]);
+            },
+        );
     }
 
     /// Helper: run `edit_in_editor` with `current` content by setting
@@ -3885,14 +4083,17 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod script");
 
-        with_env(&[
-            ("VISUAL", Some(script.to_string_lossy().as_ref())),
-            ("EDITOR", None),
-        ], || {
-            let result = super::edit_in_editor(current);
-            assert!(result.is_ok(), "edit_in_editor failed: {:?}", result.err());
-            assert_eq!(result.unwrap(), expected_output);
-        });
+        with_env(
+            &[
+                ("VISUAL", Some(script.to_string_lossy().as_ref())),
+                ("EDITOR", None),
+            ],
+            || {
+                let result = super::edit_in_editor(current);
+                assert!(result.is_ok(), "edit_in_editor failed: {:?}", result.err());
+                assert_eq!(result.unwrap(), expected_output);
+            },
+        );
     }
 
     #[test]
@@ -3906,11 +4107,7 @@ mod tests {
 
     #[test]
     fn edit_in_editor_empty_buffer() {
-        mock_edit(
-            "",
-            "printf '%s' 'new content' > \"$1\"\n",
-            "new content",
-        );
+        mock_edit("", "printf '%s' 'new content' > \"$1\"\n", "new content");
     }
 
     #[test]
@@ -3935,11 +4132,7 @@ mod tests {
     fn edit_in_editor_keeps_trailing_blank_lines() {
         // If the file ends with "a\n\n" (a, plus one blank line), stripping
         // one trailing \n must leave "a\n" — the blank line is preserved.
-        mock_edit(
-            "a\n\n",
-            "printf '%s\\n\\n' 'a' > \"$1\"\n",
-            "a\n",
-        );
+        mock_edit("a\n\n", "printf '%s\\n\\n' 'a' > \"$1\"\n", "a\n");
     }
 
     #[test]
@@ -3954,24 +4147,30 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
             .expect("chmod script");
 
-        with_env(&[
-            ("VISUAL", Some(script.to_string_lossy().as_ref())),
-            ("EDITOR", None),
-        ], || {
-            let result = super::edit_in_editor("original");
-            assert!(result.is_err(), "non-zero exit must return error");
-        });
+        with_env(
+            &[
+                ("VISUAL", Some(script.to_string_lossy().as_ref())),
+                ("EDITOR", None),
+            ],
+            || {
+                let result = super::edit_in_editor("original");
+                assert!(result.is_err(), "non-zero exit must return error");
+            },
+        );
     }
 
     #[test]
     fn edit_in_editor_nonexistent_command() {
-        with_env(&[
-            ("VISUAL", Some("/nonexistent/editor_binary")),
-            ("EDITOR", None),
-        ], || {
-            let result = super::edit_in_editor("hello");
-            assert!(result.is_err(), "nonexistent command must return error");
-        });
+        with_env(
+            &[
+                ("VISUAL", Some("/nonexistent/editor_binary")),
+                ("EDITOR", None),
+            ],
+            || {
+                let result = super::edit_in_editor("hello");
+                assert!(result.is_err(), "nonexistent command must return error");
+            },
+        );
     }
 
     // --- compute_space_budget tests ---
@@ -4070,16 +4269,14 @@ mod tests {
         let rows = vec![
             LogicalLine::new("a"),
             LogicalLine::new("b"),
-            LogicalLine::new("x\ny\nz"),  // 3 visual lines
+            LogicalLine::new("x\ny\nz"), // 3 visual lines
             LogicalLine::new("c"),
             LogicalLine::new("d"),
         ];
         let (s, c) = Repl::visual_row_window(&rows, 2, 4);
         // Can fit: row2 (3 lines) + one 1-line row = 4 lines.
         assert!(s <= 2 && s + c > 2, "selected must be in window");
-        let vis: usize = rows[s..s + c].iter()
-            .map(|r| r.0.split('\n').count())
-            .sum();
+        let vis: usize = rows[s..s + c].iter().map(|r| r.0.split('\n').count()).sum();
         assert!(vis <= 4, "window must fit budget: got {}", vis);
     }
 
@@ -4141,4 +4338,3 @@ mod tests {
         assert_eq!(s, 0, "starts at 0");
     }
 }
-

@@ -125,8 +125,7 @@ impl BatchEditFailure {
             // model_view in the same JSON envelope carries the diff /
             // line numbers for the model; no need to point the human at
             // it.
-            format!("edit failed:\n  {}",
-                items[0].failure.ui_view)
+            format!("edit failed:\n  {}", items[0].failure.ui_view)
         } else {
             format!(
                 "edit failed: {failed} of {total} edit(s) had problems. \
@@ -251,7 +250,10 @@ pub fn diagnose(query: &str, file_text: &str) -> Option<EditFailure> {
         similarity,
     );
 
-    Some(EditFailure { ui_view, model_view })
+    Some(EditFailure {
+        ui_view,
+        model_view,
+    })
 }
 
 /// Render a 1-based inclusive line span for messages: `line 7` when the span
@@ -278,7 +280,10 @@ impl EditFailure {
              Original oldText: '{}'.",
             old_text,
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 
     /// Construct a failure for an anchored choice that is neither within the
@@ -332,12 +337,17 @@ impl EditFailure {
              anchor or include more surrounding context in oldText so the match is \
              unambiguous. Original oldText: '{}'.",
             old_text,
-            d2_clause = candidates.get(1).map(|(l, d)| format!("{d} line(s) (at line {l})"))
+            d2_clause = candidates
+                .get(1)
+                .map(|(l, d)| format!("{d} line(s) (at line {l})"))
                 .unwrap_or_else(|| "not far enough behind".to_string()),
             ratio = ANCHOR_SKEW_RATIO,
             cap = ANCHOR_SKEW_CAP,
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 
     /// Construct a failure for two matches whose byte ranges overlap. Both
@@ -365,7 +375,10 @@ impl EditFailure {
              oldText so the regions are disjoint. Original oldText: '{}'.",
             old_text,
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 
     /// Construct a failure for an un-anchored block whose every candidate
@@ -411,7 +424,10 @@ impl EditFailure {
              '{}'.",
             old_text,
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 
     /// Construct a failure for "two or more occurrences are equidistant from
@@ -437,7 +453,10 @@ impl EditFailure {
              oldText so exactly one occurrence matches. Original oldText: '{}'.",
             old_text,
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 
     /// Construct a failure for "oldText appears N times and is still
@@ -495,7 +514,10 @@ impl EditFailure {
             marker = crate::edit_blocks::SEARCH_MARKER,
             first = line_numbers.first().copied().unwrap_or(0),
         );
-        EditFailure { ui_view, model_view }
+        EditFailure {
+            ui_view,
+            model_view,
+        }
     }
 }
 
@@ -695,13 +717,7 @@ mod tests {
 
     #[test]
     fn non_unique_caps_listing_with_truncation_notice() {
-        let f = EditFailure::non_unique(
-            1,
-            "foo",
-            15,
-            &(1..=10).collect::<Vec<_>>(),
-            0,
-        );
+        let f = EditFailure::non_unique(1, "foo", 15, &(1..=10).collect::<Vec<_>>(), 0);
         assert!(f.ui_view.contains("(...and 5 more)"));
         assert!(f.ui_view.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10"));
     }
@@ -875,7 +891,7 @@ mod tests {
         // The fix aligns win_start/win_end to char boundaries using
         // floor_char_boundary/ceil_char_boundary.
         let file_text = "start ─── middle ─── end"; // '─' is 3 bytes each
-        // Query that will match near a multi-byte char boundary
+                                                    // Query that will match near a multi-byte char boundary
         let query = "─── midd"; // This overlaps the 3-byte chars
         let f = diagnose(query, file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
@@ -890,7 +906,7 @@ mod tests {
         let query = "───sta";
         let f = diagnose(query, file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));
-        
+
         let file_text2 = "end───"; // 3-byte chars at end
         let query2 = "nd───";
         let f2 = diagnose(query2, file_text2).expect("should diagnose");
@@ -903,7 +919,7 @@ mod tests {
         // at position where adding WINDOW_PAD + query.len() crosses a
         // multi-byte boundary.
         let file_text = "a".repeat(1016) + "─" + &"b".repeat(100); // '─' at byte 1016 (3 bytes)
-        // Query matching a region that includes the multi-byte char
+                                                                   // Query matching a region that includes the multi-byte char
         let query = &file_text[1000..1030]; // Includes the '─'
         let f = diagnose(query, &file_text).expect("should diagnose");
         assert!(f.model_view.contains("Closest match"));

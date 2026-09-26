@@ -72,10 +72,8 @@ enum Commands {
 /// startup (rather than degrading) because both are integral to the sandboxed
 /// tool-execution model: `bwrap` provides the command namespace, `rg` backs
 /// the grep tool.
-const REQUIRED_BINARIES: &[(&str, &str)] = &[
-    ("bwrap", "bubblewrap (bwrap)"),
-    ("rg", "ripgrep (rg)"),
-];
+const REQUIRED_BINARIES: &[(&str, &str)] =
+    &[("bwrap", "bubblewrap (bwrap)"), ("rg", "ripgrep (rg)")];
 
 /// Returns `Ok(())` if every required binary is present and runnable on PATH,
 /// otherwise an error describing the missing ones with install hints.
@@ -117,16 +115,27 @@ async fn main() {
             "Unknown panic".to_string()
         };
 
-        eprintln!("\n\n--------------------------------------------------------------------------------");
+        eprintln!(
+            "\n\n--------------------------------------------------------------------------------"
+        );
         eprintln!("💥 Picocode encountered an unexpected error (panic).");
         eprintln!("Message: {}", message);
         if let Some(location) = info.location() {
-            eprintln!("Location: {}:{}:{}", location.file(), location.line(), location.column());
+            eprintln!(
+                "Location: {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
         }
-        eprintln!("--------------------------------------------------------------------------------");
+        eprintln!(
+            "--------------------------------------------------------------------------------"
+        );
         eprintln!("This is likely a bug in picocode or one of its dependencies.");
         eprintln!("Please report it at: https://github.com/jondot/picocode/issues");
-        eprintln!("--------------------------------------------------------------------------------\n");
+        eprintln!(
+            "--------------------------------------------------------------------------------\n"
+        );
     }));
 
     if let Err(e) = run().await {
@@ -193,7 +202,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some(name.clone()),
         ),
         (Some(Commands::Input { prompt }), _) => (
-            Commands::Input { prompt: prompt.clone() },
+            Commands::Input {
+                prompt: prompt.clone(),
+            },
             Some(prompt.clone()),
             None,
         ),
@@ -256,9 +267,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let show_reasoning_handle: picocode::settings::ShowReasoningHandle =
         std::sync::Arc::new(std::sync::Mutex::new(show_reasoning));
-    let reasoning_in_context = config
-        .reasoning_in_context
-        .unwrap_or_default();
+    let reasoning_in_context = config.reasoning_in_context.unwrap_or_default();
     let output: Arc<dyn picocode::Output> = if quiet {
         Arc::new(picocode::QuietOutput::new(show_reasoning_handle.clone()))
     } else {
@@ -316,8 +325,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Recipe { name: _ } => {
             let agent = create_agent(agent_config.clone()).await?;
             if let Some(r) = recipe {
-                let prompt = picocode::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
-                    .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
+                let prompt =
+                    picocode::config::read_prompt(r.prompt.clone(), r.prompt_file.clone())?
+                        .ok_or("Recipe must have either 'prompt' or 'prompt_file'")?;
                 let response = agent.run_once(prompt).await?;
                 if r.is_error(&response)? {
                     return Err(Box::new(picocode::PicocodeError::Other(

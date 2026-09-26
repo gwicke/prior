@@ -151,7 +151,9 @@ fn seed_session(fx: &Fixture, model: (&str, &str), text: &str) -> String {
 /// Count every `.jsonl` under the sessions dir (recursive).
 fn count_sessions(sessions: &Path) -> usize {
     fn walk(dir: &Path, n: &mut usize) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -185,7 +187,9 @@ fn wait_session_count(sessions: &Path, want: usize, what: &str) {
 /// Spawn picocode: llamacpp provider (no API key; base url points at a
 /// dead local port — client construction never pings it), model `test`,
 /// isolated XDG, child cwd = the fixture work dir.
-fn spawn_picocode(fx: &Fixture) -> (
+fn spawn_picocode(
+    fx: &Fixture,
+) -> (
     Box<dyn portable_pty::Child + Send + Sync>,
     Arc<Mutex<Vec<u8>>>,
     Box<dyn Write + Send>,
@@ -263,7 +267,10 @@ fn clear_input(writer: &mut Box<dyn Write + Send>) {
 }
 
 /// `/quit ` → committed line → the process exits on its own.
-fn quit_and_wait(child: &mut Box<dyn portable_pty::Child + Send + Sync>, bytes: &Arc<Mutex<Vec<u8>>>) {
+fn quit_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    bytes: &Arc<Mutex<Vec<u8>>>,
+) {
     // (caller has already typed "/quit " + Enter; we just await the exit —
     // kept as a helper for symmetry.)
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -298,7 +305,11 @@ fn menu_traffic_never_creates_empty_session_files() {
 
     // --- /session listing smoke: the overlay shows the seeded session.
     type_line(&mut writer, "/session ");
-    assert_wait(&bytes, "seed-one", "/session listing shows the seeded session");
+    assert_wait(
+        &bytes,
+        "seed-one",
+        "/session listing shows the seeded session",
+    );
     thread::sleep(Duration::from_millis(300));
 
     // --- /session delete (two-phase: prepare → confirm → submit).
@@ -372,7 +383,11 @@ fn resume_replays_history_and_seeds_model_prefill() {
 
     // Resume must not mint empty files either.
     thread::sleep(Duration::from_millis(500));
-    assert_eq!(count_sessions(&fx.sessions), 1, "no empty files after resume");
+    assert_eq!(
+        count_sessions(&fx.sessions),
+        1,
+        "no empty files after resume"
+    );
 
     // quit smoke (second path). The resume prefill occupies the input
     // line — clear it first or "/quit " appends to the `/model …`.

@@ -20,8 +20,8 @@
 //! with a TTL (a probe would be a bwrap spawn). See [`listing_stale`].
 
 use crate::fuzzy::rank_candidates;
-use crate::slashdot_menu::node_impl::CompletionRows;
 use crate::slashdot_menu::fields::Row;
+use crate::slashdot_menu::node_impl::CompletionRows;
 use chrono::TimeZone;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
@@ -79,7 +79,11 @@ fn split_prefix(expanded: &str, path_is_dir: bool) -> (String, String) {
     if expanded.ends_with('/') || path_is_dir {
         let d = expanded.trim_end_matches('/');
         return (
-            if d.is_empty() { "/".to_string() } else { d.to_string() },
+            if d.is_empty() {
+                "/".to_string()
+            } else {
+                d.to_string()
+            },
             String::new(),
         );
     }
@@ -153,7 +157,10 @@ pub fn complete(prefix: &str, sandbox: bool) -> (Vec<Entry>, Vec<HashMap<String,
     // (`id` / `description`) so the renderer can attach highlights.
     let field_extractors: Vec<(String, Box<dyn Fn(&Entry) -> String>)> = vec![
         ("id".to_string(), Box::new(|e: &Entry| e.path.clone())),
-        ("description".to_string(), Box::new(|e: &Entry| e.description())),
+        (
+            "description".to_string(),
+            Box::new(|e: &Entry| e.description()),
+        ),
     ];
     let (ranked, match_indices_by_rank) = rank_candidates(
         &entries,
@@ -337,9 +344,7 @@ fn listing_for(dir: &str, sandbox: bool) -> Listing {
     } else {
         // Captured before listing: a change after the stat makes the
         // stored mtime stale → the next call refetches.
-        std::fs::metadata(dir)
-            .and_then(|m| m.modified())
-            .ok()
+        std::fs::metadata(dir).and_then(|m| m.modified()).ok()
     };
     let listing = fetch_listing(dir, sandbox);
     let (entries, invisible) = match &listing {
@@ -423,7 +428,10 @@ fn join_path(dir: &str, name: &str, is_dir: bool) -> String {
 
 /// Basename of a display path (trailing `/` ignored).
 fn basename_of(path: &str) -> &str {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
 }
 
 /// Map a path under `home` to `~/…` (used when the typed prefix used
@@ -458,9 +466,14 @@ fn parse_ls_long(lines: &[String], dir: &str) -> Vec<Entry> {
             continue;
         }
         let mut it = line.split_whitespace();
-        let (Some(perms), Some(_links), Some(_owner), Some(_group), Some(size), Some(dt)) =
-            (it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
-        else {
+        let (Some(perms), Some(_links), Some(_owner), Some(_group), Some(size), Some(dt)) = (
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+            it.next(),
+        ) else {
             continue;
         };
         let rest: Vec<&str> = it.collect();
@@ -492,9 +505,7 @@ fn parse_ls_long(lines: &[String], dir: &str) -> Vec<Entry> {
 /// time) back into a `SystemTime`.
 fn parse_iso_local(s: &str) -> Option<SystemTime> {
     let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()?;
-    let dt = chrono::Local
-        .from_local_datetime(&naive)
-        .single()?;
+    let dt = chrono::Local.from_local_datetime(&naive).single()?;
     system_time_from_timestamp(dt.timestamp())
 }
 
@@ -532,11 +543,23 @@ mod tests {
             split_prefix(".gitignore", false),
             (".".to_string(), ".gitignore".to_string())
         );
-        assert_eq!(split_prefix("foo", false), (".".to_string(), "foo".to_string()));
-        assert_eq!(split_prefix("x/y", false), ("x".to_string(), "y".to_string()));
-        assert_eq!(split_prefix("/a/b/", true), ("/a/b".to_string(), String::new()));
+        assert_eq!(
+            split_prefix("foo", false),
+            (".".to_string(), "foo".to_string())
+        );
+        assert_eq!(
+            split_prefix("x/y", false),
+            ("x".to_string(), "y".to_string())
+        );
+        assert_eq!(
+            split_prefix("/a/b/", true),
+            ("/a/b".to_string(), String::new())
+        );
         assert_eq!(split_prefix("/", true), ("/".to_string(), String::new()));
-        assert_eq!(split_prefix("/a/b", true), ("/a/b".to_string(), String::new()));
+        assert_eq!(
+            split_prefix("/a/b", true),
+            ("/a/b".to_string(), String::new())
+        );
     }
 
     #[test]
@@ -561,10 +584,7 @@ mod tests {
         assert!(!a.is_dir, "file must not carry a slash: {a:?}");
         assert!(s.is_dir, "dir must carry a slash: {s:?}");
         // Full display path, starts with the typed (expanded) prefix.
-        assert!(
-            a.path.starts_with(dir.path().to_str().unwrap()),
-            "{a:?}"
-        );
+        assert!(a.path.starts_with(dir.path().to_str().unwrap()), "{a:?}");
         // Sorted by path.
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         let mut sorted = paths.clone();
@@ -708,7 +728,10 @@ mod tests {
             .iter()
             .find(|e| e.path.ends_with("/dirlink"))
             .unwrap();
-        assert!(!dirlink.is_dir, "symlink-to-dir must not be a dir: {dirlink:?}");
+        assert!(
+            !dirlink.is_dir,
+            "symlink-to-dir must not be a dir: {dirlink:?}"
+        );
 
         // Description of a parsed entry: ISO + raw size.
         let d = sub.description();
@@ -716,7 +739,7 @@ mod tests {
         assert!(d.ends_with("  4096"), "{d}");
     }
 
-        #[test]
+    #[test]
     #[serial_test::serial]
     fn sandbox_flag_falls_back_to_host_when_no_sandbox() {
         crate::tools::set_sandbox(None);
@@ -798,7 +821,10 @@ mod tests {
 
         let mut fc = FileCompleter::new();
         let out = fc.complete(&full);
-        assert!(out.rows.is_empty(), "exact match = nothing to complete: {out:?}");
+        assert!(
+            out.rows.is_empty(),
+            "exact match = nothing to complete: {out:?}"
+        );
     }
 
     #[test]

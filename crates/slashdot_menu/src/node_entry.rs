@@ -5,13 +5,12 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::fields::ColumnDef;
 use crate::fields::{row_field_value, FieldSpace, Row};
 use crate::filter::compile_query;
 use crate::node_impl::{
-    CompletionRows, DataError, MenuResult, PathArgs, RenderContext, SubmitResult,
-    SlashDotNode,
+    CompletionRows, DataError, MenuResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
-use crate::fields::ColumnDef;
 use crate::render::LogicalLine;
 use crate::value::Value;
 use crate::view::{RowView, ViewPlan, ViewRequest, ViewRows};
@@ -50,7 +49,10 @@ pub struct RowRef {
 impl RowRef {
     /// Resolve the handle against the slot snapshot. Returns `None` on
     /// a stale/foreign handle (§3.6: degrade/skip, never unwrap).
-    pub(crate) fn resolve<'a>(&self, data: &'a [Option<Rc<crate::node_impl::DataResponse>>]) -> Option<&'a crate::fields::Row> {
+    pub(crate) fn resolve<'a>(
+        &self,
+        data: &'a [Option<Rc<crate::node_impl::DataResponse>>],
+    ) -> Option<&'a crate::fields::Row> {
         let resp = data.get(self.child_idx as usize)?.as_ref()?;
         resp.rows.get(self.row_offset as usize)
     }
@@ -148,9 +150,7 @@ impl NodeEntry {
     /// Create a root node: an empty listing node (no rows, no data).
     #[cfg(test)]
     pub(crate) fn new_root() -> Self {
-        NodeEntry::new_child(Box::new(
-            crate::node_impl::StaticListingNode::new(&[])
-        ))
+        NodeEntry::new_child(Box::new(crate::node_impl::StaticListingNode::new(&[])))
     }
 
     /// Create a child node from a host `SlashDotNode` impl.
@@ -193,56 +193,56 @@ impl NodeEntry {
         &'a mut self,
         epoch: u64,
         path_args: &'a PathArgs,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = crate::node_impl::DataResult> + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::node_impl::DataResult> + 'a>>
+    {
         Box::pin(async move {
-        if !self.value_forwarding {
-            return self.inner.data(epoch, path_args).await;
-        }
+            if !self.value_forwarding {
+                return self.inner.data(epoch, path_args).await;
+            }
 
-        // Static rows from the inner node (id + description for parent).
-        let response = self.inner.data(epoch, path_args).await?;
+            // Static rows from the inner node (id + description for parent).
+            let response = self.inner.data(epoch, path_args).await?;
 
-        // Populate our children's data cache — same mechanism the listing
-        // view uses. This is on `self`, never on a child.
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
+            // Populate our children's data cache — same mechanism the listing
+            // view uses. This is on `self`, never on a child.
+            self.refresh_data(epoch, &path_args.ids, &path_args.suffix)
+                .await;
 
-        // Collect active IDs from the refreshed cache.
-        let mut all_active = Vec::new();
-        for slot in &self.content.data_rc {
-            if let Some(child_resp) = slot.as_ref() {
-                for id in &child_resp.active_ids {
-                    if !all_active.contains(id) {
-                        all_active.push(id.clone());
+            // Collect active IDs from the refreshed cache.
+            let mut all_active = Vec::new();
+            for slot in &self.content.data_rc {
+                if let Some(child_resp) = slot.as_ref() {
+                    for id in &child_resp.active_ids {
+                        if !all_active.contains(id) {
+                            all_active.push(id.clone());
+                        }
                     }
                 }
             }
-        }
 
-        if all_active.is_empty() {
-            return Ok(response);
-        }
+            if all_active.is_empty() {
+                return Ok(response);
+            }
 
-        // Inject active values as "value" field on own static rows.
-        let value_str = all_active.join(", ");
-        let enriched_rows: Vec<crate::fields::Row> = response
-            .rows
-            .iter()
-            .map(|row| {
-                let mut r = crate::fields::Row::new(row.id.clone())
-                    .desc(row.description.clone().unwrap_or_default());
-                for (k, v) in &row.fields {
-                    r = r.field(k.clone(), v.clone());
-                }
-                r = r.field("value", crate::value::Value::Str(value_str.clone()));
-                r
-            })
-            .collect();
-        Ok(std::rc::Rc::new(crate::node_impl::DataResponse {
-            rows: enriched_rows,
-            active_ids: response.active_ids.clone(),
-        }))
+            // Inject active values as "value" field on own static rows.
+            let value_str = all_active.join(", ");
+            let enriched_rows: Vec<crate::fields::Row> = response
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut r = crate::fields::Row::new(row.id.clone())
+                        .desc(row.description.clone().unwrap_or_default());
+                    for (k, v) in &row.fields {
+                        r = r.field(k.clone(), v.clone());
+                    }
+                    r = r.field("value", crate::value::Value::Str(value_str.clone()));
+                    r
+                })
+                .collect();
+            Ok(std::rc::Rc::new(crate::node_impl::DataResponse {
+                rows: enriched_rows,
+                active_ids: response.active_ids.clone(),
+            }))
         })
     }
 
@@ -287,105 +287,109 @@ impl NodeEntry {
         render_ctx: &'a RenderContext,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MenuResult> + 'a>> {
         Box::pin(async move {
-        // Phase 0: Epoch gate — reset per-node epoch state on new activation.
-        if epoch != self.cache_epoch {
-            self.epoch = EpochState::default();
-            self.cache_epoch = epoch;
-            self.view.reset();
-            self.completion_view.reset();
-        }
-
-        // Materialize this level's PathArgs by value: `ids` moved in,
-        // `suffix` copied once. Everything downstream borrows this local.
-        let path_args = PathArgs::new(path, prompt_suffix);
-
-        // Phase 0.5: Drill rewrite — if the parent drilled into us
-        // (DrillEnter / DrillTab), let the node optionally rewrite the
-        // prompt and restart from root. Runs before refresh: at drill
-        // time the suffix is " " and needs no row data.
-        if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
-            if let Some(new_prompt) = self.inner.drill_rewrite(&path_args).await {
-                return MenuResult::ContinuePrompt(new_prompt);
+            // Phase 0: Epoch gate — reset per-node epoch state on new activation.
+            if epoch != self.cache_epoch {
+                self.epoch = EpochState::default();
+                self.cache_epoch = epoch;
+                self.view.reset();
+                self.completion_view.reset();
             }
-        }
 
-        // Phase 1: Refresh data from children — `row_index` is fresh
-        // for the single parse pass below (no re-parse needed).
-        self.refresh_data(epoch, &path_args.ids, &path_args.suffix).await;
+            // Materialize this level's PathArgs by value: `ids` moved in,
+            // `suffix` copied once. Everything downstream borrows this local.
+            let path_args = PathArgs::new(path, prompt_suffix);
 
-        // Phase 2: Parse section — fills `path_args.args` with byte
-        // ranges into its own suffix; wraps it for dispatch.
-        let parsed = parse_section(path_args, &self.content.row_index);
-        let trailing_space = parsed.path_args.suffix.ends_with(' ');
+            // Phase 0.5: Drill rewrite — if the parent drilled into us
+            // (DrillEnter / DrillTab), let the node optionally rewrite the
+            // prompt and restart from root. Runs before refresh: at drill
+            // time the suffix is " " and needs no row data.
+            if matches!(key, HostKey::DrillEnter | HostKey::DrillTab) {
+                if let Some(new_prompt) = self.inner.drill_rewrite(&path_args).await {
+                    return MenuResult::ContinuePrompt(new_prompt);
+                }
+            }
 
-        // Phase 3: Restore trigger (§5.1 step 1 — applies without Esc).
-        if let Some(ref id_range) = parsed.matched_id {
-            if parsed.tail.is_empty()
-                && !trailing_space
-                && self.epoch.should_restore_view_args
-            {
-                // Undo the drill: rebuild the restored view and pin the
-                // cursor onto the matched ID's row (§5.1). The rows
-                // memo hits (same key as at drill time), so the pin
-                // alone moves the cursor — restore stays cheap.
-                let matched_word = parsed.path_args.suffix[id_range.clone()].to_string();
-                self.epoch.should_restore_view_args = false;
-                let restore_args = parse_section(
-                    PathArgs::new(parsed.path_args.ids.clone(), self.epoch.view_args.clone()),
-                    &self.content.row_index,
-                );
-                let rows = self.ensure_rows(&restore_args.path_args);
-                let out = self.view_plan(
-                    &restore_args,
-                    Some(&matched_word),
-                    rows,
-                    None,
-                    None,
-                    render_ctx,
-                )
+            // Phase 1: Refresh data from children — `row_index` is fresh
+            // for the single parse pass below (no re-parse needed).
+            self.refresh_data(epoch, &path_args.ids, &path_args.suffix)
                 .await;
-                return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
+
+            // Phase 2: Parse section — fills `path_args.args` with byte
+            // ranges into its own suffix; wraps it for dispatch.
+            let parsed = parse_section(path_args, &self.content.row_index);
+            let trailing_space = parsed.path_args.suffix.ends_with(' ');
+
+            // Phase 3: Restore trigger (§5.1 step 1 — applies without Esc).
+            if let Some(ref id_range) = parsed.matched_id {
+                if parsed.tail.is_empty() && !trailing_space && self.epoch.should_restore_view_args
+                {
+                    // Undo the drill: rebuild the restored view and pin the
+                    // cursor onto the matched ID's row (§5.1). The rows
+                    // memo hits (same key as at drill time), so the pin
+                    // alone moves the cursor — restore stays cheap.
+                    let matched_word = parsed.path_args.suffix[id_range.clone()].to_string();
+                    self.epoch.should_restore_view_args = false;
+                    let restore_args = parse_section(
+                        PathArgs::new(parsed.path_args.ids.clone(), self.epoch.view_args.clone()),
+                        &self.content.row_index,
+                    );
+                    let rows = self.ensure_rows(&restore_args.path_args);
+                    let out = self
+                        .view_plan(
+                            &restore_args,
+                            Some(&matched_word),
+                            rows,
+                            None,
+                            None,
+                            render_ctx,
+                        )
+                        .await;
+                    return MenuResult::Continue(out.plan, restore_args.path_args.full_prompt());
+                }
             }
-        }
 
-        // Phase 4: Dispatch.
+            // Phase 4: Dispatch.
 
-        // Leaf node (no children).
-        if self.children.is_empty() {
-            return self.handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx).await;
-        }
-
-        // Listing node: matched child with non-empty tail → recurse.
-        // Forward key as-is; the child handles Enter (drill) vs
-        // DrillEnter/DrillTab (stop recursion) at its own listing/leaf level.
-        if let Some(ref id_range) = parsed.matched_id {
-            if !parsed.tail.is_empty() {
-                // The child gets a fresh `path` vector (parent ids +
-                // matched ID, both by value) and borrows the tail slice
-                // out of this level's suffix — no string copy for the tail.
-                let mut child_path = parsed.path_args.ids.clone();
-                child_path.push(parsed.path_args.suffix[id_range.clone()].to_string());
-                let child_suffix = &parsed.path_args.suffix[parsed.tail.clone()];
-                // Cursor is suffix-relative at each level: the child's
-                // section starts at `tail.start`. Saturating — a cursor
-                // above the tail leaves the child's completion inert.
-                let child_cursor = cursor_pos.saturating_sub(parsed.tail.start);
-                return self.children[parsed.child_idx].node_traverse_at(
-                    epoch,
-                    key,
-                    child_path,
-                    child_suffix,
-                    child_cursor,
-                    render_ctx,
-                )
-                .await;
+            // Leaf node (no children).
+            if self.children.is_empty() {
+                return self
+                    .handle_leaf(epoch, key, &parsed, cursor_pos, render_ctx)
+                    .await;
             }
-            // Matched child, empty tail, no restore → bare ID render (§2.5).
-            // Fall through to show listing with cursor on the ID's row.
-        }
 
-        // Listing: show filtered listing, handle keys.
-        self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx).await
+            // Listing node: matched child with non-empty tail → recurse.
+            // Forward key as-is; the child handles Enter (drill) vs
+            // DrillEnter/DrillTab (stop recursion) at its own listing/leaf level.
+            if let Some(ref id_range) = parsed.matched_id {
+                if !parsed.tail.is_empty() {
+                    // The child gets a fresh `path` vector (parent ids +
+                    // matched ID, both by value) and borrows the tail slice
+                    // out of this level's suffix — no string copy for the tail.
+                    let mut child_path = parsed.path_args.ids.clone();
+                    child_path.push(parsed.path_args.suffix[id_range.clone()].to_string());
+                    let child_suffix = &parsed.path_args.suffix[parsed.tail.clone()];
+                    // Cursor is suffix-relative at each level: the child's
+                    // section starts at `tail.start`. Saturating — a cursor
+                    // above the tail leaves the child's completion inert.
+                    let child_cursor = cursor_pos.saturating_sub(parsed.tail.start);
+                    return self.children[parsed.child_idx]
+                        .node_traverse_at(
+                            epoch,
+                            key,
+                            child_path,
+                            child_suffix,
+                            child_cursor,
+                            render_ctx,
+                        )
+                        .await;
+                }
+                // Matched child, empty tail, no restore → bare ID render (§2.5).
+                // Fall through to show listing with cursor on the ID's row.
+            }
+
+            // Listing: show filtered listing, handle keys.
+            self.handle_listing(epoch, key, &parsed, cursor_pos, render_ctx)
+                .await
         })
     }
 
@@ -408,12 +412,12 @@ impl NodeEntry {
         // nowhere).
         let mut frame_err: Option<String> = None;
         if !self.epoch.confirm_pending
-            && matches!(
-                key,
-                HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
-            )
+            && matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab)
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
+            match self
+                .completion_pass(parsed, cursor_pos, key, render_ctx)
+                .await
+            {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -458,9 +462,9 @@ impl NodeEntry {
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
-                        .await;
+                let out = self
+                    .view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                    .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             _ => Self::build_continue(pa),
@@ -478,7 +482,9 @@ impl NodeEntry {
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let rows = self.ensure_rows(&parsed.path_args);
-        let out = self.view_plan(parsed, None, rows, None, Some(error), render_ctx).await;
+        let out = self
+            .view_plan(parsed, None, rows, None, Some(error), render_ctx)
+            .await;
         MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
     }
 
@@ -504,12 +510,12 @@ impl NodeEntry {
         // nowhere).
         let mut frame_err: Option<String> = None;
         if !self.epoch.confirm_pending
-            && matches!(
-                key,
-                HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab
-            )
+            && matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab)
         {
-            match self.completion_pass(parsed, cursor_pos, key, render_ctx).await {
+            match self
+                .completion_pass(parsed, cursor_pos, key, render_ctx)
+                .await
+            {
                 Ok(Some(m)) => return m,
                 Ok(None) => {}
                 Err(msg) => frame_err = Some(msg),
@@ -519,16 +525,23 @@ impl NodeEntry {
         match key {
             HostKey::MoveCursor(delta) => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out =
-                    self.view_plan(parsed, None, rows, Some(delta), frame_err.as_deref(), render_ctx)
-                        .await;
+                let out = self
+                    .view_plan(
+                        parsed,
+                        None,
+                        rows,
+                        Some(delta),
+                        frame_err.as_deref(),
+                        render_ctx,
+                    )
+                    .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
             HostKey::Tab | HostKey::Enter => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
-                        .await;
+                let out = self
+                    .view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                    .await;
                 let Some(row) = out.cursor_row else {
                     return Self::build_continue(pa);
                 };
@@ -548,21 +561,16 @@ impl NodeEntry {
                 } else {
                     HostKey::DrillEnter
                 };
-                self.children[child_idx].node_traverse(
-                    epoch,
-                    drill_key,
-                    new_path,
-                    " ",
-                    render_ctx,
-                )
-                .await
+                self.children[child_idx]
+                    .node_traverse(epoch, drill_key, new_path, " ", render_ctx)
+                    .await
             }
             HostKey::Esc => Self::handle_esc(parsed),
             _ => {
                 let rows = self.ensure_rows(&parsed.path_args);
-                let out =
-                    self.view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
-                        .await;
+                let out = self
+                    .view_plan(parsed, None, rows, None, frame_err.as_deref(), render_ctx)
+                    .await;
                 MenuResult::Continue(out.plan, pa.full_prompt())
             }
         }
@@ -654,7 +662,9 @@ impl NodeEntry {
                                 row.id, child_idx
                             );
                         }
-                        self.content.row_index.insert(row.id.clone(), child_idx as u16);
+                        self.content
+                            .row_index
+                            .insert(row.id.clone(), child_idx as u16);
                     }
                 }
             }
@@ -697,11 +707,8 @@ impl NodeEntry {
         // Filter by modifiers — extracted from the flat args against
         // this level's field space (valid keys only; every other dot
         // word stays a fuzzy term).
-        let (modifier_tokens, fuzzy_terms) = crate::filter::split_modifiers(
-            &path_args.args,
-            &path_args.suffix,
-            &field_space,
-        );
+        let (modifier_tokens, fuzzy_terms) =
+            crate::filter::split_modifiers(&path_args.args, &path_args.suffix, &field_space);
         let query = if modifier_tokens.is_empty() {
             crate::filter::Query::default()
         } else {
@@ -718,29 +725,23 @@ impl NodeEntry {
             .enumerate()
             .filter_map(|(ci, s)| s.as_ref().map(|rc| (ci as u16, rc)))
             .flat_map(|(ci, rc)| {
-                rc.rows
-                    .iter()
-                    .enumerate()
-                    .map(move |(off, row)| {
-                        (
-                            RowRef {
-                                child_idx: ci,
-                                row_offset: off as u32,
-                            },
-                            row,
-                        )
-                    })
+                rc.rows.iter().enumerate().map(move |(off, row)| {
+                    (
+                        RowRef {
+                            child_idx: ci,
+                            row_offset: off as u32,
+                        },
+                        row,
+                    )
+                })
             })
             .filter(|(_, row)| !row.id.is_empty())
             .filter(|(_, row)| {
-                query
-                    .filters
-                    .iter()
-                    .all(|(name, pred)| {
-                        row_field_value(row, name)
-                            .map(|v| pred.matches(&v))
-                            .unwrap_or(false)
-                    })
+                query.filters.iter().all(|(name, pred)| {
+                    row_field_value(row, name)
+                        .map(|v| pred.matches(&v))
+                        .unwrap_or(false)
+                })
             })
             .collect();
 
@@ -749,7 +750,11 @@ impl NodeEntry {
 
         // Collect displayed field names for match index computation.
         let display_fields: Vec<String> = if !self.inner.columns().is_empty() {
-            self.inner.columns().iter().map(|c| c.field.clone()).collect()
+            self.inner
+                .columns()
+                .iter()
+                .map(|c| c.field.clone())
+                .collect()
         } else {
             vec!["id".to_string(), "description".to_string()]
         };
@@ -927,7 +932,9 @@ impl NodeEntry {
                     &self.content.row_index,
                 );
                 let rerun = if self.children.is_empty() {
-                    self.inner.complete_parameter(&reparsed.path_args, cursor2).await
+                    self.inner
+                        .complete_parameter(&reparsed.path_args, cursor2)
+                        .await
                 } else {
                     self.default_complete(&reparsed, cursor2)
                 };
@@ -1034,10 +1041,12 @@ impl NodeEntry {
                 }
                 // Match against the *rendered* row id (`.name:`) so highlight
                 // offsets line up with the dialog's `id` column.
-                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
-                    ("id".to_string(), Box::new(|k: &String| format!(".{}:", k))
-                        as Box<dyn for<'a> Fn(&'a String) -> String>),
-                ];
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> =
+                    vec![(
+                        "id".to_string(),
+                        Box::new(|k: &String| format!(".{}:", k))
+                            as Box<dyn for<'a> Fn(&'a String) -> String>,
+                    )];
                 let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                     &names,
                     prefix,
@@ -1060,19 +1069,29 @@ impl NodeEntry {
                     }
                     Some(map)
                 };
-                return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
+                return Ok(Rc::new(CompletionRows {
+                    rows,
+                    labels: None,
+                    match_indices,
+                }));
             }
             Some(c) => {
                 let key = &body[..c];
                 let value = &body[c + 1..];
                 // `.sort:` → field names as values (contains filter).
                 if key == "sort" {
-                    let names: Vec<String> = field_space.names(true).into_iter().map(|s| s.to_string()).collect();
+                    let names: Vec<String> = field_space
+                        .names(true)
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
                     // Match against the rendered row id (`.sort:name`).
-                    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
-                        ("id".to_string(), Box::new(|f: &String| format!(".sort:{}", f))
-                            as Box<dyn for<'a> Fn(&'a String) -> String>),
-                    ];
+                    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> =
+                        vec![(
+                            "id".to_string(),
+                            Box::new(|f: &String| format!(".sort:{}", f))
+                                as Box<dyn for<'a> Fn(&'a String) -> String>,
+                        )];
                     let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                         &names,
                         value,
@@ -1095,7 +1114,11 @@ impl NodeEntry {
                         }
                         Some(map)
                     };
-                    return Ok(Rc::new(CompletionRows { rows, labels: None, match_indices }));
+                    return Ok(Rc::new(CompletionRows {
+                        rows,
+                        labels: None,
+                        match_indices,
+                    }));
                 }
                 // Unknown key → no dialog (word stays positional).
                 let Some(spec) = field_space.spec(key) else {
@@ -1122,10 +1145,12 @@ impl NodeEntry {
                 }
                 // Match against the rendered row id (`.key:value`).
                 let key_owned = key.to_string();
-                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> = vec![
-                    ("id".to_string(), Box::new(move |v: &String| format!(".{}:{}", key_owned, v))
-                        as Box<dyn for<'a> Fn(&'a String) -> String>),
-                ];
+                let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a String) -> String>)> =
+                    vec![(
+                        "id".to_string(),
+                        Box::new(move |v: &String| format!(".{}:{}", key_owned, v))
+                            as Box<dyn for<'a> Fn(&'a String) -> String>,
+                    )];
                 let (ranked, match_by_rank) = crate::fuzzy::rank_candidates(
                     &values,
                     value,
@@ -1152,7 +1177,11 @@ impl NodeEntry {
                     }
                     (rows, Some(map))
                 };
-                return Ok(Rc::new(CompletionRows { rows: final_rows, labels: None, match_indices: final_match_indices }));
+                return Ok(Rc::new(CompletionRows {
+                    rows: final_rows,
+                    labels: None,
+                    match_indices: final_match_indices,
+                }));
             }
         }
     }
@@ -1177,8 +1206,14 @@ impl NodeEntry {
             let ord = va.cmp_value(vb);
             if ord == std::cmp::Ordering::Equal {
                 // Tiebreak by id.
-                let id_a = ra.resolve(&self.content.data_rc).map(|r| r.id.as_str()).unwrap_or("");
-                let id_b = rb.resolve(&self.content.data_rc).map(|r| r.id.as_str()).unwrap_or("");
+                let id_a = ra
+                    .resolve(&self.content.data_rc)
+                    .map(|r| r.id.as_str())
+                    .unwrap_or("");
+                let id_b = rb
+                    .resolve(&self.content.data_rc)
+                    .map(|r| r.id.as_str())
+                    .unwrap_or("");
                 id_a.cmp(id_b)
             } else {
                 ord
@@ -1236,8 +1271,6 @@ impl NodeEntry {
     fn build_continue(path_args: &PathArgs) -> MenuResult {
         MenuResult::ContinuePrompt(path_args.full_prompt())
     }
-
-
 }
 
 // --- Section parsing (single parse pass, §2.1) ---
@@ -1281,10 +1314,7 @@ impl ParsedSection {
 ///
 /// The first word matching a row ID terminates the section; `tail`
 /// covers everything after it (including the leading space).
-fn parse_section(
-    mut path_args: PathArgs,
-    row_index: &HashMap<String, u16>,
-) -> ParsedSection {
+fn parse_section(mut path_args: PathArgs, row_index: &HashMap<String, u16>) -> ParsedSection {
     let suffix_len = path_args.suffix.len();
     let mut matched_id: Option<Range<usize>> = None;
     let mut child_idx = 0usize;
@@ -1390,13 +1420,8 @@ mod tests {
         }
 
         async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-            *self.last_submit.borrow_mut() = Some(
-                path_args
-                    .args()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string(),
-            );
+            *self.last_submit.borrow_mut() =
+                Some(path_args.args().next().unwrap_or_default().to_string());
             SubmitResult::Done(None)
         }
     }
@@ -1424,7 +1449,9 @@ mod tests {
         root
     }
 
-    fn ep() -> u64 { 1 }
+    fn ep() -> u64 {
+        1
+    }
 
     /// Test render context: 80 columns.
     fn rctx() -> RenderContext {
@@ -1436,16 +1463,18 @@ mod tests {
     /// result arrives. Tests that care about host-observable behavior
     /// use this; tests asserting a specific rewrite use `node_traverse`
     /// raw.
-    fn traverse_resolved(
-        root: &mut NodeEntry,
-        key: HostKey,
-        suffix: &str,
-    ) -> MenuResult {
+    fn traverse_resolved(root: &mut NodeEntry, key: HostKey, suffix: &str) -> MenuResult {
         const MAX_REWRITES: usize = 16;
         let mut suffix = suffix.to_string();
         let mut key = key;
         for _ in 0..MAX_REWRITES {
-            match futures::executor::block_on(root.node_traverse(ep(), key, Vec::new(), &suffix, &rctx())) {
+            match futures::executor::block_on(root.node_traverse(
+                ep(),
+                key,
+                Vec::new(),
+                &suffix,
+                &rctx(),
+            )) {
                 MenuResult::ContinuePrompt(new) => {
                     suffix = new;
                     key = HostKey::None;
@@ -1460,12 +1489,17 @@ mod tests {
     fn root_lists_commands() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "");
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert!(row_texts.iter().any(|t| t.contains("alpha")));
                 assert!(row_texts.iter().any(|t| t.contains("beta")));
                 assert_eq!(plan.selected, Some(0));
@@ -1478,7 +1512,13 @@ mod tests {
     fn fuzzy_filter_at_root() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "alp", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "alp",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts = rows_of(MenuResult::Continue(plan, String::new()));
@@ -1493,7 +1533,13 @@ mod tests {
     fn bare_id_shows_parent_listing() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "alpha", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "alpha",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "alpha");
@@ -1508,8 +1554,20 @@ mod tests {
     fn tab_drills_into_child() {
         let mut root = root_with_cmds(vec![CmdNode::new("alpha"), CmdNode::new("beta")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, "alpha "),
             other => panic!("expected ContinuePrompt drill, got {:?}", other),
@@ -1518,15 +1576,37 @@ mod tests {
 
     #[test]
     fn move_cursor_wraps() {
-        let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
+        let mut root = root_with_cmds(vec![
+            CmdNode::new("a"),
+            CmdNode::new("b"),
+            CmdNode::new("c"),
+        ]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(1),
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(1)),
             other => panic!("expected Continue, got {:?}", other),
         }
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(-1), Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(-1),
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1535,19 +1615,53 @@ mod tests {
 
     #[test]
     fn move_cursor_clamps_not_wraps() {
-        let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b"), CmdNode::new("c")]);
+        let mut root = root_with_cmds(vec![
+            CmdNode::new("a"),
+            CmdNode::new("b"),
+            CmdNode::new("c"),
+        ]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         // Move past last row: should clamp to last, not wrap to 0.
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(100), Vec::new(), "", &rctx()));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(100),
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(2)),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Move before first row: should clamp to 0, not wrap.
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(-100), Vec::new(), "", &rctx()));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(-100),
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => assert_eq!(plan.selected, Some(0)),
             other => panic!("expected Continue, got {:?}", other),
@@ -1556,12 +1670,15 @@ mod tests {
 
     #[test]
     fn active_marker_present() {
-        let mut root = root_with_cmds(vec![
-            CmdNode::new("a"),
-            CmdNode::with_active("b", "b"),
-        ]);
+        let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::with_active("b", "b")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.active_rows, vec![1]);
@@ -1574,7 +1691,13 @@ mod tests {
     fn esc_at_root_closes() {
         let mut root = root_with_cmds(vec![CmdNode::new("a")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Esc, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Esc,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
     }
 
@@ -1608,13 +1731,19 @@ mod tests {
             header_text: "Help text here".to_string(),
         }));
         // Give it a child so it's a listing node (not a leaf).
-        root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
+        root.children
+            .push(NodeEntry::new_child(Box::new(CmdNode::new("item"))));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
-                let headers: Vec<&str> = plan.detail.iter().map(|l| l.0.as_str())
-                    .collect();
+                let headers: Vec<&str> = plan.detail.iter().map(|l| l.0.as_str()).collect();
                 assert!(headers.contains(&"Help text here"));
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -1693,20 +1822,14 @@ mod tests {
         let p = parse("fuzzy .sort:price more", &ri);
         // Flat args keep every word — classification happens later.
         assert_eq!(pos(&p), vec!["fuzzy", ".sort:price", "more"]);
-        assert_eq!(
-            mods(&p),
-            vec![("sort".to_string(), "price".to_string())]
-        );
+        assert_eq!(mods(&p), vec![("sort".to_string(), "price".to_string())]);
     }
 
     #[test]
     fn parse_keeps_dot_words_flat() {
         let ri = HashMap::new();
         let p = parse(".sort:price ./src .gitignore", &ri);
-        assert_eq!(
-            pos(&p),
-            vec![".sort:price", "./src", ".gitignore"]
-        );
+        assert_eq!(pos(&p), vec![".sort:price", "./src", ".gitignore"]);
         // Only `.sort:price` classifies as a modifier for this space.
         assert_eq!(mods(&p).len(), 1);
     }
@@ -1756,11 +1879,29 @@ mod tests {
     fn epoch_reset_clears_cursor() {
         let mut root = root_with_cmds(vec![CmdNode::new("a"), CmdNode::new("b")]);
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::MoveCursor(1), Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(1),
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         assert_eq!(root.view.cursor_idx, 1);
         // New epoch resets.
-        let _ = futures::executor::block_on(root.node_traverse(ep() + 10, HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep() + 10,
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         assert_eq!(root.view.cursor_idx, 0);
     }
 
@@ -1769,15 +1910,22 @@ mod tests {
     #[test]
     fn esc_clears_filter() {
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                crate::fields::Row::new("m1").desc("first option"),
-                crate::fields::Row::new("m2").desc("second option"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    crate::fields::Row::new("m1").desc("first option"),
+                    crate::fields::Row::new("m2").desc("second option"),
+                ],
+            })));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // "first" is in m1's description but not a row ID → fuzzy filter.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "first", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "first",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_count = plan.rows.len();
@@ -1799,15 +1947,22 @@ mod tests {
     #[test]
     fn fuzzy_rank_orders_best_first() {
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                crate::fields::Row::new("p:gpt4o").desc("GPT-4o flagship"),
-                crate::fields::Row::new("c:opus").desc("Claude opus"),
-                crate::fields::Row::new("p:gpt4-mini").desc("GPT-4 mini fast"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    crate::fields::Row::new("p:gpt4o").desc("GPT-4o flagship"),
+                    crate::fields::Row::new("c:opus").desc("Claude opus"),
+                    crate::fields::Row::new("p:gpt4-mini").desc("GPT-4 mini fast"),
+                ],
+            })));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "gpt", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "gpt",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
                 let row_texts = rows_of(MenuResult::Continue(plan, String::new()));
@@ -1831,7 +1986,9 @@ mod tests {
 
     impl RecordingLeaf {
         fn new(record: Rc<std::cell::RefCell<Option<String>>>) -> Self {
-            RecordingLeaf { submitted_via: record }
+            RecordingLeaf {
+                submitted_via: record,
+            }
         }
     }
 
@@ -1856,24 +2013,31 @@ mod tests {
         let mut root = NodeEntry::new_root();
 
         // Static child: returns "add" row.
-        root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
+        root.children
+            .push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
 
         // Dynamic child: returns "bind1", "bind2" rows.
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                crate::fields::Row::new("bind1").desc("binding one"),
-                crate::fields::Row::new("bind2").desc("binding two"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    crate::fields::Row::new("bind1").desc("binding one"),
+                    crate::fields::Row::new("bind2").desc("binding two"),
+                ],
+            })));
 
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Both children's rows should appear in the listing.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert!(row_texts.iter().any(|t| t.contains("add")));
                 assert!(row_texts.iter().any(|t| t.contains("bind1")));
                 assert!(row_texts.iter().any(|t| t.contains("bind2")));
@@ -1895,10 +2059,8 @@ mod tests {
             Rc::new(std::cell::RefCell::new(None));
         let bind_seen: Rc<std::cell::RefCell<Option<String>>> =
             Rc::new(std::cell::RefCell::new(None));
-        let add_leaf =
-            NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&add_seen))));
-        let bind_leaf =
-            NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&bind_seen))));
+        let add_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&add_seen))));
+        let bind_leaf = NodeEntry::new_child(Box::new(RecordingLeaf::new(Rc::clone(&bind_seen))));
 
         // add_child returns a static "add" row.
         let mut add_cmd = NodeEntry::new_child(Box::new(CmdNode::new("add")));
@@ -1915,46 +2077,76 @@ mod tests {
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Tab on "add" → drills into add_cmd → shows "action" leaf row.
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         // Move cursor to "add" (it's first) and Tab.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(_, prompt) => assert!(prompt.starts_with("add ")),
             other => panic!("expected Continue, got {:?}", other),
         }
         // Now at "add ", the add_cmd node shows its leaf child "action".
         // Tab into the leaf.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "add ", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            "add ",
+            &rctx(),
+        ));
         match result {
-            MenuResult::ContinuePrompt(prompt) =>
-                assert!(prompt.starts_with("add action ")),
+            MenuResult::ContinuePrompt(prompt) => assert!(prompt.starts_with("add action ")),
             other => panic!("expected ContinuePrompt drill, got {:?}", other),
         }
         // Enter on "add action " → submit.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "add action ", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "add action ",
+            &rctx(),
+        ));
         match result {
             MenuResult::DoneSuccess(..) => {}
             other => panic!("expected DoneSuccess, got {:?}", other),
         }
         // Routing: only the add-branch leaf receives the submit, and it
         // records the row id it was dispatched from.
-        assert_eq!(add_seen.borrow().as_deref(), Some("action"),
-            "add leaf should record its dispatched row");
-        assert!(bind_seen.borrow().is_none(),
-            "bind leaf must not receive the add-branch submit");
+        assert_eq!(
+            add_seen.borrow().as_deref(),
+            Some("action"),
+            "add leaf should record its dispatched row"
+        );
+        assert!(
+            bind_seen.borrow().is_none(),
+            "bind leaf must not receive the add-branch submit"
+        );
     }
 
     #[test]
     fn mixed_children_fuzzy_filter_crosses_boundary() {
         // Fuzzy filter should narrow across both children.
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                crate::fields::Row::new("bind1").desc("binding one"),
-                crate::fields::Row::new("bind2").desc("binding two"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(CmdNode::new("add"))));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    crate::fields::Row::new("bind1").desc("binding one"),
+                    crate::fields::Row::new("bind2").desc("binding two"),
+                ],
+            })));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // "bind" fuzzy-matches both binding rows but not "add".
@@ -1974,20 +2166,26 @@ mod tests {
     #[test]
     fn empty_id_rows_skipped_with_warning() {
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                crate::fields::Row::new("").desc("no id"),       // empty id
-                crate::fields::Row::new("valid").desc("has id"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    crate::fields::Row::new("").desc("no id"), // empty id
+                    crate::fields::Row::new("valid").desc("has id"),
+                ],
+            })));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
 
         // Only "valid" should appear.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert_eq!(row_texts.len(), 1);
                 assert!(row_texts[0].contains("valid"));
             }
@@ -2026,9 +2224,10 @@ mod tests {
     /// Root's Enter drill will send DrillEnter to the leaf.
     fn rewrite_root(prefill: &str) -> NodeEntry {
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(
-            RewriteLeaf { prefill: prefill.to_string() },
-        )));
+        root.children
+            .push(NodeEntry::new_child(Box::new(RewriteLeaf {
+                prefill: prefill.to_string(),
+            })));
         root
     }
 
@@ -2038,10 +2237,15 @@ mod tests {
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // User presses Enter at root listing → drills into "rename" leaf
         // with DrillEnter → leaf's drill_rewrite fires.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
-            MenuResult::ContinuePrompt(prompt) =>
-                assert_eq!(prompt, "abc rename MySession"),
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, "abc rename MySession"),
             other => panic!("expected ContinuePrompt rewrite, got {:?}", other),
         }
     }
@@ -2050,10 +2254,15 @@ mod tests {
     fn drill_rewrite_fires_on_drill_tab() {
         let mut root = rewrite_root("TabFill");
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
-            MenuResult::ContinuePrompt(prompt) =>
-                assert_eq!(prompt, "abc rename TabFill"),
+            MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, "abc rename TabFill"),
             other => panic!("expected ContinuePrompt rewrite, got {:?}", other),
         }
     }
@@ -2066,9 +2275,11 @@ mod tests {
         // node recursion with HostKey::Enter (not DrillEnter).
         // drill_rewrite should NOT fire; leaf submits normally.
         let result = futures::executor::block_on(root.node_traverse(
-            ep(), HostKey::Enter,
+            ep(),
+            HostKey::Enter,
             Vec::new(),
-            "rename ", &rctx(),
+            "rename ",
+            &rctx(),
         ));
         match result {
             MenuResult::DoneSuccess(_, _) => {
@@ -2083,10 +2294,17 @@ mod tests {
         // Node without drill_rewrite (default None) → DrillEnter falls
         // through to normal leaf submit.
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(LeafNode::new())));
+        root.children
+            .push(NodeEntry::new_child(Box::new(LeafNode::new())));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // User presses Enter at root → drills into leaf with DrillEnter.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         match result {
             MenuResult::DoneSuccess(_, _) => { /* leaf submitted */ }
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -2160,7 +2378,13 @@ mod tests {
     fn completion_key_mode_lists_field_names() {
         let mut root = fielded_root();
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), ".t", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            ".t",
+            &rctx(),
+        ));
         let dialog = match &result {
             MenuResult::Continue(plan, _) => {
                 // Dialog discriminator: candidates render with the fixed
@@ -2288,7 +2512,10 @@ mod tests {
             ".srot:price",
             &rctx(),
         )));
-        assert!(rows.is_empty(), "fuzzy '.srot:price' matches nothing: {rows:?}");
+        assert!(
+            rows.is_empty(),
+            "fuzzy '.srot:price' matches nothing: {rows:?}"
+        );
     }
 
     #[test]
@@ -2327,13 +2554,9 @@ mod tests {
     fn completion_dialog_cursor_moves_and_persists() {
         let mut root = fielded_root();
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
-        let sel_of = |root: &mut NodeEntry, key: HostKey| match futures::executor::block_on(root.node_traverse(
-            ep(),
-            key,
-            Vec::new(),
-            ".t",
-            &rctx(),
-        )) {
+        let sel_of = |root: &mut NodeEntry, key: HostKey| match futures::executor::block_on(
+            root.node_traverse(ep(), key, Vec::new(), ".t", &rctx()),
+        ) {
             MenuResult::Continue(plan, _) => plan.selected,
             other => panic!("expected Continue, got {:?}", other),
         };
@@ -2367,10 +2590,19 @@ mod tests {
             &rctx(),
         )));
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert!(rows[0].contains(".sort:"), "prefix must rank first: {rows:?}");
+        assert!(
+            rows[0].contains(".sort:"),
+            "prefix must rank first: {rows:?}"
+        );
         // Tab: in-place expansion, NO trailing space — the same-turn
         // re-run lands in value mode (non-empty) and keeps going.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Tab, Vec::new(), ".so", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Tab,
+            Vec::new(),
+            ".so",
+            &rctx(),
+        ));
         match result {
             MenuResult::ContinuePrompt(prompt) => assert_eq!(prompt, ".sort:"),
             other => panic!("expected ContinuePrompt expansion, got {:?}", other),
@@ -2401,7 +2633,13 @@ mod tests {
         let mut root = fielded_root();
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         // Init epoch state at this epoch.
-        let _ = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "", &rctx()));
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
         root.epoch.confirm_pending = true;
         let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
@@ -2525,7 +2763,11 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.detail.len(), 1, "{:?}", plan.detail);
-                assert!(plan.detail[0].0.contains("[ERROR]: boom"), "{:?}", plan.detail[0]);
+                assert!(
+                    plan.detail[0].0.contains("[ERROR]: boom"),
+                    "{:?}",
+                    plan.detail[0]
+                );
                 assert!(plan.rows.is_empty(), "no dialog on Err: {:?}", plan.rows);
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -2564,7 +2806,8 @@ mod tests {
 
     fn param_root() -> NodeEntry {
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(ParamLeaf)));
+        root.children
+            .push(NodeEntry::new_child(Box::new(ParamLeaf)));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         root
     }
@@ -2574,7 +2817,13 @@ mod tests {
         let mut root = param_root();
         // Drill arrival: Enter on the bare id forwards DrillEnter into
         // the leaf with an empty suffix → submit sees no args → Error.
-        let result = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "param",
+            &rctx(),
+        ));
         match result {
             MenuResult::Continue(plan, prompt) => {
                 assert_eq!(prompt, "param ", "{prompt:?}");
@@ -2597,11 +2846,23 @@ mod tests {
     #[test]
     fn submit_error_is_one_shot() {
         let mut root = param_root();
-        let first = futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param", &rctx()));
+        let first = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "param",
+            &rctx(),
+        ));
         assert!(matches!(first, MenuResult::Continue(..)), "{:?}", first);
         // The next frame over the SAME prompt re-derives without the
         // error: nothing was stored (direct render, stateless).
-        let second = futures::executor::block_on(root.node_traverse(ep(), HostKey::None, Vec::new(), "param ", &rctx()));
+        let second = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "param ",
+            &rctx(),
+        ));
         match second {
             MenuResult::Continue(plan, _) => {
                 assert!(
@@ -2623,8 +2884,13 @@ mod tests {
     #[test]
     fn submit_with_arg_succeeds() {
         let mut root = param_root();
-        let result =
-            futures::executor::block_on(root.node_traverse(ep(), HostKey::Enter, Vec::new(), "param /home/gab", &rctx()));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "param /home/gab",
+            &rctx(),
+        ));
         match result {
             MenuResult::DoneSuccess(_, prompt) => assert_eq!(prompt, "param /home/gab"),
             other => panic!("expected DoneSuccess, got {:?}", other),
@@ -2717,14 +2983,15 @@ mod tests {
         // Predictable drill order for listings: id-prefix matches first,
         // shortest id first, fuzzy-only matches after.
         let mut root = NodeEntry::new_root();
-        root.children.push(NodeEntry::new_child(Box::new(DynamicNode {
-            rows: vec![
-                Row::new("model_xtra_long").desc("long"),
-                Row::new("alphabet").desc("modular parts"),
-                Row::new("model").desc("short"),
-                Row::new("models").desc("plural"),
-            ],
-        })));
+        root.children
+            .push(NodeEntry::new_child(Box::new(DynamicNode {
+                rows: vec![
+                    Row::new("model_xtra_long").desc("long"),
+                    Row::new("alphabet").desc("modular parts"),
+                    Row::new("model").desc("short"),
+                    Row::new("models").desc("plural"),
+                ],
+            })));
         futures::executor::block_on(root.refresh_data(ep(), &[], ""));
         let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),

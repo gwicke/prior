@@ -10,10 +10,10 @@ use crate::app_state::AppState;
 
 use std::rc::Rc;
 
+use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
 };
-use crate::slashdot_menu::menu::SlashDotMenuNode;
 
 // ---------------------------------------------------------------------------
 // PersonaEnumNode — returns all persona rows from a single node.
@@ -63,14 +63,21 @@ impl SlashDotNode for PersonaEnumNode {
 pub fn add_persona_child(listing: &mut SlashDotMenuNode, app_state: &Arc<AppState>) {
     let reader = app_state.clone();
     let writer = app_state.clone();
-    listing.add_child(PersonaEnumNode {
-        active_fn: Box::new(move || reader.persona()),
-        submit_fn: Box::new(move |name| {
-            let val = if name == "none" { None } else { Some(name.to_string()) };
-            writer.set_persona(val);
-            Ok(())
-        }),
-    }.into());
+    listing.add_child(
+        PersonaEnumNode {
+            active_fn: Box::new(move || reader.persona()),
+            submit_fn: Box::new(move |name| {
+                let val = if name == "none" {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+                writer.set_persona(val);
+                Ok(())
+            }),
+        }
+        .into(),
+    );
 }
 
 #[cfg(test)]
@@ -100,10 +107,8 @@ mod tests {
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
     /// "persona" → `PersonaEnumNode` bound to the target config.
     fn build_persona_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
-        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("persona", "set runtime persona"),
-        ])
-        .into();
+        let mut pl: SlashDotMenuNode =
+            StaticListingNode::new(&[StaticRow::new("persona", "set runtime persona")]).into();
         add_persona_child(&mut pl, app_state);
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(pl);
@@ -120,11 +125,15 @@ mod tests {
             MenuResult::Continue(plan, _) => {
                 let rows: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
                 assert!(
-                    rows.iter().any(|r| r.split_whitespace().next() == Some("persona")),
+                    rows.iter()
+                        .any(|r| r.split_whitespace().next() == Some("persona")),
                     "root should list 'persona': {rows:?}"
                 );
             }
-            other => panic!("expected Continue at root, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue at root, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -137,10 +146,15 @@ mod tests {
         app_state.set_persona(Some("definitely-not-a-persona".into()));
         let mut menu = build_persona_menu(&app_state);
         let mut h = menu.get_handle();
-        let prompt = match futures::executor::block_on(h.eval_prompt_resolved("persona ", HostKey::Tab, 80)) {
-            MenuResult::Continue(_, prompt) => prompt,
-            other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
-        };
+        let prompt =
+            match futures::executor::block_on(h.eval_prompt_resolved("persona ", HostKey::Tab, 80))
+            {
+                MenuResult::Continue(_, prompt) => prompt,
+                other => panic!(
+                    "expected Continue after Tab, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            };
         let sel = prompt
             .split_whitespace()
             .last()
@@ -148,7 +162,10 @@ mod tests {
             .to_string();
         match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
             MenuResult::DoneSuccess(..) => {}
-            other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected DoneSuccess on Enter, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         let expect = if sel == "none" { None } else { Some(sel) };
         assert_eq!(app_state.persona(), expect);

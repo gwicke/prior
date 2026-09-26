@@ -362,11 +362,7 @@ impl SessionEntry {
     }
 
     /// Create a new model_change entry.
-    pub fn new_model_change(
-        provider: String,
-        model_id: String,
-        parent_id: Option<String>,
-    ) -> Self {
+    pub fn new_model_change(provider: String, model_id: String, parent_id: Option<String>) -> Self {
         Self {
             id: Uuid::now_v7().to_string(),
             parent_id,
@@ -376,10 +372,7 @@ impl SessionEntry {
     }
 
     /// Create a new thinking_level_change entry.
-    pub fn new_thinking_level_change(
-        thinking_level: String,
-        parent_id: Option<String>,
-    ) -> Self {
+    pub fn new_thinking_level_change(thinking_level: String, parent_id: Option<String>) -> Self {
         Self {
             id: Uuid::now_v7().to_string(),
             parent_id,
@@ -483,7 +476,9 @@ impl SessionIndex {
             .entries
             .keys()
             .filter(|id| {
-                self.entries.get(id.as_str()).and_then(|e| e.parent_id.as_deref())
+                self.entries
+                    .get(id.as_str())
+                    .and_then(|e| e.parent_id.as_deref())
                     .map(|pid| !self.entries.contains_key(pid))
                     .unwrap_or(true)
             })
@@ -588,7 +583,11 @@ impl SessionIndex {
                         })
                     }
                 } else {
-                    let label = labels.get(entry.id.as_str()).copied().flatten().map(String::from);
+                    let label = labels
+                        .get(entry.id.as_str())
+                        .copied()
+                        .flatten()
+                        .map(String::from);
                     Some(SessionTreeNode {
                         entry,
                         children,
@@ -808,9 +807,7 @@ mod tests {
                 custom_type: "my-ext".into(),
                 content: serde_json::json!("plain text"),
             },
-            SessionEntryContent::Leaf {
-                target_id: None,
-            },
+            SessionEntryContent::Leaf { target_id: None },
         ];
 
         for variant in variants {

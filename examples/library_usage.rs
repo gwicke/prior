@@ -27,7 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reasoning_in_context: picocode::settings::ReasoningInContextMode::Never,
         message_log_path: None,
         sessions_dir: None,
-    }).await?;
+    })
+    .await?;
 
     println!("Running agent in silent mode...");
 

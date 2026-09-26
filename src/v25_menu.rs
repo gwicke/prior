@@ -16,32 +16,37 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
     {
         let reader = app_state.clone();
         let writer = app_state.clone();
-        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("thinking", "Set thinking level: off | low | med | high | max"),
-        ]).with_columns(vec![
+        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+            "thinking",
+            "Set thinking level: off | low | med | high | max",
+        )])
+        .with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
             crate::slashdot_menu::ColumnDef::new("description", "Description"),
-        ]).into();
-        tl.add_child(ThinkingEnumNode {
-            active_fn: Box::new(move || {
-                reader.thinking().unwrap_or_else(|| "off".to_string())
-            }),
-            submit_fn: Box::new(move |level| {
-                writer.set_thinking(Some(level.to_string()));
-                Ok(())
-            }),
-        }.into());
+        ])
+        .into();
+        tl.add_child(
+            ThinkingEnumNode {
+                active_fn: Box::new(move || reader.thinking().unwrap_or_else(|| "off".to_string())),
+                submit_fn: Box::new(move |level| {
+                    writer.set_thinking(Some(level.to_string()));
+                    Ok(())
+                }),
+            }
+            .into(),
+        );
         root.add_child(tl);
     }
 
     // Persona
     {
-        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("persona", "set runtime persona"),
-        ]).with_columns(vec![
-            crate::slashdot_menu::ColumnDef::new("id", "Persona"),
-            crate::slashdot_menu::ColumnDef::new("description", "Description"),
-        ]).into();
+        let mut pl: SlashDotMenuNode =
+            StaticListingNode::new(&[StaticRow::new("persona", "set runtime persona")])
+                .with_columns(vec![
+                    crate::slashdot_menu::ColumnDef::new("id", "Persona"),
+                    crate::slashdot_menu::ColumnDef::new("description", "Description"),
+                ])
+                .into();
         crate::v25_persona::add_persona_child(&mut pl, app_state);
         root.add_child(pl);
     }
@@ -61,17 +66,23 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
     // Stat (/stat) — leaf node directly under root.
     // data() returns the row for the root listing; header() shows stats.
     {
-        root.add_child(crate::v25_stat::StatNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_stat::StatNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     // Replay (/replay) — leaf node directly under root.
     // data() returns the row for the root listing; header() shows help.
     {
-        root.add_child(crate::v25_replay::ReplayNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_replay::ReplayNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     // Session (/session) — dynamic listing with action children.
@@ -81,23 +92,32 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
 
     // New (/new) — leaf node; sets the `new_session` control target.
     {
-        root.add_child(crate::v25_new::NewNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_new::NewNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     // Clear (/clear) — leaf node; composes new + delete-ids targets.
     {
-        root.add_child(crate::v25_clear::ClearNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_clear::ClearNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     // Compact (/compact) — leaf node; redirects to /tree <id> compact.
     {
-        root.add_child(crate::v25_tree::CompactNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_tree::CompactNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     // Tree (/tree) — dynamic listing with action children.
@@ -113,9 +133,12 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
 
     // Quit (/quit) — leaf node; latches the `quit` control target.
     {
-        root.add_child(crate::v25_quit::QuitNode {
-            app_state: app_state.clone(),
-        }.into());
+        root.add_child(
+            crate::v25_quit::QuitNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
     }
 
     SlashDotMenu::from_root_node(root)
@@ -158,17 +181,23 @@ mod tests {
                     .filter_map(|l| l.0.split_whitespace().next())
                     .collect();
                 for cmd in [
-                    "thinking", "persona", "model", "set", "stat", "replay", "session",
-                    "new", "clear", "compact", "tree", "sandbox", "quit",
+                    "thinking", "persona", "model", "set", "stat", "replay", "session", "new",
+                    "clear", "compact", "tree", "sandbox", "quit",
                 ] {
-                    assert!(ids.contains(&cmd), "missing '{cmd}' in root listing: {ids:?}");
+                    assert!(
+                        ids.contains(&cmd),
+                        "missing '{cmd}' in root listing: {ids:?}"
+                    );
                 }
                 assert!(
                     !ids.contains(&"help"),
                     "'help' must stay removed from the root listing: {ids:?}"
                 );
             }
-            other => panic!("expected Continue at root, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue at root, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 }

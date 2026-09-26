@@ -72,12 +72,8 @@ mod tests {
                 "[pi-compat] SKIP: pi sessions root not found: {}",
                 root.display()
             );
-            eprintln!(
-                "[pi-compat]   Set PICOCODE_PI_SESSIONS to a custom path, or"
-            );
-            eprintln!(
-                "[pi-compat]   install pi agent (https://github.com/badlogic/pi-mono)"
-            );
+            eprintln!("[pi-compat]   Set PICOCODE_PI_SESSIONS to a custom path, or");
+            eprintln!("[pi-compat]   install pi agent (https://github.com/badlogic/pi-mono)");
             return;
         }
 
@@ -113,24 +109,22 @@ mod tests {
                 }
             };
 
-            let header: SessionHeader = match serde_json::from_str(
-                first_line.as_deref().unwrap_or(""),
-            ) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[pi-compat]     ERROR: invalid header: {e}");
-                    total_errors += 1;
-                    continue;
-                }
-            };
+            let header: SessionHeader =
+                match serde_json::from_str(first_line.as_deref().unwrap_or("")) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("[pi-compat]     ERROR: invalid header: {e}");
+                        total_errors += 1;
+                        continue;
+                    }
+                };
 
             // Verify header fields
             assert_eq!(header.kind, "session");
             assert_eq!(header.version, 3);
 
             // 2. Build full index
-            let storage = match JsonlSessionStorage::open_readonly(file_path.clone()).await
-            {
+            let storage = match JsonlSessionStorage::open_readonly(file_path.clone()).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("[pi-compat]     ERROR: cannot open: {e}");
@@ -175,9 +169,12 @@ mod tests {
                             // Each entry's parent should be the previous entry
                             if let Some(ref pid) = entry.parent_id {
                                 assert_eq!(
-                                    pid, &path[i - 1].id,
+                                    pid,
+                                    &path[i - 1].id,
                                     "entry {} has parent {} but expected {}",
-                                    entry.id, pid, path[i - 1].id
+                                    entry.id,
+                                    pid,
+                                    path[i - 1].id
                                 );
                             }
                         }

@@ -145,8 +145,14 @@ mod tests {
 
     #[test]
     fn mixed_compare_orders_numbers_before_strings() {
-        assert_eq!(Value::Num(1.0).cmp_value(&Value::Str("a".into())), Ordering::Less);
-        assert_eq!(Value::Num(9.0).cmp_value(&Value::Num(2.0)), Ordering::Greater);
+        assert_eq!(
+            Value::Num(1.0).cmp_value(&Value::Str("a".into())),
+            Ordering::Less
+        );
+        assert_eq!(
+            Value::Num(9.0).cmp_value(&Value::Num(2.0)),
+            Ordering::Greater
+        );
         assert_eq!(
             Value::Str("b".into()).cmp_value(&Value::Str("a".into())),
             Ordering::Greater
@@ -171,7 +177,8 @@ mod tests {
             parse_filter_value("<3.5x"),
             Some(FilterValue::Exact(Value::Str("<3.5x".into())))
         );
-        assert_eq!(parse_filter_value(">"), None);    }
+        assert_eq!(parse_filter_value(">"), None);
+    }
 
     #[test]
     fn fmt_num_rounds_and_trims() {

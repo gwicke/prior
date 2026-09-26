@@ -136,10 +136,7 @@ pub fn parse_sort_spec(
     space: &FieldSpace,
 ) -> Option<(String, crate::fields::SortDir)> {
     let (name, explicit) = match value.chars().next_back() {
-        Some('<') => (
-            &value[..value.len() - 1],
-            Some(crate::fields::SortDir::Asc),
-        ),
+        Some('<') => (&value[..value.len() - 1], Some(crate::fields::SortDir::Asc)),
         Some('>') => (
             &value[..value.len() - 1],
             Some(crate::fields::SortDir::Desc),
@@ -281,37 +278,49 @@ mod tests {
     #[test]
     fn sort_ascending_with_explicit_direction() {
         let q = compile_query(&toks(&[("sort", "price<")]), &space());
-        assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
+        assert_eq!(
+            ids(&apply_query(&rows(), &q, &space())),
+            vec!["m2", "m3", "m1", "m4"]
+        );
     }
 
     #[test]
     fn sort_descending_with_explicit_direction() {
         let q = compile_query(&toks(&[("sort", "price>")]), &space());
-        assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m1", "m3", "m2", "m4"]);
+        assert_eq!(
+            ids(&apply_query(&rows(), &q, &space())),
+            vec!["m1", "m3", "m2", "m4"]
+        );
     }
 
     #[test]
     fn sort_direction_defaults_to_field_default() {
         // price declares Asc: `.sort:price` == `.sort:price<`
         let q = compile_query(&toks(&[("sort", "price")]), &space());
-        assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
+        assert_eq!(
+            ids(&apply_query(&rows(), &q, &space())),
+            vec!["m2", "m3", "m1", "m4"]
+        );
         // coding declares Desc: `.sort:coding` == `.sort:coding>`
         let q2 = compile_query(&toks(&[("sort", "coding")]), &space());
-        assert_eq!(ids(&apply_query(&rows(), &q2, &space())), vec!["m1", "m3", "m2", "m4"]);
+        assert_eq!(
+            ids(&apply_query(&rows(), &q2, &space())),
+            vec!["m1", "m3", "m2", "m4"]
+        );
     }
 
     #[test]
     fn later_sort_overrides_earlier() {
         let q = compile_query(&toks(&[("sort", "price>"), ("sort", "price<")]), &space());
-        assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m2", "m3", "m1", "m4"]);
+        assert_eq!(
+            ids(&apply_query(&rows(), &q, &space())),
+            vec!["m2", "m3", "m1", "m4"]
+        );
     }
 
     #[test]
     fn filter_before_sort() {
-        let q = compile_query(
-            &toks(&[("tier", "paid"), ("sort", "price<")]),
-            &space(),
-        );
+        let q = compile_query(&toks(&[("tier", "paid"), ("sort", "price<")]), &space());
         assert_eq!(ids(&apply_query(&rows(), &q, &space())), vec!["m3", "m1"]);
     }
 
@@ -384,7 +393,10 @@ mod tests {
     fn split_modifiers_valid_keys_become_modifiers() {
         let s = ".sort:price .tier:free fuzzy";
         let (m, t) = split_modifiers(&flat(s), s, &space());
-        let got: Vec<(&str, &str)> = m.iter().map(|t| (t.key.as_str(), t.value.as_str())).collect();
+        let got: Vec<(&str, &str)> = m
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str()))
+            .collect();
         assert_eq!(got, vec![("sort", "price"), ("tier", "free")]);
         assert_eq!(t, vec!["fuzzy"]);
     }
@@ -393,7 +405,10 @@ mod tests {
     fn split_modifiers_bare_keys_yield_empty_value() {
         let s = ".sort .tier";
         let (m, t) = split_modifiers(&flat(s), s, &space());
-        let got: Vec<(&str, &str)> = m.iter().map(|t| (t.key.as_str(), t.value.as_str())).collect();
+        let got: Vec<(&str, &str)> = m
+            .iter()
+            .map(|t| (t.key.as_str(), t.value.as_str()))
+            .collect();
         assert_eq!(got, vec![("sort", ""), ("tier", "")]);
         assert!(t.is_empty());
     }

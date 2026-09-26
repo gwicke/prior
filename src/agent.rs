@@ -1,45 +1,48 @@
 use crate::app_state::AppState;
+use crate::model_catalog;
 use crate::output::Confirmation;
-use crate::repl::{InputAction, Repl, ReplCtx, ModelFilter};
-use crate::settings::SettingsStore;
-use crate::session::Session;
+use crate::repl::{InputAction, ModelFilter, Repl, ReplCtx};
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
+use crate::session::Session;
+use crate::settings::SettingsStore;
+use crate::thinking;
 use crate::tools::{
     set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
     MoveFile, ReadFile, Remove, WriteFile,
 };
 use crate::Output;
 use crate::Result;
-use crate::model_catalog;
-use crate::thinking;
+use async_trait::async_trait;
 use chrono::Utc;
 use console::style;
+use futures::StreamExt;
 use rig_agent::agent::{
-    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, CompletionResponseEvent,
-    HookContext, InvalidToolCallAction, InvalidToolCallContext, ModelTurnAction, ModelTurnFinished,
-    MultiTurnStreamItem, NoToolConfig, ObservationAction, RequestPatch, StreamingError, ToolCall,
-    ToolCallAction, ToolResultAction, ToolResultEvent,
+    Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent,
+    CompletionResponseEvent, HookContext, InvalidToolCallAction, InvalidToolCallContext,
+    ModelTurnAction, ModelTurnFinished, MultiTurnStreamItem, NoToolConfig, ObservationAction,
+    RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::{Chat, CompletionError, PromptError};
 use rig_agent::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt};
 use rig_agent::tool::ToolContext;
 use rig_core::client::CompletionClient;
-use rig_core::message::{AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolResultContent, UserContent};
-use futures::StreamExt;
+use rig_core::message::{
+    AssistantContent, Message, Reasoning, ReasoningContent, Text, ToolResultContent, UserContent,
+};
 use rig_core::providers::{
-    anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamacpp, mira,
-    minimax, mistral, moonshot, ollama, openai, openrouter, perplexity, together, xai, xiaomimimo, zai,
+    anthropic, azure, chatgpt, cohere, copilot, deepseek, doubleword, gemini, groq, huggingface,
+    hyperbolic, llamacpp, minimax, mira, mistral, moonshot, ollama, openai, openrouter, perplexity,
+    together, xai, xiaomimimo, zai,
 };
 use rig_reqwest::client::{DefaultTransportBuilder, DefaultTransportClient};
 use serde_json;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use async_trait::async_trait;
+use std::sync::Mutex;
 
 /// Token-usage telemetry accumulated by an agent across a session.
 ///
@@ -648,7 +651,8 @@ impl PicoAgent for CodeAgent {
                     // Only drop when the leading message is this turn's user
                     // prompt (a plain text User message), never a tool-result
                     // batch or an assistant message.
-                    if matches!(to_commit.first(), Some(Message::User { content }) if content.iter().any(|c| matches!(c, UserContent::Text(_)))) {
+                    if matches!(to_commit.first(), Some(Message::User { content }) if content.iter().any(|c| matches!(c, UserContent::Text(_))))
+                    {
                         to_commit.remove(0);
                     }
                 }
@@ -691,10 +695,7 @@ impl PicoAgent for CodeAgent {
     }
 
     fn session_usage(&self) -> SessionUsage {
-        self.usage
-            .lock()
-            .map(|g| *g)
-            .unwrap_or_default()
+        self.usage.lock().map(|g| *g).unwrap_or_default()
     }
 
     async fn summarize(&self, prompt: &str) -> Result<String> {
@@ -757,7 +758,9 @@ fn classify_prompt_error(e: &PromptError, op: &str) -> crate::PicocodeError {
                 other => other,
             }
         }
-        PromptError::MaxTurnsError { max_turns, .. } => LlmMaxTurns { max_turns: *max_turns },
+        PromptError::MaxTurnsError { max_turns, .. } => LlmMaxTurns {
+            max_turns: *max_turns,
+        },
         PromptError::UnknownToolCall {
             tool_name,
             available_tools,
@@ -866,7 +869,9 @@ fn classify_stream_error(e: &StreamingError) -> crate::PicocodeError {
         StreamingError::Prompt(prompt_err) => match prompt_err.as_ref() {
             PromptError::CompletionError(ce) => ce,
             PromptError::MaxTurnsError { max_turns, .. } => {
-                return crate::PicocodeError::LlmMaxTurns { max_turns: *max_turns };
+                return crate::PicocodeError::LlmMaxTurns {
+                    max_turns: *max_turns,
+                };
             }
             PromptError::UnknownToolCall {
                 tool_name,
@@ -928,16 +933,18 @@ pub(crate) fn classify_completion_error(ce: &CompletionError) -> crate::Picocode
     match ce {
         CompletionError::HttpError(_) => LlmTransport(ce.to_string()),
         CompletionError::ProviderError(_) => LlmTransport(ce.to_string()),
-        CompletionError::ResponseError(msg) => detect_response_error(msg)
-            .unwrap_or_else(|| LlmStreamProtocol(msg.clone())),
+        CompletionError::ResponseError(msg) => {
+            detect_response_error(msg).unwrap_or_else(|| LlmStreamProtocol(msg.clone()))
+        }
         // SSE streamed the provider's error envelope as the terminal event:
         // rig's `completion_error_from_body` builds this as a
         // `ProviderResponse` with NO HTTP status (or a 2xx one from
         // `from_http_response`). The body IS the JSON envelope, so run the
         // same detector the `ResponseError` path uses instead of falling
         // through to `Other` (which is not auto-retryable).
-        CompletionError::ProviderResponse(pre) => detect_response_error(&pre.body)
-            .unwrap_or_else(|| Other(ce.to_string())),
+        CompletionError::ProviderResponse(pre) => {
+            detect_response_error(&pre.body).unwrap_or_else(|| Other(ce.to_string()))
+        }
         _ => Other(ce.to_string()),
     }
 }
@@ -971,12 +978,14 @@ fn detect_response_error(msg: &str) -> Option<crate::PicocodeError> {
     // is sometimes wrapped by `ProviderResponseError: ` (the `Display`
     // output of `CompletionError::ProviderResponse(...)` when status is
     // `None`); strip the prefix if present.
-    let body = msg
-        .strip_prefix("ProviderResponseError: ")
-        .unwrap_or(msg);
+    let body = msg.strip_prefix("ProviderResponseError: ").unwrap_or(msg);
     if let Some(code) = extract_openrouter_error_code(body) {
         match code {
-            429 => return Some(LlmRateLimited { retry_after_secs: None }),
+            429 => {
+                return Some(LlmRateLimited {
+                    retry_after_secs: None,
+                })
+            }
             500..=599 => return Some(LlmUpstream { status: code }),
             401 | 403 => return Some(LlmAuth { status: code }),
             402 => return Some(LlmBilling { status: code }),
@@ -1173,132 +1182,138 @@ fn blob_edit_tool_calls(messages: Vec<Message>) -> Vec<Message> {
         .collect()
 }
 
-    /// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
-    /// always present — minted at the provider boundary when the provider
-    /// issued no id — so the old cross-provider `call_id` normalisation is
-    /// inherently satisfied. Kept as a named passthrough so the persist path
-    /// reads the same. See doc/pi_steering_rig.md §6.5.4.
-    fn normalize_call_ids(messages: Vec<Message>) -> Vec<Message> {
-        messages
-    }
+/// No-op in rig ≥1c2f440: `ToolResult::call` (rig's correlation handle) is
+/// always present — minted at the provider boundary when the provider
+/// issued no id — so the old cross-provider `call_id` normalisation is
+/// inherently satisfied. Kept as a named passthrough so the persist path
+/// reads the same. See doc/pi_steering_rig.md §6.5.4.
+fn normalize_call_ids(messages: Vec<Message>) -> Vec<Message> {
+    messages
+}
 
-    /// Merge a finished (or aborted) turn into the session `history`.
-    ///
-    /// * `final_history` — messages for a *successfully completed* turn (`[user,
-    ///   assistant]`). Appended, because `history` already holds the prior turns;
-    ///   this mirrors rig's blocking `chat()`, which does `chat_history.extend(
-    ///   messages)`. This is the root-cause-#1 fix: the previous code *replaced*
-    ///   the whole history with just this turn, so earlier context was lost every
-    ///   turn.
-    /// * `cancelled_history` — the in-flight *full* history rig attaches to a
-    ///   `PromptCancelled` error (prior turns + the aborted user prompt + any
-    ///   partial assistant text). Replaces `history` rather than appending, since
-    ///   it already contains the prior turns; appending would duplicate them. This
-    ///   is the root-cause-#2 fix.
-    /// * `reasoning_in_context` — when `false`, `Reasoning` blocks are stripped
-    ///   from assistant messages before they enter the stored context (a cheap,
-    ///   deterministic "Level 0" compaction that saves tokens). Ignored for
-    ///   Anthropic-family providers (`provider`/`model` satisfy
-    ///   [`is_anthropic_family`]) **on turns that contain tool calls**, which
-    ///   require the leading reasoning to be replayed verbatim on the next turn
-    ///   (thinking+tool_use contract); reasoning is force-kept there. On
-    ///   Anthropic turns *without* tool calls, and on all other providers when
-    ///   the flag is `false`, reasoning is stripped normally.
-    #[allow(dead_code)]
-    fn persist_turn(
-        history: &mut Option<&mut Vec<Message>>,
-        final_history: Option<Vec<Message>>,
-        cancelled_history: Option<Vec<Message>>,
-        reasoning_in_context: crate::settings::ReasoningInContextMode,
-        provider: &str,
-        model: &str,
-    ) {
-        if let Some(h) = history {
-            if let Some(fh) = final_history {
-                let to_commit = maybe_strip_reasoning(fh, reasoning_in_context, provider, model);
-                let to_commit = normalize_call_ids(to_commit);
-                h.extend(to_commit);
-            } else if let Some(ch) = cancelled_history {
-                let to_commit = maybe_strip_reasoning(ch, reasoning_in_context, provider, model);
-                let to_commit = normalize_call_ids(to_commit);
-                **h = to_commit;
+/// Merge a finished (or aborted) turn into the session `history`.
+///
+/// * `final_history` — messages for a *successfully completed* turn (`[user,
+///   assistant]`). Appended, because `history` already holds the prior turns;
+///   this mirrors rig's blocking `chat()`, which does `chat_history.extend(
+///   messages)`. This is the root-cause-#1 fix: the previous code *replaced*
+///   the whole history with just this turn, so earlier context was lost every
+///   turn.
+/// * `cancelled_history` — the in-flight *full* history rig attaches to a
+///   `PromptCancelled` error (prior turns + the aborted user prompt + any
+///   partial assistant text). Replaces `history` rather than appending, since
+///   it already contains the prior turns; appending would duplicate them. This
+///   is the root-cause-#2 fix.
+/// * `reasoning_in_context` — when `false`, `Reasoning` blocks are stripped
+///   from assistant messages before they enter the stored context (a cheap,
+///   deterministic "Level 0" compaction that saves tokens). Ignored for
+///   Anthropic-family providers (`provider`/`model` satisfy
+///   [`is_anthropic_family`]) **on turns that contain tool calls**, which
+///   require the leading reasoning to be replayed verbatim on the next turn
+///   (thinking+tool_use contract); reasoning is force-kept there. On
+///   Anthropic turns *without* tool calls, and on all other providers when
+///   the flag is `false`, reasoning is stripped normally.
+#[allow(dead_code)]
+fn persist_turn(
+    history: &mut Option<&mut Vec<Message>>,
+    final_history: Option<Vec<Message>>,
+    cancelled_history: Option<Vec<Message>>,
+    reasoning_in_context: crate::settings::ReasoningInContextMode,
+    provider: &str,
+    model: &str,
+) {
+    if let Some(h) = history {
+        if let Some(fh) = final_history {
+            let to_commit = maybe_strip_reasoning(fh, reasoning_in_context, provider, model);
+            let to_commit = normalize_call_ids(to_commit);
+            h.extend(to_commit);
+        } else if let Some(ch) = cancelled_history {
+            let to_commit = maybe_strip_reasoning(ch, reasoning_in_context, provider, model);
+            let to_commit = normalize_call_ids(to_commit);
+            **h = to_commit;
+        }
+    }
+}
+
+/// Strip `AssistantContent::Reasoning` blocks based on the
+/// `ReasoningInContextMode`. Returns messages unchanged when:
+/// - Mode is `Always`
+/// - Provider is Anthropic-family **and** the turn contains tool calls
+///   (the thinking+tool_use replay contract)
+///
+/// When mode is `AbortedTurnsOnly`, reasoning is preserved for assistant
+/// messages with `id: None` (aborted/errored turns created locally without
+/// a provider responseId), but stripped from successful turns.
+///
+/// Assistant messages left empty by the filter get a placeholder `Text` so
+/// the message stays well-formed and user/assistant alternation holds.
+fn maybe_strip_reasoning(
+    messages: Vec<Message>,
+    reasoning_in_context: crate::settings::ReasoningInContextMode,
+    provider: &str,
+    model: &str,
+) -> Vec<Message> {
+    let keep_all = matches!(
+        reasoning_in_context,
+        crate::settings::ReasoningInContextMode::Always
+    ) || (is_anthropic_family(provider, model) && turn_has_tool_calls(&messages));
+    if keep_all {
+        return messages;
+    }
+    let keep_aborted = matches!(
+        reasoning_in_context,
+        crate::settings::ReasoningInContextMode::AbortedTurnsOnly
+    );
+    messages
+        .into_iter()
+        .map(|m| match m {
+            Message::Assistant { id, content } => {
+                let is_aborted = id.is_none(); // No provider responseId = aborted/errored turn
+                let kept: Vec<AssistantContent> = content
+                    .into_iter()
+                    .filter(|c| {
+                        if keep_aborted && is_aborted && matches!(c, AssistantContent::Reasoning(_))
+                        {
+                            true // Preserve reasoning for aborted turns
+                        } else {
+                            !matches!(c, AssistantContent::Reasoning(_))
+                        }
+                    })
+                    .collect();
+                let content = if kept.is_empty() {
+                    vec![AssistantContent::Text(Text::new("[reasoning stripped]"))]
+                } else {
+                    kept
+                };
+                Message::Assistant { id, content }
             }
-        }
-    }
-
-    /// Strip `AssistantContent::Reasoning` blocks based on the
-    /// `ReasoningInContextMode`. Returns messages unchanged when:
-    /// - Mode is `Always`
-    /// - Provider is Anthropic-family **and** the turn contains tool calls
-    ///   (the thinking+tool_use replay contract)
-    ///
-    /// When mode is `AbortedTurnsOnly`, reasoning is preserved for assistant
-    /// messages with `id: None` (aborted/errored turns created locally without
-    /// a provider responseId), but stripped from successful turns.
-    ///
-    /// Assistant messages left empty by the filter get a placeholder `Text` so
-    /// the message stays well-formed and user/assistant alternation holds.
-    fn maybe_strip_reasoning(
-        messages: Vec<Message>,
-        reasoning_in_context: crate::settings::ReasoningInContextMode,
-        provider: &str,
-        model: &str,
-    ) -> Vec<Message> {
-        let keep_all = matches!(reasoning_in_context, crate::settings::ReasoningInContextMode::Always)
-            || (is_anthropic_family(provider, model) && turn_has_tool_calls(&messages));
-        if keep_all {
-            return messages;
-        }
-        let keep_aborted = matches!(reasoning_in_context, crate::settings::ReasoningInContextMode::AbortedTurnsOnly);
-        messages
-            .into_iter()
-            .map(|m| match m {
-                Message::Assistant { id, content } => {
-                    let is_aborted = id.is_none(); // No provider responseId = aborted/errored turn
-                    let kept: Vec<AssistantContent> = content
-                        .into_iter()
-                        .filter(|c| {
-                            if keep_aborted && is_aborted && matches!(c, AssistantContent::Reasoning(_)) {
-                                true // Preserve reasoning for aborted turns
-                            } else {
-                                !matches!(c, AssistantContent::Reasoning(_))
-                            }
-                        })
-                        .collect();
-                    let content = if kept.is_empty() {
-                        vec![AssistantContent::Text(Text::new("[reasoning stripped]"))]
-                    } else {
-                        kept
-                    };
-                    Message::Assistant { id, content }
-                }
-                other => other,
-            })
-            .collect()
-    }
-
-    /// Whether the turn's persisted messages include at least one assistant
-    /// `ToolCall` block. Used to decide whether Anthropic-family reasoning must
-    /// be force-kept: the thinking+tool_use replay contract only applies on
-    /// turns that actually involve tool calls.
-    fn turn_has_tool_calls(messages: &[Message]) -> bool {
-        messages.iter().any(|m| match m {
-            Message::Assistant { content, .. } => content
-                .iter()
-                .any(|c| matches!(c, AssistantContent::ToolCall(_))),
-            _ => false,
+            other => other,
         })
-    }
+        .collect()
+}
 
-    /// Whether `provider`/`model` refers to an Anthropic-family model, for which
-    /// reasoning must be kept in context (the thinking+tool_use replay contract).
-    /// Covers direct `anthropic` and OpenRouter routing to `anthropic/*` models.
-    fn is_anthropic_family(provider: &str, model: &str) -> bool {
-        provider.eq_ignore_ascii_case("anthropic")
-            || (provider.eq_ignore_ascii_case("openrouter") && model.starts_with("anthropic/"))
-    }
+/// Whether the turn's persisted messages include at least one assistant
+/// `ToolCall` block. Used to decide whether Anthropic-family reasoning must
+/// be force-kept: the thinking+tool_use replay contract only applies on
+/// turns that actually involve tool calls.
+fn turn_has_tool_calls(messages: &[Message]) -> bool {
+    messages.iter().any(|m| match m {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+        _ => false,
+    })
+}
 
-    fn is_tool_available(tool: &str) -> bool {
+/// Whether `provider`/`model` refers to an Anthropic-family model, for which
+/// reasoning must be kept in context (the thinking+tool_use replay contract).
+/// Covers direct `anthropic` and OpenRouter routing to `anthropic/*` models.
+fn is_anthropic_family(provider: &str, model: &str) -> bool {
+    provider.eq_ignore_ascii_case("anthropic")
+        || (provider.eq_ignore_ascii_case("openrouter") && model.starts_with("anthropic/"))
+}
+
+fn is_tool_available(tool: &str) -> bool {
     std::process::Command::new("which")
         .arg(tool)
         .stdout(std::process::Stdio::null())
@@ -1573,11 +1588,13 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                         .oauth()
                         .token_dir(d)
                         .allow_device_flow(true)
-                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                        .build()
+                        .map_err(rig_core::client::ProviderClientError::from)?,
                     None => chatgpt::Client::builder()
                         .oauth()
                         .allow_device_flow(true)
-                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                        .build()
+                        .map_err(rig_core::client::ProviderClientError::from)?,
                 };
                 build!(client)
             } else {
@@ -1599,11 +1616,13 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                         .oauth()
                         .token_dir(d)
                         .allow_device_flow(true)
-                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                        .build()
+                        .map_err(rig_core::client::ProviderClientError::from)?,
                     None => copilot::Client::builder()
                         .oauth()
                         .allow_device_flow(true)
-                        .build().map_err(rig_core::client::ProviderClientError::from)?,
+                        .build()
+                        .map_err(rig_core::client::ProviderClientError::from)?,
                 };
                 build!(client)
             } else {
@@ -1828,11 +1847,7 @@ impl AgentHook for LoggingHook {
         }
     }
 
-    async fn on_tool_call(
-        &self,
-        _ctx: &HookContext,
-        event: ToolCall<'_>,
-    ) -> ToolCallAction {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
         if self.user_cancel.load(Ordering::SeqCst) {
             return ToolCallAction::Stop("cancelled by user".into());
         }
@@ -1935,7 +1950,10 @@ fn build_rig_agent(
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let mut system_message = agent_prompt.unwrap_or_else(|| {
-        format!("{}\n\nCurrent working directory: {}", DEFAULT_AGENT_PROMPT, cwd)
+        format!(
+            "{}\n\nCurrent working directory: {}",
+            DEFAULT_AGENT_PROMPT, cwd
+        )
     });
     if let Some(persona) = persona_prompt {
         system_message = format!("{}\n\n{}", persona, system_message);
@@ -2178,9 +2196,7 @@ pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
                         AssistantContent::Reasoning(r) => {
                             for rc in r.content.iter() {
                                 match rc {
-                                    ReasoningContent::Text { text, .. } => {
-                                        n += text_tokens(text)
-                                    }
+                                    ReasoningContent::Text { text, .. } => n += text_tokens(text),
                                     ReasoningContent::Summary(s) => n += text_tokens(s),
                                     _ => {}
                                 }
@@ -2375,7 +2391,11 @@ fn build_replay_units(branch: &[crate::session::SessionEntry]) -> Vec<ReplayUnit
                     _ => {}
                 }
             }
-            SessionEntryContent::Compaction { tokens_before, summary, .. } => {
+            SessionEntryContent::Compaction {
+                tokens_before,
+                summary,
+                ..
+            } => {
                 // A compaction boundary comes AFTER the turn it concludes:
                 // flush any open turn first, then emit the marker.
                 flush_pending_tools(&mut pending_tools, &mut open);
@@ -2409,7 +2429,9 @@ fn user_text_of(message: &serde_json::Value) -> Option<String> {
 /// always belong to the current turn).
 fn feed_turn_into(open: &mut Option<ConversationTurn>, msg: &Message) {
     let Some(turn) = open.as_mut() else { return };
-    let Message::Assistant { content, .. } = msg else { return };
+    let Message::Assistant { content, .. } = msg else {
+        return;
+    };
     let mut seg = AssistantSegment::new();
     for item in content.iter() {
         match item {
@@ -2511,11 +2533,11 @@ fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
                 render_turn(output, turn, first_turn_seen);
                 first_turn_seen = true;
             }
-            ReplayUnit::Compaction { tokens_before, summary } => {
-                output.display_system(&format!(
-                    "[compaction: {}k tokens]",
-                    tokens_before / 1000,
-                ));
+            ReplayUnit::Compaction {
+                tokens_before,
+                summary,
+            } => {
+                output.display_system(&format!("[compaction: {}k tokens]", tokens_before / 1000,));
                 // A text-only compaction carries its summary — render it as
                 // markdown right below the marker so the compaction point is
                 // self-documenting in the replay, exactly as it was shown
@@ -2531,7 +2553,10 @@ fn replay_units(output: &dyn Output, units: &[ReplayUnit], start: usize) {
 /// Count the conversation turns in a unit list (compaction markers are not
 /// turns).
 pub(crate) fn count_turns(units: &[ReplayUnit]) -> usize {
-    units.iter().filter(|u| matches!(u, ReplayUnit::Turn(_))).count()
+    units
+        .iter()
+        .filter(|u| matches!(u, ReplayUnit::Turn(_)))
+        .count()
 }
 
 /// Return the unit index where the last `n` turns begin (0 when `n` >= the
@@ -2553,7 +2578,11 @@ pub(crate) fn last_turns_start(units: &[ReplayUnit], n: usize) -> usize {
             }
         }
     }
-    if seen < n { 0 } else { idx }
+    if seen < n {
+        0
+    } else {
+        idx
+    }
 }
 
 /// Replay the last `n` turns (plus any markers inside that window) from a
@@ -2572,8 +2601,12 @@ pub(crate) fn parse_replay_len_arg(arg: &str, default: usize) -> (usize, bool) {
         return (default, false);
     }
     if arg.ends_with('l') {
-        let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
-        if n == 0 { (usize::MAX, false) } else { (n, true) }
+        let n: usize = arg[..arg.len() - 1].trim().parse().unwrap_or(0);
+        if n == 0 {
+            (usize::MAX, false)
+        } else {
+            (n, true)
+        }
     } else {
         let clean = arg.trim_end_matches('t').trim();
         let n: usize = clean.parse().unwrap_or(default);
@@ -2594,7 +2627,7 @@ pub(crate) async fn handle_replay(
     let units = build_replay_units(&branch);
     let total = count_turns(&units);
     if arg.ends_with('l') {
-        let n: usize = arg[..arg.len()-1].trim().parse().unwrap_or(0);
+        let n: usize = arg[..arg.len() - 1].trim().parse().unwrap_or(0);
         if n > 0 {
             if total == 0 {
                 output.display_text("Session is empty");
@@ -2740,10 +2773,7 @@ async fn record_thinking_change(session: &Session, level: &str) {
 /// The full `provider:model_id` form is intentional: pre-filling the
 /// unqualified `model_id` might surface multiple catalog entries that
 /// share a short name under different providers.
-async fn compute_resume_model_prefill(
-    session: &Session,
-    live_model_id: &str,
-) -> Option<String> {
+async fn compute_resume_model_prefill(session: &Session, live_model_id: &str) -> Option<String> {
     let recorded = session_recorded_model_id(session).await?;
     if recorded == live_model_id {
         return None; // session already runs the live model — no prefill
@@ -2774,7 +2804,8 @@ async fn handle_session_command(
 
     // Strip leading path: filter if the user typed it manually (overlay-only token).
     let rest = if let Some(r) = rest.strip_prefix("path:") {
-        r.trim_start().split_once(char::is_whitespace)
+        r.trim_start()
+            .split_once(char::is_whitespace)
             .map(|(_, after)| after.trim())
             .unwrap_or("")
     } else {
@@ -2839,11 +2870,13 @@ async fn handle_session_command(
                     }
                 }
             } else {
-                config.output.display_text(&format!("Session not found: {}", name));
+                config
+                    .output
+                    .display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
             }
         }
-"fork" => {
+        "fork" => {
             if let Some(meta) = meta {
                 match fork_session_at(repo.as_ref().unwrap(), &meta).await {
                     Ok((new_session, id)) => {
@@ -2856,14 +2889,18 @@ async fn handle_session_command(
                     }
                 }
             } else {
-                config.output.display_text(&format!("Session not found: {}", name));
+                config
+                    .output
+                    .display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
             }
         }
         "rename" => {
             let new_name = arg.unwrap_or_default();
             if new_name.is_empty() {
-                config.output.display_text("Usage: /session <name> rename <newname>");
+                config
+                    .output
+                    .display_text("Usage: /session <name> rename <newname>");
                 return SessionCommandResult::Handled;
             }
             if let Some(ref s) = session {
@@ -2884,11 +2921,15 @@ async fn handle_session_command(
                             repo.invalidate_cache();
                         }
                         Err(e) => {
-                            config.output.display_text(&format!("Cannot open session: {}", e));
+                            config
+                                .output
+                                .display_text(&format!("Cannot open session: {}", e));
                         }
                     }
                 } else {
-                    config.output.display_text(&format!("Session not found: {}", name));
+                    config
+                        .output
+                        .display_text(&format!("Session not found: {}", name));
                 }
             }
             SessionCommandResult::Handled
@@ -2897,26 +2938,32 @@ async fn handle_session_command(
             if let Some(meta) = meta {
                 if let Some(ref s) = session {
                     if s.get_session_id() == meta.id {
-                        config.output.display_text("Cannot delete the current session");
+                        config
+                            .output
+                            .display_text("Cannot delete the current session");
                         return SessionCommandResult::Handled;
                     }
                 }
                 match repo.as_ref().unwrap().delete(&meta).await {
-                    Ok(()) => {
-                        SessionCommandResult::Deleted
-                    }
+                    Ok(()) => SessionCommandResult::Deleted,
                     Err(e) => {
-                        config.output.display_text(&format!("Cannot delete session: {}", e));
+                        config
+                            .output
+                            .display_text(&format!("Cannot delete session: {}", e));
                         SessionCommandResult::Handled
                     }
                 }
             } else {
-                config.output.display_text(&format!("Session not found: {}", name));
+                config
+                    .output
+                    .display_text(&format!("Session not found: {}", name));
                 SessionCommandResult::Handled
             }
         }
         _ => {
-            config.output.display_text(&format!("Unknown session action: {}", action));
+            config
+                .output
+                .display_text(&format!("Unknown session action: {}", action));
             SessionCommandResult::Handled
         }
     }
@@ -3089,7 +3136,8 @@ fn collect_entries_for_branch_summary(
     let old_path = index.get_path_to_root(old_leaf);
     let new_path = index.get_path_to_root(new_target);
 
-    let common_len = old_path.iter()
+    let common_len = old_path
+        .iter()
         .zip(new_path.iter())
         .take_while(|(a, b)| a.id == b.id)
         .count();
@@ -3131,8 +3179,6 @@ pub(crate) fn find_predecessor_on_active_branch(
     find_predecessor(&branch, target_id)
 }
 
-
-
 /// Where the compaction result gets written. Lets `run_compaction` serve
 /// both the `/tree <id> compact` / `/compact` path (a `Compaction` entry
 /// parented at the resolved target) and a future `/tree <id> switch
@@ -3154,9 +3200,7 @@ pub(crate) enum CompactionTarget {
     /// ancestor of the abandoned branch. Not yet wired up to any
     /// command.
     #[allow(dead_code)]
-    Abandoned {
-        common_ancestor_id: String,
-    },
+    Abandoned { common_ancestor_id: String },
 }
 
 /// Review hook for a generated compaction summary before it is written. Given
@@ -3255,23 +3299,21 @@ pub(crate) async fn run_compaction(
         CompactionTarget::AtPoint {
             target_id,
             tokens_before,
-        } => {
-            run_compaction_at_point(
-                session,
-                agent,
-                settings,
-                &target_id,
-                tokens_before,
-                mode,
-                llm_payload,
-                output,
-                review,
-                user_cancel,
-                cancel_notify,
-            )
-            .await
-            .into()
-        }
+        } => run_compaction_at_point(
+            session,
+            agent,
+            settings,
+            &target_id,
+            tokens_before,
+            mode,
+            llm_payload,
+            output,
+            review,
+            user_cancel,
+            cancel_notify,
+        )
+        .await
+        .into(),
         CompactionTarget::Abandoned { common_ancestor_id } => {
             // Future: wire the abandoned-branch summary here. The
             // `Abandoned` variant intentionally does not abort with a
@@ -3342,9 +3384,8 @@ pub(crate) async fn compact_inline(
     // `emit_commit` re-anchors the row via DSR afterwards).
     let review: Option<CompactionSummaryReview> = app_state.term_guard().map(|g| {
         let out = app_state.with_config(|c| c.output.clone());
-        Box::new(move |draft: &str| {
-            crate::repl::review_compaction_summary(&g, out.as_ref(), draft)
-        }) as CompactionSummaryReview
+        Box::new(move |draft: &str| crate::repl::review_compaction_summary(&g, out.as_ref(), draft))
+            as CompactionSummaryReview
     });
     let output = app_state.with_config(|c| c.output.clone());
     let settings = app_state.settings();
@@ -3446,7 +3487,8 @@ async fn run_compaction_at_point(
             // compaction). The user edits it in the review gate before it is
             // stored. A span with no files and no seed text has nothing to
             // point at, so we fall through to the empty-summary no-op.
-            let draft = crate::session::build_manual_template(&dropped, seed_text.as_deref(), &session_dir);
+            let draft =
+                crate::session::build_manual_template(&dropped, seed_text.as_deref(), &session_dir);
             let summary = if draft.is_empty() {
                 String::new()
             } else {
@@ -3520,12 +3562,9 @@ async fn run_compaction_at_point(
             let summary_text = match agent.as_ref() {
                 Some(a) => {
                     let instruction = instruction.clone();
-                    let r = retry_summarization(
-                        output,
-                        user_cancel,
-                        cancel_notify,
-                        &mut || a.summarize_with_session_context(session, &instruction),
-                    )
+                    let r = retry_summarization(output, user_cancel, cancel_notify, &mut || {
+                        a.summarize_with_session_context(session, &instruction)
+                    })
                     .await;
                     match r {
                         Ok(t) => t,
@@ -3647,16 +3686,22 @@ pub(crate) async fn ensure_session(
     };
     match repo.create(&cwd).await {
         Ok(storage) => {
-            let index = storage.build_index().await
-                .unwrap_or_else(|_| crate::session::SessionIndex {
-                    header: crate::session::SessionHeader::with_model_context(
-                        &cwd, provider, model, thinking_level,
-                    ),
-                    entries: std::collections::HashMap::new(),
-                    leaf_id: None,
-                    children: std::collections::HashMap::new(),
-                    session_name: None,
-                });
+            let index =
+                storage
+                    .build_index()
+                    .await
+                    .unwrap_or_else(|_| crate::session::SessionIndex {
+                        header: crate::session::SessionHeader::with_model_context(
+                            &cwd,
+                            provider,
+                            model,
+                            thinking_level,
+                        ),
+                        entries: std::collections::HashMap::new(),
+                        leaf_id: None,
+                        children: std::collections::HashMap::new(),
+                        session_name: None,
+                    });
             Some(Arc::new(Session::new(storage, index)))
         }
         Err(e) => {
@@ -3674,8 +3719,8 @@ pub(crate) async fn fork_session_at(
     meta: &crate::session::SessionMetadata,
 ) -> std::result::Result<(Arc<Session>, String), String> {
     use crate::session::repo::SessionRepo;
-    let cwd = std::env::current_dir()
-        .map_err(|_| "Cannot determine current directory".to_string())?;
+    let cwd =
+        std::env::current_dir().map_err(|_| "Cannot determine current directory".to_string())?;
     match repo.fork(meta, "", &cwd, ForkMode::FullTree).await {
         Ok(new_storage) => {
             let index = new_storage.build_index().await.unwrap_or_else(|_| {
@@ -3719,8 +3764,8 @@ pub(crate) async fn resume_session(
 ) -> std::result::Result<(Arc<Session>, String, Option<String>), String> {
     use crate::session::repo::SessionRepo;
     let (count, is_lines) = replay;
-    let cwd = std::env::current_dir()
-        .map_err(|_| "Cannot determine current directory".to_string())?;
+    let cwd =
+        std::env::current_dir().map_err(|_| "Cannot determine current directory".to_string())?;
     let (storage, index) = if meta.cwd != cwd {
         // Resume in a different directory → fork the session to the new
         // cwd and delete the original (migrates the file, sets the
@@ -3859,7 +3904,11 @@ fn save_recent_models(models: &[String]) {
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
-pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_resume: bool) -> Result<()> {
+pub async fn run_interactive(
+    config: AgentConfig,
+    settings: SettingsStore,
+    auto_resume: bool,
+) -> Result<()> {
     let mut config = config;
     // Store the original (non-merged) sandbox config so the remove overlay
     // can list config-provided bindings and allow temporary exclusion.
@@ -3893,9 +3942,15 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
             style("picocode").bold(),
             style(&config.provider).cyan(),
             style(&config.model).blue(),
-            style(format!("limit:{} yolo={}", config.tool_call_limit, config.yolo)).yellow(),
+            style(format!(
+                "limit:{} yolo={}",
+                config.tool_call_limit, config.yolo
+            ))
+            .yellow(),
         );
-        config.output.display_plain("picocode - type `/` for details.");
+        config
+            .output
+            .display_plain("picocode - type `/` for details.");
         config.output.display_plain(&status);
     }
 
@@ -3903,25 +3958,26 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
     // Session storage: create repo eagerly (just a path, no I/O) for /session
     // overlay, but defer actual session file creation to the first turn
     // to avoid empty sessions.
-    let sessions_dir = config.sessions_dir.clone().or_else(|| {
-        crate::platform::app_config_dir().map(|d| d.join("sessions"))
-    });
+    let sessions_dir = config
+        .sessions_dir
+        .clone()
+        .or_else(|| crate::platform::app_config_dir().map(|d| d.join("sessions")));
     let cwd = std::env::current_dir().ok();
     let mut repo: Option<crate::session::repo::JsonlSessionRepo> =
         if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
-        let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
-        // Repo is created eagerly (just a path); the session object is also
-        // created unconditionally here so the `/session` overlay can mark the
-        // current session from the start. `repo.create()` only opens the
-        // storage — the actual `.jsonl` file is written lazily on the first
-        // `append_message()` (Session::ensure_persisted) — so no empty session
-        // file is created if the user never takes a turn. Creating up front
-        // removes the mid-loop `ensure_session` calls (in the first-turn and
-        // `!`/`!!` paths).
-        Some(repo)
-    } else {
-        None
-    };
+            let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
+            // Repo is created eagerly (just a path); the session object is also
+            // created unconditionally here so the `/session` overlay can mark the
+            // current session from the start. `repo.create()` only opens the
+            // storage — the actual `.jsonl` file is written lazily on the first
+            // `append_message()` (Session::ensure_persisted) — so no empty session
+            // file is created if the user never takes a turn. Creating up front
+            // removes the mid-loop `ensure_session` calls (in the first-turn and
+            // `!`/`!!` paths).
+            Some(repo)
+        } else {
+            None
+        };
     let mut line_history = crate::repl::History::load();
     // Shared cancel flag: the in-flight reader thread sets it on `Esc`; the
     // `LoggingHook` bridge turns it into a rig `CancelSignal` that aborts the
@@ -4032,7 +4088,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     leaf_id,
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
-            thinking_level: config.thinking_level.clone(),
+                    thinking_level: config.thinking_level.clone(),
                 };
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop
@@ -4120,12 +4176,16 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     config = new_cfg;
                 }
                 Err(e) => {
-                    let kind = if model_changed { "switch model" }
-                               else if thinking_changed { "set thinking" }
-                               else { "set persona" };
-                    config.output.display_text(
-                        &format!("Cannot {}: {}", kind, e)
-                    );
+                    let kind = if model_changed {
+                        "switch model"
+                    } else if thinking_changed {
+                        "set thinking"
+                    } else {
+                        "set persona"
+                    };
+                    config
+                        .output
+                        .display_text(&format!("Cannot {}: {}", kind, e));
                 }
             }
         }
@@ -4159,15 +4219,9 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                     sandbox_path,
                     mode,
                 } => crate::sandbox_state::add(host_path, sandbox_path, *mode),
-                SandboxOp::Remove { sandbox_path } => {
-                    crate::sandbox_state::remove(sandbox_path)
-                }
-                SandboxOp::Exclude { sandbox_path } => {
-                    crate::sandbox_state::exclude(sandbox_path)
-                }
-                SandboxOp::Restore { sandbox_path } => {
-                    crate::sandbox_state::restore(sandbox_path)
-                }
+                SandboxOp::Remove { sandbox_path } => crate::sandbox_state::remove(sandbox_path),
+                SandboxOp::Exclude { sandbox_path } => crate::sandbox_state::exclude(sandbox_path),
+                SandboxOp::Restore { sandbox_path } => crate::sandbox_state::restore(sandbox_path),
             };
             match result {
                 Ok(()) => {
@@ -4192,10 +4246,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             if sandbox_path.is_empty() {
                                 format!("sandbox: {} {} (ok)", m, host_path)
                             } else {
-                                format!(
-                                    "sandbox: {} {} → {} (ok)",
-                                    m, host_path, sandbox_path
-                                )
+                                format!("sandbox: {} {} → {} (ok)", m, host_path, sandbox_path)
                             }
                         }
                         SandboxOp::Remove { sandbox_path } => {
@@ -4295,9 +4346,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                     // message naming the command, plus an
                                     // assistant message carrying the captured
                                     // output.
-                                    let msg = Message::user(format!(
-                                        "Ran shell command: {cmd}"
-                                    ));
+                                    let msg = Message::user(format!("Ran shell command: {cmd}"));
                                     if let Some(s) = app_state.session() {
                                         let _ = s.append_message(&msg).await;
                                         let reply = Message::Assistant {
@@ -4315,9 +4364,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 }
                             }
                             Err(e) => {
-                                config
-                                    .output
-                                    .display_text(&format!("shell error: {}", e));
+                                config.output.display_text(&format!("shell error: {}", e));
                             }
                         }
                     }
@@ -4343,15 +4390,13 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                             let (abandoned, common_ancestor_id) = {
                                                 let index = s.index().lock().await;
                                                 collect_entries_for_branch_summary(
-                                                    &index,
-                                                    old_leaf,
-                                                    &target_id,
+                                                    &index, old_leaf, &target_id,
                                                 )
                                             };
                                             if !abandoned.is_empty() {
-                                                config
-                                                    .output
-                                                    .display_thinking("Summarizing abandoned branch...");
+                                                config.output.display_thinking(
+                                                    "Summarizing abandoned branch...",
+                                                );
                                                 // Lazy agent build, mirroring the
                                                 // `compact llm` arm: a
                                                 // `/tree <id> switch --summarize`
@@ -4428,7 +4473,9 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                         }
                         TreeAction::Compact => {
                             let Some(s) = app_state.session() else {
-                                config.output.display_text("Cannot compact: no active session");
+                                config
+                                    .output
+                                    .display_text("Cannot compact: no active session");
                                 continue;
                             };
                             let old_leaf_id = s.get_leaf_id().await;
@@ -4525,18 +4572,15 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             // takes this branch — `review` is only
                             // consulted inside `run_compaction`, which
                             // short-circuits to the empty summary path.
-                            let review: Option<CompactionSummaryReview> =
-                                if let Some(g) = &guard {
-                                    let g = g.clone();
-                                    let out = config.output.clone();
-                                    Some(Box::new(move |draft: &str| {
-                                        crate::repl::review_compaction_summary(
-                                            &g, out.as_ref(), draft,
-                                        )
-                                    }))
-                                } else {
-                                    None
-                                };
+                            let review: Option<CompactionSummaryReview> = if let Some(g) = &guard {
+                                let g = g.clone();
+                                let out = config.output.clone();
+                                Some(Box::new(move |draft: &str| {
+                                    crate::repl::review_compaction_summary(&g, out.as_ref(), draft)
+                                }))
+                            } else {
+                                None
+                            };
 
                             match run_compaction(
                                 &s,
@@ -4588,13 +4632,17 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                         &mut config,
                         &out,
                         &app_state.settings(),
-                    ).await;
+                    )
+                    .await;
                     app_state.set_session(sess);
                     match result {
                         SessionCommandResult::NotSession => {
                             // Not a session command — fall through to normal prompt.
                         }
-                        SessionCommandResult::Switched { id: new_id, prefill } => {
+                        SessionCommandResult::Switched {
+                            id: new_id,
+                            prefill,
+                        } => {
                             app_state.set_current_session_id(new_id);
                             // Resume returned a model-restore prefill (e.g.
                             // `/model <provider>:<model_id>`). Surface it on the
@@ -4783,9 +4831,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                         match prompt_result {
                             Ok(text) => break Ok(text),
                             Err(crate::PicocodeError::Cancelled(_)) => {
-                                break Err(crate::PicocodeError::Cancelled(
-                                    "Aborted.".into(),
-                                ));
+                                break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                             }
                             // Mid-turn failure that persisted progress: the
                             // underlying run produced content/tool calls
@@ -4809,7 +4855,10 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 // so re-sending it would duplicate the user's
                                 // request.
                                 let secs = retry_delay_secs(&cause, 1);
-                                config.output.display_text(&format!("Error: {}. Retrying in {secs}s...", cause));
+                                config.output.display_text(&format!(
+                                    "Error: {}. Retrying in {secs}s...",
+                                    cause
+                                ));
                                 let slept = cancellable_sleep(
                                     &config.user_cancel,
                                     &config.cancel_notify,
@@ -4817,9 +4866,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 )
                                 .await;
                                 if !slept {
-                                    break Err(crate::PicocodeError::Cancelled(
-                                        "Aborted.".into(),
-                                    ));
+                                    break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                                 }
                                 // Steering prompt: the synthetic feedback for
                                 // e.g. malformed tool calls (carries the parse
@@ -4859,9 +4906,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 // will be persisted/deduped as its own message.
                                 turn.mark_new_dispatch();
                                 if cancel.load(Ordering::SeqCst) {
-                                    break Err(crate::PicocodeError::Cancelled(
-                                        "Aborted.".into(),
-                                    ));
+                                    break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                                 }
                                 continue;
                             }
@@ -4881,7 +4926,9 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                             {
                                 consecutive_failures = consecutive_failures.saturating_add(1);
                                 let secs = retry_delay_secs(&e, consecutive_failures);
-                                config.output.display_text(&format!("Error: {}. Retrying in {secs}s...", e));
+                                config
+                                    .output
+                                    .display_text(&format!("Error: {}. Retrying in {secs}s...", e));
                                 let slept = cancellable_sleep(
                                     &config.user_cancel,
                                     &config.cancel_notify,
@@ -4889,9 +4936,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 )
                                 .await;
                                 if !slept {
-                                    break Err(crate::PicocodeError::Cancelled(
-                                        "Aborted.".into(),
-                                    ));
+                                    break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                                 }
                                 if let Some(feedback) = e.synthetic_retry_feedback() {
                                     // `prompt()` already persisted `user(input)`
@@ -4907,9 +4952,7 @@ pub async fn run_interactive(config: AgentConfig, settings: SettingsStore, auto_
                                 // `prompt()` clears its flag. Bail out
                                 // here so the retry respects `Esc`.
                                 if cancel.load(Ordering::SeqCst) {
-                                    break Err(crate::PicocodeError::Cancelled(
-                                        "Aborted.".into(),
-                                    ));
+                                    break Err(crate::PicocodeError::Cancelled("Aborted.".into()));
                                 }
                                 continue;
                             }
@@ -5068,9 +5111,7 @@ pub fn session_stats_lines(
             total_in.saturating_sub(cached + creation)
         ));
     } else {
-        lines.push(
-            "  cache hit rate: n/a (provider reported no cache metrics)".to_string(),
-        );
+        lines.push("  cache hit rate: n/a (provider reported no cache metrics)".to_string());
     }
 
     lines
@@ -5235,24 +5276,19 @@ pub(crate) fn test_session_with_entries(
 mod tests {
     use rig_core::message::Reasoning;
 
-    use crate::session::Session;
-    use crate::session::storage::SessionStorage;
-    use crate::SettingsStore;
-    use super::{
-        blob_edit_tool_calls,
-        build_replay_units, compute_resume_model_prefill,
-        count_turns, create_private_dir,
-        find_predecessor_on_active_branch,
-        is_anthropic_family, last_turns_start,
-        maybe_strip_reasoning, message_role, parse_tree_args, persist_turn, reasoning_text,
-        record_model_change, record_thinking_change,
-        retry_summarization, run_compaction, session_recorded_model_id,
-        session_recorded_thinking, CompactionResult, CompactionSummaryReview,
-        CompactionTarget,
-        MessageLogger,
-    };
-    use super::{ReplayUnit, TreeAction, CompactSummaryMode};
     use super::TurnPersistence;
+    use super::{
+        blob_edit_tool_calls, build_replay_units, compute_resume_model_prefill, count_turns,
+        create_private_dir, find_predecessor_on_active_branch, is_anthropic_family,
+        last_turns_start, maybe_strip_reasoning, message_role, parse_tree_args, persist_turn,
+        reasoning_text, record_model_change, record_thinking_change, retry_summarization,
+        run_compaction, session_recorded_model_id, session_recorded_thinking, CompactionResult,
+        CompactionSummaryReview, CompactionTarget, MessageLogger,
+    };
+    use super::{CompactSummaryMode, ReplayUnit, TreeAction};
+    use crate::session::storage::SessionStorage;
+    use crate::session::Session;
+    use crate::SettingsStore;
     use rig_core::message::{AssistantContent, Message, Text};
 
     #[test]
@@ -5280,12 +5316,18 @@ mod tests {
         let AssistantContent::ToolCall(tc) = &content[0] else {
             panic!("expected tool call")
         };
-        let edits = tc.function.arguments.get("edits").and_then(|v| v.as_str()).unwrap();
+        let edits = tc
+            .function
+            .arguments
+            .get("edits")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert!(edits.contains("@@@OLD"), "got: {edits}");
         assert!(edits.contains("src/x.rs"), "got: {edits}");
 
         // Idempotent: an already-block value is unchanged.
-        let already = serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        let already =
+            serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
         let Message::Assistant { content, .. } = &out2[0] else {
             panic!("expected assistant")
@@ -5405,8 +5447,7 @@ mod tests {
         ];
         let (session, path) = build_session_with_entries(entries).await;
         // Live model differs from the session's recorded model → prefill.
-        let prefill =
-            compute_resume_model_prefill(&session, "openai:gpt-4o").await;
+        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o").await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model anthropic:claude-sonnet-4-5")
@@ -5439,8 +5480,7 @@ mod tests {
             },
         ];
         let (session, path) = build_session_with_entries(entries).await;
-        let prefill =
-            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet").await;
+        let prefill = compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet").await;
         assert_eq!(prefill.as_deref(), Some("/model openai:gpt-4o"));
         let _ = std::fs::remove_file(&path);
     }
@@ -5476,11 +5516,12 @@ mod tests {
         storage.write_header(&header).await.unwrap();
         drop(storage);
 
-        let ro = JsonlSessionStorage::open_readonly(path.clone()).await.unwrap();
+        let ro = JsonlSessionStorage::open_readonly(path.clone())
+            .await
+            .unwrap();
         let index = ro.build_index().await.unwrap();
         let session = Session::new_persisted(ro, index);
-        let prefill =
-            compute_resume_model_prefill(&session, "openai:gpt-4o").await;
+        let prefill = compute_resume_model_prefill(&session, "openai:gpt-4o").await;
         assert_eq!(
             prefill.as_deref(),
             Some("/model openrouter:anthropic/claude-sonnet-4")
@@ -5493,8 +5534,7 @@ mod tests {
         // No `ModelChange`, no header metadata → empty prompt (no nudge).
         let (session, path) = build_session_with_entries(vec![]).await;
         let prefill =
-            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022")
-                .await;
+            compute_resume_model_prefill(&session, "anthropic:claude-3-5-sonnet-20241022").await;
         assert_eq!(prefill, None);
         let _ = std::fs::remove_file(&path);
     }
@@ -5505,20 +5545,17 @@ mod tests {
         // differs from the running model. Session records
         // `anthropic:claude-sonnet-4-5`; the agent already runs it → no
         // prefill (no nudge, and committing it would churn the sync).
-        let entries = vec![
-            crate::session::SessionEntry {
-                id: "m1".into(),
-                parent_id: None,
-                timestamp: "t1".into(),
-                content: crate::session::SessionEntryContent::ModelChange {
-                    provider: "anthropic".into(),
-                    model_id: "claude-sonnet-4-5".into(),
-                },
+        let entries = vec![crate::session::SessionEntry {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: "t1".into(),
+            content: crate::session::SessionEntryContent::ModelChange {
+                provider: "anthropic".into(),
+                model_id: "claude-sonnet-4-5".into(),
             },
-        ];
+        }];
         let (session, path) = build_session_with_entries(entries).await;
-        let prefill =
-            compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5").await;
+        let prefill = compute_resume_model_prefill(&session, "anthropic:claude-sonnet-4-5").await;
         assert_eq!(prefill, None);
         let _ = std::fs::remove_file(&path);
     }
@@ -5530,10 +5567,7 @@ mod tests {
     /// Build an UNPERSISTED fresh session (no file on disk) via
     /// `repo.create()` + the `ensure_session` fallback header, like
     /// `run_interactive` does at startup. Returns `(session, file path)`.
-    async fn fresh_unpersisted_session() -> (
-        crate::session::Session,
-        std::path::PathBuf,
-    ) {
+    async fn fresh_unpersisted_session() -> (crate::session::Session, std::path::PathBuf) {
         use crate::session::repo::SessionRepo;
         use crate::session::storage::SessionStorage;
         use std::path::PathBuf;
@@ -5550,18 +5584,21 @@ mod tests {
         let cwd = std::path::Path::new("/home/test/record");
         let storage = repo.create(cwd).await.unwrap();
         let path = storage.path().clone();
-        let index = storage.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
-            header: crate::session::SessionHeader::with_model_context(
-                cwd,
-                Some("anthropic".into()),
-                Some("claude-3-5-sonnet-20241022".into()),
-                Some("off".into()),
-            ),
-            entries: std::collections::HashMap::new(),
-            leaf_id: None,
-            children: std::collections::HashMap::new(),
-            session_name: None,
-        });
+        let index = storage
+            .build_index()
+            .await
+            .unwrap_or_else(|_| crate::session::SessionIndex {
+                header: crate::session::SessionHeader::with_model_context(
+                    cwd,
+                    Some("anthropic".into()),
+                    Some("claude-3-5-sonnet-20241022".into()),
+                    Some("off".into()),
+                ),
+                entries: std::collections::HashMap::new(),
+                leaf_id: None,
+                children: std::collections::HashMap::new(),
+                session_name: None,
+            });
         (crate::session::Session::new(storage, index), path)
     }
 
@@ -5575,7 +5612,10 @@ mod tests {
     #[tokio::test]
     async fn record_metadata_on_unpersisted_session_creates_no_file() {
         let (session, path) = fresh_unpersisted_session().await;
-        assert!(!session.is_persisted(), "fresh session must start unpersisted");
+        assert!(
+            !session.is_persisted(),
+            "fresh session must start unpersisted"
+        );
         assert!(!path.exists(), "precondition: no file yet");
 
         record_model_change(&session, "openai:gpt-4o").await;
@@ -5693,8 +5733,7 @@ mod tests {
         // move_leaf/get_entry as the RAW id. Regression test: with brackets
         // kept, move_leaf pointed at a nonexistent entry → empty context,
         // no current-position marker, "/replay: session is empty".
-        let (target, action, mode, summarize, _) =
-            parse_tree_args("<0194abc-123> switch");
+        let (target, action, mode, summarize, _) = parse_tree_args("<0194abc-123> switch");
         assert_eq!(target, "0194abc-123");
         assert_eq!(action, TreeAction::Switch);
         assert_eq!(mode, None);
@@ -5711,8 +5750,7 @@ mod tests {
         // Compact with mode + summarize flag orthogonal. `truncate`
         // remains recognized as a deprecated alias for the new primary
         // `manual` token.
-        let (target, action, mode, _, _) =
-            parse_tree_args("<id9> compact truncate --summarize");
+        let (target, action, mode, _, _) = parse_tree_args("<id9> compact truncate --summarize");
         assert_eq!(target, "id9");
         assert_eq!(action, TreeAction::Compact);
         assert_eq!(mode, Some(CompactSummaryMode::Manual));
@@ -5731,8 +5769,7 @@ mod tests {
     #[test]
     fn parse_tree_args_llm_mode() {
         // Bare `llm` token after `compact` selects Llm mode with empty payload.
-        let (target, action, mode, summarize, payload) =
-            parse_tree_args("<id9> compact llm");
+        let (target, action, mode, summarize, payload) = parse_tree_args("<id9> compact llm");
         assert_eq!(target, "id9");
         assert_eq!(action, TreeAction::Compact);
         assert_eq!(mode, Some(CompactSummaryMode::Llm));
@@ -5752,13 +5789,11 @@ mod tests {
 
         // Multi-word payload collapses internal whitespace runs to single
         // spaces (matches split_whitespace behavior).
-        let (_, _, _, _, payload) =
-            parse_tree_args("<id9> compact llm hello   world  foo");
+        let (_, _, _, _, payload) = parse_tree_args("<id9> compact llm hello   world  foo");
         assert_eq!(payload, "hello world foo");
 
         // `text-only` after `llm` is part of the payload, not a mode token.
-        let (_, _, mode, _, payload) =
-            parse_tree_args("<id9> compact llm text-only is just text");
+        let (_, _, mode, _, payload) = parse_tree_args("<id9> compact llm text-only is just text");
         assert_eq!(mode, Some(CompactSummaryMode::Llm));
         assert_eq!(payload, "text-only is just text");
     }
@@ -5776,11 +5811,13 @@ mod tests {
         for (i, id) in ids.iter().enumerate() {
             let entry = crate::session::SessionEntry {
                 id: id.to_string(),
-                parent_id: if i == 0 { None } else { Some(ids[i - 1].to_string()) },
-                timestamp: "2024-01-01T00:00:00.000Z".to_string(),
-                content: crate::session::SessionEntryContent::SessionInfo {
-                    name: None,
+                parent_id: if i == 0 {
+                    None
+                } else {
+                    Some(ids[i - 1].to_string())
                 },
+                timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+                content: crate::session::SessionEntryContent::SessionInfo { name: None },
             };
             index.entries.insert(id.to_string(), entry);
             if i > 0 {
@@ -5808,27 +5845,18 @@ mod tests {
             Some("m1".to_string())
         );
         // m0 has no predecessor on the chain.
-        assert_eq!(
-            find_predecessor_on_active_branch(&index, "m0"),
-            None
-        );
+        assert_eq!(find_predecessor_on_active_branch(&index, "m0"), None);
         // An id not on the active branch: get_path_to_root walks the leaf
         // chain and returns empty for the missing id, so position returns
         // None and we report no predecessor.
-        assert_eq!(
-            find_predecessor_on_active_branch(&index, "nope"),
-            None
-        );
+        assert_eq!(find_predecessor_on_active_branch(&index, "nope"), None);
     }
 
     #[test]
     fn find_predecessor_on_active_branch_no_leaf() {
         let mut index = build_chain_index("m1", &["m0", "m1"]);
         index.leaf_id = None;
-        assert_eq!(
-            find_predecessor_on_active_branch(&index, "m1"),
-            None
-        );
+        assert_eq!(find_predecessor_on_active_branch(&index, "m1"), None);
     }
 
     /// Build a SessionIndex whose entries are all `Message` entries except
@@ -5848,10 +5876,13 @@ mod tests {
         let leaf = ids.last().expect("non-empty ids");
         let mut index = build_chain_index(leaf, ids);
         for (cid, first_kept, summary) in compactions {
-            let parent = ids
-                .iter()
-                .position(|id| *id == *cid)
-                .and_then(|i| if i == 0 { None } else { Some(ids[i - 1].to_string()) });
+            let parent = ids.iter().position(|id| *id == *cid).and_then(|i| {
+                if i == 0 {
+                    None
+                } else {
+                    Some(ids[i - 1].to_string())
+                }
+            });
             let entry = crate::session::SessionEntry {
                 id: cid.to_string(),
                 parent_id: parent,
@@ -5885,15 +5916,10 @@ mod tests {
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(
-            output.as_ref(),
-            cancel,
-            notify,
-            &mut || {
-                calls += 1;
-                async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
-            },
-        )
+        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+            calls += 1;
+            async { Ok::<_, crate::PicocodeError>("summary".to_string()) }
+        })
         .await;
         assert_eq!(r.unwrap(), "summary");
         assert_eq!(calls, 1);
@@ -5908,23 +5934,18 @@ mod tests {
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(
-            output.as_ref(),
-            cancel,
-            notify,
-            &mut || {
-                calls += 1;
-                async move {
-                    if calls == 1 {
-                        Err(crate::PicocodeError::LlmRateLimited {
-                            retry_after_secs: Some(1),
-                        })
-                    } else {
-                        Ok("second".to_string())
-                    }
+        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+            calls += 1;
+            async move {
+                if calls == 1 {
+                    Err(crate::PicocodeError::LlmRateLimited {
+                        retry_after_secs: Some(1),
+                    })
+                } else {
+                    Ok("second".to_string())
                 }
-            },
-        )
+            }
+        })
         .await;
         assert_eq!(r.unwrap(), "second");
         assert_eq!(calls, 2);
@@ -5936,15 +5957,10 @@ mod tests {
         let output = null_output();
         let cancel = &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let notify = &std::sync::Arc::new(tokio::sync::Notify::new());
-        let r = retry_summarization(
-            output.as_ref(),
-            cancel,
-            notify,
-            &mut || {
-                calls += 1;
-                async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
-            },
-        )
+        let r = retry_summarization(output.as_ref(), cancel, notify, &mut || {
+            calls += 1;
+            async { Err(crate::PicocodeError::Llm("permanent".to_string())) }
+        })
         .await;
         assert!(matches!(r, Err(crate::PicocodeError::Llm(_))));
         assert_eq!(calls, 1, "non-retryable must not retry");
@@ -5967,17 +5983,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             cancel2.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        let r = retry_summarization(
-            output.as_ref(),
-            &cancel_out,
-            &notify,
-            &mut || {
-                calls += 1;
-                async { Err(crate::PicocodeError::LlmRateLimited {
+        let r = retry_summarization(output.as_ref(), &cancel_out, &notify, &mut || {
+            calls += 1;
+            async {
+                Err(crate::PicocodeError::LlmRateLimited {
                     retry_after_secs: Some(5),
-                }) }
-            },
-        )
+                })
+            }
+        })
         .await;
         let _ = handle.await;
         assert!(matches!(r, Err(crate::PicocodeError::Cancelled(_))));
@@ -5989,9 +6002,7 @@ mod tests {
     /// storage as read-only because it only tests reading (resume
     /// prefill); `run_compaction` calls `append_compaction` which
     /// needs a writable handle, so we use `open_or_create` here.
-    async fn build_writable_session_with(
-        entries: Vec<crate::session::SessionEntry>,
-    ) -> Session {
+    async fn build_writable_session_with(entries: Vec<crate::session::SessionEntry>) -> Session {
         use crate::session::storage::JsonlSessionStorage;
         use crate::session::types::session_filename;
         use std::path::Path;
@@ -6099,21 +6110,26 @@ mod tests {
         let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "u1".to_string(),
-                tokens_before: 100,
-            },
-            CompactSummaryMode::Manual,
-            "",
-            out.as_ref(),
-            None,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "manual compaction should succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "u1".to_string(),
+                    tokens_before: 100,
+                },
+                CompactSummaryMode::Manual,
+                "",
+                out.as_ref(),
+                None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "manual compaction should succeed"
+        );
 
         // The new leaf should be a Compaction entry.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -6144,22 +6160,26 @@ mod tests {
         let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "u1".to_string(),
-                tokens_before: 50,
-            },
-
-            CompactSummaryMode::TextOnly,
-            "",
-            out.as_ref(),
-            None,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "text-only compaction should succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "u1".to_string(),
+                    tokens_before: 50,
+                },
+                CompactSummaryMode::TextOnly,
+                "",
+                out.as_ref(),
+                None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "text-only compaction should succeed"
+        );
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let new_entry = s.get_entry(&new_leaf).await.expect("entry");
@@ -6199,7 +6219,6 @@ mod tests {
                 target_id: "u1".to_string(),
                 tokens_before: 0,
             },
-
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
@@ -6236,22 +6255,26 @@ mod tests {
         let _old_leaf = s.get_leaf_id().await;
         let settings = test_settings();
         let out = null_output();
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "a1".to_string(),
-                tokens_before: 10,
-            },
-
-            CompactSummaryMode::TextOnly,
-            "",
-            out.as_ref(),
-            None,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "text-only compaction should succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "a1".to_string(),
+                    tokens_before: 10,
+                },
+                CompactSummaryMode::TextOnly,
+                "",
+                out.as_ref(),
+                None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "text-only compaction should succeed"
+        );
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let new_entry = s.get_entry(&new_leaf).await.expect("entry");
@@ -6293,22 +6316,26 @@ mod tests {
 
         let settings = test_settings();
         let out = null_output();
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "u0".to_string(),
-                tokens_before: 42,
-            },
-
-            CompactSummaryMode::Manual,
-            "",
-            out.as_ref(),
-            None,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "manual re-compaction over a leaf-compaction must succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "u0".to_string(),
+                    tokens_before: 42,
+                },
+                CompactSummaryMode::Manual,
+                "",
+                out.as_ref(),
+                None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "manual re-compaction over a leaf-compaction must succeed"
+        );
 
         // New leaf is a Compaction entry with empty summary and firstKept=u0.
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
@@ -6351,22 +6378,26 @@ mod tests {
 
         let settings = test_settings();
         let out = null_output();
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "u1".to_string(),
-                tokens_before: 60,
-            },
-
-            CompactSummaryMode::TextOnly,
-            "",
-            out.as_ref(),
-            None,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "text-only re-compaction over a leaf-compaction must succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "u1".to_string(),
+                    tokens_before: 60,
+                },
+                CompactSummaryMode::TextOnly,
+                "",
+                out.as_ref(),
+                None,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "text-only re-compaction over a leaf-compaction must succeed"
+        );
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
@@ -6414,22 +6445,26 @@ mod tests {
             );
             Some(format!("{}\n\nEDITED BY USER", draft))
         }));
-        assert!(run_compaction(
-            &s,
-            &None,
-            &settings,
-            CompactionTarget::AtPoint {
-                target_id: "a1".to_string(),
-                tokens_before: 10,
-            },
-
-            CompactSummaryMode::TextOnly,
-            "",
-            out.as_ref(),
-            review,
-            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            &std::sync::Arc::new(tokio::sync::Notify::new()),
-        ).await.is_done(), "text-only compaction with review should succeed");
+        assert!(
+            run_compaction(
+                &s,
+                &None,
+                &settings,
+                CompactionTarget::AtPoint {
+                    target_id: "a1".to_string(),
+                    tokens_before: 10,
+                },
+                CompactSummaryMode::TextOnly,
+                "",
+                out.as_ref(),
+                review,
+                &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                &std::sync::Arc::new(tokio::sync::Notify::new()),
+            )
+            .await
+            .is_done(),
+            "text-only compaction with review should succeed"
+        );
 
         let new_leaf = s.get_leaf_id().await.expect("leaf must exist");
         let summary = match s.get_entry(&new_leaf).await.expect("entry").content {
@@ -6471,7 +6506,6 @@ mod tests {
                 target_id: "a1".to_string(),
                 tokens_before: 10,
             },
-
             CompactSummaryMode::TextOnly,
             "",
             out.as_ref(),
@@ -6531,7 +6565,6 @@ mod tests {
                 target_id: "a0".to_string(),
                 tokens_before: 30,
             },
-
             CompactSummaryMode::Llm,
             "user payload",
             out.as_ref(),
@@ -6563,10 +6596,7 @@ mod tests {
     /// the logger being wired but never called (no file created).
     #[tokio::test]
     async fn message_logger_writes_jsonl_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-msglog-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("picocode-msglog-test-{}", std::process::id()));
         let path = dir.join("messages.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -6644,16 +6674,14 @@ mod tests {
         use rig_agent::agent::{AgentBuilder, MultiTurnStreamItem};
         use rig_agent::streaming::StreamingPrompt;
         use rig_core::completion::Usage;
-        use rig_core::test_utils::{MockCompletionModel, MockStreamEvent, mock_final};
+        use rig_core::test_utils::{mock_final, MockCompletionModel, MockStreamEvent};
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
 
         use super::LoggingHook;
 
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-msglog-stream-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-msglog-stream-{}", std::process::id()));
         let path = dir.join("messages.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
 
@@ -6704,10 +6732,7 @@ mod tests {
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
 
-        let sent: Vec<_> = lines
-            .iter()
-            .filter(|l| l["direction"] == "sent")
-            .collect();
+        let sent: Vec<_> = lines.iter().filter(|l| l["direction"] == "sent").collect();
         let received: Vec<_> = lines
             .iter()
             .filter(|l| l["direction"] == "received")
@@ -6715,12 +6740,13 @@ mod tests {
 
         // One user prompt sent, one assistant reply received.
         assert_eq!(sent.len(), 1, "expected exactly one sent message: {raw}");
-        assert_eq!(received.len(), 1, "expected exactly one received message: {raw}");
-        assert_eq!(received[0]["role"], "assistant");
         assert_eq!(
-            received[0]["message"]["content"][0]["text"],
-            "hello there"
+            received.len(),
+            1,
+            "expected exactly one received message: {raw}"
         );
+        assert_eq!(received[0]["role"], "assistant");
+        assert_eq!(received[0]["message"]["content"][0]["text"], "hello there");
         // Both sides of the same turn share a turn id.
         assert_eq!(sent[0]["turn_id"], received[0]["turn_id"]);
 
@@ -6731,8 +6757,7 @@ mod tests {
     #[test]
     fn create_private_dir_sets_0700() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("picocode_token_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("picocode_token_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         create_private_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
@@ -6765,7 +6790,10 @@ mod tests {
         assert!(hist.contains(&Message::user("turn-2-prompt")));
         assert!(hist.contains(&Message::assistant("turn-2-reply")));
         // Prior must come before the new turn.
-        let prior_idx = hist.iter().position(|m| *m == Message::user("prior-1")).unwrap();
+        let prior_idx = hist
+            .iter()
+            .position(|m| *m == Message::user("prior-1"))
+            .unwrap();
         let new_idx = hist
             .iter()
             .position(|m| *m == Message::user("turn-2-prompt"))
@@ -6786,13 +6814,22 @@ mod tests {
             Message::assistant("aborted-partial"),
         ];
         use crate::settings::ReasoningInContextMode;
-        persist_turn(&mut Some(&mut hist), None, Some(cancelled), ReasoningInContextMode::Always, "openai", "");
+        persist_turn(
+            &mut Some(&mut hist),
+            None,
+            Some(cancelled),
+            ReasoningInContextMode::Always,
+            "openai",
+            "",
+        );
 
         // Replaced (not appended): exactly the in-flight full history, with no
         // duplicate of `prior-1`.
         assert_eq!(hist.len(), 3);
         assert_eq!(
-            hist.iter().filter(|m| **m == Message::user("prior-1")).count(),
+            hist.iter()
+                .filter(|m| **m == Message::user("prior-1"))
+                .count(),
             1
         );
         assert!(hist.contains(&Message::user("aborted-prompt")));
@@ -6819,25 +6856,41 @@ mod tests {
         // Never + non-Anthropic: reasoning dropped, text preserved.
         let out = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Never, "openai", "");
         if let Message::Assistant { content, .. } = &out[1] {
-            assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
-            assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
+            assert!(!content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Text(_))));
         } else {
             panic!("expected assistant message");
         }
 
         // Always: reasoning kept.
-        let kept = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Always, "openai", "");
+        let kept =
+            maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Always, "openai", "");
         if let Message::Assistant { content, .. } = &kept[1] {
-            assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))));
         } else {
             panic!("expected assistant message");
         }
 
         // Anthropic-family WITHOUT tool calls: mode honored, reasoning stripped.
-        let stripped = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::Never, "anthropic", "claude-3-5-sonnet");
+        let stripped = maybe_strip_reasoning(
+            msgs.clone(),
+            ReasoningInContextMode::Never,
+            "anthropic",
+            "claude-3-5-sonnet",
+        );
         if let Message::Assistant { content, .. } = &stripped[1] {
-            assert!(!content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
-            assert!(content.iter().any(|c| matches!(c, AssistantContent::Text(_))));
+            assert!(!content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Text(_))));
         } else {
             panic!("expected assistant message");
         }
@@ -6872,18 +6925,34 @@ mod tests {
         ];
 
         // AbortedTurnsOnly: successful reasoning stripped, aborted reasoning kept
-        let out = maybe_strip_reasoning(msgs.clone(), ReasoningInContextMode::AbortedTurnsOnly, "openai", "");
-        let contents: Vec<&Vec<AssistantContent>> = out.iter().filter_map(|m| match m {
-            Message::Assistant { content, .. } => Some(content),
-            _ => None,
-        }).collect();
+        let out = maybe_strip_reasoning(
+            msgs.clone(),
+            ReasoningInContextMode::AbortedTurnsOnly,
+            "openai",
+            "",
+        );
+        let contents: Vec<&Vec<AssistantContent>> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect();
         assert_eq!(contents.len(), 2);
         // First (successful) should have reasoning stripped
-        assert!(!contents[0].iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
-        assert!(contents[0].iter().any(|c| matches!(c, AssistantContent::Text(t) if t.text == "successful answer")));
+        assert!(!contents[0]
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        assert!(contents[0]
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "successful answer")));
         // Second (aborted) should have reasoning preserved
-        assert!(contents[1].iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
-        assert!(contents[1].iter().any(|c| matches!(c, AssistantContent::Text(t) if t.text == "aborted answer")));
+        assert!(contents[1]
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(_))));
+        assert!(contents[1]
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Text(t) if t.text == "aborted answer")));
     }
 
     // Anthropic-family turn WITH a tool call: the leading reasoning must be
@@ -6906,9 +6975,16 @@ mod tests {
         };
         let msgs = vec![Message::user("q"), assistant];
 
-        let forced = maybe_strip_reasoning(msgs, crate::settings::ReasoningInContextMode::Never, "anthropic", "claude-3-5-sonnet");
+        let forced = maybe_strip_reasoning(
+            msgs,
+            crate::settings::ReasoningInContextMode::Never,
+            "anthropic",
+            "claude-3-5-sonnet",
+        );
         if let Message::Assistant { content, .. } = &forced[1] {
-            assert!(content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))));
+            assert!(content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_))));
         } else {
             panic!("expected assistant message");
         }
@@ -6917,7 +6993,10 @@ mod tests {
     #[test]
     fn is_anthropic_family_classifies_providers() {
         assert!(is_anthropic_family("anthropic", "claude-x"));
-        assert!(is_anthropic_family("openrouter", "anthropic/claude-3.5-sonnet"));
+        assert!(is_anthropic_family(
+            "openrouter",
+            "anthropic/claude-3.5-sonnet"
+        ));
         assert!(!is_anthropic_family("openrouter", "openai/gpt-4o"));
         assert!(!is_anthropic_family("openai", "gpt-4o"));
     }
@@ -6941,10 +7020,10 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use crate::config::{BindPath, SandboxConfig};
-        use crate::Output;
         use crate::output::Confirmation;
         use crate::settings::SettingsStore;
         use crate::AgentConfig;
+        use crate::Output;
         use std::sync::atomic::AtomicBool;
 
         // bwrap is required for the sandbox to engage at all.
@@ -6965,10 +7044,8 @@ mod tests {
 
         // Host file we remap into the sandbox at a path absent on the host.
         let sentinel = "SANDBOX_REGRESSION_MARKER_12345";
-        let host_path = std::env::temp_dir().join(format!(
-            "picocode_sandbox_regr_{}.txt",
-            std::process::id()
-        ));
+        let host_path =
+            std::env::temp_dir().join(format!("picocode_sandbox_regr_{}.txt", std::process::id()));
         std::fs::write(&host_path, sentinel).unwrap();
         let probe = "/sandbox_probe_xyz".to_string();
 
@@ -7021,15 +7098,7 @@ mod tests {
             }
             fn display_thinking(&self, _: &str) {}
             fn stop_thinking(&self) {}
-            fn display_header(
-                &self,
-                _: &str,
-                _: &str,
-                _: bool,
-                _: usize,
-                _: Option<&str>,
-            ) {
-            }
+            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
         }
 
         let inputs = Arc::new(Mutex::new(VecDeque::from([
@@ -7107,7 +7176,11 @@ mod tests {
         }
     }
 
-    fn pi_assistant_entry(id: &str, parent: Option<&str>, text: &str) -> crate::session::SessionEntry {
+    fn pi_assistant_entry(
+        id: &str,
+        parent: Option<&str>,
+        text: &str,
+    ) -> crate::session::SessionEntry {
         crate::session::SessionEntry {
             id: id.to_string(),
             parent_id: parent.map(|p| p.to_string()),
@@ -7121,7 +7194,11 @@ mod tests {
         }
     }
 
-    fn pi_compaction_entry(id: &str, parent: Option<&str>, tokens: u64) -> crate::session::SessionEntry {
+    fn pi_compaction_entry(
+        id: &str,
+        parent: Option<&str>,
+        tokens: u64,
+    ) -> crate::session::SessionEntry {
         crate::session::SessionEntry {
             id: id.to_string(),
             parent_id: parent.map(|p| p.to_string()),
@@ -7147,7 +7224,10 @@ mod tests {
         assert_eq!(units.len(), 3);
         assert!(matches!(units[0], ReplayUnit::Turn(_)));
         match &units[1] {
-            ReplayUnit::Compaction { tokens_before, summary } => {
+            ReplayUnit::Compaction {
+                tokens_before,
+                summary,
+            } => {
                 assert_eq!(*tokens_before, 42_000);
                 assert_eq!(summary, ""); // manual-mode compaction (no files touched)
             }
@@ -7237,7 +7317,10 @@ mod tests {
                 assert!(parse_error.contains("column 335"));
                 assert!(classified.is_auto_retryable());
                 assert_eq!(classified.retry_after_secs(), None);
-                assert!(classified.synthetic_retry_feedback().unwrap().contains("edit"));
+                assert!(classified
+                    .synthetic_retry_feedback()
+                    .unwrap()
+                    .contains("edit"));
             }
             other => panic!("expected LlmMalformedToolCall, got {other:?}"),
         }
@@ -7342,25 +7425,22 @@ mod tests {
         // LlmStreamProtocol.
         let err = CompletionError::ResponseError("unexpected EOF mid-stream".into());
         let classified = super::classify_completion_error(&err);
-        assert!(matches!(
-            classified,
-            PicocodeError::LlmStreamProtocol(_)
-        ));
+        assert!(matches!(classified, PicocodeError::LlmStreamProtocol(_)));
     }
 
     #[test]
     fn retry_after_secs_extracted_from_provider_response_headers() {
-        use rig_core::ProviderResponseError;
         use rig_core::http_client::{HeaderMap, HeaderValue, StatusCode};
+        use rig_core::ProviderResponseError;
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "retry-after",
-            HeaderValue::from_str("60").unwrap(),
-        );
+        headers.insert("retry-after", HeaderValue::from_str("60").unwrap());
         let body = HashMap::from([("error".to_string(), "rate_limited".to_string())]);
         let ce = CompletionError::ProviderResponse(
-            ProviderResponseError::new(StatusCode::TOO_MANY_REQUESTS, serde_json::to_string(&body).unwrap())
-                .with_headers(Some(Box::new(headers))),
+            ProviderResponseError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::to_string(&body).unwrap(),
+            )
+            .with_headers(Some(Box::new(headers))),
         );
         let classified = super::classify_completion_error(&ce);
         match classified {
@@ -7380,13 +7460,10 @@ mod tests {
         // `PromptError` rather than a `StreamingError`. A 429 must still
         // classify as `LlmRateLimited` with the Retry-After hint preserved
         // so the REPL can back off correctly on `/tree --summarize`.
-        use rig_core::ProviderResponseError;
         use rig_core::http_client::{HeaderMap, HeaderValue, StatusCode};
+        use rig_core::ProviderResponseError;
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "retry-after",
-            HeaderValue::from_str("30").unwrap(),
-        );
+        headers.insert("retry-after", HeaderValue::from_str("30").unwrap());
         let ce = CompletionError::ProviderResponse(
             ProviderResponseError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -7447,15 +7524,7 @@ mod tests {
         fn display_separator(&self) {}
         fn display_thinking(&self, _m: &str) {}
         fn stop_thinking(&self) {}
-        fn display_header(
-            &self,
-            _p: &str,
-            _m: &str,
-            _y: bool,
-            _l: usize,
-            _pn: Option<&str>,
-        ) {
-        }
+        fn display_header(&self, _p: &str, _m: &str, _y: bool, _l: usize, _pn: Option<&str>) {}
     }
 
     #[test]
@@ -7465,7 +7534,9 @@ mod tests {
         // calls. The budget exists to cap a runaway, not to second-guess
         // the policy per class. Non-retryable classes get 0 (no retries).
         assert_eq!(
-            super::retry_budget(&PicocodeError::LlmRateLimited { retry_after_secs: None }),
+            super::retry_budget(&PicocodeError::LlmRateLimited {
+                retry_after_secs: None
+            }),
             50
         );
         assert_eq!(
@@ -7513,7 +7584,9 @@ mod tests {
         // LlmInterrupted delegates to its cause.
         assert_eq!(
             super::retry_budget(&PicocodeError::LlmInterrupted {
-                cause: Box::new(PicocodeError::LlmRateLimited { retry_after_secs: None }),
+                cause: Box::new(PicocodeError::LlmRateLimited {
+                    retry_after_secs: None
+                }),
             }),
             50
         );
@@ -7583,8 +7656,8 @@ mod tests {
         // 502 as a `ProviderResponseError` with status 502. The classifier
         // must map it to `LlmUpstream { status: 502 }` and mark it
         // auto-retryable.
-        use rig_core::ProviderResponseError;
         use rig_core::http_client::StatusCode;
+        use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-1788441206-TngoywArM91X9nINXYNP","object":"chat.completion.chunk","created":1788441206,"model":"z-ai/glm-5.3-flash","provider":"DeepInfra","choices":[],"error":{"code":502,"message":"Upstream error from DeepInfra: TimeoutError: Timeout on reading data from socket","metadata":{"error_type":"provider_unavailable"}}}"#;
         let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
             StatusCode::BAD_GATEWAY,
@@ -7675,9 +7748,9 @@ mod tests {
         // and map it to `LlmRateLimited` so the REPL's budget applies.
         use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-1788464790-qEKKA0Klq7sLFL2HAM4O","object":"chat.completion.chunk","created":1788464790,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":429,"message":"Provider returned error","metadata":{"error_type":"rate_limit_exceeded"}}}"#;
-        let ce = CompletionError::ProviderResponse(
-            ProviderResponseError::without_status(body.to_string()),
-        );
+        let ce = CompletionError::ProviderResponse(ProviderResponseError::without_status(
+            body.to_string(),
+        ));
         // Sanity-check the fixture matches the production wiring: no HTTP
         // status is preserved, so only body-based envelope detection can
         // classify this.
@@ -7699,8 +7772,8 @@ mod tests {
         // the `ProviderResponse`. A 2xx status must not be treated as a
         // failure on its own — the classifier defers to the body envelope,
         // mapping the 502 to `LlmUpstream`.
-        use rig_core::ProviderResponseError;
         use rig_core::http_client::StatusCode;
+        use rig_core::ProviderResponseError;
         let body = r#"{"id":"gen-x","object":"chat.completion.chunk","created":0,"model":"unknown","provider":"GMICloud","choices":[],"error":{"code":502,"message":"Upstream error","metadata":{"error_type":"provider_unavailable"}}}"#;
         let ce = CompletionError::ProviderResponse(ProviderResponseError::new(
             StatusCode::OK,
@@ -7723,9 +7796,9 @@ mod tests {
         // must keep the pre-fix behavior: fall through to `Other`, NOT get
         // auto-retried (there is no signal it is transient).
         use rig_core::ProviderResponseError;
-        let ce = CompletionError::ProviderResponse(
-            ProviderResponseError::without_status("provider exploded".to_string()),
-        );
+        let ce = CompletionError::ProviderResponse(ProviderResponseError::without_status(
+            "provider exploded".to_string(),
+        ));
         let classified = super::classify_completion_error(&ce);
         assert!(
             matches!(classified, PicocodeError::Other(_)),
@@ -7742,10 +7815,7 @@ mod tests {
         let envelope = r#"{"id":"x","error":"invalid_argument"}"#;
         let err = CompletionError::ResponseError(envelope.to_string());
         let classified = super::classify_completion_error(&err);
-        assert!(matches!(
-            classified,
-            PicocodeError::LlmStreamProtocol(_)
-        ));
+        assert!(matches!(classified, PicocodeError::LlmStreamProtocol(_)));
     }
 
     #[test]
@@ -7778,7 +7848,12 @@ mod tests {
         };
         // Call through the trait so we exercise the default impl, not a
         // concrete method.
-        <dyn Output>::display_tool_error(&recorder, "edit", "invalid_args", "expected `,` or `}` at line 1");
+        <dyn Output>::display_tool_error(
+            &recorder,
+            "edit",
+            "invalid_args",
+            "expected `,` or `}` at line 1",
+        );
         let recorded = errors.lock().unwrap().clone();
         assert_eq!(recorded.len(), 1, "expected exactly one display_error call");
         let msg = &recorded[0];
@@ -7799,10 +7874,13 @@ mod tests {
 
     #[test]
     fn transcript_batches_tool_results_between_assistant_turns() {
-        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent};
         use super::TurnTranscript;
+        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent};
 
-        let tc = ToolCall::from_wire("call_1", ToolFunction::new("read".to_string(), serde_json::json!({})));
+        let tc = ToolCall::from_wire(
+            "call_1",
+            ToolFunction::new("read".to_string(), serde_json::json!({})),
+        );
         let call_id = tc.id.clone();
         let mut t = TurnTranscript::default();
         // Assistant turn with a tool call.
@@ -7819,15 +7897,21 @@ mod tests {
         t.push_assistant_turn(None, vec![AssistantContent::text("done")]);
         let f = t.finalize();
         assert_eq!(f.len(), 3, "assistant + user(results) + assistant: {f:?}");
-        assert!(matches!(&f[1], Message::User { .. }), "batch must be one user msg");
+        assert!(
+            matches!(&f[1], Message::User { .. }),
+            "batch must be one user msg"
+        );
     }
 
     #[test]
     fn transcript_finalize_answers_interrupted_calls_with_text_results() {
-        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent, UserContent};
         use super::TurnTranscript;
+        use rig_core::message::{ToolCall, ToolFunction, ToolResultContent, UserContent};
 
-        let tc = ToolCall::from_wire("call_1", ToolFunction::new("read".to_string(), serde_json::json!({})));
+        let tc = ToolCall::from_wire(
+            "call_1",
+            ToolFunction::new("read".to_string(), serde_json::json!({})),
+        );
         let mut t = TurnTranscript::default();
         t.push_assistant_turn(None, vec![AssistantContent::ToolCall(tc)]);
         // Run interrupted before any tool result: finalize must synthesize a
@@ -7853,7 +7937,10 @@ mod tests {
 
         let mut t = TurnTranscript::default();
         t.push_assistant_turn(None, vec![AssistantContent::text("   ")]);
-        assert!(!t.has_progress(), "blank-text turn must not count as progress");
+        assert!(
+            !t.has_progress(),
+            "blank-text turn must not count as progress"
+        );
         assert!(t.finalize().is_empty());
     }
 
@@ -7880,10 +7967,10 @@ mod tests {
     // hermetic — independent of `std::env::current_dir()` at test-run time.
     #[tokio::test]
     async fn ensure_session_after_drop_creates_fresh_persistent_session() {
-        use rig_core::message::Message;
-        use std::path::PathBuf;
         use crate::session::repo::SessionRepo;
         use crate::session::storage::SessionStorage;
+        use rig_core::message::Message;
+        use std::path::PathBuf;
 
         let base: PathBuf = std::env::temp_dir().join(format!(
             "picocode-new-fix-{}-{}",
@@ -7900,13 +7987,17 @@ mod tests {
         // session file is written and is distinct from a bare header.
         let storage1 = repo.create(cwd).await.unwrap();
         let header1 = crate::session::SessionHeader::new(cwd);
-        let index1 = storage1.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
-            header: header1,
-            entries: std::collections::HashMap::new(),
-            leaf_id: None,
-            children: std::collections::HashMap::new(),
-            session_name: None,
-        });
+        let index1 =
+            storage1
+                .build_index()
+                .await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: header1,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
         let first = crate::session::Session::new(storage1, index1);
         let first_id = first.get_session_id().to_string();
         first
@@ -7923,13 +8014,17 @@ mod tests {
         // We replicate that by calling `repo.create()` again with the same cwd.
         let storage2 = repo.create(cwd).await.unwrap();
         let header2 = crate::session::SessionHeader::new(cwd);
-        let index2 = storage2.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
-            header: header2,
-            entries: std::collections::HashMap::new(),
-            leaf_id: None,
-            children: std::collections::HashMap::new(),
-            session_name: None,
-        });
+        let index2 =
+            storage2
+                .build_index()
+                .await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: header2,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
         let second = crate::session::Session::new(storage2, index2);
         let second_id = second.get_session_id().to_string();
 
@@ -7987,10 +8082,10 @@ mod tests {
     // `slash.rs` covers that end.
     #[tokio::test]
     async fn new_and_clear_with_name_set_session_name_on_fresh_session() {
-        use rig_core::message::Message;
-        use std::path::PathBuf;
         use crate::session::repo::SessionRepo;
         use crate::session::storage::SessionStorage;
+        use rig_core::message::Message;
+        use std::path::PathBuf;
 
         for cmd in ["/new", "/clear"] {
             let base: PathBuf = std::env::temp_dir().join(format!(
@@ -8008,13 +8103,16 @@ mod tests {
             // Seed a previous session so the post-{cmd} state is a *new* one.
             let s0 = repo.create(cwd).await.unwrap();
             let h0 = crate::session::SessionHeader::new(cwd);
-            let i0 = s0.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
-                header: h0,
-                entries: std::collections::HashMap::new(),
-                leaf_id: None,
-                children: std::collections::HashMap::new(),
-                session_name: None,
-            });
+            let i0 = s0
+                .build_index()
+                .await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: h0,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
             let prev = crate::session::Session::new(s0, i0);
             prev.append_message(&Message::user("seed")).await.unwrap();
             let prev_id = prev.get_session_id().to_string();
@@ -8034,13 +8132,16 @@ mod tests {
             // it isn't — the new session is created identically either way.)
             let s1 = repo.create(cwd).await.unwrap();
             let h1 = crate::session::SessionHeader::new(cwd);
-            let i1 = s1.build_index().await.unwrap_or_else(|_| crate::session::SessionIndex {
-                header: h1,
-                entries: std::collections::HashMap::new(),
-                leaf_id: None,
-                children: std::collections::HashMap::new(),
-                session_name: None,
-            });
+            let i1 = s1
+                .build_index()
+                .await
+                .unwrap_or_else(|_| crate::session::SessionIndex {
+                    header: h1,
+                    entries: std::collections::HashMap::new(),
+                    leaf_id: None,
+                    children: std::collections::HashMap::new(),
+                    session_name: None,
+                });
             let fresh = crate::session::Session::new(s1, i1);
             let fresh_id = fresh.get_session_id().to_string();
             assert_ne!(fresh_id, prev_id, "{} must mint a new session id", cmd);
@@ -8084,8 +8185,7 @@ mod tests {
 
             // `/clear` must have removed the old session; `/new` must have
             // kept it. Both must list the new one.
-            let ids: std::collections::HashSet<_> =
-                metas.iter().map(|m| m.id.clone()).collect();
+            let ids: std::collections::HashSet<_> = metas.iter().map(|m| m.id.clone()).collect();
             if cmd == "/clear" {
                 assert!(
                     !ids.contains(&prev_id) && ids.contains(&fresh_id),
@@ -8104,10 +8204,9 @@ mod tests {
         }
     }
 
-
     #[test]
     fn session_stats_lines_renders_session_and_model_sections() {
-        use super::{SessionStatsInfo, session_stats_lines, SessionUsage};
+        use super::{session_stats_lines, SessionStatsInfo, SessionUsage};
 
         let info = SessionStatsInfo {
             display_name: "my-session".into(),
@@ -8117,7 +8216,13 @@ mod tests {
             user_message_count: 7,
         };
         let usage = SessionUsage::default();
-        let lines = session_stats_lines("openrouter", "minimax/minimax-m3:free", usage, Some(info), 42_000);
+        let lines = session_stats_lines(
+            "openrouter",
+            "minimax/minimax-m3:free",
+            usage,
+            Some(info),
+            42_000,
+        );
 
         // The first three lines are the new "session:" section.
         assert!(
@@ -8218,7 +8323,9 @@ impl MessageLogger {
     /// request/response round trip: the full context sent (history + prompt)
     /// and the assistant content received in reply.
     pub fn advance_turn(&self) -> u64 {
-        self.turn_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+        self.turn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// Current turn id (without incrementing) — used by the response side to
@@ -8248,7 +8355,9 @@ impl MessageLogger {
     }
 
     /// Ensure the file handle is open, creating the file if needed.
-    async fn ensure_file_open(&self) -> Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
+    async fn ensure_file_open(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
         let mut guard = self.file.lock().await;
         if guard.is_none() {
             // Create parent directories

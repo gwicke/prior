@@ -9,12 +9,11 @@ use std::sync::Arc;
 use std::rc::Rc;
 
 use crate::app_state::AppState;
+use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, SubmitResult,
-    StaticListingNode, StaticRow,
+    DataResponse, DataResult, PathArgs, SlashDotNode, StaticListingNode, StaticRow, SubmitResult,
 };
-use crate::slashdot_menu::fields::ColumnDef;
 
 // ---------------------------------------------------------------------------
 // ModelNode — dynamic catalog rows with Rc-cached DataResponse.
@@ -66,8 +65,14 @@ impl SlashDotNode for ModelNode {
         // Catalog changed (or first call) — rebuild rows.
         let entries = crate::model_catalog::catalog_cached();
         let active_id = (self.active_fn)();
-        let active = if active_id.is_empty() { None } else { Some(active_id) };
-        let recent: Vec<String> = self.live.as_ref()
+        let active = if active_id.is_empty() {
+            None
+        } else {
+            Some(active_id)
+        };
+        let recent: Vec<String> = self
+            .live
+            .as_ref()
             .map(|r| r.recent_models())
             .unwrap_or_default();
 
@@ -83,10 +88,7 @@ impl SlashDotNode for ModelNode {
         };
 
         let rows: Vec<Row> = ordered.iter().map(|e| model_row(e)).collect();
-        let response = Rc::new(DataResponse {
-            rows,
-            active_ids,
-        });
+        let response = Rc::new(DataResponse { rows, active_ids });
         self.cached_response = Some(Rc::clone(&response));
         self.cached_generation = gen;
         Ok(response)
@@ -128,18 +130,42 @@ impl SlashDotNode for ModelNode {
                 .unwrap_or("")
         };
         vec![
-            FieldSpec::new("context", true).dir(SortDir::Asc).description(desc_of("context")),
-            FieldSpec::new("price_input", true).dir(SortDir::Asc).description(desc_of("price_input")),
-            FieldSpec::new("price_output", true).dir(SortDir::Asc).description(desc_of("price_output")),
-            FieldSpec::new("price", true).dir(SortDir::Asc).description(desc_of("price")),
-            FieldSpec::new("coding", true).dir(SortDir::Desc).description(desc_of("coding")),
-            FieldSpec::new("intelligence", true).dir(SortDir::Desc).description(desc_of("intelligence")),
-            FieldSpec::new("agentic", true).dir(SortDir::Desc).description(desc_of("agentic")),
-            FieldSpec::new("reasoning", true).dir(SortDir::Desc).description("reasoning capability"),
-            FieldSpec::new("created", false).dir(SortDir::Desc).description("creation date"),
-            FieldSpec::new("coding_price", true).dir(SortDir::Desc).description("coding_price"),
-            FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
-            FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
+            FieldSpec::new("context", true)
+                .dir(SortDir::Asc)
+                .description(desc_of("context")),
+            FieldSpec::new("price_input", true)
+                .dir(SortDir::Asc)
+                .description(desc_of("price_input")),
+            FieldSpec::new("price_output", true)
+                .dir(SortDir::Asc)
+                .description(desc_of("price_output")),
+            FieldSpec::new("price", true)
+                .dir(SortDir::Asc)
+                .description(desc_of("price")),
+            FieldSpec::new("coding", true)
+                .dir(SortDir::Desc)
+                .description(desc_of("coding")),
+            FieldSpec::new("intelligence", true)
+                .dir(SortDir::Desc)
+                .description(desc_of("intelligence")),
+            FieldSpec::new("agentic", true)
+                .dir(SortDir::Desc)
+                .description(desc_of("agentic")),
+            FieldSpec::new("reasoning", true)
+                .dir(SortDir::Desc)
+                .description("reasoning capability"),
+            FieldSpec::new("created", false)
+                .dir(SortDir::Desc)
+                .description("creation date"),
+            FieldSpec::new("coding_price", true)
+                .dir(SortDir::Desc)
+                .description("coding_price"),
+            FieldSpec::new("intelligence_price", true)
+                .dir(SortDir::Desc)
+                .description("intelligence_price"),
+            FieldSpec::new("agentic_price", true)
+                .dir(SortDir::Desc)
+                .description("agentic_price"),
         ]
     }
 
@@ -311,36 +337,63 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
             .unwrap_or("")
     };
 
-    let mut node: SlashDotMenuNode = StaticListingNode::new(&[
-        StaticRow::new("model", "select a model (provider:name)"),
-    ])
-    .with_columns(model_columns())
-    .with_fields(vec![
-        FieldSpec::new("context", true).dir(SortDir::Asc).description(desc_of("context")),
-        FieldSpec::new("price_input", true).dir(SortDir::Asc).description(desc_of("price_input")),
-        FieldSpec::new("price_output", true).dir(SortDir::Asc).description(desc_of("price_output")),
-        FieldSpec::new("price", true).dir(SortDir::Asc).description(desc_of("price")),
-        FieldSpec::new("coding", true).dir(SortDir::Desc).description(desc_of("coding")),
-        FieldSpec::new("intelligence", true).dir(SortDir::Desc).description(desc_of("intelligence")),
-        FieldSpec::new("agentic", true).dir(SortDir::Desc).description(desc_of("agentic")),
-        FieldSpec::new("reasoning", true).dir(SortDir::Desc).description("reasoning capability"),
-        FieldSpec::new("created", false).dir(SortDir::Desc).description("creation date"),
-        FieldSpec::new("coding_price", true).dir(SortDir::Desc).description("coding_price"),
-        FieldSpec::new("intelligence_price", true).dir(SortDir::Desc).description("intelligence_price"),
-        FieldSpec::new("agentic_price", true).dir(SortDir::Desc).description("agentic_price"),
-    ]).into();
+    let mut node: SlashDotMenuNode =
+        StaticListingNode::new(&[StaticRow::new("model", "select a model (provider:name)")])
+            .with_columns(model_columns())
+            .with_fields(vec![
+                FieldSpec::new("context", true)
+                    .dir(SortDir::Asc)
+                    .description(desc_of("context")),
+                FieldSpec::new("price_input", true)
+                    .dir(SortDir::Asc)
+                    .description(desc_of("price_input")),
+                FieldSpec::new("price_output", true)
+                    .dir(SortDir::Asc)
+                    .description(desc_of("price_output")),
+                FieldSpec::new("price", true)
+                    .dir(SortDir::Asc)
+                    .description(desc_of("price")),
+                FieldSpec::new("coding", true)
+                    .dir(SortDir::Desc)
+                    .description(desc_of("coding")),
+                FieldSpec::new("intelligence", true)
+                    .dir(SortDir::Desc)
+                    .description(desc_of("intelligence")),
+                FieldSpec::new("agentic", true)
+                    .dir(SortDir::Desc)
+                    .description(desc_of("agentic")),
+                FieldSpec::new("reasoning", true)
+                    .dir(SortDir::Desc)
+                    .description("reasoning capability"),
+                FieldSpec::new("created", false)
+                    .dir(SortDir::Desc)
+                    .description("creation date"),
+                FieldSpec::new("coding_price", true)
+                    .dir(SortDir::Desc)
+                    .description("coding_price"),
+                FieldSpec::new("intelligence_price", true)
+                    .dir(SortDir::Desc)
+                    .description("intelligence_price"),
+                FieldSpec::new("agentic_price", true)
+                    .dir(SortDir::Desc)
+                    .description("agentic_price"),
+            ])
+            .into();
     // Live session model: reads the runtime-target config, writes it, and
     // records the explicit user commit in one place.
     let reader = app_state.clone();
     let writer = app_state.clone();
-    node.add_child(ModelNode::new(
-        Box::new(move || reader.model()),
-        Box::new(move |model| {
-            writer.set_model(model);
-            Ok(())
-        }),
-        Some(app_state.clone()),
-    ).into());
+    node.add_child(
+        ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |model| {
+                writer.set_model(model);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        )
+        .into(),
+    );
     node
 }
 
@@ -352,7 +405,11 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
 mod tests {
     use super::*;
 
-    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: crate::slashdot_menu::HostKey) -> crate::slashdot_menu::node_impl::MenuResult {
+    fn eval(
+        h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
+        prompt: &str,
+        key: crate::slashdot_menu::HostKey,
+    ) -> crate::slashdot_menu::node_impl::MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does.
         futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
@@ -380,7 +437,10 @@ mod tests {
         let writer = app_state.clone();
         ModelNode::new(
             Box::new(move || reader.model()),
-            Box::new(move |model| { writer.set_model(model); Ok(()) }),
+            Box::new(move |model| {
+                writer.set_model(model);
+                Ok(())
+            }),
             Some(app_state.clone()),
         )
     }
@@ -523,9 +583,8 @@ mod tests {
     fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        let mut ml: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("model", "select a model"),
-        ]).into();
+        let mut ml: SlashDotMenuNode =
+            StaticListingNode::new(&[StaticRow::new("model", "select a model")]).into();
         ml.add_child(test_model_node(app_state).into());
         root.add_child(ml);
         crate::slashdot_menu::SlashDotMenu::from_root_node(root)
@@ -542,18 +601,22 @@ mod tests {
         // Root listing: shows the "model" row.
         match eval(&mut h, "", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
-                assert!(row_texts.iter().any(|t| t.contains("model")),
-                    "root should show model row");
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
+                assert!(
+                    row_texts.iter().any(|t| t.contains("model")),
+                    "root should show model row"
+                );
             }
             other => panic!("expected Continue at root, got {:?}", other),
         }
         // Tab drills into the model listing.
         match eval(&mut h, "", crate::slashdot_menu::HostKey::Tab) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
-                assert!(prompt.starts_with("model"),
-                    "after Tab should drill into model, got: {}", prompt);
+                assert!(
+                    prompt.starts_with("model"),
+                    "after Tab should drill into model, got: {}",
+                    prompt
+                );
             }
             other => panic!("expected Continue after Tab drill, got {:?}", other),
         }
@@ -563,13 +626,18 @@ mod tests {
             if !plan.rows.is_empty() {
                 match eval(&mut h, "model ", crate::slashdot_menu::HostKey::Tab) {
                     crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
-                        assert!(prompt.starts_with("model "),
-                            "should drill into a model entry, got: {}", prompt);
+                        assert!(
+                            prompt.starts_with("model "),
+                            "should drill into a model entry, got: {}",
+                            prompt
+                        );
                         match eval(&mut h, &prompt, crate::slashdot_menu::HostKey::Enter) {
                             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                                 let model = app_state.model();
-                                assert!(!model.is_empty(),
-                                    "target config should have a model after submit");
+                                assert!(
+                                    !model.is_empty(),
+                                    "target config should have a model after submit"
+                                );
                             }
                             other => panic!("expected DoneSuccess on model Enter, got {:?}", other),
                         }
@@ -589,17 +657,19 @@ mod tests {
         let mut h = menu.get_handle();
         // Unfiltered count.
         let total = match eval(&mut h, "model ", crate::slashdot_menu::HostKey::None) {
-            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
-                plan.rows.len()
-            }
+            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => plan.rows.len(),
             other => panic!("expected Continue, got {:?}", other),
         };
         // Filtered count must be strictly less.
         match eval(&mut h, "model deep", crate::slashdot_menu::HostKey::None) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 let filtered = plan.rows.len();
-                assert!(filtered < total,
-                    "filter 'deep' should narrow results: {} >= {}", filtered, total);
+                assert!(
+                    filtered < total,
+                    "filter 'deep' should narrow results: {} >= {}",
+                    filtered,
+                    total
+                );
             }
             other => panic!("expected Continue on fuzzy filter, got {:?}", other),
         }
@@ -618,19 +688,27 @@ mod tests {
             crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) => {
                 // Dialog discriminator: candidates render with the fixed
                 // Modifier/Description columns (the listing has none).
-                assert!(plan.table_header.is_some(),
-                    "dot word must open the modifier dialog");
+                assert!(
+                    plan.table_header.is_some(),
+                    "dot word must open the modifier dialog"
+                );
                 let rows: Vec<String> = plan.rows.iter().map(|l| l.0.clone()).collect();
-                assert!(rows.iter().any(|r| r.contains(".sort:")),
-                    "sort key must be offered: {rows:?}");
+                assert!(
+                    rows.iter().any(|r| r.contains(".sort:")),
+                    "sort key must be offered: {rows:?}"
+                );
                 // Keys at this level are inferred from the merged dataset
                 // rows (declared-spec completion for row-less fields is the
                 // arg/modifier rework track): context/price are present on
                 // every catalog row.
-                assert!(rows.iter().any(|r| r.contains(".context:")),
-                    ".context: must be offered: {rows:?}");
-                assert!(rows.iter().any(|r| r.contains(".price:")),
-                    ".price: must be offered: {rows:?}");
+                assert!(
+                    rows.iter().any(|r| r.contains(".context:")),
+                    ".context: must be offered: {rows:?}"
+                );
+                assert!(
+                    rows.iter().any(|r| r.contains(".price:")),
+                    ".price: must be offered: {rows:?}"
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }

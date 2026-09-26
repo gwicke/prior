@@ -9,8 +9,7 @@ use std::rc::Rc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
 
 pub struct ReplayNode {
@@ -27,11 +26,7 @@ impl SlashDotNode for ReplayNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Replay the full history of the current session.".to_string(),
             "".to_string(),
@@ -62,9 +57,7 @@ impl SlashDotNode for ReplayNode {
 mod tests {
     use super::*;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-    use crate::slashdot_menu::node_impl::{
-        MenuResult, StaticListingNode,
-    };
+    use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode};
     use crate::slashdot_menu::HostKey;
 
     fn test_settings() -> crate::settings::SettingsStore {
@@ -107,7 +100,12 @@ mod tests {
 
     fn build_replay_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(ReplayNode { app_state: app_state.clone() }.into());
+        root.add_child(
+            ReplayNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
         SlashDotMenu::from_root_node(root)
     }
 
@@ -119,7 +117,9 @@ mod tests {
         let result = futures::executor::block_on(handle.eval_prompt("replay ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
-                let header: String = plan.detail.iter()
+                let header: String = plan
+                    .detail
+                    .iter()
                     .map(|l| l.0.clone())
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -127,8 +127,10 @@ mod tests {
                 assert!(header.contains("10t"), "{}", header);
                 assert!(header.contains("10l"), "{}", header);
             }
-            other => panic!("expected Continue, got {:?}",
-                std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 

@@ -40,18 +40,15 @@ pub struct CombinedBind {
 }
 
 /// Global session-scoped additional bindings.
-static SESSION_BINDS: LazyLock<Mutex<Vec<SessionBind>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static SESSION_BINDS: LazyLock<Mutex<Vec<SessionBind>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Snapshot of the *original* sandbox config (before session merge), captured
 /// at startup so we can distinguish config-provided bindings from ad-hoc ones.
-static BASE_CONFIG: LazyLock<Mutex<Option<SandboxConfig>>> =
-    LazyLock::new(|| Mutex::new(None));
+static BASE_CONFIG: LazyLock<Mutex<Option<SandboxConfig>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Sandbox paths (resolved, in-sandbox) that the user has temporarily excluded
 /// from the config.  These are skipped during [`merge_into`].
-static EXCLUDED: LazyLock<Mutex<Vec<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+static EXCLUDED: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Store the original (non-merged) sandbox config so we can list config-
 /// provided bindings in the remove overlay and rebuild correctly on merge.
@@ -99,7 +96,9 @@ pub fn add(host_path: &str, sandbox_path: &str, mode: BindMode) -> Result<(), St
     } else {
         resolve_sandbox_path(sandbox_path)
     };
-    let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
+    let mut binds = SESSION_BINDS
+        .lock()
+        .map_err(|e| format!("lock error: {}", e))?;
     // Dedup by sandbox (in-sandbox) path.
     if let Some(pos) = binds.iter().position(|b| b.sandbox_path == sandbox) {
         binds[pos].mode = mode;
@@ -132,7 +131,9 @@ pub fn add_rw(host_path: &str, sandbox_path: &str) -> Result<(), String> {
 /// Returns an error if no matching binding is found.
 pub fn remove(sandbox_path: &str) -> Result<(), String> {
     let target = resolve_sandbox_path(sandbox_path);
-    let mut binds = SESSION_BINDS.lock().map_err(|e| format!("lock error: {}", e))?;
+    let mut binds = SESSION_BINDS
+        .lock()
+        .map_err(|e| format!("lock error: {}", e))?;
     let pos = binds
         .iter()
         .position(|b| b.sandbox_path == target)
@@ -143,10 +144,7 @@ pub fn remove(sandbox_path: &str) -> Result<(), String> {
 
 /// Return a copy of the current session bindings.
 pub fn list() -> Vec<SessionBind> {
-    SESSION_BINDS
-        .lock()
-        .map(|b| b.clone())
-        .unwrap_or_default()
+    SESSION_BINDS.lock().map(|b| b.clone()).unwrap_or_default()
 }
 
 /// Return the combined list of all visible bindings: config-provided (minus
@@ -164,12 +162,24 @@ pub fn combined_list() -> Vec<CombinedBind> {
     let resolve_cfg = |spec: &crate::config::BindPath, mode: BindMode| -> CombinedBind {
         let (from, to) = match spec {
             crate::config::BindPath::Simple(p) => {
-                let r = path_util::resolve_with_home(p, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
+                let r = path_util::resolve_with_home(
+                    p,
+                    cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+                    home.as_deref(),
+                );
                 (r.clone(), r)
             }
             crate::config::BindPath::Remap { from, to } => {
-                let f = path_util::resolve_with_home(from, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
-                let t = path_util::resolve_with_home(to, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref());
+                let f = path_util::resolve_with_home(
+                    from,
+                    cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+                    home.as_deref(),
+                );
+                let t = path_util::resolve_with_home(
+                    to,
+                    cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+                    home.as_deref(),
+                );
                 (f, t)
             }
         };
@@ -272,12 +282,20 @@ fn sandbox_path_of(spec: &crate::config::BindPath) -> PathBuf {
             // Resolve tilde/relative so we can compare with excluded paths.
             let cwd = std::env::current_dir().ok();
             let home = std::env::var("HOME").ok().map(PathBuf::from);
-            path_util::resolve_with_home(p, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref())
+            path_util::resolve_with_home(
+                p,
+                cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+                home.as_deref(),
+            )
         }
         crate::config::BindPath::Remap { to, .. } => {
             let cwd = std::env::current_dir().ok();
             let home = std::env::var("HOME").ok().map(PathBuf::from);
-            path_util::resolve_with_home(to, cwd.as_deref().unwrap_or(std::path::Path::new(".")), home.as_deref())
+            path_util::resolve_with_home(
+                to,
+                cwd.as_deref().unwrap_or(std::path::Path::new(".")),
+                home.as_deref(),
+            )
         }
     }
 }
@@ -294,8 +312,8 @@ fn resolve_sandbox_path(path: &str) -> PathBuf {
     path_util::normalize(&path_util::expand_tilde(path))
 }
 
-    /// Clear all session bindings, exclusions, and the base-config
-    /// snapshot (used in tests).
+/// Clear all session bindings, exclusions, and the base-config
+/// snapshot (used in tests).
 #[cfg(test)]
 pub fn clear() {
     if let Ok(mut b) = SESSION_BINDS.lock() {
@@ -356,7 +374,10 @@ mod tests {
         assert_eq!(binds[0].mode, BindMode::Ro);
         assert_eq!(binds[0].host_path, host);
         // sandbox_path is resolved to an absolute path
-        assert!(binds[0].sandbox_path.to_string_lossy().ends_with("sandbox_ro"));
+        assert!(binds[0]
+            .sandbox_path
+            .to_string_lossy()
+            .ends_with("sandbox_ro"));
         assert_ne!(binds[0].host_path, binds[0].sandbox_path);
     }
 

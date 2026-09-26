@@ -8,8 +8,7 @@ use std::rc::Rc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
 
 pub struct NewNode {
@@ -20,17 +19,12 @@ pub struct NewNode {
 impl SlashDotNode for NewNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
-            rows: vec![crate::slashdot_menu::fields::Row::new("new")
-                .desc("start a new session")],
+            rows: vec![crate::slashdot_menu::fields::Row::new("new").desc("start a new session")],
             active_ids: Vec::new(),
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Start a new session.".to_string(),
             "".to_string(),
@@ -52,9 +46,7 @@ impl SlashDotNode for NewNode {
 mod tests {
     use super::*;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-    use crate::slashdot_menu::node_impl::{
-        MenuResult, StaticListingNode,
-    };
+    use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode};
     use crate::slashdot_menu::HostKey;
 
     fn test_app_state() -> Arc<AppState> {
@@ -74,7 +66,12 @@ mod tests {
 
     fn build_new_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(NewNode { app_state: app_state.clone() }.into());
+        root.add_child(
+            NewNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
         SlashDotMenu::from_root_node(root)
     }
 
@@ -86,13 +83,18 @@ mod tests {
         let result = crate::agent::block_on_test(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
-                let text: String = plan.rows.iter()
+                let text: String = plan
+                    .rows
+                    .iter()
                     .map(|l| l.0.clone())
                     .collect::<Vec<_>>()
                     .join("\n");
                 assert!(text.contains("new"), "new should be in listing: {}", text);
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -118,8 +120,10 @@ mod tests {
         app_state.set_repo(Some(repo));
         let mut menu = build_new_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::None, 80));
-        let _ = crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
+        let _ =
+            crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::None, 80));
+        let _ =
+            crate::agent::block_on_test(handle.eval_prompt("new my-session ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
         let name =
             crate::agent::block_on_test(async { s.index().lock().await.session_name.clone() });

@@ -1,13 +1,17 @@
+use rig_core::tool::ToolContext;
 use rig_core::tool_macro as rig_tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-use rig_core::tool::ToolContext;
 
 #[allow(unused_imports)]
-use crate::config::{resolve_path_policy, resolve_paths, env_vars_to_keep, SandboxConfig, ReadOffset, ReadLimit, BashTimeout, SandboxTimeoutSecs, SandboxMemoryMb, SandboxTmpSizeMb, SandboxMaxOutputBytes, EditStartLine};
+use crate::config::{
+    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, EditStartLine, ReadLimit,
+    ReadOffset, SandboxConfig, SandboxMaxOutputBytes, SandboxMemoryMb, SandboxTimeoutSecs,
+    SandboxTmpSizeMb,
+};
 use crate::edit_match;
 use crate::path_util::relativize_path;
 
@@ -128,7 +132,11 @@ pub async fn read_file(
     Ok(lines.concat())
 }
 
-#[rig_tool(name = "write", description = "Write content to file", required(path, content))]
+#[rig_tool(
+    name = "write",
+    description = "Write content to file",
+    required(path, content)
+)]
 pub async fn write_file(path: String, content: String) -> Result<String, ToolError> {
     let p = get_path_with(&path, true)?;
     fs::write(&p, &content).await?;
@@ -144,7 +152,8 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
         "content": preview,
         "lines": content.lines().count(),
         "bytes": content.len(),
-    }).to_string())
+    })
+    .to_string())
 }
 
 /// A single targeted text replacement within a file.
@@ -293,9 +302,9 @@ fn elide_value(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(a) => {
             serde_json::Value::Array(a.iter().map(elide_value).collect())
         }
-        serde_json::Value::Object(o) => serde_json::Value::Object(
-            o.iter().map(|(k, v)| (k.clone(), elide_value(v))).collect(),
-        ),
+        serde_json::Value::Object(o) => {
+            serde_json::Value::Object(o.iter().map(|(k, v)| (k.clone(), elide_value(v))).collect())
+        }
         other => other.clone(),
     }
 }
@@ -398,12 +407,15 @@ impl EditArgs {
 
         // Legacy batch form: `edits` is an array.
         if let Some(arr) = obj.get("edits").and_then(|v| v.as_array()) {
-            let path = json_path
-                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let path =
+                json_path.ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
             let mut edits = Vec::with_capacity(arr.len());
             for e in arr {
                 edits.push(Self::op_from_value(e).ok_or_else(|| {
-                    Self::invalid(raw, "each `edits[]` entry needs string 'oldText' and 'newText'")
+                    Self::invalid(
+                        raw,
+                        "each `edits[]` entry needs string 'oldText' and 'newText'",
+                    )
                 })?);
             }
             return Ok(EditArgs {
@@ -418,8 +430,8 @@ impl EditArgs {
             obj.get("oldText").and_then(|v| v.as_str()),
             obj.get("newText").and_then(|v| v.as_str()),
         ) {
-            let path = json_path
-                .ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
+            let path =
+                json_path.ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
             let anchor = match (start_line, path_anchor) {
                 (Some(s), Some(p)) if s.0 != p => {
                     return Err(Self::invalid(
@@ -582,15 +594,13 @@ fn first_claim_overlap(
     start: usize,
     end: usize,
 ) -> Option<usize> {
-    claims.iter().position(|&(_, cs, ce)| start < ce && cs < end)
+    claims
+        .iter()
+        .position(|&(_, cs, ce)| start < ce && cs < end)
 }
 
 /// The "oldText not found" failure, shared by both resolution passes.
-fn not_found_failure(
-    edit_index0: usize,
-    edit: &EditOp,
-    text: &str,
-) -> edit_match::BatchItem {
+fn not_found_failure(edit_index0: usize, edit: &EditOp, text: &str) -> edit_match::BatchItem {
     let edit_idx_1 = edit_index0 + 1;
     let anchor_info = match edit.start_line.map(|l| l.0) {
         Some(s) => format!(" (anchored near line {s})"),
@@ -606,9 +616,7 @@ fn not_found_failure(
         }
         None => {
             let mut msg = format!("edit #{edit_idx_1} oldText not found{anchor_info} ");
-            msg.push_str(
-                "No similar region in the file; re-read the file and re-anchor the edit.",
-            );
+            msg.push_str("No similar region in the file; re-read the file and re-anchor the edit.");
             edit_match::EditFailure {
                 ui_view: msg,
                 model_view: format!(
@@ -678,11 +686,8 @@ fn resolve_edits(
             let (nearest_byte, _nearest_line, d1) = ranked[0];
             let d2 = ranked[1].2;
             if !edit_match::anchor_accepts(d1, d2, tol) {
-                let candidates: Vec<(usize, usize)> = ranked
-                    .iter()
-                    .take(10)
-                    .map(|&(_, l, d)| (l, d))
-                    .collect();
+                let candidates: Vec<(usize, usize)> =
+                    ranked.iter().take(10).map(|&(_, l, d)| (l, d)).collect();
                 failures.push(edit_match::BatchItem {
                     edit_index: i,
                     failure: edit_match::EditFailure::anchor_out_of_tolerance(
@@ -797,10 +802,7 @@ fn resolve_edits(
     (claims, resolved)
 }
 
-pub async fn edit_file(
-    path: String,
-    edits: Vec<EditOp>,
-) -> Result<String, ToolError> {
+pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolError> {
     let p = get_path_with(&path, true)?;
     let text = fs::read_to_string(&p).await?;
     let total = edits.len();
@@ -923,7 +925,11 @@ pub async fn glob_files(pattern: String, path: String) -> Result<String, ToolErr
     Ok(if res.is_empty() { "none".into() } else { res })
 }
 
-#[rig_tool(name = "grep", description = "Search files for a regex pattern (ripgrep)", required(pattern, path))]
+#[rig_tool(
+    name = "grep",
+    description = "Search files for a regex pattern (ripgrep)",
+    required(pattern, path)
+)]
 pub async fn grep_text(pattern: String, path: String) -> Result<String, ToolError> {
     // Validate the search root against the active path policy (or cwd bounds);
     // ripgrep itself runs confined inside a read-only sandbox.
@@ -1007,7 +1013,8 @@ impl rig_core::tool::Tool for Bash {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> std::result::Result<Self::Output, Self::Error> {
-        let (out, exit_code) = run_sandboxed_with_status(&args.command, args.timeout.map(|v| v.into())).await?;
+        let (out, exit_code) =
+            run_sandboxed_with_status(&args.command, args.timeout.map(|v| v.into())).await?;
         // The bash tool result is shown verbatim to the user (via
         // `LoggingHook::on_tool_result` → `display_tool_result`) AND handed
         // straight back to the LLM as the tool message. An empty stdout
@@ -1063,12 +1070,7 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     let output = std::process::Command::new("bwrap")
         .args(&args)
         .arg("--")
-        .args([
-            "ls",
-            "-lap",
-            "--time-style=+%Y-%m-%dT%H:%M:%S",
-            dir,
-        ])
+        .args(["ls", "-lap", "--time-style=+%Y-%m-%dT%H:%M:%S", dir])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1150,7 +1152,10 @@ pub(crate) async fn run_sandboxed(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
+    let configured = cfg
+        .as_ref()
+        .as_ref()
+        .and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -1207,7 +1212,10 @@ pub(crate) async fn run_sandboxed_with_status(
     // The LLM may override the configured default timeout per command. The
     // timeout is enforced whenever the command actually runs; an unset sandbox
     // config is refused before the timeout is relevant (see the closure below).
-    let configured = cfg.as_ref().as_ref().and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
+    let configured = cfg
+        .as_ref()
+        .as_ref()
+        .and_then(|c| c.timeout_secs.clone().map(|v| v.into()));
     let timeout = resolve_timeout(override_timeout, configured)?;
 
     // Move owned copies into the blocking task (`cmd` cloned to a String, the
@@ -1253,16 +1261,17 @@ pub(crate) async fn run_sandboxed_ro(
     let argv = argv.to_vec();
     let cfg = cfg.clone();
     let cap = cfg.max_output_bytes();
-    let output = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-        let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
-        // Stream merged stdout+stderr in bounded chunks (matches the shell
-        // path: bwrap forwards stdio to inherited fds; stderr is merged in,
-        // as `2>&1` would do). Output is capped to `cap` (configurable:
-        // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB).
-        capture_bounded(expr, timeout, cap)
-    })
-    .await
-    .map_err(|e| ToolError::Generic(e.to_string()))??;
+    let output =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
+            // Stream merged stdout+stderr in bounded chunks (matches the shell
+            // path: bwrap forwards stdio to inherited fds; stderr is merged in,
+            // as `2>&1` would do). Output is capped to `cap` (configurable:
+            // `[tool_config.bash.sandbox].max_output_bytes`, default 20 KiB).
+            capture_bounded(expr, timeout, cap)
+        })
+        .await
+        .map_err(|e| ToolError::Generic(e.to_string()))??;
     // Exit code is discarded — read-only tools don't surface it to the model
     // (grep/list_dir etc. treat a non-zero status as a non-error "no match").
     let (output, _exit) = output;
@@ -1435,9 +1444,8 @@ fn capture_bounded(
 
     if exceeded {
         let dropped = total.saturating_sub(max_bytes);
-        let note = format!(
-            "\n\n[output truncated: {dropped} bytes dropped, cap is {max_bytes} bytes]"
-        );
+        let note =
+            format!("\n\n[output truncated: {dropped} bytes dropped, cap is {max_bytes} bytes]");
         out.extend_from_slice(note.as_bytes());
     }
 
@@ -1542,7 +1550,11 @@ fn memory_wrapped_target(
         // exactly (the limit is set before the inner shell is exec'd).
         let payload = target.get(2).cloned().unwrap_or_default();
         let kb = mb * 1024;
-        return vec!["sh".into(), "-c".into(), format!("ulimit -v {kb}; {payload}")];
+        return vec![
+            "sh".into(),
+            "-c".into(),
+            format!("ulimit -v {kb}; {payload}"),
+        ];
     }
     target
 }
@@ -1552,10 +1564,7 @@ fn memory_wrapped_target(
 /// capability isolation, and the sanitized environment. Callers append either
 /// the `sh -c` payload (shell path) or the program argv (direct path) after
 /// `--`.
-fn build_bwrap_args(
-    cfg: &SandboxConfig,
-    read_only: bool,
-) -> Result<Vec<String>, ToolError> {
+fn build_bwrap_args(cfg: &SandboxConfig, read_only: bool) -> Result<Vec<String>, ToolError> {
     let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
     let home = dirs_home();
 
@@ -1590,7 +1599,7 @@ fn build_bwrap_args(
     // directory (old behavior).  When an exact /etc bind is configured,
     // the user takes full control and we add nothing extra.
     let etc_exact = binds.iter().any(|b| b.to == std::path::Path::new("/etc"));
-    let etc_sub   = binds.iter().any(|b| b.to.starts_with("/etc/"));
+    let etc_sub = binds.iter().any(|b| b.to.starts_with("/etc/"));
     if etc_exact {
         // User provides their own /etc binding.
     } else if etc_sub {
@@ -1757,7 +1766,11 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-#[rig_tool(name = "ls", description = "List files and directories in a path", required(path))]
+#[rig_tool(
+    name = "ls",
+    description = "List files and directories in a path",
+    required(path)
+)]
 pub async fn list_dir(path: String) -> Result<String, ToolError> {
     let base = get_path(&path)?;
 
@@ -1852,8 +1865,8 @@ pub async fn agent_browser(args: String) -> Result<String, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use serial_test::serial;
+    use std::path::Path;
 
     #[test]
     fn test_validate_path_normal() {
@@ -1979,9 +1992,7 @@ mod tests {
 
         let cwd = std::env::current_dir().unwrap();
         let search_root = cwd.to_string_lossy().into_owned();
-        let res = glob_files("*.txt".to_string(), search_root)
-            .await
-            .unwrap();
+        let res = glob_files("*.txt".to_string(), search_root).await.unwrap();
 
         // The matched path must appear in relative form.
         assert!(
@@ -2019,7 +2030,9 @@ mod sandbox_tests {
         timeout_secs: Option<u64>,
     ) -> SandboxConfig {
         SandboxConfig {
-            timeout_secs: timeout_secs.map(|v| crate::config::SandboxTimeoutSecs(Some(v))).unwrap_or(crate::config::SandboxTimeoutSecs(None)),
+            timeout_secs: timeout_secs
+                .map(|v| crate::config::SandboxTimeoutSecs(Some(v)))
+                .unwrap_or(crate::config::SandboxTimeoutSecs(None)),
             network: Some(false),
             memory_mb: crate::config::SandboxMemoryMb(None),
             pid_isolation: Some(true),
@@ -2122,7 +2135,9 @@ mod sandbox_tests {
             return;
         }
         set_sandbox(Some(sandbox_with(vec![], vec![], Some(30))));
-        let out = run_sandboxed("echo x > /tmp/probe && cat /tmp/probe", None).await.unwrap();
+        let out = run_sandboxed("echo x > /tmp/probe && cat /tmp/probe", None)
+            .await
+            .unwrap();
         assert_eq!(out, "x");
     }
 
@@ -2172,7 +2187,11 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        set_sandbox(Some(sandbox_with(vec![], vec![BindPath::Simple("/dev".into())], Some(30))));
+        set_sandbox(Some(sandbox_with(
+            vec![],
+            vec![BindPath::Simple("/dev".into())],
+            Some(30),
+        )));
         // Open /dev/null read-write; many tools (git, compilers, ...) require it.
         let out = run_sandboxed(
             "exec 3<>/dev/null && echo DEVNULL_RW_OK || echo DEVNULL_RW_FAIL",
@@ -2192,10 +2211,17 @@ mod sandbox_tests {
         if !bwrap_on_path() {
             return;
         }
-        set_sandbox(Some(sandbox_with(vec![], vec![BindPath::Simple("/proc".into())], Some(30))));
-        let out = run_sandboxed("test -f /proc/self/status && echo PROC_OK || echo PROC_FAIL", None)
-            .await
-            .unwrap();
+        set_sandbox(Some(sandbox_with(
+            vec![],
+            vec![BindPath::Simple("/proc".into())],
+            Some(30),
+        )));
+        let out = run_sandboxed(
+            "test -f /proc/self/status && echo PROC_OK || echo PROC_FAIL",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, "PROC_OK");
     }
 
@@ -2286,7 +2312,10 @@ mod sandbox_tests {
         // The crate root is not bound, so this is rejected.
         let res = super::write_file("outside.txt".to_string(), "x".to_string()).await;
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("not within a permitted binding"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("not within a permitted binding"));
     }
 
     #[tokio::test]
@@ -2344,19 +2373,31 @@ mod sandbox_tests {
             .await
             .unwrap();
         // Shell write to /tmp/x2.
-        run_sandboxed("echo from-shell > /tmp/x2.txt", None).await.unwrap();
+        run_sandboxed("echo from-shell > /tmp/x2.txt", None)
+            .await
+            .unwrap();
 
         // Both landed on the host temp dir.
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("x.txt")).unwrap().trim(),
+            std::fs::read_to_string(dir.path().join("x.txt"))
+                .unwrap()
+                .trim(),
             "from-tool"
         );
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("x2.txt")).unwrap().trim(),
+            std::fs::read_to_string(dir.path().join("x2.txt"))
+                .unwrap()
+                .trim(),
             "from-shell"
         );
         // And the non-shell tool can read what the shell wrote.
-        let read = super::read_file("/tmp/x2.txt".to_string(), crate::config::ReadOffset(0), crate::config::ReadLimit(0)).await.unwrap();
+        let read = super::read_file(
+            "/tmp/x2.txt".to_string(),
+            crate::config::ReadOffset(0),
+            crate::config::ReadLimit(0),
+        )
+        .await
+        .unwrap();
         assert!(read.contains("from-shell"));
     }
 
@@ -2390,8 +2431,14 @@ mod sandbox_tests {
         )
         .await
         .unwrap();
-        assert!(out.contains("WRITE_DENIED"), "nested ro child should deny write: {out}");
-        assert!(out.contains("PARENT_OK"), "rw parent should allow write: {out}");
+        assert!(
+            out.contains("WRITE_DENIED"),
+            "nested ro child should deny write: {out}"
+        );
+        assert!(
+            out.contains("PARENT_OK"),
+            "rw parent should allow write: {out}"
+        );
     }
 
     // ---- Environment isolation ----
@@ -2423,12 +2470,9 @@ mod sandbox_tests {
         std::env::set_var("PICOCODE_TEST_KEY", "supersecret");
         // PATH must still be present for `cat` (external) to work, proving the
         // default is a blacklist, not a blanket wipe.
-        let out = run_sandboxed(
-            "echo \"K=[$PICOCODE_TEST_KEY] PATH_OK=$PATH\"",
-            None,
-        )
-        .await
-        .unwrap();
+        let out = run_sandboxed("echo \"K=[$PICOCODE_TEST_KEY] PATH_OK=$PATH\"", None)
+            .await
+            .unwrap();
         assert!(
             !out.contains("supersecret"),
             "secret leaked into sandbox: {out}"
@@ -2448,12 +2492,9 @@ mod sandbox_tests {
             mode: EnvMode::OnlyAllow,
             patterns: vec!["PATH".into()],
         })));
-        let out = run_sandboxed(
-            "echo \"K=[$PICOCODE_TEST_KEY2] PATH_OK=$PATH\"",
-            None,
-        )
-        .await
-        .unwrap();
+        let out = run_sandboxed("echo \"K=[$PICOCODE_TEST_KEY2] PATH_OK=$PATH\"", None)
+            .await
+            .unwrap();
         assert!(
             !out.contains("topsecret"),
             "secret leaked under only_allow: {out}"
@@ -2497,7 +2538,9 @@ mod sandbox_tests {
         let res = run_sandboxed("echo hi-there", None).await;
         assert!(res.is_err());
         assert!(
-            res.unwrap_err().to_string().contains("sandbox not configured"),
+            res.unwrap_err()
+                .to_string()
+                .contains("sandbox not configured"),
             "expected refusal, not an unsandboxed run"
         );
     }
@@ -2564,9 +2607,12 @@ mod sandbox_tests {
         set_sandbox(None);
         let cwd = std::env::current_dir().unwrap();
         let absolute = cwd.join("src/main.rs");
-        let out = grep_text("fn main".to_string(), absolute.to_string_lossy().into_owned())
-            .await
-            .unwrap();
+        let out = grep_text(
+            "fn main".to_string(),
+            absolute.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
         assert!(
             out.contains("src/main.rs:"),
             "expected `src/main.rs:` prefix (relative form), got: {out}",
@@ -2674,12 +2720,9 @@ mod edit_file_tests {
     #[serial]
     async fn unmatched_old_text_emits_structured_diagnostic_with_both_views() {
         let _cwd = CwdGuard::new();
-        tokio::fs::write(
-            "b.txt",
-            "fn main() {\n    let x = 1;\n    let y = 2;\n}\n",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write("b.txt", "fn main() {\n    let x = 1;\n    let y = 2;\n}\n")
+            .await
+            .unwrap();
         // Off-by-one indentation in the query — close enough to diagnose.
         let res = edit_file(
             "b.txt".into(),
@@ -2731,8 +2774,7 @@ mod edit_file_tests {
         let v: Value = serde_json::from_str(&res).unwrap();
         let model = v.get("model_view").and_then(|x| x.as_str()).unwrap();
         assert!(
-            model.contains("no similar region")
-                || model.contains("No close-enough region"),
+            model.contains("no similar region") || model.contains("No close-enough region"),
             "expected no-match fallback message, got model_view: {model}",
         );
     }
@@ -2769,9 +2811,7 @@ mod edit_file_tests {
         let _cwd = CwdGuard::new();
         // 15 occurrences on lines 1..=15; we should list 10 and indicate
         // the remainder.
-        let content: String = (1..=15)
-            .map(|i| format!("x {i}\n"))
-            .collect();
+        let content: String = (1..=15).map(|i| format!("x {i}\n")).collect();
         tokio::fs::write("many.txt", &content).await.unwrap();
         let res = edit_file(
             "many.txt".into(),
@@ -2856,7 +2896,10 @@ mod edit_file_tests {
 
         // The file must be unchanged.
         let after = tokio::fs::read_to_string("batch.txt").await.unwrap();
-        assert!(after.contains("let a = 1;"), "edit #1 should NOT have applied");
+        assert!(
+            after.contains("let a = 1;"),
+            "edit #1 should NOT have applied"
+        );
         assert!(!after.contains("let a = 42;"));
     }
 
@@ -2917,7 +2960,9 @@ mod edit_args_wire_tests {
     #[serial]
     async fn canonical_edits_array_parses_and_applies() {
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("canon.txt", "hello\nworld\n").await.unwrap();
+        tokio::fs::write("canon.txt", "hello\nworld\n")
+            .await
+            .unwrap();
         let result = execute_edit(serde_json::json!({
             "path": "canon.txt",
             "edits": [{"oldText": "hello", "newText": "goodbye"}]
@@ -3021,14 +3066,8 @@ mod edit_args_wire_tests {
         .await;
         assert!(result.is_error(), "missing newText must fail: {result:?}");
         let msg = result.output().render();
-        assert!(
-            msg.contains("Invalid edit tool arguments:"),
-            "got: {msg}"
-        );
-        assert!(
-            msg.contains("Expected one of these formats:"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Invalid edit tool arguments:"), "got: {msg}");
+        assert!(msg.contains("Expected one of these formats:"), "got: {msg}");
         assert!(msg.contains("edits"), "got: {msg}");
     }
 
@@ -3038,10 +3077,7 @@ mod edit_args_wire_tests {
         let result = execute_edit(serde_json::json!("just a string")).await;
         assert!(result.is_error());
         let msg = result.output().render();
-        assert!(
-            msg.contains("Invalid edit tool arguments:"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("Invalid edit tool arguments:"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -3077,7 +3113,10 @@ mod edit_args_wire_tests {
         assert!(out.contains("@@@NEW"), "divider lost: {out}");
         assert!(out.contains("@@@END"), "closing marker lost: {out}");
         assert!(out.contains("lines elided"), "no elision notice: {out}");
-        assert!(!out.contains("old line 20"), "bulk content not elided: {out}");
+        assert!(
+            !out.contains("old line 20"),
+            "bulk content not elided: {out}"
+        );
         assert!(
             out.len() <= super::MAX_ECHOED_ARGS,
             "echo exceeds cap: {} chars",
@@ -3125,7 +3164,10 @@ mod edit_args_wire_tests {
             result.output().render()
         );
         // Nothing applied.
-        assert_eq!(tokio::fs::read_to_string("win.txt").await.unwrap(), "x\nkeep\nx\n");
+        assert_eq!(
+            tokio::fs::read_to_string("win.txt").await.unwrap(),
+            "x\nkeep\nx\n"
+        );
     }
 
     #[tokio::test]
@@ -3137,7 +3179,10 @@ mod edit_args_wire_tests {
         let blob = "win2.txt:3\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "win2.txt", "edits": blob})).await;
         assert!(result.is_success(), "got: {result:?}");
-        assert_eq!(tokio::fs::read_to_string("win2.txt").await.unwrap(), "x\nkeep\ny\n");
+        assert_eq!(
+            tokio::fs::read_to_string("win2.txt").await.unwrap(),
+            "x\nkeep\ny\n"
+        );
     }
 
     // ---- `path:LINE` on the JSON `path` argument ----
@@ -3310,7 +3355,10 @@ mod edit_args_wire_tests {
         let blob = "uniq.txt:100\n@@@OLD\nhere\n@@@NEW\nthere\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "uniq.txt", "edits": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
-        assert_eq!(tokio::fs::read_to_string("uniq.txt").await.unwrap(), "only\nthere\n");
+        assert_eq!(
+            tokio::fs::read_to_string("uniq.txt").await.unwrap(),
+            "only\nthere\n"
+        );
     }
 
     #[tokio::test]
@@ -3322,7 +3370,10 @@ mod edit_args_wire_tests {
         let blob = "amb.txt:1\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "amb.txt", "edits": blob})).await;
         let out = result.output().render();
-        assert!(out.contains("ambiguous"), "expected ambiguity failure, got: {out}");
+        assert!(
+            out.contains("ambiguous"),
+            "expected ambiguity failure, got: {out}"
+        );
         assert_eq!(tokio::fs::read_to_string("amb.txt").await.unwrap(), "x x\n");
     }
 
@@ -3359,7 +3410,10 @@ mod edit_args_wire_tests {
         let blob = "skew.txt:52\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "skew.txt", "edits": blob})).await;
         let out = result.output().render();
-        assert!(out.starts_with("Replaced"), "expected skew acceptance, got: {out}");
+        assert!(
+            out.starts_with("Replaced"),
+            "expected skew acceptance, got: {out}"
+        );
         let after = tokio::fs::read_to_string("skew.txt").await.unwrap();
         let lines: Vec<&str> = after.lines().collect();
         assert_eq!(lines[49], "hit", "line 50 should be replaced");
@@ -3382,10 +3436,21 @@ mod edit_args_wire_tests {
         let blob = "tie.txt:43\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "tie.txt", "edits": blob})).await;
         let out = result.output().render();
-        assert!(looks_like_edit_failure(&out), "near-tie must be rejected, got: {out}");
-        assert!(out.contains("next-nearest at line 40"), "d2 must be reported: {out}");
+        assert!(
+            looks_like_edit_failure(&out),
+            "near-tie must be rejected, got: {out}"
+        );
+        assert!(
+            out.contains("next-nearest at line 40"),
+            "d2 must be reported: {out}"
+        );
         assert_eq!(
-            tokio::fs::read_to_string("tie.txt").await.unwrap().lines().nth(39).unwrap(),
+            tokio::fs::read_to_string("tie.txt")
+                .await
+                .unwrap()
+                .lines()
+                .nth(39)
+                .unwrap(),
             "alpha",
             "nothing applied",
         );
@@ -3409,7 +3474,12 @@ mod edit_args_wire_tests {
         assert!(looks_like_edit_failure(&out), "cap must reject, got: {out}");
         assert!(out.contains("not decisive"), "got: {out}");
         assert_eq!(
-            tokio::fs::read_to_string("cap.txt").await.unwrap().lines().next().unwrap(),
+            tokio::fs::read_to_string("cap.txt")
+                .await
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
             "alpha",
             "nothing applied",
         );
@@ -3425,7 +3495,8 @@ mod edit_args_wire_tests {
         // block reports that its only candidate is already claimed.
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("dup.txt", "hello world\n").await.unwrap();
-        let blob = "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
+        let blob =
+            "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "dup.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
@@ -3447,7 +3518,9 @@ mod edit_args_wire_tests {
         // leaves the first un-anchored, expecting elimination. Pass 1 claims
         // line 3; pass 2's block 1 sees only line 1 free.
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("mot.txt", "foo\nbar\nfoo\n").await.unwrap();
+        tokio::fs::write("mot.txt", "foo\nbar\nfoo\n")
+            .await
+            .unwrap();
         let blob = "mot.txt\n@@@OLD\nfoo\n@@@NEW\nAAA\n@@@END\n\nmot.txt:3\n@@@OLD\nfoo\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "mot.txt", "edits": blob})).await;
         let out = result.output().render();
@@ -3465,8 +3538,11 @@ mod edit_args_wire_tests {
         // match claims a region containing one of block 2's candidates,
         // leaving block 2 exactly one free occurrence.
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("chain.txt", "foo bar\nbaz\nbar\n").await.unwrap();
-        let blob = "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
+        tokio::fs::write("chain.txt", "foo bar\nbaz\nbar\n")
+            .await
+            .unwrap();
+        let blob =
+            "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "chain.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
@@ -3505,15 +3581,21 @@ mod edit_args_wire_tests {
         // plain ambiguity. Both diagnostics arrive in one response, in block
         // order.
         let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("noclaim.txt", "dup\na\nb\nc\ndup\n").await.unwrap();
-        let blob = "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
+        tokio::fs::write("noclaim.txt", "dup\na\nb\nc\ndup\n")
+            .await
+            .unwrap();
+        let blob =
+            "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
         let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "edits": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
         // Pass-1 failure: anchor not decisive (d1=2 at line 1, d2=3 at line 5... anchor 3 → |3-1|=2, |3-5|=2 tie).
         assert!(out.contains("edit #1"), "pass-1 diagnostic missing: {out}");
         // Pass-2: no claims exist → plain ambiguity, explicitly NOT claimed.
-        assert!(out.contains("appears 2 times"), "pass-2 diagnostic missing: {out}");
+        assert!(
+            out.contains("appears 2 times"),
+            "pass-2 diagnostic missing: {out}"
+        );
         assert!(
             !out.contains("already matched"),
             "failed block must not have claimed: {out}",
@@ -3535,7 +3617,10 @@ mod edit_args_wire_tests {
         // The whole point of v2: a flat bag of optional scalars, with NO
         // `anyOf` union or nested array that weak harnesses stringify.
         let schema = EditFile.parameters();
-        assert!(schema.get("anyOf").is_none(), "schema must not use anyOf: {schema}");
+        assert!(
+            schema.get("anyOf").is_none(),
+            "schema must not use anyOf: {schema}"
+        );
         assert!(
             schema.get("oneOf").is_none(),
             "schema must not use oneOf: {schema}"
@@ -3543,7 +3628,10 @@ mod edit_args_wire_tests {
 
         let props = schema.get("properties").expect("properties present");
         for key in ["path", "oldText", "newText", "startLine", "edits"] {
-            assert!(props.get(key).is_some(), "missing property `{key}`: {schema}");
+            assert!(
+                props.get(key).is_some(),
+                "missing property `{key}`: {schema}"
+            );
         }
         assert!(
             props.get("endLine").is_none(),
@@ -3551,7 +3639,10 @@ mod edit_args_wire_tests {
         );
         // `edits` is a *string* (the blob), not an array.
         assert_eq!(
-            props.get("edits").and_then(|e| e.get("type")).and_then(|t| t.as_str()),
+            props
+                .get("edits")
+                .and_then(|e| e.get("type"))
+                .and_then(|t| t.as_str()),
             Some("string"),
             "`edits` must be advertised as a string"
         );
@@ -3560,7 +3651,10 @@ mod edit_args_wire_tests {
             .get("required")
             .and_then(|v| v.as_array())
             .expect("required array present");
-        assert!(required.is_empty(), "no parameter is required: {required:?}");
+        assert!(
+            required.is_empty(),
+            "no parameter is required: {required:?}"
+        );
     }
 
     #[tokio::test]

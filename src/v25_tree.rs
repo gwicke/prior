@@ -11,14 +11,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::app_state::{CompactMode, AppState};
+use crate::app_state::{AppState, CompactMode};
 use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
+use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
-use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -46,9 +45,7 @@ fn entry_display_label(entry: &SessionEntry, label: Option<&str>) -> String {
                             arr.iter()
                                 .filter_map(|item| {
                                     match item.get("type").and_then(|t| t.as_str()) {
-                                        Some("text") => {
-                                            item.get("text").and_then(|t| t.as_str())
-                                        }
+                                        Some("text") => item.get("text").and_then(|t| t.as_str()),
                                         _ => None,
                                     }
                                 })
@@ -99,9 +96,7 @@ fn entry_display_label(entry: &SessionEntry, label: Option<&str>) -> String {
             format!("[LABEL] {} -> {}", l, target_id)
         }
         // Meta entries: invisible.
-        SessionEntryContent::SessionInfo { .. } | SessionEntryContent::Leaf { .. } => {
-            String::new()
-        }
+        SessionEntryContent::SessionInfo { .. } | SessionEntryContent::Leaf { .. } => String::new(),
         SessionEntryContent::ActiveToolsChange { .. } => String::new(),
         SessionEntryContent::Custom { custom_type, .. } => {
             format!("[custom] {}", custom_type)
@@ -155,11 +150,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 /// Walk from `leaf_id` up through the tree to collect the set of entry
 /// IDs on the active branch.
-fn collect_active_path(
-    nodes: &[SessionTreeNode],
-    leaf_id: &str,
-    out: &mut HashSet<String>,
-) {
+fn collect_active_path(nodes: &[SessionTreeNode], leaf_id: &str, out: &mut HashSet<String>) {
     // Iterative DFS: walk the tree to find leaf_id, then record the
     // path from root to leaf.  Uses an explicit stack so deep linear
     // sessions (1000s of entries) don't overflow the call stack.
@@ -193,10 +184,7 @@ fn is_assistant(entry: &SessionEntry) -> bool {
 }
 
 /// Find a node by entry ID. Iterative DFS to avoid stack overflow.
-fn find_entry<'a>(
-    nodes: &'a [SessionTreeNode],
-    id: &str,
-) -> Option<&'a SessionTreeNode> {
+fn find_entry<'a>(nodes: &'a [SessionTreeNode], id: &str) -> Option<&'a SessionTreeNode> {
     let mut stack: Vec<&'a [SessionTreeNode]> = Vec::new();
     stack.push(nodes);
     while let Some(current) = stack.pop() {
@@ -253,40 +241,28 @@ fn entry_full_text(entry: &SessionEntry) -> String {
     match &entry.content {
         SessionEntryContent::Message { message } => {
             match message.get("role").and_then(|r| r.as_str()) {
-                Some("user") => {
-                    message
-                        .pointer("/content/0/text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(user)")
-                        .to_string()
-                }
-                Some("assistant") => {
-                    message
-                        .get("content")
-                        .and_then(|c| c.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|item| {
-                                    match item.get("type").and_then(|t| t.as_str()) {
-                                        Some("text") => {
-                                            item.get("text").and_then(|t| t.as_str())
-                                        }
-                                        _ => None,
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default()
-                }
+                Some("user") => message
+                    .pointer("/content/0/text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(user)")
+                    .to_string(),
+                Some("assistant") => message
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| match item.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => item.get("text").and_then(|t| t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default(),
                 _ => String::new(),
             }
         }
-        SessionEntryContent::Compaction {
-            summary, ..
-        } => {
-            summary.clone()
-        }
+        SessionEntryContent::Compaction { summary, .. } => summary.clone(),
         SessionEntryContent::ThinkingLevelChange { thinking_level } => {
             format!("thinking: {}", thinking_level)
         }
@@ -301,13 +277,11 @@ fn entry_full_text(entry: &SessionEntry) -> String {
 /// Extract the role string for metadata.
 fn entry_role(entry: &SessionEntry) -> String {
     match &entry.content {
-        SessionEntryContent::Message { message } => {
-            message
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown")
-                .to_string()
-        }
+        SessionEntryContent::Message { message } => message
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
         SessionEntryContent::Compaction { .. } => "compaction".into(),
         SessionEntryContent::ThinkingLevelChange { .. } => "thinking".into(),
         SessionEntryContent::ModelChange { .. } => "model".into(),
@@ -349,9 +323,7 @@ fn visible_terminals(
         }
         let mut has = false;
         for child in &node.children {
-            if visible(child)
-                || has_vis.get(&child.entry.id).copied().unwrap_or(false)
-            {
+            if visible(child) || has_vis.get(&child.entry.id).copied().unwrap_or(false) {
                 has = true;
                 break;
             }
@@ -382,13 +354,16 @@ fn flatten_turns(
     }
 
     while let Some((node, cur_indent)) = stack.pop() {
-        let label =
-            entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
+        let label = entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
         // Children indent: visible multi-child nodes get +4 indent;
         // everything else keeps current level.
         let is_branch = node.children.len() > 1;
-        let child_indent = if is_branch { cur_indent + 4 } else { cur_indent };
+        let child_indent = if is_branch {
+            cur_indent + 4
+        } else {
+            cur_indent
+        };
 
         if label.is_empty() {
             // Meta entry: skip visual row but descend into children.
@@ -399,7 +374,11 @@ fn flatten_turns(
         }
 
         // Indent rule: assistant → +2, everything else → base indent.
-        let row_indent = if is_assistant(&node.entry) { cur_indent + 2 } else { cur_indent };
+        let row_indent = if is_assistant(&node.entry) {
+            cur_indent + 2
+        } else {
+            cur_indent
+        };
 
         let is_active = active_path.contains(&node.entry.id);
         let is_current = leaf_id == Some(node.entry.id.as_str());
@@ -499,7 +478,10 @@ fn entry_row_desc(
 /// Column definitions for the `/tree` listing.
 pub fn tree_listing_columns() -> Vec<ColumnDef> {
     // Empty label suppresses the table header row (no "DESCRIPTION" line).
-    vec![ColumnDef::new("description", "").min(20).prio(3).wrap(false)]
+    vec![ColumnDef::new("description", "")
+        .min(20)
+        .prio(3)
+        .wrap(false)]
 }
 
 /// Field metadata for the tree listing.
@@ -533,7 +515,11 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
             let mut remaining = line;
             let mut first_chunk = true;
             while remaining.len() > eff_width {
-                let pfx = if first && first_chunk { prefix } else { &indent };
+                let pfx = if first && first_chunk {
+                    prefix
+                } else {
+                    &indent
+                };
                 if let Some(break_at) = remaining[..eff_width].rfind(' ') {
                     result.push(format!("{}{}", pfx, &remaining[..break_at]));
                     remaining = &remaining[break_at + 1..];
@@ -544,7 +530,11 @@ fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
                 first_chunk = false;
             }
             if !remaining.is_empty() {
-                let pfx = if first && first_chunk { prefix } else { &indent };
+                let pfx = if first && first_chunk {
+                    prefix
+                } else {
+                    &indent
+                };
                 result.push(format!("{}{}", pfx, remaining));
             }
         }
@@ -662,10 +652,7 @@ impl SlashDotNode for TreeListNode {
             .map(|l| vec![l])
             .unwrap_or_default();
 
-        let response = Rc::new(DataResponse {
-            rows,
-            active_ids,
-        });
+        let response = Rc::new(DataResponse { rows, active_ids });
 
         // Cache for next call.
         self.cached_data = Some(response.clone());
@@ -721,11 +708,9 @@ impl SlashDotNode for TreeListNode {
             }
             // Marker already in the body; timestamp goes in parens.
             "model" | "thinking" => vec![format!("{} ({})", body, ts)],
-            "user" | "assistant" => wrap_with_prefix(
-                &format!("[{} {}] ", role.to_uppercase(), ts),
-                body,
-                tw,
-            ),
+            "user" | "assistant" => {
+                wrap_with_prefix(&format!("[{} {}] ", role.to_uppercase(), ts), body, tw)
+            }
             // Label/custom/meta: terse legacy form.
             r => vec![format!("[{}] {}", r, ts)],
         }
@@ -745,17 +730,12 @@ pub struct TreeSwitchNode {
 impl SlashDotNode for TreeSwitchNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         Ok(Rc::new(DataResponse {
-            rows: vec![Row::new("switch")
-                .desc("continue from this entry")],
+            rows: vec![Row::new("switch").desc("continue from this entry")],
             active_ids: Vec::new(),
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Move the session leaf to this entry.".to_string(),
             "The next prompt continues from this point.".to_string(),
@@ -807,11 +787,7 @@ impl SlashDotNode for CompactNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Compact: summarize entries before the current point.".into(),
             "Redirects to /tree <id> compact.".into(),
@@ -847,7 +823,10 @@ pub struct TreeCompactManualNode {
 
 impl TreeCompactManualNode {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state, edited: std::cell::RefCell::new(None) }
+        Self {
+            app_state,
+            edited: std::cell::RefCell::new(None),
+        }
     }
 }
 
@@ -860,11 +839,7 @@ impl SlashDotNode for TreeCompactManualNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Manual compaction: scan touched files, open in editor.".into(),
             "Save and close to confirm; discard to cancel.".into(),
@@ -881,13 +856,8 @@ impl SlashDotNode for TreeCompactManualNode {
         let draft = self.edited.borrow_mut().take().unwrap_or_default();
         // Data-plane inline: session/agent/guard/output are all reachable
         // via the slot; errors come back as the stay-open message.
-        match crate::agent::compact_inline(
-            &self.app_state,
-            &target_id,
-            CompactMode::Manual,
-            &draft,
-        )
-        .await
+        match crate::agent::compact_inline(&self.app_state, &target_id, CompactMode::Manual, &draft)
+            .await
         {
             None => SubmitResult::Done(None),
             Some(msg) => SubmitResult::Done(Some(msg)),
@@ -909,7 +879,10 @@ pub struct TreeCompactTextNode {
 
 impl TreeCompactTextNode {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state, edited: std::cell::RefCell::new(None) }
+        Self {
+            app_state,
+            edited: std::cell::RefCell::new(None),
+        }
     }
 }
 
@@ -922,11 +895,7 @@ impl SlashDotNode for TreeCompactTextNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Text-only compaction: extract user prompts + assistant text.".into(),
             "No reasoning, tool calls, or tool output. Edit in editor.".into(),
@@ -1036,9 +1005,7 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 // ---------------------------------------------------------------------------
 
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
-pub fn build_tree_node(
-    app_state: &Arc<AppState>,
-) -> crate::slashdot_menu::menu::SlashDotMenuNode {
+pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
     use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
 
@@ -1050,12 +1017,13 @@ pub fn build_tree_node(
     .with_fields(tree_fields())
     .into();
 
-    let mut tree_node: SlashDotMenuNode =
-        TreeListNode::new(app_state.clone()).into();
-    tree_node.add_child(TreeSwitchNode {
-        app_state: app_state.clone(),
-    }
-    .into());
+    let mut tree_node: SlashDotMenuNode = TreeListNode::new(app_state.clone()).into();
+    tree_node.add_child(
+        TreeSwitchNode {
+            app_state: app_state.clone(),
+        }
+        .into(),
+    );
 
     // Compact subtree: a listing node with three mode children.
     let mut compact_node: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
@@ -1080,12 +1048,10 @@ pub fn build_tree_node(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-    use crate::slashdot_menu::node_impl::{
-        MenuResult, PathArgs, StaticListingNode,
-    };
-    use crate::slashdot_menu::HostKey;
     use crate::session::{SessionEntry, SessionEntryContent, SessionTreeNode};
+    use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
+    use crate::slashdot_menu::node_impl::{MenuResult, PathArgs, StaticListingNode};
+    use crate::slashdot_menu::HostKey;
 
     fn test_settings() -> crate::settings::SettingsStore {
         crate::settings::SettingsStore {
@@ -1163,15 +1129,13 @@ mod tests {
 
     #[test]
     fn tree_listing_shows_entries() {
-        let tree = vec![
-            node(
-                make_entry("u1", None, "user", "hello world"),
-                vec![node(
-                    make_entry("a1", Some("u1"), "assistant", "hi there"),
-                    vec![],
-                )],
-            ),
-        ];
+        let tree = vec![node(
+            make_entry("u1", None, "user", "hello world"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "hi there"),
+                vec![],
+            )],
+        )];
         let app_state = app_state_with_tree(tree);
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
@@ -1179,10 +1143,16 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2, "should have user + assistant rows");
-                assert!(plan.rows[0].0.contains("hello world"),
-                    "first row should contain user text: {}", plan.rows[0].0);
-                assert!(plan.rows[1].0.contains("hi there"),
-                    "second row should contain assistant text: {}", plan.rows[1].0);
+                assert!(
+                    plan.rows[0].0.contains("hello world"),
+                    "first row should contain user text: {}",
+                    plan.rows[0].0
+                );
+                assert!(
+                    plan.rows[1].0.contains("hi there"),
+                    "second row should contain assistant text: {}",
+                    plan.rows[1].0
+                );
             }
             other => panic!(
                 "expected Continue, got {:?}",
@@ -1221,45 +1191,70 @@ mod tests {
 
         // 1. Filtered leaf overview: u1 is a branch parent (no `tags`
         //    field → dropped); only u2/u3 survive.
-        let (plan, prompt) =
-            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80)));
-        assert_eq!(plan.rows.len(), 2, "filter must show only leaves: {:?}", plan.rows);
+        let (plan, prompt) = expect_continue(futures::executor::block_on(
+            handle.eval_prompt_resolved("tree .tags:leaf", HostKey::None, 80),
+        ));
+        assert_eq!(
+            plan.rows.len(),
+            2,
+            "filter must show only leaves: {:?}",
+            plan.rows
+        );
         assert_eq!(prompt, "tree .tags:leaf");
 
         // 2. Cursor to the second leaf, Tab drills into it.
-        let _ = futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::MoveCursor(1), 80));
-        let (_, prompt) =
-            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80)));
+        let _ = futures::executor::block_on(handle.eval_prompt_resolved(
+            "tree .tags:leaf",
+            HostKey::MoveCursor(1),
+            80,
+        ));
+        let (_, prompt) = expect_continue(futures::executor::block_on(
+            handle.eval_prompt_resolved("tree .tags:leaf", HostKey::Tab, 80),
+        ));
         assert_eq!(prompt, "tree u3 ", "drill appends cursored id + space");
 
         // 3. Esc drills out: §5.1 step 1 restores the stored filter in
         //    the prompt (not a bare id) with the cursor back on u3.
-        let (plan, prompt) =
-            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80)));
-        assert_eq!(prompt, "tree .tags:leaf",
-            "Esc must restore the filter view_args into the prompt");
-        assert_eq!(plan.rows.len(), 2,
-            "restored view is the filtered listing: {:?}", plan.rows);
+        let (plan, prompt) = expect_continue(futures::executor::block_on(
+            handle.eval_prompt_resolved(&prompt, HostKey::Esc, 80),
+        ));
+        assert_eq!(
+            prompt, "tree .tags:leaf",
+            "Esc must restore the filter view_args into the prompt"
+        );
+        assert_eq!(
+            plan.rows.len(),
+            2,
+            "restored view is the filtered listing: {:?}",
+            plan.rows
+        );
         let selected = plan.selected.unwrap_or(0);
-        assert!(plan.rows[selected].0.contains("child b"),
-            "cursor must be pinned on the drilled row (u3): {:?}", plan.rows[selected]);
+        assert!(
+            plan.rows[selected].0.contains("child b"),
+            "cursor must be pinned on the drilled row (u3): {:?}",
+            plan.rows[selected]
+        );
 
         // 4. A cursor move after the restore stays in the filtered
         //    view (the bug: it fell back to the full listing).
-        let (plan, _) =
-            expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(&prompt, HostKey::MoveCursor(-1), 80)));
-        assert_eq!(plan.rows.len(), 2,
-            "filtered view must survive cursor moves: {:?}", plan.rows);
+        let (plan, _) = expect_continue(futures::executor::block_on(handle.eval_prompt_resolved(
+            &prompt,
+            HostKey::MoveCursor(-1),
+            80,
+        )));
+        assert_eq!(
+            plan.rows.len(),
+            2,
+            "filtered view must survive cursor moves: {:?}",
+            plan.rows
+        );
     }
 
     // --- Caching ---
 
     #[test]
     fn tree_listing_caching_skips_rebuild() {
-        let tree = vec![node(
-            make_entry("u1", None, "user", "test"),
-            vec![],
-        )];
+        let tree = vec![node(make_entry("u1", None, "user", "test"), vec![])];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
 
@@ -1271,16 +1266,15 @@ mod tests {
 
         let r1 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
         let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
-        assert!(Rc::ptr_eq(&r1, &r2),
-            "same tree + same leaf should return same Rc");
+        assert!(
+            Rc::ptr_eq(&r1, &r2),
+            "same tree + same leaf should return same Rc"
+        );
     }
 
     #[test]
     fn tree_listing_caching_rebuilds_on_change() {
-        let tree = vec![node(
-            make_entry("u1", None, "user", "test"),
-            vec![],
-        )];
+        let tree = vec![node(make_entry("u1", None, "user", "test"), vec![])];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
 
@@ -1300,8 +1294,7 @@ mod tests {
         app_state.set_raw_tree(Arc::new(new_tree));
 
         let r2 = futures::executor::block_on(tree_node.data(1, &path_args)).unwrap();
-        assert!(!Rc::ptr_eq(&r1, &r2),
-            "changed tree should return new Rc");
+        assert!(!Rc::ptr_eq(&r1, &r2), "changed tree should return new Rc");
         assert_eq!(r2.rows.len(), 2, "new tree has two entries");
     }
 
@@ -1309,10 +1302,7 @@ mod tests {
 
     #[test]
     fn tree_entry_header_shows_message_body() {
-        let tree = vec![node(
-            make_entry("u1", None, "user", "hello\nworld"),
-            vec![],
-        )];
+        let tree = vec![node(make_entry("u1", None, "user", "hello\nworld"), vec![])];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
 
@@ -1325,20 +1315,35 @@ mod tests {
         // Trigger data() first to populate the cache.
         let _ = futures::executor::block_on(tree_node.data(0, &path_args));
 
-        let header = futures::executor::block_on(tree_node.header(&path_args, &RenderContext { term_width: 80 }));
+        let header = futures::executor::block_on(
+            tree_node.header(&path_args, &RenderContext { term_width: 80 }),
+        );
         let joined = header.join("\n");
-        assert!(joined.contains("hello"), "header should contain message text: {}", joined);
-        assert!(joined.contains("world"), "header should contain full text: {}", joined);
-        assert!(joined.contains("USER"), "header should contain role: {}", joined);
+        assert!(
+            joined.contains("hello"),
+            "header should contain message text: {}",
+            joined
+        );
+        assert!(
+            joined.contains("world"),
+            "header should contain full text: {}",
+            joined
+        );
+        assert!(
+            joined.contains("USER"),
+            "header should contain role: {}",
+            joined
+        );
     }
 
     fn row_field(row: &Row, name: &str) -> Option<String> {
-        row.fields.iter().find(|(k, _)| k == name).and_then(|(_, v)| {
-            match v {
+        row.fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .and_then(|(_, v)| match v {
                 crate::slashdot_menu::value::Value::Str(s) => Some(s.clone()),
                 _ => None,
-            }
-        })
+            })
     }
 
     fn tree_path(ids: &[&str]) -> PathArgs {
@@ -1351,21 +1356,18 @@ mod tests {
 
     #[test]
     fn tree_row_desc_keeps_newlines_and_carries_fields() {
-        let tree = vec![node(
-            make_entry("u1", None, "user", "hello\nworld"),
-            vec![],
-        )];
+        let tree = vec![node(make_entry("u1", None, "user", "hello\nworld"), vec![])];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
-        let row = resp
-            .rows
-            .iter()
-            .find(|r| r.id == "u1")
-            .expect("u1 row");
+        let resp =
+            futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
+        let row = resp.rows.iter().find(|r| r.id == "u1").expect("u1 row");
         let desc = row.description.clone().unwrap_or_default();
-        assert!(desc.contains("hello\nworld"),
-            "desc must keep newlines for header/fuzzy: {:?}", desc);
+        assert!(
+            desc.contains("hello\nworld"),
+            "desc must keep newlines for header/fuzzy: {:?}",
+            desc
+        );
         assert_eq!(row_field(row, "role").as_deref(), Some("user"));
         assert_eq!(
             row_field(row, "timestamp").as_deref(),
@@ -1384,15 +1386,19 @@ mod tests {
         )];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
+        let resp =
+            futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
                 .find(|r| r.id == id)
                 .and_then(|r| row_field(r, "tags"))
         };
-        assert_eq!(tags("u1"), None,
-            "parent has visible children — not a leaf endpoint");
+        assert_eq!(
+            tags("u1"),
+            None,
+            "parent has visible children — not a leaf endpoint"
+        );
         assert_eq!(tags("u2"), Some("leaf".to_string()));
         assert_eq!(tags("u3"), Some("leaf".to_string()));
     }
@@ -1413,7 +1419,8 @@ mod tests {
         )];
         let app_state = app_state_with_tree(tree);
         let mut tree_node = TreeListNode::new(app_state.clone());
-        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
+        let resp =
+            futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let tags = |id: &str| {
             resp.rows
                 .iter()
@@ -1422,8 +1429,10 @@ mod tests {
         };
         assert_eq!(tags("u1"), None, "visible descendant below");
         assert_eq!(tags("u3"), Some("leaf".to_string()));
-        assert!(resp.rows.iter().all(|r| r.id != "u2"),
-            "invisible tool result has no row");
+        assert!(
+            resp.rows.iter().all(|r| r.id != "u2"),
+            "invisible tool result has no row"
+        );
     }
 
     #[test]
@@ -1446,25 +1455,40 @@ mod tests {
         let mut tree_node = TreeListNode::new(app_state.clone());
 
         // Desc carries the truncated "from" context AND the summary.
-        let resp = futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
+        let resp =
+            futures::executor::block_on(tree_node.data(0, &tree_path(&["tree"]))).expect("data");
         let row = resp.rows.iter().find(|r| r.id == "c1").expect("c1 row");
         let desc = row.description.clone().unwrap_or_default();
-        assert!(desc.contains("[COMPACT] from kept context line"),
-            "desc from-context: {:?}", desc);
+        assert!(
+            desc.contains("[COMPACT] from kept context line"),
+            "desc from-context: {:?}",
+            desc
+        );
         assert!(desc.contains("summarised body"), "desc summary: {:?}", desc);
         assert_eq!(row_field(row, "tags").as_deref(), Some("leaf"));
 
         // Header renders from that row: marker with timestamp, then
         // from-context, then summary.
-        let header = futures::executor::block_on(tree_node.header(&tree_path(&["tree", "c1"]),
-            &RenderContext { term_width: 120 }));
+        let header = futures::executor::block_on(tree_node.header(
+            &tree_path(&["tree", "c1"]),
+            &RenderContext { term_width: 120 },
+        ));
         let joined = header.join("\n");
-        assert!(joined.contains("[COMPACT 2025-01-02"),
-            "header timestamped marker: {}", joined);
-        assert!(joined.contains("from kept context line"),
-            "header from-context: {}", joined);
-        assert!(joined.contains("summarised body"),
-            "header summary: {}", joined);
+        assert!(
+            joined.contains("[COMPACT 2025-01-02"),
+            "header timestamped marker: {}",
+            joined
+        );
+        assert!(
+            joined.contains("from kept context line"),
+            "header from-context: {}",
+            joined
+        );
+        assert!(
+            joined.contains("summarised body"),
+            "header summary: {}",
+            joined
+        );
     }
 
     // --- Switch ---
@@ -1479,7 +1503,9 @@ mod tests {
             "hi",
         )]);
         app_state.set_session(Some(session.clone()));
-        let mut tree_node = TreeSwitchNode { app_state: app_state.clone() };
+        let mut tree_node = TreeSwitchNode {
+            app_state: app_state.clone(),
+        };
         // Action node path: ["tree", "<entry-id>", "switch"]
         let path_args = PathArgs {
             ids: vec!["tree".into(), "some-entry".into(), "switch".into()],
@@ -1499,15 +1525,13 @@ mod tests {
 
     #[test]
     fn tree_switch_full_traversal() {
-        let tree = vec![
-            node(
-                make_entry("u1", None, "user", "first message"),
-                vec![node(
-                    make_entry("a1", Some("u1"), "assistant", "response"),
-                    vec![],
-                )],
-            ),
-        ];
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first message"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "response"),
+                vec![],
+            )],
+        )];
         let app_state = app_state_with_tree(tree);
         let session = crate::agent::test_session_with_entries(vec![make_entry(
             "u1",
@@ -1525,7 +1549,10 @@ mod tests {
             MenuResult::Continue(plan, _) => {
                 assert!(!plan.rows.is_empty(), "tree listing should have rows");
             }
-            other => panic!("expected Continue at listing, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected Continue at listing, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
 
         // 2. Drill into u1.
@@ -1533,11 +1560,13 @@ mod tests {
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into entry");
 
         // 3. Drill into switch.
-        let r = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::None, 80));
+        let r =
+            futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)), "drill into switch");
 
         // 4. Enter → submit.
-        let _ = futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
+        let _ =
+            futures::executor::block_on(handle.eval_prompt("tree u1 switch ", HostKey::Enter, 80));
         let leaf = futures::executor::block_on(session.get_leaf_id());
         assert_eq!(
             leaf.as_deref(),
@@ -1570,12 +1599,21 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 1);
-                assert!(plan.rows[0].0.contains("[MODEL]"),
-                    "model change should have [MODEL] prefix: {}", plan.rows[0].0);
-                assert!(plan.rows[0].0.contains("openai/gpt-4o"),
-                    "model change should show provider/model: {}", plan.rows[0].0);
+                assert!(
+                    plan.rows[0].0.contains("[MODEL]"),
+                    "model change should have [MODEL] prefix: {}",
+                    plan.rows[0].0
+                );
+                assert!(
+                    plan.rows[0].0.contains("openai/gpt-4o"),
+                    "model change should show provider/model: {}",
+                    plan.rows[0].0
+                );
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1603,10 +1641,15 @@ mod tests {
         let result = futures::executor::block_on(handle.eval_prompt("tree ", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
-                assert!(plan.rows.is_empty(),
-                    "tool-call-only assistant should be hidden");
+                assert!(
+                    plan.rows.is_empty(),
+                    "tool-call-only assistant should be hidden"
+                );
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1626,8 +1669,11 @@ mod tests {
             args: Default::default(),
         };
         let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
-        assert_eq!(resp.active_ids, vec!["u2".to_string()],
-            "active_ids should contain the leaf entry");
+        assert_eq!(
+            resp.active_ids,
+            vec!["u2".to_string()],
+            "active_ids should contain the leaf entry"
+        );
     }
 
     #[test]
@@ -1639,10 +1685,7 @@ mod tests {
             make_entry("u1", None, "user", "first"),
             vec![node(
                 make_entry("a1", Some("u1"), "assistant", "reply"),
-                vec![node(
-                    make_entry("u2", Some("a1"), "user", "second"),
-                    vec![],
-                )],
+                vec![node(make_entry("u2", Some("a1"), "user", "second"), vec![])],
             )],
         )];
         let app_state = app_state_with_tree(tree);
@@ -1654,8 +1697,11 @@ mod tests {
             args: Default::default(),
         };
         let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
-        assert_eq!(resp.active_ids, vec!["u2".to_string()],
-            "active_ids should find leaf deep in tree");
+        assert_eq!(
+            resp.active_ids,
+            vec!["u2".to_string()],
+            "active_ids should find leaf deep in tree"
+        );
     }
 
     // --- Compact: mode submit tests ---
@@ -1663,16 +1709,17 @@ mod tests {
     #[test]
     fn compact_manual_submit_appends_compaction() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
-            "u1",
-            None,
-            "user",
-            "hi",
-        )]);
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactManualNode::new(app_state.clone());
         let path_args = PathArgs {
-            ids: vec!["tree".into(), "u1".into(), "compact".into(), "manual".into()],
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "manual".into(),
+            ],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -1693,16 +1740,17 @@ mod tests {
     #[test]
     fn compact_text_only_submit_appends_compaction() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
-            "u1",
-            None,
-            "user",
-            "hi",
-        )]);
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
         let mut node = TreeCompactTextNode::new(app_state.clone());
         let path_args = PathArgs {
-            ids: vec!["tree".into(), "u1".into(), "compact".into(), "text-only".into()],
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "text-only".into(),
+            ],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -1723,16 +1771,17 @@ mod tests {
     #[test]
     fn compact_prompt_unknown_entry_errors() {
         let app_state = test_app_state();
-        let session = crate::agent::test_session_with_entries(vec![make_entry(
-            "other",
-            None,
-            "user",
-            "hi",
-        )]);
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("other", None, "user", "hi")]);
         app_state.set_session(Some(session));
         let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
-            ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "prompt".into(),
+            ],
             suffix: "summarize the key decisions".into(),
             args: Default::default(),
         };
@@ -1743,7 +1792,10 @@ mod tests {
             SubmitResult::Done(Some(msg)) => {
                 assert!(msg.contains("unknown tree entry"), "msg: {msg}")
             }
-            other => panic!("expected stay-open unknown-entry error, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected stay-open unknown-entry error, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1752,7 +1804,12 @@ mod tests {
         let app_state = test_app_state();
         let mut node = TreeCompactPromptNode::new(app_state.clone());
         let path_args = PathArgs {
-            ids: vec!["tree".into(), "u1".into(), "compact".into(), "prompt".into()],
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "prompt".into(),
+            ],
             suffix: String::new(),
             args: Default::default(),
         };
@@ -1761,7 +1818,10 @@ mod tests {
             SubmitResult::Done(Some(msg)) => {
                 assert!(msg.contains("no active session"), "msg: {msg}")
             }
-            other => panic!("expected stay-open no-session error, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected stay-open no-session error, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1769,15 +1829,13 @@ mod tests {
 
     #[test]
     fn compact_full_traversal_manual() {
-        let tree = vec![
-            node(
-                make_entry("u1", None, "user", "first message"),
-                vec![node(
-                    make_entry("a1", Some("u1"), "assistant", "response"),
-                    vec![],
-                )],
-            ),
-        ];
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first message"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "response"),
+                vec![],
+            )],
+        )];
         let app_state = app_state_with_tree(tree);
         let session = crate::agent::test_session_with_entries(vec![make_entry(
             "u1",
@@ -1798,17 +1856,26 @@ mod tests {
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 3. Drill into compact.
-        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact ", HostKey::None, 80));
+        let r =
+            futures::executor::block_on(handle.eval_prompt("tree u1 compact ", HostKey::None, 80));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 4. Drill into manual.
-        let r = futures::executor::block_on(handle.eval_prompt("tree u1 compact manual ", HostKey::None, 80));
+        let r = futures::executor::block_on(handle.eval_prompt(
+            "tree u1 compact manual ",
+            HostKey::None,
+            80,
+        ));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
         // 5. Enter → submit (inline compact drives session IO — tokio
         // driver; review is None without a term guard → non-interactive
         // append).
-        let _ = crate::agent::block_on_test(handle.eval_prompt("tree u1 compact manual ", HostKey::Enter, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt(
+            "tree u1 compact manual ",
+            HostKey::Enter,
+            80,
+        ));
         let appended = crate::agent::block_on_test(async {
             let idx = session.index().lock().await;
             idx.entries.values().any(|e| {
@@ -1832,9 +1899,14 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
+        let header =
+            futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
         assert!(!header.is_empty());
-        assert!(header[0].contains("Manual"), "header mentions manual: {}", header[0]);
+        assert!(
+            header[0].contains("Manual"),
+            "header mentions manual: {}",
+            header[0]
+        );
     }
 
     #[test]
@@ -1846,9 +1918,13 @@ mod tests {
             suffix: "my custom prompt".into(),
             args: Default::default(),
         };
-        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
-        assert!(header.iter().any(|l| l.contains("my custom prompt")),
-            "header should contain the prompt text: {:?}", header);
+        let header =
+            futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
+        assert!(
+            header.iter().any(|l| l.contains("my custom prompt")),
+            "header should contain the prompt text: {:?}",
+            header
+        );
     }
 
     #[test]
@@ -1860,9 +1936,13 @@ mod tests {
             suffix: String::new(),
             args: Default::default(),
         };
-        let header = futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
-        assert!(header.iter().any(|l| l.contains("default")),
-            "header should mention default: {:?}", header);
+        let header =
+            futures::executor::block_on(node.header(&path_args, &RenderContext { term_width: 80 }));
+        assert!(
+            header.iter().any(|l| l.contains("default")),
+            "header should mention default: {:?}",
+            header
+        );
     }
 
     // --- Indentation ---
@@ -1919,9 +1999,11 @@ mod tests {
         assert_eq!(flat.len(), expected.len());
         for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
             assert_eq!(flat[i].0, *exp_id, "row {} id", i);
-            assert_eq!(flat[i].1, *exp_indent,
+            assert_eq!(
+                flat[i].1, *exp_indent,
                 "row {} ({}) indent: expected {}, got {}",
-                i, exp_id, exp_indent, flat[i].1);
+                i, exp_id, exp_indent, flat[i].1
+            );
         }
     }
 
@@ -1946,10 +2028,21 @@ mod tests {
                 let a1_text = &plan.rows[1].0;
                 let u1_indent = u1_text.len() - u1_text.trim_start().len();
                 let a1_indent = a1_text.len() - a1_text.trim_start().len();
-                assert_eq!(u1_indent, 0, "user row should have no indent: {:?}", u1_text);
-                assert_eq!(a1_indent, 2, "assistant row should have 2-space indent: {:?}", a1_text);
+                assert_eq!(
+                    u1_indent, 0,
+                    "user row should have no indent: {:?}",
+                    u1_text
+                );
+                assert_eq!(
+                    a1_indent, 2,
+                    "assistant row should have 2-space indent: {:?}",
+                    a1_text
+                );
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -1993,12 +2086,17 @@ mod tests {
                 for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
                     let text = &plan.rows[i].0;
                     let indent = text.len() - text.trim_start().len();
-                    assert_eq!(indent, *exp_indent,
+                    assert_eq!(
+                        indent, *exp_indent,
                         "row {} ({}) indent wrong in rendered output: {:?}",
-                        i, exp_id, text);
+                        i, exp_id, text
+                    );
                 }
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -2006,12 +2104,12 @@ mod tests {
     fn indent_survives_table_render() {
         // Check that leading-space indent survives through the Table
         // rendering pipeline used by build_render_plan.
-        use crate::slashdot_menu::table::{Table, Align};
+        use crate::slashdot_menu::table::{Align, Table};
 
         let cells = vec![
-            "hello",           // indent 0
-            "  world",         // indent 2
-            "    model",       // indent 4
+            "hello",     // indent 0
+            "  world",   // indent 2
+            "    model", // indent 4
         ];
         let mut t = Table::new(&[""])
             .with_aligns(&[Align::Left])
@@ -2026,9 +2124,11 @@ mod tests {
         for (i, (cell, line)) in cells.iter().zip(rendered.iter()).enumerate() {
             let indent = line.len() - line.trim_start().len();
             let expected_indent = cell.len() - cell.trim_start().len();
-            assert_eq!(indent, expected_indent,
+            assert_eq!(
+                indent, expected_indent,
                 "row {} cell={:?} rendered={:?}: indent lost in table render",
-                i, cell, line);
+                i, cell, line
+            );
         }
     }
 
@@ -2060,7 +2160,10 @@ mod tests {
         for (i, row) in resp.rows.iter().enumerate() {
             let desc = row.description.clone().unwrap_or_default();
             let indent = desc.len() - desc.trim_start().len();
-            eprintln!("  row {}: id={:?} indent={} desc={:?}", i, row.id, indent, desc);
+            eprintln!(
+                "  row {}: id={:?} indent={} desc={:?}",
+                i, row.id, indent, desc
+            );
         }
     }
 
@@ -2149,19 +2252,25 @@ mod tests {
                     ("a1", 2),
                     ("u2", 0),
                     ("a2", 2),
-                    ("mc1", 0),  // model change: Boundary at base
-                    ("mc2", 4),  // branch: mc1 has 3 children → indent+4
+                    ("mc1", 0), // model change: Boundary at base
+                    ("mc2", 4), // branch: mc1 has 3 children → indent+4
                     ("mc3", 4),
                     ("mc4", 4),
                 ];
                 for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
                     let text = &plan.rows[i].0;
                     let indent = text.len() - text.trim_start().len();
-                    assert_eq!(indent, *exp_indent,
-                        "row {} ({}) indent wrong: {:?}", i, exp_id, text);
+                    assert_eq!(
+                        indent, *exp_indent,
+                        "row {} ({}) indent wrong: {:?}",
+                        i, exp_id, text
+                    );
                 }
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -2213,19 +2322,25 @@ mod tests {
         }
 
         let expected = vec![
-            ("u1", 0),   // user
-            ("a1", 2),   // assistant (+2)
-            ("mc1", 0),  // model change: back to base
-            ("u2", 0),   // user: base indent
-            ("a2", 2),   // assistant (+2)
+            ("u1", 0),  // user
+            ("a1", 2),  // assistant (+2)
+            ("mc1", 0), // model change: back to base
+            ("u2", 0),  // user: base indent
+            ("a2", 2),  // assistant (+2)
         ];
-        assert_eq!(flat.len(), expected.len(),
-            "rows: {:?}", flat.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>());
+        assert_eq!(
+            flat.len(),
+            expected.len(),
+            "rows: {:?}",
+            flat.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+        );
         for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
             assert_eq!(flat[i].0, *exp_id, "row {} id", i);
-            assert_eq!(flat[i].1, *exp_indent,
+            assert_eq!(
+                flat[i].1, *exp_indent,
                 "row {} ({}) indent: expected {}, got {}",
-                i, exp_id, exp_indent, flat[i].1);
+                i, exp_id, exp_indent, flat[i].1
+            );
         }
     }
 
@@ -2334,7 +2449,11 @@ mod tests {
         let u1_indent = u1_desc.len() - u1_desc.trim_start().len();
         let a_indent = a_desc.len() - a_desc.trim_start().len();
         assert_eq!(u1_indent, 0, "user should have indent 0: {:?}", u1_desc);
-        assert_eq!(a_indent, 2, "assistant should have indent 2 after tool chain: {:?}", a_desc);
+        assert_eq!(
+            a_indent, 2,
+            "assistant should have indent 2 after tool chain: {:?}",
+            a_desc
+        );
     }
 
     // --- drill_rewrite tests ---
@@ -2343,7 +2462,9 @@ mod tests {
     fn compact_node_drill_rewrite_redirects_to_tree() {
         let app_state = test_app_state();
         app_state.set_leaf_id(Some("msg-42".into()));
-        let mut node = CompactNode { app_state: app_state.clone() };
+        let mut node = CompactNode {
+            app_state: app_state.clone(),
+        };
         let path = vec!["compact".to_string()];
         let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, Some("tree msg-42 compact ".to_string()));
@@ -2353,7 +2474,9 @@ mod tests {
     fn compact_node_no_leaf_returns_none() {
         let app_state = test_app_state();
         // leaf_id is None (no session).
-        let mut node = CompactNode { app_state: app_state.clone() };
+        let mut node = CompactNode {
+            app_state: app_state.clone(),
+        };
         let path = vec!["compact".to_string()];
         let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
         assert_eq!(result, None);
@@ -2363,11 +2486,19 @@ mod tests {
     fn compact_prompt_drill_rewrite_fills_default() {
         let app_state = test_app_state();
         let mut node = TreeCompactPromptNode::new(app_state.clone());
-        let path = vec!["tree".to_string(), "msg-1".to_string(),
-                        "compact".to_string(), "prompt".to_string()];
+        let path = vec![
+            "tree".to_string(),
+            "msg-1".to_string(),
+            "compact".to_string(),
+            "prompt".to_string(),
+        ];
         let result = futures::executor::block_on(node.drill_rewrite(&PathArgs::new(path, " ")));
-        assert_eq!(result, Some(
-            "tree msg-1 compact prompt Summarize the conversation up to this point.".to_string()
-        ));
+        assert_eq!(
+            result,
+            Some(
+                "tree msg-1 compact prompt Summarize the conversation up to this point."
+                    .to_string()
+            )
+        );
     }
 }

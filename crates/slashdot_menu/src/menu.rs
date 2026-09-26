@@ -30,8 +30,8 @@
 //! let menu = SlashDotMenu::from_root_node(root);
 //! ```
 
-use crate::node_entry::NodeEntry;
 use crate::node_entry::HostKey;
+use crate::node_entry::NodeEntry;
 use crate::node_impl::{MenuResult, RenderContext, SlashDotNode};
 
 /// A node in the menu tree. Wraps the internal `NodeEntry` with a
@@ -114,8 +114,14 @@ impl<'a> SlashDotHandle<'a> {
     /// `term_width` is the current terminal width in columns; it is
     /// packaged into a [`RenderContext`] and threaded through the
     /// traversal by reference.
-    pub async fn eval_prompt(&mut self, prompt: &str, key: HostKey, term_width: usize) -> MenuResult {
-        self.eval_prompt_with_cursor(prompt, key, term_width, prompt.len()).await
+    pub async fn eval_prompt(
+        &mut self,
+        prompt: &str,
+        key: HostKey,
+        term_width: usize,
+    ) -> MenuResult {
+        self.eval_prompt_with_cursor(prompt, key, term_width, prompt.len())
+            .await
     }
 
     /// Like [`eval_prompt`](Self::eval_prompt) with an explicit cursor

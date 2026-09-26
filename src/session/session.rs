@@ -244,7 +244,10 @@ fn collect_touched_files(
 ///
 /// Deterministic (no LLM). Used as the `summary` of a `Compaction` entry
 /// ("text only" mode). Empty when the dropped span has no renderable text.
-pub(crate) fn build_text_only_summary(dropped: &[SessionEntry], session_dir: &std::path::Path) -> String {
+pub(crate) fn build_text_only_summary(
+    dropped: &[SessionEntry],
+    session_dir: &std::path::Path,
+) -> String {
     let mut out = String::new();
     let mut files: Vec<TouchedFile> = Vec::new();
     // Assistant text accumulates until the next user prompt closes the turn.
@@ -345,7 +348,11 @@ pub(crate) fn build_text_only_summary(dropped: &[SessionEntry], session_dir: &st
 /// Empty groups (no `.md` files or no other files) are omitted. A span
 /// that touches no files returns the empty string — i.e. manual-mode
 /// compaction remains a no-op when there is nothing to point at.
-pub(crate) fn build_manual_template(dropped: &[SessionEntry], previous_summary: Option<&str>, session_dir: &std::path::Path) -> String {
+pub(crate) fn build_manual_template(
+    dropped: &[SessionEntry],
+    previous_summary: Option<&str>,
+    session_dir: &std::path::Path,
+) -> String {
     // Build the file list: previous-summary files first (in their original
     // order), then newly-touched files from the dropped span (in chronological
     // session order), de-duplicated. De-dup promotes read→modified in-place at
@@ -509,7 +516,8 @@ impl<'a> Extractor<'a> {
             || path.starts_with('<')  // email / markup
             || !path.contains('.')     // no extension → not a file
             || path.ends_with('.')     // trailing dot
-            || path.contains("://")    // URL
+            || path.contains("://")
+        // URL
         {
             self.unparsed.push(line);
             return;
@@ -529,7 +537,11 @@ impl<'a> Extractor<'a> {
             None => Some("read".to_string()),
         };
 
-        let target = if is_doc { &mut self.documents } else { &mut self.files };
+        let target = if is_doc {
+            &mut self.documents
+        } else {
+            &mut self.files
+        };
         target.push((path, descriptor));
     }
 
@@ -579,8 +591,7 @@ fn split_sections(input: &str) -> (String, HashMap<String, String>) {
                     current_body.clear();
                 }
                 // Normalise label.
-                let label_raw =
-                    rest_stripped.trim_start_matches('[').trim_end_matches(']');
+                let label_raw = rest_stripped.trim_start_matches('[').trim_end_matches(']');
                 current_label = Some(label_raw.to_lowercase());
                 continue;
             }
@@ -649,7 +660,11 @@ fn parse_summary_into_sections(
             for line in body.lines() {
                 extractor.ingest(line);
             }
-            for (path, descriptor) in extractor.files.drain(..).chain(extractor.documents.drain(..)) {
+            for (path, descriptor) in extractor
+                .files
+                .drain(..)
+                .chain(extractor.documents.drain(..))
+            {
                 let modified = descriptor.as_deref() == Some("modified");
                 all_files.push(TouchedFile {
                     path: path.to_string(),
@@ -912,12 +927,9 @@ impl Session {
             for pi_entry in &mut pi_entries {
                 if let SessionEntryContent::Message { message } = &mut pi_entry.content {
                     if message.get("role").and_then(|v| v.as_str()) == Some("toolResult") {
-                        if let Some(call_id) =
-                            message.get("toolCallId").and_then(|v| v.as_str())
-                        {
+                        if let Some(call_id) = message.get("toolCallId").and_then(|v| v.as_str()) {
                             if let Some(tool_name) = map.get(call_id) {
-                                message["toolName"] =
-                                    serde_json::Value::String(tool_name.clone());
+                                message["toolName"] = serde_json::Value::String(tool_name.clone());
                             }
                         }
                     }
@@ -945,7 +957,11 @@ impl Session {
             for pi_entry in &pi_entries {
                 index.entries.insert(pi_entry.id.clone(), pi_entry.clone());
                 if let Some(ref pid) = pi_entry.parent_id {
-                    index.children.entry(pid.clone()).or_default().push(pi_entry.id.clone());
+                    index
+                        .children
+                        .entry(pid.clone())
+                        .or_default()
+                        .push(pi_entry.id.clone());
                 }
             }
             index.leaf_id = last_id.clone();
@@ -955,7 +971,11 @@ impl Session {
     }
 
     /// Append a model/provider change entry.
-    pub async fn append_model_change(&self, provider: &str, model_id: &str) -> crate::Result<String> {
+    pub async fn append_model_change(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> crate::Result<String> {
         self.ensure_persisted().await?;
         let parent_id = {
             let index = self.index.lock().await;
@@ -977,7 +997,11 @@ impl Session {
             let mut index = self.index.lock().await;
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
             index.leaf_id = Some(id.clone());
         }
@@ -991,10 +1015,7 @@ impl Session {
             let index = self.index.lock().await;
             index.leaf_id.clone()
         };
-        let entry = SessionEntry::new_thinking_level_change(
-            level.to_string(),
-            parent_id.clone(),
-        );
+        let entry = SessionEntry::new_thinking_level_change(level.to_string(), parent_id.clone());
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
         storage.append_entry(&entry).await?;
@@ -1006,7 +1027,11 @@ impl Session {
             let mut index = self.index.lock().await;
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
             index.leaf_id = Some(id.clone());
         }
@@ -1020,10 +1045,7 @@ impl Session {
             let index = self.index.lock().await;
             index.leaf_id.clone()
         };
-        let entry = SessionEntry::new_session_info(
-            Some(name.to_string()),
-            parent_id.clone(),
-        );
+        let entry = SessionEntry::new_session_info(Some(name.to_string()), parent_id.clone());
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
         storage.append_entry(&entry).await?;
@@ -1044,7 +1066,11 @@ impl Session {
             index.session_name = Some(name.to_string());
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
             index.leaf_id = Some(id.clone());
         }
@@ -1086,8 +1112,7 @@ impl Session {
         };
         let path = index.get_path_to_root(&leaf_id);
         path.iter().fold(0usize, |count, entry| {
-            if let crate::session::types::SessionEntryContent::Message { message } =
-                &entry.content
+            if let crate::session::types::SessionEntryContent::Message { message } = &entry.content
             {
                 if message.get("role").and_then(|r| r.as_str()) == Some("user") {
                     return count + 1;
@@ -1108,10 +1133,13 @@ impl Session {
     ///
     /// Returns `None` if the leaf cannot be saved or moved.
     pub async fn get_pivot_context(
-        &self, predecessor_id: &str,
+        &self,
+        predecessor_id: &str,
     ) -> Option<(SessionContext, String)> {
         let old_leaf = self.get_leaf_id().await?;
-        self.move_leaf(Some(predecessor_id.to_string())).await.ok()?;
+        self.move_leaf(Some(predecessor_id.to_string()))
+            .await
+            .ok()?;
         let ctx = self.build_context().await.ok()?;
         self.move_leaf(Some(old_leaf.clone())).await.ok()?;
         Some((ctx, old_leaf))
@@ -1202,12 +1230,16 @@ impl Session {
 
     /// Write a BranchSummary entry and advance leaf.
     pub async fn append_branch_summary(
-        &self, from_id: &str, summary: &str,
+        &self,
+        from_id: &str,
+        summary: &str,
     ) -> crate::Result<String> {
         self.ensure_persisted().await?;
         let parent_id = { self.index.lock().await.leaf_id.clone() };
         let entry = SessionEntry::new_branch_summary(
-            from_id.to_string(), summary.to_string(), parent_id.clone(),
+            from_id.to_string(),
+            summary.to_string(),
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -1218,7 +1250,11 @@ impl Session {
             let mut index = self.index.lock().await;
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
             index.leaf_id = Some(id.clone());
         }
@@ -1227,12 +1263,18 @@ impl Session {
 
     /// Write a Compaction entry and advance leaf.
     pub async fn append_compaction(
-        &self, summary: &str, first_kept_entry_id: &str, tokens_before: u64,
+        &self,
+        summary: &str,
+        first_kept_entry_id: &str,
+        tokens_before: u64,
     ) -> crate::Result<String> {
         self.ensure_persisted().await?;
         let parent_id = { self.index.lock().await.leaf_id.clone() };
         let entry = SessionEntry::new_compaction(
-            summary.to_string(), first_kept_entry_id.to_string(), tokens_before, parent_id.clone(),
+            summary.to_string(),
+            first_kept_entry_id.to_string(),
+            tokens_before,
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -1243,7 +1285,11 @@ impl Session {
             let mut index = self.index.lock().await;
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
             index.leaf_id = Some(id.clone());
         }
@@ -1252,13 +1298,13 @@ impl Session {
 
     /// Write a Label entry attached to a target entry.
     /// Does NOT advance the leaf (labels are metadata, not navigation points).
-    pub async fn append_label(
-        &self, target_id: &str, label: &str,
-    ) -> crate::Result<String> {
+    pub async fn append_label(&self, target_id: &str, label: &str) -> crate::Result<String> {
         self.ensure_persisted().await?;
         let parent_id = { self.index.lock().await.leaf_id.clone() };
         let entry = SessionEntry::new_label(
-            target_id.to_string(), Some(label.to_string()), parent_id.clone(),
+            target_id.to_string(),
+            Some(label.to_string()),
+            parent_id.clone(),
         );
         let id = entry.id.clone();
         let storage = self.storage.lock().await;
@@ -1267,7 +1313,11 @@ impl Session {
             let mut index = self.index.lock().await;
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
-                index.children.entry(pid.clone()).or_default().push(id.clone());
+                index
+                    .children
+                    .entry(pid.clone())
+                    .or_default()
+                    .push(id.clone());
             }
         }
         Ok(id)
@@ -1410,9 +1460,7 @@ pub(crate) fn pi_message_to_rig(value: &serde_json::Value) -> Option<Message> {
     match role {
         "user" => {
             let content = pi_content_to_user_content(value.get("content")?)?;
-            Some(Message::User {
-                content,
-            })
+            Some(Message::User { content })
         }
         "assistant" => {
             let content = pi_content_to_assistant_content(value.get("content")?)?;
@@ -1477,9 +1525,7 @@ fn pi_content_to_user_content(content: &serde_json::Value) -> Option<Vec<UserCon
 }
 
 /// Convert pi content array to rig AssistantContent items.
-fn pi_content_to_assistant_content(
-    content: &serde_json::Value,
-) -> Option<Vec<AssistantContent>> {
+fn pi_content_to_assistant_content(content: &serde_json::Value) -> Option<Vec<AssistantContent>> {
     let array = content.as_array()?;
     let mut items = Vec::new();
     for item in array {
@@ -1494,9 +1540,9 @@ fn pi_content_to_assistant_content(
                 let signature = item
                     .get("thinkingSignature")
                     .and_then(|s| s.as_str().map(String::from));
-                items.push(AssistantContent::Reasoning(
-                    Reasoning::new_with_signature(&thinking, signature),
-                ));
+                items.push(AssistantContent::Reasoning(Reasoning::new_with_signature(
+                    &thinking, signature,
+                )));
             }
             "toolCall" => {
                 let id = item.get("id")?.as_str()?.to_string();
@@ -1518,9 +1564,7 @@ fn pi_content_to_assistant_content(
 }
 
 /// Convert pi content array to rig ToolResultContent items.
-fn pi_content_to_toolresult_content(
-    content: &serde_json::Value,
-) -> Option<Vec<ToolResultContent>> {
+fn pi_content_to_toolresult_content(content: &serde_json::Value) -> Option<Vec<ToolResultContent>> {
     let array = content.as_array()?;
     let mut items = Vec::new();
     for item in array {
@@ -1704,8 +1748,7 @@ pub(crate) fn rig_message_to_pi_entries(
             let entry = SessionEntry {
                 id: base_id.to_string(),
                 parent_id: parent_id.clone(),
-                timestamp: Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                timestamp: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 content: SessionEntryContent::Message { message },
             };
             vec![entry]
@@ -1720,39 +1763,31 @@ pub(crate) fn rig_message_to_pi_entries(
 
 /// Find the most recent `ThinkingLevelChange` on the branch (closest to leaf).
 pub(crate) fn derive_thinking_level(entries: &[SessionEntry]) -> Option<String> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|e| {
-            if let SessionEntryContent::ThinkingLevelChange { thinking_level } = &e.content {
-                Some(thinking_level.clone())
-            } else {
-                None
-            }
-        })
+    entries.iter().rev().find_map(|e| {
+        if let SessionEntryContent::ThinkingLevelChange { thinking_level } = &e.content {
+            Some(thinking_level.clone())
+        } else {
+            None
+        }
+    })
 }
 
 /// Find the most recent `ModelChange` on the branch (closest to leaf).
 fn derive_model(entries: &[SessionEntry]) -> Option<String> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|e| {
-            if let SessionEntryContent::ModelChange { model_id, .. } = &e.content {
-                Some(model_id.clone())
-            } else {
-                None
-            }
-        })
+    entries.iter().rev().find_map(|e| {
+        if let SessionEntryContent::ModelChange { model_id, .. } = &e.content {
+            Some(model_id.clone())
+        } else {
+            None
+        }
+    })
 }
 
 /// Find the most recent `ModelChange` on the branch (closest to leaf),
 /// returning both the provider and the model id. Used by the resume
 /// prefill, which formats `provider:model_id` so the `/model` overlay's
 /// fuzzy filter matches a single catalog entry directly.
-pub(crate) fn derive_model_change(
-    entries: &[SessionEntry],
-) -> Option<(String, String)> {
+pub(crate) fn derive_model_change(entries: &[SessionEntry]) -> Option<(String, String)> {
     entries.iter().rev().find_map(|e| {
         if let SessionEntryContent::ModelChange { provider, model_id } = &e.content {
             Some((provider.clone(), model_id.clone()))
@@ -1776,13 +1811,9 @@ mod tests {
 
     /// Write entries to a temp session file, then open it read-only and build
     /// a Session for context-building tests.
-    async fn build_session_for_test(
-        entries: Vec<SessionEntry>,
-    ) -> (Session, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-test-{}",
-            std::process::id()
-        ));
+    async fn build_session_for_test(entries: Vec<SessionEntry>) -> (Session, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session2-test-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -1888,15 +1919,13 @@ mod tests {
                 assert_eq!(id, Some("msg_001".into()));
                 assert_eq!(content.len(), 2);
                 match content.first().unwrap() {
-                    AssistantContent::Reasoning(r) => {
-                        match &r.content[0] {
-                            ReasoningContent::Text { text, signature } => {
-                                assert_eq!(text, "let me think");
-                                assert_eq!(signature.as_deref(), Some("sig123"));
-                            }
-                            _ => panic!("expected ReasoningContent::Text"),
+                    AssistantContent::Reasoning(r) => match &r.content[0] {
+                        ReasoningContent::Text { text, signature } => {
+                            assert_eq!(text, "let me think");
+                            assert_eq!(signature.as_deref(), Some("sig123"));
                         }
-                    }
+                        _ => panic!("expected ReasoningContent::Text"),
+                    },
                     _ => panic!("expected Reasoning"),
                 }
                 match content.iter().nth(1).unwrap() {
@@ -2153,15 +2182,13 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("resp-1"));
                 assert_eq!(content.len(), 2);
                 match content.first().unwrap() {
-                    AssistantContent::Reasoning(r) => {
-                        match &r.content[0] {
-                            ReasoningContent::Text { text, signature } => {
-                                assert_eq!(text, "step by step");
-                                assert_eq!(signature.as_deref(), Some("sig"));
-                            }
-                            _ => panic!("expected ReasoningContent::Text"),
+                    AssistantContent::Reasoning(r) => match &r.content[0] {
+                        ReasoningContent::Text { text, signature } => {
+                            assert_eq!(text, "step by step");
+                            assert_eq!(signature.as_deref(), Some("sig"));
                         }
-                    }
+                        _ => panic!("expected ReasoningContent::Text"),
+                    },
                     _ => panic!("expected Reasoning"),
                 }
                 match content.iter().nth(1).unwrap() {
@@ -2238,10 +2265,8 @@ mod tests {
     #[tokio::test]
     async fn test_append_and_reread() {
         // Create a fresh session, append a message, then re-open and verify.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-append-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session2-append-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2253,7 +2278,10 @@ mod tests {
         let index = storage.build_index().await.unwrap();
 
         let session = Session::new_persisted(storage, index);
-        let _ = session.append_message(&Message::user("append test")).await.unwrap();
+        let _ = session
+            .append_message(&Message::user("append test"))
+            .await
+            .unwrap();
 
         // Re-open read-only to verify
         let ro = JsonlSessionStorage::open_readonly(path.clone())
@@ -2270,10 +2298,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_model_and_thinking() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-metadata-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session2-metadata-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2286,7 +2312,10 @@ mod tests {
 
         let session = Session::new_persisted(storage, index);
         session.append_message(&Message::user("q1")).await.unwrap();
-        session.append_model_change("anthropic", "claude-3-5-sonnet").await.unwrap();
+        session
+            .append_model_change("anthropic", "claude-3-5-sonnet")
+            .await
+            .unwrap();
         session.append_thinking_level_change("high").await.unwrap();
 
         // Re-open and verify metadata is derived correctly
@@ -2308,10 +2337,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_session_name() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-name-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session2-name-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2342,10 +2369,8 @@ mod tests {
         // IN-MEMORY index (without re-opening from disk). The bug was that
         // append operations wrote to disk and updated leaf_id but never
         // inserted entries into index.entries, so get_branch() returned empty.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session2-inmem-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session2-inmem-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2358,8 +2383,14 @@ mod tests {
         let session = Session::new_persisted(storage, index);
 
         // --- Turn 1: append a user + assistant message ---
-        session.append_message(&Message::user("hello")).await.unwrap();
-        session.append_message(&Message::assistant("hi there")).await.unwrap();
+        session
+            .append_message(&Message::user("hello"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::assistant("hi there"))
+            .await
+            .unwrap();
 
         // Verify context without re-opening from disk
         let ctx = session.build_context().await.unwrap();
@@ -2368,7 +2399,10 @@ mod tests {
         assert_eq!(ctx.messages[1], Message::assistant("hi there"));
 
         // --- Model change ---
-        session.append_model_change("anthropic", "claude-3-5-sonnet").await.unwrap();
+        session
+            .append_model_change("anthropic", "claude-3-5-sonnet")
+            .await
+            .unwrap();
 
         // Verify context still includes the original messages
         let ctx = session.build_context().await.unwrap();
@@ -2381,11 +2415,18 @@ mod tests {
         session.append_thinking_level_change("high").await.unwrap();
 
         let ctx = session.build_context().await.unwrap();
-        assert_eq!(ctx.messages.len(), 2, "thinking change must not drop messages");
+        assert_eq!(
+            ctx.messages.len(),
+            2,
+            "thinking change must not drop messages"
+        );
         assert_eq!(ctx.thinking_level.as_deref(), Some("high"));
 
         // --- Turn 2: another user message ---
-        session.append_message(&Message::user("follow up")).await.unwrap();
+        session
+            .append_message(&Message::user("follow up"))
+            .await
+            .unwrap();
 
         let ctx = session.build_context().await.unwrap();
         assert_eq!(ctx.messages.len(), 3, "should accumulate across turns");
@@ -2426,26 +2467,44 @@ mod tests {
         let session = Session::new_persisted(storage, index);
 
         // User prompt.
-        session.append_message(&Message::user("summarise the project")).await.unwrap();
+        session
+            .append_message(&Message::user("summarise the project"))
+            .await
+            .unwrap();
 
         // Assistant turn with three tool calls.
         let assistant_with_tools = Message::Assistant {
             id: None,
             content: vec![
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_0").unwrap(), provider: None,
-                    function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
-                    signature: None, additional_params: None,
+                    id: ToolCallId::new("tc_0").unwrap(),
+                    provider: None,
+                    function: rig_core::message::ToolFunction::new(
+                        "read".into(),
+                        serde_json::json!({}),
+                    ),
+                    signature: None,
+                    additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_1").unwrap(), provider: None,
-                    function: rig_core::message::ToolFunction::new("read".into(), serde_json::json!({})),
-                    signature: None, additional_params: None,
+                    id: ToolCallId::new("tc_1").unwrap(),
+                    provider: None,
+                    function: rig_core::message::ToolFunction::new(
+                        "read".into(),
+                        serde_json::json!({}),
+                    ),
+                    signature: None,
+                    additional_params: None,
                 }),
                 AssistantContent::ToolCall(rig_core::message::ToolCall {
-                    id: ToolCallId::new("tc_2").unwrap(), provider: None,
-                    function: rig_core::message::ToolFunction::new("ls".into(), serde_json::json!({})),
-                    signature: None, additional_params: None,
+                    id: ToolCallId::new("tc_2").unwrap(),
+                    provider: None,
+                    function: rig_core::message::ToolFunction::new(
+                        "ls".into(),
+                        serde_json::json!({}),
+                    ),
+                    signature: None,
+                    additional_params: None,
                 }),
             ],
         };
@@ -2455,17 +2514,20 @@ mod tests {
         let tool_results = Message::User {
             content: vec![
                 UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_0").unwrap(), provider: None,
+                    call: ToolCallId::new("tc_0").unwrap(),
+                    provider: None,
                     name: "tool".into(),
                     content: vec![ToolResultContent::Text(Text::new("result 0"))],
                 }),
                 UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_1").unwrap(), provider: None,
+                    call: ToolCallId::new("tc_1").unwrap(),
+                    provider: None,
                     name: "tool".into(),
                     content: vec![ToolResultContent::Text(Text::new("result 1"))],
                 }),
                 UserContent::ToolResult(ToolResult {
-                    call: ToolCallId::new("tc_2").unwrap(), provider: None,
+                    call: ToolCallId::new("tc_2").unwrap(),
+                    provider: None,
                     name: "tool".into(),
                     content: vec![ToolResultContent::Text(Text::new("result 2"))],
                 }),
@@ -2474,24 +2536,45 @@ mod tests {
         session.append_message(&tool_results).await.unwrap();
 
         // Final assistant response.
-        session.append_message(&Message::assistant("here is the summary")).await.unwrap();
+        session
+            .append_message(&Message::assistant("here is the summary"))
+            .await
+            .unwrap();
 
         // --- Verify roundtrip ---
         let ctx = session.build_context().await.unwrap();
-        assert_eq!(ctx.messages.len(), 4, "user + assistant(tools) + user(results) + assistant(final)");
+        assert_eq!(
+            ctx.messages.len(),
+            4,
+            "user + assistant(tools) + user(results) + assistant(final)"
+        );
 
         // The tool-result user message must contain all three results.
         let tool_result_msg = &ctx.messages[2];
         let Message::User { content } = tool_result_msg else {
-            panic!("expected User message at index 2, got {:?}", tool_result_msg);
+            panic!(
+                "expected User message at index 2, got {:?}",
+                tool_result_msg
+            );
         };
-        assert_eq!(content.len(), 3, "all three tool results must be present after roundtrip");
+        assert_eq!(
+            content.len(),
+            3,
+            "all three tool results must be present after roundtrip"
+        );
 
-        let ids: Vec<&str> = content.iter().map(|c| match c {
-            UserContent::ToolResult(tr) => tr.call.as_str(),
-            _ => panic!("expected ToolResult"),
-        }).collect();
-        assert_eq!(ids, ["tc_0", "tc_1", "tc_2"], "tool results must be in original order");
+        let ids: Vec<&str> = content
+            .iter()
+            .map(|c| match c {
+                UserContent::ToolResult(tr) => tr.call.as_str(),
+                _ => panic!("expected ToolResult"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            ["tc_0", "tc_1", "tc_2"],
+            "tool results must be in original order"
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -2500,10 +2583,8 @@ mod tests {
     /// without creating dangling tool_calls on the next turn.
     #[tokio::test]
     async fn test_tool_call_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session-toolrt-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session-toolrt-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2515,30 +2596,47 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+        use rig_core::message::{
+            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
+        };
 
         // --- Turn 1: user asks about weather, assistant responds with tool
         // call, tool executes, assistant gives final answer ---
-        session.append_message(&Message::user("weather")).await.unwrap();
-        session.append_message(&Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(ToolCall {
-                id: ToolCallId::new("call_abc").unwrap(),
-                provider: None,
-                function: ToolFunction::new("get_weather".to_string(), serde_json::json!({"city": "NYC"})),
-                signature: None,
-                additional_params: None,
-            })],
-        }).await.unwrap();
-        session.append_message(&Message::User {
-            content: vec![UserContent::ToolResult(RigToolResult {
-                call: ToolCallId::new("call_abc").unwrap(),
-                provider: None,
-                name: "tool".into(),
-                content: vec![ToolResultContent::Text(Text::new("72F"))],
-            })],
-        }).await.unwrap();
-        session.append_message(&Message::assistant("It's 72F in NYC")).await.unwrap();
+        session
+            .append_message(&Message::user("weather"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: ToolCallId::new("call_abc").unwrap(),
+                    provider: None,
+                    function: ToolFunction::new(
+                        "get_weather".to_string(),
+                        serde_json::json!({"city": "NYC"}),
+                    ),
+                    signature: None,
+                    additional_params: None,
+                })],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::User {
+                content: vec![UserContent::ToolResult(RigToolResult {
+                    call: ToolCallId::new("call_abc").unwrap(),
+                    provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("72F"))],
+                })],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::assistant("It's 72F in NYC"))
+            .await
+            .unwrap();
 
         // Verify context is correct after turn 1
         let ctx1 = session.build_context().await.unwrap();
@@ -2552,37 +2650,54 @@ mod tests {
 
         // Verify the tool call is present in message[1]
         if let Message::Assistant { content, .. } = &ctx1.messages[1] {
-            let has_tool_call = content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)));
-            assert!(has_tool_call, "assistant message 1 should contain a tool call");
+            let has_tool_call = content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(_)));
+            assert!(
+                has_tool_call,
+                "assistant message 1 should contain a tool call"
+            );
         }
 
         // Verify the tool result is in message[2]
         if let Message::User { content } = &ctx1.messages[2] {
-            let has_tool_result = content.iter().any(|c| matches!(c, UserContent::ToolResult(_)));
-            assert!(has_tool_result, "user message 2 should contain a tool result");
+            let has_tool_result = content
+                .iter()
+                .any(|c| matches!(c, UserContent::ToolResult(_)));
+            assert!(
+                has_tool_result,
+                "user message 2 should contain a tool result"
+            );
         }
 
         // --- Turn 2: simulate a subsequent user message ---
-        session.append_message(&Message::user("forecast")).await.unwrap();
+        session
+            .append_message(&Message::user("forecast"))
+            .await
+            .unwrap();
 
         let ctx2 = session.build_context().await.unwrap();
         // Should have 5 messages: 4 from turn 1 + 1 new user message
-        assert_eq!(ctx2.messages.len(), 5, "turn 2 should have 5 accumulated messages");
+        assert_eq!(
+            ctx2.messages.len(),
+            5,
+            "turn 2 should have 5 accumulated messages"
+        );
 
         // Verify no dangling tool call: the last assistant(toolCall) must be
         // followed by a tool result or another assistant message.
         for i in 0..ctx2.messages.len().saturating_sub(1) {
             let is_assistant_with_tool_call = match &ctx2.messages[i] {
-                Message::Assistant { content, .. } => {
-                    content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)))
-                }
+                Message::Assistant { content, .. } => content
+                    .iter()
+                    .any(|c| matches!(c, AssistantContent::ToolCall(_))),
                 _ => false,
             };
             if is_assistant_with_tool_call {
                 let next_is_tool_result = match &ctx2.messages[i + 1] {
-                    Message::User { content } => {
-                        content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))
-                    }
+                    Message::User { content } => content
+                        .iter()
+                        .any(|c| matches!(c, UserContent::ToolResult(_))),
                     _ => false,
                 };
                 assert!(
@@ -2599,7 +2714,13 @@ mod tests {
     // ── Phase 1: compaction scoping (pi `buildContextEntries` parity) ──────
 
     /// Helper: create a Compaction entry.
-    fn compaction_entry(id: &str, summary: &str, first_kept: &str, tokens: u64, parent: Option<&str>) -> SessionEntry {
+    fn compaction_entry(
+        id: &str,
+        summary: &str,
+        first_kept: &str,
+        tokens: u64,
+        parent: Option<&str>,
+    ) -> SessionEntry {
         SessionEntry {
             id: id.into(),
             parent_id: parent.map(String::from),
@@ -2784,42 +2905,59 @@ mod tests {
         // End-to-end: append a compaction entry (empty summary, firstKept=m1),
         // then a follow-up message, and verify build_context() on a RE-OPENED
         // session (simulating resume) exposes only the scoped prefix.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-cmp-resume-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("picocode-cmp-resume-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
-        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        session.append_message(&Message::user("intro")).await.unwrap();
-        session.append_message(&Message::user("kept-a")).await.unwrap();
-        session.append_message(&Message::user("kept-b")).await.unwrap();
+        session
+            .append_message(&Message::user("intro"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::user("kept-a"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::user("kept-b"))
+            .await
+            .unwrap();
 
         // find the id of "kept-a" (second message) to use as firstKeptEntryId
         let branch = session.get_branch().await;
         let kept_id = branch[1].id.clone();
         session.append_compaction("", &kept_id, 200).await.unwrap();
-        session.append_message(&Message::user("after")).await.unwrap();
+        session
+            .append_message(&Message::user("after"))
+            .await
+            .unwrap();
 
         // Re-open (resume) and verify the scoped context: [kept-a, kept-b, after]
-        let ro = JsonlSessionStorage::open_readonly(path.clone()).await.unwrap();
+        let ro = JsonlSessionStorage::open_readonly(path.clone())
+            .await
+            .unwrap();
         let index2 = ro.build_index().await.unwrap();
         let session2 = Session::new_persisted(ro, index2);
         let ctx = session2.build_context().await.unwrap();
 
-        let texts: Vec<&str> = ctx.messages.iter().map(|m| match m {
-            Message::User { content } => match &content[0] {
-                UserContent::Text(t) => t.text.as_str(),
+        let texts: Vec<&str> = ctx
+            .messages
+            .iter()
+            .map(|m| match m {
+                Message::User { content } => match &content[0] {
+                    UserContent::Text(t) => t.text.as_str(),
+                    _ => "",
+                },
                 _ => "",
-            },
-            _ => "",
-        }).collect();
+            })
+            .collect();
         assert_eq!(texts, ["kept-a", "kept-b", "after"]);
 
         let _ = tokio::fs::remove_file(&path).await;
@@ -2838,28 +2976,33 @@ mod tests {
         // [u0 a0 c1 u1 a1]; latest compaction on that prefix is c1, so the
         // context must be [summary(S1)] + [u1 a1] (c1 itself stepped over,
         // u0 a0 covered by the summary).
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-cmp-prefix-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("picocode-cmp-prefix-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
-        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
         session.append_message(&Message::user("u0")).await.unwrap();
-        session.append_message(&Message::assistant("a0")).await.unwrap();
+        session
+            .append_message(&Message::assistant("a0"))
+            .await
+            .unwrap();
         // c1 summaries everything before u1 (firstKept=u0's successor). Use
         // the message id of u1 as firstKept.
         let branch = session.get_branch().await;
         let u0_id = branch[0].id.clone();
         session.append_compaction("S1", &u0_id, 100).await.unwrap();
         session.append_message(&Message::user("u1")).await.unwrap();
-        session.append_message(&Message::assistant("a1")).await.unwrap();
+        session
+            .append_message(&Message::assistant("a1"))
+            .await
+            .unwrap();
         session.append_message(&Message::user("u2")).await.unwrap();
 
         // Leaf dance: move to the predecessor of a hypothetical new
@@ -2904,7 +3047,10 @@ mod tests {
         // compaction entries never reach the wire.
         assert_eq!(texts.len(), 3, "user texts at a1: {texts:?}");
         assert!(texts[0].contains("S1"), "summary wrapper first: {texts:?}");
-        assert!(texts[0].contains("<summary>"), "pi wrapper format: {texts:?}");
+        assert!(
+            texts[0].contains("<summary>"),
+            "pi wrapper format: {texts:?}"
+        );
         assert_eq!(texts[1], "u0");
         assert_eq!(texts[2], "u1");
 
@@ -2922,21 +3068,24 @@ mod tests {
         // Session: u0 a0 c1{firstKept:u0} (leaf=c1). Re-compact at target=u0
         // -> predecessor = (root, none?) u0 has no predecessor -> guard
         // triggers. Use the MEANINGFUL case: target = a0 -> predecessor = u0.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-cmp-boundary-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-cmp-boundary-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
-        let storage = JsonlSessionStorage::open_or_create(path.clone()).await.unwrap();
+        let storage = JsonlSessionStorage::open_or_create(path.clone())
+            .await
+            .unwrap();
         let header = SessionHeader::new(Path::new("/test"));
         storage.write_header(&header).await.unwrap();
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
         session.append_message(&Message::user("u0")).await.unwrap();
-        session.append_message(&Message::assistant("a0")).await.unwrap();
+        session
+            .append_message(&Message::assistant("a0"))
+            .await
+            .unwrap();
         let u0_id = session.get_branch().await[0].id.clone();
         session.append_compaction("S1", &u0_id, 50).await.unwrap();
 
@@ -2963,10 +3112,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_toolname_in_toolresult() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-toolname-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-toolname-test-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -2978,29 +3125,43 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+        use rig_core::message::{
+            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
+        };
 
         // Turn: user -> assistant(read tool call) -> user(tool result) -> assistant
-        session.append_message(&Message::user("read file")).await.unwrap();
-        session.append_message(&Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(ToolCall {
-                id: ToolCallId::new("tc_read").unwrap(),
-                provider: None,
-                function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
-                signature: None,
-                additional_params: None,
-            })],
-        }).await.unwrap();
-        session.append_message(&Message::User {
-            content: vec![UserContent::ToolResult(RigToolResult {
-                call: ToolCallId::new("tc_read").unwrap(),
-                provider: None,
-                name: "tool".into(),
-                content: vec![ToolResultContent::Text(Text::new("file contents"))],
-            })],
-        }).await.unwrap();
-        session.append_message(&Message::assistant("done")).await.unwrap();
+        session
+            .append_message(&Message::user("read file"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::Assistant {
+                id: None,
+                content: vec![AssistantContent::ToolCall(ToolCall {
+                    id: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
+                    function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
+                    signature: None,
+                    additional_params: None,
+                })],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::User {
+                content: vec![UserContent::ToolResult(RigToolResult {
+                    call: ToolCallId::new("tc_read").unwrap(),
+                    provider: None,
+                    name: "tool".into(),
+                    content: vec![ToolResultContent::Text(Text::new("file contents"))],
+                })],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::assistant("done"))
+            .await
+            .unwrap();
 
         // Read back the JSONL file and check toolName in tool result entries.
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
@@ -3024,10 +3185,8 @@ mod tests {
     async fn test_edit_block_form_persisted_as_canonical_array() {
         // The model emits the Aider block string; the persisted JSONL must be
         // the canonical pi-compatible array.
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-edit-canon-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-edit-canon-test-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3082,10 +3241,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_toolname_multiple_tools() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-multitool-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-multitool-test-{}", std::process::id()));
         let filename = session_filename(&chrono::Utc::now());
         let path = dir.join(&filename);
 
@@ -3097,46 +3254,66 @@ mod tests {
         let index = storage.build_index().await.unwrap();
         let session = Session::new_persisted(storage, index);
 
-        use rig_core::message::{ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent};
+        use rig_core::message::{
+            ToolCall, ToolFunction, ToolResult as RigToolResult, ToolResultContent,
+        };
 
         // Turn: assistant calls two different tools, then user provides results.
-        session.append_message(&Message::user("do things")).await.unwrap();
-        session.append_message(&Message::Assistant {
-            id: None,
-            content: vec![
-                AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("tc_bash").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new("bash".into(), serde_json::json!({"command": "ls"})),
-                    signature: None,
-                    additional_params: None,
-                }),
-                AssistantContent::ToolCall(ToolCall {
-                    id: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    function: ToolFunction::new("read".into(), serde_json::json!({"path": "x.rs"})),
-                    signature: None,
-                    additional_params: None,
-                }),
-            ],
-        }).await.unwrap();
-        session.append_message(&Message::User {
-            content: vec![
-                UserContent::ToolResult(RigToolResult {
-                    call: ToolCallId::new("tc_bash").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("file1.txt"))],
-                }),
-                UserContent::ToolResult(RigToolResult {
-                    call: ToolCallId::new("tc_read").unwrap(),
-                    provider: None,
-                    name: "tool".into(),
-                    content: vec![ToolResultContent::Text(Text::new("content"))],
-                }),
-            ],
-        }).await.unwrap();
-        session.append_message(&Message::assistant("all done")).await.unwrap();
+        session
+            .append_message(&Message::user("do things"))
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::Assistant {
+                id: None,
+                content: vec![
+                    AssistantContent::ToolCall(ToolCall {
+                        id: ToolCallId::new("tc_bash").unwrap(),
+                        provider: None,
+                        function: ToolFunction::new(
+                            "bash".into(),
+                            serde_json::json!({"command": "ls"}),
+                        ),
+                        signature: None,
+                        additional_params: None,
+                    }),
+                    AssistantContent::ToolCall(ToolCall {
+                        id: ToolCallId::new("tc_read").unwrap(),
+                        provider: None,
+                        function: ToolFunction::new(
+                            "read".into(),
+                            serde_json::json!({"path": "x.rs"}),
+                        ),
+                        signature: None,
+                        additional_params: None,
+                    }),
+                ],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::User {
+                content: vec![
+                    UserContent::ToolResult(RigToolResult {
+                        call: ToolCallId::new("tc_bash").unwrap(),
+                        provider: None,
+                        name: "tool".into(),
+                        content: vec![ToolResultContent::Text(Text::new("file1.txt"))],
+                    }),
+                    UserContent::ToolResult(RigToolResult {
+                        call: ToolCallId::new("tc_read").unwrap(),
+                        provider: None,
+                        name: "tool".into(),
+                        content: vec![ToolResultContent::Text(Text::new("content"))],
+                    }),
+                ],
+            })
+            .await
+            .unwrap();
+        session
+            .append_message(&Message::assistant("all done"))
+            .await
+            .unwrap();
 
         // Read back and verify toolName values.
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
@@ -3153,8 +3330,14 @@ mod tests {
                 }
             }
         }
-        assert!(bash_ok, "should have a bash tool result with toolName 'bash'");
-        assert!(read_ok, "should have a read tool result with toolName 'read'");
+        assert!(
+            bash_ok,
+            "should have a bash tool result with toolName 'bash'"
+        );
+        assert!(
+            read_ok,
+            "should have a read tool result with toolName 'read'"
+        );
 
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -3191,7 +3374,10 @@ mod tests {
         assert_eq!(session.count_persisted_user_prompts().await, 0);
 
         // One genuine user prompt.
-        session.append_message(&Message::user("hello")).await.unwrap();
+        session
+            .append_message(&Message::user("hello"))
+            .await
+            .unwrap();
         assert_eq!(session.count_persisted_user_prompts().await, 1);
 
         // An assistant turn does not add a user prompt.
@@ -3229,7 +3415,10 @@ mod tests {
         assert_eq!(session.count_persisted_user_prompts().await, 1);
 
         // A second user prompt now makes 2.
-        session.append_message(&Message::user("again")).await.unwrap();
+        session
+            .append_message(&Message::user("again"))
+            .await
+            .unwrap();
         assert_eq!(session.count_persisted_user_prompts().await, 2);
 
         let _ = tokio::fs::remove_file(&path).await;
@@ -3313,12 +3502,16 @@ mod tests {
         let session_dir = std::path::PathBuf::from("/test");
         let dropped = vec![
             sum_user("m0", None, "first prompt"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "reasoning", "text": "deep thoughts"},
-                {"type": "text", "text": "first answer"},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "src/lib.rs"}}
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "reasoning", "text": "deep thoughts"},
+                    {"type": "text", "text": "first answer"},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "src/lib.rs"}}
+                ]),
+            ),
             // Tool result — must be excluded entirely.
             SessionEntry {
                 id: "t0".into(),
@@ -3332,9 +3525,13 @@ mod tests {
                 },
             },
             sum_user("m1", Some("t0"), "second prompt"),
-            sum_assistant("a1", Some("m1"), serde_json::json!([
-                {"type": "text", "text": "second answer"}
-            ])),
+            sum_assistant(
+                "a1",
+                Some("m1"),
+                serde_json::json!([
+                    {"type": "text", "text": "second answer"}
+                ]),
+            ),
         ];
         let s = build_text_only_summary(&dropped, &session_dir);
         assert!(s.contains("# [user]\nfirst prompt"));
@@ -3364,17 +3561,21 @@ mod tests {
         let session_dir = std::path::PathBuf::from("/test");
         let dropped = vec![
             sum_user("m0", None, "do work"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "text", "text": "working"},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "b.txt", "offset": 0, "limit": 10}},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "a.txt"}},
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "a.txt", "edits": []}},
-                {"type": "toolCall", "name": "bash",
-                 "arguments": {"command": "ls"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "text", "text": "working"},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "b.txt", "offset": 0, "limit": 10}},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "a.txt"}},
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "a.txt", "edits": []}},
+                    {"type": "toolCall", "name": "bash",
+                     "arguments": {"command": "ls"}},
+                ]),
+            ),
         ];
         let s = build_text_only_summary(&dropped, &session_dir);
         // No .md files in this span, so only the "Files" section appears.
@@ -3422,11 +3623,15 @@ mod tests {
         // before the kept messages (pi contract).
         let dropped = vec![
             sum_user("m0", None, "early task"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "text", "text": "early answer"},
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "src/lib.rs", "edits": []}}
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "text", "text": "early answer"},
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "src/lib.rs", "edits": []}}
+                ]),
+            ),
         ];
         let summary = build_text_only_summary(&dropped, &session_dir);
         assert!(!summary.is_empty());
@@ -3435,9 +3640,13 @@ mod tests {
         // Branch: dropped span + compaction entry (with summary) + kept span.
         let branch = vec![
             sum_user("m0", None, "early task"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "text", "text": "early answer"}
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "text", "text": "early answer"}
+                ]),
+            ),
             SessionEntry {
                 id: "cmp".into(),
                 parent_id: Some("a0".into()),
@@ -3455,9 +3664,11 @@ mod tests {
         assert_eq!(transformed.len(), 2);
         let first = &transformed[0];
         let text = match &first.content {
-            SessionEntryContent::Message { message } => {
-                message.pointer("/content/0/text").unwrap().as_str().unwrap()
-            }
+            SessionEntryContent::Message { message } => message
+                .pointer("/content/0/text")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             other => panic!("expected Message, got {:?}", std::mem::discriminant(other)),
         };
         // pi wrapper + our summary as the FIRST message of the context.
@@ -3469,9 +3680,11 @@ mod tests {
         assert!(!text.contains("# [Documents]"));
         assert!(text.contains("- modified: src/lib.rs"));
         let second_text = match &transformed[1].content {
-            SessionEntryContent::Message { message } => {
-                message.pointer("/content/0/text").unwrap().as_str().unwrap()
-            }
+            SessionEntryContent::Message { message } => message
+                .pointer("/content/0/text")
+                .unwrap()
+                .as_str()
+                .unwrap(),
             _ => panic!("expected Message"),
         };
         assert_eq!(second_text, "kept prompt");
@@ -3506,22 +3719,29 @@ mod tests {
         // with each group in chronological order of first appearance.
         let dropped = vec![
             sum_user("m0", None, "do work"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "text", "text": "working"},
-                // Non-markdown (code) — goes to "Files".
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "src/lib.rs", "edits": []}},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "README.md"}},
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "docs/plan.md", "edits": []}},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "CHANGELOG.md"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "text", "text": "working"},
+                    // Non-markdown (code) — goes to "Files".
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "src/lib.rs", "edits": []}},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "README.md"}},
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "docs/plan.md", "edits": []}},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "CHANGELOG.md"}},
+                ]),
+            ),
         ];
         let s = build_text_only_summary(&dropped, &session_dir);
         // Both headers present.
-        assert!(s.contains("# [Documents]"), "missing Documents section: {s}");
+        assert!(
+            s.contains("# [Documents]"),
+            "missing Documents section: {s}"
+        );
         assert!(s.contains("# [Files]"), "missing Files section: {s}");
         // Documents section: only .md files, in chronological order of first appearance.
         let docs_start = s.find("# [Documents]").unwrap();
@@ -3551,10 +3771,14 @@ mod tests {
         // bullets). Same for the converse.
         let only_md = vec![
             sum_user("m0", None, "read docs"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "README.md"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "README.md"}},
+                ]),
+            ),
         ];
         let s = build_text_only_summary(&only_md, &session_dir);
         assert!(s.contains("# [Documents]"));
@@ -3562,10 +3786,14 @@ mod tests {
 
         let only_rs = vec![
             sum_user("m0", None, "read code"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "src/lib.rs"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "src/lib.rs"}},
+                ]),
+            ),
         ];
         let s = build_text_only_summary(&only_rs, &session_dir);
         assert!(s.contains("# [Files]"));
@@ -3579,18 +3807,19 @@ mod tests {
         // but the seed text (first user prompt) is always included.
         let dropped = vec![
             sum_user("m0", None, "no files"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "text", "text": "just text"},
-                {"type": "toolCall", "name": "bash",
-                 "arguments": {"command": "ls"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "text", "text": "just text"},
+                    {"type": "toolCall", "name": "bash",
+                     "arguments": {"command": "ls"}},
+                ]),
+            ),
         ];
         let t = build_manual_template(&dropped, None, &session_dir);
         // Seed text is always present; no file sections since bash doesn't touch files.
-        assert_eq!(
-            t,
-            "# Compaction notes\n\nno files"
-        );
+        assert_eq!(t, "# Compaction notes\n\nno files");
     }
 
     #[test]
@@ -3600,14 +3829,18 @@ mod tests {
         // preceded by the first user prompt as seed text.
         let dropped = vec![
             sum_user("m0", None, "do work"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "src/lib.rs", "edits": []}},
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "README.md"}},
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "docs/plan.md", "edits": []}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "src/lib.rs", "edits": []}},
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "README.md"}},
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "docs/plan.md", "edits": []}},
+                ]),
+            ),
         ];
         let t = build_manual_template(&dropped, None, &session_dir);
         // Title section ends with the first file section heading.
@@ -3639,10 +3872,14 @@ mod tests {
         // Only non-.md touched: no Documents section, only Files.
         let dropped = vec![
             sum_user("m0", None, "code work"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "toolCall", "name": "edit",
-                 "arguments": {"path": "src/lib.rs", "edits": []}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "edit",
+                     "arguments": {"path": "src/lib.rs", "edits": []}},
+                ]),
+            ),
         ];
         let t = build_manual_template(&dropped, None, &session_dir);
         assert!(!t.contains("# [Documents]"));
@@ -3654,10 +3891,14 @@ mod tests {
         // Only .md touched: no Files section, only Documents.
         let dropped = vec![
             sum_user("m0", None, "doc work"),
-            sum_assistant("a0", Some("m0"), serde_json::json!([
-                {"type": "toolCall", "name": "read",
-                 "arguments": {"path": "README.md"}},
-            ])),
+            sum_assistant(
+                "a0",
+                Some("m0"),
+                serde_json::json!([
+                    {"type": "toolCall", "name": "read",
+                     "arguments": {"path": "README.md"}},
+                ]),
+            ),
         ];
         let t = build_manual_template(&dropped, None, &session_dir);
         assert!(t.contains("# [Documents]"));
@@ -3681,7 +3922,8 @@ mod tests {
 
     #[test]
     fn split_sections_ignores_heading_levels_and_brackets() {
-        let input = "## documents\n- a.md\n### [Files]\n- b.rs\n# FILES\n- c.txt\n## Documents\n- d.md";
+        let input =
+            "## documents\n- a.md\n### [Files]\n- b.rs\n# FILES\n- c.txt\n## Documents\n- d.md";
         let (preamble, sections) = split_sections(input);
         // Preamble is empty (no text before first heading).
         assert!(preamble.is_empty());
@@ -3720,7 +3962,10 @@ mod tests {
         assert_eq!(ex.documents[0].0, "path.md");
         assert_eq!(ex.documents[0].1.as_deref(), Some("Design doc")); // custom preserved
         assert_eq!(ex.documents[1].0, "another.md");
-        assert_eq!(ex.documents[1].1.as_deref(), Some("Progress doc; update after each turn"));
+        assert_eq!(
+            ex.documents[1].1.as_deref(),
+            Some("Progress doc; update after each turn")
+        );
         assert_eq!(ex.files.len(), 2);
         assert_eq!(ex.files[0].0, "/path/file.rs");
         assert_eq!(ex.files[0].1.as_deref(), Some("Some sentence"));
@@ -3798,7 +4043,7 @@ mod tests {
     #[test]
     fn extract_seed_from_context_strips_prefix_and_suffix() {
         use crate::session::types::SessionContext;
-        use rig_core::message::{Message, UserContent, Text};
+        use rig_core::message::{Message, Text, UserContent};
         let summary_text = "Summary body content";
         // Reconstruct the exact wrapper used by compaction_summary_message.
         let prefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
@@ -3840,8 +4085,7 @@ mod tests {
     fn relativize_path_returns_relative_for_sub_path() {
         // Paths below session_dir become compact relative (no leading ./)
         // Use a temp dir + file so canonicalize works on both sides.
-        let tmp = std::path::PathBuf::from(std::env::temp_dir())
-            .join("picocode_relpath_test");
+        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // Create the nested file so canonicalize resolves the path.
@@ -3857,23 +4101,19 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_parent_path() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir())
-            .join("picocode_relpath_test2");
+        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test2");
         std::fs::create_dir_all(&tmp).unwrap();
         // The parent of session_dir is not a sub-path.
         std::fs::write(tmp.join("marker"), b"").unwrap();
-        let result = crate::session::session::relativize_path(
-            &tmp,
-            std::env::temp_dir().to_str().unwrap(),
-        );
+        let result =
+            crate::session::session::relativize_path(&tmp, std::env::temp_dir().to_str().unwrap());
         assert_eq!(result, None);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn relativize_path_returns_none_for_equal_path() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir())
-            .join("picocode_relpath_test3");
+        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test3");
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("marker"), b"").unwrap();
         // The path itself is the session_dir; strip_prefix succeeds but yields "".
@@ -3884,8 +4124,7 @@ mod tests {
 
     #[test]
     fn relativize_path_returns_none_for_nonexistent() {
-        let tmp = std::path::PathBuf::from(std::env::temp_dir())
-            .join("picocode_relpath_test4");
+        let tmp = std::path::PathBuf::from(std::env::temp_dir()).join("picocode_relpath_test4");
         std::fs::create_dir_all(&tmp).unwrap();
         // A nonexistent file inside the session_dir -> relativizes successfully.
         std::fs::write(tmp.join("marker"), b"").unwrap();

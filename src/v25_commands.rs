@@ -8,14 +8,18 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::slashdot_menu::node_impl::{
-        DataResponse, DataResult, MenuResult, PathArgs,
-        SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
-    };
     use crate::slashdot_menu::menu::SlashDotMenu;
+    use crate::slashdot_menu::node_impl::{
+        DataResponse, DataResult, MenuResult, PathArgs, SlashDotNode, StaticListingNode, StaticRow,
+        SubmitResult,
+    };
     use crate::slashdot_menu::HostKey;
 
-    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
+    fn eval(
+        h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
+        prompt: &str,
+        key: HostKey,
+    ) -> MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does:
         // tests observe frames, never half-completed rewrites.
         futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
@@ -57,7 +61,8 @@ mod tests {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.app_state.borrow();
             let active = current.as_deref().unwrap_or("off").to_string();
-            let rows = ["off", "low", "med", "high", "max"].iter()
+            let rows = ["off", "low", "med", "high", "max"]
+                .iter()
                 .map(|l| crate::slashdot_menu::fields::Row::new(*l).desc(""))
                 .collect();
             Ok(Rc::new(DataResponse {
@@ -80,10 +85,14 @@ mod tests {
     fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("thinking", "set thinking level"),
-        ]).into();
-        tl.add_child(ThinkingEnumNode { app_state: state.clone() }.into());
+        let mut tl: SlashDotMenuNode =
+            StaticListingNode::new(&[StaticRow::new("thinking", "set thinking level")]).into();
+        tl.add_child(
+            ThinkingEnumNode {
+                app_state: state.clone(),
+            }
+            .into(),
+        );
         root.add_child(tl);
         SlashDotMenu::from_root_node(root)
     }
@@ -99,8 +108,7 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "thinking ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert_eq!(row_texts.len(), 5);
                 assert!(row_texts.iter().any(|t| t.contains("off")));
                 assert!(row_texts.iter().any(|t| t.contains("low")));
@@ -119,7 +127,10 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "thinking ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                assert!(!plan.active_rows.is_empty(), "med should have active marker");
+                assert!(
+                    !plan.active_rows.is_empty(),
+                    "med should have active marker"
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -139,10 +150,16 @@ mod tests {
         }
         match eval(&mut h, "thinking ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
-                assert!(plan.rows.len() == 0
-                    || plan.rows.iter().any(|l| l.0.contains("off")),
-                    "should show leaf content, got {:?}", plan.rows);
-                assert!(prompt.contains("off"), "prompt should contain off: {}", prompt);
+                assert!(
+                    plan.rows.len() == 0 || plan.rows.iter().any(|l| l.0.contains("off")),
+                    "should show leaf content, got {:?}",
+                    plan.rows
+                );
+                assert!(
+                    prompt.contains("off"),
+                    "prompt should contain off: {}",
+                    prompt
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -155,7 +172,10 @@ mod tests {
         let mut h = menu.get_handle();
         let _ = eval(&mut h, "thinking ", HostKey::None);
         let r = eval(&mut h, "thinking ", HostKey::Tab);
-        let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
+        let prompt = match &r {
+            MenuResult::Continue(_, p) => p.clone(),
+            _ => panic!(),
+        };
         match eval(&mut h, &prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(..) => {
                 assert_eq!(*state.borrow(), Some("off".to_string()));
@@ -210,7 +230,11 @@ mod tests {
         let _ = eval(&mut h, "thinking ", HostKey::Tab);
         match eval(&mut h, "thinking off ", HostKey::Esc) {
             MenuResult::Continue(_, prompt) => {
-                assert!(prompt.contains("thinking"), "should be back at thinking: {}", prompt);
+                assert!(
+                    prompt.contains("thinking"),
+                    "should be back at thinking: {}",
+                    prompt
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -255,8 +279,7 @@ mod tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert!(row_texts.iter().any(|t| t.contains("thinking")));
             }
             other => panic!("expected Continue, got {:?}", other),
@@ -272,7 +295,11 @@ mod tests {
         let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
         match eval(&mut h, "thinking ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {
-                assert!(prompt.contains("high"), "should drill into high: {}", prompt);
+                assert!(
+                    prompt.contains("high"),
+                    "should drill into high: {}",
+                    prompt
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -286,7 +313,10 @@ mod tests {
         let _ = eval(&mut h, "thinking ", HostKey::None);
         let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(2));
         let r = eval(&mut h, "thinking ", HostKey::Tab);
-        let prompt = match &r { MenuResult::Continue(_, p) => p.clone(), _ => panic!() };
+        let prompt = match &r {
+            MenuResult::Continue(_, p) => p.clone(),
+            _ => panic!(),
+        };
         assert!(prompt.contains("med"), "should be med: {}", prompt);
         match eval(&mut h, &prompt, HostKey::Enter) {
             MenuResult::DoneSuccess(..) => {
@@ -306,14 +336,18 @@ mod persona_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::slashdot_menu::node_impl::{
-        DataResponse, DataResult, MenuResult, PathArgs,
-        SlashDotNode, SubmitResult, StaticListingNode, StaticRow,
-    };
     use crate::slashdot_menu::menu::SlashDotMenu;
+    use crate::slashdot_menu::node_impl::{
+        DataResponse, DataResult, MenuResult, PathArgs, SlashDotNode, StaticListingNode, StaticRow,
+        SubmitResult,
+    };
     use crate::slashdot_menu::HostKey;
 
-    fn eval(h: &mut crate::slashdot_menu::SlashDotHandle<'_>, prompt: &str, key: HostKey) -> MenuResult {
+    fn eval(
+        h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
+        prompt: &str,
+        key: HostKey,
+    ) -> MenuResult {
         // Resolve ContinuePrompt like the host (repl::v25_eval) does.
         futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80))
     }
@@ -355,10 +389,14 @@ mod persona_tests {
     fn build_persona_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        let mut pl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("persona", "set runtime persona"),
-        ]).into();
-        pl.add_child(PersonaEnumNode { app_state: state.clone() }.into());
+        let mut pl: SlashDotMenuNode =
+            StaticListingNode::new(&[StaticRow::new("persona", "set runtime persona")]).into();
+        pl.add_child(
+            PersonaEnumNode {
+                app_state: state.clone(),
+            }
+            .into(),
+        );
         root.add_child(pl);
         SlashDotMenu::from_root_node(root)
     }
@@ -370,8 +408,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert_eq!(row_texts.len(), 4);
                 assert!(row_texts.iter().any(|t| t.contains("architect")));
                 assert!(row_texts.iter().any(|t| t.contains("strict")));
@@ -388,7 +425,10 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                assert!(!plan.active_rows.is_empty(), "strict should have active marker");
+                assert!(
+                    !plan.active_rows.is_empty(),
+                    "strict should have active marker"
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -401,7 +441,10 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "persona ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                assert!(!plan.active_rows.is_empty(), "none should be active when persona is None");
+                assert!(
+                    !plan.active_rows.is_empty(),
+                    "none should be active when persona is None"
+                );
             }
             other => panic!("expected Continue, got {:?}", other),
         }
@@ -482,8 +525,7 @@ mod persona_tests {
         let mut h = menu.get_handle();
         match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
-                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str())
-                    .collect();
+                let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert!(row_texts.iter().any(|t| t.contains("persona")));
             }
             other => panic!("expected Continue, got {:?}", other),

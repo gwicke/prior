@@ -59,7 +59,12 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, Arc<A
 fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if bytes.lock().unwrap().windows(needle.len()).any(|w| w == needle.as_bytes()) {
+        if bytes
+            .lock()
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+        {
             return true;
         }
         if Instant::now() > deadline {
@@ -86,17 +91,11 @@ fn popup_scroll_does_not_duplicate_input() {
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .expect("spawn picocode");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
     // Keep the tempdir alive for the duration of the run.
     let _config_tempdir = config_tempdir;
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .expect("clone reader");
+    let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
 
@@ -201,7 +200,11 @@ fn popup_scroll_does_not_duplicate_input() {
             mid_thinking, mid_div, mid
         );
         // The first menu entry must be visible exactly once, with a single divider above it.
-        assert_eq!(mid_thinking, 1, "MID: expected one '> thinking' menu line; screen={:?}", mid);
+        assert_eq!(
+            mid_thinking, 1,
+            "MID: expected one '> thinking' menu line; screen={:?}",
+            mid
+        );
     }
 
     // The final input buffer is "/mo" => exactly one such line.
@@ -337,7 +340,14 @@ fn settings_string_hierarchy_saves_and_errors() {
         })
         .expect("open pty");
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
-    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c", cfg.to_str().unwrap()]);
+    cmd.args([
+        "-p",
+        "openrouter",
+        "-m",
+        "tencent/hy3:free",
+        "-c",
+        cfg.to_str().unwrap(),
+    ]);
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
@@ -372,8 +382,16 @@ fn settings_string_hierarchy_saves_and_errors() {
         let data = bytes.lock().unwrap().clone();
         let mut p = Parser::new(20, 100, 1000);
         p.process(&data);
-        let vis: Vec<String> = p.screen().rows(0, 100).map(|s| s.trim().to_string()).collect();
-        assert!(vis.iter().any(|r| r.contains("security_mode")), "security_mode row missing: {:?}", vis);
+        let vis: Vec<String> = p
+            .screen()
+            .rows(0, 100)
+            .map(|s| s.trim().to_string())
+            .collect();
+        assert!(
+            vis.iter().any(|r| r.contains("security_mode")),
+            "security_mode row missing: {:?}",
+            vis
+        );
     }
 
     // Type a valid value and press Enter -> saves + reverts to top.
@@ -396,11 +414,16 @@ fn settings_string_hierarchy_saves_and_errors() {
         let data = bytes.lock().unwrap().clone();
         let mut p = Parser::new(20, 100, 1000);
         p.process(&data);
-        let vis: Vec<String> = p.screen().rows(0, 100).map(|s| s.trim().to_string()).collect();
+        let vis: Vec<String> = p
+            .screen()
+            .rows(0, 100)
+            .map(|s| s.trim().to_string())
+            .collect();
         let sec = vis.iter().find(|r| r.contains("security_mode"));
         assert!(
             sec.map(|r| r.contains("yolo")).unwrap_or(false),
-            "security_mode value not saved as yolo: {:?}", vis
+            "security_mode value not saved as yolo: {:?}",
+            vis
         );
     }
 
@@ -419,7 +442,11 @@ fn settings_string_hierarchy_saves_and_errors() {
         assert!(
             s.contains("error: tool_call_limit must be greater than 0"),
             "invalid value did not show red error; tail={}",
-            s.replace('\x1b', "ESC").chars().rev().take(300).collect::<String>()
+            s.replace('\x1b', "ESC")
+                .chars()
+                .rev()
+                .take(300)
+                .collect::<String>()
         );
     }
     // Nit 3: the red error is tied to value mode — Escaping back to the list
@@ -431,10 +458,15 @@ fn settings_string_hierarchy_saves_and_errors() {
         let data = bytes.lock().unwrap().clone();
         let mut p = Parser::new(20, 100, 1000);
         p.process(&data);
-        let visible: Vec<String> = p.screen().rows(0, 100).map(|r| r.trim().to_string()).collect();
+        let visible: Vec<String> = p
+            .screen()
+            .rows(0, 100)
+            .map(|r| r.trim().to_string())
+            .collect();
         assert!(
             !visible.iter().any(|r| r.contains("error:")),
-            "red error must clear when leaving value mode: {:?}", visible
+            "red error must clear when leaving value mode: {:?}",
+            visible
         );
     }
 
@@ -465,7 +497,14 @@ fn settings_change_triggers_deferred_rebuild() {
         })
         .expect("open pty");
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
-    cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free", "-c", cfg.to_str().unwrap()]);
+    cmd.args([
+        "-p",
+        "openrouter",
+        "-m",
+        "tencent/hy3:free",
+        "-c",
+        cfg.to_str().unwrap(),
+    ]);
     // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
     let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
     cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
@@ -515,7 +554,11 @@ fn settings_change_triggers_deferred_rebuild() {
         assert!(
             s.contains("/set default_model definitelynotarealprovider:model"),
             "committed /settings line not emitted; tail={}",
-            s.replace('\x1b', "ESC").chars().rev().take(300).collect::<String>()
+            s.replace('\x1b', "ESC")
+                .chars()
+                .rev()
+                .take(300)
+                .collect::<String>()
         );
     }
 
@@ -539,7 +582,11 @@ fn settings_change_triggers_deferred_rebuild() {
         assert!(
             s.contains("Unsupported provider: definitelynotarealprovider"),
             "deferred rebuild was not attempted at next Submit; tail={}",
-            s.replace('\x1b', "ESC").chars().rev().take(400).collect::<String>()
+            s.replace('\x1b', "ESC")
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
         );
     }
 

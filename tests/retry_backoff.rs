@@ -114,7 +114,12 @@ fn serve(
     let kind = pattern.chars().nth(n).unwrap_or('T');
     if kind == 'E' {
         let json = r#"{"error":{"message":"Rate limit exceeded: mock","code":429}}"#;
-        return write_response(stream, "429 Too Many Requests", "application/json", json.as_bytes());
+        return write_response(
+            stream,
+            "429 Too Many Requests",
+            "application/json",
+            json.as_bytes(),
+        );
     }
 
     // Successful turn. If this request carries a tool result (a continuation
@@ -136,9 +141,7 @@ fn serve(
     write_response(stream, "200 OK", "text/event-stream", sse.as_bytes())
 }
 
-fn read_http_request(
-    stream: &mut std::net::TcpStream,
-) -> std::io::Result<(String, Vec<u8>)> {
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
@@ -154,7 +157,10 @@ fn read_http_request(
             break;
         }
     }
-    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(buf.len());
+    let header_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(buf.len());
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let mut body = buf[header_end + 4..].to_vec();
     let clen: usize = head
@@ -193,14 +199,22 @@ fn run_one(pattern: &str, label: &str) -> (Vec<u64>, Vec<(u64, usize, bool)>) {
     let llm = TrackedMockLlm::start(pattern);
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
     let args: Vec<String> = vec![
-        "-p".into(), "llamacpp".into(),
-        "-m".into(), "test".into(),
-        "--yolo".into(), "true".into(),
+        "-p".into(),
+        "llamacpp".into(),
+        "-m".into(),
+        "test".into(),
+        "--yolo".into(),
+        "true".into(),
     ];
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
@@ -259,7 +273,12 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Arc<Mutex<Vec<u8>>>, Arc<A
 fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if bytes.lock().unwrap().windows(needle.len()).any(|w| w == needle.as_bytes()) {
+        if bytes
+            .lock()
+            .unwrap()
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+        {
             return true;
         }
         if Instant::now() > deadline {
@@ -302,7 +321,10 @@ fn progress_then_error_resets_to_base() {
     // delay (1s), NOT grow. So the req1->req2 gap should be ~1s.
     let g1 = gaps[1];
     eprintln!("req1->req2 gap = {g1}ms");
-    assert!((900..1600).contains(&g1), "expected base ~1s after progress+error, got {g1}ms");
+    assert!(
+        (900..1600).contains(&g1),
+        "expected base ~1s after progress+error, got {g1}ms"
+    );
 }
 
 /// Build up the back-off with several no-progress 429s, then make a
@@ -329,7 +351,10 @@ fn backoff_resets_after_progress_even_with_prior_growth() {
     // After the progress+midrun-error the next no-progress error must be base.
     let g4 = gaps[4];
     eprintln!("post-reset no-progress gap = {g4}ms");
-    assert!((900..1600).contains(&g4), "expected base ~1s after reset, got {g4}ms");
+    assert!(
+        (900..1600).contains(&g4),
+        "expected base ~1s after reset, got {g4}ms"
+    );
 }
 
 /// Regression test: the consecutive-failure back-off must reset after the
@@ -342,13 +367,21 @@ fn no_session_still_resets_backoff_after_progress() {
     let llm = TrackedMockLlm::start("EEETEETT");
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .expect("openpty");
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
     let args: Vec<String> = vec![
-        "-p".into(), "llamacpp".into(),
-        "-m".into(), "test".into(),
-        "--yolo".into(), "true".into(),
+        "-p".into(),
+        "llamacpp".into(),
+        "-m".into(),
+        "test".into(),
+        "--yolo".into(),
+        "true".into(),
     ];
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
@@ -374,7 +407,10 @@ fn no_session_still_resets_backoff_after_progress() {
     thread::sleep(Duration::from_millis(400));
     let gaps = llm.gaps_ms();
     let log = llm.log();
-    eprintln!("[no-session] served={} gaps={gaps:?} log={log:?}", llm.count());
+    eprintln!(
+        "[no-session] served={} gaps={gaps:?} log={log:?}",
+        llm.count()
+    );
     let _ = child.kill();
     let _ = child.wait();
     assert!(gaps.len() >= 5, "need >=5 gaps, got {gaps:?}");

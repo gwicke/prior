@@ -10,8 +10,7 @@ use std::rc::Rc;
 use crate::app_state::AppState;
 use crate::session::repo::SessionRepo;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
 
 pub struct ClearNode {
@@ -28,11 +27,7 @@ impl SlashDotNode for ClearNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Delete the current session and start fresh.".to_string(),
             "".to_string(),
@@ -68,9 +63,7 @@ impl SlashDotNode for ClearNode {
 mod tests {
     use super::*;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-    use crate::slashdot_menu::node_impl::{
-        MenuResult, StaticListingNode,
-    };
+    use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode};
     use crate::slashdot_menu::HostKey;
 
     fn test_app_state() -> Arc<AppState> {
@@ -90,7 +83,12 @@ mod tests {
 
     fn build_clear_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
-        root.add_child(ClearNode { app_state: app_state.clone() }.into());
+        root.add_child(
+            ClearNode {
+                app_state: app_state.clone(),
+            }
+            .into(),
+        );
         SlashDotMenu::from_root_node(root)
     }
 
@@ -102,13 +100,22 @@ mod tests {
         let result = crate::agent::block_on_test(handle.eval_prompt("", HostKey::None, 80));
         match result {
             MenuResult::Continue(plan, _) => {
-                let text: String = plan.rows.iter()
+                let text: String = plan
+                    .rows
+                    .iter()
                     .map(|l| l.0.clone())
                     .collect::<Vec<_>>()
                     .join("\n");
-                assert!(text.contains("clear"), "clear should be in listing: {}", text);
+                assert!(
+                    text.contains("clear"),
+                    "clear should be in listing: {}",
+                    text
+                );
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -123,10 +130,18 @@ mod tests {
         let _ = crate::agent::block_on_test(handle.eval_prompt("clear ", HostKey::None, 80));
         let _ = crate::agent::block_on_test(handle.eval_prompt("clear ", HostKey::Enter, 80));
         let s = app_state.session().expect("fresh session activated");
-        assert_ne!(s.get_session_id(), outgoing, "fresh session replaces the outgoing one");
+        assert_ne!(
+            s.get_session_id(),
+            outgoing,
+            "fresh session replaces the outgoing one"
+        );
         assert_eq!(app_state.current_session_id(), s.get_session_id());
         assert!(
-            app_state.repo().unwrap().list_sessions_sync(None).is_empty(),
+            app_state
+                .repo()
+                .unwrap()
+                .list_sessions_sync(None)
+                .is_empty(),
             "the outgoing file must be gone (the fresh one is not written until its first turn)"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -135,16 +150,21 @@ mod tests {
     #[test]
     fn clear_with_name_names_fresh_session() {
         let app_state = test_app_state();
-        let base = std::env::temp_dir().join(format!(
-            "v25-clear-name-test-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("v25-clear-name-test-{}", std::process::id()));
         let repo = crate::session::repo::JsonlSessionRepo::new(base.clone());
         app_state.set_repo(Some(repo));
         let mut menu = build_clear_menu(&app_state);
         let mut handle = menu.get_handle();
-        let _ = crate::agent::block_on_test(handle.eval_prompt("clear my-fresh-start ", HostKey::None, 80));
-        let _ = crate::agent::block_on_test(handle.eval_prompt("clear my-fresh-start ", HostKey::Enter, 80));
+        let _ = crate::agent::block_on_test(handle.eval_prompt(
+            "clear my-fresh-start ",
+            HostKey::None,
+            80,
+        ));
+        let _ = crate::agent::block_on_test(handle.eval_prompt(
+            "clear my-fresh-start ",
+            HostKey::Enter,
+            80,
+        ));
         let s = app_state.session().expect("fresh session activated");
         let name =
             crate::agent::block_on_test(async { s.index().lock().await.session_name.clone() });

@@ -129,7 +129,9 @@ impl ReasoningInContextMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "always" | "true" | "on" | "yes" => Some(ReasoningInContextMode::Always),
             "never" | "false" | "off" | "no" => Some(ReasoningInContextMode::Never),
-            "aborted_turns_only" | "aborted" | "aborted_only" => Some(ReasoningInContextMode::AbortedTurnsOnly),
+            "aborted_turns_only" | "aborted" | "aborted_only" => {
+                Some(ReasoningInContextMode::AbortedTurnsOnly)
+            }
             _ => None,
         }
     }
@@ -139,8 +141,14 @@ impl ReasoningInContextMode {
     pub fn variants() -> &'static [(&'static str, &'static str)] {
         &[
             ("always", "keep all reasoning blocks in context"),
-            ("never", "drop reasoning from context to save tokens (default)"),
-            ("aborted_turns_only", "preserve reasoning only from aborted/errored turns"),
+            (
+                "never",
+                "drop reasoning from context to save tokens (default)",
+            ),
+            (
+                "aborted_turns_only",
+                "preserve reasoning only from aborted/errored turns",
+            ),
         ]
     }
 }
@@ -341,9 +349,7 @@ impl SettingsStore {
                 .and_then(|s| ShowReasoning::parse_opt(&s))
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_else(|| "content".to_string()),
-            reasoning_in_context: cfg
-                .reasoning_in_context
-                .unwrap_or_default(),
+            reasoning_in_context: cfg.reasoning_in_context.unwrap_or_default(),
             session_resume_replay_turns: 3,
             llm_compact_prompt: cfg.llm_compact_prompt.clone().unwrap_or_default(),
             path: path.map(|p| p.to_path_buf()),
@@ -422,9 +428,10 @@ impl SettingsStore {
     pub fn validate(key: SettingKey, value: &str) -> Result<(), String> {
         match key {
             SettingKey::DefaultModel => {
-                let (p, m) = value
-                    .split_once(':')
-                    .ok_or_else(|| "expected provider:model (e.g. anthropic:claude-3-5-sonnet-20241022)".to_string())?;
+                let (p, m) = value.split_once(':').ok_or_else(|| {
+                    "expected provider:model (e.g. anthropic:claude-3-5-sonnet-20241022)"
+                        .to_string()
+                })?;
                 if p.trim().is_empty() || m.trim().is_empty() {
                     return Err("provider and model must be non-empty (provider:model)".into());
                 }
@@ -438,10 +445,12 @@ impl SettingsStore {
                 )),
             },
             SettingKey::ToolCallLimit => {
-                let n: usize = value
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("tool_call_limit must be a positive integer (got '{}')", value.trim()))?;
+                let n: usize = value.trim().parse().map_err(|_| {
+                    format!(
+                        "tool_call_limit must be a positive integer (got '{}')",
+                        value.trim()
+                    )
+                })?;
                 if n == 0 {
                     return Err("tool_call_limit must be greater than 0".into());
                 }
@@ -477,10 +486,12 @@ impl SettingsStore {
                 .map(|_| ())
                 .map_err(|e| e),
             SettingKey::SessionResumeReplayTurns => {
-                value
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| format!("session_resume_replay_turns must be a non-negative integer (got '{}')", value.trim()))?;
+                value.trim().parse::<usize>().map_err(|_| {
+                    format!(
+                        "session_resume_replay_turns must be a non-negative integer (got '{}')",
+                        value.trim()
+                    )
+                })?;
                 Ok(())
             }
             // FreeText: any value is acceptable. Empty is allowed and falls
@@ -512,10 +523,12 @@ impl SettingsStore {
         let filtered: Vec<&SettingMeta> = if filter.trim().is_empty() {
             SETTINGS.iter().collect()
         } else {
-            crate::fuzzy::fuzzy_filter_bonus(SETTINGS, filter, |m| format!("{} {}", m.name, m.description))
-                .into_iter()
-                .map(|r| r.item)
-                .collect()
+            crate::fuzzy::fuzzy_filter_bonus(SETTINGS, filter, |m| {
+                format!("{} {}", m.name, m.description)
+            })
+            .into_iter()
+            .map(|r| r.item)
+            .collect()
         };
         filtered
             .into_iter()
@@ -546,8 +559,14 @@ impl SettingsStore {
             d
         };
         let table = doc.as_table_mut();
-        table.insert("default_model", toml_edit::value(self.default_model.clone()));
-        table.insert("security_mode", toml_edit::value(self.security_mode.clone()));
+        table.insert(
+            "default_model",
+            toml_edit::value(self.default_model.clone()),
+        );
+        table.insert(
+            "security_mode",
+            toml_edit::value(self.security_mode.clone()),
+        );
         table.insert(
             "tool_call_limit",
             toml_edit::value(self.tool_call_limit as i64),
@@ -575,7 +594,10 @@ impl SettingsStore {
         // llm_compact_prompt: only written when set (non-empty); an absent
         // key falls back to DEFAULT_LLM_COMPACT_PROMPT on load.
         if !self.llm_compact_prompt.trim().is_empty() {
-            table.insert("llm_compact_prompt", toml_edit::value(self.llm_compact_prompt.clone()));
+            table.insert(
+                "llm_compact_prompt",
+                toml_edit::value(self.llm_compact_prompt.clone()),
+            );
         } else {
             table.remove("llm_compact_prompt");
         }
@@ -615,7 +637,10 @@ impl SettingsStore {
                     .unwrap_or_default()
             }
             SettingKey::SessionResumeReplayTurns => {
-                self.session_resume_replay_turns = value.trim().parse().unwrap_or(self.session_resume_replay_turns)
+                self.session_resume_replay_turns = value
+                    .trim()
+                    .parse()
+                    .unwrap_or(self.session_resume_replay_turns)
             }
             SettingKey::LlmCompactPrompt => {
                 self.llm_compact_prompt = value.trim().to_string();
@@ -714,7 +739,9 @@ mod tests {
     fn validate_reasoning_in_context() {
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "always").is_ok());
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "never").is_ok());
-        assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "aborted_turns_only").is_ok());
+        assert!(
+            SettingsStore::validate(SettingKey::ReasoningInContext, "aborted_turns_only").is_ok()
+        );
         // Legacy aliases
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "true").is_ok());
         assert!(SettingsStore::validate(SettingKey::ReasoningInContext, "FALSE").is_ok());
@@ -724,11 +751,23 @@ mod tests {
     #[test]
     fn show_reasoning_parse_and_default() {
         assert_eq!(ShowReasoning::default(), ShowReasoning::Content);
-        assert_eq!("disabled".parse::<ShowReasoning>().unwrap(), ShowReasoning::Disabled);
-        assert_eq!("INDICATOR".parse::<ShowReasoning>().unwrap(), ShowReasoning::Indicator);
-        assert_eq!("content".parse::<ShowReasoning>().unwrap(), ShowReasoning::Content);
+        assert_eq!(
+            "disabled".parse::<ShowReasoning>().unwrap(),
+            ShowReasoning::Disabled
+        );
+        assert_eq!(
+            "INDICATOR".parse::<ShowReasoning>().unwrap(),
+            ShowReasoning::Indicator
+        );
+        assert_eq!(
+            "content".parse::<ShowReasoning>().unwrap(),
+            ShowReasoning::Content
+        );
         assert!("bogus".parse::<ShowReasoning>().is_err());
-        assert_eq!(ShowReasoning::parse_opt("spinner"), Some(ShowReasoning::Indicator));
+        assert_eq!(
+            ShowReasoning::parse_opt("spinner"),
+            Some(ShowReasoning::Indicator)
+        );
         assert_eq!(ShowReasoning::as_str(ShowReasoning::Disabled), "disabled");
     }
 
@@ -740,7 +779,9 @@ mod tests {
         let mut cfg = crate::AgentConfig {
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet-20241022".into(),
-            output: std::sync::Arc::new(crate::QuietOutput::new(crate::settings::default_show_reasoning_handle())),
+            output: std::sync::Arc::new(crate::QuietOutput::new(
+                crate::settings::default_show_reasoning_handle(),
+            )),
             yolo: false,
             quiet: true,
             thinking_level: None,
@@ -763,17 +804,22 @@ mod tests {
             .unwrap();
         s.set_value(SettingKey::SecurityMode, "yolo").unwrap();
         s.set_value(SettingKey::ToolCallLimit, "12").unwrap();
-        s.set_value(SettingKey::DefaultPersona, "architect").unwrap();
+        s.set_value(SettingKey::DefaultPersona, "architect")
+            .unwrap();
         s.set_value(SettingKey::DefaultThinking, "high").unwrap();
         s.set_value(SettingKey::ShowReasoning, "indicator").unwrap();
-        s.set_value(SettingKey::ReasoningInContext, "always").unwrap();
+        s.set_value(SettingKey::ReasoningInContext, "always")
+            .unwrap();
         s.apply_to_config(&mut cfg);
         assert_eq!(cfg.provider, "openrouter");
         assert_eq!(cfg.model, "tencent/hy3:free");
         assert!(cfg.yolo);
         assert_eq!(cfg.tool_call_limit, 12);
         assert_eq!(cfg.persona_name.as_deref(), Some("architect"));
-        assert!(cfg.persona_prompt.is_some(), "persona prompt should resolve");
+        assert!(
+            cfg.persona_prompt.is_some(),
+            "persona prompt should resolve"
+        );
         assert_eq!(cfg.thinking_level.as_deref(), Some("high"));
         // `show_reasoning` is applied live via the shared handle.
         assert_eq!(
@@ -782,7 +828,13 @@ mod tests {
         );
 
         // reasoning_in_context is applied from the store value.
-        assert!(matches!(cfg.reasoning_in_context, crate::settings::ReasoningInContextMode::Always), "reasoning_in_context should be Always after /set");
+        assert!(
+            matches!(
+                cfg.reasoning_in_context,
+                crate::settings::ReasoningInContextMode::Always
+            ),
+            "reasoning_in_context should be Always after /set"
+        );
 
         // "off" thinking level maps back to `None`.
         s.set_value(SettingKey::DefaultThinking, "off").unwrap();
@@ -839,7 +891,10 @@ mod tests {
         s.set_value(SettingKey::DefaultPersona, "").unwrap();
         assert_eq!(s.default_persona, None);
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(!content.contains("default_persona"), "empty persona must omit the key");
+        assert!(
+            !content.contains("default_persona"),
+            "empty persona must omit the key"
+        );
     }
 
     #[test]
@@ -879,7 +934,11 @@ mod tests {
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
         let lines: Vec<&str> = out.lines().collect();
         // title + 9 single-line options (pre-formatted rows are NOT wrapped).
-        assert_eq!(lines.len(), 10, "pre-formatted rows must not be word-wrapped");
+        assert_eq!(
+            lines.len(),
+            10,
+            "pre-formatted rows must not be word-wrapped"
+        );
         // Strip ANSI so visible column positions compare cleanly (the selected
         // row carries an extra color escape that must not affect alignment).
         fn strip_ansi(s: &str) -> String {
@@ -940,20 +999,29 @@ mod tests {
             table.add_row(&[meta.name, value.as_str(), meta.description]);
         }
         let opts: Vec<String> = table.render_multiline(78);
-        assert!(opts[0].contains('\n'), "first option wraps to multiple visual lines");
+        assert!(
+            opts[0].contains('\n'),
+            "first option wraps to multiple visual lines"
+        );
         let widths = table.column_widths(78);
         let first_opt_lines: Vec<&str> = opts[0].split('\n').collect();
         // The description column starts at the same column on every wrapped
         // visual line. (The value cell may also wrap when it is longer than
         // its column, which is expected.)
         let desc_start = widths[0] + 2 + widths[1] + 2; // Setting + gap + Value + gap
-        assert_eq!(first_opt_lines[0].find("Default model").unwrap(), desc_start);
+        assert_eq!(
+            first_opt_lines[0].find("Default model").unwrap(),
+            desc_start
+        );
         assert!(first_opt_lines[1][desc_start..].starts_with("provider:model"));
         assert!(first_opt_lines[2][desc_start..].starts_with("new sessions"));
         // overlay_lines must preserve the multi-line option as visual lines
         // (title + every visual line of every option).
         let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
-        let expected = 1 + opts.iter().map(|o| o.matches('\n').count() + 1).sum::<usize>();
+        let expected = 1 + opts
+            .iter()
+            .map(|o| o.matches('\n').count() + 1)
+            .sum::<usize>();
         assert_eq!(out.lines().count(), expected);
     }
 }

@@ -35,7 +35,8 @@ impl SlashDotNode for ThinkingEnumNode {
             ("high", "high reasoning"),
             ("max", "maximum reasoning"),
         ];
-        let rows = levels.iter()
+        let rows = levels
+            .iter()
             .map(|(l, d)| crate::slashdot_menu::fields::Row::new(*l).desc(*d))
             .collect();
         Ok(Rc::new(DataResponse {
@@ -56,11 +57,11 @@ impl SlashDotNode for ThinkingEnumNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::app_state::AppState;
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
     use crate::slashdot_menu::node_impl::{MenuResult, StaticListingNode, StaticRow};
     use crate::slashdot_menu::HostKey;
+    use std::sync::Arc;
 
     fn test_app_state() -> Arc<AppState> {
         let settings = crate::settings::SettingsStore {
@@ -83,17 +84,14 @@ mod tests {
     fn build_thinking_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let reader = app_state.clone();
         let writer = app_state.clone();
-        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("thinking", "Set thinking level: off | low | med | high"),
-        ])
+        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+            "thinking",
+            "Set thinking level: off | low | med | high",
+        )])
         .into();
         tl.add_child(
             ThinkingEnumNode {
-                active_fn: Box::new(move || {
-                    reader
-                        .thinking()
-                        .unwrap_or_else(|| "off".to_string())
-                }),
+                active_fn: Box::new(move || reader.thinking().unwrap_or_else(|| "off".to_string())),
                 submit_fn: Box::new(move |level| {
                     writer.set_thinking(Some(level.to_string()));
                     Ok(())
@@ -120,11 +118,15 @@ mod tests {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 assert!(
-                    rows.iter().any(|r| r.split_whitespace().next() == Some("thinking")),
+                    rows.iter()
+                        .any(|r| r.split_whitespace().next() == Some("thinking")),
                     "root should list 'thinking': {rows:?}"
                 );
             }
-            other => panic!("expected Continue at root, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue at root, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -149,7 +151,10 @@ mod tests {
                     "active marker must point at 'med': rows={rows:?}"
                 );
             }
-            other => panic!("expected Continue, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -159,9 +164,16 @@ mod tests {
         let app_state = test_app_state();
         let mut menu = build_thinking_menu(&app_state);
         let mut h = menu.get_handle();
-        let prompt = match futures::executor::block_on(h.eval_prompt_resolved("thinking ", HostKey::Tab, 80)) {
+        let prompt = match futures::executor::block_on(h.eval_prompt_resolved(
+            "thinking ",
+            HostKey::Tab,
+            80,
+        )) {
             MenuResult::Continue(_, prompt) => prompt,
-            other => panic!("expected Continue after Tab, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Continue after Tab, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         };
         let sel = prompt
             .split_whitespace()
@@ -170,7 +182,10 @@ mod tests {
             .to_string();
         match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
             MenuResult::DoneSuccess(..) => {}
-            other => panic!("expected DoneSuccess on Enter, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected DoneSuccess on Enter, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
         assert_eq!(app_state.thinking().as_deref(), Some(sel.as_str()));
     }

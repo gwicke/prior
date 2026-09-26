@@ -1,24 +1,24 @@
+use crate::repl::{current_term_width, Repl};
+use crate::settings::{ShowReasoning, ShowReasoningHandle};
+use crate::tools::EditOp;
 use console::{style, StyledObject};
+use crossterm::event::{self, Event, KeyCode};
 use indicatif::{ProgressBar, ProgressStyle};
+use libc;
+use markdown_stream::{Parser, StreamParser};
+use markdown_terminal::{Renderer, Theme};
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 use std::collections::VecDeque;
-use std::io::{self, Read, Write};
 use std::io::IsTerminal;
+use std::io::{self, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
 use termimad;
-use markdown_stream::{Parser, StreamParser};
-use markdown_terminal::{Renderer, Theme};
-use libc;
-use crossterm::event::{self, Event, KeyCode};
-use crate::repl::{Repl, current_term_width};
-use crate::settings::{ShowReasoning, ShowReasoningHandle};
-use crate::tools::EditOp;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
@@ -131,7 +131,9 @@ pub trait Output: Send + Sync {
     fn begin_capture(&self) {}
     /// End a previous [`begin_capture`] and return the captured bytes.
     /// Returns an empty vec for non-console implementations.
-    fn end_capture(&self) -> Vec<u8> { Vec::new() }
+    fn end_capture(&self) -> Vec<u8> {
+        Vec::new()
+    }
     /// Print plain text with no decorative prefix (used for the startup
     /// hint/status line and REPL-originated confirmations). Advances the
     /// tracked cursor by the wrapped line count.
@@ -142,7 +144,9 @@ pub trait Output: Send + Sync {
     /// returns the terminal height (correct for non-console outputs, which
     /// don't run the raw-mode REPL).
     fn cursor_row(&self) -> usize {
-        crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24)
+        crossterm::terminal::size()
+            .map(|(_, h)| h as usize)
+            .unwrap_or(24)
     }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
@@ -269,7 +273,10 @@ pub struct RecordingOutput {
 
 #[cfg(test)]
 impl RecordingOutput {
-    pub fn new() -> (std::sync::Arc<Self>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    pub fn new() -> (
+        std::sync::Arc<Self>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         (
             std::sync::Arc::new(RecordingOutput {
@@ -482,7 +489,11 @@ pub fn term_height() -> usize {
 pub(crate) fn render_markdown(src: &str, width: usize, color: bool) -> String {
     // In callers, `color` is `is_terminal()`, so enabling OSC 8 clickable
     // links here gates them to a real TTY (pipes/CI stay escape-free).
-    let mut theme = if color { Theme::default() } else { Theme::no_color() };
+    let mut theme = if color {
+        Theme::default()
+    } else {
+        Theme::no_color()
+    };
     theme.clickable_links = color;
     markdown_terminal::render_with(&markdown_stream::parse_gfm(src), &theme, width)
 }
@@ -743,9 +754,7 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
         }
         s if s.starts_with("grep") => {
             // Grep tool: show pattern (from "pattern" or "pat") and path.
-            let pat = get_str("pattern")
-                .or_else(|| get_str("pat"))
-                .unwrap_or("");
+            let pat = get_str("pattern").or_else(|| get_str("pat")).unwrap_or("");
             let path = get_str("path").unwrap_or("");
             (format!("grep {} {}", pat, path), Vec::new())
         }
@@ -758,8 +767,8 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             let path = get_str("path").unwrap_or("");
             // Try canonical format (edits array) first, then the legacy
             // single-edit top-level shape, then the old "old/new" fields.
-            let edits: Vec<EditOp> = if let Some(edits_array) = 
-                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array()) 
+            let edits: Vec<EditOp> = if let Some(edits_array) =
+                obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
             {
                 edits_array
                     .iter()
@@ -767,7 +776,10 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                         Some(EditOp {
                             old_text: e.get("oldText")?.as_str()?.to_string(),
                             new_text: e.get("newText")?.as_str()?.to_string(),
-                            start_line: e.get("startLine").and_then(|v| v.as_u64()).map(crate::config::EditStartLine),
+                            start_line: e
+                                .get("startLine")
+                                .and_then(|v| v.as_u64())
+                                .map(crate::config::EditStartLine),
                         })
                     })
                     .collect()
@@ -787,7 +799,14 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 // Old format: old/new fields.
                 let old = get_str("old").unwrap_or("");
                 let new_str = get_str("new").unwrap_or("");
-                edit_preview(path, &[EditOp { old_text: old.to_string(), new_text: new_str.to_string(), start_line: None }])
+                edit_preview(
+                    path,
+                    &[EditOp {
+                        old_text: old.to_string(),
+                        new_text: new_str.to_string(),
+                        start_line: None,
+                    }],
+                )
             };
             let mut s = format!("edit {}", path);
             if let Some(r) = range {
@@ -808,7 +827,10 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 .next()
                 .map(|c| c.to_uppercase().collect::<String>() + &name[1..])
                 .unwrap_or_else(|| name.to_string());
-            (format!("{} {}", cap, truncate(&first.replace('\n', " "), 50)), Vec::new())
+            (
+                format!("{} {}", cap, truncate(&first.replace('\n', " "), 50)),
+                Vec::new(),
+            )
         }
     }
 }
@@ -1069,7 +1091,9 @@ fn strip_ansi(s: &str) -> String {
                 while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
                     i += 1;
                 }
-                if i < bytes.len() { i += 1; } // consume final byte
+                if i < bytes.len() {
+                    i += 1;
+                } // consume final byte
                 continue;
             }
             if i + 1 < bytes.len() && bytes[i + 1] == b']' {
@@ -1077,7 +1101,9 @@ fn strip_ansi(s: &str) -> String {
                 while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
                     i += 1;
                 }
-                if i < bytes.len() { i += 1; } // consume BEL or ST
+                if i < bytes.len() {
+                    i += 1;
+                } // consume BEL or ST
                 continue;
             }
         }
@@ -1094,7 +1120,17 @@ fn strip_ansi(s: &str) -> String {
 
 /// UTF-8 lead byte -> byte length (1..=4).
 fn utf8_len(b: u8) -> usize {
-    if b < 0x80 { 1 } else if b >> 5 == 0b110 { 2 } else if b >> 4 == 0b1110 { 3 } else if b >> 3 == 0b11110 { 4 } else { 1 }
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 /// Non-blocking Device Status Report: ask the terminal for the real
@@ -1110,7 +1146,9 @@ fn query_real_cursor_row() -> Option<usize> {
         return None;
     }
     unsafe { libc::fcntl(fd, libc::F_SETFL, old | libc::O_NONBLOCK) };
-    let restore = |f: i32, o: i32| unsafe { libc::fcntl(f, libc::F_SETFL, o); };
+    let restore = |f: i32, o: i32| unsafe {
+        libc::fcntl(f, libc::F_SETFL, o);
+    };
 
     let mut out = io::stdout();
     if out.write_all(b"\x1b[6n").is_err() || out.flush().is_err() {
@@ -1146,11 +1184,7 @@ fn query_real_cursor_row() -> Option<usize> {
 
 /// Parse a Device Status Report reply `ESC[<row>;<col>R` into the 1-indexed row.
 fn parse_dsr(buf: &[u8]) -> Option<usize> {
-    if buf.len() < 4
-        || buf[0] != 0x1b
-        || buf[1] != b'['
-        || *buf.last()? != b'R'
-    {
+    if buf.len() < 4 || buf[0] != 0x1b || buf[1] != b'[' || *buf.last()? != b'R' {
         return None;
     }
     let inner = &buf[2..buf.len() - 1];
@@ -1313,7 +1347,11 @@ impl ConsoleOutput {
         };
         let row = format!(
             "{}{}{}{}",
-            if indent { format!("{BG} ") } else { String::new() },
+            if indent {
+                format!("{BG} ")
+            } else {
+                String::new()
+            },
             painted,
             format!("{BG}"),
             format!("{}{}", " ".repeat(pad), RESET),
@@ -1855,7 +1893,11 @@ impl Output for ConsoleOutput {
             }
             // `read_file` renders `NNNN| content`; drop the gutter for display
             // (the model still gets the numbers in the raw tool result).
-            let visible = if is_read { strip_read_lineno(line) } else { line };
+            let visible = if is_read {
+                strip_read_lineno(line)
+            } else {
+                line
+            };
             for wline in wrap(visible, inner) {
                 if is_error {
                     self.tool_panel(&wline, true, true);
@@ -2025,10 +2067,7 @@ impl Output for ConsoleOutput {
 
         // Default selection = Accept (safe for an explicit review step the
         // user reached by editing the summary and pressing a key).
-        let options = vec![
-            "Accept".to_string(),
-            "Cancel".to_string(),
-        ];
+        let options = vec!["Accept".to_string(), "Cancel".to_string()];
         let mut sel: usize = 0;
 
         let draw = |sel: usize| {
@@ -2151,7 +2190,8 @@ impl Output for ConsoleOutput {
             .unwrap_or_else(|_| "unknown".into());
 
         let _ = write!(
-            out, "{} | {} ({})",
+            out,
+            "{} | {} ({})",
             style("picocode").bold(),
             style(provider).cyan(),
             style(model).blue(),
@@ -2162,7 +2202,8 @@ impl Output for ConsoleOutput {
         }
 
         let _ = writeln!(
-            out, " | {} | {} | {}",
+            out,
+            " | {} | {} | {}",
             status(yolo, "yolo", |s| s.red()),
             style(format!("limit:{}", limit)).yellow(),
             style(cwd).dim()
@@ -2264,7 +2305,8 @@ impl Output for ScrollbackOutput {
         limit: usize,
         persona: Option<&str>,
     ) {
-        self.inner.display_header(provider, model, yolo, limit, persona);
+        self.inner
+            .display_header(provider, model, yolo, limit, persona);
     }
 }
 
@@ -2279,10 +2321,7 @@ mod tests {
 
     #[test]
     fn wrap_long_no_space() {
-        assert_eq!(
-            wrap("abcdefghij", 3),
-            vec!["abc", "def", "ghi", "j"]
-        );
+        assert_eq!(wrap("abcdefghij", 3), vec!["abc", "def", "ghi", "j"]);
     }
 
     #[test]
@@ -2329,7 +2368,10 @@ mod tests {
 
     #[test]
     fn wrap_single_spaces_around_emdash() {
-        assert_eq!(wrap("— Show available commands", 100), vec!["— Show available commands"]);
+        assert_eq!(
+            wrap("— Show available commands", 100),
+            vec!["— Show available commands"]
+        );
     }
 
     #[test]
@@ -2424,7 +2466,11 @@ mod tests {
         let r = wrap_with_diff_markers(text, 20);
         // The first line must keep the marker; continuation lines must be
         // prefixed with two spaces to align under `- `.
-        assert!(r[0].starts_with("- "), "first line must keep the marker, got {:?}", r);
+        assert!(
+            r[0].starts_with("- "),
+            "first line must keep the marker, got {:?}",
+            r
+        );
         for line in &r[1..] {
             assert!(
                 line.starts_with("  "),
@@ -2433,10 +2479,7 @@ mod tests {
             );
         }
         // And the body content must survive intact (no collapsing).
-        let joined: String = r
-            .iter()
-            .flat_map(|l| l.chars())
-            .collect();
+        let joined: String = r.iter().flat_map(|l| l.chars()).collect();
         // Every original character must appear in the wrapped output.
         assert!(joined.contains("foo"));
         assert!(joined.contains("garply"));
@@ -2480,13 +2523,19 @@ mod tests {
     #[test]
     fn get_preview_read_file_range() {
         let args = serde_json::json!({"path": "src/output.rs", "offset": 100, "limit": 50});
-        assert_eq!(get_preview("read_file", &args).0, "read src/output.rs [101..150]");
+        assert_eq!(
+            get_preview("read_file", &args).0,
+            "read src/output.rs [101..150]"
+        );
         // zero limit => whole file, no range
         let args = serde_json::json!({"path": "src/output.rs", "offset": 0, "limit": 0});
         assert_eq!(get_preview("read_file", &args).0, "read src/output.rs");
         // offset-only (limit 0) => open-ended range
         let args = serde_json::json!({"path": "src/output.rs", "offset": 19, "limit": 0});
-        assert_eq!(get_preview("read_file", &args).0, "read src/output.rs [20..]");
+        assert_eq!(
+            get_preview("read_file", &args).0,
+            "read src/output.rs [20..]"
+        );
     }
 
     #[test]
@@ -2522,7 +2571,11 @@ mod tests {
         assert_eq!(label, "edit /no/such/file.rs");
         // The refined diff is derived purely from oldText/newText, so it is
         // shown even when the file cannot be read (e.g. during replay).
-        assert_eq!(diff, vec!["@@ -1 +1 @@", "- a", "+ b"], "diff should come from old/new: {diff:?}");
+        assert_eq!(
+            diff,
+            vec!["@@ -1 +1 @@", "- a", "+ b"],
+            "diff should come from old/new: {diff:?}"
+        );
     }
 
     #[test]
@@ -2538,7 +2591,11 @@ mod tests {
         assert_eq!(label, "edit /no/such/file.rs");
         // File doesn't exist, so no range, but the diff is still rendered from
         // oldText/newText (this is what guarantees replay shows the edits).
-        assert_eq!(diff, vec!["@@ -1 +1 @@", "- a", "+ b"], "diff should come from oldText/newText: {diff:?}");
+        assert_eq!(
+            diff,
+            vec!["@@ -1 +1 @@", "- a", "+ b"],
+            "diff should come from oldText/newText: {diff:?}"
+        );
     }
 
     #[test]
@@ -2557,14 +2614,7 @@ mod tests {
         assert_eq!(label, "edit /no/such/file.rs");
         assert_eq!(
             diff,
-            vec![
-                "@@ -1 +1 @@",
-                "- a",
-                "+ b",
-                "@@ -1 +1 @@",
-                "- x",
-                "+ y",
-            ],
+            vec!["@@ -1 +1 @@", "- a", "+ b", "@@ -1 +1 @@", "- x", "+ y",],
             "each batch edit should produce its own diff: {diff:?}"
         );
     }
@@ -2617,7 +2667,12 @@ mod tests {
         // source-line token.
         for line in &diff {
             let wrapped = wrap_with_diff_markers(line, 80);
-            assert_eq!(wrapped, vec![line.clone()], "indent should survive wrap_with_diff_markers for {:?}", line);
+            assert_eq!(
+                wrapped,
+                vec![line.clone()],
+                "indent should survive wrap_with_diff_markers for {:?}",
+                line
+            );
         }
 
         let _ = std::fs::remove_file(&path);
@@ -2626,19 +2681,36 @@ mod tests {
     #[test]
     fn refined_diff_lines_shows_changes_without_trailing_newlines() {
         let old_text = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
-        let new_text = "fn main() {\n    let x = 42;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
+        let new_text =
+            "fn main() {\n    let x = 42;\n    let y = 2;\n    println!(\"{}\", x);\n}\n";
         let lines = refined_diff_lines(old_text, new_text);
 
         // Hunk header present.
-        assert!(lines.iter().any(|l| l.contains("@@")), "should contain hunk header: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("@@")),
+            "should contain hunk header: {lines:?}"
+        );
         // Show the changed lines with marker + space + indented content.
-        assert!(lines.iter().any(|l| l == "-     let x = 1;"), "removed line: {lines:?}");
-        assert!(lines.iter().any(|l| l == "+     let x = 42;"), "added line: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "-     let x = 1;"),
+            "removed line: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "+     let x = 42;"),
+            "added line: {lines:?}"
+        );
         // Context lines use a space marker + space then the source indent.
-        assert!(lines.iter().any(|l| l == "      let y = 2;"), "context line: {lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "      let y = 2;"),
+            "context line: {lines:?}"
+        );
         // No line may carry a trailing newline (would split into blank rows).
         for l in &lines {
-            assert!(!l.ends_with('\n'), "line must not end with newline: {:?}", l);
+            assert!(
+                !l.ends_with('\n'),
+                "line must not end with newline: {:?}",
+                l
+            );
         }
     }
 
@@ -2674,7 +2746,10 @@ mod tests {
     fn refined_diff_lines_no_changes_is_empty() {
         let text = "fn main() {\n    let x = 1;\n}\n";
         let lines = refined_diff_lines(text, text);
-        assert!(lines.is_empty(), "identical text yields no diff lines: {lines:?}");
+        assert!(
+            lines.is_empty(),
+            "identical text yields no diff lines: {lines:?}"
+        );
     }
 
     #[test]
@@ -2688,8 +2763,15 @@ mod tests {
             new.push_str(&format!("line {i} changed\n"));
         }
         let lines = refined_diff_lines(&old, &new);
-        assert!(lines.len() < 200, "should cap huge diffs, got {}", lines.len());
-        assert!(lines.iter().any(|l| l.contains("truncated")), "should flag truncation: {lines:?}");
+        assert!(
+            lines.len() < 200,
+            "should cap huge diffs, got {}",
+            lines.len()
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("truncated")),
+            "should flag truncation: {lines:?}"
+        );
     }
 
     #[test]
@@ -2712,7 +2794,10 @@ mod tests {
             let (label, diff) = get_preview(name, &args);
             // Label is shortened to just `grep`, and both pattern and path are
             // shown in full (no 50-col truncation).
-            assert_eq!(label, "grep fn (main|run)\\( /home/gabriel/src/picocode2/src");
+            assert_eq!(
+                label,
+                "grep fn (main|run)\\( /home/gabriel/src/picocode2/src"
+            );
             assert!(diff.is_empty());
         }
     }
@@ -2777,7 +2862,10 @@ mod tests {
     fn render_markdown_code_has_no_ansi_when_plain() {
         let src = "```rust\nfn main() {}\n```\n";
         let plain = render_markdown(src, 80, false);
-        assert!(!plain.contains('\x1b'), "non-terminal path must stay ANSI-free");
+        assert!(
+            !plain.contains('\x1b'),
+            "non-terminal path must stay ANSI-free"
+        );
         assert!(plain.contains("fn main()"));
     }
 
@@ -2871,7 +2959,10 @@ mod tests {
         // `color` is `is_terminal()` in callers, so OSC 8 clickable links must
         // appear on a TTY (color = true) and stay absent for pipes/CI.
         let tty = render_markdown("[text](https://example.com/a)", 80, true);
-        assert!(tty.contains("\x1b]8;;https://example.com/a\x1b\\"), "TTY render must wrap link in OSC 8");
+        assert!(
+            tty.contains("\x1b]8;;https://example.com/a\x1b\\"),
+            "TTY render must wrap link in OSC 8"
+        );
         assert!(tty.contains("text"));
         let piped = render_markdown("[text](https://example.com/a)", 80, false);
         assert!(
@@ -2889,7 +2980,10 @@ mod tests {
         let mut renderer = Renderer::new(Theme::dimmed(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let _ = write!(buf, "\x1b[2m"); // initial dim (mirrors `ensure_dim(true)`)
-        let _ = renderer.feed(&parser.write("let me **think** step by step\n".as_bytes()), &mut buf);
+        let _ = renderer.feed(
+            &parser.write("let me **think** step by step\n".as_bytes()),
+            &mut buf,
+        );
         let _ = renderer.feed(&parser.flush(), &mut buf);
         let _ = write!(buf, "\x1b[0m"); // reset (mirrors `ensure_dim(false)`)
         let out = String::from_utf8(buf).unwrap();
@@ -2908,26 +3002,35 @@ mod tests {
         let mut renderer = Renderer::new(Theme::dimmed(), 80);
         let mut buf: Vec<u8> = Vec::new();
         let _ = write!(buf, "\x1b[2m");
-        
+
         // First paragraph - no flush yet (no blank line)
         let _ = renderer.feed(&parser.write("\n\n[test] first ".as_bytes()), &mut buf);
         let _ = renderer.feed(&parser.write("\nparagraph \n".as_bytes()), &mut buf);
         let before_flush = String::from_utf8(buf.clone()).unwrap();
-        assert!(!before_flush.contains("first paragraph"), "content held before boundary");
-        
+        assert!(
+            !before_flush.contains("first paragraph"),
+            "content held before boundary"
+        );
+
         // Add blank line - should flush
         let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         let after_flush = String::from_utf8(buf.clone()).unwrap();
         eprintln!("after newline: {}", after_flush);
-        assert!(after_flush.contains("first paragraph"), "content emitted after boundary");
-        
+        assert!(
+            after_flush.contains("first paragraph"),
+            "content emitted after boundary"
+        );
+
         // Second paragraph with explicit blank line
         let _ = renderer.feed(&parser.write("second paragraph\n".as_bytes()), &mut buf);
         let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         // let _ = renderer.feed(&parser.write("\n".as_bytes()), &mut buf);
         let after_blank = String::from_utf8(buf.clone()).unwrap();
-        assert!(after_blank.contains("second paragraph"), "content emitted on blank line");
-        
+        assert!(
+            after_blank.contains("second paragraph"),
+            "content emitted on blank line"
+        );
+
         let _ = write!(buf, "\x1b[0m");
     }
 
@@ -3006,7 +3109,7 @@ mod tests {
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.begin_response_inner(true); // force the live/TTY path
         out.set_answer_hold(true); // reasoning enabled → hold the answer
-        // Answer arrives first, then a trailing reasoning delta.
+                                   // Answer arrives first, then a trailing reasoning delta.
         out.stream_text("ZQANSWERZQ");
         out.stream_thinking("ZQTHINKZQ");
         // While held, the answer lives in the buffer, not yet emitted.
@@ -3063,7 +3166,10 @@ mod tests {
         // Simulate reasoning that ends with a bullet list (the stranding trigger).
         // Using `flush()` (not `write(b"\n\n")`) so the list closes properly.
         out.extend_from_slice(b"\x1b[2m"); // initial dim (mirrors ensure_dim(true))
-        let _ = thinking_renderer.feed(&thinking_parser.write(b"Plan:\n- step one\n- step two\n"), &mut out);
+        let _ = thinking_renderer.feed(
+            &thinking_parser.write(b"Plan:\n- step one\n- step two\n"),
+            &mut out,
+        );
         let _ = thinking_renderer.feed(&thinking_parser.flush(), &mut out);
         out.extend_from_slice(b"\x1b[0m"); // reset dim (mirrors ensure_dim(false))
 
@@ -3081,7 +3187,10 @@ mod tests {
         // Assert (a): list items appear before the answer.
         let list_idx = lines.iter().position(|l| l.contains("step one")).unwrap();
         let ans_idx = lines.iter().position(|l| l.contains("done.")).unwrap();
-        assert!(list_idx < ans_idx, "reasoning (list) must render BEFORE the answer");
+        assert!(
+            list_idx < ans_idx,
+            "reasoning (list) must render BEFORE the answer"
+        );
 
         // Assert (b): exactly one blank line before answer.
         assert!(
@@ -3109,7 +3218,10 @@ mod tests {
         let colored = highlight_code_fg("let x = 1;", "rust", true);
         // ANSI escapes break the literal substring, so strip them first
         let plain = strip_ansi(&colored);
-        assert!(plain.contains("let x = 1;"), "highlighting must not drop content; got plain={plain:?} from colored={colored:?}");
+        assert!(
+            plain.contains("let x = 1;"),
+            "highlighting must not drop content; got plain={plain:?} from colored={colored:?}"
+        );
         assert!(colored.contains('\x1b'), "color path must emit ANSI");
         // non-color path returns the line untouched
         assert_eq!(highlight_code_fg("let x = 1;", "rust", false), "let x = 1;");
@@ -3203,7 +3315,10 @@ mod tests {
         out.begin_capture_inner();
 
         // Simulate a write tool call with structured result (as write_file returns)
-        out.display_tool_call("write_file", &serde_json::json!({"path": "test.rs", "content": "fn main() {}"}));
+        out.display_tool_call(
+            "write_file",
+            &serde_json::json!({"path": "test.rs", "content": "fn main() {}"}),
+        );
         let result = r#"{"path":"./test.rs","content":"fn main() {\n    let x = 42;\n    println!(\"Hello, world! {}\", x);\n}","lines":4,"bytes":72}"#;
         out.display_tool_result(result);
 
@@ -3212,12 +3327,24 @@ mod tests {
         let output = strip_ansi(&String::from_utf8_lossy(&captured));
 
         // Should contain the path header with line count
-        assert!(output.contains("write ./test.rs [4 lines]"), "missing path header with line count: {}", output);
+        assert!(
+            output.contains("write ./test.rs [4 lines]"),
+            "missing path header with line count: {}",
+            output
+        );
         // Should contain syntax-highlighted content (first 10 lines)
         assert!(output.contains("fn main()"), "missing fn main: {}", output);
-        assert!(output.contains("let x = 42"), "missing let x = 42: {}", output);
+        assert!(
+            output.contains("let x = 42"),
+            "missing let x = 42: {}",
+            output
+        );
         assert!(output.contains("println!"), "missing println!: {}", output);
         // Should NOT contain line numbers (unlike read_file which has them in raw result but stripped for display)
-        assert!(!output.contains("|"), "should not contain line number gutter: {}", output);
+        assert!(
+            !output.contains("|"),
+            "should not contain line number gutter: {}",
+            output
+        );
     }
 }

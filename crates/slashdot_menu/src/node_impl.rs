@@ -45,9 +45,7 @@ impl PathArgs {
     /// Flat word slices into `suffix` (all non-ID tokens, pre-
     /// classification).
     pub fn args(&self) -> impl Iterator<Item = &str> + '_ {
-        self.args
-            .iter()
-            .map(move |r| &self.suffix[r.clone()])
+        self.args.iter().map(move |r| &self.suffix[r.clone()])
     }
 
     /// The space-delimited word directly before `cursor` (byte offset
@@ -200,7 +198,7 @@ pub enum MenuResult {
 pub trait SlashDotNode {
     /// The rows this node contributes to its parent's listing.  *All* leaf
     /// nodes need to implement this, and should return one or more rows with an `id` and
-    /// `description`. 
+    /// `description`.
     /// Handled automatically for `StaticListingNode`, so higher levels of the hierarchy which have
     /// leaf nodes as children.
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
@@ -232,11 +230,7 @@ pub trait SlashDotNode {
     /// Non-selectable header lines (replaces v2 DetailProvider).
     /// Default: empty. The engine truncates based on terminal size.
     /// `render_ctx` carries display metrics (terminal width) for layout.
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         Vec::new()
     }
 
@@ -428,11 +422,7 @@ impl SlashDotNode for StaticListingNode {
         }))
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         self.header_lines.clone()
     }
 

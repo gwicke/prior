@@ -4,9 +4,9 @@
 //! implements [`SessionStorage`].  The file is append-only; the in-memory index
 //! is rebuilt on each open by scanning the full file.
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::session::types::*;
@@ -28,7 +28,9 @@ const CANONICAL_NAMES: &[(&str, &str)] = &[
 
 /// Rename argument fields in `args` from old/pi names to canonical names.
 fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
-    let Some(obj) = args.as_object_mut() else { return };
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
     match name {
         "bash" => {
             // Pi uses "command"; old picocode used "cmd".
@@ -162,10 +164,7 @@ impl JsonlSessionStorage {
     /// directories, and does not request write access.  Useful for inspecting
     /// external session stores (e.g. pi sessions on a read-only mount).
     pub async fn open_readonly(path: PathBuf) -> crate::Result<Self> {
-        let file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .open(&path)
-            .await?;
+        let file = tokio::fs::OpenOptions::new().read(true).open(&path).await?;
         Ok(Self {
             path,
             file: tokio::sync::Mutex::new(Some(file)),
@@ -173,7 +172,9 @@ impl JsonlSessionStorage {
     }
 
     /// Ensure the write handle is open, creating the file if needed.
-    async fn ensure_open(&self) -> crate::Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
+    async fn ensure_open(
+        &self,
+    ) -> crate::Result<tokio::sync::MutexGuard<'_, Option<tokio::fs::File>>> {
         let mut guard = self.file.lock().await;
         if guard.is_none() {
             if let Some(parent) = self.path.parent() {
@@ -379,7 +380,8 @@ mod tests {
         );
 
         // Already-array form is unchanged (idempotent).
-        let orig = serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]});
+        let orig =
+            serde_json::json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]});
         let mut v = orig.clone();
         normalize_args_in_place("edit", &mut v);
         assert_eq!(v, orig);
@@ -393,10 +395,8 @@ mod tests {
 
     /// Helper: create a JsonlSessionStorage backed by a temp file.
     async fn create_temp_storage() -> (JsonlSessionStorage, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
         let filename = session_filename(&Utc::now());
         let path = dir.join(&filename);
         let storage = JsonlSessionStorage::open_or_create(path.clone())
@@ -422,10 +422,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_index_empty_file_errors() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
         let path = dir.join("empty.jsonl");
         // Create empty file
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -546,10 +544,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncated_last_line_skipped() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-session-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("picocode-session-test-{}", std::process::id()));
         let filename = session_filename(&Utc::now());
         let path = dir.join(&filename);
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -653,10 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_pi_format_jsonl() {
-        let dir = std::env::temp_dir().join(format!(
-            "picocode-pi-compat-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("picocode-pi-compat-{}", std::process::id()));
         let path = dir.join("pi-format.jsonl");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(&path, PI_FORMAT_JSONL).await.unwrap();

@@ -7,7 +7,19 @@ use std::path::{Path, PathBuf};
 // Wrapper types that can deserialize from both JSON numbers and strings.
 /// These handle the common case where LLMs send numeric parameters as strings.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct ReadOffset(pub u64);
 
 impl<'de> serde::Deserialize<'de> for ReadOffset {
@@ -48,7 +60,10 @@ impl<'de> serde::Deserialize<'de> for ReadOffset {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(parsed)
                 } else {
-                    Err(E::custom(format!("invalid read offset: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid read offset: '{}' - must be number",
+                        value
+                    )))
                 }
             }
         }
@@ -69,7 +84,19 @@ impl From<ReadOffset> for u64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct ReadLimit(pub u64);
 
 impl<'de> serde::Deserialize<'de> for ReadLimit {
@@ -110,7 +137,10 @@ impl<'de> serde::Deserialize<'de> for ReadLimit {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(parsed)
                 } else {
-                    Err(E::custom(format!("invalid read limit: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid read limit: '{}' - must be number",
+                        value
+                    )))
                 }
             }
         }
@@ -131,7 +161,19 @@ impl From<ReadLimit> for u64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct BashTimeout(pub Option<u64>);
 
 impl<'de> serde::Deserialize<'de> for BashTimeout {
@@ -160,7 +202,9 @@ impl<'de> serde::Deserialize<'de> for BashTimeout {
                 E: serde::de::Error,
             {
                 if value < 0 {
-                    return Err(E::custom("invalid bash timeout: negative value not allowed"));
+                    return Err(E::custom(
+                        "invalid bash timeout: negative value not allowed",
+                    ));
                 }
                 Ok(Some(value as u64))
             }
@@ -175,7 +219,10 @@ impl<'de> serde::Deserialize<'de> for BashTimeout {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(Some(parsed))
                 } else {
-                    Err(E::custom(format!("invalid bash timeout: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid bash timeout: '{}' - must be number",
+                        value
+                    )))
                 }
             }
 
@@ -225,7 +272,9 @@ impl From<BashTimeout> for Option<u64> {
 /// Custom deserializer for `ReasoningInContextMode` that accepts both legacy
 /// boolean values (`true`/`false`) and new string enum values
 /// (`"always"`, `"never"`, `"aborted_turns_only"`).
-fn deserialize_reasoning_in_context<'de, D>(deserializer: D) -> Result<Option<crate::settings::ReasoningInContextMode>, D::Error>
+fn deserialize_reasoning_in_context<'de, D>(
+    deserializer: D,
+) -> Result<Option<crate::settings::ReasoningInContextMode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -245,12 +294,25 @@ where
                 crate::settings::ReasoningInContextMode::Never
             }
         }
-        BoolOrString::String(s) => crate::settings::ReasoningInContextMode::parse_opt(&s)
-            .unwrap_or_default(),
+        BoolOrString::String(s) => {
+            crate::settings::ReasoningInContextMode::parse_opt(&s).unwrap_or_default()
+        }
     }))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct SandboxTimeoutSecs(pub Option<u64>);
 
 impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
@@ -279,7 +341,9 @@ impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
                 E: serde::de::Error,
             {
                 if value < 0 {
-                    return Err(E::custom("invalid timeout_secs: negative value not allowed"));
+                    return Err(E::custom(
+                        "invalid timeout_secs: negative value not allowed",
+                    ));
                 }
                 Ok(Some(value as u64))
             }
@@ -294,7 +358,10 @@ impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(Some(parsed))
                 } else {
-                    Err(E::custom(format!("invalid timeout_secs: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid timeout_secs: '{}' - must be number",
+                        value
+                    )))
                 }
             }
 
@@ -313,7 +380,9 @@ impl<'de> serde::Deserialize<'de> for SandboxTimeoutSecs {
             }
         }
 
-        deserializer.deserialize_any(Visitor).map(SandboxTimeoutSecs)
+        deserializer
+            .deserialize_any(Visitor)
+            .map(SandboxTimeoutSecs)
     }
 }
 
@@ -341,7 +410,19 @@ impl From<SandboxTimeoutSecs> for Option<u64> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct SandboxMemoryMb(pub Option<u64>);
 
 impl<'de> serde::Deserialize<'de> for SandboxMemoryMb {
@@ -385,7 +466,10 @@ impl<'de> serde::Deserialize<'de> for SandboxMemoryMb {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(Some(parsed))
                 } else {
-                    Err(E::custom(format!("invalid memory_mb: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid memory_mb: '{}' - must be number",
+                        value
+                    )))
                 }
             }
 
@@ -432,7 +516,19 @@ impl From<SandboxMemoryMb> for Option<u64> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct SandboxTmpSizeMb(pub Option<u64>);
 
 impl<'de> serde::Deserialize<'de> for SandboxTmpSizeMb {
@@ -476,7 +572,10 @@ impl<'de> serde::Deserialize<'de> for SandboxTmpSizeMb {
                 if let Ok(parsed) = value.parse::<u64>() {
                     Ok(Some(parsed))
                 } else {
-                    Err(E::custom(format!("invalid tmp_size_mb: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid tmp_size_mb: '{}' - must be number",
+                        value
+                    )))
                 }
             }
 
@@ -523,7 +622,19 @@ impl From<SandboxTmpSizeMb> for Option<u64> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct SandboxMaxOutputBytes(pub Option<usize>);
 
 impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
@@ -537,7 +648,8 @@ impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
             type Value = Option<usize>;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a positive integer for max_output_bytes (not a string), or null")
+                formatter
+                    .write_str("a positive integer for max_output_bytes (not a string), or null")
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
@@ -552,7 +664,9 @@ impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
                 E: serde::de::Error,
             {
                 if value < 0 {
-                    return Err(E::custom("invalid max_output_bytes: negative value not allowed"));
+                    return Err(E::custom(
+                        "invalid max_output_bytes: negative value not allowed",
+                    ));
                 }
                 Ok(Some(value as usize))
             }
@@ -567,7 +681,10 @@ impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
                 if let Ok(parsed) = value.parse::<usize>() {
                     Ok(Some(parsed))
                 } else {
-                    Err(E::custom(format!("invalid max_output_bytes: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid max_output_bytes: '{}' - must be number",
+                        value
+                    )))
                 }
             }
 
@@ -586,7 +703,9 @@ impl<'de> serde::Deserialize<'de> for SandboxMaxOutputBytes {
             }
         }
 
-        deserializer.deserialize_any(Visitor).map(SandboxMaxOutputBytes)
+        deserializer
+            .deserialize_any(Visitor)
+            .map(SandboxMaxOutputBytes)
     }
 }
 
@@ -617,7 +736,19 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
 /// Wrapper type for a 1-indexed line number (the `edit` tool's `startLine`
 /// anchor, and the same numbers a `path:LINE` header parses to).
 /// Handles deserialization from JSON numbers and strings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, schemars::JsonSchema, Default, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
 pub struct EditStartLine(pub u64);
 
 impl<'de> serde::Deserialize<'de> for EditStartLine {
@@ -664,7 +795,10 @@ impl<'de> serde::Deserialize<'de> for EditStartLine {
                     }
                     Ok(parsed)
                 } else {
-                    Err(E::custom(format!("invalid start line: '{}' - must be number", value)))
+                    Err(E::custom(format!(
+                        "invalid start line: '{}' - must be number",
+                        value
+                    )))
                 }
             }
         }
@@ -808,7 +942,9 @@ impl SandboxConfig {
             ro: self.ro.clone(),
             rw: self.rw.clone(),
             env: self.env.clone(),
-            max_output_bytes: self.max_output_bytes.or(SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))),
+            max_output_bytes: self
+                .max_output_bytes
+                .or(SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))),
         }
     }
 
@@ -818,7 +954,10 @@ impl SandboxConfig {
     /// [`DEFAULT_MAX_OUTPUT_BYTES`]. Used by the bash and grep/rg reader paths
     /// to bound how much child output is kept in memory.
     pub fn max_output_bytes(&self) -> usize {
-        self.max_output_bytes.clone().map(|v| v.into()).unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+        self.max_output_bytes
+            .clone()
+            .map(|v| v.into())
+            .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
     }
 }
 
@@ -864,13 +1003,8 @@ pub enum EnvMode {
 /// block. Drops common secret shapes (`*_KEY`, `*_SECRET`, `*_TOKEN`, `AWS_*`,
 /// `SSH_AUTH_SOCK`) while leaving the rest of the environment intact, so
 /// ordinary commands (which rely on `PATH`, `HOME`, `TERM`, ...) still work.
-pub const DEFAULT_ENV_DISALLOW: &[&str] = &[
-    "*_KEY",
-    "*_SECRET",
-    "*_TOKEN",
-    "AWS_*",
-    "SSH_AUTH_SOCK",
-];
+pub const DEFAULT_ENV_DISALLOW: &[&str] =
+    &["*_KEY", "*_SECRET", "*_TOKEN", "AWS_*", "SSH_AUTH_SOCK"];
 
 impl SandboxConfig {
     /// Effective environment policy.
@@ -894,17 +1028,10 @@ impl SandboxConfig {
 ///
 /// `env` is the parent's full environment (e.g. `std::env::vars().collect()`).
 /// The result is what `build_bwrap_expr` passes via `--clearenv` + `--setenv`.
-pub fn env_vars_to_keep(
-    policy: &EnvPolicy,
-    env: &[(String, String)],
-) -> Vec<(String, String)> {
+pub fn env_vars_to_keep(policy: &EnvPolicy, env: &[(String, String)]) -> Vec<(String, String)> {
     let keep = |name: &str| patterns_match_any(&policy.patterns, name);
     match policy.mode {
-        EnvMode::Disallow => env
-            .iter()
-            .filter(|(n, _)| !keep(n))
-            .cloned()
-            .collect(),
+        EnvMode::Disallow => env.iter().filter(|(n, _)| !keep(n)).cloned().collect(),
         EnvMode::OnlyAllow => env.iter().filter(|(n, _)| keep(n)).cloned().collect(),
     }
 }
@@ -1133,16 +1260,11 @@ fn resolve_one(cwd: &Path, home: Option<&Path>, spec: &BindPath, mode: BindMode)
             (from.clone(), from)
         }
         // Remap form: explicit host (`from`) and in-sandbox (`to`) paths.
-        BindPath::Remap { from, to } => (
-            resolve_path(cwd, home, from),
-            resolve_path(cwd, home, to),
-        ),
+        BindPath::Remap { from, to } => {
+            (resolve_path(cwd, home, from), resolve_path(cwd, home, to))
+        }
     };
-    ResolvedBind {
-        mode,
-        from,
-        to,
-    }
+    ResolvedBind { mode, from, to }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1201,11 +1323,16 @@ impl Config {
 
     /// Returns the raw (user-provided) sandbox config for the `bash` tool, if any.
     pub fn bash_sandbox_raw(&self) -> Option<&SandboxConfig> {
-        self.tool_config.get("bash").and_then(|s| s.sandbox.as_ref())
+        self.tool_config
+            .get("bash")
+            .and_then(|s| s.sandbox.as_ref())
     }
 }
 
-pub fn read_prompt(prompt: Option<String>, prompt_file: Option<String>) -> crate::Result<Option<String>> {
+pub fn read_prompt(
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+) -> crate::Result<Option<String>> {
     if let Some(file_path) = prompt_file {
         let path = Path::new(&file_path);
         let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
@@ -1284,13 +1411,19 @@ mod tests {
         assert_eq!(d.drop_caps, Some(true));
         assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
         // Output cap defaults when unset.
-        assert_eq!(d.max_output_bytes, SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES)));
+        assert_eq!(
+            d.max_output_bytes,
+            SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))
+        );
         // ...and a user value is preserved.
         let raw2 = SandboxConfig {
             max_output_bytes: SandboxMaxOutputBytes(Some(4096)),
             ..Default::default()
         };
-        assert_eq!(raw2.with_defaults().max_output_bytes, SandboxMaxOutputBytes(Some(4096)));
+        assert_eq!(
+            raw2.with_defaults().max_output_bytes,
+            SandboxMaxOutputBytes(Some(4096))
+        );
     }
 
     #[test]
@@ -1307,7 +1440,10 @@ mod tests {
         assert_eq!(d.pid_isolation, Some(true));
         assert_eq!(d.drop_caps, Some(true));
         assert_eq!(d.tmp_size_mb, SandboxTmpSizeMb(Some(256)));
-        assert_eq!(d.max_output_bytes, SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES)));
+        assert_eq!(
+            d.max_output_bytes,
+            SandboxMaxOutputBytes(Some(DEFAULT_MAX_OUTPUT_BYTES))
+        );
     }
 
     #[test]
@@ -1319,8 +1455,14 @@ mod tests {
             Some(Path::new("/home/u")),
             &[BindPath::Simple(".".to_string())],
             &[
-                BindPath::Remap { from: "./cache".to_string(), to: "/var/cache/app".to_string() },
-                BindPath::Remap { from: "~/.cargo".to_string(), to: "/opt/cargo".to_string() },
+                BindPath::Remap {
+                    from: "./cache".to_string(),
+                    to: "/var/cache/app".to_string(),
+                },
+                BindPath::Remap {
+                    from: "~/.cargo".to_string(),
+                    to: "/opt/cargo".to_string(),
+                },
             ],
         )
         .unwrap();
@@ -1341,12 +1483,18 @@ mod tests {
             Path::new("/work"),
             None,
             &[],
-            &[BindPath::Remap { from: "./scratch".to_string(), to: "/tmp".to_string() }],
+            &[BindPath::Remap {
+                from: "./scratch".to_string(),
+                to: "/tmp".to_string(),
+            }],
         )
         .unwrap();
         assert_eq!(binds[0].mode, BindMode::Rw);
         let table = RemapTable::build(&binds);
-        assert_eq!(table.rewrite(Path::new("/tmp/x")), Path::new("/work/scratch/x"));
+        assert_eq!(
+            table.rewrite(Path::new("/tmp/x")),
+            Path::new("/work/scratch/x")
+        );
         // Non-remapped path is unchanged.
         assert_eq!(table.rewrite(Path::new("/work/y")), Path::new("/work/y"));
     }
@@ -1382,10 +1530,7 @@ mod tests {
             mode: EnvMode::Disallow,
             patterns: vec![],
         };
-        let kept = env_vars_to_keep(
-            &policy,
-            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]),
-        );
+        let kept = env_vars_to_keep(&policy, &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]));
         assert_eq!(kept.len(), 2);
     }
 
@@ -1409,10 +1554,7 @@ mod tests {
             mode: EnvMode::OnlyAllow,
             patterns: vec![],
         };
-        let kept = env_vars_to_keep(
-            &policy,
-            &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]),
-        );
+        let kept = env_vars_to_keep(&policy, &env(&[("ANTHROPIC_API_KEY", "x"), ("PATH", "/b")]));
         assert!(kept.is_empty());
     }
 
@@ -1422,7 +1564,13 @@ mod tests {
         let cfg = SandboxConfig::default();
         let policy = cfg.env_policy();
         assert_eq!(policy.mode, EnvMode::Disallow);
-        assert_eq!(policy.patterns, DEFAULT_ENV_DISALLOW.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            policy.patterns,
+            DEFAULT_ENV_DISALLOW
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
 
         let kept = env_vars_to_keep(
             &policy,
@@ -1458,10 +1606,9 @@ mod tests {
         assert_eq!(p.mode, EnvMode::Disallow);
         assert_eq!(p.patterns, vec!["*_KEY".to_string(), "AWS_*".to_string()]);
 
-        let cfg: SandboxConfig = toml_edit::de::from_str(
-            "[env]\nmode = \"only_allow\"\npatterns = [\"PATH\"]\n",
-        )
-        .expect("only_allow should parse");
+        let cfg: SandboxConfig =
+            toml_edit::de::from_str("[env]\nmode = \"only_allow\"\npatterns = [\"PATH\"]\n")
+                .expect("only_allow should parse");
         let p = cfg.env.expect("env present");
         assert_eq!(p.mode, EnvMode::OnlyAllow);
         assert_eq!(p.patterns, vec!["PATH".to_string()]);
@@ -1518,10 +1665,15 @@ model = "claude-3-5-sonnet-20241022"
         // old YAML example) must parse under the TOML config loader.
         let content =
             std::fs::read_to_string("settings.toml.example").expect("example file present");
-        let cfg: Config =
-            toml_edit::de::from_str(&content).expect("example TOML should parse");
-        let bash = cfg.tool_config.get("bash").expect("bash tool config present");
-        assert!(bash.sandbox.is_some(), "example should include a sandbox block");
+        let cfg: Config = toml_edit::de::from_str(&content).expect("example TOML should parse");
+        let bash = cfg
+            .tool_config
+            .get("bash")
+            .expect("bash tool config present");
+        assert!(
+            bash.sandbox.is_some(),
+            "example should include a sandbox block"
+        );
         assert_eq!(cfg.tool_call_limit, Some(50));
         assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
     }

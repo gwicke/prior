@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::rc::Rc;
 
 use crate::app_state::AppState;
-use crate::settings::{SettingKey, SETTINGS, ValueKind};
+use crate::settings::{SettingKey, ValueKind, SETTINGS};
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    SubmitResult, StaticListingNode, StaticRow,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, StaticListingNode, StaticRow,
+    SubmitResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,9 @@ struct EnumSettingNode {
 impl SlashDotNode for EnumSettingNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let current = self.app_state.with_settings(|s| s.value(self.key));
-        let rows = self.values.iter()
+        let rows = self
+            .values
+            .iter()
             .map(|(val, desc)| Row::new(*val).desc(*desc))
             .collect();
         Ok(Rc::new(DataResponse {
@@ -87,14 +89,13 @@ impl SlashDotNode for SettingLeafNode {
         }
     }
 
-    async fn header(
-        &mut self,
-        _path_args: &PathArgs,
-        _render_ctx: &RenderContext,
-    ) -> Vec<String> {
+    async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
         let val = self.app_state.with_settings(|s| s.value(self.key));
-        vec![format!("{} = {}  (type a new value and press Enter)", meta.name, val)]
+        vec![format!(
+            "{} = {}  (type a new value and press Enter)",
+            meta.name, val
+        )]
     }
 
     async fn drill_rewrite(&mut self, path_args: &PathArgs) -> Option<String> {
@@ -135,15 +136,14 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
 pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
     use crate::slashdot_menu::fields::ColumnDef;
 
-    let mut set_node: SlashDotMenuNode = StaticListingNode::new(&[
-        StaticRow::new("set", "view and edit settings"),
-    ])
-    .with_columns(vec![
-        ColumnDef::new("id", "Setting").min(22).prio(2),
-        ColumnDef::new("value", "Value").min(18).prio(2),
-        ColumnDef::new("description", "Description").min(26).prio(1),
-    ])
-    .into();
+    let mut set_node: SlashDotMenuNode =
+        StaticListingNode::new(&[StaticRow::new("set", "view and edit settings")])
+            .with_columns(vec![
+                ColumnDef::new("id", "Setting").min(22).prio(2),
+                ColumnDef::new("value", "Value").min(18).prio(2),
+                ColumnDef::new("description", "Description").min(26).prio(1),
+            ])
+            .into();
 
     // --- default_model ---
     {
@@ -154,9 +154,12 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
             None, // no recent models for /set
         );
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("default_model", "Default model as provider:model (used for new sessions)"),
-        ]).with_columns(crate::v25_model::model_columns()).into();
+        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+            "default_model",
+            "Default model as provider:model (used for new sessions)",
+        )])
+        .with_columns(crate::v25_model::model_columns())
+        .into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);
@@ -173,9 +176,11 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
                 writer.set_setting(SettingKey::DefaultPersona, val)
             }),
         };
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("default_persona", "Persona for new sessions (built-in name or file)"),
-        ]).into();
+        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+            "default_persona",
+            "Persona for new sessions (built-in name or file)",
+        )])
+        .into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);
@@ -186,16 +191,16 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         let reader = app_state.clone();
         let writer = app_state.clone();
         let child = crate::v25_thinking::ThinkingEnumNode {
-            active_fn: Box::new(move || {
-                reader.with_settings(|s| s.default_thinking_level.clone())
-            }),
+            active_fn: Box::new(move || reader.with_settings(|s| s.default_thinking_level.clone())),
             submit_fn: Box::new(move |level| {
                 writer.set_setting(SettingKey::DefaultThinking, level)
             }),
         };
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
-            StaticRow::new("default_thinking_level", "Default thinking level: off | low | med | high"),
-        ]).into();
+        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
+            "default_thinking_level",
+            "Default thinking level: off | low | med | high",
+        )])
+        .into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);
@@ -205,10 +210,9 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
     // Loop once; build wrapper with value_forwarding for enum children,
     // direct leaf for int/freetext.
     for meta in SETTINGS {
-        if matches!(meta.key,
-            SettingKey::DefaultModel
-            | SettingKey::DefaultPersona
-            | SettingKey::DefaultThinking
+        if matches!(
+            meta.key,
+            SettingKey::DefaultModel | SettingKey::DefaultPersona | SettingKey::DefaultThinking
         ) {
             continue;
         }
@@ -220,9 +224,8 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
                     values: descs,
                     app_state: app_state.clone(),
                 };
-                let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[
-                    StaticRow::new(meta.name, meta.description),
-                ]).into();
+                let mut wrapper: SlashDotMenuNode =
+                    StaticListingNode::new(&[StaticRow::new(meta.name, meta.description)]).into();
                 wrapper = wrapper.with_value_forwarding();
                 wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
                 set_node.add_child(wrapper);
@@ -299,7 +302,11 @@ mod tests {
         // Tab into /set → should show settings with value column.
         match futures::executor::block_on(h.eval_prompt("", HostKey::Tab, 80)) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
-                assert!(prompt.starts_with("set"), "should drill into set, got: {}", prompt);
+                assert!(
+                    prompt.starts_with("set"),
+                    "should drill into set, got: {}",
+                    prompt
+                );
             }
             other => panic!("expected Continue after Tab, got {:?}", other),
         }
@@ -309,8 +316,11 @@ mod tests {
                 assert!(!plan.rows.is_empty(), "/set should show settings rows");
                 // Check that value forwarding populated the value column.
                 let first = &plan.rows[0].0;
-                assert!(first.contains("default_model") || first.contains("security_mode"),
-                    "should contain a setting name, got: {}", first);
+                assert!(
+                    first.contains("default_model") || first.contains("security_mode"),
+                    "should contain a setting name, got: {}",
+                    first
+                );
             }
             other => panic!("expected Continue at /set, got {:?}", other),
         }
@@ -322,19 +332,30 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Drill into security_mode.
-        let result = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::None, 80));
+        let result =
+            futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::None, 80));
         if let crate::slashdot_menu::node_impl::MenuResult::Continue(plan, _) = result {
             // Should show yolo/confirm rows.
             let texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
             assert!(texts.iter().any(|t| t.contains("yolo")), "should show yolo");
-            assert!(texts.iter().any(|t| t.contains("confirm")), "should show confirm");
+            assert!(
+                texts.iter().any(|t| t.contains("confirm")),
+                "should show confirm"
+            );
         }
         // The cursor follows the active row ("confirm" is current).
         // Tab drills into the highlighted row; Enter on it persists.
-        match futures::executor::block_on(h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80)) {
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            "set security_mode ",
+            HostKey::Tab,
+            80,
+        )) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
-                assert!(prompt.contains("security_mode"),
-                    "should drill into a value, got: {}", prompt);
+                assert!(
+                    prompt.contains("security_mode"),
+                    "should drill into a value, got: {}",
+                    prompt
+                );
                 match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         // The active value was resubmitted (confirm).
@@ -357,10 +378,22 @@ mod tests {
         let mut h = menu.get_handle();
         // Move cursor to "yolo" (Down from "confirm" position).
         let _ = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::None, 80));
-        let _ = futures::executor::block_on(h.eval_prompt("set security_mode ", HostKey::MoveCursor(1), 80));
-        match futures::executor::block_on(h.eval_prompt_resolved("set security_mode ", HostKey::Tab, 80)) {
+        let _ = futures::executor::block_on(h.eval_prompt(
+            "set security_mode ",
+            HostKey::MoveCursor(1),
+            80,
+        ));
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            "set security_mode ",
+            HostKey::Tab,
+            80,
+        )) {
             crate::slashdot_menu::node_impl::MenuResult::Continue(_, prompt) => {
-                assert!(prompt.contains("yolo"), "should drill to yolo, got: {}", prompt);
+                assert!(
+                    prompt.contains("yolo"),
+                    "should drill to yolo, got: {}",
+                    prompt
+                );
                 match futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 80)) {
                     crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                         assert_eq!(app_state.with_settings(|s| s.security_mode.clone()), "yolo");
@@ -378,7 +411,11 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Type a value for tool_call_limit directly.
-        match futures::executor::block_on(h.eval_prompt("set tool_call_limit 42", HostKey::Enter, 80)) {
+        match futures::executor::block_on(h.eval_prompt(
+            "set tool_call_limit 42",
+            HostKey::Enter,
+            80,
+        )) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {
                 assert_eq!(app_state.with_settings(|s| s.tool_call_limit), 42);
             }
@@ -392,10 +429,16 @@ mod tests {
         let mut menu = build_test_menu(&app_state);
         let mut h = menu.get_handle();
         // Invalid value for tool_call_limit.
-        match futures::executor::block_on(h.eval_prompt("set tool_call_limit 0", HostKey::Enter, 80)) {
+        match futures::executor::block_on(h.eval_prompt(
+            "set tool_call_limit 0",
+            HostKey::Enter,
+            80,
+        )) {
             crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(msg, _) => {
-                assert!(msg.unwrap_or_default().contains("greater than 0"),
-                    "should show validation error");
+                assert!(
+                    msg.unwrap_or_default().contains("greater than 0"),
+                    "should show validation error"
+                );
                 assert_eq!(app_state.with_settings(|s| s.tool_call_limit), 50);
             }
             other => panic!("expected DoneSuccess with error, got {:?}", other),

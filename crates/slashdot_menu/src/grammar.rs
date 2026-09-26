@@ -112,12 +112,8 @@ pub fn parse_level(s: &str, rule: &SelectionRule) -> LevelTokens {
     let mut selection: Option<String> = None;
     let mut body_end = words.len();
     if let Some(last) = words.last() {
-        let sel_ok = !last.starts_with('.')
-            && rule
-                .is_selection
-                .as_ref()
-                .map(|f| f(last))
-                .unwrap_or(false);
+        let sel_ok =
+            !last.starts_with('.') && rule.is_selection.as_ref().map(|f| f(last)).unwrap_or(false);
         if sel_ok {
             // Only treat it as a selection if the words before it do not
             // *require* it as a modifier value (i.e. a pending multi-word

@@ -100,22 +100,64 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
     ("deepseek", "deepseek-reasoner", 64_000, 0.55, 2.19, true),
     ("openai", "gpt-4o", 128_000, 2.5, 10.0, false),
     ("openai", "gpt-4o-mini", 128_000, 0.15, 0.60, false),
-    ("anthropic", "claude-3-5-sonnet-20241022", 200_000, 3.0, 15.0, false),
+    (
+        "anthropic",
+        "claude-3-5-sonnet-20241022",
+        200_000,
+        3.0,
+        15.0,
+        false,
+    ),
     ("anthropic", "claude-3-7-sonnet", 200_000, 3.0, 15.0, true),
     ("gemini", "gemini-1.5-pro", 1_000_000, 1.25, 5.0, false),
     ("groq", "llama3-70b-8192", 8_192, 0.59, 0.79, false),
     ("mistral", "mistral-large-latest", 128_000, 2.0, 6.0, false),
     ("ollama", "llama3", 8_192, 0.0, 0.0, false),
-    ("openrouter", "meta-llama/llama-3-70b-instruct", 8_192, 0.0, 0.0, false),
+    (
+        "openrouter",
+        "meta-llama/llama-3-70b-instruct",
+        8_192,
+        0.0,
+        0.0,
+        false,
+    ),
     ("xai", "grok-1", 8_192, 5.0, 15.0, false),
     ("cohere", "command-r-plus", 128_000, 2.5, 10.0, false),
     ("chatgpt", "gpt-5", 128_000, 0.0, 0.0, false),
     ("copilot", "gpt-5-codex", 128_000, 0.0, 0.0, false),
     ("moonshot", "moonshot-v1-8k", 8_192, 0.0, 0.0, false),
-    ("together", "meta-llama/Llama-3-70b-chat-hf", 8_192, 0.0, 0.0, false),
-    ("perplexity", "llama-3-sonar-large-32k-online", 32_000, 1.0, 1.0, false),
-    ("hyperbolic", "meta-llama/Llama-3-70b-instruct", 8_192, 0.0, 0.0, false),
-    ("huggingface", "meta-llama/Llama-3-70b-chat-hf", 8_192, 0.0, 0.0, false),
+    (
+        "together",
+        "meta-llama/Llama-3-70b-chat-hf",
+        8_192,
+        0.0,
+        0.0,
+        false,
+    ),
+    (
+        "perplexity",
+        "llama-3-sonar-large-32k-online",
+        32_000,
+        1.0,
+        1.0,
+        false,
+    ),
+    (
+        "hyperbolic",
+        "meta-llama/Llama-3-70b-instruct",
+        8_192,
+        0.0,
+        0.0,
+        false,
+    ),
+    (
+        "huggingface",
+        "meta-llama/Llama-3-70b-chat-hf",
+        8_192,
+        0.0,
+        0.0,
+        false,
+    ),
     ("mira", "mira-v1", 8_192, 0.0, 0.0, false),
     ("doubleword", "Qwen/Qwen3.5-4B", 128_000, 0.0, 0.0, false),
     ("llamafile", "LLaMA_CPP", 128_000, 0.0, 0.0, false),
@@ -128,10 +170,31 @@ const DIRECT_PRICING: &[(&str, &str, u64, f64, f64, bool)] = &[
 /// All known provider names, in one place.  Kept in sync with
 /// [`required_env_vars`] match arms (every arm name must appear here).
 const KNOWN_PROVIDERS: &[&str] = &[
-    "anthropic", "openai", "azure", "cohere", "chatgpt", "copilot",
-    "deepseek", "doubleword", "gemini", "google", "groq", "huggingface",
-    "hyperbolic", "llamafile", "mira", "minimax", "mistral", "moonshot",
-    "ollama", "openrouter", "perplexity", "together", "xai", "xiaomimimo", "zai",
+    "anthropic",
+    "openai",
+    "azure",
+    "cohere",
+    "chatgpt",
+    "copilot",
+    "deepseek",
+    "doubleword",
+    "gemini",
+    "google",
+    "groq",
+    "huggingface",
+    "hyperbolic",
+    "llamafile",
+    "mira",
+    "minimax",
+    "mistral",
+    "moonshot",
+    "ollama",
+    "openrouter",
+    "perplexity",
+    "together",
+    "xai",
+    "xiaomimimo",
+    "zai",
 ];
 
 /// Does picocode know about this provider name?  Unknown providers cannot
@@ -287,12 +350,18 @@ pub fn cost_cell(e: &ModelEntry) -> String {
 /// Cell text for the `Reason` column of an aligned model table: `✓` when the
 /// model exposes reasoning/thinking, `✗` otherwise.
 pub fn reason_cell(e: &ModelEntry) -> String {
-    if e.reasoning { "✓".to_string() } else { "✗".to_string() }
+    if e.reasoning {
+        "✓".to_string()
+    } else {
+        "✗".to_string()
+    }
 }
 
 /// Cell text for the `Coding` column showing the Artificial Analysis coding index.
 pub fn coding_index_cell(e: &ModelEntry) -> String {
-    e.coding_index.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "—".to_string())
+    e.coding_index
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "—".to_string())
 }
 
 /// Human-readable one-line description for the `/model` picker.
@@ -345,7 +414,8 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
             if let Some((orprovider, model)) = or_id.split_once('/') {
                 let ns = &rig_provider(orprovider);
                 if is_known_provider(ns) && provider_available(ns) {
-                    let (pc, cc, source) = direct_price(ns, model, e.prompt_cost, e.completion_cost);
+                    let (pc, cc, source) =
+                        direct_price(ns, model, e.prompt_cost, e.completion_cost);
                     out.push(ModelEntry {
                         provider: ns.to_string(),
                         id: format!("{}:{}", ns, model),
@@ -366,16 +436,22 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         }
     }
     if DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[debug-providers] extrapolate: {} OpenRouter entries → {} direct entries added", out.len() - debug_count, debug_count);
+        eprintln!(
+            "[debug-providers] extrapolate: {} OpenRouter entries → {} direct entries added",
+            out.len() - debug_count,
+            debug_count
+        );
         for e in &out {
             if e.provider != "openrouter" {
-                eprintln!("[debug-providers]   direct: {} (cost_source={:?})", e.display, e.cost_source);
+                eprintln!(
+                    "[debug-providers]   direct: {} (cost_source={:?})",
+                    e.display, e.cost_source
+                );
             }
         }
     }
     out
 }
-
 
 /// Parameters for filtering/sorting the model list (client-side only).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -407,7 +483,6 @@ impl ModelFilterParams {
     }
 }
 
-
 /// One dotted modifier token usable in a filter string (e.g. `.sort:coding`,
 /// `.price:0.5`).  This is the **single source of truth** for both the parser
 /// (`apply_modifier`) and the in-prompt auto-complete overlay: adding a new
@@ -431,21 +506,60 @@ pub const MODEL_MODIFIERS: &[ModifierSpec] = &[
         token: "sort",
         desc: "sort order",
         choices: Some(&[
-            "most-popular", "created", "coding", "intelligence", "agentic",
-            "price_input", "price_output", "price", "coding_price",
-            "intelligence_price", "agentic_price",
+            "most-popular",
+            "created",
+            "coding",
+            "intelligence",
+            "agentic",
+            "price_input",
+            "price_output",
+            "price",
+            "coding_price",
+            "intelligence_price",
+            "agentic_price",
         ]),
     },
-    ModifierSpec { token: "price_input", desc: "max prompt $/M", choices: None },
-    ModifierSpec { token: "price_output", desc: "max output $/M", choices: None },
-    ModifierSpec { token: "price", desc: "max combined $/M", choices: None },
-    ModifierSpec { token: "coding", desc: "min coding index", choices: None },
-    ModifierSpec { token: "intelligence", desc: "min intel index", choices: None },
-    ModifierSpec { token: "agentic", desc: "min agentic index", choices: None },
-    ModifierSpec { token: "max_age_days", desc: "max model age (days)", choices: None },
-    ModifierSpec { token: "context", desc: "min context length", choices: None },
+    ModifierSpec {
+        token: "price_input",
+        desc: "max prompt $/M",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "price_output",
+        desc: "max output $/M",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "price",
+        desc: "max combined $/M",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "coding",
+        desc: "min coding index",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "intelligence",
+        desc: "min intel index",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "agentic",
+        desc: "min agentic index",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "max_age_days",
+        desc: "max model age (days)",
+        choices: None,
+    },
+    ModifierSpec {
+        token: "context",
+        desc: "min context length",
+        choices: None,
+    },
 ];
-
 
 pub fn fmt_iso_date(unix_secs: u64) -> String {
     use chrono::TimeZone;
@@ -459,7 +573,7 @@ pub fn fmt_iso_date(unix_secs: u64) -> String {
 /// This is the main entry point for the `/model` overlay.
 pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
     let mut entries = catalog_cached();
-    
+
     // Apply filters
     if let Some(max_price) = params.price_input {
         entries.retain(|e| e.prompt_cost.map_or(false, |p| p <= max_price));
@@ -483,7 +597,7 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
     if let Some(min_ctx) = params.min_context {
         entries.retain(|e| e.context_length.map_or(false, |c| c >= min_ctx as u64));
     }
-    
+
     // Apply sort
     if let Some(sort) = &params.sort {
         match sort.as_str() {
@@ -494,36 +608,81 @@ pub fn get_filtered_catalog(params: &ModelFilterParams) -> Vec<ModelEntry> {
                 entries.sort_by(|a, b| b.created.unwrap_or(0).cmp(&a.created.unwrap_or(0)));
             }
             "coding" => {
-                entries.sort_by(|a, b| b.coding_index.unwrap_or(0.0).partial_cmp(&a.coding_index.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    b.coding_index
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.coding_index.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "intelligence" => {
-                entries.sort_by(|a, b| b.intelligence_index.unwrap_or(0.0).partial_cmp(&a.intelligence_index.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    b.intelligence_index
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.intelligence_index.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "agentic" => {
-                entries.sort_by(|a, b| b.agentic_index.unwrap_or(0.0).partial_cmp(&a.agentic_index.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    b.agentic_index
+                        .unwrap_or(0.0)
+                        .partial_cmp(&a.agentic_index.unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "price_input" => {
-                entries.sort_by(|a, b| a.prompt_cost.unwrap_or(f64::MAX).partial_cmp(&b.prompt_cost.unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    a.prompt_cost
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&b.prompt_cost.unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "price_output" => {
-                entries.sort_by(|a, b| a.completion_cost.unwrap_or(f64::MAX).partial_cmp(&b.completion_cost.unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    a.completion_cost
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&b.completion_cost.unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "price" => {
-                entries.sort_by(|a, b| combined_price(a).unwrap_or(f64::MAX).partial_cmp(&combined_price(b).unwrap_or(f64::MAX)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    combined_price(a)
+                        .unwrap_or(f64::MAX)
+                        .partial_cmp(&combined_price(b).unwrap_or(f64::MAX))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "coding_price" => {
-                entries.sort_by(|a, b| price_to_index_ratio(b, b.coding_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.coding_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    price_to_index_ratio(b, b.coding_index)
+                        .unwrap_or(0.0)
+                        .partial_cmp(&price_to_index_ratio(a, a.coding_index).unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "intelligence_price" => {
-                entries.sort_by(|a, b| price_to_index_ratio(b, b.intelligence_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.intelligence_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    price_to_index_ratio(b, b.intelligence_index)
+                        .unwrap_or(0.0)
+                        .partial_cmp(&price_to_index_ratio(a, a.intelligence_index).unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             "agentic_price" => {
-                entries.sort_by(|a, b| price_to_index_ratio(b, b.agentic_index).unwrap_or(0.0).partial_cmp(&price_to_index_ratio(a, a.agentic_index).unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                entries.sort_by(|a, b| {
+                    price_to_index_ratio(b, b.agentic_index)
+                        .unwrap_or(0.0)
+                        .partial_cmp(&price_to_index_ratio(a, a.agentic_index).unwrap_or(0.0))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
             _ => {}
         }
     }
-    
+
     entries
 }
 
@@ -571,7 +730,10 @@ fn static_fallback() -> Vec<ModelEntry> {
         })
         .collect();
     if DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[debug-providers] static_fallback: {} entries from DIRECT_PRICING", entries.len());
+        eprintln!(
+            "[debug-providers] static_fallback: {} entries from DIRECT_PRICING",
+            entries.len()
+        );
         for e in &entries {
             eprintln!("[debug-providers]   {}", e.display);
         }
@@ -601,7 +763,6 @@ fn direct_price(
     }
 }
 
-
 /// Live ids from a provider's native `/models` endpoint (best-effort).
 async fn native_models(provider: &str) -> Vec<String> {
     // TODO: support env var API base + hard-coded fall-back consistently?
@@ -621,7 +782,9 @@ async fn native_models(provider: &str) -> Vec<String> {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let req = client.get(url).header("Authorization", format!("Bearer {}", key));
+    let req = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", key));
     let Ok(resp) = req.send().await else {
         return Vec::new();
     };
@@ -646,16 +809,18 @@ async fn native_models(provider: &str) -> Vec<String> {
 fn openrouter_provider(provider: &str) -> String {
     match provider {
         "xiaomimimo" => "xiaomi",
-        _ => provider
-    }.to_string()
+        _ => provider,
+    }
+    .to_string()
 }
 
 /// Openrouter -> rig provider
 fn rig_provider(provider: &str) -> String {
     match provider {
         "xiaomi" => "xiaomimimo",
-        _ => provider
-    }.to_string()
+        _ => provider,
+    }
+    .to_string()
 }
 
 /// Prune/extend direct entries for providers exposing `/models`, using the
@@ -666,19 +831,29 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         let before = entries.len();
         if !provider_available(provider) {
             if debug {
-                eprintln!("[debug-providers] liveness_prune: {} not available (skipped)", provider);
+                eprintln!(
+                    "[debug-providers] liveness_prune: {} not available (skipped)",
+                    provider
+                );
             }
             continue;
         }
         let live = native_models(provider).await;
         if live.is_empty() {
             if debug {
-                eprintln!("[debug-providers] liveness_prune: {} native /models returned empty (skipped)", provider);
+                eprintln!(
+                    "[debug-providers] liveness_prune: {} native /models returned empty (skipped)",
+                    provider
+                );
             }
             continue;
         }
         if debug {
-            eprintln!("[debug-providers] liveness_prune: {} returned {} live models", provider, live.len());
+            eprintln!(
+                "[debug-providers] liveness_prune: {} returned {} live models",
+                provider,
+                live.len()
+            );
             for m in &live {
                 eprintln!("[debug-providers]   live: {}", m);
             }
@@ -696,7 +871,10 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
         });
         let pruned = retained - entries.len();
         if debug && pruned > 0 {
-            eprintln!("[debug-providers] liveness_prune: pruned {} stale entries for {}", pruned, provider);
+            eprintln!(
+                "[debug-providers] liveness_prune: pruned {} stale entries for {}",
+                pruned, provider
+            );
         }
         for m in live {
             let id = format!("{}:{}", provider, m);
@@ -710,18 +888,25 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                     completion_cost: None,
                     reasoning: false,
                     cost_source: CostSource::Direct,
-            created: None,
-            coding_index: None,
-            intelligence_index: None,
-            agentic_index: None,
+                    created: None,
+                    coding_index: None,
+                    intelligence_index: None,
+                    agentic_index: None,
                 });
                 if debug {
-                    eprintln!("[debug-providers] liveness_prune: added new live model {}", id);
+                    eprintln!(
+                        "[debug-providers] liveness_prune: added new live model {}",
+                        id
+                    );
                 }
             }
         }
         if debug {
-            eprintln!("[debug-providers] liveness_prune: {} entries before, {} after", before, entries.len());
+            eprintln!(
+                "[debug-providers] liveness_prune: {} entries before, {} after",
+                before,
+                entries.len()
+            );
         }
     }
     entries
@@ -747,24 +932,37 @@ pub async fn catalog() -> Vec<ModelEntry> {
     {
         if c.at.elapsed() < CACHE_TTL {
             if debug {
-                eprintln!("[debug-providers] catalog: returning {} cached entries (age={}s)", c.entries.len(), c.at.elapsed().as_secs());
+                eprintln!(
+                    "[debug-providers] catalog: returning {} cached entries (age={}s)",
+                    c.entries.len(),
+                    c.at.elapsed().as_secs()
+                );
             }
             return c.entries;
         }
         if debug {
-            eprintln!("[debug-providers] catalog: cache stale (age={}s), re-fetching", c.at.elapsed().as_secs());
+            eprintln!(
+                "[debug-providers] catalog: cache stale (age={}s), re-fetching",
+                c.at.elapsed().as_secs()
+            );
         }
     }
     let entries = match fetch_openrouter().await {
         Ok(or) => {
             if debug {
-                eprintln!("[debug-providers] catalog: OpenRouter returned {} models", or.len());
+                eprintln!(
+                    "[debug-providers] catalog: OpenRouter returned {} models",
+                    or.len()
+                );
             }
             extrapolate(or)
         }
         Err(e) => {
             if debug {
-                eprintln!("[debug-providers] catalog: OpenRouter fetch failed: {}, using static fallback", e);
+                eprintln!(
+                    "[debug-providers] catalog: OpenRouter fetch failed: {}, using static fallback",
+                    e
+                );
             }
             static_fallback()
         }
@@ -772,7 +970,10 @@ pub async fn catalog() -> Vec<ModelEntry> {
     let entries = liveness_prune(entries).await;
     let entries = dedupe(entries);
     if debug {
-        eprintln!("[debug-providers] catalog: final count = {} entries", entries.len());
+        eprintln!(
+            "[debug-providers] catalog: final count = {} entries",
+            entries.len()
+        );
     }
     if let Some(mut m) = CACHE.get_or_init(|| Mutex::new(None)).lock().ok() {
         *m = Some(CacheEntry {
@@ -831,8 +1032,7 @@ fn dedupe(entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
             }
             Some(&idx) => {
                 // Prefer Direct-priced entries over estimates.
-                if e.cost_source == CostSource::Direct
-                    && out[idx].cost_source != CostSource::Direct
+                if e.cost_source == CostSource::Direct && out[idx].cost_source != CostSource::Direct
                 {
                     out[idx] = e;
                 }
@@ -869,14 +1069,22 @@ pub fn list_available_providers() -> Vec<(String, bool, Vec<String>)> {
     for p in KNOWN_PROVIDERS {
         let vars = required_env_vars(p);
         let available = provider_available(p);
-        let env_list: Vec<String> = vars.iter().map(|v| {
-            let val = std::env::var(v).ok().unwrap_or_default();
-            if val.is_empty() {
-                format!("{}=", v)
-            } else {
-                format!("{}={}{}", v, &val[..val.len().min(8)], if val.len() > 8 { "…" } else { "" })
-            }
-        }).collect();
+        let env_list: Vec<String> = vars
+            .iter()
+            .map(|v| {
+                let val = std::env::var(v).ok().unwrap_or_default();
+                if val.is_empty() {
+                    format!("{}=", v)
+                } else {
+                    format!(
+                        "{}={}{}",
+                        v,
+                        &val[..val.len().min(8)],
+                        if val.len() > 8 { "…" } else { "" }
+                    )
+                }
+            })
+            .collect();
         out.push((p.to_string(), available, env_list));
     }
     out
@@ -967,7 +1175,10 @@ mod tests {
             intelligence_index: None,
             agentic_index: None,
         };
-        assert_eq!(or.qualified_parts(), ("openrouter".to_string(), "tencent/hy3:free".to_string()));
+        assert_eq!(
+            or.qualified_parts(),
+            ("openrouter".to_string(), "tencent/hy3:free".to_string())
+        );
         assert_eq!(or.qualified(), "openrouter:tencent/hy3:free");
 
         let direct = ModelEntry {
@@ -984,7 +1195,10 @@ mod tests {
             intelligence_index: None,
             agentic_index: None,
         };
-        assert_eq!(direct.qualified_parts(), ("tencent".to_string(), "hy3:free".to_string()));
+        assert_eq!(
+            direct.qualified_parts(),
+            ("tencent".to_string(), "hy3:free".to_string())
+        );
         assert_eq!(direct.qualified(), "tencent:hy3:free");
     }
 
@@ -1183,7 +1397,9 @@ mod tests {
                 DIRECT_PRICING
                     .iter()
                     .any(|(pp, mm, _, _, _, _)| *pp == p && *mm == m),
-                "missing catalog entry for {}/{}", p, m
+                "missing catalog entry for {}/{}",
+                p,
+                m
             );
         }
     }

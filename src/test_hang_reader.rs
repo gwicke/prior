@@ -34,7 +34,12 @@ mod test_hang {
                     out.extend_from_slice(&buf[..n]);
                 }
                 Err(e) => {
-                    println!("Read error after {} bytes: {} (elapsed: {:?})", total, e, start.elapsed());
+                    println!(
+                        "Read error after {} bytes: {} (elapsed: {:?})",
+                        total,
+                        e,
+                        start.elapsed()
+                    );
                     break;
                 }
             }
@@ -103,7 +108,12 @@ mod test_hang {
                     break;
                 }
                 Ok(n) => {
-                    println!("Read {} bytes after {:?}: {:?}", n, start.elapsed(), String::from_utf8_lossy(&buf[..n]));
+                    println!(
+                        "Read {} bytes after {:?}: {:?}",
+                        n,
+                        start.elapsed(),
+                        String::from_utf8_lossy(&buf[..n])
+                    );
                 }
                 Err(e) => {
                     println!("Read error: {} after {:?}", e, start.elapsed());

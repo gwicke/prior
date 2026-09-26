@@ -98,12 +98,19 @@ pub fn rank_candidates<'a, T>(
                 // Prefix tier: shortest first, then lexicographic.
                 0 => a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)),
                 // Fuzzy tier: best score first, then shortest, then alpha.
-                _ => b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)),
+                _ => {
+                    b.3.cmp(&a.3)
+                        .then_with(|| a.1.cmp(&b.1))
+                        .then_with(|| a.2.cmp(&b.2))
+                }
             })
             // Input order breaks remaining ties (deterministic).
             .then_with(|| a.4.cmp(&b.4))
     });
-    let ranked: Vec<&'a T> = classified.iter().map(|(_, _, _, _, slot, _)| &items[*slot]).collect();
+    let ranked: Vec<&'a T> = classified
+        .iter()
+        .map(|(_, _, _, _, slot, _)| &items[*slot])
+        .collect();
 
     // Match indices for the requested fields, parallel to `ranked` (so the
     // caller never has to key by pointer). Only filtered items are computed.
@@ -138,10 +145,7 @@ fn fuzzy_filter_impl<'a, T>(
     bonus_prefix: bool,
 ) -> Vec<Ranked<'a, T>> {
     if query.trim().is_empty() {
-        return items
-            .iter()
-            .map(|item| Ranked { item, score: 0 })
-            .collect();
+        return items.iter().map(|item| Ranked { item, score: 0 }).collect();
     }
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(i64, &'a T)> = items
@@ -150,10 +154,17 @@ fn fuzzy_filter_impl<'a, T>(
             let text = to_text(item);
             let base_score = matcher.fuzzy_match(&text, query)?;
             let ql = query.to_lowercase();
-            let score = if bonus_prefix && text.split_whitespace()
-                .next()
-                .map(|first| first.trim_start_matches('/').to_lowercase().starts_with(&ql))
-                .unwrap_or(false)
+            let score = if bonus_prefix
+                && text
+                    .split_whitespace()
+                    .next()
+                    .map(|first| {
+                        first
+                            .trim_start_matches('/')
+                            .to_lowercase()
+                            .starts_with(&ql)
+                    })
+                    .unwrap_or(false)
             {
                 // Large enough that any prefix match beats any subsequence-only match
                 base_score + 10_000
@@ -224,13 +235,24 @@ mod tests {
     fn rc_rank(items: &[String], query: &str) -> Vec<String> {
         let field_extractors: Vec<(String, Box<dyn Fn(&String) -> String>)> = items
             .iter()
-            .map(|s| (s.clone(), Box::new(|x: &String| x.clone()) as Box<dyn Fn(&String) -> String>))
+            .map(|s| {
+                (
+                    s.clone(),
+                    Box::new(|x: &String| x.clone()) as Box<dyn Fn(&String) -> String>,
+                )
+            })
             .collect();
-        rank_candidates(items, query, |s| s.clone(), |s| s.clone(), &field_extractors)
-            .0
-            .into_iter()
-            .cloned()
-            .collect()
+        rank_candidates(
+            items,
+            query,
+            |s| s.clone(),
+            |s| s.clone(),
+            &field_extractors,
+        )
+        .0
+        .into_iter()
+        .cloned()
+        .collect()
     }
 
     #[test]

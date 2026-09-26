@@ -50,8 +50,6 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-
-
 /// Compact mode for `tree_compact`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactMode {
@@ -62,7 +60,6 @@ pub enum CompactMode {
     /// LLM-generated summary; `payload` is the custom prompt.
     Prompt,
 }
-
 
 /// Sandbox path-mapping mutation requested by the v2.5 `/sandbox` nodes.
 /// The applier owns the merge + re-publish (it owns the applied config).
@@ -91,13 +88,8 @@ pub struct ControlConfig {
     /// Latching: the loop exits when it observes `true` (never cleared).
     pub quit: bool,
 
-
-
-
-
     /// `/sandbox` mutations (applier merges + re-publishes).
     pub sandbox: Option<SandboxOp>,
-
 }
 
 impl ControlConfig {
@@ -107,10 +99,7 @@ impl ControlConfig {
         ControlConfig {
             quit: self.quit,
 
-
-
             sandbox: self.sandbox.take(),
-
         }
     }
 }
@@ -185,7 +174,6 @@ pub struct State {
 pub struct AppState {
     state: Mutex<State>,
 }
-
 
 impl AppState {
     /// Wrap the startup-resolved state. `config` is both the initial target
@@ -434,16 +422,9 @@ impl AppState {
         self.state.lock().control.quit
     }
 
-
-
-
-
-
-
     pub fn request_sandbox(&self, op: SandboxOp) {
         self.state.lock().control.sandbox = Some(op);
     }
-
 
     /// Sole-consumer drain: clone out + GC every one-shot control field in a
     /// single acquisition (`quit` latches). Run by the loop's convergence
@@ -553,7 +534,10 @@ mod tests {
         app_state.set_model("openrouter:tencent/hy3:free");
         assert_eq!(app_state.model(), "openrouter:tencent/hy3:free");
         assert_eq!(app_state.with_config(|c| c.provider.clone()), "openrouter");
-        assert_eq!(app_state.with_config(|c| c.model.clone()), "tencent/hy3:free");
+        assert_eq!(
+            app_state.with_config(|c| c.model.clone()),
+            "tencent/hy3:free"
+        );
     }
 
     #[test]
@@ -604,5 +588,4 @@ mod tests {
         assert_eq!(app_state.context_tokens(), 42_000);
         assert_eq!(app_state.leaf_id().as_deref(), Some("leaf-1"));
     }
-
 }

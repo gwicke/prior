@@ -1,38 +1,38 @@
 use thiserror::Error;
 
 pub mod agent;
+pub mod config;
+pub mod edit_blocks;
+pub mod edit_match;
 pub mod output;
+pub mod persona;
 pub mod platform;
 pub mod tools;
-pub mod persona;
-pub mod config;
-pub mod edit_match;
-pub mod edit_blocks;
 pub use slashdot_menu;
 pub mod app_state;
-pub mod repl;
 pub mod model_catalog;
-pub mod thinking;
-pub mod v25_thinking;
-pub mod v25_menu;
-pub mod v25_persona;
-pub mod v25_model;
-pub mod v25_set;
-pub mod v25_commands;
-pub mod v25_stat;
-pub mod v25_replay;
-pub mod v25_session;
-pub mod v25_quit;
-pub mod v25_new;
-pub mod v25_clear;
-pub mod v25_tree;
-pub mod v25_sandbox;
-pub mod sandbox_state;
-pub mod settings;
-pub mod path_util;
 pub mod path_complete;
+pub mod path_util;
 pub mod prompt_complete;
+pub mod repl;
+pub mod sandbox_state;
 pub mod session;
+pub mod settings;
+pub mod thinking;
+pub mod v25_clear;
+pub mod v25_commands;
+pub mod v25_menu;
+pub mod v25_model;
+pub mod v25_new;
+pub mod v25_persona;
+pub mod v25_quit;
+pub mod v25_replay;
+pub mod v25_sandbox;
+pub mod v25_session;
+pub mod v25_set;
+pub mod v25_stat;
+pub mod v25_thinking;
+pub mod v25_tree;
 
 // Table + fuzzy primitives moved into the `slashdot_menu` crate; re-exported
 // here so internal paths (`crate::table`, `crate::fuzzy`) keep working.
@@ -265,4 +265,5 @@ impl PicocodeError {
 }
 
 pub type Result<T> = std::result::Result<T, PicocodeError>;
-#[cfg(test)] mod test_hang_reader;
+#[cfg(test)]
+mod test_hang_reader;

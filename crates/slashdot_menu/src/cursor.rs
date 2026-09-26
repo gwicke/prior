@@ -107,28 +107,44 @@ pub(crate) fn rank_row_refs(
     display_fields: &[String],
 ) -> RankRefResult {
     // Build field extractors for match index computation.
-    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)> = display_fields
-        .iter()
-        .filter_map(|f| {
-            match f.as_str() {
-                "id" => Some(("id".to_string(), Box::new(|(_, row): &(RowRef, &Row)| row.id.clone()) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)),
-                "description" => Some(("description".to_string(), Box::new(|(_, row): &(RowRef, &Row)| row.description.clone().unwrap_or_default()) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)),
-                _ => {
-                    // Custom field - extract from row.fields
-                    let field_name = f.clone();
-                    Some((f.clone(), Box::new(move |(_, row): &(RowRef, &Row)| {
-                        row.fields.iter()
-                            .find(|(k, _)| k == &field_name)
-                            .map(|(_, v)| match v {
-                                crate::value::Value::Str(s) => s.clone(),
-                                crate::value::Value::Num(n) => crate::value::fmt_num(*n),
+    let field_extractors: Vec<(String, Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>)> =
+        display_fields
+            .iter()
+            .filter_map(|f| {
+                match f.as_str() {
+                    "id" => Some((
+                        "id".to_string(),
+                        Box::new(|(_, row): &(RowRef, &Row)| row.id.clone())
+                            as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
+                    )),
+                    "description" => Some((
+                        "description".to_string(),
+                        Box::new(|(_, row): &(RowRef, &Row)| {
+                            row.description.clone().unwrap_or_default()
+                        })
+                            as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
+                    )),
+                    _ => {
+                        // Custom field - extract from row.fields
+                        let field_name = f.clone();
+                        Some((
+                            f.clone(),
+                            Box::new(move |(_, row): &(RowRef, &Row)| {
+                                row.fields
+                                    .iter()
+                                    .find(|(k, _)| k == &field_name)
+                                    .map(|(_, v)| match v {
+                                        crate::value::Value::Str(s) => s.clone(),
+                                        crate::value::Value::Num(n) => crate::value::fmt_num(*n),
+                                    })
+                                    .unwrap_or_default()
                             })
-                            .unwrap_or_default()
-                    }) as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>))
+                                as Box<dyn for<'a> Fn(&'a (RowRef, &Row)) -> String>,
+                        ))
+                    }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     let (ranked_items, match_indices_by_rank) = crate::fuzzy::rank_candidates(
         candidates,
@@ -261,7 +277,13 @@ mod tests {
             (mk(2), &short),
             (mk(3), &mid),
         ];
-        let ranked = rank_row_refs(&candidates, "mod", None, &["id".to_string(), "description".to_string()]).rows;
+        let ranked = rank_row_refs(
+            &candidates,
+            "mod",
+            None,
+            &["id".to_string(), "description".to_string()],
+        )
+        .rows;
         let order: Vec<u32> = ranked.iter().map(|r| r.row_offset).collect();
         assert_eq!(
             order,

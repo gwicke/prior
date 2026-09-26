@@ -72,7 +72,10 @@ fn marker_of(line: &str) -> Option<&'static str> {
             return Some(SEARCH_MARKER);
         }
         if after.chars().count() == 1
-            && matches!(after.chars().next(), Some('>') | Some(']') | Some('}') | Some(')'))
+            && matches!(
+                after.chars().next(),
+                Some('>') | Some(']') | Some('}') | Some(')')
+            )
         {
             return Some(SEARCH_MARKER);
         }
@@ -268,7 +271,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     }
 
     if edits.is_empty() {
-        return Err(ParseError(format!("no `{SEARCH_MARKER}` / {DIVIDER} blocks found")));
+        return Err(ParseError(format!(
+            "no `{SEARCH_MARKER}` / {DIVIDER} blocks found"
+        )));
     }
 
     let multi_file = distinct_headers.len() > 1;
@@ -490,7 +495,10 @@ mod tests {
         assert!(!p.multi_file);
         assert_eq!(
             p.edits,
-            vec![plain("def foo():\n    return 1", "def foo():\n    return 2")]
+            vec![plain(
+                "def foo():\n    return 1",
+                "def foo():\n    return 2"
+            )]
         );
         assert_eq!(p.edits[0].start_line, None);
     }
@@ -501,10 +509,7 @@ mod tests {
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
-        assert_eq!(
-            p.edits,
-            vec![plain("a", "A"), plain("b", "B")]
-        );
+        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
     }
 
     #[test]
@@ -710,8 +715,7 @@ mod tests {
 
     #[test]
     fn canonicalize_blob_string() {
-        let v =
-            json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let c = canonicalize_edit_value(&v);
         assert_eq!(
             c,

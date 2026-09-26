@@ -281,8 +281,12 @@ mod tests {
 
     fn sample_rows() -> Vec<Row> {
         vec![
-            Row::new("a").desc("first").field("tier", Value::Str("free".into())),
-            Row::new("b").desc("second").field("tier", Value::Str("paid".into())),
+            Row::new("a")
+                .desc("first")
+                .field("tier", Value::Str("free".into())),
+            Row::new("b")
+                .desc("second")
+                .field("tier", Value::Str("paid".into())),
             Row::new("c").field("tier", Value::Str("free".into())),
         ]
     }
@@ -298,7 +302,10 @@ mod tests {
     #[test]
     fn row_field_value_reads_implicit_and_explicit() {
         let rows = sample_rows();
-        assert_eq!(row_field_value(&rows[0], "id"), Some(Value::Str("a".into())));
+        assert_eq!(
+            row_field_value(&rows[0], "id"),
+            Some(Value::Str("a".into()))
+        );
         assert_eq!(
             row_field_value(&rows[0], "description"),
             Some(Value::Str("first".into()))

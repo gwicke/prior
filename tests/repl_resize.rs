@@ -75,7 +75,12 @@ impl Term {
     fn spawn(rows: u16, cols: u16) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("open pty");
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
         cmd.args(["-p", "openrouter", "-m", "tencent/hy3:free"]);
@@ -131,7 +136,12 @@ impl Term {
 
     fn resize(&mut self, rows: u16, cols: u16) {
         self.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("resize");
         self.parser.screen_mut().set_size(rows, cols);
     }
@@ -210,7 +220,8 @@ fn vertical_resize_drag_does_not_consume_history() {
     let after = t.rows();
     let thinking = after.iter().filter(|l| l.contains("thinking")).count();
     assert_eq!(
-        thinking, 1,
+        thinking,
+        1,
         "keystroke repaint after resize duplicated the menu:\n{}",
         after.join("\n"),
     );
@@ -242,7 +253,8 @@ fn horizontal_resize_drag_leaves_no_stale_frames() {
         let after = t.rows();
         let thinking = after.iter().filter(|l| l.contains("thinking")).count();
         assert_eq!(
-            thinking, 1,
+            thinking,
+            1,
             "{when}: stale overlay frames left on screen (duplicated menu):\n{}",
             after.join("\n"),
         );

@@ -166,12 +166,7 @@ impl PromptCompletion {
     /// replace_range`, char range — the cursor lands after the id) and
     /// its re-run is kicked immediately; the caller re-derives on the
     /// next frame. `Enter`/`Esc` never reach here.
-    pub fn eval(
-        &mut self,
-        editor: &mut LineEditor,
-        key: HostKey,
-        ctx: RenderContext,
-    ) -> Frame {
+    pub fn eval(&mut self, editor: &mut LineEditor, key: HostKey, ctx: RenderContext) -> Frame {
         // 1. Word under the cursor (char space, gated).
         let mut word: Option<(Range<usize>, String)> =
             word_at_cursor(editor.chars(), editor.cursor()).and_then(|r| {
@@ -398,7 +393,11 @@ mod tests {
     /// Harness without a worker: the test holds the request receiver
     /// (what the worker would see) and the result sender (what the
     /// worker would push).
-    fn harness() -> (PromptCompletion, Receiver<String>, Sender<(String, CompletionRows)>) {
+    fn harness() -> (
+        PromptCompletion,
+        Receiver<String>,
+        Sender<(String, CompletionRows)>,
+    ) {
         let (tx, rx_req) = channel();
         let (tx_res, rx) = channel();
         (
@@ -504,7 +503,10 @@ mod tests {
         assert_eq!(req.try_recv().unwrap(), "./src");
         assert_eq!(pc.outstanding.as_deref(), Some("./src"));
         assert!(pc.armed.is_none());
-        assert!(pc.poll_timeout().unwrap() <= RESULT_SLICE, "poll for result");
+        assert!(
+            pc.poll_timeout().unwrap() <= RESULT_SLICE,
+            "poll for result"
+        );
 
         // Same word again: never re-sent (dedupe on outstanding).
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
@@ -582,19 +584,31 @@ mod tests {
     fn empty_result_dismisses_and_resets_cursor() {
         let (mut pc, _req, res) = harness();
         let mut ed = editor_at("cat ./only", 10);
-        res.send(("./only".into(), rows(&["./a", "./b", "./c"]))).unwrap();
+        res.send(("./only".into(), rows(&["./a", "./b", "./c"])))
+            .unwrap();
         assert_eq!(selected(&pc.eval(&mut ed, HostKey::None, ctx())), Some(0));
-        assert_eq!(selected(&pc.eval(&mut ed, HostKey::MoveCursor(1), ctx())), Some(1));
+        assert_eq!(
+            selected(&pc.eval(&mut ed, HostKey::MoveCursor(1), ctx())),
+            Some(1)
+        );
 
         // Re-run comes back all-exact ⇒ empty ⇒ dismissed (Idle).
-        res.send(("./only".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
-            .unwrap();
+        res.send((
+            "./only".into(),
+            CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+                match_indices: None,
+            },
+        ))
+        .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
 
         // A later dialog for the same word reseeds at row 0 — the
         // reset cleared the moved cursor (without it, the kept id
         // would land back on row 1).
-        res.send(("./only".into(), rows(&["./a", "./b", "./c"]))).unwrap();
+        res.send(("./only".into(), rows(&["./a", "./b", "./c"])))
+            .unwrap();
         assert_eq!(selected(&pc.eval(&mut ed, HostKey::None, ctx())), Some(0));
     }
 
@@ -604,11 +618,15 @@ mod tests {
     fn tab_splices_word_and_kicks_rerun() {
         let (mut pc, req, res) = harness();
         let mut ed = editor_at("cat ./sr", 8);
-        res.send(("./sr".into(), rows(&["./src/", "./srv/"]))).unwrap();
+        res.send(("./sr".into(), rows(&["./src/", "./srv/"])))
+            .unwrap();
         selected(&pc.eval(&mut ed, HostKey::None, ctx()));
 
         // Move to the second row, then Tab: splice in place.
-        assert_eq!(selected(&pc.eval(&mut ed, HostKey::MoveCursor(1), ctx())), Some(1));
+        assert_eq!(
+            selected(&pc.eval(&mut ed, HostKey::MoveCursor(1), ctx())),
+            Some(1)
+        );
         let f = pc.eval(&mut ed, HostKey::Tab, ctx());
         idle(&f);
         assert_eq!(ed.text(), "cat ./srv/", "word replaced, prefix kept");
@@ -627,8 +645,15 @@ mod tests {
         idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
         assert_eq!(ed.text(), "./file.txt");
 
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
-            .unwrap();
+        res.send((
+            "./file.txt".into(),
+            CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+                match_indices: None,
+            },
+        ))
+        .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         assert_eq!(ed.text(), "./file.txt ", "trailing space appended");
         assert_eq!(ed.cursor(), 11);
@@ -646,7 +671,8 @@ mod tests {
         idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
         assert_eq!(ed.text(), "./src/");
 
-        res.send(("./src/".into(), rows(&["./src/a", "./src/b"]))).unwrap();
+        res.send(("./src/".into(), rows(&["./src/a", "./src/b"])))
+            .unwrap();
         let f = pc.eval(&mut ed, HostKey::None, ctx());
         selected(&f);
         assert_eq!(ed.text(), "./src/", "drill continues, no space");
@@ -672,8 +698,15 @@ mod tests {
 
         // User types on before the re-run lands: expansion void.
         ed.insert('x');
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
-            .unwrap();
+        res.send((
+            "./file.txt".into(),
+            CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+                match_indices: None,
+            },
+        ))
+        .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         assert_eq!(ed.text(), "./file.txtx", "no space for a void expansion");
     }
@@ -688,8 +721,15 @@ mod tests {
         idle(&pc.eval(&mut ed, HostKey::Tab, ctx()));
         assert_eq!(ed.text(), "./file.txt ");
 
-        res.send(("./file.txt".into(), CompletionRows { rows: Vec::new(), labels: None, match_indices: None }))
-            .unwrap();
+        res.send((
+            "./file.txt".into(),
+            CompletionRows {
+                rows: Vec::new(),
+                labels: None,
+                match_indices: None,
+            },
+        ))
+        .unwrap();
         idle(&pc.eval(&mut ed, HostKey::None, ctx()));
         // Should consume the existing space, not add a second one
         assert_eq!(ed.text(), "./file.txt ", "single space preserved");

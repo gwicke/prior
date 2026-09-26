@@ -16,13 +16,13 @@
 pub mod menu;
 
 // --- Engine modules ---
-pub mod node_impl;
-pub mod node_entry;
 pub mod cursor;
 pub mod fields;
 pub mod filter;
 pub mod fuzzy;
 pub mod grammar;
+pub mod node_entry;
+pub mod node_impl;
 pub mod prompt;
 pub mod render;
 pub mod table;
@@ -31,10 +31,13 @@ pub mod view;
 pub mod wrap;
 
 // Re-export public types for convenience.
-pub use menu::{SlashDotMenu, SlashDotHandle, SlashDotMenuNode};
-pub use node_entry::{HostKey, RowRef};
-pub use node_impl::{SlashDotNode, MenuResult, PathArgs, RenderContext, CompletionRows, DataResponse, DataError, DataResult, SubmitResult, StaticListingNode, StaticRow};
 pub use fields::ColumnDef;
+pub use menu::{SlashDotHandle, SlashDotMenu, SlashDotMenuNode};
+pub use node_entry::{HostKey, RowRef};
+pub use node_impl::{
+    CompletionRows, DataError, DataResponse, DataResult, MenuResult, PathArgs, RenderContext,
+    SlashDotNode, StaticListingNode, StaticRow, SubmitResult,
+};
 pub use render::LogicalLine;
 pub use table::{Align, Table};
 pub use view::{RowView, ViewPlan, ViewRequest, ViewRows};

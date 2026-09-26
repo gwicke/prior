@@ -80,10 +80,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", "/xdg");
         std::env::remove_var("HOME");
         std::env::remove_var("APPDATA");
-        assert_eq!(
-            app_config_dir(),
-            Some(PathBuf::from("/xdg/picocode"))
-        );
+        assert_eq!(app_config_dir(), Some(PathBuf::from("/xdg/picocode")));
         assert_eq!(
             config_path(),
             Some(PathBuf::from("/xdg/picocode/settings.toml"))
@@ -113,8 +110,10 @@ mod tests {
         // The value is a Windows-style path, but `app_config_dir` joins with the
         // host's separator, so build the expectation with `MAIN_SEPARATOR`
         // instead of a hard-coded backslash (keeps the test green off Windows).
-        let expected =
-            format!("C:\\Users\\me\\AppData\\Roaming{}picocode", std::path::MAIN_SEPARATOR);
+        let expected = format!(
+            "C:\\Users\\me\\AppData\\Roaming{}picocode",
+            std::path::MAIN_SEPARATOR
+        );
         assert_eq!(app_config_dir(), Some(PathBuf::from(expected)));
         std::env::remove_var("APPDATA");
     }

@@ -120,7 +120,10 @@ mod tests {
     fn parse_level_variants() {
         assert_eq!("off".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Off);
         assert_eq!("LOW".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Low);
-        assert_eq!("medium".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Med);
+        assert_eq!(
+            "medium".parse::<ThinkingLevel>().unwrap(),
+            ThinkingLevel::Med
+        );
         assert_eq!("3".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::High);
         assert_eq!("max".parse::<ThinkingLevel>().unwrap(), ThinkingLevel::Max);
         assert!("bogus".parse::<ThinkingLevel>().is_err());

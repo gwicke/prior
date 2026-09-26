@@ -4,7 +4,9 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Setup the output handler (ConsoleOutput provides pretty terminal printing)
-    let output = Arc::new(ConsoleOutput::new(picocode::settings::default_show_reasoning_handle()));
+    let output = Arc::new(ConsoleOutput::new(
+        picocode::settings::default_show_reasoning_handle(),
+    ));
 
     // 2. Create the agent with a simple config struct
     // You no longer need to manually initialize Rig clients or builders.
@@ -28,14 +30,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reasoning_in_context: picocode::settings::ReasoningInContextMode::Never,
         message_log_path: None,
         sessions_dir: None,
-    }).await?;
+    })
+    .await?;
 
     println!("--- Picocode Library Example ---");
     println!("Asking the agent to analyze the current directory...\n");
 
     // 3. Run a task and get the response!
     let response = agent
-        .run_once("List the files in the current directory and explain what this project seems to be.".into())
+        .run_once(
+            "List the files in the current directory and explain what this project seems to be."
+                .into(),
+        )
         .await?;
 
     println!("\nFinal Response captured in library mode:\n{}", response);

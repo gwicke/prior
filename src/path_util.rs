@@ -194,20 +194,14 @@ mod relativize_tests {
             relativize_path(Path::new("/home/u/proj/src/main.rs"), &cwd),
             "./src/main.rs",
         );
-        assert_eq!(
-            relativize_path(Path::new("/home/u/proj/a"), &cwd),
-            "./a",
-        );
+        assert_eq!(relativize_path(Path::new("/home/u/proj/a"), &cwd), "./a",);
     }
 
     #[test]
     fn deeply_nested_child_keeps_full_tail() {
         let cwd = cwd("/home/u/proj");
         assert_eq!(
-            relativize_path(
-                Path::new("/home/u/proj/src/sub/mod.rs"),
-                &cwd
-            ),
+            relativize_path(Path::new("/home/u/proj/src/sub/mod.rs"), &cwd),
             "./src/sub/mod.rs",
         );
     }
@@ -239,10 +233,7 @@ mod relativize_tests {
             relativize_path(Path::new("/home/u/other/x"), &cwd),
             "/home/u/other/x",
         );
-        assert_eq!(
-            relativize_path(Path::new("/tmp/foo"), &cwd),
-            "/tmp/foo",
-        );
+        assert_eq!(relativize_path(Path::new("/tmp/foo"), &cwd), "/tmp/foo",);
     }
 
     #[test]

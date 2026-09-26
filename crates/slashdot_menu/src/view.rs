@@ -10,10 +10,10 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::fields::ColumnDef;
 use crate::fields::{row_field_value, Row};
 use crate::node_entry::RowRef;
 use crate::node_impl::{DataResponse, RenderContext};
-use crate::fields::ColumnDef;
 use crate::render::{LogicalLine, RenderPlan};
 use crate::table::{display_width, highlight_matches};
 
@@ -231,12 +231,9 @@ impl RowView {
         if let Some(d) = req.cursor_delta {
             let n = view.len();
             if n > 0 {
-                self.cursor_idx = (self.cursor_idx as isize + d as isize)
-                    .clamp(0, (n - 1) as isize) as usize;
-                self.cursor_id = view
-                    .iter()
-                    .nth(self.cursor_idx)
-                    .map(|(r, _)| r.id.clone());
+                self.cursor_idx =
+                    (self.cursor_idx as isize + d as isize).clamp(0, (n - 1) as isize) as usize;
+                self.cursor_id = view.iter().nth(self.cursor_idx).map(|(r, _)| r.id.clone());
             }
             self.cursor_user_moved = true;
         }
@@ -306,21 +303,15 @@ impl RowView {
 
     /// Rebuild table header + row lines + active indices from scratch
     /// (extracted from `NodeEntry::build_render_plan`).
-    fn rebuild_rows(
-        &mut self,
-        view: &ViewRows,
-        columns: &[ColumnDef],
-        render_ctx: RenderContext,
-    ) {
-        use crate::table::{Align, Table, extract_snippet};
+    fn rebuild_rows(&mut self, view: &ViewRows, columns: &[ColumnDef], render_ctx: RenderContext) {
+        use crate::table::{extract_snippet, Align, Table};
         let col_field_names: Vec<String> = if !columns.is_empty() {
             columns.iter().map(|c| c.field.clone()).collect()
         } else {
             vec!["id".to_string(), "description".to_string()]
         };
-        let has_table_header = !columns.is_empty()
-            && !view.is_empty()
-            && columns.iter().any(|c| !c.header.is_empty());
+        let has_table_header =
+            !columns.is_empty() && !view.is_empty() && columns.iter().any(|c| !c.header.is_empty());
         // Column count comes from the labels (Table::new), so the
         // default id/description pair must be passed even when the
         // header row itself is never rendered (has_table_header false).
@@ -347,7 +338,8 @@ impl RowView {
                 let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
                 let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
                 let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-                temp = temp.with_aligns(&aligns)
+                temp = temp
+                    .with_aligns(&aligns)
                     .with_min_widths(&mins)
                     .with_priorities(&prios);
             }
@@ -375,7 +367,8 @@ impl RowView {
             let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
             let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
             let prios: Vec<usize> = columns.iter().map(|c| c.priority).collect();
-            t = t.with_aligns(&aligns)
+            t = t
+                .with_aligns(&aligns)
                 .with_min_widths(&mins)
                 .with_priorities(&prios);
         }
@@ -388,7 +381,8 @@ impl RowView {
             let match_indices = view.match_indices(&rref);
             let mut cells: Vec<String> = Vec::with_capacity(col_field_names.len());
             for (col_idx, k) in col_field_names.iter().enumerate() {
-                let cell = row.field_display(k)
+                let cell = row
+                    .field_display(k)
                     .or_else(|| {
                         row_field_value(row, k).map(|v| match v {
                             crate::value::Value::Str(s) => s,
@@ -406,10 +400,7 @@ impl RowView {
                         // highlight it). Otherwise highlight in place (the
                         // wrap path renders the whole cell).
                         let col_w = col_widths.get(col_idx).copied().unwrap_or(0);
-                        if !use_wrap
-                            && col_w > 0
-                            && display_width(&cell) > col_w
-                        {
+                        if !use_wrap && col_w > 0 && display_width(&cell) > col_w {
                             extract_snippet(&cell, indices, col_w)
                         } else {
                             highlight_matches(&cell, indices)
@@ -426,9 +417,7 @@ impl RowView {
         }
 
         let table_header = if has_table_header {
-            Some(LogicalLine::new(
-                t.render_header(width),
-            ))
+            Some(LogicalLine::new(t.render_header(width)))
         } else {
             None
         };
@@ -522,7 +511,7 @@ mod tests {
         let mut r = req();
         r.cursor_delta = Some(2);
         v.plan(rows3(), &r); // cursor on "c", user_moved = true
-        // New view without "c": drop flag, re-seed to row0.
+                             // New view without "c": drop flag, re-seed to row0.
         let out = v.plan(view_of(vec![Row::new("x"), Row::new("y")]), &req());
         assert_eq!(out.plan.selected, Some(0));
     }
@@ -601,28 +590,25 @@ mod tests {
         // active markers — the shape prose completion feeds to plan().
         let view = ViewRows::of(vec![Row::new("a"), Row::new("b")]);
         assert_eq!(view.len(), 2);
-        let ids: Vec<&str> = view.iter().map(|(r, a)| {
-            assert!(!a, "completion rows never carry active markers");
-            r.id.as_str()
-        }).collect();
+        let ids: Vec<&str> = view
+            .iter()
+            .map(|(r, a)| {
+                assert!(!a, "completion rows never carry active markers");
+                r.id.as_str()
+            })
+            .collect();
         assert_eq!(ids, vec!["a", "b"]);
     }
 
     #[test]
     fn plan_over_of_round_trips_selection() {
         let mut v = RowView::new();
-        let out = v.plan(
-            ViewRows::of(vec![Row::new("x"), Row::new("y")]),
-            &req(),
-        );
+        let out = v.plan(ViewRows::of(vec![Row::new("x"), Row::new("y")]), &req());
         assert_eq!(out.plan.selected, Some(0));
         assert_eq!(out.cursor_row.map(|r| r.id), Some("x".to_string()));
         let mut r = req();
         r.cursor_delta = Some(1);
-        let out = v.plan(
-            ViewRows::of(vec![Row::new("x"), Row::new("y")]),
-            &r,
-        );
+        let out = v.plan(ViewRows::of(vec![Row::new("x"), Row::new("y")]), &r);
         assert_eq!(out.cursor_row.map(|r| r.id), Some("y".to_string()));
     }
 }
