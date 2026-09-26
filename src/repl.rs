@@ -889,7 +889,7 @@ impl Repl {
             let overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                    Self::paint_plan(plan, cur_h as usize)
+                    crate::slashdot_menu::render::paint_plan(plan, cur_w as usize, cur_h as usize)
                 }
             };
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
@@ -1044,19 +1044,20 @@ impl Repl {
                                     let dv: usize =
                                         plan.detail.iter().map(|d| d.0.split('\n').count()).sum();
                                     let th_lines = if plan.table_header.is_some() { 1 } else { 0 };
-                                    let (_, data_budget) = Self::compute_space_budget(
-                                        max_pop,
-                                        th_lines,
-                                        dv,
-                                        plan.rows.len(),
-                                        3,
-                                    );
+                                    let (_, data_budget) =
+                                        crate::slashdot_menu::render::compute_space_budget(
+                                            max_pop,
+                                            th_lines,
+                                            dv,
+                                            plan.rows.len(),
+                                            3,
+                                        );
                                     let direction = if matches!(key.code, KeyCode::PageDown) {
                                         1
                                     } else {
                                         -1
                                     };
-                                    let delta = Self::page_delta(
+                                    let delta = crate::slashdot_menu::render::page_delta(
                                         &plan.rows,
                                         cur_sel,
                                         data_budget,
@@ -1215,162 +1216,6 @@ impl Repl {
         }
         s
     }
-    /// `avail` rows (≤ `overlay_len`), centered on `sel`. Returns the
-    /// Render a LogicalLine as a single ANSI-styled string. Used for
-    /// table_header and detail lines (not data rows, which are rendered
-    /// inline with markers). Splits on `\n` for multi-line logical lines.
-    fn render_logical_line(
-        line: &crate::slashdot_menu::render::LogicalLine,
-        tw: usize,
-        is_selected: bool,
-        is_active: bool,
-        is_header: bool,
-    ) -> String {
-        let bg = if is_header {
-            "\x1b[48;5;237m"
-        } else if is_selected {
-            "\x1b[48;5;239m"
-        } else {
-            ""
-        };
-        let fg = if is_selected { "\x1b[1;36m" } else { "" };
-        let mut parts = Vec::new();
-        for (j, sub) in line.0.split('\n').enumerate() {
-            let marker = if j == 0 {
-                if is_active {
-                    "* "
-                } else if is_selected {
-                    "> "
-                } else {
-                    "  "
-                }
-            } else {
-                "  "
-            };
-            let content = format!("{}{}", marker, sub);
-            let vis = crate::slashdot_menu::table::display_width(&content);
-            let pad = tw.saturating_sub(vis);
-            parts.push(format!(
-                "{}{}{}{}{}",
-                bg,
-                fg,
-                content,
-                " ".repeat(pad),
-                "\x1b[0m"
-            ));
-        }
-        parts.join("\n")
-    }
-
-    /// Compute vertical space budgets for detail and data rows within the
-    /// overlay. Returns `(detail_budget, rows_budget)` in visual lines.
-    ///
-    /// When both sections overflow, they split available space 50:50.
-    /// If one section fits in its half, the other gets the surplus.
-    /// Rows always get at least `min_rows` (capped at `total_rows`).
-    fn compute_space_budget(
-        overlay_budget: usize, // total overlay lines (e.g. 2/3 terminal)
-        table_header_lines: usize,
-        total_detail_vis: usize, // visual lines all detail items consume
-        total_rows: usize,
-        min_rows: usize,
-    ) -> (usize, usize) {
-        let available = overlay_budget.saturating_sub(table_header_lines);
-        let half = available / 2;
-        let min_rows_guaranteed = min_rows.min(total_rows);
-
-        // When rows overflow their half, detail is capped at half so rows
-        // are not starved.  When rows fit, detail may use up to
-        // `available - min_rows` (the surplus flows from rows' unused half).
-        let detail_limit = if total_rows > half {
-            // Both overflow (or rows do): detail capped at half.
-            half
-        } else {
-            // Rows fit: detail may use their unused half.
-            available.saturating_sub(min_rows_guaranteed)
-        };
-        let detail_budget = total_detail_vis.min(detail_limit);
-
-        // Rows get the remaining space, at least `min_rows_guaranteed`.
-        // When rows fit in their half, cap at total_rows (the renderer
-        // shows `min(total, budget)` anyway, but a tighter budget is
-        // clearer for callers).
-        let rows_budget = if total_rows > half {
-            available
-                .saturating_sub(detail_budget)
-                .max(min_rows_guaranteed)
-        } else {
-            total_rows
-        };
-
-        (detail_budget, rows_budget)
-    }
-
-    /// Compute the window of row indices to render, accounting for multi-line
-    /// `LogicalLine` rows.  Returns `(start, count)` — the first row index and
-    /// how many logical rows to render.  `budget` is in visual lines.
-    fn visual_row_window(
-        rows: &[crate::slashdot_menu::render::LogicalLine],
-        selected: usize,
-        budget: usize,
-    ) -> (usize, usize) {
-        let total = rows.len();
-        if total == 0 || budget == 0 {
-            return (0, 0);
-        }
-        let heights: Vec<usize> = rows
-            .iter()
-            .map(|r| r.0.split('\n').count().max(1))
-            .collect();
-        let total_vis: usize = heights.iter().sum();
-        if total_vis <= budget {
-            return (0, total);
-        }
-        let sel = selected.min(total - 1);
-        let half = budget / 2;
-
-        // Walk backward from sel, using at most half the budget for rows above.
-        let mut start = sel;
-        let mut vis = heights[sel]; // always include the selected row
-        while start > 0 && vis + heights[start - 1] <= half {
-            start -= 1;
-            vis += heights[start];
-        }
-
-        // Walk forward from start, filling the full budget.
-        let mut count = 0;
-        let mut vis_total = 0;
-        for i in start..total {
-            if vis_total + heights[i] > budget {
-                break;
-            }
-            vis_total += heights[i];
-            count += 1;
-        }
-
-        // If we hit the end of the list before filling the budget,
-        // extend backward to use remaining space (avoids empty gap
-        // below the window when selected is near the end).
-        if start > 0 && vis_total < budget {
-            while start > 0 {
-                let h = heights[start - 1];
-                if vis_total + h > budget {
-                    break;
-                }
-                start -= 1;
-                vis_total += h;
-                count += 1;
-            }
-        }
-
-        // At least the selected row (may exceed budget if it's very tall).
-        if count == 0 {
-            count = 1;
-        }
-
-        (start, count)
-    }
-
     /// start index into the full overlay. Extracted so it can be unit-tested
     /// without a TTY.
     pub(crate) fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
@@ -1379,146 +1224,6 @@ impl Repl {
         } else {
             sel.saturating_sub(avail / 2).min(overlay_len - avail)
         }
-    }
-
-    /// Compute the number of logical rows to skip for a page scroll,
-    /// accounting for multi-line (wrapped) rows. Returns a signed delta
-    /// (positive = down, negative = up) that moves `selected` by at most
-    /// `budget` visual lines, clamped to [0, total_rows).
-    pub(crate) fn page_delta(
-        rows: &[crate::slashdot_menu::render::LogicalLine],
-        selected: usize,
-        budget: usize,
-        direction: i32,
-    ) -> i32 {
-        let total = rows.len();
-        if total == 0 || budget == 0 {
-            return 0;
-        }
-        let mut visual_used = 0usize;
-        let mut delta = 0i32;
-        if direction > 0 {
-            // PageDown: count forward from selected+1
-            let mut i = selected + 1;
-            while i < total {
-                let h = rows[i].0.lines().count().max(1);
-                if visual_used + h > budget && delta > 0 {
-                    break;
-                }
-                visual_used += h;
-                delta += 1;
-                i += 1;
-            }
-        } else {
-            // PageUp: count backward from selected
-            let mut i = selected;
-            while i > 0 {
-                let h = rows[i - 1].0.lines().count().max(1);
-                if visual_used + h > budget && delta < 0 {
-                    break;
-                }
-                i -= 1;
-                visual_used += h;
-                delta -= 1;
-            }
-        }
-        delta
-    }
-
-    /// Paint an engine `RenderPlan` to ANSI overlay text: detail lines,
-    /// table header, then data rows windowed around `selected` within
-    /// the 2/3-height overlay budget. Shared by the plan-carrying
-    /// overlay variants (slash `V25Menu`, prose `PathComplete`) — the
-    /// one place a `RenderPlan` becomes display lines. Height is a
-    /// parameter; width is read from the terminal like the other
-    /// render helpers.
-    fn paint_plan(plan: &crate::slashdot_menu::render::RenderPlan, term_h: usize) -> String {
-        let tw = crate::output::term_width().max(1);
-        let mut result: Vec<String> = Vec::new();
-
-        // --- Space allocation ---
-        // `term_h` is the full terminal height; 2/3 is the overlay budget.
-        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-        let table_header_lines = if plan.table_header.is_some() { 1 } else { 0 };
-        let min_rows = 3usize;
-
-        // Count visual lines each detail item occupies (LogicalLine
-        // may contain embedded \n for wrapped sub-lines).
-        let detail_visual: Vec<usize> = plan
-            .detail
-            .iter()
-            .map(|d| d.0.split('\n').count())
-            .collect();
-        let total_detail_vis: usize = detail_visual.iter().sum();
-        let total_rows = plan.rows.len();
-
-        let (detail_budget, data_budget) = Self::compute_space_budget(
-            max_pop,
-            table_header_lines,
-            total_detail_vis,
-            total_rows,
-            min_rows,
-        );
-
-        // 1. Detail (header() output — no background, stands out).
-        let mut detail_vis_used = 0usize;
-        for (d, &vis) in plan.detail.iter().zip(&detail_visual) {
-            if detail_vis_used + vis > detail_budget {
-                break;
-            }
-            result.push(Self::render_logical_line(d, tw, false, false, false));
-            detail_vis_used += vis;
-        }
-
-        // 2. Table header (column labels, grey background).
-        if let Some(ref th) = plan.table_header {
-            result.push(Self::render_logical_line(th, tw, false, false, true));
-        }
-
-        // 3. Data rows, windowed around `selected` (visual-line-aware).
-        let total = plan.rows.len();
-        if total > 0 {
-            let sel_idx = plan.selected.unwrap_or(0);
-            let (win_start, win_count) = Self::visual_row_window(&plan.rows, sel_idx, data_budget);
-            for i in win_start..(win_start + win_count).min(total) {
-                let is_selected = plan.selected == Some(i);
-                let is_active = plan.active_rows.contains(&i);
-                let row = &plan.rows[i];
-                let sub_lines: Vec<&str> = row.0.split('\n').collect();
-                for (j, sub) in sub_lines.iter().enumerate() {
-                    let first = j == 0;
-                    let marker = if first {
-                        if is_active {
-                            "* "
-                        } else if is_selected {
-                            "> "
-                        } else {
-                            "  "
-                        }
-                    } else {
-                        "  "
-                    };
-                    let bg = if is_selected {
-                        "\x1b[48;5;239m"
-                    } else {
-                        "\x1b[48;5;235m"
-                    };
-                    let fg = if is_selected { "\x1b[1;36m" } else { "" };
-                    let content = format!("{}{}", marker, sub);
-                    let vis = crate::slashdot_menu::table::display_width(&content);
-                    let pad = tw.saturating_sub(vis);
-                    result.push(format!(
-                        "{}{}{}{}{}",
-                        bg,
-                        fg,
-                        content,
-                        " ".repeat(pad),
-                        "\x1b[0m"
-                    ));
-                }
-            }
-        }
-        result.join("\n")
     }
 
     /// Evaluate one menu key event (editor's real cursor: char index →
@@ -3203,13 +2908,13 @@ mod tests {
     #[test]
     fn overlay_window_centers_on_selection_and_clamps() {
         // 50 options in a 10-row window, selection at the very end.
-        assert_eq!(Repl::overlay_window(50, 10, 49), 40);
-        assert_eq!(Repl::overlay_window(50, 10, 0), 0);
-        assert_eq!(Repl::overlay_window(50, 10, 5), 0);
+        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 49), 40);
+        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 0), 0);
+        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 5), 0);
         // avail >= len: show everything from the top.
-        assert_eq!(Repl::overlay_window(5, 10, 4), 0);
+        assert_eq!(crate::repl::Repl::overlay_window(5, 10, 4), 0);
         // avail == 0: degenerate, clamp to 0.
-        assert_eq!(Repl::overlay_window(50, 0, 49), 0);
+        assert_eq!(crate::repl::Repl::overlay_window(50, 0, 49), 0);
     }
 
     #[test]
@@ -3219,13 +2924,22 @@ mod tests {
         let rows: Vec<LogicalLine> = (0..10)
             .map(|i| LogicalLine::new(format!("row {}", i)))
             .collect();
-        assert_eq!(Repl::page_delta(&rows, 0, 4, 1), 4);
+        assert_eq!(crate::slashdot_menu::render::page_delta(&rows, 0, 4, 1), 4);
         // PageUp from row 9 with budget 4: skip 4 rows back to row 5.
-        assert_eq!(Repl::page_delta(&rows, 9, 4, -1), -4);
+        assert_eq!(
+            crate::slashdot_menu::render::page_delta(&rows, 9, 4, -1),
+            -4
+        );
         // Clamping: PageDown from row 7 with budget 100: only 2 rows left.
-        assert_eq!(Repl::page_delta(&rows, 7, 100, 1), 2);
+        assert_eq!(
+            crate::slashdot_menu::render::page_delta(&rows, 7, 100, 1),
+            2
+        );
         // Clamping: PageUp from row 1 with budget 100: only 1 row above.
-        assert_eq!(Repl::page_delta(&rows, 1, 100, -1), -1);
+        assert_eq!(
+            crate::slashdot_menu::render::page_delta(&rows, 1, 100, -1),
+            -1
+        );
         // Multi-line rows: a row with 3 newlines = 4 visual lines.
         let mixed = vec![
             LogicalLine::new("short"),
@@ -3234,11 +2948,14 @@ mod tests {
             LogicalLine::new("a\nb"),
         ];
         // From row 0, budget 5: row1 uses 4 lines, row2 uses 1 line = 5 total → delta 2.
-        assert_eq!(Repl::page_delta(&mixed, 0, 5, 1), 2);
+        assert_eq!(crate::slashdot_menu::render::page_delta(&mixed, 0, 5, 1), 2);
         // From row 3, budget 3: row2 has 1 line (fits), row1 has 4 lines (exceeds budget) → delta -1.
-        assert_eq!(Repl::page_delta(&mixed, 3, 3, -1), -1);
+        assert_eq!(
+            crate::slashdot_menu::render::page_delta(&mixed, 3, 3, -1),
+            -1
+        );
         // Empty rows: no delta.
-        assert_eq!(Repl::page_delta(&[], 0, 10, 1), 0);
+        assert_eq!(crate::slashdot_menu::render::page_delta(&[], 0, 10, 1), 0);
     }
 
     #[test]
@@ -3705,7 +3422,7 @@ mod tests {
     /// cursor row (`>` loses to `*`, Marker contract).
     #[test]
     fn paint_plan_active_marker_beats_cursor() {
-        use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
+        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
         use std::rc::Rc;
         let plan = RenderPlan {
             rows: Rc::new(vec![LogicalLine::new("x")]),
@@ -3713,7 +3430,7 @@ mod tests {
             active_rows: vec![0],
             ..Default::default()
         };
-        let painted = Repl::paint_plan(&plan, 40);
+        let painted = paint_plan(&plan, 80, 40);
         assert!(
             painted.contains("* x"),
             "shared row shows `*`, not `>`: {painted:?}"
@@ -4179,7 +3896,7 @@ mod tests {
     fn budget_both_fit() {
         // Both detail (5 vis lines) and rows (3) fit in overlay.
         // overlay_budget=20, table_header=1, available=19, half=9.
-        let (d, r) = Repl::compute_space_budget(20, 1, 5, 3, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 5, 3, 3);
         assert_eq!(d, 5, "detail gets what it needs");
         assert_eq!(r, 3, "rows get what they need");
     }
@@ -4188,7 +3905,7 @@ mod tests {
     fn budget_both_overflow_50_50() {
         // Detail has 30 vis lines, rows has 30. available=39, half=19.
         // Both overflow: detail capped at 19, rows get 20.
-        let (d, r) = Repl::compute_space_budget(40, 1, 30, 30, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(40, 1, 30, 30, 3);
         assert_eq!(d, 19);
         assert_eq!(r, 20);
     }
@@ -4198,7 +3915,7 @@ mod tests {
         // Detail has 20 vis lines, rows has 2. available=19, half=9.
         // Rows fit (2 < 9), min_rows_guaranteed=min(3,2)=2.
         // detail gets available - 2 = 17.
-        let (d, r) = Repl::compute_space_budget(20, 1, 20, 2, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 20, 2, 3);
         assert_eq!(d, 17, "detail uses rows' surplus");
         assert_eq!(r, 2, "rows capped at total_rows");
     }
@@ -4207,7 +3924,7 @@ mod tests {
     fn budget_rows_overflow_detail_doesnt() {
         // Detail has 3 vis lines, rows has 30. available=19, half=9.
         // Detail fits (3 < 9): detail gets 3, rows get 16.
-        let (d, r) = Repl::compute_space_budget(20, 1, 3, 30, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 3, 30, 3);
         assert_eq!(d, 3, "detail gets what it needs");
         assert_eq!(r, 16, "rows get the rest");
     }
@@ -4218,7 +3935,7 @@ mod tests {
         // min_rows_guaranteed = min(3, 2) = 2.
         // available = 19. detail_limit = 19 - 2 = 17. detail = min(20, 17) = 17.
         // rows = max(19 - 17, 2) = 2.
-        let (d, r) = Repl::compute_space_budget(20, 1, 20, 2, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 20, 2, 3);
         assert_eq!(d, 17);
         assert_eq!(r, 2, "rows capped at total_rows");
     }
@@ -4226,7 +3943,7 @@ mod tests {
     #[test]
     fn budget_no_rows() {
         // No rows: all space goes to detail.
-        let (d, r) = Repl::compute_space_budget(20, 1, 15, 0, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 15, 0, 3);
         assert_eq!(d, 15);
         assert_eq!(r, 0, "no rows to allocate");
     }
@@ -4234,7 +3951,7 @@ mod tests {
     #[test]
     fn budget_no_table_header() {
         // No table header: available = overlay_budget.
-        let (d, r) = Repl::compute_space_budget(18, 0, 5, 5, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(18, 0, 5, 5, 3);
         assert_eq!(d, 5);
         assert_eq!(r, 5);
     }
@@ -4243,7 +3960,7 @@ mod tests {
     fn budget_small_terminal() {
         // Tiny terminal: overlay_budget=6, table_header=1, available=5.
         // Both overflow: half=2, detail=2, rows=3.
-        let (d, r) = Repl::compute_space_budget(6, 1, 10, 10, 3);
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(6, 1, 10, 10, 3);
         assert_eq!(d, 2);
         assert_eq!(r, 3, "min_rows enforced");
     }
@@ -4257,7 +3974,7 @@ mod tests {
             .map(|i| LogicalLine::new(format!("row {}", i)))
             .collect();
         // Budget 4: all single-line, window centered on sel=5.
-        let (s, c) = Repl::visual_row_window(&rows, 5, 4);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 5, 4);
         assert_eq!(c, 4);
         assert!(s <= 5 && s + c > 5, "selected must be in window");
     }
@@ -4273,7 +3990,7 @@ mod tests {
             LogicalLine::new("c"),
             LogicalLine::new("d"),
         ];
-        let (s, c) = Repl::visual_row_window(&rows, 2, 4);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 2, 4);
         // Can fit: row2 (3 lines) + one 1-line row = 4 lines.
         assert!(s <= 2 && s + c > 2, "selected must be in window");
         let vis: usize = rows[s..s + c].iter().map(|r| r.0.split('\n').count()).sum();
@@ -4289,7 +4006,7 @@ mod tests {
             LogicalLine::new("c"),
         ];
         // Budget is large enough for all rows.
-        let (s, c) = Repl::visual_row_window(&rows, 0, 100);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 100);
         assert_eq!(s, 0);
         assert_eq!(c, 3);
     }
@@ -4299,7 +4016,7 @@ mod tests {
         use crate::slashdot_menu::render::LogicalLine;
         // Single row taller than budget.
         let rows = vec![LogicalLine::new("a\nb\nc\nd\ne")];
-        let (s, c) = Repl::visual_row_window(&rows, 0, 2);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 2);
         assert_eq!(s, 0);
         assert_eq!(c, 1, "tall row is always included");
     }
@@ -4308,7 +4025,7 @@ mod tests {
     fn vw_empty_rows() {
         use crate::slashdot_menu::render::LogicalLine;
         let rows: Vec<LogicalLine> = vec![];
-        let (s, c) = Repl::visual_row_window(&rows, 0, 10);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 10);
         assert_eq!(s, 0);
         assert_eq!(c, 0);
     }
@@ -4321,7 +4038,7 @@ mod tests {
         let rows: Vec<LogicalLine> = (0..100)
             .map(|i| LogicalLine::new(format!("row {}", i)))
             .collect();
-        let (s, c) = Repl::visual_row_window(&rows, 99, 20);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 99, 20);
         assert_eq!(c, 20, "must use full budget");
         assert_eq!(s, 80, "window starts 20 rows before end");
         assert!(s <= 99 && s + c > 99, "selected in window");
@@ -4333,7 +4050,7 @@ mod tests {
         let rows: Vec<LogicalLine> = (0..100)
             .map(|i| LogicalLine::new(format!("row {}", i)))
             .collect();
-        let (s, c) = Repl::visual_row_window(&rows, 0, 20);
+        let (s, c) = crate::slashdot_menu::render::visual_row_window(&rows, 0, 20);
         assert_eq!(c, 20, "must use full budget");
         assert_eq!(s, 0, "starts at 0");
     }
