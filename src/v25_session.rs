@@ -96,7 +96,7 @@ fn session_description(meta: &crate::repl::SessionMeta) -> String {
         .as_deref()
         .unwrap_or("(empty)");
     match &meta.name {
-        Some(name) if !name.is_empty() => format!("{} — {}", name, prompt),
+        Some(name) if !name.is_empty() => format!("{}: {}", name, prompt),
         _ => prompt.to_string(),
     }
 }
@@ -1121,7 +1121,7 @@ mod tests {
             path: None,
         };
         let desc = session_description(&meta);
-        assert_eq!(desc, "my session — fix the bug in main.rs");
+        assert_eq!(desc, "my session: fix the bug in main.rs");
     }
 
     #[test]
