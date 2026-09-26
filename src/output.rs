@@ -106,6 +106,13 @@ pub trait Output: Send + Sync {
     fn display_error(&self, error: &str);
     fn display_system(&self, text: &str);
     fn confirm(&self, message: &str) -> Confirmation;
+    /// Non-interactive policy for confirm dialogs. Used by the async confirm
+    /// driver when `confirm_gate()` is `None`. Default implementations
+    /// return their existing `confirm` behavior (e.g. `Yes` for QuietOutput,
+    /// `No` for LogOutput).
+    fn confirm_default(&self, message: &str) -> Confirmation {
+        self.confirm(message)
+    }
     /// Ask the user to accept or cancel a pending compaction summary after
     /// they have reviewed/edited it in an external editor. `true` = accept
     /// (write the entry with the possibly-edited summary); `false` = cancel
@@ -1955,174 +1962,50 @@ impl Output for ConsoleOutput {
     }
 
     fn confirm(&self, message: &str) -> Confirmation {
-        self.stop_thinking();
-        // The REPL runs in raw mode while a request is in flight and a
-        // background reader thread polls stdin (Esc/Ctrl-C/Ctrl-Z). Two things
-        // go wrong if we read with `std::io::read_line` here:
-        //   1. `cfmakeraw` disables ICRNL, so the Enter key delivers `\r`
-        //      (0x0D) and never a `\n` (0x0A); `read_line` waits forever for a
-        //      newline that never arrives -> the client hangs with no echoed
-        //      input (verified: after `enable_raw_mode`, ICRNL==false).
-        //   2. The background reader also reads stdin and would consume the
-        //      keystrokes meant for this dialog.
-        // So (1) ask the reader to stand down, and (2) render the choice as an
-        // overlay (consistent with the `/` dialogs) and read a single
-        // navigation/selection key via crossterm's raw-mode event reader.
-        self.reader_paused.store(true, Ordering::SeqCst);
+        use crate::slashdot_menu::node_impl::StaticRow;
+        use crate::ui::{confirm, ConfirmSpec};
 
-        let (_w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let h = h.max(1) as usize;
-        // Anchor just below the current cursor. Clamp so this small overlay
-        // never scrolls the screen (which would make it impossible to clear
-        // precisely afterwards).
-        let start_row = self.cursor_row().min(h);
-        let n = 4usize; // title + 3 options
-        let top = start_row.min(h.saturating_sub(n));
-
-        // Options in display order. Default selection = No (safe: Enter -> No,
-        // matching the previous `read_line("")` default).
-        let options = vec![
-            "Yes".to_string(),
-            "No".to_string(),
-            "Always (session)".to_string(),
-        ];
-        let mut sel: usize = 1;
-
-        let draw = |sel: usize| {
-            let panel = Repl::overlay_lines(message, &options, None, sel, None, true);
-            let mut s = String::new();
-            s.push_str(&format!("\x1b[{};1H", top));
-            s.push_str("\x1b[0J");
-            for line in panel.lines() {
-                s.push_str(line);
-                s.push('\n');
-            }
-            let _ = io::stdout().write_all(s.as_bytes());
-            let _ = io::stdout().flush();
-        };
-        draw(sel);
-
-        // Navigate with up/down, confirm with Enter, or use quick keys.
-        let choice = loop {
-            match event::read() {
-                Ok(Event::Key(key)) => match key.code {
-                    KeyCode::Up => {
-                        if sel > 0 {
-                            sel -= 1;
-                            draw(sel);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if sel + 1 < options.len() {
-                            sel += 1;
-                            draw(sel);
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        break match c.to_ascii_lowercase() {
-                            'y' => 0,
-                            's' => 2,
-                            _ => 1, // n / anything else -> No
-                        };
-                    }
-                    KeyCode::Enter => break sel,
-                    KeyCode::Esc => break 1, // No
-                    _ => {}
-                },
-                _ => {}
-            }
+        let spec = ConfirmSpec {
+            header: message,
+            options: &[
+                StaticRow::new("yes", "Yes"),
+                StaticRow::new("no", "No"),
+                StaticRow::new("always", "Always (session)"),
+            ],
+            quick_keys: Some(&[('y', 0), ('s', 2)]),
+            default_sel: 1, // No
         };
 
-        // Clear the overlay region.
-        let mut s = String::new();
-        s.push_str(&format!("\x1b[{};1H", top));
-        s.push_str("\x1b[0J");
-        let _ = io::stdout().write_all(s.as_bytes());
-        let _ = io::stdout().flush();
-        self.reader_paused.store(false, Ordering::SeqCst);
+        // Run the sync dialog.
+        let result = crate::ui::confirm(self, &spec);
 
-        // Echo the resolved choice (raw mode has no terminal echo).
-        println!("  {}", options[choice]);
-        self.note_lines(1);
-
-        match choice {
-            0 => Confirmation::Yes,
-            2 => Confirmation::Always,
+        // Map result to Confirmation. Esc/dismiss -> No (safe default).
+        match result {
+            crate::ui::ConfirmResult::Selected(0) => Confirmation::Yes,
+            crate::ui::ConfirmResult::Selected(2) => Confirmation::Always,
             _ => Confirmation::No,
         }
     }
 
     fn confirm_compaction_summary(&self, message: &str) -> bool {
-        self.stop_thinking();
-        // The reader (if any) must not swallow the dialog keystrokes; the
-        // accept/cancel dialog is owned by the main task, mirroring the
-        // tool-confirmation gate.
-        self.reader_paused.store(true, Ordering::SeqCst);
+        use crate::slashdot_menu::node_impl::StaticRow;
+        use crate::ui::{confirm, ConfirmSpec};
 
-        let (_w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-        let h = h.max(1) as usize;
-        let start_row = self.cursor_row().min(h);
-        let n = 3usize; // title + 2 options
-        let top = start_row.min(h.saturating_sub(n));
-
-        // Default selection = Accept (safe for an explicit review step the
-        // user reached by editing the summary and pressing a key).
-        let options = vec!["Accept".to_string(), "Cancel".to_string()];
-        let mut sel: usize = 0;
-
-        let draw = |sel: usize| {
-            let panel = Repl::overlay_lines(message, &options, None, sel, None, true);
-            let mut s = String::new();
-            s.push_str(&format!("\x1b[{};1H", top));
-            s.push_str("\x1b[0J");
-            for line in panel.lines() {
-                s.push_str(line);
-                s.push('\n');
-            }
-            let _ = io::stdout().write_all(s.as_bytes());
-            let _ = io::stdout().flush();
-        };
-        draw(sel);
-
-        let choice = loop {
-            match event::read() {
-                Ok(Event::Key(key)) => match key.code {
-                    KeyCode::Up => {
-                        if sel > 0 {
-                            sel -= 1;
-                            draw(sel);
-                        }
-                    }
-                    KeyCode::Down => {
-                        if sel + 1 < options.len() {
-                            sel += 1;
-                            draw(sel);
-                        }
-                    }
-                    KeyCode::Char(c) => {
-                        break match c.to_ascii_lowercase() {
-                            'a' => 0,
-                            'c' => 1,
-                            _ => 0, // anything else -> Accept (default)
-                        };
-                    }
-                    KeyCode::Enter => break sel,
-                    KeyCode::Esc => break 1, // Cancel
-                    _ => {}
-                },
-                _ => {}
-            }
+        let spec = ConfirmSpec {
+            header: message,
+            options: &[
+                StaticRow::new("accept", "Accept"),
+                StaticRow::new("cancel", "Cancel"),
+            ],
+            quick_keys: Some(&[('a', 0), ('c', 1)]),
+            default_sel: 0, // Accept
         };
 
-        // Clear the overlay region.
-        let mut s = String::new();
-        s.push_str(&format!("\x1b[{};1H", top));
-        s.push_str("\x1b[0J");
-        let _ = io::stdout().write_all(s.as_bytes());
-        let _ = io::stdout().flush();
-        self.reader_paused.store(false, Ordering::SeqCst);
+        // Run the sync dialog.
+        let result = crate::ui::confirm(self, &spec);
 
-        choice == 0
+        // Esc/dismiss -> false (Cancel - safe default)
+        matches!(result, crate::ui::ConfirmResult::Selected(0))
     }
 
     fn display_separator(&self) {
