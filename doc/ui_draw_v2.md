@@ -1,6 +1,6 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implementation not started
+**Status:** Design settled — implementation in progress (P0 next)
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -34,9 +34,9 @@ without an input segment".
 | Draw pipeline | 4 phases: **compose → allocate → render → apply** |
 | Composition | Elements declare `(must, might)` heights; allocator distributes |
 | Budget | Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed scrollback |
-| Full apply | **Scroll-then-paint**: explicit scroll by `delta`, then absolute writes |
+| Full apply | **Scroll-then-paint**: LF scroll by `delta` from the bottom row (never `CSI S` — it deletes rows instead of pushing scrollback), then absolute writes |
 | Partial apply | Row-diff repaint when `delta == 0 ∧ top unchanged ∧ width unchanged` |
-| Clear policy | Only rows previously owned by the frame (cached `bottom`); absolute `CUP`+`EL` |
+| Clear policy | Full apply: clear `top..screen bottom` (conservative — anchor may have moved). Partial apply: row-diff + shrink remainder only (`top+height..=cache.bottom`) |
 | Buffer | Flat `String` + per-screen-row extents `Vec<Range<usize>>` |
 | Caret | `(row_idx, display_col)`, applied with `CUP` + `CHA` (`\x1b[{col}G`) |
 | Anchor state | Owned by `ConsoleOutput`; all writers maintain it before returning |
@@ -150,11 +150,24 @@ delta = max(0, (anchor.row + frame.height - 1) - term_h)
 top   = anchor.row - delta
 ```
 
-1. If `delta > 0`: explicit scroll `CSI {delta} S` (scrolls page up, cursor unmoved).
+All coordinates are computed **before** any emission; the whole sequence is one
+`write_all`. There is no post-hoc caret-delta math — `top` is final.
+
+1. If `delta > 0`: `CUP(term_h, 1)` then emit `delta` bare newlines. Precondition:
+   newlines must start from the bottom row, otherwise leading LFs just walk the
+   cursor down without scrolling. This is the same mechanism the current `redraw`
+   uses (bare `\n` → `\r\n` via ONLCR; scrolls at the bottom row) and pushes the
+   scrolled-out top lines into scrollback — **never `CSI {delta} S`**, which deletes
+   those lines instead of preserving them in some terminals (xterm.js#6010,
+   codex#45091). `delta == 0` (steady state) skips the scroll entirely.
 2. `CUP top`, write frame rows — **no further scroll possible** since
    `top + height - 1 ≤ term_h` by construction.
-3. Clear remainder: for rows `top+height ..= cache.bottom`, `CUP r` + `EL`
-   (absolute addressing; never scrolls).
+3. Clear `top+frame.height ..= screen bottom`, `CUP r` + `EL` per row (absolute
+   addressing; never scrolls). Conservative: the full apply is the rare path and the
+   anchor may have moved (DSR re-anchor after resize/editor), so the old frame's
+   cached coordinates are not trusted — clear the whole live region below the frame,
+   as today's `clear_rows_to(row, clear_to)` does. Rows below the frame are the live
+   region by definition; clearing them is always safe.
 4. `CUP` + `CHA` to the caret target.
 5. Update cache (`row = top`, `bottom = top + height - 1`, `caret`, `last_frame`).
 
@@ -173,8 +186,10 @@ last_frame.is_some()
 ```
 
 Then diff `last_frame.extents[i]` vs the new extents: emit `CUP r` + row bytes for changed
-rows only (one batched `write_all`, **no newlines** → can never scroll), clear-remainder if
-the frame shrank, reposition the caret. Identical frames emit nothing but the caret.
+rows only (one batched `write_all`, **no newlines** → can never scroll), clear the shrink
+remainder if the frame shrank (`top+height ..= cache.bottom` — trusted here: the anchor
+is stable by the predicate), reposition the caret. Identical frames emit nothing but the
+caret.
 
 Row diff (not dirty flags) is the starting point — it catches input-growth shifts and
 cross-element reflows that per-element flags miss; cost is negligible against I/O.
@@ -242,12 +257,25 @@ emit logic" into a real safety net for P2–P3.
 
 ---
 
-## 8. Open questions
+## 8. Open questions (resolved)
 
 1. **Scroll-on-demand cap.** `delta` lands the frame with its bottom at `term_h`; the top
    1/3 guarantee follows from `height ≤ 2/3`. Confirm no case needs a smaller `delta`
    (e.g. preferring to scroll less when the frame would fit higher).
+   - Answer: If the sum of max-heights of individual elements is less than the
+     budget, and the cursor position is at the bottom, then render to that
+     sum, and only scroll to what is used. If the ask is for more than budget,
+     then actual render height of elements will be scaled to fit.
 2. **Input `must` height.** 1 row (caret only) vs. a small context floor (e.g. 3 rows).
    Affects tiny-terminal UX.
+   - Input `must` is one row today. I would keep the min at that value for
+     now, with the `max` scaled to fit actual wrapped contents. So in the
+     typical menu situation with a short input, input min=max=1. The final
+     assignment should balance between flexible elements. Maybe start with an
+     even division of "flex rows" between flexible elements? If more tuning is
+     required, weights could be added later - but keep it simple for now.
 3. **Partial-repaint and the caret.** When only the caret moves (no row changes), is a
    caret-only emit worth a special case, or is it subsumed by the diff (both cheap)?
+   - Up to you - if caret-only diffing is easy enough, then do so. If keeping
+     it bundled with rows makes it simpler, then I think that would be fine
+     too.
