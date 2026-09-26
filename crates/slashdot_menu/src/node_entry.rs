@@ -329,10 +329,9 @@ impl NodeEntry {
                 // memo hits (same key as at drill time), so the pin
                 // alone moves the cursor — restore stays cheap.
                 let matched_word = parsed.path_args.suffix[id_range.clone()].to_string();
-                let restore_to = self.epoch.view_args.clone();
                 self.epoch.should_restore_view_args = false;
                 let restore_args = parse_section(
-                    PathArgs::new(parsed.path_args.ids.clone(), restore_to.clone()),
+                    PathArgs::new(parsed.path_args.ids.clone(), self.epoch.view_args.clone()),
                     &self.content.row_index,
                 );
                 let rows = self.ensure_rows(&restore_args.path_args);
@@ -496,7 +495,7 @@ impl NodeEntry {
         let pa = &parsed.path_args;
         // View args = everything before the matched tail (or entire
         // section when unmatched — `tail.start` is then the suffix end).
-        let view_args_clean = pa.suffix[..parsed.tail.start].trim_end().to_string();
+        let view_args_clean = pa.suffix[..parsed.tail.start].to_string();
 
         // Completion first: while the dialog is up it owns the passive
         // render, cursor moves, and Tab (exclusive view); Enter/Esc/
