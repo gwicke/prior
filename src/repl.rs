@@ -643,6 +643,17 @@ impl Repl {
                 .unwrap_or(24),
         );
 
+        // Width as of the last redraw, for the same purpose. A width change
+        // re-wraps the input (so its visual cursor offset moves) and, on a
+        // reflowing terminal (wezterm), the block's row. Resizes no longer
+        // repaint on their own (see the wait below): this flag makes the
+        // *next keystroke's* repaint re-anchor for both dimensions first.
+        let prev_term_w = Cell::new(
+            crossterm::terminal::size()
+                .map(|(w, _)| w.max(1) as usize)
+                .unwrap_or(80),
+        );
+
         // Render the input line at `input_row` and the live overlay directly
         // *below* it. We clear the input + overlay rows (bounded at the previous
         // screen bottom on a grow, so a maximize's revealed scrollback survives)
@@ -748,17 +759,35 @@ impl Repl {
             }
             // Re-anchor `input_row` to the real cursor *before* we redraw, so no
             // redraw ever runs with a stale `input_row` against a changed size.
-            // `crossterm::terminal::size()` reports the new size the instant the
-            // kernel resizes — typically *before* the `Resize` event is consumed
-            // below — so a redraw driven off that event would otherwise clear
-            // from the stale row down to the new bottom and wipe the scrollback a
-            // maximize just revealed. `prev_term_h` stays one step behind (it is
-            // advanced only after the redraw), so `redraw` uses it as the clear
-            // boundary and the revealed rows survive.
+            // Resize events are consumed without repainting (see the wait
+            // below), so after a drag this check first fires on the keystroke
+            // that triggers the repaint: `prev_term_*` only advances *after*
+            // the redraw, making the size mismatch the "repaint is due, and
+            // re-anchor first" signal. `redraw` also uses `prev_term_h` as the
+            // clear boundary, so scrollback a maximize revealed survives.
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
-            if cur_h != prev_term_h.get() {
+            if cur_h != prev_term_h.get() || cur_w != prev_term_w.get() {
+                // Key-triggered repaint after a size change. A *width*
+                // change makes a reflowing terminal (wezterm) re-wrap the
+                // painted frame, stacking wrapped copies of the input and
+                // overlay that no clear can locate precisely. Instead:
+                // wipe everything from the cursor down (the reflow leaves
+                // it at the end of the content — the best possible
+                // starting point), replay the last turn through the normal
+                // scrollback (pushing any corruption above the fold), then
+                // re-anchor; the usual redraw below repaints the input.
+                // Skipped without a session — nothing to replay and usually
+                // nothing to clear up. Height-only changes don't re-wrap,
+                // so they keep the cheap re-anchor path.
+                if cur_w != prev_term_w.get() {
+                    if let Some(s) = app_state.session() {
+                        let _ = io::stdout().write_all(b"\x1b[0J");
+                        let _ = io::stdout().flush();
+                        crate::agent::replay_last_turn_silent(&s, output).await;
+                    }
+                }
                 input_row = output.cursor_row();
             }
             // Keep the shared width in sync (covers width changes even without
@@ -807,6 +836,7 @@ impl Repl {
                         Repl::emit_commit(
                             output, &mut editor, &redraw, sel,
                             &mut input_row, &committed, "", false,
+                            history,
                         );
                         if let Some(text) = msg {
                             output.display_text(&text);
@@ -823,6 +853,7 @@ impl Repl {
                         Repl::emit_commit(
                             output, &mut editor, &redraw, sel,
                             &mut input_row, &committed, "", false,
+                            history,
                         );
                         output.display_text(&err);
                         return Some(InputAction::MenuDone);
@@ -900,28 +931,50 @@ impl Repl {
             };
             redraw(&editor, &overlay_vec, focus, &mut input_row);
             prev_term_h.set(cur_h as usize);
+            prev_term_w.set(cur_w);
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
             // the dialog can open (or the debounce fire) without a
             // keystroke; otherwise block as before. Slash frames block —
-            // prose state is not consulted while `/` owns the buffer. ---
+            // prose state is not consulted while `/` owns the buffer.
+            //
+            // Resize events are consumed *here, without repainting*. A drag
+            // emits a stream of them, and repainting per event writes
+            // absolute-positioned frames while a reflowing terminal is still
+            // moving rows around (wezterm) — interleaving that strands stale
+            // frames; xterm doesn't reflow, which is why it never corrupted.
+            // The painted frame is left for the terminal to reflow on its own;
+            // the next keystroke re-anchors via DSR at the top of the loop and
+            // repaints once, against the settled size. ---
             let prose_wait = if editor.chars().first() == Some(&'/') {
                 None
             } else {
                 prose.poll_timeout()
             };
-            let ev = match prose_wait {
-                Some(d) => match event::poll(d) {
-                    Ok(true) => event::read(),
-                    Ok(false) => continue, // wake: re-eval (drain / arm)
+            let ev: Option<Event> = loop {
+                let e = match prose_wait {
+                    Some(d) => match event::poll(d) {
+                        Ok(true) => event::read(),
+                        Ok(false) => break None, // prose wake: re-eval
+                        Err(_) => return None,
+                    },
+                    None => event::read(),
+                };
+                match e {
+                    Ok(Event::Resize(w, _)) => {
+                        // Track the width for renderers; the repaint is
+                        // deferred to the next key / content wake.
+                        TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
+                        continue;
+                    }
+                    Ok(e) => break Some(e),
                     Err(_) => return None,
-                },
-                None => event::read(),
+                }
             };
             // --- Dispatch one key. ---
             match ev {
-                Ok(Event::Key(key)) => {
+                Some(Event::Key(key)) => {
                     // Ctrl-C: restore terminal, hard exit.
                     if let KeyCode::Char('c') = key.code {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1107,27 +1160,11 @@ impl Repl {
                         return Some(a);
                     }
                 }
-                Ok(Event::Paste(text)) => {
+                Some(Event::Paste(text)) => {
                     editor.insert_str(&text);
                 }
-                Ok(Event::Resize(w, _h)) => {
-                    // Update the shared terminal width so renderers pick up
-                    // the change. This covers both the REPL input phase and
-                    // any output rendering happening outside the in-flight reader.
-                    TERMINAL_WIDTH.store(w as usize, Ordering::SeqCst);
-                    // Belt-and-suspenders re-anchor: the terminal changed size,
-                    // so `input_row` may now sit above the real input line. The
-                    // primary re-anchor already happens *before* the redraw at
-                    // the top of the loop (so a redraw never runs with a stale
-                    // `input_row` against the new size), but a `Resize` that
-                    // arrives after the top-of-loop check still benefits from a
-                    // DSR-driven refresh here. `redraw` clears only down to the
-                    // previous screen bottom (`prev_term_h`), so the scrollback
-                    // a maximized window just revealed is never clobbered.
-                    input_row = output.cursor_row();
-                }
-                Ok(_) => {} // other events (mouse): ignored
-                Err(_) => return None,
+                Some(_) => {} // other events (mouse): ignored
+                None => {}    // prose wake with no key: re-eval below
             }
         }
     }
@@ -1563,7 +1600,13 @@ impl Repl {
         line: &str,
         next_input: &str,
         sep: bool,
+        history: &mut History,
     ) {
+        // v2.5 menu commits (`/replay 1`, `/thinking low`, …) return
+        // `MenuDone` and never pass through the `Submit` arm in agent.rs
+        // where typed input is recorded — record the committed line here
+        // so recall (Up/Down) sees every command the user actually ran.
+        history.add(line);
         // Re-anchor to the real cursor BEFORE drawing: an external editor
         // ($EDITOR via `review_compaction_summary`, which runs mid-eval for
         // menu-driven compaction) may have repainted the screen since the
