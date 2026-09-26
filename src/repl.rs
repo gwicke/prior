@@ -627,80 +627,22 @@ impl Repl {
                 // the real cursor before the redraw, so this is safe on both the
                 // top- and bottom-anchored reflow models.
                 let clear_to = prev_term_h.get().min(term_h);
-                let row = (*current_row).max(1).min(term_h);
                 let layout = editor.layout(w, prompt);
-                let er = layout.row_count.max(1);
-                // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
-                // the terminal height (≥ 1 line); the terminal scrolls on overflow.
-                let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                let n = overlay.len().min(max_pop);
-                // Window the (possibly long) overlay around the selection.
-                let win = Self::overlay_window(overlay.len(), n, sel);
-                let mut s = String::new();
-                // Position at the input block's top row, then clear the rows the
-                // input + overlay will occupy — bounded at `clear_to` (the previous
-                // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
-                // bottom and wipe the scrollback a maximized window just revealed.
-                s.push_str(&format!("\x1b[{};1H", row));
-                s.push_str(&Self::clear_rows_to(row, clear_to));
-                s.push_str(&format!("\x1b[{};1H", row));
-                s.push_str(&render_content(&layout, prompt));
-                s.push_str(&cursor_positioning(&layout, prompt));
-                if n > 0 {
-                    // Move *below* the input block using a relative down-move. An absolute
-                    // address would be out of range when the input sits on the bottom
-                    // row (and get silently ignored, overwriting the input); a relative
-                    // move scrolls the screen instead, which is the desired behavior.
-                    // `below` is the number of rows from the (caret) cursor row to just
-                    // past the last input row.
-                    let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
-                    let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(w));
-                    // Step below the input block with line feeds rather than a
-                    // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
-                    // the cursor to the bottom margin and never scrolls, so when the
-                    // input sits on the bottom row the divider was emitted on the
-                    // input's own row, overwriting it (see bug report: two stacked
-                    // dividers, no input line). A bare `\n` is translated to `\r\n`
-                    // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
-                    // returns to column 0 and *scrolls* when the cursor is on the
-                    // bottom row — exactly the move we need. Emitting `below` of
-                    // them lands just past the last input row and makes the real
-                    // scroll count match `next_input_row`'s `er + n` assumption.
-                    for _ in 0..below {
-                        s.push('\n');
-                    }
-                    s.push('\r');
-                    s.push_str(&divider);
-                    s.push('\n');
-                    for i in 0..n {
-                        s.push_str(overlay[win + i]);
-                        if i + 1 < n {
-                            s.push('\n');
-                        }
-                    }
-                    // Reposition the cursor back on the input line after drawing
-                    // the overlay below it.  The cursor was placed at
-                    // `(row + cursor_row, cursor_col)` by `cursor_positioning`
-                    // above; the overlay moved it down as it drew.  Rather than
-                    // a relative move that breaks when the terminal scrolls,
-                    // compute the *visual* row after the scroll and use an
-                    // absolute position.
-                    //
-                    // The cursor after the overlay is at viewport row
-                    // `row + er + n` (er = total input rows, n = overlay count).
-                    // Anything past `term_h` causes the terminal to scroll,
-                    // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
-                    let delta = (row + er + n).saturating_sub(term_h);
-                    let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
-                    s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
-                }
+                // Pure builder shared with the vt100 tests (ui_draw_v2 P0): the
+                // bytes written below are exactly what the tests pin.
+                let (s, next_row) = Self::build_redraw(
+                    &layout,
+                    prompt,
+                    overlay,
+                    sel,
+                    *current_row,
+                    clear_to,
+                    w,
+                    term_h,
+                );
                 let _ = io::stdout().write_all(s.as_bytes());
                 let _ = io::stdout().flush();
-                // Follow the terminal's native scroll: if this write pushed the input
-                // up, remember the new visible row so the next redraw clears/writes
-                // at the correct place (prevents the duplication seen when a tall
-                // pop-up shrinks but the screen has not scrolled back down).
-                *current_row = Self::next_input_row(row, term_h, er, n);
+                *current_row = next_row;
             };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
@@ -1216,6 +1158,105 @@ impl Repl {
         }
         s
     }
+    /// Build the complete byte sequence for one input-region redraw: anchor
+    /// position, bounded clear (via [`Self::clear_rows_to`]), input content
+    /// ([`render_content`]), caret ([`cursor_positioning`]), the optional
+    /// overlay below the input (windowed via [`Self::overlay_window`]), and the
+    /// caret's absolute reposition after any scroll. Returns the escape bytes
+    /// and the next tracked input row ([`Self::next_input_row`]).
+    ///
+    /// Pure — no terminal access — so production (`read_input`'s `redraw`
+    /// closure) and the vt100 tests consume the *same* bytes (ui_draw_v2 P0).
+    /// Newlines are emitted bare: the tty's OPOST/ONLCR maps them to CRLF
+    /// before the terminal sees them. Test harnesses that bypass the tty must
+    /// apply that mapping themselves.
+    fn build_redraw(
+        layout: &Layout,
+        prompt: &str,
+        overlay: &[&str],
+        sel: usize,
+        input_row: usize,
+        clear_to: usize,
+        term_w: usize,
+        term_h: usize,
+    ) -> (String, usize) {
+        let term_h = term_h.max(1);
+        // Clamp the anchor so a stale `input_row` (e.g. after a resize) can
+        // never address outside the screen.
+        let row = input_row.max(1).min(term_h);
+        let er = layout.row_count.max(1);
+        // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
+        // the terminal height (≥ 1 line); the terminal scrolls on overflow.
+        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
+        let n = overlay.len().min(max_pop);
+        // Window the (possibly long) overlay around the selection.
+        let win = Self::overlay_window(overlay.len(), n, sel);
+        let mut s = String::new();
+        // Position at the input block's top row, then clear the rows the
+        // input + overlay will occupy — bounded at `clear_to` (the previous
+        // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
+        // bottom and wipe the scrollback a maximized window just revealed.
+        s.push_str(&format!("\x1b[{};1H", row));
+        s.push_str(&Self::clear_rows_to(row, clear_to));
+        s.push_str(&format!("\x1b[{};1H", row));
+        s.push_str(&render_content(layout, prompt));
+        s.push_str(&cursor_positioning(layout, prompt));
+        if n > 0 {
+            // Move *below* the input block using a relative down-move. An absolute
+            // address would be out of range when the input sits on the bottom
+            // row (and get silently ignored, overwriting the input); a relative
+            // move scrolls the screen instead, which is the desired behavior.
+            // `below` is the number of rows from the (caret) cursor row to just
+            // past the last input row.
+            let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
+            let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_w));
+            // Step below the input block with line feeds rather than a
+            // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
+            // the cursor to the bottom margin and never scrolls, so when the
+            // input sits on the bottom row the divider was emitted on the
+            // input's own row, overwriting it (see bug report: two stacked
+            // dividers, no input line). A bare `\n` is translated to `\r\n`
+            // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
+            // returns to column 0 and *scrolls* when the cursor is on the
+            // bottom row — exactly the move we need. Emitting `below` of
+            // them lands just past the last input row and makes the real
+            // scroll count match `next_input_row`'s `er + n` assumption.
+            for _ in 0..below {
+                s.push('\n');
+            }
+            s.push('\r');
+            s.push_str(&divider);
+            s.push('\n');
+            for i in 0..n {
+                s.push_str(overlay[win + i]);
+                if i + 1 < n {
+                    s.push('\n');
+                }
+            }
+            // Reposition the cursor back on the input line after drawing
+            // the overlay below it.  The cursor was placed at
+            // `(row + cursor_row, cursor_col)` by `cursor_positioning`
+            // above; the overlay moved it down as it drew.  Rather than a
+            // relative move that breaks when the terminal scrolls,
+            // compute the *visual* row after the scroll and use an
+            // absolute position.
+            //
+            // The cursor after the overlay is at viewport row
+            // `row + er + n` (er = total input rows, n = overlay count).
+            // Anything past `term_h` causes the terminal to scroll,
+            // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
+            let delta = (row + er + n).saturating_sub(term_h);
+            let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
+            s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
+        }
+        // Follow the terminal's native scroll: if this write pushed the input
+        // up, remember the new visible row so the next redraw clears/writes
+        // at the correct place (prevents the duplication seen when a tall
+        // pop-up shrinks but the screen has not scrolled back down).
+        let next_row = Self::next_input_row(row, term_h, er, n);
+        (s, next_row)
+    }
+
     /// start index into the full overlay. Extracted so it can be unit-tested
     /// without a TTY.
     pub(crate) fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
@@ -3445,85 +3486,40 @@ mod tests {
     // strongest test possible without a real TTY.
     #[cfg(test)]
     mod vt100_tests {
-        use crate::repl::LineEditor;
+        use crate::repl::{LineEditor, Repl};
         use vt100::Parser;
 
-        // Build the escape sequence the production `redraw` emits for the
-        // input region, minus the clear-down (which uses `\x1b[1E` that the
-        // vt100 parser doesn't implement).  The core positioning is:
-        //
-        // 1. `\x1b[{input_row};1H` — jump to input top row
-        // 2. `render_content(prompt)` — write prompt + rows with `\n` separators
-        // 3. `cursor_positioning(prompt)` — fine-tune cursor to the right cell
-        fn build_render(
-            editor: &LineEditor,
-            width: usize,
-            prompt: &str,
-            term_rows: usize,
-            input_row: usize,
-        ) -> Vec<u8> {
-            let row = input_row.max(1).min(term_rows);
-            let layout = editor.layout(width, prompt);
-            let mut s = String::new();
-            let pcols = prompt.chars().count();
-            let rc = layout.row_count.max(1);
-
-            // 1. Position at input top row
-            s.push_str(&format!("\x1b[{};1H", row));
-
-            // 2. Render content (use \r\n because the real terminal has
-            // OPOST/ONLCR which converts bare \n to \r\n)
-            for r in 0..rc {
-                if r > 0 {
-                    s.push_str("\r\n");
-                }
-                if r == 0 {
-                    s.push_str(prompt);
-                }
-                if r < layout.rows.len() {
-                    s.push_str(&layout.rows[r]);
-                }
-            }
-
-            // 3. cursor_positioning (same logic as the real function)
-            let last_row_len = if rc == 1 {
-                layout.rows.first().map(|x| x.chars().count()).unwrap_or(0)
-            } else {
-                layout.rows.last().map(|x| x.chars().count()).unwrap_or(0)
-            };
-            let move_up = (rc - 1).saturating_sub(layout.cursor_row);
-            if move_up > 0 {
-                s.push_str(&format!("\x1b[{}A", move_up));
-                s.push('\r');
-                if layout.cursor_col > 0 {
-                    s.push_str(&format!("\x1b[{}C", layout.cursor_col));
-                }
-            } else {
-                let effective_end_col = if rc == 1 {
-                    pcols + last_row_len
-                } else {
-                    last_row_len
-                };
-                let d = effective_end_col.saturating_sub(layout.cursor_col);
-                if d > 0 {
-                    s.push_str(&format!("\x1b[{}D", d));
-                }
-            }
-
-            s.into_bytes()
+        /// Simulate the tty's OPOST/ONLCR: the production builder emits bare
+        /// `\n` (the real terminal's line discipline maps it to `\r\n` before
+        /// the emulator sees it). This harness feeds bytes straight to the
+        /// vt100 parser, so apply the same mapping here — and *only* here:
+        /// nothing else in this module may re-encode newlines.
+        fn onlcr(s: &str) -> Vec<u8> {
+            s.replace('\n', "\r\n").into_bytes()
         }
 
-        fn render_through_vt100(
+        /// Render one full redraw — input *plus* an optional overlay — through
+        /// the production builder ([`Repl::build_redraw`], ONLCR-translated by
+        /// [`onlcr`]) into the emulator. `clear_to == term_rows` models the
+        /// steady state (no resize); the clear-down *is* included — vt100 0.16
+        /// implements CNL, so the old "minus the clear-down" copy is obsolete.
+        /// Returns (cursor row, cursor col, screen rows, next_input_row).
+        fn render_overlay_through_vt100(
             editor: &LineEditor,
             width: usize,
             prompt: &str,
             term_rows: usize,
             term_cols: usize,
             input_row: usize,
-        ) -> (usize, usize, Vec<String>) {
-            let bytes = build_render(editor, width, prompt, term_rows, input_row);
+            overlay: &[&str],
+            sel: usize,
+        ) -> (usize, usize, Vec<String>, usize) {
+            let layout = editor.layout(width, prompt);
+            let (s, next_row) = Repl::build_redraw(
+                &layout, prompt, overlay, sel, input_row, term_rows, width, term_rows,
+            );
             let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
-            p.process(&bytes);
+            p.process(&onlcr(&s));
             let screen = p.screen();
             let (cr, cc) = screen.cursor_position();
             let rows: Vec<String> = (0..term_rows)
@@ -3543,7 +3539,30 @@ mod tests {
                     s.trim_end().to_string()
                 })
                 .collect();
-            (cr as usize, cc as usize, rows)
+            (cr as usize, cc as usize, rows, next_row)
+        }
+
+        /// Input-only variant (no overlay): the pre-existing entry point the
+        /// cursor-positioning tests use.
+        fn render_through_vt100(
+            editor: &LineEditor,
+            width: usize,
+            prompt: &str,
+            term_rows: usize,
+            term_cols: usize,
+            input_row: usize,
+        ) -> (usize, usize, Vec<String>) {
+            let (cr, cc, rows, _) = render_overlay_through_vt100(
+                editor,
+                width,
+                prompt,
+                term_rows,
+                term_cols,
+                input_row,
+                &[],
+                0,
+            );
+            (cr, cc, rows)
         }
 
         #[test]
@@ -3697,6 +3716,98 @@ mod tests {
                 "cursor at start without prompt should be row 4 col 0"
             );
             assert!(rows[4].starts_with("Hello"), "row 4: {:?}", rows[4]);
+        }
+
+        // ---- overlay path (input + pop-up + scroll-delta caret) ----
+
+        #[test]
+        fn vt100_overlay_fits_no_scroll() {
+            // Input at row 10 of 24, 3-row overlay: everything fits, no scroll.
+            // The overlay must appear directly below the input, the caret must
+            // return to the input, and next_input_row must not move.
+            let mut e = LineEditor::new();
+            e.insert_str("hi");
+            let overlay = ["one", "two", "three"];
+            let (cr, cc, rows, next_row) =
+                render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
+            assert!(rows[9].starts_with("> hi"), "input row: {:?}", rows[9]);
+            assert!(
+                rows[10].chars().all(|c| c == '─'),
+                "divider: {:?}",
+                rows[10]
+            );
+            assert_eq!(rows[11], "one", "ov0: {:?}", rows[11]);
+            assert_eq!(rows[12], "two");
+            assert_eq!(rows[13], "three");
+            // Caret back on the input line, at prompt(2) + "hi"(2) = col 4.
+            assert_eq!((cr, cc), (9, 4), "caret should be on the input row");
+            // No overflow: input row unchanged.
+            assert_eq!(next_row, 10);
+        }
+
+        #[test]
+        fn vt100_overlay_overflow_scrolls_and_tracks_input() {
+            // Input at row 20 of a 24-row terminal with a 6-row overlay:
+            // 20 + 1 (input) + 1 (divider) + 6 (overlay) = 28 > 24, so the
+            // terminal scrolls by 4. The emulator's *actual* input row must
+            // match what `next_input_row` reports, and the caret (repositioned
+            // by the visual_row delta math) must land on the input row — this
+            // is exactly the bug class the old hand-rolled test copy could
+            // not catch.
+            let mut e = LineEditor::new();
+            e.insert_str("hi");
+            let overlay = ["one", "two", "three", "four", "five", "six"];
+            let (cr, cc, rows, next_row) =
+                render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
+            // delta = (20 + 1 + 6) - 24 = 3 → input lands at row 17 (1-indexed).
+            assert_eq!(next_row, 17, "next_input_row must report the scrolled row");
+            // Find the input row in the emulator's screen: it must be at
+            // next_row (1-indexed) = index 16 (0-indexed).
+            assert!(
+                rows[16].starts_with("> hi"),
+                "input must be at the reported row: {:?}",
+                rows
+            );
+            assert!(rows[17].chars().all(|c| c == '─'), "divider below input");
+            assert_eq!(rows[18], "one");
+            assert_eq!(rows[23], "six", "last overlay row at screen bottom");
+            // Caret tracks the input: row 16 (0-indexed), col 4.
+            assert_eq!(
+                (cr, cc),
+                (16, 4),
+                "caret must be repositioned to the scrolled input row"
+            );
+        }
+
+        #[test]
+        fn vt100_overlay_clamped_to_two_thirds_budget() {
+            // Pop-up may use at most ⌈2/3·term_h⌉ = 16 rows of a 24-row
+            // terminal. A 100-row overlay must be windowed to exactly those
+            // 16 rows, centered on the selection — and the write (input row 8
+            // + input + divider + 16 overlay rows = row 25) overflows by one,
+            // so the terminal scrolls once; every expectation below is the
+            // *post-scroll* position.
+            let e = LineEditor::new();
+            let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
+            let refs: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
+            let (cr, cc, rows, next_row) =
+                render_overlay_through_vt100(&e, 80, "> ", 24, 80, 8, &refs, 50);
+            // max_pop = ceil(24 * 2/3) = 16. Window centers on sel=50:
+            // win = 50 - 8 = 42, so rows 42..58 of the overlay are shown.
+            // delta = (8 + 1 + 16) - 24 = 1 → input lands at 1-idx 7 (0-idx 6).
+            assert_eq!(next_row, 7, "next_input_row must account for the scroll");
+            assert_eq!(rows[6].trim_end(), ">", "empty input: {:?}", rows[6]);
+            assert!(rows[7].chars().all(|c| c == '─'), "divider: {:?}", rows[7]);
+            assert_eq!(rows[8], "item 42", "window start: {:?}", rows[8]);
+            assert_eq!(rows[23], "item 57", "window end: {:?}", rows[23]);
+            // Nothing above the input: the scroll consumed rows at the top.
+            assert!(
+                rows[..6].iter().all(|r| r.is_empty()),
+                "clean top: {:?}",
+                &rows[..6]
+            );
+            // Caret on the (single-row) input: 0-idx row 6, col 2 (prompt end).
+            assert_eq!((cr, cc), (6, 2));
         }
     }
 

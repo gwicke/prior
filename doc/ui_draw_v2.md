@@ -1,6 +1,6 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implementation in progress (P0 next)
+**Status:** Design settled — implementation in progress (P0 ✅, P1 next)
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -232,7 +232,7 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 
 | Phase | Work | Gate |
 |---|---|---|
-| **P0** | Test-safety net: make the vt100 tests consume the real emit path. Extract a pure `build_apply(frame, anchor, opts) -> String` from today's `redraw` so both prod and tests use it. No behavior change. | vt100 tests green against the extracted fn |
+| **P0** ✅ | Test-safety net: make the vt100 tests consume the real emit path. Extracted `Repl::build_redraw(layout, prompt, overlay, sel, row, clear_to, w, h) -> (String, next_row)` from today's `redraw` (takes today's inputs, not a `Frame` — Frame arrives in P1). vt100 harness now feeds production bytes through an ONLCR shim (production emits bare `\n`; the tty maps to `\r\n`). Added 3 overlay tests pinning the scroll-delta caret math. | ✅ 674 tests green |
 | **P1** | Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`, `window` (input windowing). Pure; lives in a new `src/ui/frame.rs` (or `ui/` dir). Unit tests: allocation distribution, windowing, extents/caret. | Pure tests, no REPL wiring |
 | **P2** | Cache + apply in `ConsoleOutput`: `DrawCache`, full apply (scroll-then-paint), clear-remainder, partial apply, invalidation contract. Route `note_lines`/`display_*` through cache maintenance. | vt100 tests over `apply` output |
 | **P3** | REPL wiring: `redraw` → compose/apply; retire `input_row`/`prev_term_h` locals; `emit_commit` on the new path; `$EDITOR` wrapper DSR. | `repl_resize`, `popup_scroll_*`, vt100 suites green |
