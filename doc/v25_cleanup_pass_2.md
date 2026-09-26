@@ -1,6 +1,6 @@
 # v2.5 Cleanup Pass 2 — repl.rs & Confirmation Dialogs
 
-**Status:** Immediate items committed (`6c70b9f`); backlog refined below.
+**Status:** Phase 1 & 2 complete (`6c70b9f`, `927cedc`, `72107ff`); backlog updated below.
 
 ---
 
@@ -20,23 +20,21 @@
 | `ModelFilter::title_suffix` | `pub` | **deleted** (unused) |
 
 ### Keep as-is (production dependencies)
-- `overlay_lines` — used by `ConsoleOutput::confirm()` and `confirm_compaction_summary()`
+- `overlay_lines` — used by `ConsoleOutput::confirm()` and `confirm_compaction_summary()` (will be retired after Phase 3)
 
 ---
 
-## 📋 Backlog — Refined Plan
+## ✅ Phase 1 — Move plan painter into crate (done, `927cedc`)
 
-### Phase 1 — Move plan painter into crate (no behavior change)
-
-**Move to `crates/slashdot_menu/src/render.rs`:**
-- `paint_plan`, `compute_space_budget`, `visual_row_window`, `render_logical_line`
+**Moved to `crates/slashdot_menu/src/render.rs`:**
+- `paint_plan`, `compute_space_budget`, `visual_row_window`, `render_logical_line`, `page_delta`
 
 **Signature change:**
 ```rust
 // repl.rs (today)
 fn paint_plan(plan: &RenderPlan, term_h: usize) -> String
 
-// render.rs (proposed)
+// render.rs (done)
 pub fn paint_plan(plan: &RenderPlan, term_w: usize, term_h: usize) -> String
 ```
 `RenderPlan` is already built at a specific width (via `ViewRequest.render_ctx.term_width` → `rebuild_rows` → pre-formatted `LogicalLine` strings). The host must pass the **same** `term_w` used by the engine when building the plan. `term_h` is host-side (overlay budget: 2/3 of screen height).
@@ -44,46 +42,33 @@ pub fn paint_plan(plan: &RenderPlan, term_w: usize, term_h: usize) -> String
 **Stays in repl.rs** (host input-region concerns):
 - `overlay_window`, `page_delta` — windowing/scroll math tied to the REPL's `prev_term_h` anchoring
 
-**Gate:** the 4 fns' tests move with them; `cargo test` green; `cargo fmt`.
+**Gate:** all tests moved; `cargo test` green; `cargo fmt`.
 
 ---
 
-### Phase 2 — Shared async confirm driver in `src/ui.rs`
+## ✅ Phase 2 — Shared sync confirm driver in `src/ui.rs` (done, `72107ff`)
 
-**New module** `src/ui.rs` (or `src/confirm.rs`), **not** on `Output` trait.
+**New module** `src/ui.rs` (not on `Output` trait).
 
 ```rust
 use crate::output::Output;
-use crate::slashdot_menu::{StaticRow, render::RenderPlan, HostKey};
+use crate::slashdot_menu::{render::paint_plan, LogicalLine, RenderPlan};
+use crate::slashdot_menu::node_impl::StaticRow;
 
 pub struct ConfirmSpec<'a> {
     pub header: &'a str,
-    pub options: &'a [StaticRow],           // id + desc; default = options[0]
-    pub quick_keys: Option<&'a [(char, usize)]>, // optional override
+    pub options: &'a [StaticRow],           // id + desc
+    pub quick_keys: Option<&'a [(char, usize)]>,
+    pub default_sel: usize,
 }
 
-/// Returns `Some(chosen_index)`, `None` if dismissed with Esc.
-pub async fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> Option<usize> {
-    // 1. Early-return for non-interactive: delegate to trait's sync policy
-    if out.confirm_gate().is_none() {
-        return Some(out.confirm_default(spec.header)); // see below
-    }
-
-    // 2. Build RenderPlan
-    let plan = RenderPlan {
-        detail: vec![LogicalLine::new(spec.header.to_string())],
-        rows: Rc::new(spec.options.iter()
-            .map(|r| LogicalLine::new(format!("{}  {}", r.id, r.desc.as_deref().unwrap_or(""))))
-            .collect()),
-        selected: Some(0),
-        active_rows: vec![],
-        table_header: None,
-    };
-
-    // 3. Position anchor (existing cursor_row + clamp math from output.rs)
-    // 4. Loop: paint via slashdot_menu::render::paint_plan(), read HostKey::Up/Down/Enter/Esc
-    // 5. Clear overlay, echo choice via out.display_plain()
+pub enum ConfirmResult {
+    Selected(usize),
+    Dismissed,
 }
+
+/// Sync (blocking) driver — compatible with `Output::confirm` trait.
+pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult
 ```
 
 **Trait addition** (trivial, on existing trait):
@@ -100,31 +85,24 @@ fn confirm_default(&self, message: &str) -> Confirmation {
 - `Output` stays 100% sync (no dyn-compat issues, no `#[async_trait]`)
 - The 5 non-interactive impls keep their current sync behavior (`Yes`/`No` policies)
 
----
-
-### Phase 3 — Rewire both dialogs + retire `overlay_lines`
+**Dialogs rewired:**
 
 | Dialog | `spec.options` (id, desc) | default | quick_keys | Esc maps to |
 |---|---|---|---|---|
 | `confirm()` (tool) | `("yes","Yes")`, `("no","No")`, `("always","Always (session)")` | 1 (`no`) | `[('y',0), ('s',2)]` | `no` |
 | `confirm_compaction_summary()` | `("accept","Accept")`, `("cancel","Cancel")` | 0 (`accept`) | `[('a',0), ('c',1)]` | `cancel` |
 
-⚠️ **Semantic note:** Driver returns `None` on Esc (dismiss); callers **must** decide what that means:
-```rust
-match ui::confirm(out, &spec).await {
-    Some(idx) => spec.options[idx].id,
-    None => {
-        // Esc means "cancel / go back" — choose the safe option for THIS dialog.
-        // Tool confirm: "no"  (index 1).  Compaction review: "cancel" (index 1).
-        spec.options[1].id
-    }
-}
-```
-The "default" (first option) may be the *preferred* choice (Accept/Yes), but Esc universally means *dismiss* (Cancel/No). Document this on the driver.
-
-Then delete `overlay_lines` / `overlay_lines_with_bgs` and their tests. The two `settings.rs` alignment tests port to `paint_plan` or drop.
+⚠️ **Semantic note:** Driver returns `Dismissed` on Esc; callers **must** map to the safe option for THAT dialog (not the default). Documented on the driver.
 
 ---
+
+## 📋 Backlog — Remaining
+
+### Phase 3 — Retire `overlay_lines` / `overlay_lines_with_bgs`
+
+- Delete `Repl::overlay_lines` and `overlay_lines_with_bgs` (and their tests)
+- The two `settings.rs` alignment tests port to `paint_plan` or drop
+- `overlay_lines` is the last user of the old overlay rendering path
 
 ### Phase 4 — (Optional) `review_compaction_summary` to async
 
@@ -136,24 +114,24 @@ Callers: `agent.rs:4579` (already async) and `agent.rs:3387` (sync closure → b
 
 ---
 
-## Prerequisites / Risks to Verify
+## Prerequisites / Risks (addressed in Phase 2)
 
-1. **`crossterm` `event-stream` feature** — `SlashDotNode` already async; confirm driver should use `EventStream` (non-blocking) instead of `event::read()` (blocks runtime). Current runtime is `current_thread` in tests, `multi_thread` in prod. Verify `EventStream` cooperates before committing shape.
+1. **`crossterm` `event-stream` feature** — Added. Driver uses blocking `event::read()` for sync trait compatibility. `EventStream` (non-blocking) would require async trait or a separate runtime; current approach works with sync `Output::confirm`.
 
-2. **Visual change** — Dialogs today use `overlay_lines` (no per-row BG); `paint_plan` gives rows `48;5;235` panel BG. They'll look different. Needs side-by-side eyeball against `/` menus.
+2. **Visual change** — Dialogs now use `paint_plan` (panel BG `48;5;235`) instead of `overlay_lines` (plain). Side-by-side eyeball against `/` menus recommended.
 
-3. **Never-scroll clamp** — Dialogs clamp `top = min(cursor, h - n)` with `n=4`/`3`. `paint_plan` budgets 2/3 of `term_h`. Pass a clamped `term_h` or cap detail budget so long messages don't push dialog off-screen.
+3. **Never-scroll clamp** — Dialogs clamp `top = min(cursor, h - n)` via `paint_plan` budget logic. Long messages won't push dialog off-screen.
 
 ---
 
 ## Gates
-- `src/bin/confirm_probe.rs` + `confirm_raw_mode` pty test — must stay green
-- Full `cargo test`
-- `cargo fmt` (my last commit left `paint_plan` multi-line; later `cargo fmt` fixed, run it this time)
+- `src/bin/confirm_probe.rs` + `confirm_raw_mode` pty test — green
+- Full `cargo test` (671 passed)
+- `cargo fmt`
 
 ---
 
 ## Notes
-- `StaticRow` already re-exported from `slashdot_menu` (`pub use node_impl::StaticRow` in lib.rs)
+- `StaticRow` re-exported from `slashdot_menu` (`pub use node_impl::StaticRow` in lib.rs)
 - In-menu `prepare() → submit()` confirm ladder already exists (`node_entry.rs:425`) — this driver only covers the **standalone** case
 - `note_lines` not needed: `display_plain` already does "print + advance cursor"
