@@ -222,8 +222,8 @@ pub(crate) fn render(elements: &[Element], heights: &[usize], term_w: usize) -> 
                     let start = window(n, layout.cursor_row, h, INPUT_CONTEXT_ROWS);
                     let count = h.min(n.saturating_sub(start));
                     for r in start..start + count {
-                        // Mirror `render_content`: the prompt renders on row
-                        // 0; later rows are content-only.
+                        // The prompt renders on row 0; later rows are
+                        // content-only.
                         let body = if r == 0 { prompt } else { "" };
                         let text = layout.rows.get(r).map(String::as_str).unwrap_or("");
                         let mut content = String::with_capacity(body.len() + text.len() + 3);
@@ -1093,5 +1093,50 @@ mod apply_tests {
         let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
         assert_eq!(cache.reanchor(3), 3);
         assert_eq!(cache.anchor(), 3);
+    }
+
+    /// Ports the old `Repl::next_input_row` cases (folded into the apply
+    /// phase by ui_draw_v2 P3): a frame that overflows the bottom scrolls
+    /// itself into view and the cache tracks the scrolled top; the next,
+    /// shorter frame anchors at that top and the screen never scrolls back
+    /// down on its own.
+    #[test]
+    fn frame_tracks_scroll_then_stays_on_shrink() {
+        let mut cache = DrawCache::new(40);
+        let tall = lines_frame(&["a", "b", "c", "d"], 20);
+        // anchor 38 + 4 rows - 1 = 41 > 40 → delta 1, top 37.
+        let s1 = plan_apply(&mut cache, &tall, 38, ApplyPolicy::Frame, 20, 40);
+        assert_eq!(cache.anchor(), 37, "scroll must be tracked");
+        // The next redraw anchors where the live frame is (the REPL's
+        // `frame_anchor()`): no scroll, same top — a shrinking frame leaves
+        // the region where the tallest one put it.
+        let short = lines_frame(&["a"], 20);
+        let anchor = cache.anchor();
+        let s = plan_apply(&mut cache, &short, anchor, ApplyPolicy::Frame, 20, 40);
+        assert_eq!(cache.anchor(), 37, "shrink must not scroll back down");
+        let p = run(40, 20, &[&s1, &s]);
+        let rows = screen(&p, 40, 20);
+        assert_eq!(rows[36], "a");
+        assert_eq!(rows[37], "", "shrunken rows cleared in place");
+    }
+
+    /// Ports the old `Repl::clear_rows_to(40, 24) == ""` case: with the
+    /// frame anchored below the previous screen bottom (bottom-anchored
+    /// grow), the clear floor sits above the frame — nothing is cleared, so
+    /// the scrollback a grow revealed stays intact.
+    #[test]
+    fn full_clears_nothing_when_frame_sits_below_the_old_bottom() {
+        let mut cache = DrawCache::new(24); // screen_bottom = 24
+        let f = lines_frame(&["here"], 20);
+        let s = plan_apply(&mut cache, &f, 40, ApplyPolicy::Frame, 20, 40);
+        // floor = min(40, 24) = 24 < frame top: only the frame row's own
+        // trailing `EL` is emitted — no clear addresses any other row.
+        assert_eq!(
+            s.matches("\x1b[K").count(),
+            1,
+            "only the painted row erases itself: {s:?}"
+        );
+        let p = run(40, 20, &[&s]);
+        assert_eq!(screen(&p, 40, 20)[39], "here");
     }
 }

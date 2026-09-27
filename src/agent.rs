@@ -3380,8 +3380,8 @@ pub(crate) async fn compact_inline(
         }
     }
     // Editor review: the term guard + output clone out of the slot; the
-    // closure suspends raw mode around $EDITOR (overlay-agnostic —
-    // `emit_commit` re-anchors the row via DSR afterwards).
+    // closure suspends raw mode around $EDITOR and re-anchors the draw
+    // cache (DSR) on exit itself (plan §4.2).
     let review: Option<CompactionSummaryReview> = app_state.term_guard().map(|g| {
         let out = app_state.with_config(|c| c.output.clone());
         Box::new(move |draft: &str| crate::repl::review_compaction_summary(&g, out.as_ref(), draft))
@@ -4095,13 +4095,15 @@ pub async fn run_interactive(
                 // iteration starts with `None`.
                 let prefill = app_state.take_prefill();
                 let prefill_ref = prefill.as_deref();
+                // `read_input` re-anchors the draw cache itself on entry
+                // (DSR) and tracks its frame through `frame_anchor()`
+                // afterwards (ui_draw_v2 §5.2).
                 r.read_input(
                     &prompt_str,
                     prefill_ref,
                     &mut line_history,
                     &ctx,
                     &app_state,
-                    config.output.cursor_row(),
                     config.output.as_ref(),
                 )
                 .await

@@ -3,19 +3,21 @@
 //! - [`TermGuard`] owns terminal raw-mode lifecycle + capability negotiation
 //!   (plan §3.5.2) and is safe to call from `Drop`/panic hook/signal handler.
 //! - [`Repl`] is the raw-mode driver. [`Repl::read_input`] is a multi-line
-//!   line editor; [`Repl::select`] is a single-column list picker.
+//!   line editor with the v2.5 slash-menu frame.
 //!
 //! The line editor keeps a single flat `Vec<char>` buffer (with `'\n'` as a
 //! hard line break) plus a char-index cursor. Rendering wraps the buffer to
 //! visual rows via [`layout`] (word-boundary wrap, CJK char-wrap) and positions
-//! the cursor. All editor *logic* is pure and unit-tested; only the final
-//! escape-sequence emission touches the terminal.
+//! the cursor. All editor *logic* is pure and unit-tested; the on-screen frame
+//! is composed and applied by the shared draw pipeline (`crate::ui::frame`,
+//! plan `doc/ui_draw_v2.md`).
 
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
 use crate::model_catalog;
 use crate::output::{term_width, wrap, Output};
 use crate::session::SessionTreeNode;
+use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -509,15 +511,15 @@ impl Repl {
     /// the frame. Prompt-line Tab completion uses its own `PathComplete`
     /// overlay.
     ///
-    /// The input line sits at `initial_row` — the natural cursor row tracked
-    /// by the console `Output` — and is *not* forced to the screen
-    /// bottom, so closing an overlay never leaves a gap in the scrollback.
-    /// Overlays are drawn by **overwriting the rows just below the input line**
-    /// (each cleared with `CSI K`); they never scroll, so once a dialog is
-    /// dismissed there are no picker traces in the scrollback. All clearing is
-    /// confined to the input row and below, so the greeter / status / divider /
-    /// session content above the input is never touched (plan §3.7). The pop-up
-    /// uses at most 2/3 of the terminal height (≥ 1 line).
+    /// The input line sits at the natural cursor row (re-anchored via DSR on
+    /// entry) and is *not* forced to the screen bottom, so closing an overlay
+    /// never leaves a gap in the scrollback. Drawing goes through the unified
+    /// frame pipeline (plan `doc/ui_draw_v2.md` §5.2): `redraw` composes
+    /// `[Input, Divider?, Overlay?]`, and `Output::draw_frame` anchors
+    /// (`frame_anchor()`), scrolls and clears within the live region — all
+    /// clearing is confined to the frame region and below, so the greeter /
+    /// status / session content above the input is never touched. The whole
+    /// frame uses at most 2/3 of the terminal height (≥ 1 row).
     pub async fn read_input(
         &mut self,
         prompt: &str,
@@ -525,9 +527,13 @@ impl Repl {
         history: &mut History,
         ctx: &ReplCtx,
         app_state: &Arc<AppState>,
-        initial_row: usize,
         output: &dyn Output,
     ) -> Option<InputAction> {
+        // Re-anchor the draw cache to the real cursor (DSR) before the first
+        // paint: content streamed since the last prompt is not tracked row by
+        // row, and the input must start at the natural cursor row (plan §4.2).
+        // From here the REPL anchors through the cache (`frame_anchor()`).
+        let _ = output.cursor_row();
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
         // menu nodes read them live through the same handle — no snapshot
@@ -572,97 +578,62 @@ impl Repl {
         // unconditionally at the top, so a stale key can never outlive
         // one iteration.
         let mut pending_key: Option<crate::slashdot_menu::HostKey> = None;
-        // The input line starts at `initial_row` — the natural cursor row tracked
-        // by the console `Output` — and is *not* forced to the bottom of the
-        // screen, so it never leaves a gap in the session scrollback. `input_row`
-        // is the *current* visible row of the input and is updated every redraw to
-        // follow the terminal's native scroll: when a tall pop-up pushes the input
-        // up, `input_row` decreases and stays there as the pop-up later shrinks
-        // (the terminal never scrolls back down on its own).
-        let mut input_row = initial_row.max(1);
-
-        // Height of the screen as of the last redraw. `redraw` uses it as the
-        // lower bound for its clear, so a *grow* (maximize) that reveals
-        // scrollback below the old bottom does not get erased. It is kept one
-        // step behind the live size: the resize handling at the top of the loop
-        // re-anchors `input_row` via a DSR query *before* redrawing, and only
-        // advances `prev_term_h` to the new size *after* the redraw (see below).
-        // Interior mutability (`Cell`) lets the `redraw` closure read it without
-        // holding a mutable borrow across the loop.
-        let prev_term_h = Cell::new(
+        // Terminal size at the last paint, `(w, h)`. Resizes are consumed
+        // without repainting (see the wait below), so a mismatch at the top of
+        // the loop is the "repaint is due, and re-anchor first" signal (plan
+        // §4.2); a *width* change additionally wipes + replays first. The
+        // clear bound this pair used to provide is `plan_apply`'s
+        // `screen_bottom` now (plan §4.3). Interior mutability (`Cell`) lets
+        // the loop read it without holding a mutable borrow.
+        let painted_size = Cell::new(
             crossterm::terminal::size()
-                .map(|(_, h)| h.max(1) as usize)
-                .unwrap_or(24),
+                .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+                .unwrap_or((80, 24)),
         );
 
-        // Width as of the last redraw, for the same purpose. A width change
-        // re-wraps the input (so its visual cursor offset moves) and, on a
-        // reflowing terminal (wezterm), the block's row. Resizes no longer
-        // repaint on their own (see the wait below): this flag makes the
-        // *next keystroke's* repaint re-anchor for both dimensions first.
-        let prev_term_w = Cell::new(
-            crossterm::terminal::size()
-                .map(|(w, _)| w.max(1) as usize)
-                .unwrap_or(80),
-        );
-
-        // Render the input line at `input_row` and the live overlay directly
-        // *below* it. We clear the input + overlay rows (bounded at the previous
-        // screen bottom on a grow, so a maximize's revealed scrollback survives)
-        // and rewrite input + overlay; content *above* the input (greeter /
-        // status / divider / session) is untouched. When the overlay is taller
-        // than the space left, the terminal scrolls the overflow into its native
-        // scrollback (session preserved); `input_row` is adjusted by the scroll
-        // delta so the next redraw clears/writes at the right place (no
-        // duplication). See plan §3.7.
-        let redraw =
-            |editor: &LineEditor, overlay: &[&str], sel: usize, current_row: &mut usize| {
-                let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-                let w = w as usize;
-                let term_h = h.max(1) as usize;
-                // Lower bound for the clear below: the *previous* screen bottom when
-                // the terminal just grew, so a maximize that reveals scrollback
-                // below the old bottom is not erased. `prev_term_h` is advanced only
-                // after the redraw (see the loop), and `input_row` is re-anchored to
-                // the real cursor before the redraw, so this is safe on both the
-                // top- and bottom-anchored reflow models.
-                let clear_to = prev_term_h.get().min(term_h);
-                let layout = editor.layout(w, prompt);
-                // Pure builder shared with the vt100 tests (ui_draw_v2 P0): the
-                // bytes written below are exactly what the tests pin.
-                let (s, next_row) = Self::build_redraw(
-                    &layout,
-                    prompt,
-                    overlay,
-                    sel,
-                    *current_row,
-                    clear_to,
-                    w,
-                    term_h,
-                );
-                let _ = io::stdout().write_all(s.as_bytes());
-                let _ = io::stdout().flush();
-                *current_row = next_row;
-            };
+        // Compose → allocate → render → apply the input frame (plan §5.2):
+        // `[Input]`, or `[Input, Divider, Overlay]` while a pop-up shows.
+        // The apply phase owns the rest — `frame_anchor()` tracks the live
+        // frame's top (so a tall pop-up's scroll is followed without a row
+        // counter), the scroll `delta` and the bounded clear live in
+        // `plan_apply`. Content *above* the frame (greeter / status / session)
+        // is never touched. The closure carries no state.
+        let redraw = |editor: &LineEditor, overlay: &[&str], focus: usize| {
+            let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+            let frame = Self::compose_frame(
+                editor,
+                prompt,
+                overlay,
+                focus,
+                w.max(1) as usize,
+                h.max(1) as usize,
+            );
+            output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame);
+        };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
             // is not running then), re-enter raw mode so the next keystroke is
             // read correctly. Idempotent; a no-op on every normal iteration.
+            // The shell may have repainted while we were stopped, so re-anchor
+            // the draw cache (DSR) before the next paint (plan §4.2).
             if RESUMED.swap(false, Ordering::SeqCst) {
                 let _ = self.guard.start();
+                let _ = output.cursor_row();
             }
-            // Re-anchor `input_row` to the real cursor *before* we redraw, so no
-            // redraw ever runs with a stale `input_row` against a changed size.
-            // Resize events are consumed without repainting (see the wait
-            // below), so after a drag this check first fires on the keystroke
-            // that triggers the repaint: `prev_term_*` only advances *after*
-            // the redraw, making the size mismatch the "repaint is due, and
-            // re-anchor first" signal. `redraw` also uses `prev_term_h` as the
-            // clear boundary, so scrollback a maximize revealed survives.
+            // Resize detection against `painted_size`. Resize events are
+            // consumed without repainting (see the wait below), so after a drag
+            // this check first fires on the keystroke that triggers the
+            // repaint: a size mismatch means "repaint is due, and re-anchor
+            // first" — reflow may have moved the cursor, so the cached frame
+            // rows can no longer be trusted (plan §4.2). The clear boundary a
+            // stale `prev_term_h` used to provide lives in `plan_apply`
+            // (`screen_bottom`) now, so a grow's revealed scrollback survives
+            // without any state here.
             let (cur_w_u16, cur_h_u16) = crossterm::terminal::size().unwrap_or((80, 24));
             let cur_h = cur_h_u16 as usize;
             let cur_w = cur_w_u16 as usize;
-            if cur_h != prev_term_h.get() || cur_w != prev_term_w.get() {
+            let (painted_w, painted_h) = painted_size.get();
+            if cur_w != painted_w || cur_h != painted_h {
                 // Key-triggered repaint after a size change. A *width*
                 // change makes a reflowing terminal (wezterm) re-wrap the
                 // painted frame, stacking wrapped copies of the input and
@@ -675,20 +646,18 @@ impl Repl {
                 // Skipped without a session — nothing to replay and usually
                 // nothing to clear up. Height-only changes don't re-wrap,
                 // so they keep the cheap re-anchor path.
-                if cur_w != prev_term_w.get() {
+                if cur_w != painted_w {
                     if let Some(s) = app_state.session() {
                         let _ = io::stdout().write_all(b"\x1b[0J");
                         let _ = io::stdout().flush();
                         crate::agent::replay_last_turn_silent(&s, output).await;
                     }
                 }
-                input_row = output.cursor_row();
+                let _ = output.cursor_row();
             }
             // Keep the shared width in sync (covers width changes even without
             // an explicit Resize event, e.g. on some terminals).
             TERMINAL_WIDTH.store(cur_w, Ordering::SeqCst);
-            // Also keep `cur_h` available as `u16` for code below that expects it.
-            let cur_h = cur_h_u16;
             // --- Eval: resolve the pending key (or a passive frame)
             // into an overlay. Single place where an engine prompt is
             // applied to the buffer AND its plan rendered, so a §5.1
@@ -734,7 +703,6 @@ impl Repl {
                             &mut editor,
                             &redraw,
                             sel,
-                            &mut input_row,
                             &committed,
                             "",
                             false,
@@ -757,7 +725,6 @@ impl Repl {
                             &mut editor,
                             &redraw,
                             sel,
-                            &mut input_row,
                             &committed,
                             "",
                             false,
@@ -771,9 +738,15 @@ impl Repl {
                     // area, surface it in the transcript, and drop the
                     // prompt — back to normal operation.
                     V25Frame::DoneError(err, _) => {
-                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                        // Clear the input region through the frame path, then
+                        // surface the error. The exact line `display_text`
+                        // consumed depends on inline-markdown wrapping, so
+                        // re-anchor (DSR) rather than trusting the wrap count
+                        // ("any uncertainty → clear it", plan §4.2): the next
+                        // iteration anchors below the error.
+                        redraw(&LineEditor::new(), &[], sel);
                         output.display_text(&err);
-                        input_row = output.cursor_row();
+                        let _ = output.cursor_row();
                         editor.set("");
                         v25_handle = None;
                         ActiveOverlay::None
@@ -831,7 +804,7 @@ impl Repl {
             let overlay_text = match &overlay {
                 ActiveOverlay::None => String::new(),
                 ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                    crate::slashdot_menu::render::paint_plan(plan, cur_w as usize, cur_h as usize)
+                    crate::slashdot_menu::render::paint_plan(plan, cur_w, cur_h)
                 }
             };
             let overlay_vec: Vec<&str> = overlay_text.lines().collect();
@@ -842,9 +815,8 @@ impl Repl {
                     .map(|o| o.matches('\n').count() + 1)
                     .sum::<usize>()
             };
-            redraw(&editor, &overlay_vec, focus, &mut input_row);
-            prev_term_h.set(cur_h as usize);
-            prev_term_w.set(cur_w);
+            redraw(&editor, &overlay_vec, focus);
+            painted_size.set((cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -929,9 +901,17 @@ impl Repl {
                                 }
                             }
                             let _ = self.guard.start();
-                            input_row = output.cursor_row();
+                            // The editor owned the screen while we were out:
+                            // re-anchor the draw cache (DSR) before the next
+                            // paint (plan §4.2). A *height* change the editor
+                            // caused is folded into `painted_size` here (the
+                            // re-anchor already covered it), while a width
+                            // change is left for the wipe + replay at the
+                            // loop top.
+                            let _ = output.cursor_row();
                             if let Ok((_, h)) = crossterm::terminal::size() {
-                                prev_term_h.set(h.max(1) as usize);
+                                let (w, _) = painted_size.get();
+                                painted_size.set((w, h.max(1) as usize));
                             }
                             continue;
                         }
@@ -1056,7 +1036,7 @@ impl Repl {
                                     prompt,
                                 ) {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                        redraw(&LineEditor::new(), &[], sel);
                                     }
                                     return Some(a);
                                 }
@@ -1087,7 +1067,7 @@ impl Repl {
                                     prompt,
                                 ) {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                                        redraw(&LineEditor::new(), &[], sel);
                                     }
                                     return Some(a);
                                 }
@@ -1102,7 +1082,7 @@ impl Repl {
                         Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                     {
                         if let InputAction::Submit(_) = &a {
-                            redraw(&LineEditor::new(), &[], sel, &mut input_row);
+                            redraw(&LineEditor::new(), &[], sel);
                         }
                         return Some(a);
                     }
@@ -1116,155 +1096,42 @@ impl Repl {
         }
     }
 
-    /// Compute the input row for the *next* redraw after emitting `er` input rows
-    /// plus an `n`-line pop-up, given the current input row and terminal height.
-    /// When the pop-up overflows the bottom, the terminal scrolls up by the
-    /// overflow (`delta`), shifting the input up; it never scrolls back down on
-    /// its own, so a shrinking pop-up leaves the input where the tallest pop-up
-    /// put it. Pure + unit-tested (see `tests`).
-    fn next_input_row(start: usize, term_h: usize, er: usize, n: usize) -> usize {
-        let end_row = if n > 0 {
-            start + er + n
-        } else {
-            start + er - 1
-        };
-        let delta = end_row.saturating_sub(term_h);
-        if delta > 0 {
-            start.saturating_sub(delta).max(1)
-        } else {
-            start
-        }
-    }
-    /// Build the escape sequence that clears from `row` down to `clear_to`
-    /// (inclusive), erasing each line to its end with `\x1b[K`, without
-    /// touching anything above `row` or below `clear_to`. Returns an empty
-    /// string when `clear_to` is above `row` (nothing to clear).
+    /// Compose → allocate → render the REPL's input frame (plan §3, pure):
+    /// `[Input]`, or `[Input, Divider, Overlay]` while `overlay` shows.
     ///
-    /// Used by `read_input`'s redraw so a terminal *grow* (maximize) clears
-    /// only up to the previous screen bottom and never wipes the scrollback a
-    /// maximized window reveals below it — a plain `\x1b[0J` would clear to
-    /// the new bottom and destroy that history. Extracted as a free function
-    /// (no TTY needed) so the boundary logic is unit-testable.
-    fn clear_rows_to(row: usize, clear_to: usize) -> String {
-        if clear_to < row {
-            return String::new();
-        }
-        let mut s = String::new();
-        for i in 0..(clear_to - row + 1) {
-            s.push_str("\x1b[K");
-            if i + 1 < clear_to - row + 1 {
-                s.push_str("\x1b[1E");
-            }
-        }
-        s
-    }
-    /// Build the complete byte sequence for one input-region redraw: anchor
-    /// position, bounded clear (via [`Self::clear_rows_to`]), input content
-    /// ([`render_content`]), caret ([`cursor_positioning`]), the optional
-    /// overlay below the input (windowed via [`Self::overlay_window`]), and the
-    /// caret's absolute reposition after any scroll. Returns the escape bytes
-    /// and the next tracked input row ([`Self::next_input_row`]).
+    /// `focus` is the overlay's windowing index (the pre-computed visual row
+    /// of the selection); `term_w`/`term_h` are the size the frame is composed
+    /// for — the same values `Output::draw_frame` applies it with. The frame
+    /// (input + divider + pop-up together) never exceeds the live-region
+    /// budget of ⌈2/3·term_h⌉; overflow is windowed (`render`) and, if the
+    /// frame does not fit below its anchor, scrolled in by `plan_apply`.
     ///
-    /// Pure — no terminal access — so production (`read_input`'s `redraw`
-    /// closure) and the vt100 tests consume the *same* bytes (ui_draw_v2 P0).
-    /// Newlines are emitted bare: the tty's OPOST/ONLCR maps them to CRLF
-    /// before the terminal sees them. Test harnesses that bypass the tty must
-    /// apply that mapping themselves.
-    fn build_redraw(
-        layout: &Layout,
+    /// Shared by `read_input`'s `redraw` closure and the vt100 tests, so both
+    /// drive the exact bytes production emits (ui_draw_v2 P0/P3).
+    pub(crate) fn compose_frame(
+        editor: &LineEditor,
         prompt: &str,
         overlay: &[&str],
-        sel: usize,
-        input_row: usize,
-        clear_to: usize,
+        focus: usize,
         term_w: usize,
         term_h: usize,
-    ) -> (String, usize) {
-        let term_h = term_h.max(1);
-        // Clamp the anchor so a stale `input_row` (e.g. after a resize) can
-        // never address outside the screen.
-        let row = input_row.max(1).min(term_h);
-        let er = layout.row_count.max(1);
-        // Overlay rows live BELOW the input line. Pop-up uses at most 2/3 of
-        // the terminal height (≥ 1 line); the terminal scrolls on overflow.
-        let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-        let n = overlay.len().min(max_pop);
-        // Window the (possibly long) overlay around the selection.
-        let win = Self::overlay_window(overlay.len(), n, sel);
-        let mut s = String::new();
-        // Position at the input block's top row, then clear the rows the
-        // input + overlay will occupy — bounded at `clear_to` (the previous
-        // screen bottom on a grow). A plain `\x1b[0J` would clear to the new
-        // bottom and wipe the scrollback a maximized window just revealed.
-        s.push_str(&format!("\x1b[{};1H", row));
-        s.push_str(&Self::clear_rows_to(row, clear_to));
-        s.push_str(&format!("\x1b[{};1H", row));
-        s.push_str(&render_content(layout, prompt));
-        s.push_str(&cursor_positioning(layout, prompt));
-        if n > 0 {
-            // Move *below* the input block using a relative down-move. An absolute
-            // address would be out of range when the input sits on the bottom
-            // row (and get silently ignored, overwriting the input); a relative
-            // move scrolls the screen instead, which is the desired behavior.
-            // `below` is the number of rows from the (caret) cursor row to just
-            // past the last input row.
-            let below = (er as isize - layout.cursor_row as isize).max(0) as usize;
-            let divider = format!("\x1b[2m{}\x1b[0m", "─".repeat(term_w));
-            // Step below the input block with line feeds rather than a
-            // relative cursor-down (`CSI <below> B`). `CSI B` only *clamps*
-            // the cursor to the bottom margin and never scrolls, so when the
-            // input sits on the bottom row the divider was emitted on the
-            // input's own row, overwriting it (see bug report: two stacked
-            // dividers, no input line). A bare `\n` is translated to `\r\n`
-            // by the OPOST/ONLCR re-enabled in `TermGuard::start`, so it both
-            // returns to column 0 and *scrolls* when the cursor is on the
-            // bottom row — exactly the move we need. Emitting `below` of
-            // them lands just past the last input row and makes the real
-            // scroll count match `next_input_row`'s `er + n` assumption.
-            for _ in 0..below {
-                s.push('\n');
-            }
-            s.push('\r');
-            s.push_str(&divider);
-            s.push('\n');
-            for i in 0..n {
-                s.push_str(overlay[win + i]);
-                if i + 1 < n {
-                    s.push('\n');
-                }
-            }
-            // Reposition the cursor back on the input line after drawing
-            // the overlay below it.  The cursor was placed at
-            // `(row + cursor_row, cursor_col)` by `cursor_positioning`
-            // above; the overlay moved it down as it drew.  Rather than a
-            // relative move that breaks when the terminal scrolls,
-            // compute the *visual* row after the scroll and use an
-            // absolute position.
-            //
-            // The cursor after the overlay is at viewport row
-            // `row + er + n` (er = total input rows, n = overlay count).
-            // Anything past `term_h` causes the terminal to scroll,
-            // shifting the input up by `delta = max(0, (row + er + n) - term_h)`.
-            let delta = (row + er + n).saturating_sub(term_h);
-            let visual_row = (row + layout.cursor_row).saturating_sub(delta).max(1);
-            s.push_str(&format!("\x1b[{};{}H", visual_row, layout.cursor_col + 1));
+    ) -> Frame {
+        let term_w = term_w.max(1);
+        let layout = editor.layout(term_w, prompt);
+        let mut elements = vec![Element::Input {
+            layout,
+            prompt: prompt.to_string(),
+        }];
+        if !overlay.is_empty() {
+            elements.push(Element::Divider);
+            elements.push(Element::Overlay {
+                rows: overlay.iter().map(|s| (*s).to_string()).collect(),
+                focus,
+            });
         }
-        // Follow the terminal's native scroll: if this write pushed the input
-        // up, remember the new visible row so the next redraw clears/writes
-        // at the correct place (prevents the duplication seen when a tall
-        // pop-up shrinks but the screen has not scrolled back down).
-        let next_row = Self::next_input_row(row, term_h, er, n);
-        (s, next_row)
-    }
-
-    /// start index into the full overlay. Extracted so it can be unit-tested
-    /// without a TTY.
-    pub(crate) fn overlay_window(overlay_len: usize, avail: usize, sel: usize) -> usize {
-        if overlay_len <= avail || avail == 0 {
-            0
-        } else {
-            sel.saturating_sub(avail / 2).min(overlay_len - avail)
-        }
+        let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+        let heights = allocate(&extents, live_budget(term_h.max(1)));
+        render(&elements, &heights, term_w)
     }
 
     /// Evaluate one menu key event (editor's real cursor: char index →
@@ -1377,8 +1244,9 @@ impl Repl {
     /// job, which previously left `/set` value commits looking
     /// separator-less because their next prompt (`/set` list) is visibly
     /// different from the emitted line. `redraw` is the live overlay closure
-    /// from `read_input`; `input_row` is kept in sync so the next loop
-    /// iteration redraws at the correct row.
+    /// from `read_input`; it clears the input region through the frame
+    /// pipeline, after which `display_plain` writes the line at the frame's
+    /// caret (plan §5.2).
     ///
     /// `sep` controls whether this helper draws the separator itself:
     /// `/set` value commits *stay in the `read_input` loop* (they revert
@@ -1387,12 +1255,11 @@ impl Repl {
     /// *return* an `InputAction`, so `agent.rs` draws a separator before the
     /// next `read_input` (its per-prompt framing); passing `false` here avoids
     /// a doubled separator.
-    fn emit_commit<F: Fn(&LineEditor, &[&str], usize, &mut usize)>(
+    fn emit_commit<F: Fn(&LineEditor, &[&str], usize)>(
         output: &dyn Output,
         editor: &mut LineEditor,
         redraw: &F,
         sel: usize,
-        input_row: &mut usize,
         line: &str,
         next_input: &str,
         sep: bool,
@@ -1403,19 +1270,16 @@ impl Repl {
         // where typed input is recorded — record the committed line here
         // so recall (Up/Down) sees every command the user actually ran.
         history.add(line);
-        // Re-anchor to the real cursor BEFORE drawing: an external editor
-        // ($EDITOR via `review_compaction_summary`, which runs mid-eval for
-        // menu-driven compaction) may have repainted the screen since the
-        // last frame. `cursor_row()` does a live DSR query — the same
-        // pattern the Ctrl-E path uses after `guard.start()` — and falls
-        // back to the tracked value when the terminal doesn't answer.
-        *input_row = output.cursor_row().max(1);
-        redraw(&LineEditor::new(), &[], sel, input_row);
+        // No DSR here: the draw cache is the steady-state anchor
+        // (`frame_anchor()`), content writes advance it, and a foreign
+        // screen writer ($EDITOR via `review_compaction_summary`) re-anchors
+        // on exit (plan §4.2). Clear the input region, then echo the line
+        // at the caret the frame apply left.
+        redraw(&LineEditor::new(), &[], sel);
         output.display_plain(line);
         if sep {
             output.display_separator();
         }
-        *input_row = output.cursor_row();
         editor.set(next_input);
     }
 
@@ -1776,6 +1640,10 @@ pub(crate) fn review_compaction_summary(
     let _ = guard.stop();
     let edited = edit_in_editor(draft);
     let _ = guard.start();
+    // The editor is a foreign screen writer: re-anchor the draw cache to the
+    // real cursor (DSR) and invalidate the frame region before anything else
+    // draws (plan §4.2).
+    let _ = output.cursor_row();
 
     let text = match edited {
         Ok(t) => t,
@@ -2289,82 +2157,6 @@ fn wrap_line(
     (ranges, cursor_pos)
 }
 
-/// Build the escape sequence that restores the saved input-top, clears down,
-/// redraws `prompt` + rows, and positions the cursor. Pure string builder.
-/// Content of the input region (prompt + visual rows), CRLF-separated, with
-/// no cursor positioning or other terminal escapes. Composed by the editor
-/// redraw and by [`render_input`].
-fn render_content(layout: &Layout, prompt: &str) -> String {
-    let mut s = String::new();
-    let rc = layout.row_count.max(1);
-    for r in 0..rc {
-        if r > 0 {
-            // Bare `\n`: `OPOST`/`ONLCR` (re-enabled in `TermGuard::start`) turns it
-            // into `\r\n`, so writing `\r\n` here would become `\r\r\n`.
-            s.push('\n');
-        }
-        if r == 0 {
-            s.push_str(prompt);
-        }
-        if r < layout.rows.len() {
-            s.push_str(&layout.rows[r]);
-        }
-    }
-    s
-}
-
-/// Cursor-positioning suffix that places the caret at `layout.cursor_row` /
-/// `layout.cursor_col` after [`render_content`] has been written.
-/// `prompt` is needed to account for the prompt prefix when the cursor is on
-/// the only row (rc == 1), which always includes the prompt.  Without it the
-/// left‑arrow adjustment would be off by the prompt width, placing the cursor
-/// too far right on the first character.
-fn cursor_positioning(layout: &Layout, prompt: &str) -> String {
-    let rc = layout.row_count.max(1);
-    let pcols = prompt.chars().count();
-    let last_row_len = if rc == 1 {
-        layout.rows.first().map(|x| x.chars().count()).unwrap_or(0)
-    } else {
-        layout.rows.last().map(|x| x.chars().count()).unwrap_or(0)
-    };
-    let mut s = String::new();
-    let move_up = (rc - 1).saturating_sub(layout.cursor_row);
-    if move_up > 0 {
-        s.push_str(&format!("\x1b[{}A", move_up));
-        s.push('\r');
-        // Only emit CUF when cursor_col > 0; some terminals treat
-        // CSI 0 C (or missing param) as 1, which would shift the cursor
-        // one column to the right when we want column 0.
-        if layout.cursor_col > 0 {
-            s.push_str(&format!("\x1b[{}C", layout.cursor_col));
-        }
-    } else {
-        // When the cursor is on the last (or only) row and the prompt prefix
-        // is present on row 0 (rc == 1), the distance from the rendered end
-        // to the cursor column must include the prompt prefix.
-        let effective_end_col = if rc == 1 {
-            pcols + last_row_len
-        } else {
-            last_row_len
-        };
-        let d = effective_end_col.saturating_sub(layout.cursor_col);
-        if d > 0 {
-            s.push_str(&format!("\x1b[{}D", d));
-        }
-    }
-    s
-}
-
-/// `render_input` is only used by the unit tests below; gate it so the
-/// non-test build doesn't warn about an unused function.
-#[cfg(test)]
-fn render_input(layout: &Layout, prompt: &str) -> String {
-    let mut s = String::from("\x1b[u\r\x1b[0J");
-    s.push_str(&render_content(layout, prompt));
-    s.push_str(&cursor_positioning(layout, prompt));
-    s
-}
-
 /// Persistent input-line history (in-memory + appended to
 /// `~/.config/picocode/history`). `Up`/`Down` navigate; the in-progress line is
 /// restored when navigating back past the newest entry.
@@ -2780,38 +2572,6 @@ mod tests {
     }
 
     #[test]
-    fn render_input_roundtrips_empty() {
-        let e = LineEditor::new();
-        let layout = e.layout(80, "> ");
-        let s = render_input(&layout, "> ");
-        // restores input-top, clears down, writes prompt, no trailing newline,
-        // and positions the cursor at the prompt end (col 2, no move needed).
-        assert!(s.starts_with("\x1b[u\r\x1b[0J> "));
-        assert!(!s.ends_with('\n'));
-    }
-
-    #[test]
-    fn render_input_multiline_positions_cursor() {
-        // cursor on the last row -> no vertical move needed
-        let e = LineEditor::from_text("aaa\nbbb");
-        let layout = e.layout(80, "");
-        assert_eq!(layout.rows, vec!["aaa", "bbb"]);
-        let s = render_input(&layout, "");
-        assert!(s.contains("aaa\nbbb"), "{}", s);
-
-        // cursor on row 0 -> render must move up one row to reposition
-        let mut e2 = LineEditor::from_text("aaa\nbbb");
-        e2.left(); // cursor 5 -> 4 (on row 1)
-        e2.left();
-        e2.left();
-        e2.left(); // cursor 1 (row 0)
-        let layout2 = e2.layout(80, "");
-        assert_eq!(layout2.cursor_row, 0);
-        let s2 = render_input(&layout2, "");
-        assert!(s2.contains("\x1b[1A"), "expected move-up, got {}", s2);
-    }
-
-    #[test]
     fn history_navigation_with_draft_restore() {
         let mut h = History {
             entries: Vec::new(),
@@ -2947,18 +2707,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_window_centers_on_selection_and_clamps() {
-        // 50 options in a 10-row window, selection at the very end.
-        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 49), 40);
-        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 0), 0);
-        assert_eq!(crate::repl::Repl::overlay_window(50, 10, 5), 0);
-        // avail >= len: show everything from the top.
-        assert_eq!(crate::repl::Repl::overlay_window(5, 10, 4), 0);
-        // avail == 0: degenerate, clamp to 0.
-        assert_eq!(crate::repl::Repl::overlay_window(50, 0, 49), 0);
-    }
-
-    #[test]
     fn page_delta_skips_rows_by_visual_height() {
         use crate::slashdot_menu::render::LogicalLine;
         // Single-line rows: page_delta(4 budget) from row 0 down should skip 4 rows.
@@ -2999,64 +2747,11 @@ mod tests {
         assert_eq!(crate::slashdot_menu::render::page_delta(&[], 0, 10, 1), 0);
     }
 
-    #[test]
-    fn next_input_row_tracks_scroll_on_open_and_stays_on_shrink() {
-        // Input at the bottom row (40). A tall pop-up (n=4) overflows by 5, so
-        // the input scrolls up to row 35.
-        assert_eq!(Repl::next_input_row(40, 40, 1, 4), 35);
-        // The pop-up now shrinks (n=1) but the screen does NOT scroll back down,
-        // so the input stays at row 35 (no duplication on the next redraw).
-        assert_eq!(Repl::next_input_row(35, 40, 1, 1), 35);
-        // No overflow: input row is unchanged.
-        assert_eq!(Repl::next_input_row(5, 40, 1, 4), 5);
-        // Overflow never pushes the input off the top (clamped to 1).
-        assert_eq!(Repl::next_input_row(2, 40, 1, 40), 1);
-        // No pop-up: only the input block is rewritten in place.
-        assert_eq!(Repl::next_input_row(35, 40, 1, 0), 35);
-    }
-
-    #[test]
-    fn clear_rows_to_bounds_clear_at_previous_bottom_on_grow() {
-        // Grew from 24 to 40 rows. Input at row 10 (top-anchored reflow: the
-        // cursor stays put). The revealed scrollback is rows 25..=40, *below*
-        // the old bottom. The clear must stop at the old bottom (24) and must
-        // NOT contain a clear-to-end-of-screen (`\x1b[0J`), which would wipe
-        // that reveal.
-        let seq = Repl::clear_rows_to(10, 24);
-        assert!(!seq.contains("\x1b[0J"), "must not clear to end of screen");
-        assert_eq!(
-            seq.matches("\x1b[K").count(),
-            15,
-            "one erase per row 10..=24"
-        );
-        // Each line is stepped to the next (col 1) except after the last row.
-        assert_eq!(seq.matches("\x1b[1E").count(), 14);
-        // Nothing below the old bottom (row 25) is referenced.
-        assert!(!seq.contains("\x1b[25;1H"));
-    }
-
-    #[test]
-    fn clear_rows_to_full_screen_on_no_resize() {
-        // No resize: clear_to == term_h, so the clear must cover every row
-        // from the input down to the bottom — equivalent to the old `\x1b[0J`.
-        let seq = Repl::clear_rows_to(3, 40);
-        assert_eq!(seq.matches("\x1b[K").count(), 38);
-        assert_eq!(seq.matches("\x1b[1E").count(), 37);
-    }
-
-    #[test]
-    fn clear_rows_to_no_clear_when_input_below_old_bottom() {
-        // Bottom-anchored grow: the cursor moved to the new bottom (40) but the
-        // previous bottom was 24. Clearing "below" the input would be upwards
-        // and must not happen; nothing is cleared so the revealed scrollback
-        // (above the new input) is preserved.
-        assert_eq!(Repl::clear_rows_to(40, 24), "");
-    }
-
-    #[test]
-    fn clear_rows_to_single_row() {
-        assert_eq!(Repl::clear_rows_to(5, 5), "\x1b[K");
-    }
+    // `next_input_row` / `clear_rows_to` were folded into `plan_apply` by
+    // ui_draw_v2 P3; their cases live on in `ui::frame::apply_tests`
+    // (`frame_tracks_scroll_then_stays_on_shrink`,
+    // `full_clears_nothing_when_frame_sits_below_the_old_bottom`,
+    // `grow_preserves_revealed_rows_below_old_bottom`).
 
     #[test]
     fn replace_range_tests() {
@@ -3480,43 +3175,51 @@ mod tests {
 
     // ===== vt100 terminal-emulator tests =====
     //
-    // Build the actual escape sequences the terminal would see (as emitted by
-    // `redraw`) and feed them through a real vt100 terminal emulator.  This
-    // checks both visible cell content and the final cursor position — the
-    // strongest test possible without a real TTY.
+    // Build the frame production draws — `Repl::compose_frame` →
+    // `plan_apply`, i.e. the exact bytes `Output::draw_frame` writes
+    // (ONLCR-translated by [`onlcr`]) — and feed them through a real vt100
+    // terminal emulator. This checks both visible cell content and the final
+    // cursor position — the strongest test possible without a real TTY.
     #[cfg(test)]
     mod vt100_tests {
         use crate::repl::{LineEditor, Repl};
+        use crate::ui::frame::{plan_apply, ApplyPolicy, DrawCache};
         use vt100::Parser;
 
-        /// Simulate the tty's OPOST/ONLCR: the production builder emits bare
-        /// `\n` (the real terminal's line discipline maps it to `\r\n` before
-        /// the emulator sees it). This harness feeds bytes straight to the
-        /// vt100 parser, so apply the same mapping here — and *only* here:
-        /// nothing else in this module may re-encode newlines.
+        /// Simulate the tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the
+        /// real terminal's line discipline maps it to `\r\n` before the
+        /// emulator sees it). This harness feeds bytes straight to the vt100
+        /// parser, so apply the same mapping here — and *only* here: nothing
+        /// else in this module may re-encode newlines.
         fn onlcr(s: &str) -> Vec<u8> {
             s.replace('\n', "\r\n").into_bytes()
         }
 
         /// Render one full redraw — input *plus* an optional overlay — through
-        /// the production builder ([`Repl::build_redraw`], ONLCR-translated by
-        /// [`onlcr`]) into the emulator. `clear_to == term_rows` models the
-        /// steady state (no resize); the clear-down *is* included — vt100 0.16
-        /// implements CNL, so the old "minus the clear-down" copy is obsolete.
-        /// Returns (cursor row, cursor col, screen rows, next_input_row).
+        /// the production pipeline ([`Repl::compose_frame`] + [`plan_apply`],
+        /// ONLCR-translated by [`onlcr`]) into the emulator. The cache starts
+        /// fresh (`live = None`, as after a re-anchor), so the apply takes the
+        /// full path with the frame's top at `anchor`. Returns (cursor row,
+        /// cursor col, screen rows, post-apply anchor).
         fn render_overlay_through_vt100(
             editor: &LineEditor,
             width: usize,
             prompt: &str,
             term_rows: usize,
             term_cols: usize,
-            input_row: usize,
+            anchor: usize,
             overlay: &[&str],
-            sel: usize,
+            focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
-            let layout = editor.layout(width, prompt);
-            let (s, next_row) = Repl::build_redraw(
-                &layout, prompt, overlay, sel, input_row, term_rows, width, term_rows,
+            let frame = Repl::compose_frame(editor, prompt, overlay, focus, width, term_rows);
+            let mut cache = DrawCache::new(term_rows);
+            let s = plan_apply(
+                &mut cache,
+                &frame,
+                anchor,
+                ApplyPolicy::Frame,
+                width,
+                term_rows,
             );
             let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
             p.process(&onlcr(&s));
@@ -3539,7 +3242,8 @@ mod tests {
                     s.trim_end().to_string()
                 })
                 .collect();
-            (cr as usize, cc as usize, rows, next_row)
+            let anchor = cache.anchor();
+            (cr as usize, cc as usize, rows, anchor)
         }
 
         /// Input-only variant (no overlay): the pre-existing entry point the
@@ -3550,7 +3254,7 @@ mod tests {
             prompt: &str,
             term_rows: usize,
             term_cols: usize,
-            input_row: usize,
+            anchor: usize,
         ) -> (usize, usize, Vec<String>) {
             let (cr, cc, rows, _) = render_overlay_through_vt100(
                 editor,
@@ -3558,7 +3262,7 @@ mod tests {
                 prompt,
                 term_rows,
                 term_cols,
-                input_row,
+                anchor,
                 &[],
                 0,
             );
@@ -3571,7 +3275,7 @@ mod tests {
             e.insert_str("Hello");
             e.cursor = 0;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "> ", 24, 80, 10);
-            // input_row=10 is 1-indexed; vt100 uses 0-indexed rows, so row = 9
+            // anchor=10 is 1-indexed; vt100 uses 0-indexed rows, so row = 9
             assert_eq!((cr, cc), (9, 2), "cursor at start should be row 9 col 2");
             assert!(rows[9].starts_with("> Hello"), "row 9: {:?}", rows[9]);
         }
@@ -3658,7 +3362,7 @@ mod tests {
                 e.cursor = pos;
                 let layout = e.layout(w, prompt);
                 let (cr, cc, _) = render_through_vt100(&e, w, prompt, 24, 80, 10);
-                // vt100 rows are 0-indexed; input_row=10 1-indexed = 9 0-indexed
+                // vt100 rows are 0-indexed; anchor=10 1-indexed = 9 0-indexed
                 let expected_row = 9 + layout.cursor_row;
                 assert_eq!(
                     (cr, cc),
@@ -3688,7 +3392,7 @@ mod tests {
                         e.cursor = pos;
                         let layout = e.layout(*w, "> ");
                         let (cr, cc, _) = render_through_vt100(&e, *w, "> ", 24, 80, 5);
-                        // input_row=5 1-indexed = 4 0-indexed
+                        // anchor=5 1-indexed = 4 0-indexed
                         assert_eq!(
                             (cr, cc),
                             (4 + layout.cursor_row, layout.cursor_col),
@@ -3709,7 +3413,7 @@ mod tests {
             e.insert_str("Hello");
             e.cursor = 0;
             let (cr, cc, rows) = render_through_vt100(&e, 80, "", 24, 80, 5);
-            // input_row=5 1-indexed = 4 0-indexed. No prompt, so col=0.
+            // anchor=5 1-indexed = 4 0-indexed. No prompt, so col=0.
             assert_eq!(
                 (cr, cc),
                 (4, 0),
@@ -3722,13 +3426,14 @@ mod tests {
 
         #[test]
         fn vt100_overlay_fits_no_scroll() {
-            // Input at row 10 of 24, 3-row overlay: everything fits, no scroll.
-            // The overlay must appear directly below the input, the caret must
-            // return to the input, and next_input_row must not move.
+            // Input at row 10 of 24, 3-row overlay: the frame (1 + 1 + 3)
+            // fits both the screen and the budget, so nothing scrolls. The
+            // overlay must appear directly below the input, the caret must
+            // return to the input, and the live frame's anchor must not move.
             let mut e = LineEditor::new();
             e.insert_str("hi");
             let overlay = ["one", "two", "three"];
-            let (cr, cc, rows, next_row) =
+            let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
             assert!(rows[9].starts_with("> hi"), "input row: {:?}", rows[9]);
             assert!(
@@ -3741,28 +3446,29 @@ mod tests {
             assert_eq!(rows[13], "three");
             // Caret back on the input line, at prompt(2) + "hi"(2) = col 4.
             assert_eq!((cr, cc), (9, 4), "caret should be on the input row");
-            // No overflow: input row unchanged.
-            assert_eq!(next_row, 10);
+            // No overflow: the frame stays anchored where it was drawn.
+            assert_eq!(anchor, 10);
         }
 
         #[test]
         fn vt100_overlay_overflow_scrolls_and_tracks_input() {
             // Input at row 20 of a 24-row terminal with a 6-row overlay:
-            // 20 + 1 (input) + 1 (divider) + 6 (overlay) = 28 > 24, so the
-            // terminal scrolls by 4. The emulator's *actual* input row must
-            // match what `next_input_row` reports, and the caret (repositioned
-            // by the visual_row delta math) must land on the input row — this
-            // is exactly the bug class the old hand-rolled test copy could
-            // not catch.
+            // 20 + 1 (input) + 1 (divider) + 6 (overlay) = 28 rows, so
+            // `plan_apply` scrolls by delta = 20 + 8 - 1 - 24 = 3 before
+            // painting (scroll-then-paint, plan §4.3). The emulator's
+            // *actual* input row must match the anchor the apply records in
+            // the cache, and the caret must land on the input row — this is
+            // exactly the bug class the old hand-rolled test copy could not
+            // catch.
             let mut e = LineEditor::new();
             e.insert_str("hi");
             let overlay = ["one", "two", "three", "four", "five", "six"];
-            let (cr, cc, rows, next_row) =
+            let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
-            // delta = (20 + 1 + 6) - 24 = 3 → input lands at row 17 (1-indexed).
-            assert_eq!(next_row, 17, "next_input_row must report the scrolled row");
-            // Find the input row in the emulator's screen: it must be at
-            // next_row (1-indexed) = index 16 (0-indexed).
+            // delta = (20 + 8) - 1 - 24 = 3 → frame lands at row 17 (1-indexed).
+            assert_eq!(anchor, 17, "the cache must track the scrolled row");
+            // Find the input row in the emulator's screen: it must be at the
+            // anchor (1-indexed) = index 16 (0-indexed).
             assert!(
                 rows[16].starts_with("> hi"),
                 "input must be at the reported row: {:?}",
@@ -3781,33 +3487,34 @@ mod tests {
 
         #[test]
         fn vt100_overlay_clamped_to_two_thirds_budget() {
-            // Pop-up may use at most ⌈2/3·term_h⌉ = 16 rows of a 24-row
-            // terminal. A 100-row overlay must be windowed to exactly those
-            // 16 rows, centered on the selection — and the write (input row 8
-            // + input + divider + 16 overlay rows = row 25) overflows by one,
-            // so the terminal scrolls once; every expectation below is the
-            // *post-scroll* position.
+            // The live region — input + divider + pop-up *together* — may use
+            // at most ⌈2/3·term_h⌉ = 16 rows of a 24-row terminal (plan §2).
+            // A 100-row overlay is flexed down to 16 - 2 = 14 rows and
+            // windowed around the selection, so the frame fits at its anchor
+            // (row 8 + 16 - 1 = 23 ≤ 24): no scroll, top 1/3 of the screen
+            // stays scrollback.
             let e = LineEditor::new();
             let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
             let refs: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
-            let (cr, cc, rows, next_row) =
+            let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 8, &refs, 50);
-            // max_pop = ceil(24 * 2/3) = 16. Window centers on sel=50:
-            // win = 50 - 8 = 42, so rows 42..58 of the overlay are shown.
-            // delta = (8 + 1 + 16) - 24 = 1 → input lands at 1-idx 7 (0-idx 6).
-            assert_eq!(next_row, 7, "next_input_row must account for the scroll");
-            assert_eq!(rows[6].trim_end(), ">", "empty input: {:?}", rows[6]);
-            assert!(rows[7].chars().all(|c| c == '─'), "divider: {:?}", rows[7]);
-            assert_eq!(rows[8], "item 42", "window start: {:?}", rows[8]);
-            assert_eq!(rows[23], "item 57", "window end: {:?}", rows[23]);
-            // Nothing above the input: the scroll consumed rows at the top.
+            // allocate: [input 1, divider 1, overlay 14] of budget 16.
+            // The overlay window (14 rows, prefer 7 of context) centers on
+            // focus=50: start = 50 - 7 = 43, so rows 43..=56 are shown.
+            assert_eq!(anchor, 8, "frame fits: no scroll");
+            assert_eq!(rows[7].trim_end(), ">", "empty input: {:?}", rows[7]);
+            assert!(rows[8].chars().all(|c| c == '─'), "divider: {:?}", rows[8]);
+            assert_eq!(rows[9], "item 43", "window start: {:?}", rows[9]);
+            assert_eq!(rows[22], "item 56", "window end: {:?}", rows[22]);
+            // The frame starts at row 8 (1-indexed): everything above is
+            // untouched scrollback.
             assert!(
-                rows[..6].iter().all(|r| r.is_empty()),
+                rows[..7].iter().all(|r| r.is_empty()),
                 "clean top: {:?}",
-                &rows[..6]
+                &rows[..7]
             );
-            // Caret on the (single-row) input: 0-idx row 6, col 2 (prompt end).
-            assert_eq!((cr, cc), (6, 2));
+            // Caret on the (single-row) input: 0-idx row 7, col 2 (prompt end).
+            assert_eq!((cr, cc), (7, 2));
         }
     }
 

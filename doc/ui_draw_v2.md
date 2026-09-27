@@ -1,6 +1,6 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 ✅, P3 next)
+**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 next)
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -299,8 +299,9 @@ scroll tracking (the cache holds the post-scroll top). The REPL always applies a
 empty-input frame before returning (as today's submit paths do), so no frame is live
 when content streams under the next turn.
 
-`next_input_row` / `clear_rows_to` (currently `pub(crate)` in `repl.rs`) fold into the
-apply implementation; their unit tests move with them.
+`next_input_row` / `clear_rows_to` folded into the apply implementation (P3); their
+meaningful unit tests moved to `ui::frame::apply_tests`, the byte-mechanics ones
+dropped with the helpers.
 
 ### 5.3 Dialogs (`ui.rs::confirm`)
 
@@ -322,6 +323,7 @@ the frame scrolls itself into the budget; it never overwrites above the cursor.
 
 `repl.rs`'s module header still documents `Repl::select` as a single-column list
 picker; the fn no longer exists. Fix the header while touching this file.
+(Done in P3.)
 
 ---
 
@@ -334,9 +336,9 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 | **P0** ✅ | Test-safety net: make the vt100 tests consume the real emit path. Extracted `Repl::build_redraw(layout, prompt, overlay, sel, row, clear_to, w, h) -> (String, next_row)` from today's `redraw` (takes today's inputs, not a `Frame` — Frame arrives in P1). vt100 harness now feeds production bytes through an ONLCR shim (production emits bare `\n`; the tty maps to `\r\n`). Added 3 overlay tests pinning the scroll-delta caret math. | ✅ 674 tests green |
 | **P1** ✅ | Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`, `window` (input windowing). Pure; lives in `src/ui/frame.rs` + `live_budget`. Unit tests: allocation distribution, windowing, extents/caret. | ✅ 21 unit tests; 695 total green |
 | **P2** ✅ | Cache + apply in `ui::frame` (`plan_apply`, `DrawCache { caret, screen_bottom, live }`, `LiveFrame`, `ApplyPolicy`), stored as `ConsoleOutput.draw`. Trait surface `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI; `Frame`/`ApplyPolicy` published — `ui` is a `pub mod`, the module is expected to become a companion UI crate). Full apply (scroll-then-paint, union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the extended predicate, `Append` policy for commits. `note_lines` advances `caret` + invalidates `live`; `cursor_row()` = re-anchor primitive (DSR → `caret`, invalidates). Replaces the old `row: Mutex<usize>`. | ✅ 13 apply tests over `apply` output through vt100; 708 lib tests green |
-| **P3** | REPL wiring: `redraw` → compose/apply; retire `input_row`/`prev_term_h` locals; `emit_commit` on the new path; `$EDITOR` wrapper DSR. | `repl_resize`, `popup_scroll_*`, vt100 suites green |
+| **P3** ✅ | REPL wiring: `redraw` → `Repl::compose_frame` (compose/allocate/render) → `Output::draw_frame(frame, frame_anchor(), Frame)`. Retired the `input_row`/`prev_term_*` locals (one `painted_size` cell remains for resize *detection* → DSR re-anchor + width wipe/replay; the clear bound lives in `plan_apply`'s `screen_bottom`) and the `initial_row` parameter (entry re-anchor via DSR inside `read_input`); Ctrl-Z resume re-anchors. `emit_commit` on the frame path without its own DSR — `$EDITOR` (`review_compaction_summary`) re-anchors on exit instead. Deleted `build_redraw`, `next_input_row`, `clear_rows_to`, `overlay_window`, `render_content`, `cursor_positioning` and their byte-copy tests; the vt100 suite now drives `compose_frame` + `plan_apply`. Behavior change: the 2/3 budget bounds the *whole* frame, so the pop-up gets `budget − input − divider` rows (the clamped-budget test was re-pinned: frame fits at its anchor, no scroll). | ✅ full suite green (702 lib + pty tests) |
 | **P4** | Dialog wiring: `ui.rs` on the frame path; divider policy; commit frame for the decision line; delete ad-hoc `render_at`. | `confirm_raw_mode` pty test + manual check |
-| **P5** | Cleanup: delete `overlay_lines`/`overlay_lines_with_bgs` and port their tests to `paint_plan`; fold `next_input_row`/`clear_rows_to` into apply; update `repl.rs` module docs. | Full suite; `overlay_lines` zero hits |
+| **P5** | Cleanup: delete `overlay_lines`/`overlay_lines_with_bgs` and port their tests to `paint_plan`; drop `ui::frame`'s `allow(dead_code)` once P3/P4 have wired everything. (`next_input_row`/`clear_rows_to` folded into apply and `repl.rs` module docs updated in P3.) | Full suite; `overlay_lines` zero hits |
 
 P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
 emit logic" into a real safety net for P2–P3.
