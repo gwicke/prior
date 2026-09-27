@@ -168,8 +168,12 @@ pub(crate) fn window(n: usize, focus: usize, budget: usize, prefer_context: usiz
 
 /// What [`render`] produces (plan §3.3): one flat buffer, one extent per
 /// screen row, and the row range each element occupies.
+///
+/// Public (opaque — the fields are crate-private) so the [`crate::Output`]
+/// frame surface can name it; this module is expected to graduate into a
+/// companion UI crate alongside `slashdot_menu`.
 #[derive(Clone)]
-pub(crate) struct Frame {
+pub struct Frame {
     /// Rows concatenated **without** separators; `extents[i]` delimits row
     /// `i`. `apply` inserts line breaks (or absolute moves) as it sees fit.
     pub(crate) buf: String,
@@ -314,7 +318,7 @@ fn pad_row(row: &str, term_w: usize) -> String {
 
 /// How [`plan_apply`] treats a frame's screen region (plan §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApplyPolicy {
+pub enum ApplyPolicy {
     /// Frame UI (input / overlay / dialog): partial row-diff when the previous
     /// frame is intact and nothing moved, else a full scroll-then-paint with a
     /// bounded clear of the old frame region.

@@ -10,7 +10,7 @@
 //! draw pipeline (`doc/ui_draw_v2.md`); its `apply` stage lives on
 //! `ConsoleOutput`.
 
-pub(crate) mod frame;
+pub mod frame;
 
 use std::sync::Arc;
 

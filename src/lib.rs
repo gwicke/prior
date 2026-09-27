@@ -266,7 +266,7 @@ impl PicocodeError {
 
 pub type Result<T> = std::result::Result<T, PicocodeError>;
 
-mod ui;
+pub mod ui;
 
 #[cfg(test)]
 mod test_hang_reader;

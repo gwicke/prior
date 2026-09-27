@@ -161,7 +161,6 @@ pub trait Output: Send + Sync {
     /// `anchor` (1-based). Default: drop it — non-console outputs carry no
     /// interactive UI, so the raw-mode REPL never runs against them. This is
     /// the *UI* surface; content output (`display_*`) stays separate.
-    #[allow(private_interfaces)]
     fn draw_frame(&self, _frame: &Frame, _anchor: usize, _policy: ApplyPolicy) {}
 
     /// Where the next frame belongs (ui_draw_v2 §5.1): the intact frame's top
@@ -1451,7 +1450,6 @@ impl Output for ConsoleOutput {
         }
     }
 
-    #[allow(private_interfaces)]
     fn draw_frame(&self, frame: &Frame, anchor: usize, policy: ApplyPolicy) {
         // Lock the writer before the cache so the byte emission and the cache
         // advance are one atomic step, and so we never hold `draw` while
