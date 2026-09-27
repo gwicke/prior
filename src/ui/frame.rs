@@ -326,11 +326,9 @@ pub(crate) enum ApplyPolicy {
 
 /// The last applied frame, while it is still intact on screen (plan §4.1).
 pub(crate) struct LiveFrame {
-    /// Absolute 1-based row of the frame's first row, post-scroll.
+    /// Absolute 1-based row of the frame's first row, post-scroll. The bottom
+    /// is derived as `frame_top_row + frame.height() - 1`.
     pub(crate) frame_top_row: usize,
-    /// Absolute 1-based row of the frame's last row (`== frame_top_row` for an
-    /// empty frame).
-    pub(crate) frame_bottom_row: usize,
     /// Terminal size when the frame was applied (partial-apply predicate).
     pub(crate) term_w: usize,
     pub(crate) term_h: usize,
@@ -476,7 +474,6 @@ fn plan_full(
     let caret = push_caret(&mut s, frame, top, th);
     cache.live = Some(LiveFrame {
         frame_top_row: top,
-        frame_bottom_row: top + h.saturating_sub(1),
         term_w: tw,
         term_h: th,
         frame: frame.clone(),
@@ -525,7 +522,6 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
     };
     cache.live = Some(LiveFrame {
         frame_top_row: top,
-        frame_bottom_row: top + h_new.saturating_sub(1),
         term_w,
         term_h,
         frame: frame.clone(),

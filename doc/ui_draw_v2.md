@@ -136,10 +136,9 @@ struct DrawCache {
 
 struct LiveFrame {
     frame_top_row: usize,     // absolute, 1-based, inclusive
-    frame_bottom_row: usize,  // absolute, 1-based, inclusive
     term_w: usize,            // size at apply time (partial predicate)
     term_h: usize,
-    frame: Frame,             // rows for the diff
+    frame: Frame,             // rows for the diff; bottom = top + height - 1
 }
 ```
 
@@ -214,8 +213,8 @@ All coordinates are computed **before** any emission; the whole sequence is one
    - all other rows: `CUP r;1` + `EL` (absolute addressing; never scrolls).
 3. `CUP` + `CHA` to the caret target.
 4. Update cache: `caret` (absolute), `live = Some(LiveFrame { frame_top_row: top,
-   frame_bottom_row: top + height − 1, term_w, term_h, frame })`, `screen_bottom
-   = term_h`.
+   term_w, term_h, frame })` (bottom derived as `top + height − 1`),
+   `screen_bottom = term_h`.
 
 Because `height ≤ ⌈2/3·term_h⌉` (allocator-guaranteed) and `delta` lands the frame
 at `top ≥ term_h − height + 1`, the top 1/3 of the screen is never occupied by the
@@ -235,9 +234,9 @@ live.is_some()
 
 Then diff `live.frame.extents[i]` vs the new extents: emit `CUP r` + row bytes for
 changed rows only (one batched `write_all`, **no newlines** → can never scroll), clear
-the shrink remainder if the frame shrank (`top+height ..= live.frame_bottom_row` —
-trusted here: the anchor is stable by the predicate), reposition the caret. Identical
-frames emit nothing but the caret.
+the shrink remainder if the frame shrank (`top+height ..= live.frame_top_row +
+live.frame.height() − 1` — trusted here: the anchor is stable by the predicate),
+reposition the caret. Identical frames emit nothing but the caret.
 
 The `term_h` check matters: a size change we did not observe (no resize event
 processed) must still force the full path, because the terminal may have reflowed the
@@ -246,6 +245,19 @@ frame region under us.
 Row diff (not dirty flags) is the starting point — it catches input-growth shifts and
 cross-element reflows that per-element flags miss; cost is negligible against I/O.
 Dirty spans from `spans` are a later refinement if profiling demands it.
+
+### 4.5 Contraction and fixed bottom elements (future)
+
+The `Append` policy re-consumes the space *below* a block down to the terminal
+bottom — the "contraction" mirror of the overlay/menu "expansion" of the bottom
+drawing area. The natural generalization for a status line or a persistent input
+line is to **compose those fixed parts into the same screen update** rather than
+writing them ad hoc: a policy per chunk — **no-clear** on the content/scrollback
+chunks, **clear** on the no-content chunks — with the fixed bottom elements
+establishing the lower bound the cursor may write to (i.e. how far the screen is
+scrolled back up before the non-scrollback elements are redrawn). Not needed for
+P3/P4; recorded so the frame model grows in this direction instead of accumulating
+side channels.
 
 ---
 
