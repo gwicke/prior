@@ -989,28 +989,61 @@ impl Repl {
                             let _ = self.guard.start();
                         }
                     }
-                    // Ctrl-E: external editor (only when no overlay is active).
+                    // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
                     if let KeyCode::Char('e') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(overlay, ActiveOverlay::None)
-                        {
-                            let _ = self.guard.stop();
-                            match edit_in_editor(&editor.text()) {
-                                Ok(new_text) => {
-                                    editor.set(&new_text);
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match &overlay {
+                                ActiveOverlay::None => {
+                                    // Edit input buffer.
+                                    let _ = self.guard.stop();
+                                    match edit_in_editor(&editor.text()) {
+                                        Ok(new_text) => {
+                                            editor.set(&new_text);
+                                        }
+                                        Err(e) => {
+                                            let _ = io::stdout().write_all(
+                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
+                                            );
+                                        }
+                                    }
+                                    let _ = self.guard.start();
+                                    input_row = output.cursor_row();
+                                    if let Ok((_, h)) = crossterm::terminal::size() {
+                                        prev_term_h.set(h.max(1) as usize);
+                                    }
+                                    continue;
                                 }
-                                Err(e) => {
-                                    let _ = io::stdout().write_all(
-                                        format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                    );
+                                ActiveOverlay::V25Menu { plan } => {
+                                    // Edit header content from the current plan's detail lines.
+                                    let header_text = plan
+                                        .detail
+                                        .iter()
+                                        .map(|l| l.0.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    if !header_text.is_empty() {
+                                        let _ = self.guard.stop();
+                                        match edit_in_editor(&header_text) {
+                                            Ok(_) => { /* user viewed/saved; no feedback */ }
+                                            Err(e) => {
+                                                let _ = io::stdout().write_all(
+                                                    format!("\r\neditor error: {}\r\n", e)
+                                                        .as_bytes(),
+                                                );
+                                            }
+                                        }
+                                        let _ = self.guard.start();
+                                        input_row = output.cursor_row();
+                                        if let Ok((_, h)) = crossterm::terminal::size() {
+                                            prev_term_h.set(h.max(1) as usize);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                ActiveOverlay::PathComplete { .. } => {
+                                    // No-op in prose completion dialog.
                                 }
                             }
-                            let _ = self.guard.start();
-                            input_row = output.cursor_row();
-                            if let Ok((_, h)) = crossterm::terminal::size() {
-                                prev_term_h.set(h.max(1) as usize);
-                            }
-                            continue;
                         }
                     }
                     // Active overlay key dispatch via enum methods.
