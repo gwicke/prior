@@ -15,7 +15,7 @@
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
 use crate::model_catalog;
-use crate::output::{term_width, wrap, Output};
+use crate::output::Output;
 use crate::session::SessionTreeNode;
 use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -1283,141 +1283,6 @@ impl Repl {
         editor.set(next_input);
     }
 
-    /// Render the `/model` / `/thinking` / `/set` overlay: a panel title
-    /// line plus option rows with a `> ` selection marker and (for `/model`)
-    /// a green `*` on the currently-active model. Returns plain text; the
-    /// caller emits it directly above the input line.
-    ///
-    /// `wrap_opts` controls layout of the option rows: pre-formatted rows
-    /// (model/settings/thinking tables) must pass `false` so the inter-column
-    /// padding spaces are preserved (word-wrapping would collapse them and
-    /// destroy column alignment); prose rows (help) pass `true`.
-    pub fn overlay_lines(
-        title: &str,
-        options: &[String],
-        header: Option<&[String]>,
-        sel: usize,
-        active: Option<usize>,
-        wrap_opts: bool,
-    ) -> String {
-        Self::overlay_lines_with_bgs(title, options, header, sel, active, wrap_opts, None)
-    }
-
-    /// Like [`overlay_lines`], but accepts a `row_bgs` array that overrides
-    /// the default panel BG on a per-option basis. Length must match
-    /// `options` (entries past the end fall back to the default BG; a
-    /// `None` entry also falls back). The cursor-selected row always uses
-    /// BG_SEL regardless of `row_bgs` so the selection stays distinct.
-    pub(crate) fn overlay_lines_with_bgs(
-        title: &str,
-        options: &[String],
-        header: Option<&[String]>,
-        sel: usize,
-        active: Option<usize>,
-        wrap_opts: bool,
-        row_bgs: Option<&[Option<&str>]>,
-    ) -> String {
-        const BG: &str = "\x1b[48;5;235m"; // panel background (dark)
-        const BG_SEL: &str = "\x1b[48;5;239m"; // selected row background
-        const C_SEL: &str = "\x1b[1;36m"; // bold cyan: cursor selection
-        const C_RESET: &str = "\x1b[0m";
-        const BG_HEADER: &str = "\x1b[48;5;237m"; // slightly lighter for header
-        let tw = term_width().max(1);
-        let opt_w = tw.saturating_sub(2); // "> " / "* " / "  " marker
-        let mut rows: Vec<(usize, String, bool)> = Vec::new();
-        for (i, o) in options.iter().enumerate() {
-            // Prose overlays (help, command list) word-wrap each option.
-            // Pre-formatted overlays (model/settings/thinking tables) are already
-            // width-bounded and may carry their own `\n` (multi-line rows from
-            // `Table::render_multiline`); preserve newlines instead of
-            // re-wrapping, so column alignment survives across the wrapped
-            // lines of one logical option.
-            let wrapped: Vec<String> = if wrap_opts {
-                wrap(o, opt_w)
-            } else {
-                o.split('\n').map(String::from).collect()
-            };
-            for (j, line) in wrapped.into_iter().enumerate() {
-                rows.push((i, line, j == 0));
-            }
-        }
-        let bg_line =
-            |s: &str, bg: &str| -> String { format!("{}{:<width$}{}", bg, s, C_RESET, width = tw) };
-        let mut out = String::new();
-        if !title.is_empty() {
-            out.push_str(&bg_line(title, BG));
-        }
-        // Render header rows (non-selectable info) if present.
-        if let Some(hdr) = header {
-            for hline in hdr {
-                for subline in hline.split('\n') {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&format!(
-                        "{}{:<width$}{}",
-                        BG_HEADER,
-                        subline,
-                        C_RESET,
-                        width = tw
-                    ));
-                }
-            }
-        }
-        for (i, line, first) in &rows {
-            // The 2-char marker area prefixes every line (including wrapped
-            // continuation lines) so all visual lines of one option stay
-            // column-aligned; only the first line shows a marker. The
-            // marker carries two pieces of information, both piggy-backing
-            // on the same 2-char slot:
-            //   - cursor selection (`>`)
-            //   - current-state row (active model, current session, leaf
-            //     in `/tree`, ...) (`*`)
-            // If the cursor is on the current-state row, `*` wins so the
-            // user sees "this is where you already are" instead of a
-            // generic selection arrow.
-            let is_selected = *first && *i == sel;
-            let is_active = *first && active == Some(*i);
-            let marker = if is_selected && is_active {
-                "* "
-            } else if is_selected {
-                "> "
-            } else if is_active {
-                "* "
-            } else {
-                "  "
-            };
-            let body = format!("{}{}", marker, line);
-            // BG selection:
-            //   - cursor row → BG_SEL (always wins so the cursor is
-            //     distinct from any per-row tint).
-            //   - row has an explicit `row_bgs[i]` → use that.
-            //   - otherwise → default BG.
-            // Active rows no longer get their own foreground colour — the
-            // `*` marker is the indicator — so the table stays consistent
-            // (overlays that need an inline active marker can prefix it
-            // into the row string themselves).
-            let bg = if *i == sel {
-                BG_SEL
-            } else {
-                row_bgs
-                    .and_then(|bgs| bgs.get(*i).and_then(|b| *b))
-                    .unwrap_or(BG)
-            };
-            let fg = if *i == sel { C_SEL } else { "" };
-            let content = if fg.is_empty() {
-                body
-            } else {
-                format!("{}{}", fg, body)
-            };
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&bg_line(&content, bg));
-        }
-        out
-    }
-
     /// Apply a normal editing key to the line editor. Returns `Some(action)`
     /// only for terminal actions (Enter submits, Esc cancels the line,
     /// Ctrl-C exits). All other keys mutate `editor` and return `None`. History
@@ -2264,51 +2129,35 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn overlay_lines_selected_active_uses_star_marker() {
-        // Selected AND active row shows `* `, not `> ` (so the user
-        // sees "you're already here" rather than a generic cursor; the
-        // cursor itself is still visible via the row highlight).
-        let opts = vec!["one".to_string(), "two".to_string()];
-        let out = Repl::overlay_lines("title", &opts, None, 1, Some(1), true);
-        let line_with_two = out.lines().find(|l| l.contains("two")).unwrap_or("");
+    fn paint_plan_active_row_keeps_star_when_not_selected() {
+        // Port of the old `overlay_lines` marker tests (ui_draw_v2 P5):
+        // the `*` current-state marker owns the 2-char prefix and does not
+        // depend on the cursor — an active row that is NOT selected keeps
+        // `* `, and the cursor row keeps `> `. (active == selected, where
+        // `* ` wins over `> `, is pinned by
+        // `paint_plan_active_marker_beats_cursor`.)
+        //
+        // The old per-row BG override test went away with
+        // `overlay_lines_with_bgs`: paint_plan has fixed
+        // selected/default backgrounds and no override feature (nothing
+        // used it).
+        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+        use std::rc::Rc;
+        let plan = RenderPlan {
+            rows: Rc::new(vec![LogicalLine::new("one"), LogicalLine::new("two")]),
+            selected: Some(0),
+            active_rows: vec![1],
+            ..Default::default()
+        };
+        let painted = paint_plan(&plan, 40, 20);
         assert!(
-            line_with_two.contains("* two"),
-            "selected active row must use `* ` not `> `: {line_with_two:?}"
+            painted.lines().any(|l| l.contains("* two")),
+            "got: {painted:?}"
         );
-        assert!(!line_with_two.contains("> two"));
-    }
-
-    #[test]
-    fn overlay_lines_active_not_selected_uses_star_marker() {
-        // Active row that's NOT selected still gets `* ` (consistent
-        // with the previous behaviour: active state lives in the
-        // 2-char prefix, no separate indicator column).
-        let opts = vec!["one".to_string(), "two".to_string()];
-        let out = Repl::overlay_lines("title", &opts, None, 0, Some(1), true);
-        let line_with_two = out.lines().find(|l| l.contains("two")).unwrap_or("");
-        assert!(line_with_two.contains("* two"), "got: {line_with_two:?}");
-    }
-
-    #[test]
-    fn overlay_lines_with_bgs_applies_per_row_background() {
-        // Per-row BG override: row 0 default, row 1 ochre, row 2
-        // bluish-grey. Selected row keeps BG_SEL regardless of the
-        // override.
-        let opts = vec!["one".to_string(), "two".to_string(), "three".to_string()];
-        let bgs: Vec<Option<&str>> = vec![None, Some("\x1b[48;5;180m"), Some("\x1b[48;5;240m")];
-        // sel = 0 → row 0 uses BG_SEL, others use their override.
-        let out = Repl::overlay_lines_with_bgs("title", &opts, None, 0, None, true, Some(&bgs));
-        // Selected row uses BG_SEL (\x1b[48;5;239m) and *not* the row's
-        // BG override (which is None here, so BG_SEL is also the
-        // fallback).
-        let line0 = out.lines().nth(1).unwrap_or("");
-        assert!(line0.contains("\x1b[48;5;239m"), "got: {line0:?}");
-        // Row 1 (non-selected) uses its ochre override.
-        let line1 = out.lines().nth(2).unwrap_or("");
-        assert!(line1.contains("\x1b[48;5;180m"), "got: {line1:?}");
-        // Row 2 uses bluish-grey.
-        let line2 = out.lines().nth(3).unwrap_or("");
-        assert!(line2.contains("\x1b[48;5;240m"), "got: {line2:?}");
+        assert!(
+            painted.lines().any(|l| l.contains("> one")),
+            "got: {painted:?}"
+        );
     }
 
     #[test]
@@ -2679,11 +2528,20 @@ mod tests {
 
     #[test]
     fn render_select_title_appears_once() {
-        let opts = vec![
-            "a: alpha model ctx 128000 $0.10/0.20 per M".to_string(),
-            "b: beta model ctx 200000 $0.30/0.40 per M".to_string(),
-        ];
-        let out = Repl::overlay_lines("Select a model:", &opts, None, 0, None, true);
+        // Ported to paint_plan (ui_draw_v2 P5): the title lives in the
+        // plan's detail block, rows keep their `> `/`  ` markers.
+        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+        use std::rc::Rc;
+        let plan = RenderPlan {
+            detail: vec![LogicalLine::new("Select a model:")],
+            rows: Rc::new(vec![
+                LogicalLine::new("a: alpha model ctx 128000 $0.10/0.20 per M"),
+                LogicalLine::new("b: beta model ctx 200000 $0.30/0.40 per M"),
+            ]),
+            selected: Some(0),
+            ..Default::default()
+        };
+        let out = paint_plan(&plan, 80, 40);
         assert_eq!(out.matches("Select a model:").count(), 1);
         assert!(out.contains("> a: alpha"));
         assert!(out.contains("  b: beta"));
@@ -2691,11 +2549,26 @@ mod tests {
 
     #[test]
     fn render_select_wraps_long_option_with_aligned_continuation() {
+        // Ported to paint_plan (ui_draw_v2 P5): the option arrives
+        // pre-wrapped (word wrap now happens where the plan is built, as
+        // the v2.5 engine does); paint_plan must keep the first line
+        // marked and every continuation indented under the option text.
+        use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+        use std::rc::Rc;
         let long = "deepseek:deepseek-v4-flash ctx 1048576 $0.000000435/0.00000087 per M (est) and some extra trailing text to force a wrap";
-        let opts = vec![long.to_string()];
-        let out = Repl::overlay_lines("Select a model:", &opts, None, 0, None, true);
+        let wrapped = crate::output::wrap(long, 60);
+        assert!(wrapped.len() > 1, "long option must wrap at 60 cols");
+        let plan = RenderPlan {
+            rows: Rc::new(vec![LogicalLine::new(wrapped.join("\n"))]),
+            selected: Some(0),
+            ..Default::default()
+        };
+        let out = paint_plan(&plan, 60, 20);
         let lines: Vec<&str> = out.lines().collect();
-        assert!(lines[1].contains("> "), "first row is the marker row");
+        assert!(
+            lines[0].contains("> "),
+            "first row is the marker row: {lines:?}"
+        );
         let cont: Vec<&&str> = lines
             .iter()
             .filter(|l| l.contains("  ") && !l.contains("> "))

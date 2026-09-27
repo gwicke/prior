@@ -904,11 +904,13 @@ mod tests {
     }
 
     #[test]
-    fn overlay_lines_preserves_table_column_alignment() {
-        // Regression: pre-formatted table rows passed through `overlay_lines`
-        // must keep column alignment. Word-wrapping them collapsed the
-        // inter-column padding spaces (and an empty value column vanished),
-        // which is the misalignment reported for `/settings`.
+    fn paint_plan_preserves_table_column_alignment() {
+        // Regression: pre-formatted table rows passed through the overlay
+        // paint path must keep column alignment (ported from
+        // `overlay_lines` to `paint_plan`, ui_draw_v2 P5). Word-wrapping
+        // them collapsed the inter-column padding spaces (and an empty
+        // value column vanished), which is the misalignment reported for
+        // `/settings`.
         let dir = tempfile::tempdir().unwrap();
         let s = SettingsStore {
             default_model: "openrouter:tencent/hy3:free".into(), // matches the reported value
@@ -929,9 +931,19 @@ mod tests {
             table.add_row(&[meta.name, value.as_str(), meta.description]);
         }
         // Render wide enough that nothing ellipsizes (no multi-byte '…' to
-        // confuse byte-based find); wrap_opts=false keeps rows intact.
+        // confuse byte-based find); `render` never wraps.
         let opts: Vec<String> = table.render(200);
-        let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
+        let plan = crate::slashdot_menu::render::RenderPlan {
+            detail: vec![crate::slashdot_menu::render::LogicalLine::new("Settings")],
+            rows: std::rc::Rc::new(
+                opts.iter()
+                    .map(|o| crate::slashdot_menu::render::LogicalLine::new(o.clone()))
+                    .collect(),
+            ),
+            selected: Some(0),
+            ..Default::default()
+        };
+        let out = crate::slashdot_menu::render::paint_plan(&plan, 200, 40);
         let lines: Vec<&str> = out.lines().collect();
         // title + 9 single-line options (pre-formatted rows are NOT wrapped).
         assert_eq!(
@@ -977,9 +989,11 @@ mod tests {
     }
 
     #[test]
-    fn overlay_lines_keeps_wrapped_option_aligned_and_single() {
+    fn paint_plan_keeps_wrapped_option_aligned_and_single() {
         // A wrapped option (Table::render_multiline output) must stay one
-        // selectable item whose visual lines remain column-aligned.
+        // selectable plan row whose visual lines remain column-aligned
+        // and come out of the paint path un-collapsed (ported from
+        // `overlay_lines` to `paint_plan`, ui_draw_v2 P5).
         let dir = tempfile::tempdir().unwrap();
         let s = SettingsStore {
             default_model: "openrouter:tencent/hy3:free".into(),
@@ -1015,13 +1029,34 @@ mod tests {
         );
         assert!(first_opt_lines[1][desc_start..].starts_with("provider:model"));
         assert!(first_opt_lines[2][desc_start..].starts_with("new sessions"));
-        // overlay_lines must preserve the multi-line option as visual lines
-        // (title + every visual line of every option).
-        let out = crate::repl::Repl::overlay_lines("Settings", &opts, None, 0, None, false);
-        let expected = 1 + opts
-            .iter()
-            .map(|o| o.matches('\n').count() + 1)
-            .sum::<usize>();
-        assert_eq!(out.lines().count(), expected);
+        // paint_plan must preserve the multi-line option as visual lines:
+        // every line of the *selected* option appears (marked first line,
+        // `  `-indented continuations), none of them re-wrapped. Unlike
+        // overlay_lines, paint_plan windows long plans around the
+        // selection — the old exact total-line count belonged to a
+        // renderer that never windowed, so pin what the plan guarantees:
+        // sel = 0 keeps option 0 fully in view.
+        let plan = crate::slashdot_menu::render::RenderPlan {
+            detail: vec![crate::slashdot_menu::render::LogicalLine::new("Settings")],
+            rows: std::rc::Rc::new(
+                opts.iter()
+                    .map(|o| crate::slashdot_menu::render::LogicalLine::new(o.clone()))
+                    .collect(),
+            ),
+            selected: Some(0),
+            ..Default::default()
+        };
+        let out = crate::slashdot_menu::render::paint_plan(&plan, 78, 40);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            lines.iter().any(|l| l.contains(first_opt_lines[0].trim())),
+            "first option's marked line missing: {lines:?}"
+        );
+        for sub in first_opt_lines.iter().skip(1) {
+            assert!(
+                lines.iter().any(|l| l.contains(sub)),
+                "first option's continuation line missing: {sub:?}\n{lines:?}"
+            );
+        }
     }
 }

@@ -18,7 +18,6 @@
 //! carries the escapes needed to repaint itself in place (trailing `EL` or
 //! padding to `term_w`), so `apply` may rewrite any subset of rows
 //! unconditionally.
-#![allow(dead_code)] // Wired into the REPL/dialogs in ui_draw_v2 P3/P4.
 
 use std::ops::Range;
 
@@ -62,6 +61,10 @@ pub(crate) enum Element {
     Overlay { rows: Vec<String>, focus: usize },
     /// Fixed text rows (commit lines, future status line). Never flexed;
     /// truncated from the top when the budget cannot hold them all.
+    // Not constructed outside tests yet: commit lines currently go through
+    // `display_plain` (P4), and the §4.5 fixed-bottom/status-line
+    // composition is this variant's first production user.
+    #[allow(dead_code)]
     Lines(Vec<String>),
 }
 
@@ -180,6 +183,10 @@ pub struct Frame {
     /// Byte range of each screen row; contiguous, covering all of `buf`.
     pub(crate) extents: Vec<Range<usize>>,
     /// `(element index, row range)` — which element painted which rows.
+    /// Written on every render; reserved for the dirty-span refinement of
+    /// the partial diff (§4.4) — the row diff is deliberately kept as the
+    /// sole reader until profiling asks for more.
+    #[allow(dead_code)]
     pub(crate) spans: Vec<(usize, Range<usize>)>,
     /// `(row, display_col)` — both 0-based; row is frame-relative, col is
     /// the on-screen column (prompt included on row 0). `None` when no input
