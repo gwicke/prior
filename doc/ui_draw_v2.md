@@ -1,6 +1,6 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 design refreshed below, implementation next)
+**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 ✅, P3 next)
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -143,9 +143,12 @@ struct LiveFrame {
 }
 ```
 
-Lives in `ConsoleOutput` (it already owns `row: Mutex<usize>` and the
-`writer: Mutex<...>`). Apply takes both locks together so the write and the cache
-update are atomic.
+The type lives with the rest of the pure drawing code in `src/ui/frame.rs`;
+`ConsoleOutput` stores one as `draw: Mutex<DrawCache>` (replacing the old
+`row: Mutex<usize>`) and `plan_apply(&mut cache, frame, anchor, policy, w, h)`
+computes the bytes + the next cache state. `draw_frame` locks `writer` then
+`draw` so the write and the cache advance are atomic (never the reverse — the
+`display_*`/`note_lines` path is writer-then-cache too).
 
 **Rows are stored absolute.** Everything emitted and consumed is an absolute row —
 `CUP`, DSR replies, anchors — so the stored top/bottom are absolute too; the
@@ -312,7 +315,7 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 |---|---|---|
 | **P0** ✅ | Test-safety net: make the vt100 tests consume the real emit path. Extracted `Repl::build_redraw(layout, prompt, overlay, sel, row, clear_to, w, h) -> (String, next_row)` from today's `redraw` (takes today's inputs, not a `Frame` — Frame arrives in P1). vt100 harness now feeds production bytes through an ONLCR shim (production emits bare `\n`; the tty maps to `\r\n`). Added 3 overlay tests pinning the scroll-delta caret math. | ✅ 674 tests green |
 | **P1** ✅ | Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`, `window` (input windowing). Pure; lives in `src/ui/frame.rs` + `live_budget`. Unit tests: allocation distribution, windowing, extents/caret. | ✅ 21 unit tests; 695 total green |
-| **P2** | Cache + apply: `DrawCache { caret, screen_bottom, live }`; trait surface `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI); full apply (scroll-then-paint, union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the extended predicate; `note_lines`/`display_*` maintain `caret` + invalidate `live`; `cursor_row()` = re-anchor primitive (DSR → `caret`, invalidates). | vt100 tests over `apply` output |
+| **P2** ✅ | Cache + apply in `ui::frame` (`plan_apply`, `DrawCache { caret, screen_bottom, live }`, `LiveFrame`, `ApplyPolicy`), stored as `ConsoleOutput.draw`. Trait surface `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI, `#[allow(private_interfaces)]`). Full apply (scroll-then-paint, union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the extended predicate, `Append` policy for commits. `note_lines` advances `caret` + invalidates `live`; `cursor_row()` = re-anchor primitive (DSR → `caret`, invalidates). Replaces the old `row: Mutex<usize>`. | ✅ 13 apply tests over `apply` output through vt100; 708 lib tests green |
 | **P3** | REPL wiring: `redraw` → compose/apply; retire `input_row`/`prev_term_h` locals; `emit_commit` on the new path; `$EDITOR` wrapper DSR. | `repl_resize`, `popup_scroll_*`, vt100 suites green |
 | **P4** | Dialog wiring: `ui.rs` on the frame path; divider policy; commit frame for the decision line; delete ad-hoc `render_at`. | `confirm_raw_mode` pty test + manual check |
 | **P5** | Cleanup: delete `overlay_lines`/`overlay_lines_with_bgs` and port their tests to `paint_plan`; fold `next_input_row`/`clear_rows_to` into apply; update `repl.rs` module docs. | Full suite; `overlay_lines` zero hits |

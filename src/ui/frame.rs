@@ -7,8 +7,12 @@
 //! * [`allocate`] distributes the live-region budget ([`live_budget`], at
 //!   most 2/3 of terminal rows) over the elements' `(must, might)` extents,
 //! * [`render`] produces a [`Frame`] — a flat byte buffer with per-row
-//!   extents and element spans — ready for `apply` (P2:
-//!   `ConsoleOutput::draw_frame`).
+//!   extents and element spans.
+//!
+//! The `apply` phase is also pure here: [`plan_apply`] turns a frame plus the
+//! live-screen [`DrawCache`] into the exact escape bytes to write and the
+//! post-apply cache state (plan §4). `ConsoleOutput::draw_frame` is the only
+//! caller that actually writes them.
 //!
 //! Nothing here touches a terminal. A frame's rows are self-contained: each
 //! carries the escapes needed to repaint itself in place (trailing `EL` or
@@ -164,6 +168,7 @@ pub(crate) fn window(n: usize, focus: usize, budget: usize, prefer_context: usiz
 
 /// What [`render`] produces (plan §3.3): one flat buffer, one extent per
 /// screen row, and the row range each element occupies.
+#[derive(Clone)]
 pub(crate) struct Frame {
     /// Rows concatenated **without** separators; `extents[i]` delimits row
     /// `i`. `apply` inserts line breaks (or absolute moves) as it sees fit.
@@ -295,6 +300,290 @@ fn pad_row(row: &str, term_w: usize) -> String {
         Some(body) => format!("{body}{pad}\x1b[0m"),
         None => format!("{row}{pad}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Apply: the live-screen cache and the escape planner (plan §4).
+//
+// Kept pure (bytes out, cache in/out) so the REPL, the dialogs and the vt100
+// tests all exercise the *same* sequence: `ConsoleOutput::draw_frame` only
+// locks the writer and writes what [`plan_apply`] returns. Newlines are emitted
+// bare — the tty's OPOST/ONLCR maps them to CRLF (the same convention as the
+// REPL's redraw) — so any harness that bypasses the tty must do that mapping.
+// ---------------------------------------------------------------------------
+
+/// How [`plan_apply`] treats a frame's screen region (plan §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyPolicy {
+    /// Frame UI (input / overlay / dialog): partial row-diff when the previous
+    /// frame is intact and nothing moved, else a full scroll-then-paint with a
+    /// bounded clear of the old frame region.
+    Frame,
+    /// Commit lines / append: write the rows at the anchor as content
+    /// (scrolling if needed), no region clear; the caret lands just below.
+    Append,
+}
+
+/// The last applied frame, while it is still intact on screen (plan §4.1).
+pub(crate) struct LiveFrame {
+    /// Absolute 1-based row of the frame's first row, post-scroll.
+    pub(crate) frame_top_row: usize,
+    /// Absolute 1-based row of the frame's last row (`== frame_top_row` for an
+    /// empty frame).
+    pub(crate) frame_bottom_row: usize,
+    /// Terminal size when the frame was applied (partial-apply predicate).
+    pub(crate) term_w: usize,
+    pub(crate) term_h: usize,
+    /// The rows, for the partial-apply diff.
+    pub(crate) frame: Frame,
+}
+
+/// Live screen bookkeeping, owned by `ConsoleOutput` (plan §4.1). Rows are
+/// absolute; bottom-relative quantities are recomputed on every apply.
+pub(crate) struct DrawCache {
+    /// Absolute cursor position as we last left it: (1-based row, 0-based col).
+    /// The row is authoritative; the col is best-effort (only an apply sets it,
+    /// and only the row is ever consumed).
+    caret: (usize, usize),
+    /// Terminal height at the last apply. The full-apply clear floor is
+    /// `min(term_h, screen_bottom)`, so a maximize's revealed rows below the old
+    /// bottom survive. Never cleared by invalidation.
+    screen_bottom: usize,
+    live: Option<LiveFrame>,
+}
+
+impl DrawCache {
+    pub(crate) fn new(term_h: usize) -> Self {
+        DrawCache {
+            caret: (1, 0),
+            screen_bottom: term_h.max(1),
+            live: None,
+        }
+    }
+
+    pub(crate) fn caret_row(&self) -> usize {
+        self.caret.0
+    }
+
+    /// Where the next frame belongs (plan §5.1): the intact frame's top row if
+    /// there is one, else the tracked cursor row.
+    pub(crate) fn anchor(&self) -> usize {
+        self.live
+            .as_ref()
+            .map(|l| l.frame_top_row)
+            .unwrap_or(self.caret.0)
+    }
+
+    /// Advance the tracked cursor by `n` lines, clamped to the screen, and
+    /// invalidate the frame region: an ordinary content write moved the cursor,
+    /// so the previous frame no longer describes the screen (plan §4.2).
+    pub(crate) fn note_lines(&mut self, n: usize, term_h: usize) {
+        let h = term_h.max(1);
+        self.caret.0 = (self.caret.0 + n).clamp(1, h);
+        self.live = None;
+    }
+
+    /// Record a re-anchor (DSR) result and invalidate the frame region: a
+    /// caller asking for the real cursor position cannot trust the cached frame
+    /// coordinates (plan §4.2). Returns the recorded row.
+    pub(crate) fn reanchor(&mut self, row: usize) -> usize {
+        self.caret.0 = row.max(1);
+        self.live = None;
+        self.caret.0
+    }
+}
+
+/// Plan the escape bytes that apply `frame` with its top row at absolute row
+/// `anchor` (1-based) under `policy`, advancing `cache` to the post-apply state
+/// (plan §4.3–4.4). Pure: the caller writes the returned bytes.
+pub(crate) fn plan_apply(
+    cache: &mut DrawCache,
+    frame: &Frame,
+    anchor: usize,
+    policy: ApplyPolicy,
+    term_w: usize,
+    term_h: usize,
+) -> String {
+    let tw = term_w.max(1);
+    let th = term_h.max(1);
+    let anchor = anchor.clamp(1, th);
+    let h = frame.height();
+
+    if policy == ApplyPolicy::Append {
+        return plan_append(cache, frame, anchor, th);
+    }
+
+    // `delta` rows must scroll off the top to fit the frame's bottom on screen.
+    let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
+    let top = anchor.saturating_sub(delta).max(1);
+
+    let partial = cache.live.as_ref().is_some_and(|live| {
+        delta == 0 && top == live.frame_top_row && tw == live.term_w && th == live.term_h
+    });
+    if partial {
+        plan_partial(cache, frame, top, th)
+    } else {
+        plan_full(cache, frame, top, delta, tw, th)
+    }
+}
+
+/// Full apply (plan §4.3): scroll the overflow into scrollback, paint the frame
+/// rows absolutely, clear the rest of the live region (bounded by the clear
+/// floor), then place the caret.
+fn plan_full(
+    cache: &mut DrawCache,
+    frame: &Frame,
+    top: usize,
+    delta: usize,
+    tw: usize,
+    th: usize,
+) -> String {
+    let h = frame.height();
+    let mut s = String::new();
+
+    // 1. Scroll `delta` lines off the top. Bare LF at the bottom row scrolls and
+    //    pushes the top lines into scrollback — never `CSI S`, which deletes.
+    if delta > 0 {
+        s.push_str(&cup(th, 1));
+        for _ in 0..delta {
+            s.push('\n');
+        }
+    }
+
+    // 2. Paint the frame rows (absolute addressing; can no longer scroll).
+    for i in 0..h {
+        s.push_str(&cup(top + i, 1));
+        s.push_str(frame.row(i));
+    }
+
+    // 3. Clear the rest of the live region, floored so a maximize's revealed
+    //    rows survive. Include the old frame's rows the scroll left above the
+    //    new top, so a re-anchor without invalidation leaves nothing stale.
+    let floor = th.min(cache.screen_bottom);
+    let from = match cache.live.as_ref() {
+        Some(live) => top.min(live.frame_top_row.saturating_sub(delta).max(1)),
+        None => top + h,
+    };
+    for r in from..=floor {
+        if r >= top && r < top + h {
+            continue; // painted above
+        }
+        s.push_str(&cup(r, 1));
+        s.push_str("\x1b[K");
+    }
+
+    // 4. Caret, then 5. cache update.
+    let caret = push_caret(&mut s, frame, top, th);
+    cache.live = Some(LiveFrame {
+        frame_top_row: top,
+        frame_bottom_row: top + h.saturating_sub(1),
+        term_w: tw,
+        term_h: th,
+        frame: frame.clone(),
+    });
+    cache.screen_bottom = th;
+    cache.caret = caret;
+    s
+}
+
+/// Partial apply (plan §4.4): repaint only the rows whose bytes changed, clear
+/// rows an orphaned (shrunken) frame left behind, and reposition the caret. One
+/// batched write with no newlines — it can never scroll.
+fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> String {
+    let h_new = frame.height();
+    let h_old = cache.live.as_ref().map_or(0, |l| l.frame.height());
+    let mut s = String::new();
+    {
+        let old = &cache
+            .live
+            .as_ref()
+            .expect("partial needs a live frame")
+            .frame;
+        for i in 0..h_new.max(h_old) {
+            match (i < h_new, i < h_old) {
+                (true, true) if frame.row(i) != old.row(i) => {
+                    s.push_str(&cup(top + i, 1));
+                    s.push_str(frame.row(i));
+                }
+                (true, false) => {
+                    s.push_str(&cup(top + i, 1));
+                    s.push_str(frame.row(i));
+                }
+                (false, true) => {
+                    // Frame shrank: erase the orphaned row.
+                    s.push_str(&cup(top + i, 1));
+                    s.push_str("\x1b[K");
+                }
+                _ => {}
+            }
+        }
+    }
+    let caret = push_caret(&mut s, frame, top, th);
+    let (term_w, term_h) = {
+        let live = cache.live.as_ref().expect("partial needs a live frame");
+        (live.term_w, live.term_h)
+    };
+    cache.live = Some(LiveFrame {
+        frame_top_row: top,
+        frame_bottom_row: top + h_new.saturating_sub(1),
+        term_w,
+        term_h,
+        frame: frame.clone(),
+    });
+    cache.caret = caret;
+    s
+}
+
+/// Append apply (plan §2, commit lines): write the rows at the anchor as
+/// content, scrolling the overflow into scrollback, and leave the caret on the
+/// row just below the block. No region clear; `live` is cleared so the next
+/// frame re-anchors at the cursor.
+fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -> String {
+    let h = frame.height();
+    let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
+    let top = anchor.saturating_sub(delta).max(1);
+    let mut s = String::new();
+    if delta > 0 {
+        s.push_str(&cup(th, 1));
+        for _ in 0..delta {
+            s.push('\n');
+        }
+    }
+    for i in 0..h {
+        s.push_str(&cup(top + i, 1));
+        s.push_str(frame.row(i));
+    }
+    // Move to the row just below the block. A bare LF at the last row scrolls
+    // the block into scrollback — exactly the commit-line behavior.
+    s.push('\n');
+    cache.live = None;
+    cache.screen_bottom = th;
+    cache.caret = ((top + h).min(th), 0);
+    s
+}
+
+/// Emit the caret move (`CUP` to the row, `CHA` to the column) and return the
+/// absolute `(row, col)` to store. Frames without a caret rest at the frame's
+/// bottom-left.
+fn push_caret(s: &mut String, frame: &Frame, top: usize, th: usize) -> (usize, usize) {
+    match frame.caret {
+        Some((r, c)) if top + r <= th => {
+            let row = top + r;
+            s.push_str(&cup(row, 1));
+            s.push_str(&format!("\x1b[{}G", c + 1));
+            (row, c)
+        }
+        _ => {
+            let row = (top + frame.height().saturating_sub(1)).clamp(1, th);
+            s.push_str(&cup(row, 1));
+            (row, 0)
+        }
+    }
+}
+
+/// Absolute cursor position (CUP): `CSI {row};{col} H`, both 1-based.
+fn cup(row: usize, col: usize) -> String {
+    format!("\x1b[{row};{col}H")
 }
 
 #[cfg(test)]
@@ -568,5 +857,241 @@ mod tests {
             "\x1b[48;5;239mab  \x1b[0m"
         );
         assert_eq!(pad_row("abcde", 4), "abcde"); // never truncates
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    //! Apply-phase tests (plan §4). They drive [`plan_apply`]'s bytes through a
+    //! real vt100 emulator — the same screen/caret checks the REPL's `redraw`
+    //! tests use — so the cache transitions and the emitted bytes are pinned
+    //! together.
+    use super::*;
+    use crate::repl::LineEditor;
+    use vt100::Parser;
+
+    /// The tty's OPOST/ONLCR: `plan_apply` emits bare `\n` (the line discipline
+    /// maps it to CRLF before the emulator sees it).
+    fn onlcr(s: &str) -> Vec<u8> {
+        s.replace('\n', "\r\n").into_bytes()
+    }
+
+    /// A fresh emulator fed each chunk in order.
+    fn run(rows: usize, cols: usize, chunks: &[&str]) -> Parser {
+        let mut p = Parser::new(rows as u16, cols as u16, 2000);
+        for c in chunks {
+            p.process(&onlcr(c));
+        }
+        p
+    }
+
+    /// Screen contents as trimmed strings, one per row.
+    fn screen(p: &Parser, rows: usize, cols: usize) -> Vec<String> {
+        let s = p.screen();
+        (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        s.cell(r as u16, c as u16)
+                            .map(|cell| cell.contents())
+                            .unwrap_or(" ")
+                            .chars()
+                            .next()
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A frame of fixed text rows (self-contained: `Lines` appends the `EL`).
+    fn lines_frame(rows: &[&str], tw: usize) -> Frame {
+        let rows: Vec<String> = rows.iter().map(|s| s.to_string()).collect();
+        let h = rows.len();
+        render(&[Element::Lines(rows)], &[h], tw)
+    }
+
+    #[test]
+    fn full_paints_rows_and_clears_below() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        let p = run(24, 20, &[&s]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "one");
+        assert_eq!(rows[5], "two");
+        assert_eq!(rows[6], "");
+        // The frame region is now live at rows 5..6.
+        assert_eq!(cache.anchor(), 5);
+        // No caret in the frame → rest at the frame's bottom-left (1-based 6).
+        assert_eq!(p.screen().cursor_position(), (5, 0));
+    }
+
+    #[test]
+    fn full_clears_stale_rows_below() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        // Seed stale content the frame must erase.
+        let seed = "\x1b[8;1Hstale8\x1b[9;1Hstale9";
+        let p = run(24, 20, &[seed, &s]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[7], "");
+        assert_eq!(rows[8], "");
+    }
+
+    #[test]
+    fn partial_repaints_only_changed_rows() {
+        let mut cache = DrawCache::new(24);
+        let f1 = lines_frame(&["aa", "bb", "cc"], 20);
+        let s1 = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        let f2 = lines_frame(&["aa", "XX", "cc"], 20);
+        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
+        assert!(s2.contains("XX"), "changed row repainted");
+        assert!(!s2.contains("aa"), "unchanged rows skipped");
+        let p = run(24, 20, &[&s1, &s2]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "aa");
+        assert_eq!(rows[5], "XX");
+        assert_eq!(rows[6], "cc");
+    }
+
+    #[test]
+    fn partial_clears_orphaned_row_on_shrink() {
+        let mut cache = DrawCache::new(24);
+        let f1 = lines_frame(&["aa", "bb", "cc"], 20);
+        let s1 = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        let f2 = lines_frame(&["aa"], 20);
+        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
+        let p = run(24, 20, &[&s1, &s2]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "aa");
+        assert_eq!(rows[5], "");
+        assert_eq!(rows[6], "");
+    }
+
+    #[test]
+    fn scrolls_frame_into_view() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["a", "b", "c"], 20);
+        // anchor 9 + 3 rows = row 11 > 10 → delta 1.
+        let s = plan_apply(&mut cache, &f, 9, ApplyPolicy::Frame, 20, 10);
+        let p = run(10, 20, &[&s]);
+        let rows = screen(&p, 10, 20);
+        assert_eq!(rows[7], "a");
+        assert_eq!(rows[8], "b");
+        assert_eq!(rows[9], "c");
+        assert_eq!(cache.anchor(), 8);
+    }
+
+    #[test]
+    fn grow_preserves_revealed_rows_below_old_bottom() {
+        // screen_bottom was 24; terminal is now 40 with no apply in between.
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["head"], 20);
+        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 40);
+        assert!(
+            !s.contains("\x1b[25;1H"),
+            "clear must stop at the old bottom (24)"
+        );
+        let seed = "\x1b[25;1Hkeep25\x1b[30;1Hkeep30";
+        let p = run(40, 20, &[seed, &s]);
+        let rows = screen(&p, 40, 20);
+        assert_eq!(rows[24], "keep25");
+        assert_eq!(rows[29], "keep30");
+    }
+
+    #[test]
+    fn reanchor_to_new_row_clears_old_rows() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        let s1 = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        // Same size/shape, different anchor → full apply, old rows cleared.
+        let s2 = plan_apply(&mut cache, &f, 8, ApplyPolicy::Frame, 20, 24);
+        let p = run(24, 20, &[&s1, &s2]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "");
+        assert_eq!(rows[5], "");
+        assert_eq!(rows[7], "one");
+        assert_eq!(rows[8], "two");
+    }
+
+    #[test]
+    fn width_change_forces_full_repaint() {
+        let mut cache = DrawCache::new(24);
+        let f1 = lines_frame(&["aa"], 20);
+        let _ = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        let f2 = lines_frame(&["aa"], 20);
+        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 40, 24);
+        assert!(s2.contains("aa"), "width change repaints the row");
+    }
+
+    #[test]
+    fn append_writes_content_and_advances_caret() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["div", "line"], 20);
+        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Append, 20, 24);
+        assert!(s.ends_with('\n'), "append ends on a fresh line");
+        let p = run(24, 20, &[&s]);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "div");
+        assert_eq!(rows[5], "line");
+        // live cleared → next frame anchors at the cursor (top + height = 7).
+        assert_eq!(cache.anchor(), 7);
+        assert_eq!(p.screen().cursor_position(), (6, 0));
+    }
+
+    #[test]
+    fn clamps_anchor_to_screen() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["x"], 20);
+        let s = plan_apply(&mut cache, &f, 999, ApplyPolicy::Frame, 20, 24);
+        let p = run(24, 20, &[&s]);
+        assert_eq!(screen(&p, 24, 20)[23], "x");
+    }
+
+    #[test]
+    fn places_caret_for_input_frame() {
+        let mut cache = DrawCache::new(24);
+        let mut e = LineEditor::new();
+        e.insert_str("hi");
+        let layout = e.layout(20, "> ");
+        let f = render(
+            &[Element::Input {
+                layout,
+                prompt: "> ".to_string(),
+            }],
+            &[1],
+            20,
+        );
+        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        let p = run(24, 20, &[&s]);
+        // "> hi" at 1-based row 5; caret after "hi" → col 4.
+        assert_eq!(p.screen().cursor_position(), (4, 4));
+        assert_eq!(cache.anchor(), 5);
+    }
+
+    #[test]
+    fn note_lines_advances_and_invalidates() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["x"], 20);
+        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        assert_eq!(cache.anchor(), 5);
+        cache.note_lines(3, 10);
+        assert_eq!(cache.caret_row(), 8);
+        assert_eq!(cache.anchor(), 8, "live frame invalidated");
+        cache.note_lines(100, 10);
+        assert_eq!(cache.caret_row(), 10, "clamped to the screen");
+    }
+
+    #[test]
+    fn reanchor_sets_row_and_invalidates() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["x"], 20);
+        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        assert_eq!(cache.reanchor(3), 3);
+        assert_eq!(cache.anchor(), 3);
     }
 }
