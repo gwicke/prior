@@ -1,6 +1,6 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 next)
+**Status:** Design settled — implementation in progress (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 next)
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -36,15 +36,15 @@ without an input segment".
 | Budget | Live region ≤ **2/3 of terminal height**; top 1/3 guaranteed scrollback |
 | Full apply | **Scroll-then-paint**: LF scroll by `delta` from the bottom row (never `CSI S` — it deletes rows instead of pushing scrollback), then absolute writes |
 | Partial apply | Row-diff repaint when `delta == 0 ∧ top == live.frame_top_row ∧ term size (w, h) unchanged` |
-| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append policy (commits): no region clear |
+| Clear policy | Full apply: clear the union of the old frame region (scroll-shifted) and the rows below the new frame, floored at `min(term_h, screen_bottom)`. Partial apply: row-diff + shrink remainder only. Append: no region clear (reserved for §4.5's chunked writes). **General invariant (P4):** a Frame apply clears the rows below the frame, so any later append-only render (and any row-diff) lands in already-clean space and never re-clears it |
 | Buffer | Flat `String` + per-screen-row extents `Vec<Range<usize>>` |
 | Caret | Absolute `(row, col)` in the cache (row authoritative, col best-effort); frame-relative `(row_idx, display_col)` inside `Frame`; applied with `CUP` + `CHA` (`\x1b[{col}G`) |
 | Draw state | `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }` in `ConsoleOutput`; all writers maintain it before returning |
 | Screen position | Stored rows are absolute (everything emitted/consumed is); bottom-relative quantities (`delta`, 2/3 budget, clear floor) are computed per apply. No reflow-model invariance is assumed |
 | UI surface | `Output::draw_frame(frame, anchor, policy)` + `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides. Content-out (`display_*`) and UI-out stay separate |
-| DSR | Only via the explicit `cursor_row()` re-anchor primitive (foreign-process / size-change sites); steady state uses the cache |
-| Dialogs | Same pipeline, no input segment; anchored at the cursor row, scrolls itself into the live region if needed |
-| Commit lines | Compose `[divider, line]`, **Append** policy (no clear) → scrolls into history |
+| DSR | Only via the explicit `cursor_row()` re-anchor primitive (foreign-process / size-change / dialog-entry sites); steady state uses the cache |
+| Dialogs | Same pipeline, no input segment; entry DSR re-anchor, then `frame_anchor()`; `ConfirmSpec.divider` separates mid-turn dialogs from streamed output. Resolve = `Frame::empty()` union-clear; the optional decision line is written at the cleared first row |
+| Commit lines | Clear the region with a Frame apply, then write the line where the caret lands (`emit_commit`, dialog decision line). `Append` stays reserved for §4.5's chunked/fixed-bottom writes |
 
 ---
 
@@ -175,14 +175,16 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 | `$EDITOR` wrapper (`review_compaction_summary`, Ctrl-E) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
 | Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
+| Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor — mid-turn the tracked caret does not follow streamed content; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame` |
 
 `live = None` forces the full path on the next apply. Any uncertainty → clear it.
 
-**`cursor_row()` is the explicit re-anchor primitive.** In P2 it keeps today's
+**`cursor_row()` is the explicit re-anchor primitive.** It keeps the historical
 behavior — DSR with a tracked fallback — and additionally stores the answer into
 `caret.0` and clears `live` (a caller asking to re-anchor cannot trust the frame
-region). P3 rewires the REPL's steady-state reads to `frame_anchor()`, leaving
-`cursor_row()` at the true re-anchor sites (resize, editor, Ctrl-Z).
+region). Since P3 the REPL's steady-state reads go through `frame_anchor()`;
+`cursor_row()` remains at the true re-anchor sites: entry into `read_input` and
+`ui::confirm`, resize, editor exit, Ctrl-Z resume.
 
 ### 4.3 Full apply (scroll-then-paint)
 
@@ -305,18 +307,34 @@ dropped with the helpers.
 
 ### 5.3 Dialogs (`ui.rs::confirm`)
 
-Compose `[Divider?, Overlay]` (divider conditional per context — tool confirm wants a
-separation from the streamed output above), allocate, render, apply. Anchor =
-`frame_anchor()`; mid-turn that is the cursor row below the streamed output, and if the
-frame does not fit below, `delta` scrolls it into the live region. Key loop stays; each
-key re-composes (cheap) and re-applies (partial). On resolve, a **commit frame**
-(`[divider, decision line]`, `ApplyPolicy::Append`) records the choice in the
-transcript.
+Compose `[Divider?, Overlay]` — the divider is a `ConfirmSpec.divider` flag: mid-turn
+dialogs (tool approval, compaction review) want a separation from the streamed output
+above them; REPL-context dialogs pass `false` (scrollback already carries a separator
+above the input region). Allocate, render, apply. The entry `cursor_row()` DSR is kept:
+mid-turn the tracked caret does not follow streamed content, so `frame_anchor()` alone
+would point into the stream; after that the dialog anchors via `frame_anchor()`, and if
+it does not fit below, `delta` scrolls it into the live region. Key loop stays; each
+key re-composes (cheap) and re-applies (partial). A resize re-composes at the new size
+(full repaint; the dialog keeps its top).
 
-P4 review item: today's `render_at` anchors the dialog *above* the cursor; the frame
-pipeline anchors at the cursor and scrolls on demand.
+On resolve the dialog is erased **through the pipeline**: applying `Frame::empty()`
+under the Frame policy takes the union clear over the old (taller) dialog region and
+parks the cursor on the region's first row — the general invariant (§2 clear policy):
+the space below is already clean, so nothing needs a second clear and the next
+append-only render can start right there. What is written at that row:
 
-The zero-room case (input on the last row) is handled by the normal `delta` scroll —
+- **Tool approval** — one synthetic decision line, `accepted tool X` / `denied tool X`
+  (subject derived from the `Confirm tool {NAME} call?` message convention; Esc
+  records `denied`). No divider on the commit — scrollback already carries one above
+  the input region.
+- **Compaction review** — nothing: the committed `/tree <id> compact …` prompt is
+  self-documenting; the dialog simply clears away.
+
+Resolved P4 review item: the old `render_at` anchored the dialog *above* the cursor
+and cleared with `\x1b[0J`; the frame pipeline anchors at the cursor and scrolls on
+demand — `render_at` is deleted.
+
+The zero-room case (cursor on the last row) is handled by the normal `delta` scroll —
 the frame scrolls itself into the budget; it never overwrites above the cursor.
 
 ### 5.4 Stale doc reference
@@ -337,7 +355,7 @@ Each phase: green build + `cargo test` + `cargo fmt`.
 | **P1** ✅ | Frame model: `Element`, `Extent`, `Frame`, `allocate`, `render`, `window` (input windowing). Pure; lives in `src/ui/frame.rs` + `live_budget`. Unit tests: allocation distribution, windowing, extents/caret. | ✅ 21 unit tests; 695 total green |
 | **P2** ✅ | Cache + apply in `ui::frame` (`plan_apply`, `DrawCache { caret, screen_bottom, live }`, `LiveFrame`, `ApplyPolicy`), stored as `ConsoleOutput.draw`. Trait surface `draw_frame(frame, anchor, policy)` + `frame_anchor()` (defaults drop UI; `Frame`/`ApplyPolicy` published — `ui` is a `pub mod`, the module is expected to become a companion UI crate). Full apply (scroll-then-paint, union clear, floor `min(term_h, screen_bottom)`), partial row-diff with the extended predicate, `Append` policy for commits. `note_lines` advances `caret` + invalidates `live`; `cursor_row()` = re-anchor primitive (DSR → `caret`, invalidates). Replaces the old `row: Mutex<usize>`. | ✅ 13 apply tests over `apply` output through vt100; 708 lib tests green |
 | **P3** ✅ | REPL wiring: `redraw` → `Repl::compose_frame` (compose/allocate/render) → `Output::draw_frame(frame, frame_anchor(), Frame)`. Retired the `input_row`/`prev_term_*` locals (one `painted_size` cell remains for resize *detection* → DSR re-anchor + width wipe/replay; the clear bound lives in `plan_apply`'s `screen_bottom`) and the `initial_row` parameter (entry re-anchor via DSR inside `read_input`); Ctrl-Z resume re-anchors. `emit_commit` on the frame path without its own DSR — `$EDITOR` (`review_compaction_summary`) re-anchors on exit instead. Deleted `build_redraw`, `next_input_row`, `clear_rows_to`, `overlay_window`, `render_content`, `cursor_positioning` and their byte-copy tests; the vt100 suite now drives `compose_frame` + `plan_apply`. Behavior change: the 2/3 budget bounds the *whole* frame, so the pop-up gets `budget − input − divider` rows (the clamped-budget test was re-pinned: frame fits at its anchor, no scroll). | ✅ full suite green (702 lib + pty tests) |
-| **P4** | Dialog wiring: `ui.rs` on the frame path; divider policy; commit frame for the decision line; delete ad-hoc `render_at`. | `confirm_raw_mode` pty test + manual check |
+| **P4** ✅ | Dialog wiring: `ui::confirm` composes `[Divider?, Overlay]` → `Output::draw_frame` (entry DSR re-anchor, then per-key/per-resize re-compose = partial applies); resolve = `Frame::empty()` union-clear, then a synthetic decision line for tool approval (`accepted\|denied tool X` via `ConfirmSpec.subject`) and nothing for compaction; `ConfirmSpec` gains `divider`/`subject`; `render_at` deleted. Also fixed the pre-existing `confirm_n_returns_no` miss (no `('n', 1)` quick key — the suite is `test-utils`-gated, so plain `cargo test` skips it). | ✅ `cargo test --features test-utils --test confirm_raw_mode` 7 green (incl. new paint → clear → decision screen test); full suite green |
 | **P5** | Cleanup: delete `overlay_lines`/`overlay_lines_with_bgs` and port their tests to `paint_plan`; drop `ui::frame`'s `allow(dead_code)` once P3/P4 have wired everything. (`next_input_row`/`clear_rows_to` folded into apply and `repl.rs` module docs updated in P3.) | Full suite; `overlay_lines` zero hits |
 
 P0 is not optional: it converts the existing carefully-tuned tests from "a copy of the
@@ -355,7 +373,7 @@ emit logic" into a real safety net for P2–P3.
 | DSR cost if used per-frame | Cache-first (`frame_anchor()`/`caret`); DSR only via the explicit `cursor_row()` re-anchor at foreign-process / size-change sites |
 | Terminal reflow model (top- vs bottom-anchored) | No invariance is assumed: any size change invalidates `live`; clear floor preserves the reveal; DSR re-anchors |
 | Behavioral change: input no longer pushes scrollback off the top | Intended; windowing keeps caret visible. Covered by a new test |
-| Dialog divider in mid-turn context | Divider is a composable element; tool confirm adds it, menu-context dialogs don't |
+| Dialog divider in mid-turn context | `ConfirmSpec.divider` (true for both mid-turn dialogs; `false` reserved for REPL-context dialogs) |
 
 ---
 

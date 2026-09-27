@@ -2,23 +2,22 @@
 //!
 //! This module provides a shared driver for standalone confirmation
 //! dialogs (tool confirm, compaction review). It builds a RenderPlan from a
-//! simple spec, renders it via the crate's `paint_plan`, and handles key
-//! input via crossterm's blocking `event::read()` (compatible with the
-//! sync `Output::confirm` trait method).
-//!
-//! `frame` is the pure compose → allocate → render stage of the unified
-//! draw pipeline (`doc/ui_draw_v2.md`); its `apply` stage lives on
-//! `ConsoleOutput`.
+//! simple spec and draws it through the unified frame pipeline
+//! (`doc/ui_draw_v2.md` §5.3): compose `[Divider?, Overlay]` → allocate →
+//! render → `Output::draw_frame`, key input via crossterm's blocking
+//! `event::read()` (compatible with the sync `Output::confirm` trait
+//! method). The dialog has no input segment; on resolve its region is
+//! erased through the same pipeline and the decision (if the spec asks for
+//! one) is written where the dialog was.
 
 pub mod frame;
-
-use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::output::{Confirmation, Output};
 use crate::slashdot_menu::node_impl::StaticRow;
 use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
 use std::rc::Rc;
 
 /// Specification for a confirmation dialog.
@@ -32,6 +31,16 @@ pub struct ConfirmSpec<'a> {
     pub quick_keys: Option<&'a [(char, usize)]>,
     /// Initial cursor position (default selection).
     pub default_sel: usize,
+    /// Draw a dim divider above the dialog: mid-turn confirmations want a
+    /// separation from the streamed output above them. Dialogs drawn inside
+    /// the REPL pass `false` — scrollback already carries a separator above
+    /// the input region (and none is re-drawn on commit either).
+    pub divider: bool,
+    /// Subject of the decision line recorded on resolve
+    /// (`accepted <subject>` / `denied <subject>`), or `None` to record
+    /// nothing: the compaction review records nothing because the committed
+    /// `/tree … compact` prompt is already self-documenting (plan §5.3).
+    pub subject: Option<String>,
 }
 
 /// Result of a confirmation dialog.
@@ -65,32 +74,26 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
         return ConfirmResult::Selected(idx);
     }
 
-    // Build the RenderPlan.
-    let plan = build_confirm_plan(spec);
-    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
-    let term_w = term_w as usize;
-    let term_h = term_h as usize;
-
-    // Render the plan to get the visual line count for positioning.
-    let painted = paint_plan(&plan, term_w, term_h);
-    let line_count = painted.lines().count();
-
-    // Position anchor: just below current cursor, clamped so it never scrolls.
-    let start_row = out.cursor_row().min(term_h);
-    let top = start_row
-        .saturating_sub(line_count + 1)
-        .min(term_h.saturating_sub(line_count + 1));
-
     // Pause the background reader.
     if let Some(gate) = out.confirm_gate() {
         gate.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     out.stop_thinking();
 
-    // Initial render.
-    render_at(out, top, &painted);
+    // Re-anchor (DSR): mid-turn the draw cache's caret does not follow
+    // streamed content row by row, so the dialog must start at the *real*
+    // cursor row — right below the output above it (plan §4.2/§5.3). The
+    // frame then scrolls itself into the live region if it does not fit.
+    let _ = out.cursor_row();
 
+    let plan = build_confirm_plan(spec);
+    let mut size = crossterm::terminal::size()
+        .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+        .unwrap_or((80, 24));
+
+    // Initial render.
     let mut sel: usize = spec.default_sel;
+    draw_dialog(out, spec, &plan, sel, size);
 
     loop {
         match event::read() {
@@ -101,8 +104,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if sel > 0 {
                     sel -= 1;
-                    let painted = paint_plan(&update_plan_sel(&plan, sel), term_w, term_h);
-                    render_at(out, top, &painted);
+                    draw_dialog(out, spec, &plan, sel, size);
                 }
             }
             Ok(Event::Key(KeyEvent {
@@ -112,8 +114,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if sel + 1 < spec.options.len() {
                     sel += 1;
-                    let painted = paint_plan(&update_plan_sel(&plan, sel), term_w, term_h);
-                    render_at(out, top, &painted);
+                    draw_dialog(out, spec, &plan, sel, size);
                 }
             }
             Ok(Event::Key(KeyEvent {
@@ -123,7 +124,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if let Some(idx) = quick_key_index(spec, c) {
                     if idx < spec.options.len() {
-                        return ConfirmResult::Selected(idx);
+                        return resolve(out, spec, ConfirmResult::Selected(idx));
                     }
                 }
             }
@@ -132,24 +133,87 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
                 modifiers: KeyModifiers::NONE,
                 ..
             })) => {
-                return ConfirmResult::Selected(sel);
+                return resolve(out, spec, ConfirmResult::Selected(sel));
             }
             Ok(Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 modifiers: KeyModifiers::NONE,
                 ..
             })) => {
-                return ConfirmResult::Dismissed;
+                return resolve(out, spec, ConfirmResult::Dismissed);
             }
             Ok(Event::Resize(w, h)) => {
-                let new_term_w = w as usize;
-                let new_term_h = h as usize;
-                let painted = paint_plan(&plan, new_term_w, new_term_h);
-                render_at(out, top, &painted);
+                // Re-compose for the new size; the cached size mismatch
+                // forces a full repaint (no DSR: the dialog keeps its place).
+                size = (w.max(1) as usize, h.max(1) as usize);
+                draw_dialog(out, spec, &plan, sel, size);
             }
             _ => {}
         }
     }
+}
+
+/// Compose `[Divider?, Overlay]` and apply it as a frame: the first draw
+/// anchors at the cursor row, every later one at the live frame's top
+/// (`frame_anchor()` → partial row-diff). Re-composed per key and per
+/// resize — cheap, and the one place the dialog's bytes come from.
+fn draw_dialog(
+    out: &dyn Output,
+    spec: &ConfirmSpec<'_>,
+    plan: &RenderPlan,
+    sel: usize,
+    size: (usize, usize),
+) {
+    let (term_w, term_h) = size;
+    let painted = paint_plan(&update_plan_sel(plan, sel), term_w, term_h);
+    let rows: Vec<String> = painted.lines().map(str::to_string).collect();
+    // Windowing focus = the cursor-marked row; only consulted when the
+    // frame budget squeezes the overlay below its painted height.
+    let focus = rows.iter().position(|r| r.starts_with("> ")).unwrap_or(0);
+    let mut elements = Vec::new();
+    if spec.divider {
+        elements.push(Element::Divider);
+    }
+    elements.push(Element::Overlay { rows, focus });
+    let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
+    let heights = allocate(&extents, live_budget(term_h));
+    let frame = render(&elements, &heights, term_w);
+    out.draw_frame(&frame, out.frame_anchor(), ApplyPolicy::Frame);
+}
+
+/// Resolve the dialog: erase its region through the frame pipeline — a
+/// Frame apply's union clear takes care of the rows the (taller) dialog
+/// painted, so nothing needs a second clear, and the bottom space stays
+/// clean for whatever the caller appends next (plan §4.3/§5.3). The clear
+/// parks the cursor on the region's first row, so the optional decision
+/// line lands exactly where the dialog was.
+fn resolve(out: &dyn Output, spec: &ConfirmSpec<'_>, result: ConfirmResult) -> ConfirmResult {
+    out.draw_frame(&Frame::empty(), out.frame_anchor(), ApplyPolicy::Frame);
+    if let Some(subject) = &spec.subject {
+        // `yes` / `always` / `accept` record; `no` / `cancel` and a dismiss
+        // record the refusal.
+        let accepted = match &result {
+            ConfirmResult::Selected(i) => !matches!(
+                spec.options.get(*i).map(|o| o.id.as_str()),
+                Some("no") | Some("cancel")
+            ),
+            ConfirmResult::Dismissed => false,
+        };
+        out.display_plain(&format!(
+            "{} {subject}",
+            if accepted { "accepted" } else { "denied" }
+        ));
+    }
+    result
+}
+
+/// Subject of a tool-confirmation decision line: the caller's message
+/// follows the `Confirm tool {NAME} call?` convention (the confirm gate in
+/// `agent.rs`) → `tool {NAME}`. Surrounding convention furniture is stripped
+/// independently; anything left over passes through unchanged.
+pub(crate) fn confirm_subject(header: &str) -> String {
+    let s = header.strip_prefix("Confirm ").unwrap_or(header);
+    s.strip_suffix(" call?").unwrap_or(s).to_string()
 }
 
 /// Build a RenderPlan from a ConfirmSpec.
@@ -198,16 +262,21 @@ fn quick_key_index(spec: &ConfirmSpec<'_>, c: char) -> Option<usize> {
     }
 }
 
-/// Render the painted plan at the given top row.
-fn render_at(out: &dyn Output, top: usize, painted: &str) {
-    use std::io::{self, Write};
-    let mut s = String::new();
-    s.push_str(&format!("\x1b[{};1H", top));
-    s.push_str("\x1b[0J");
-    for line in painted.lines() {
-        s.push_str(line);
-        s.push('\n');
+#[cfg(test)]
+mod tests {
+    use super::confirm_subject;
+
+    #[test]
+    fn confirm_subject_follows_the_tool_confirm_convention() {
+        assert_eq!(confirm_subject("Confirm tool BASH call?"), "tool BASH");
+        assert_eq!(confirm_subject("Confirm tool EDIT call?"), "tool EDIT");
     }
-    let _ = io::stdout().write_all(s.as_bytes());
-    let _ = io::stdout().flush();
+
+    #[test]
+    fn confirm_subject_strips_convention_furniture_independently() {
+        // Suffix only (the probe's message), prefix only, neither.
+        assert_eq!(confirm_subject("tool BASH call?"), "tool BASH");
+        assert_eq!(confirm_subject("Confirm tool BASH"), "tool BASH");
+        assert_eq!(confirm_subject("something else"), "something else");
+    }
 }

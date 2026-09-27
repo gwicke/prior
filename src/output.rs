@@ -2003,7 +2003,7 @@ impl Output for ConsoleOutput {
 
     fn confirm(&self, message: &str) -> Confirmation {
         use crate::slashdot_menu::node_impl::StaticRow;
-        use crate::ui::{confirm, ConfirmSpec};
+        use crate::ui::ConfirmSpec;
 
         let spec = ConfirmSpec {
             header: message,
@@ -2012,8 +2012,13 @@ impl Output for ConsoleOutput {
                 StaticRow::new("no", "No"),
                 StaticRow::new("always", "Always (session)"),
             ],
-            quick_keys: Some(&[('y', 0), ('s', 2)]),
+            quick_keys: Some(&[('y', 0), ('n', 1), ('s', 2)]),
             default_sel: 1, // No
+            // Mid-turn: a divider separates the dialog from the streamed
+            // output above; the resolved choice is recorded as a synthetic
+            // decision line (`accepted tool X` / `denied tool X`).
+            divider: true,
+            subject: Some(crate::ui::confirm_subject(message)),
         };
 
         // Run the sync dialog.
@@ -2029,7 +2034,7 @@ impl Output for ConsoleOutput {
 
     fn confirm_compaction_summary(&self, message: &str) -> bool {
         use crate::slashdot_menu::node_impl::StaticRow;
-        use crate::ui::{confirm, ConfirmSpec};
+        use crate::ui::ConfirmSpec;
 
         let spec = ConfirmSpec {
             header: message,
@@ -2039,6 +2044,10 @@ impl Output for ConsoleOutput {
             ],
             quick_keys: Some(&[('a', 0), ('c', 1)]),
             default_sel: 0, // Accept
+            divider: true,
+            // No decision line: the committed `/tree … compact …` prompt is
+            // self-documenting — the dialog simply clears away (plan §5.3).
+            subject: None,
         };
 
         // Run the sync dialog.
