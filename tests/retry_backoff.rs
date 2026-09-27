@@ -218,8 +218,12 @@ fn run_one(pattern: &str, label: &str) -> (Vec<u64>, Vec<(u64, usize, bool)>) {
     ];
     cmd.args(args);
     cmd.env("LLAMACPP_API_BASE_URL", llm.base_url());
-    let _keep = std::env::temp_dir();
+    // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
+    let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
+    cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    // Keep the tempdir alive for the duration of the run.
+    let _config_tempdir = config_tempdir;
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let (bytes, _stop) = spawn_reader(reader);
     let mut writer = pair.master.take_writer().expect("take writer");
