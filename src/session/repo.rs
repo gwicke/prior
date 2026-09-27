@@ -274,6 +274,7 @@ impl JsonlSessionRepo {
         let mut first_prompt_preview = None::<String>;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
+        let mut compaction_summary: Option<String> = None;
 
         for line in content.lines().skip(1) {
             if line.contains("\"type\":\"message\"") {
@@ -303,6 +304,17 @@ impl JsonlSessionRepo {
                     if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
                         if !n.is_empty() {
                             name = Some(n.to_string());
+                        }
+                    }
+                }
+            } else if line.contains("\"compaction\"") {
+                // Flexible match for compaction type (handles "type":"compaction" or "type": "compaction")
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if val.get("type").and_then(|v| v.as_str()) == Some("compaction") {
+                        if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                            if !s.is_empty() {
+                                compaction_summary = Some(s.to_string());
+                            }
                         }
                     }
                 }
@@ -341,7 +353,7 @@ impl JsonlSessionRepo {
                 token_count: None,
                 last_prompt_text: None,
                 last_prompt_timestamp,
-                compaction_summary: None,
+                compaction_summary,
             }),
         })
     }
@@ -648,11 +660,14 @@ impl JsonlSessionRepo {
                         }
                     }
                 }
-            } else if line.contains("\"type\":\"compaction\"") {
+            } else if line.contains("\"compaction\"") {
+                // Flexible match for compaction type (handles "type":"compaction" or "type": "compaction")
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
-                        if !s.is_empty() {
-                            compaction_summary = Some(s.to_string());
+                    if val.get("type").and_then(|v| v.as_str()) == Some("compaction") {
+                        if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                            if !s.is_empty() {
+                                compaction_summary = Some(s.to_string());
+                            }
                         }
                     }
                 }
