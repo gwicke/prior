@@ -110,7 +110,7 @@ impl SessionHeader {
             provider: None,
             model_id: None,
             thinking_level: None,
-            name: None,
+            name: Some(String::new()),
         }
     }
 
