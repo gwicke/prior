@@ -333,7 +333,7 @@ impl RowView {
         let col_widths: Vec<usize> = if use_wrap {
             Vec::new()
         } else {
-            let mut temp = Table::new(&header_labels).set_gap(2);
+            let mut temp = Table::new(&header_labels).set_gap(1);
             if !columns.is_empty() {
                 let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
                 let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();
@@ -362,7 +362,7 @@ impl RowView {
             temp.column_widths(width)
         };
 
-        let mut t = Table::new(&header_labels).set_gap(2);
+        let mut t = Table::new(&header_labels).set_gap(1);
         if !columns.is_empty() {
             let aligns: Vec<Align> = columns.iter().map(|c| c.align).collect();
             let mins: Vec<usize> = columns.iter().map(|c| c.min_width).collect();

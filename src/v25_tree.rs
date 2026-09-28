@@ -2115,7 +2115,7 @@ mod tests {
             .with_aligns(&[Align::Left])
             .with_min_widths(&[20])
             .with_priorities(&[3])
-            .set_gap(2);
+            .set_gap(1);
         for c in &cells {
             t.add_row(&[c.to_string()]);
         }
