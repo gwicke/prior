@@ -39,3 +39,8 @@
       - [x] P3: REPL redraw on the frame path; $EDITOR DSR wrapper
       - [x] P4: dialogs on the frame path; commit frame for decision line
       - [x] P5: retire overlay_lines, fold next_input_row/clear_rows_to into apply
+      - [ ] Cleanups / follow-ups
+- [ ] doc/editor_cleanup.md - generalize editor integration
+- [ ] safe sed wrapper producing edit input - generic?
+- [ ] tree view: lowest indent for longest "master" branch
+- [ ] temperature support: model level only? move thinking level to model too?
