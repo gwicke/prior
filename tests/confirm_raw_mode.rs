@@ -126,6 +126,19 @@ fn run_confirm(key: &[u8]) -> (String, Vec<u8>, Vec<u8>) {
     (result, mid, final_bytes)
 }
 
+/// Find `marker` in the captured bytes; return the rest of its line.
+fn find_field(data: &[u8], marker: &str) -> Option<String> {
+    let pos = data
+        .windows(marker.len())
+        .position(|w| w == marker.as_bytes())?;
+    let rest = &data[pos + marker.len()..];
+    let end = rest
+        .iter()
+        .position(|&c| c == b'\n' || c == b'\r')
+        .unwrap_or(rest.len());
+    Some(String::from_utf8_lossy(&rest[..end]).to_string())
+}
+
 #[test]
 fn confirm_yes_returns_without_hang() {
     assert_eq!(run_confirm(b"y").0, "Yes");
@@ -145,6 +158,22 @@ fn confirm_enter_defaults_to_no() {
 #[test]
 fn confirm_n_returns_no() {
     assert_eq!(run_confirm(b"n").0, "No");
+}
+
+/// ui_draw_v2 §9 latent issue 1: on resolve the dialog must release the
+/// in-flight reader gate it raised on entry. A gate left raised makes every
+/// *later* in-flight reader born paused — it would ignore Esc/Ctrl-C for the
+/// rest of the session (the mid-turn Esc handler died exactly this way when
+/// the confirm driver moved to `ui::confirm` without the release).
+#[test]
+fn confirm_releases_reader_gate_on_resolve() {
+    let (result, _, final_bytes) = run_confirm(b"y");
+    assert_eq!(result, "Yes");
+    assert_eq!(
+        find_field(&final_bytes, "GATE_RELEASED=").as_deref(),
+        Some("true"),
+        "confirm gate left raised after resolve"
+    );
 }
 
 #[test]

@@ -171,8 +171,11 @@ pub trait Output: Send + Sync {
 
     /// Gate the background in-flight reader should honor. While it is `true`,
     /// the reader must not read stdin, because a confirmation dialog on the
-    /// main task owns stdin. Returns `None` for outputs that don't run the
-    /// raw-mode REPL (so there is no background reader to coordinate with).
+    /// main task owns stdin. `ui::confirm` raises it on entry and releases it
+    /// in `resolve()` — every post-pause exit — so a gate left raised would
+    /// freeze every later in-flight reader (plan §9 latent issue 1). Returns
+    /// `None` for outputs that don't run the raw-mode REPL (so there is no
+    /// background reader to coordinate with).
     fn confirm_gate(&self) -> Option<Arc<AtomicBool>> {
         None
     }
@@ -1441,12 +1444,12 @@ impl Output for ConsoleOutput {
         // ANSI escapes, and termimad-rendered responses). Fall back
         // to the tracked/ANSI-stripped prediction if the terminal
         // does not answer the Device Status Report (e.g. a headless pty).
-        // Both paths re-anchor: the frame region can no longer be trusted
-        // once a caller has asked for the real position (plan §4.2).
-        match query_real_cursor_row() {
-            Some(r) => self.draw.lock().unwrap().reanchor(r),
-            None => self.draw.lock().unwrap().caret_row(),
-        }
+        // Both paths re-anchor and invalidate the frame region — the
+        // fallback too: a silent terminal offers no more guarantee than an
+        // answering one, so §4.2's "any uncertainty → clear it" applies to
+        // it as well (plan §9 latent issue 2).
+        let row = query_real_cursor_row();
+        self.draw.lock().unwrap().reanchor(row)
     }
 
     fn draw_frame(&self, frame: &Frame, anchor: usize, policy: ApplyPolicy) {

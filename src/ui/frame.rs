@@ -378,10 +378,6 @@ impl DrawCache {
         }
     }
 
-    pub(crate) fn caret_row(&self) -> usize {
-        self.caret.0
-    }
-
     /// Where the next frame belongs (plan §5.1): the intact frame's top row if
     /// there is one, else the tracked cursor row.
     pub(crate) fn anchor(&self) -> usize {
@@ -400,11 +396,18 @@ impl DrawCache {
         self.live = None;
     }
 
-    /// Record a re-anchor (DSR) result and invalidate the frame region: a
-    /// caller asking for the real cursor position cannot trust the cached frame
-    /// coordinates (plan §4.2). Returns the recorded row.
-    pub(crate) fn reanchor(&mut self, row: usize) -> usize {
-        self.caret.0 = row.max(1);
+    /// Record a re-anchor attempt (plan §4.2) and invalidate the frame region:
+    /// a caller asking for the real cursor position cannot trust the cached
+    /// frame coordinates — DSR answer or not ("any uncertainty → clear it",
+    /// plan §9 latent issue 2). With an answer (`Some`) the tracked row is
+    /// replaced by it; on fallback (`None` — a terminal that never answered,
+    /// e.g. a headless pty) the tracked row stands but `live` is cleared
+    /// all the same, so the next apply takes the full path. Returns the row
+    /// to use.
+    pub(crate) fn reanchor(&mut self, row: Option<usize>) -> usize {
+        if let Some(r) = row {
+            self.caret.0 = r.max(1);
+        }
         self.live = None;
         self.caret.0
     }
@@ -1095,10 +1098,10 @@ mod apply_tests {
         let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
         assert_eq!(cache.anchor(), 5);
         cache.note_lines(3, 10);
-        assert_eq!(cache.caret_row(), 8);
+        assert_eq!(cache.caret.0, 8);
         assert_eq!(cache.anchor(), 8, "live frame invalidated");
         cache.note_lines(100, 10);
-        assert_eq!(cache.caret_row(), 10, "clamped to the screen");
+        assert_eq!(cache.caret.0, 10, "clamped to the screen");
     }
 
     #[test]
@@ -1106,8 +1109,27 @@ mod apply_tests {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
         let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(3), 3);
+        assert_eq!(cache.reanchor(Some(3)), 3);
         assert_eq!(cache.anchor(), 3);
+    }
+
+    /// Plan §9 latent issue 2: a DSR *timeout* is still a re-anchor — the
+    /// tracked row stands (nothing better is known), but the live frame must
+    /// be invalidated all the same ("any uncertainty → clear it"), so the
+    /// next apply takes the full path instead of a partial diff against a
+    /// screen that may have changed under us.
+    #[test]
+    fn reanchor_fallback_keeps_row_but_invalidates() {
+        let mut cache = DrawCache::new(10);
+        let f = lines_frame(&["x"], 20);
+        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        assert_eq!(cache.reanchor(None), 5, "tracked row stands");
+        assert!(cache.live.is_none(), "live frame must be invalidated");
+        // Identical frame, same anchor: the partial path would emit nothing
+        // but the caret; the full path clears the region below the frame.
+        let anchor = cache.anchor();
+        let s = plan_apply(&mut cache, &f, anchor, ApplyPolicy::Frame, 20, 10);
+        assert!(s.contains("\x1b[K"), "full path required: {s:?}");
     }
 
     /// Ports the old `Repl::next_input_row` cases (folded into the apply

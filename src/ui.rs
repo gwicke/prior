@@ -74,7 +74,9 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
         return ConfirmResult::Selected(idx);
     }
 
-    // Pause the background reader.
+    // Pause the background reader; `resolve()` releases it on every exit
+    // from the key loop (plan §9 latent issue 1: a gate left raised freezes
+    // every later in-flight reader).
     if let Some(gate) = out.confirm_gate() {
         gate.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -188,6 +190,14 @@ fn draw_dialog(
 /// parks the cursor on the region's first row, so the optional decision
 /// line lands exactly where the dialog was.
 fn resolve(out: &dyn Output, spec: &ConfirmSpec<'_>, result: ConfirmResult) -> ConfirmResult {
+    // Release the in-flight reader gate raised on entry: the dialog is done
+    // with stdin, and a gate left raised would leave every later in-flight
+    // reader born paused — Esc/Ctrl-C dead for the rest of the session
+    // (plan §9 latent issue 1). Idempotent for dialogs that never paused
+    // anything (non-interactive outputs return before this point anyway).
+    if let Some(gate) = out.confirm_gate() {
+        gate.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
     out.draw_frame(&Frame::empty(), out.frame_anchor(), ApplyPolicy::Frame);
     if let Some(subject) = &spec.subject {
         // `yes` / `always` / `accept` record; `no` / `cancel` and a dismiss

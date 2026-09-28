@@ -20,6 +20,16 @@ fn main() {
     let out = ConsoleOutput::new(picocode::settings::default_show_reasoning_handle());
     let c: Confirmation = out.confirm(&msg);
 
+    // ui_draw_v2 §9 latent issue 1: the dialog must release the in-flight
+    // reader gate it raised on entry — a gate left raised would leave every
+    // later in-flight reader born paused (Esc/Ctrl-C dead for the session).
+    // Printed *before* RESULT so the harness's RESULT wait implies this
+    // line has been captured too.
+    let gate_released = out
+        .confirm_gate()
+        .map_or(true, |g| !g.load(std::sync::atomic::Ordering::SeqCst));
+    println!("GATE_RELEASED={}", gate_released);
+
     // Print the resolved choice on its own line so the test can read it back.
     println!("RESULT={:?}", c);
 }
