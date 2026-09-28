@@ -261,6 +261,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             ));
         }
         let new_text = replace_lines.join("\n");
+        validate_no_delimiters(&old_text, &new_text)?;
         edits.push(ParsedEdit {
             old_text,
             new_text,
@@ -292,6 +293,37 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         multi_file,
         edits,
     })
+}
+
+/// Check if text contains any of the block delimiters.
+/// Returns the delimiter found, or None if clean.
+fn find_delimiter(text: &str) -> Option<&'static str> {
+    if text.contains(SEARCH_MARKER) {
+        return Some(SEARCH_MARKER);
+    }
+    if text.contains(DIVIDER) {
+        return Some(DIVIDER);
+    }
+    if text.contains(REPLACE_MARKER) {
+        return Some(REPLACE_MARKER);
+    }
+    None
+}
+
+/// Validate that old_text and new_text don't contain block delimiters.
+/// Returns an error if a delimiter is found, indicating which section.
+fn validate_no_delimiters(old_text: &str, new_text: &str) -> Result<(), ParseError> {
+    if let Some(d) = find_delimiter(old_text) {
+        return Err(ParseError(format!(
+            "Invalid edit: block delimiters in {d}! This is likely a mistake, and would break block editing on this file in the future. If it is deliberate, then use the OpenAI single-edit format to insert the delimiters - and use that format on this file in the future."
+        )));
+    }
+    if let Some(d) = find_delimiter(new_text) {
+        return Err(ParseError(format!(
+            "Invalid edit: block delimiters in {d}! This is likely a mistake, and would break block editing on this file in the future. If it is deliberate, then use the OpenAI single-edit format to insert the delimiters - and use that format on this file in the future."
+        )));
+    }
+    Ok(())
 }
 
 /// Compare two path strings the way the rest of the codebase does: resolve
@@ -768,5 +800,47 @@ mod tests {
         let blob = render_blob("src/m.rs", &edits);
         let parsed = parse_blocks(&blob).unwrap();
         assert_eq!(parsed.edits, edits);
+    }
+
+    #[test]
+    fn rejects_old_delimiter_in_new_text() {
+        // @@@OLD in newText should fail
+        let text = "@@@OLD\nold\n@@@NEW\nnew @@@OLD\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err.0.contains("Invalid edit: block delimiters in @@@OLD"));
+    }
+
+    #[test]
+    fn rejects_new_delimiter_in_old_text() {
+        // @@@NEW in oldText should fail
+        let text = "@@@OLD\nold @@@NEW\n@@@NEW\nnew\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err.0.contains("Invalid edit: block delimiters in @@@NEW"));
+    }
+
+    #[test]
+    fn rejects_end_delimiter_in_new_text() {
+        // @@@END in newText should fail
+        let text = "@@@OLD\nold\n@@@NEW\nnew @@@END\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err.0.contains("Invalid edit: block delimiters in @@@END"));
+    }
+
+    #[test]
+    fn rejects_delimiter_in_old_text() {
+        // @@@END in oldText should fail
+        let text = "@@@OLD\nold @@@END\n@@@NEW\nnew\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err.0.contains("Invalid edit: block delimiters in @@@END"));
+    }
+
+    #[test]
+    fn valid_block_still_works() {
+        // Ensure we didn't break normal operation
+        let text = "@@@OLD\nold\n@@@NEW\nnew\n@@@END";
+        let parsed = parse_blocks(text).unwrap();
+        assert_eq!(parsed.edits.len(), 1);
+        assert_eq!(parsed.edits[0].old_text, "old");
+        assert_eq!(parsed.edits[0].new_text, "new");
     }
 }
