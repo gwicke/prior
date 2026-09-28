@@ -296,3 +296,9 @@ clippy clean in touched regions.
    node pair exactly as designed (quiet/pipe compaction accepted without an
    editor). The arm survives with a reachability comment; only the stale claim in
    §6/the E3 record was corrected.
+   **Non-priority (follow-up decision):** the non-REPL path itself is *not a
+   priority* — the four inline arms (`/tree`, `/session`, `/clear`, `/new`) are
+   tolerated as-is, not grown. If scripted slash input ever becomes important,
+   it should go through the **v2.5 menu eval** too — the same dispatch as
+   interactive — with the drawing output ignored (frames are irrelevant with
+   no overlay); one implementation instead of per-command arms.

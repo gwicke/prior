@@ -4161,6 +4161,12 @@ pub async fn run_interactive(
                 // `Repl::read_input`, whose Enter commits as `MenuDone` —
                 // `Submit` never carries `/` text, and the engine's tree
                 // nodes do the work there.
+                //
+                // Non-priority: this typed path is tolerated, not grown. If
+                // scripted slash input ever matters, route raw lines through
+                // the v2.5 menu eval (same dispatch as interactive) with the
+                // drawing output ignored — not more per-command arms
+                // (doc/editor_cleanup.md §10.9).
                 if let Some(rest) = input.strip_prefix("/tree") {
                     let rest = rest.trim();
                     let (target_id, action, mode, summarize, llm_payload) = parse_tree_args(rest);
