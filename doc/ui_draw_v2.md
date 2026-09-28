@@ -181,8 +181,10 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 
 **`cursor_row()` is the explicit re-anchor primitive.** It keeps the historical
 behavior — DSR with a tracked fallback — and additionally stores the answer into
-`caret.0` and clears `live` (a caller asking to re-anchor cannot trust the frame
-region). Since P3 the REPL's steady-state reads go through `frame_anchor()`;
+`caret.0` (the tracked row when the DSR timed out) and clears `live` in *both*
+cases: a caller asking to re-anchor cannot trust the frame region, and a
+fallback is no more trustworthy than an answer (§9 latent issue 2).
+Since P3 the REPL's steady-state reads go through `frame_anchor()`;
 `cursor_row()` remains at the true re-anchor sites: entry into `read_input` and
 `ui::confirm`, resize, editor exit, Ctrl-Z resume.
 
@@ -405,25 +407,33 @@ emit logic" into a real safety net for P2–P3.
 ## 9. Follow-ups & take-aways (post-implementation)
 
 Recorded while implementing P0–P5. None of these block the shipped pipeline;
-the first two are latent bugs that pre-date ui_draw_v2.
+the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 
-### Latent issues
+### Latent issues (both fixed)
 
 1. **The confirm gate is never released.** `ui::confirm` stores `true` into
    `confirm_gate()` before drawing, and nothing ever stores `false` — but the
    in-flight reader checks that flag every tick. So after the *first*
    interactive confirm, every later in-flight reader is born paused and
-   ignores Esc/Ctrl-C for the rest of the session. Fix: release the gate when
-   the dialog resolves (every post-pause exit goes through `resolve()`).
-   Pre-dates the draw work; orthogonal to it, hence untouched in P4.
+   ignores Esc/Ctrl-C for the rest of the session (the mid-turn Esc handler
+   died exactly this way). Fix: release the gate when the dialog resolves
+   (every post-pause exit goes through `resolve()`). Pre-dates the draw work;
+   orthogonal to it, hence untouched in P4.
+   **Fixed:** `ui::resolve()` now stores `false` — restoring the release the
+   pre-refactor `ConsoleOutput::confirm` had before the driver moved into
+   `ui.rs`. Pinned by `confirm_releases_reader_gate_on_resolve`.
 
 2. **DSR fallback leaves `live` intact.** `ConsoleOutput::cursor_row()`
-   clears `live` only when the terminal *answers*; on timeout it returns the
-   tracked `caret_row()` without invalidating. A foreign writer on a silent
+   cleared `live` only when the terminal *answered*; on timeout it returned
+   the tracked row without invalidating. A foreign writer on a silent
    terminal (headless pty) can therefore still take the partial path against
    a changed screen. The §4.2 contract says "any uncertainty → clear it" —
    the fallback should clear `live` too. Costs nothing (the next apply just
    takes the full path).
+   **Fixed:** `DrawCache::reanchor` now takes the DSR answer as an
+   `Option<usize>` — `Some(row)` records the row, `None` (timeout) keeps the
+   tracked one — and clears `live` in both cases. Pinned by
+   `reanchor_fallback_keeps_row_but_invalidates`.
 
 ### Small robustness cleanups
 
