@@ -56,7 +56,7 @@ impl Table {
             min_widths: vec![3; n],
             priorities: vec![1; n],
             rows: Vec::new(),
-            gap: 2,
+            gap: 1,
             ellipsis: '…',
         }
     }
@@ -79,7 +79,7 @@ impl Table {
         self
     }
 
-    /// Set the number of spaces between columns (default 2).
+    /// Set the number of spaces between columns (default 1).
     pub fn set_gap(mut self, gap: usize) -> Self {
         self.gap = gap;
         self
@@ -933,18 +933,18 @@ mod tests {
         t.add_row(&["longer", "zz"]);
         let rows = t.render(80);
         assert_eq!(rows.len(), 2);
-        // Natural widths: A=6 ("longer"), B=2 ("zz"), gap=2 => total 10, which
-        // fits in 80. The 70 cols of slack are absorbed by the last column, so
+        // Natural widths: A=6 ("longer"), B=2 ("zz"), gap=1 => total 9, which
+        // fits in 80. The 71 cols of slack are absorbed by the last column, so
         // every row spans the full width and columns stay aligned.
         assert_eq!(display_width(&rows[0]), 80);
         assert_eq!(display_width(&rows[1]), 80);
-        let col1 = 6 + 2;
+        let col1 = 6 + 1;
         assert!(rows[0][col1..].starts_with('y'));
         assert!(rows[1][col1..].starts_with("zz"));
         // B is left-aligned within its grown column, so trailing padding only.
-        // (Col A is padded to its natural width 6, then a 2-space gap, then B.)
-        assert_eq!(rows[0].trim_end(), "x       y");
-        assert_eq!(rows[1].trim_end(), "longer  zz");
+        // (Col A is padded to its natural width 6, then a 1-space gap, then B.)
+        assert_eq!(rows[0].trim_end(), "x      y");
+        assert_eq!(rows[1].trim_end(), "longer zz");
     }
 
     #[test]
@@ -988,10 +988,10 @@ mod tests {
             .with_min_widths(&[3, 3, 3]);
         t.add_row(&["abcdef", "123456", "ghijkl"]);
         // Width 5 -> content 4 + ellipsis 1.
-        let rows = t.render(5 + 2 + 5 + 2 + 5);
+        let rows = t.render(5 + 1 + 5 + 1 + 5);
         let r = &rows[0];
-        // Split on the 2-space gap.
-        let parts: Vec<&str> = r.split("  ").collect();
+        // Split on the 1-space gap.
+        let parts: Vec<&str> = r.split(' ').collect();
         assert_eq!(parts.len(), 3);
         assert!(
             parts[0].ends_with('…'),
