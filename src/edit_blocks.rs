@@ -190,7 +190,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 }
                 // Any other delimiter (@@@OLD or @@@END) is invalid in OLD section
                 return Err(ParseError(format!(
-                    "unexpected delimiter `{m}` in OLD section; expected `@@@NEW`"
+                    "unexpected delimiter `{m}` in @@@OLD section; expected `@@@NEW`"
                 )));
             }
             search_lines.push(&lines[j]);
@@ -198,7 +198,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if j >= lines.len() {
             return Err(ParseError(format!(
-                "an `@@@OLD` / `@@@NEW` block is missing its `@@@NEW` divider"
+                "an edit block is missing its `@@@NEW` section"
             )));
         }
 
@@ -213,7 +213,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 }
                 // Any other delimiter (@@@OLD or @@@NEW) is invalid in NEW section
                 return Err(ParseError(format!(
-                    "unexpected delimiter `{m}` in NEW section; expected `@@@END`"
+                    "unexpected delimiter `{m}` in @@@OLD section; expected `@@@END`"
                 )));
             }
             replace_lines.push(&lines[k]);
@@ -221,7 +221,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         }
         if k >= lines.len() {
             return Err(ParseError(format!(
-                "an `@@@OLD` block is missing its `@@@END` marker"
+                "an `@@@OLD` section is missing its `@@@END` marker"
             )));
         }
 
