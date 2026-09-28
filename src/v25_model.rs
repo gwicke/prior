@@ -294,9 +294,7 @@ pub fn model_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
         ColumnDef::new("id", "Model").min(12).prio(3),
-        ColumnDef::new("context", "Ctx")
-            .align(Align::Right)
-            .prio(1),
+        ColumnDef::new("context", "Ctx").align(Align::Right).prio(1),
         ColumnDef::new("coding", "Coding")
             .align(Align::Right)
             .prio(1),
