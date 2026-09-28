@@ -1547,7 +1547,7 @@ impl Output for ConsoleOutput {
                 self.set_blank(true);
             }
             self.note_text();
-        } else {
+        } else if *self.last_was_tool.lock().unwrap() {
             if !self.ended_blank() {
                 let _ = out.write_all(b"\n");
                 self.note_lines(1);
