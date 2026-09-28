@@ -1,6 +1,6 @@
 # Editor cleanup — one wrapper, node-driven editing
 
-Status: **E1b + E1 + E2 + E3 + E4 done** — all phases complete. Rebased onto
+Status: **E1b + E1 + E2 + E3 + E4 + E5 done** — all phases complete. Rebased onto
 `origin/main` @ `c705add` (which fixed `ui_draw_v2.md` §9 #1/#2 — see §2.3).
 Companion to `doc/ui_draw_v2.md` §9.
 
@@ -11,6 +11,7 @@ Companion to `doc/ui_draw_v2.md` §9.
 | E2 | `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch + `v25_listing_node.rs` | ✅ this change |
 | E3 | compaction split; `prepare()`/`submit()`; drop review/confirm plumbing | ✅ this change |
 | E4 | cleanup + doc updates | ✅ this change |
+| E5 | typed non-REPL slash dispatch → v2.5 batch eval | ✅ this change |
 
 ## 1. Goals
 
@@ -172,12 +173,14 @@ height-resize-during-edit case; no correctness path depended on it.
   `NodeEntry` arms `confirm_pending`, Enter runs `submit()`, Esc aborts. No
   confirmation dialog exists anywhere in the compaction path anymore.
 - `header()` carries the guidance ("Enter opens $EDITOR; then Enter writes, Esc aborts").
-- The typed `/tree … compact` arm drives the *same node pair* (`prepare` → `submit`
-  back-to-back; the typed Enter stands in for the engine's confirm key) — one code
-  path for generate/edit/apply. **Verified reachable in E4 (§10.9)**: it is the
-  non-REPL (quiet / piped stdin) command path — interactive slash input never
-  reaches `Submit`, but scripted input does, so the arm stays (carries a
-  reachability comment on the arm).
+- Non-REPL slash input has no typed arms anymore (E5): `Repl::batch_slash` runs
+  a complete line through the v2.5 engine as a batch — passive derive +
+  virtual `Enter` presses (`Prepared` confirms take a second press; an Enter
+  that *navigates* stops the sequence so blind presses never act on an
+  unchosen row) — dropping `Continue` plans (no overlay paints without a
+  REPL) and echoing commits like `emit_commit`. One dispatch for interactive
+  and scripted input; the four `/tree`/`/session`/`/clear`/`/new` arms and
+  their private helpers are deleted (§9 E5).
 
 ## 7. Async? — No, keep it blocking (decided)
 
@@ -261,6 +264,33 @@ is a blocking read by design.
   Phase 7). No new pty test: `e2e_session_state.rs` already drives interactive
   slash commands through `read_input`'s engine path, and the node-level tests
   cover the arm's mechanics.
+- **E5** ✅ this change: **typed non-REPL dispatch removed — scripted slash
+  input goes through the v2.5 engine.** Deleted the four Submit-arm slash arms
+  plus `parse_tree_args`/`TreeAction`/`handle_session_command`/
+  `SessionCommandResult`/`build_summary_prompt`/
+  `collect_entries_for_branch_summary`/`parse_session_name_after` and the
+  parser tests (~730 lines). New `Repl::batch_slash` (`repl.rs`): evaluated in
+  the **input position** (before the loop's convergence step, so control and
+  target writes land the same cycle as an interactive `MenuDone`); key
+  mapping = passive `HostKey::None` + virtual `Enter`s with the navigation
+  guard (returned prompt moved → a listing drill → stop); `Continue` plans are
+  dropped (drawing is host-side) and commits echo through `batch_commit`
+  (history + `display_plain` + message — the `emit_commit` equivalent without
+  a frame). `/q` and `exit` keep their loop arm. **Casualty:**
+  `switch --summarize`'s only implementation left with the typed arm (the
+  engine's switch node never had it) — `doc/todo.md` is now its sole tracker.
+  Tests: 4 batch tests (one-Enter `/thinking high` commit, `/quit` latches the
+  control target, non-slash//`/q` fall through to `Submit`, unknown input
+  returns instead of hanging) plus 1 in-process `run_interactive` test
+  (scripted `Output` feeding `/thinking high` + `/quit`: the commit echo
+  proves `batch_slash` ran, the consumed queue proves `quit` landed on its
+  own cycle — input-position eval → `MenuDone` → same-cycle convergence).
+  Host reality found while verifying: the binary never yields non-REPL
+  input (`QuietOutput::get_user_input` is an always-empty stub; piped
+  stdin was never a command source) — the supported hosts are
+  in-process/scripted ones, so a spawned pipe e2e was removed as a wrong
+  premise, and the pre-existing empty-input spin is logged in
+  `doc/todo.md`.
 
 Gate: `cargo test --features test-utils` (includes `confirm_raw_mode`), `cargo fmt --check`,
 clippy clean in touched regions.
@@ -296,9 +326,16 @@ clippy clean in touched regions.
    node pair exactly as designed (quiet/pipe compaction accepted without an
    editor). The arm survives with a reachability comment; only the stale claim in
    §6/the E3 record was corrected.
-   **Non-priority (follow-up decision):** the non-REPL path itself is *not a
-   priority* — the four inline arms (`/tree`, `/session`, `/clear`, `/new`) are
-   tolerated as-is, not grown. If scripted slash input ever becomes important,
-   it should go through the **v2.5 menu eval** too — the same dispatch as
-   interactive — with the drawing output ignored (frames are irrelevant with
-   no overlay); one implementation instead of per-command arms.
+  **Non-priority (follow-up decision):** the non-REPL path itself is *not a
+  priority* — the four inline arms (`/tree`, `/session`, `/clear`, `/new`) are
+  tolerated as-is, not grown. If scripted slash input ever becomes important,
+  it should go through the **v2.5 menu eval** too — the same dispatch as
+  interactive — with the drawing output ignored (frames are irrelevant with
+  no overlay); one implementation instead of per-command arms.
+  **Executed (E5):** the arms are deleted and `Repl::batch_slash` implements
+  exactly that — the v2.5 eval with drawing ignored (§9 E5). E4's "scripted
+  input reaches the arm" overstated the *binary* case: the binary never
+  reads command lines from a pipe (`QuietOutput::get_user_input` is an
+  always-empty stub — pre-existing, see `doc/todo.md`), so the real
+  non-REPL consumers are in-process/embedded hosts with a reading `Output` —
+  which makes the deletion even more clearly correct.

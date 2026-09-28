@@ -1296,10 +1296,11 @@ Accept/Cancel overlay:
    epoch or a consumed stash is rejected with
    `[ERROR]: No fresh prepared summary — press Enter to generate one.`
    and the next Enter regenerates.
-3. The typed `/tree <id> compact …` entry point drives the same node pair
-   back-to-back (`prepare` then `submit` — the typed Enter *is* the
-   confirmation; agent.rs carries a reachability note: interactive slash
-   input never reaches that arm, quiet/pipe input does).
+3. Entry points: interactively the engine drives the flow key by key; a
+   non-REPL host (in-process / scripted input) runs the same line through
+   `Repl::batch_slash` — passive derive + virtual Enter (`Prepared` takes
+   a second press; a navigating Enter stops the sequence) with no overlay
+  drawing.
 
 Without an interactive tty (quiet / pipe / tests) `edit_text` reports
 `Unsupported` and the generated draft is accepted as-is — the pre-split

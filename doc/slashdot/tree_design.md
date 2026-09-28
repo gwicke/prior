@@ -179,10 +179,11 @@ The three nodes share `compact_prepare` / `edit_draft` / `compact_submit`
   `(target, epoch)` and returns `SubmitResult::Prepared` — the engine's
   `NodeEntry` confirm then gates `submit()` behind Enter (apply via
   `agent::apply_compaction`) / Esc (cancel in place).
-- The typed `/tree <id> compact …` arm in `agent.rs` drives the same
-  node pair back-to-back (typed Enter = confirmation); it is reachable
-  only in non-REPL mode (quiet / piped stdin — see the reachability note
-  on the arm).
+- Non-REPL hosts (in-process / scripted input) run the same nodes through
+  `Repl::batch_slash` — a batch eval (passive derive + virtual Enter,
+  `Prepared` confirms take a second press) with no overlay drawing; the
+  old typed `/tree … compact` arm in `agent.rs` was deleted
+  (doc/editor_cleanup.md §9 E5).
 
 (The original `AsyncOp::TreeCompact` control-target design sketched in
 this plan was never built that way — there is no `AsyncOp` in the code;

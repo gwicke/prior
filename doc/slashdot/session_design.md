@@ -281,9 +281,11 @@ After the v2.5 session nodes are working:
 3. Remove `ActiveOverlay::Confirm` variant (delete confirm is now §9)
 4. Remove `session_action_overlay_entries()` and related v2.0 methods
 5. Remove `SessionProvider` (replaced by `SessionListNode::data()`)
-6. The `handle_session_command()` function in agent.rs stays — its logic
-   is reused by the AsyncOp dispatch. The string-parsing entry point is
-   removed (no longer called from the REPL input path).
+6. ~~The `handle_session_command()` function in agent.rs stays~~ — since
+   editor cleanup E5 the typed dispatcher itself is deleted; the session
+   node's `submit` (+ shared `resume_session`/`fork_session_at` helpers)
+   owns the logic, and scripted input reaches it through
+   `Repl::batch_slash`.
 
 ---
 

@@ -2216,39 +2216,6 @@ pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
     n.max(1)
 }
 
-/// Result of handling a `/session` command.
-#[derive(Debug)]
-enum SessionCommandResult {
-    /// Input was not a session command (pass through).
-    NotSession,
-    /// Session command handled, current session unchanged.
-    Handled,
-    /// Session command created/resumed a new session with this ID. `prefill`
-    /// is pre-loaded into the next input prompt (use `None` for no prefill,
-    /// e.g. on fork; `Some("/model …")` on resume to surface the restored
-    /// model to the user for explicit confirmation).
-    Switched { id: String, prefill: Option<String> },
-    /// Session command deleted a session.
-    Deleted,
-}
-
-/// Parse the session name and remaining text from a `/session <rest>` string.
-pub(crate) fn parse_session_name_after(rest: &str) -> (String, String) {
-    if rest.starts_with('"') {
-        if let Some(end) = rest[1..].find('"').map(|i| i + 2) {
-            let n = rest[1..end - 1].to_string();
-            let after = rest[end..].trim().to_string();
-            (n, after)
-        } else {
-            (String::new(), String::new())
-        }
-    } else {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let n = parts.next().unwrap_or("").to_string();
-        (n, parts.next().unwrap_or("").to_string())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Session replay helpers
 // ---------------------------------------------------------------------------
@@ -2780,204 +2747,6 @@ async fn compute_resume_model_prefill(session: &Session, live_model_id: &str) ->
     }
     Some(format!("/model {}", recorded))
 }
-/// Parse and dispatch a `/session <name> <action>` command.
-///
-/// `config` is *not* mutated on resume anymore: the running agent keeps
-/// whatever model it had before, and the restored session's stored model is
-/// surfaced to the user via a `/model <…>` prefill on the next prompt (see
-/// `compute_resume_model_prefill`). This keeps the accept/abort/choose
-/// decision in the user's hands.
-async fn handle_session_command(
-    input: &str,
-    session: &mut Option<Arc<Session>>,
-    repo: &mut Option<crate::session::repo::JsonlSessionRepo>,
-    config: &mut AgentConfig,
-    output: &Arc<dyn Output>,
-    settings: &SettingsStore,
-) -> SessionCommandResult {
-    let input = input.trim();
-    if !input.starts_with("/session") {
-        return SessionCommandResult::NotSession;
-    }
-
-    let rest = input["/session".len()..].trim();
-
-    // Strip leading path: filter if the user typed it manually (overlay-only token).
-    let rest = if let Some(r) = rest.strip_prefix("path:") {
-        r.trim_start()
-            .split_once(char::is_whitespace)
-            .map(|(_, after)| after.trim())
-            .unwrap_or("")
-    } else {
-        rest
-    };
-
-    if rest.is_empty() {
-        return SessionCommandResult::Handled;
-    }
-
-    let (name, after_name) = parse_session_name_after(rest);
-
-    if name.is_empty() {
-        return SessionCommandResult::Handled;
-    }
-
-    let (action, arg) = if let Some((a, r)) = after_name.split_once(char::is_whitespace) {
-        (a.to_string(), Some(r.trim().to_string()))
-    } else {
-        (after_name.clone(), None)
-    };
-
-    let action = action.to_lowercase();
-
-    let meta = if let Some(repo) = repo {
-        repo.list(None)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .find(|m| m.name.as_deref() == Some(&name) || m.id == name)
-    } else {
-        None
-    };
-
-    match action.as_str() {
-        "resume" => {
-            if let Some(meta) = meta {
-                // Parse optional replay length from argument: N, Nt, or Nl.
-                let default = settings.session_resume_replay_turns;
-                let (count, is_lines) = arg
-                    .as_deref()
-                    .map(|s| crate::agent::parse_replay_len_arg(s, default))
-                    .unwrap_or((default, false));
-                // Load/migrate/replay/prefill — shared with the inline
-                // resume node (`resume_session` owns the rationale).
-                match resume_session(
-                    repo.as_ref().unwrap(),
-                    &meta,
-                    (count, is_lines),
-                    output.as_ref(),
-                    &config.qualified_model_id(),
-                )
-                .await
-                {
-                    Ok((new_session, id, prefill)) => {
-                        *session = Some(new_session);
-                        SessionCommandResult::Switched { id, prefill }
-                    }
-                    Err(msg) => {
-                        config.output.display_text(&msg);
-                        SessionCommandResult::Handled
-                    }
-                }
-            } else {
-                config
-                    .output
-                    .display_text(&format!("Session not found: {}", name));
-                SessionCommandResult::Handled
-            }
-        }
-        "fork" => {
-            if let Some(meta) = meta {
-                match fork_session_at(repo.as_ref().unwrap(), &meta).await {
-                    Ok((new_session, id)) => {
-                        *session = Some(new_session);
-                        SessionCommandResult::Switched { id, prefill: None }
-                    }
-                    Err(msg) => {
-                        config.output.display_text(&msg);
-                        SessionCommandResult::Handled
-                    }
-                }
-            } else {
-                config
-                    .output
-                    .display_text(&format!("Session not found: {}", name));
-                SessionCommandResult::Handled
-            }
-        }
-        "rename" => {
-            let new_name = arg.unwrap_or_default();
-            if new_name.is_empty() {
-                config
-                    .output
-                    .display_text("Usage: /session <name> rename <newname>");
-                return SessionCommandResult::Handled;
-            }
-            if let Some(ref s) = session {
-                let cur_id = s.get_session_id().to_string();
-                if Some(&cur_id) == meta.as_ref().map(|m| &m.id) {
-                    let _ = s.set_session_name(&new_name).await;
-                    // Refresh the repo's metadata cache so that the listing picks up the new name immediately
-                    if let Some(ref repo) = repo {
-                        repo.invalidate_cache();
-                    }
-                } else if let Some(meta) = meta {
-                    let repo = repo.as_ref().unwrap();
-                    match repo.open(&meta).await {
-                        Ok((storage, index)) => {
-                            let s = Session::new_persisted(storage, index);
-                            let _ = s.set_session_name(&new_name).await;
-                            // Refresh the repo's metadata cache so that the listing picks up the new name immediately
-                            repo.invalidate_cache();
-                        }
-                        Err(e) => {
-                            config
-                                .output
-                                .display_text(&format!("Cannot open session: {}", e));
-                        }
-                    }
-                } else {
-                    config
-                        .output
-                        .display_text(&format!("Session not found: {}", name));
-                }
-            }
-            SessionCommandResult::Handled
-        }
-        "delete" => {
-            if let Some(meta) = meta {
-                if let Some(ref s) = session {
-                    if s.get_session_id() == meta.id {
-                        config
-                            .output
-                            .display_text("Cannot delete the current session");
-                        return SessionCommandResult::Handled;
-                    }
-                }
-                match repo.as_ref().unwrap().delete(&meta).await {
-                    Ok(()) => SessionCommandResult::Deleted,
-                    Err(e) => {
-                        config
-                            .output
-                            .display_text(&format!("Cannot delete session: {}", e));
-                        SessionCommandResult::Handled
-                    }
-                }
-            } else {
-                config
-                    .output
-                    .display_text(&format!("Session not found: {}", name));
-                SessionCommandResult::Handled
-            }
-        }
-        _ => {
-            config
-                .output
-                .display_text(&format!("Unknown session action: {}", action));
-            SessionCommandResult::Handled
-        }
-    }
-}
-
-/// Tree action selected from the `/tree` overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TreeAction {
-    /// Move the session leaf pointer to the target (today's behavior).
-    Switch,
-    /// Append a `Compaction` entry with `firstKeptEntryId = target`, then let
-    /// `build_context()` scope the agent context at that point.
-    Compact,
-}
 
 /// Summary mode for `/tree compact`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3003,96 +2772,6 @@ pub(crate) enum CompactSummaryMode {
     /// Accepts an optional trailing free-text payload (the user-editable
     /// instruction); when empty, `settings.llm_compact_prompt()` is used.
     Llm,
-}
-
-/// Parse `/tree <target_id> [switch [--summarize] | compact [manual|text-only|llm [<payload>]]]`.
-/// The bare `/tree <id> --summarize` form is accepted as an alias for
-/// `switch --summarize` (backward compat). Only committed canonical lines (or
-/// hand-typed canonical/alias forms) reach this parser — sub-menu filter
-/// fragments are consumed by the overlay's fuzzy/pre-selection logic.
-/// For `compact llm`, the trailing free-text payload (whitespace-joined,
-/// no quote parsing — matches `rename`/`set`) is returned in the last
-/// tuple slot; empty for the other modes.
-fn parse_tree_args(rest: &str) -> (String, TreeAction, Option<CompactSummaryMode>, bool, String) {
-    let mut summarize = false;
-    let mut target = String::new();
-    let mut action = TreeAction::Switch;
-    let mut mode: Option<CompactSummaryMode> = None;
-    let mut llm_payload = String::new();
-    let mut seen_compact = false;
-    let mut after_mode = false;
-    for part in rest.split_whitespace() {
-        match part {
-            "--summarize" | "-s" => summarize = true,
-            "switch" => action = TreeAction::Switch,
-            "compact" => {
-                action = TreeAction::Compact;
-                seen_compact = true;
-            }
-            // Primary mode token is now `manual` (the user-editable
-            // pre-fill of the touched-files list). `truncate` / `none` /
-            // `no-summary` remain recognized as deprecated aliases for
-            // muscle-memory / session-log back-compat; the empty-summary
-            // behavior is preserved when the dropped span touches no
-            // files.
-            "manual" | "truncate" | "none" | "no-summary" if seen_compact && !after_mode => {
-                mode = Some(CompactSummaryMode::Manual)
-            }
-            "text-only" | "text" if seen_compact && !after_mode => {
-                mode = Some(CompactSummaryMode::TextOnly)
-            }
-            "llm" | "summary" if seen_compact => {
-                mode = Some(CompactSummaryMode::Llm);
-                after_mode = true;
-            }
-            id if !seen_compact => {
-                // The overlay commits the id angle-bracketed (`/tree <id>
-                // switch`); strip the brackets — the raw id is what move_leaf
-                // / get_entry expect.
-                let t = id.trim();
-                let t = t.strip_prefix('<').unwrap_or(t);
-                let t = t.strip_suffix('>').unwrap_or(t);
-                target = t.to_string();
-            }
-            // Anything after the `llm` token is part of the payload;
-            // re-join with single spaces so multi-word prompts survive
-            // split_whitespace's collapse.
-            _ if after_mode && mode == Some(CompactSummaryMode::Llm) => {
-                if !llm_payload.is_empty() {
-                    llm_payload.push(' ');
-                }
-                llm_payload.push_str(part);
-            }
-            _ => {}
-        }
-    }
-    (target, action, mode, summarize, llm_payload)
-}
-
-/// Build a summarization prompt from a list of session entries.
-/// Produces a concise [role] / text transcript of the abandoned branch.
-fn build_summary_prompt(entries: &[crate::session::SessionEntry]) -> String {
-    let mut text = String::from("Summarize the following conversation branch concisely. Focus on the key decisions, findings, and outcomes:\n\n");
-    for entry in entries {
-        if let crate::session::SessionEntryContent::Message { message } = &entry.content {
-            if let Some(role) = message.get("role").and_then(|r| r.as_str()) {
-                let content = message
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .unwrap_or_default();
-                if !content.is_empty() {
-                    text.push_str(&format!("[{}] {}\n", role, content));
-                }
-            }
-        }
-    }
-    text
 }
 
 /// Build the LLM-bound conversation prefix for the session's current leaf.
@@ -3122,34 +2801,6 @@ async fn session_context_messages(
         provider,
         model,
     ))
-}
-
-/// Walk from `old_leaf` to root and from `new_target` to root, find the common
-/// ancestor, and return `(abandoned_entries, common_ancestor_id)`.
-///
-/// `get_path_to_root` returns entries in root→leaf order.
-fn collect_entries_for_branch_summary(
-    index: &crate::session::SessionIndex,
-    old_leaf: &str,
-    new_target: &str,
-) -> (Vec<crate::session::SessionEntry>, String) {
-    let old_path = index.get_path_to_root(old_leaf);
-    let new_path = index.get_path_to_root(new_target);
-
-    let common_len = old_path
-        .iter()
-        .zip(new_path.iter())
-        .take_while(|(a, b)| a.id == b.id)
-        .count();
-
-    let common_ancestor_id = common_len
-        .checked_sub(1)
-        .and_then(|i| old_path.get(i))
-        .map(|e| e.id.clone())
-        .unwrap_or_default();
-
-    let abandoned = old_path.into_iter().skip(common_len).collect();
-    (abandoned, common_ancestor_id)
 }
 
 /// Walk the active branch (root → leaf) and return the entry id that
@@ -3491,8 +3142,7 @@ pub(crate) async fn ensure_session(
 }
 
 /// Fork a session (full tree, current dir) into a fresh `Arc<Session>` —
-/// shared by the inline fork node and `handle_session_command`. The
-/// caller activates it (slot) or stores it (typed path's local write).
+/// used by the session node's fork action; the caller activates it (slot).
 pub(crate) async fn fork_session_at(
     repo: &crate::session::repo::JsonlSessionRepo,
     meta: &crate::session::SessionMetadata,
@@ -3520,8 +3170,8 @@ pub(crate) async fn fork_session_at(
     }
 }
 
-/// Load a session by meta and switch to it (the `/session resume`
-/// action — shared by the typed path and the inline resume node).
+/// Load a session by meta and switch to it (the `/session <id> resume`
+/// action — used by the session node's `submit`).
 /// Migrates to the current cwd when the session lives elsewhere (fork
 /// + delete original), replays `(count, is_lines)` through `output`,
 /// and computes the `/model` prefill against `qualified_id`.
@@ -3742,7 +3392,7 @@ pub async fn run_interactive(
         .clone()
         .or_else(|| crate::platform::app_config_dir().map(|d| d.join("sessions")));
     let cwd = std::env::current_dir().ok();
-    let mut repo: Option<crate::session::repo::JsonlSessionRepo> =
+    let repo: Option<crate::session::repo::JsonlSessionRepo> =
         if let (Some(dir), Some(_)) = (&sessions_dir, &cwd) {
             let repo = crate::session::repo::JsonlSessionRepo::new(dir.clone());
             // Repo is created eagerly (just a path); the session object is also
@@ -3828,7 +3478,7 @@ pub async fn run_interactive(
     // first prompt already has the slash command queued — the user presses
     // Enter once and goes through the exact same code path as a manual
     // `/session`, Tab, Enter: the REPL parses `/session <id> resume`, the
-    // `handle_session_command` dispatch opens + replays the session, and the
+    // session node's `submit` opens + replays the session, and the
     // usual `/model …` prefill flows back into the slot's prefill
     // second prompt. This keeps the history and UX identical to a typed
     // resume (including the model-overlay catalog fetch that needs the
@@ -3887,7 +3537,27 @@ pub async fn run_interactive(
                 )
                 .await
             }
-            None => Some(InputAction::Submit(config.output.get_user_input())),
+            None => {
+                // Non-REPL input (quiet / piped stdin): `/`-prefixed lines
+                // go through the v2.5 engine as a batch (passive derive +
+                // virtual Enter — `Repl::batch_slash`), with no overlay
+                // drawing; everything else is raw `Submit` text. This runs
+                // BEFORE the convergence step below, so control/target
+                // writes land the same cycle as an interactive `MenuDone`
+                // (doc/editor_cleanup.md §10.9).
+                let input = config.output.get_user_input();
+                match Repl::batch_slash(
+                    &app_state,
+                    &input,
+                    config.output.as_ref(),
+                    &mut line_history,
+                )
+                .await
+                {
+                    Some(action) => Some(action),
+                    None => Some(InputAction::Submit(input)),
+                }
+            }
         };
         let action = match action {
             Some(a) => a,
@@ -4146,324 +3816,6 @@ pub async fn run_interactive(
                             }
                             Err(e) => {
                                 config.output.display_text(&format!("shell error: {}", e));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Handle `/tree <target_id>` commands — navigate or compact.
-                //
-                // Reachability (doc/editor_cleanup.md §10.9): typed slash
-                // input reaches this block ONLY in non-REPL mode
-                // (`use_repl = stdin().is_terminal() && !config.quiet` is
-                // false → raw `get_user_input` lines). Interactively every
-                // `/`-prefixed buffer is owned by the v2.5 engine inside
-                // `Repl::read_input`, whose Enter commits as `MenuDone` —
-                // `Submit` never carries `/` text, and the engine's tree
-                // nodes do the work there.
-                //
-                // Non-priority: this typed path is tolerated, not grown. If
-                // scripted slash input ever matters, route raw lines through
-                // the v2.5 menu eval (same dispatch as interactive) with the
-                // drawing output ignored — not more per-command arms
-                // (doc/editor_cleanup.md §10.9).
-                if let Some(rest) = input.strip_prefix("/tree") {
-                    let rest = rest.trim();
-                    let (target_id, action, mode, summarize, llm_payload) = parse_tree_args(rest);
-                    if target_id.is_empty() {
-                        // No target: the overlay is already open from from_buffer.
-                        continue;
-                    }
-
-                    match action {
-                        TreeAction::Switch => {
-                            if let Some(s) = app_state.session() {
-                                let old_leaf_id = s.get_leaf_id().await;
-                                if old_leaf_id.as_deref() != Some(target_id.as_str()) {
-                                    // Summarize the abandoned branch if requested.
-                                    if summarize {
-                                        if let Some(old_leaf) = old_leaf_id.as_deref() {
-                                            let (abandoned, common_ancestor_id) = {
-                                                let index = s.index().lock().await;
-                                                collect_entries_for_branch_summary(
-                                                    &index, old_leaf, &target_id,
-                                                )
-                                            };
-                                            if !abandoned.is_empty() {
-                                                config.output.display_thinking(
-                                                    "Summarizing abandoned branch...",
-                                                );
-                                                // Lazy agent build, mirroring the
-                                                // `compact llm` arm: a
-                                                // `/tree <id> switch --summarize`
-                                                // right after `/session resume`
-                                                // (before any prompt) would
-                                                // otherwise hit the `None` arm
-                                                // below and silently skip the
-                                                // summary. A non-empty abandoned
-                                                // branch is the signal that an
-                                                // LLM call is needed, so we
-                                                // build the agent on demand and
-                                                // store it for the next prompt
-                                                // to reuse.
-                                                let mut agent = app_state.agent();
-                                                if agent.is_none() {
-                                                    match create_agent(config.clone()).await {
-                                                        Ok(a) => {
-                                                            app_state.activate_agent(Arc::from(a));
-                                                            agent = app_state.agent();
-                                                        }
-                                                        Err(e) => {
-                                                            config.output.display_text(&format!(
-                                                                "Cannot start agent: {}",
-                                                                e
-                                                            ));
-                                                            continue;
-                                                            // (Inside the `summarize`
-                                                            //  branch of `Switch`. Skip
-                                                            //  the summary; the leaf
-                                                            //  still moves below.)
-                                                        }
-                                                    }
-                                                }
-                                                let prompt = build_summary_prompt(&abandoned);
-                                                if let Some(ref agent) = agent {
-                                                    let r = retry_summarization(
-                                                        config.output.as_ref(),
-                                                        &config.user_cancel,
-                                                        &config.cancel_notify,
-                                                        &mut || agent.summarize(&prompt),
-                                                    )
-                                                    .await;
-                                                    match r {
-                                                        Ok(summary) => {
-                                                            let _ = s
-                                                                .append_branch_summary(
-                                                                    &common_ancestor_id,
-                                                                    &summary,
-                                                                )
-                                                                .await;
-                                                        }
-                                                        Err(e) => {
-                                                            config.output.display_text(&format!(
-                                                                "Summary failed: {}",
-                                                                e
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Move the leaf pointer. The next prompt() call
-                                    // reads the new branch via build_context()
-                                    // automatically.
-                                    let _ = s.move_leaf(Some(target_id.clone())).await;
-                                }
-                                // No confirmation line: the committed prompt
-                                // "/tree <id> switch [--summarize]" (echoed by the
-                                // overlay's emit_commit, or typed verbatim by the
-                                // user) documents the action.
-                            }
-                        }
-                        TreeAction::Compact => {
-                            // The compaction UX lives entirely in the
-                            // menu nodes' native workflow
-                            // (doc/editor_cleanup.md §6): prepare()
-                            // generates the draft and opens $EDITOR,
-                            // NodeEntry's two-phase confirm (Prepared →
-                            // Enter/Esc) decides, submit() applies the
-                            // stashed draft. This typed entry drives the
-                            // same node pair directly — the typed Enter
-                            // is the confirmation — so validation, the
-                            // editor, and the write exist exactly once
-                            // and no second confirm implementation
-                            // exists outside NodeEntry.
-                            use crate::app_state::CompactMode;
-                            use crate::slashdot_menu::node_impl::{PathArgs, SubmitResult};
-                            use crate::v25_tree::{
-                                TreeCompactManualNode, TreeCompactPromptNode, TreeCompactTextNode,
-                            };
-
-                            let (mode_token, compact_mode) =
-                                match mode.unwrap_or(CompactSummaryMode::Manual) {
-                                    CompactSummaryMode::Manual => ("manual", CompactMode::Manual),
-                                    CompactSummaryMode::TextOnly => {
-                                        ("text-only", CompactMode::TextOnly)
-                                    }
-                                    CompactSummaryMode::Llm => ("prompt", CompactMode::Prompt),
-                                };
-                            let path_args = PathArgs {
-                                ids: vec![
-                                    "tree".to_string(),
-                                    target_id.clone(),
-                                    "compact".to_string(),
-                                    mode_token.to_string(),
-                                ],
-                                suffix: llm_payload.clone(),
-                                args: Vec::new(),
-                            };
-                            let mut node: Box<dyn crate::slashdot_menu::node_impl::SlashDotNode> =
-                                match compact_mode {
-                                    CompactMode::Manual => {
-                                        Box::new(TreeCompactManualNode::new(app_state.clone()))
-                                    }
-                                    CompactMode::TextOnly => {
-                                        Box::new(TreeCompactTextNode::new(app_state.clone()))
-                                    }
-                                    CompactMode::Prompt => {
-                                        Box::new(TreeCompactPromptNode::new(app_state.clone()))
-                                    }
-                                };
-                            // prepare → (Prepared) → submit: the node's
-                            // two halves back to back.
-                            let result = match node.prepare(0, &path_args).await {
-                                SubmitResult::Prepared => node.submit(0, &path_args).await,
-                                other => other,
-                            };
-                            match result {
-                                // Silent on success: the committed input
-                                // line documents the write.
-                                SubmitResult::Done(None) => {}
-                                SubmitResult::Done(Some(msg)) | SubmitResult::Error(msg) => {
-                                    config.output.display_text(&msg);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Handle `/session <name> <action>` commands.
-                if input.starts_with("/session") {
-                    let out = config.output.clone();
-                    let mut sess = app_state.session();
-                    let result = handle_session_command(
-                        &input,
-                        &mut sess,
-                        &mut repo,
-                        &mut config,
-                        &out,
-                        &app_state.settings(),
-                    )
-                    .await;
-                    app_state.set_session(sess);
-                    match result {
-                        SessionCommandResult::NotSession => {
-                            // Not a session command — fall through to normal prompt.
-                        }
-                        SessionCommandResult::Switched {
-                            id: new_id,
-                            prefill,
-                        } => {
-                            app_state.set_current_session_id(new_id);
-                            // Resume returned a model-restore prefill (e.g.
-                            // `/model <provider>:<model_id>`). Surface it on the
-                            // next prompt instead of letting the user type it
-                            // themselves; clearing the buffer would force them to
-                            // retype the model they just resumed into. The
-                            // prefill is consumed once — the slot register is
-                            // taken at the top of the next loop iteration so a
-                            // subsequent prompt starts empty.
-                            if let Some(p) = prefill {
-                                app_state.set_prefill(p);
-                            }
-                            continue;
-                        }
-                        _ => {
-                            continue;
-                        }
-                    }
-                }
-                // Handle `/clear`: delete current session and start fresh.
-                // Optional: `/clear <name>` names the new session so it shows
-                // up in `/session` listings by user-friendly name from the
-                // first turn onward (instead of needing a follow-up rename).
-                if input == "/clear" || input.starts_with("/clear ") {
-                    let new_name = input["/clear".len()..].trim().to_string();
-                    if let Some(s) = app_state.session() {
-                        let id = s.get_session_id().to_string();
-                        if let Some(ref r) = repo {
-                            // Find the session meta to delete it.
-                            let cwd = std::env::current_dir().ok();
-                            let metas = r.list(cwd.as_deref()).await.unwrap_or_default();
-                            if let Some(meta) = metas.iter().find(|m| m.id == id) {
-                                let _ = r.delete(meta).await;
-                            }
-                        }
-                    }
-                    // Create a fresh session for the next prompt so context
-                    // carries across turns AND the new turns get persisted.
-                    // `repo.create()` defers the header write to the first
-                    // `append_message`, so a user that quits immediately
-                    // still produces no empty `.jsonl` file. (`None` drops
-                    // the in-memory session — ensure keeps a `Some` as-is.)
-                    let fresh = ensure_session(
-                        None,
-                        &repo,
-                        Some(config.provider.clone()),
-                        Some(config.model.clone()),
-                        config.thinking_level.clone(),
-                    )
-                    .await;
-                    let fresh_id = fresh
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default();
-                    app_state.activate_session(fresh.clone(), fresh_id);
-                    if !new_name.is_empty() {
-                        if let Some(ref s) = fresh {
-                            if let Err(e) = s.set_session_name(&new_name).await {
-                                config
-                                    .output
-                                    .display_text(&format!("Could not name session: {}", e));
-                            } else if let Some(ref r) = repo {
-                                // Mirror `/session <name> rename`: refresh the
-                                // cached listing so the new name is visible
-                                // immediately.
-                                r.invalidate_cache();
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Handle `/new`: drop the current in-memory session and let
-                // `ensure_session` create a fresh one on the next prompt.
-                // The old session is preserved on disk and can be resumed
-                // via `/session <name> resume`. Optional: `/new <name>`
-                // names the new session (same rationale as `/clear <name>`).
-                if input == "/new" || input.starts_with("/new ") {
-                    let new_name = input["/new".len()..].trim().to_string();
-                    // See `/clear` above: without the fresh ensure, the next
-                    // prompt would run with no session — losing prior context
-                    // and skipping every `append_message` (since they're gated
-                    // on the session being present), so the new "session"
-                    // wouldn't be saved. (`None` drops the in-memory session.)
-                    let fresh = ensure_session(
-                        None,
-                        &repo,
-                        Some(config.provider.clone()),
-                        Some(config.model.clone()),
-                        config.thinking_level.clone(),
-                    )
-                    .await;
-                    let fresh_id = fresh
-                        .as_ref()
-                        .map(|s| s.get_session_id().to_string())
-                        .unwrap_or_default();
-                    app_state.activate_session(fresh.clone(), fresh_id);
-                    if !new_name.is_empty() {
-                        if let Some(ref s) = fresh {
-                            if let Err(e) = s.set_session_name(&new_name).await {
-                                config
-                                    .output
-                                    .display_text(&format!("Could not name session: {}", e));
-                            } else if let Some(ref r) = repo {
-                                // Mirror `/session <name> rename`: refresh the
-                                // cached listing so the new name is visible
-                                // immediately.
-                                r.invalidate_cache();
                             }
                         }
                     }
@@ -4994,11 +4346,11 @@ mod tests {
     use super::{
         apply_compaction, blob_edit_tool_calls, build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir, estimate_context_tokens, generate_compaction,
-        is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role,
-        parse_tree_args, persist_turn, reasoning_text, record_model_change, record_thinking_change,
-        retry_summarization, session_recorded_model_id, session_recorded_thinking, MessageLogger,
+        is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role, persist_turn,
+        reasoning_text, record_model_change, record_thinking_change, retry_summarization,
+        session_recorded_model_id, session_recorded_thinking, MessageLogger,
     };
-    use super::{CompactSummaryMode, ReplayUnit, TreeAction};
+    use super::{CompactSummaryMode, ReplayUnit};
     use crate::session::storage::SessionStorage;
     use crate::session::Session;
     use crate::SettingsStore;
@@ -5440,77 +4792,6 @@ mod tests {
         assert_eq!(m, model);
     }
 
-    #[test]
-    fn parse_tree_args_strips_angle_brackets_from_id() {
-        // The overlay commits `/tree <id> switch`; the target must arrive at
-        // move_leaf/get_entry as the RAW id. Regression test: with brackets
-        // kept, move_leaf pointed at a nonexistent entry → empty context,
-        // no current-position marker, "/replay: session is empty".
-        let (target, action, mode, summarize, _) = parse_tree_args("<0194abc-123> switch");
-        assert_eq!(target, "0194abc-123");
-        assert_eq!(action, TreeAction::Switch);
-        assert_eq!(mode, None);
-        assert!(!summarize);
-
-        // Bare angle-bracketed id (action menu commit path).
-        let (target, ..) = parse_tree_args("<x>");
-        assert_eq!(target, "x");
-
-        // Plain id still works (hand-typed without brackets).
-        let (target, ..) = parse_tree_args("plain-id switch");
-        assert_eq!(target, "plain-id");
-
-        // Compact with mode + summarize flag orthogonal. `truncate`
-        // remains recognized as a deprecated alias for the new primary
-        // `manual` token.
-        let (target, action, mode, _, _) = parse_tree_args("<id9> compact truncate --summarize");
-        assert_eq!(target, "id9");
-        assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::Manual));
-
-        // Primary mode token is `manual`.
-        let (_, action, mode, _, _) = parse_tree_args("<id9> compact manual");
-        assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::Manual));
-
-        // Text-only mode token.
-        let (_, action, mode, _, _) = parse_tree_args("<id9> compact text-only");
-        assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::TextOnly));
-    }
-
-    #[test]
-    fn parse_tree_args_llm_mode() {
-        // Bare `llm` token after `compact` selects Llm mode with empty payload.
-        let (target, action, mode, summarize, payload) = parse_tree_args("<id9> compact llm");
-        assert_eq!(target, "id9");
-        assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::Llm));
-        assert!(!summarize);
-        assert_eq!(payload, "");
-
-        // `summary` is accepted as an alias for `llm`.
-        let (_, action, mode, _, _) = parse_tree_args("<id9> compact summary");
-        assert_eq!(action, TreeAction::Compact);
-        assert_eq!(mode, Some(CompactSummaryMode::Llm));
-
-        // Trailing text after `llm` is preserved verbatim, whitespace-joined.
-        let (_, _, mode, _, payload) =
-            parse_tree_args("<id9> compact llm Summarize the conversation");
-        assert_eq!(mode, Some(CompactSummaryMode::Llm));
-        assert_eq!(payload, "Summarize the conversation");
-
-        // Multi-word payload collapses internal whitespace runs to single
-        // spaces (matches split_whitespace behavior).
-        let (_, _, _, _, payload) = parse_tree_args("<id9> compact llm hello   world  foo");
-        assert_eq!(payload, "hello world foo");
-
-        // `text-only` after `llm` is part of the payload, not a mode token.
-        let (_, _, mode, _, payload) = parse_tree_args("<id9> compact llm text-only is just text");
-        assert_eq!(mode, Some(CompactSummaryMode::Llm));
-        assert_eq!(payload, "text-only is just text");
-    }
-
     // ---- compaction: retry + generate/apply ----
     //
     // The compaction data path is `generate_compaction` (validate →
@@ -5522,9 +4803,9 @@ mod tests {
     // `Compaction` entry with an empty summary when the dropped span
     // touched no files; TextOnly writes a deterministic summary; Llm
     // fails cleanly without a live model. Mode plumbing itself is
-    // covered by the `parse_tree_args` tests — here we focus on the
-    // side effects of the two halves, including that generation
-    // restores the leaf it pivoted.
+    // covered by the node two-phase tests in `v25_tree.rs` — here we
+    // focus on the side effects of the two halves, including that
+    // generation restores the leaf it pivoted.
 
     #[tokio::test]
     async fn retry_summarization_succeeds_on_first_attempt() {
@@ -6698,6 +5979,114 @@ mod tests {
         assert!(
             shown.contains(sentinel),
             "expected sandboxed `!` command to print the remapped host file content; output:\n{shown}"
+        );
+    }
+
+    // ── Non-REPL input path (editor cleanup E5) ───────────────────────
+
+    /// The `repl == None` input arm (in-process host / non-tty) routes
+    /// `/`-prefixed lines through `Repl::batch_slash` — passive derive +
+    /// virtual Enter, no overlay drawing — and returns `MenuDone`, so the
+    /// node's control writes (`/quit` → `request_quit`) are drained by the
+    /// same cycle's convergence step. Pins the loop wiring the `batch_slash`
+    /// unit tests cannot see: input-position eval → `MenuDone` → quit break.
+    #[tokio::test]
+    async fn non_repl_slash_lines_run_through_batch_engine() {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use crate::output::Confirmation;
+        use crate::settings::SettingsStore;
+        use crate::AgentConfig;
+        use crate::Output;
+        use std::sync::atomic::AtomicBool;
+
+        struct ScriptOutput {
+            inputs: Arc<Mutex<VecDeque<String>>>,
+            shown: Arc<Mutex<String>>,
+        }
+        impl Output for ScriptOutput {
+            fn display_text(&self, t: &str) {
+                self.shown.lock().unwrap().push_str(t);
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn display_plain(&self, t: &str) {
+                self.shown.lock().unwrap().push_str(t);
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn display_separator(&self) {
+                self.shown.lock().unwrap().push('\n');
+            }
+            fn get_user_input(&self) -> String {
+                self.inputs
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| "/q".to_string())
+            }
+            fn display_tool_call(&self, _: &str, _: &serde_json::Value) {}
+            fn display_tool_result(&self, _: &str) {}
+            fn display_error(&self, _: &str) {}
+            fn display_system(&self, _: &str) {}
+            fn confirm(&self, _: &str) -> Confirmation {
+                Confirmation::No
+            }
+            fn display_thinking(&self, _: &str) {}
+            fn stop_thinking(&self) {}
+            fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
+        }
+
+        // `/thinking high` commits through the engine (echoed line proves
+        // `batch_slash` ran); `/quit` must then end the loop — if the eval
+        // sat AFTER convergence, quit would be stranded until another line
+        // arrived and the `unwrap_or_else("/q")` fallback would mask it.
+        // So: exactly two lines, and the queue must be empty afterwards.
+        let inputs = Arc::new(Mutex::new(VecDeque::from([
+            "/thinking high".to_string(),
+            "/quit".to_string(),
+        ])));
+        let shown = Arc::new(Mutex::new(String::new()));
+        let out = ScriptOutput {
+            inputs: inputs.clone(),
+            shown: shown.clone(),
+        };
+
+        let sessions_tempdir = tempfile::tempdir().unwrap();
+        let config = AgentConfig {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            output: Arc::new(out),
+            yolo: true,
+            quiet: true,
+            thinking_level: None,
+            tool_call_limit: 10,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            sandbox: None,
+            show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            message_log_path: None,
+            sessions_dir: Some(sessions_tempdir.path().to_path_buf()),
+        };
+        let settings = SettingsStore::from_agent_config(&config, None);
+
+        super::run_interactive(config, settings, false)
+            .await
+            .unwrap();
+
+        let shown = shown.lock().unwrap().clone();
+        assert!(
+            shown.contains("thinking high"),
+            "expected the batch commit echo for `/thinking high`, got:\n{shown}"
+        );
+        assert!(
+            inputs.lock().unwrap().is_empty(),
+            "both scripted lines must have been consumed (quit must land on its own cycle)"
         );
     }
 

@@ -15,12 +15,17 @@
         deleted in editor cleanup E3 — a menu version would add a target
         kind to `generate_compaction`)
         `/tree <id> switch`, `/tree <id> switch llm <prompt>`, `/tree <id> switch simple`
-- [ ] Non-REPL slash input (quiet / piped stdin) — **non-priority.** Today four
-      inline arms in the agent loop handle it (`/tree`, `/session`, `/clear`,
-      `/new`); tolerated as-is, not grown. If it becomes important, feed raw
-      lines through the v2.5 menu eval (same dispatch as interactive) with the
-      drawing output ignored — one implementation, not more arms
-      (doc/editor_cleanup.md §10.9).
+- [x] Non-REPL slash input (in-process / non-tty hosts) — routed through the
+      v2.5 menu eval (`Repl::batch_slash`: passive derive + virtual Enter,
+      drawing ignored); the four typed arms are deleted
+      (doc/editor_cleanup.md §9 E5).
+- [ ] `--quiet` with no positional prompt spins: the non-REPL input arm
+      (`repl == None`) pairs a `QuietOutput::get_user_input` that always
+      returns `""` with `if input.is_empty() { continue }` — a pre-existing
+      hot loop (reproduces at `50e4e69`; piped stdin was never a command
+      source — one-shots go through `Commands::Input`/the positional prompt).
+      Either make `QuietOutput` read lines (batch-friendly: pairs with
+      `Repl::batch_slash`) or stop the loop on empty input.
 - [ ] Thinking-level restore on `/session <id> resume` (single input field
       currently can only carry one prefill — model or thinking. Bundle both
       into a slug syntax like `/thinking <level> & /model <slug>` or a new

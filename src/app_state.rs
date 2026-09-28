@@ -278,8 +278,8 @@ impl AppState {
     }
 
     /// Snapshot of the settings store for read-only use across `.await`s
-    /// (helpers like `handle_session_command` take `&SettingsStore`): clone
-    /// out under the lock, then await against the private copy (rule 3).
+    /// (helpers taking `&SettingsStore`): clone out under the lock, then
+    /// await against the private copy (rule 3).
     pub fn settings(&self) -> SettingsStore {
         self.state.lock().settings.clone()
     }

@@ -1229,6 +1229,117 @@ impl Repl {
         V25Frame::DoneError(msg, buf.trim_start_matches('/').to_string())
     }
 
+    /// Non-REPL slash driver (quiet / piped stdin): run one complete `/…`
+    /// line through the v2.5 menu engine as if it had been typed and
+    /// submitted, with **no overlay drawing** — `Continue` plans are
+    /// dropped, commits echo through the same `Output` methods an
+    /// interactive `emit_commit` uses (messages, confirm, and the
+    /// no-tty `$EDITOR` fallback all stay `Output`/`AppState` concerns;
+    /// menu painting is host-side and never happens here).
+    ///
+    /// Returns `None` for input this driver does not own (empty, non-slash,
+    /// `/q`) so the caller falls back to raw `Submit`.
+    ///
+    /// Key mapping — a passive derive (`HostKey::None`, exactly what typing
+    /// does), then virtual `Enter` presses:
+    /// - ordinary endpoints finish on the first Enter (`prepare` defaults to
+    ///   `submit`);
+    /// - two-phase nodes (`Prepared`, e.g. compaction) take a second one —
+    ///   an Enter whose returned prompt still matches the stage re-presses;
+    /// - an Enter that *navigates* (returned prompt moved: a listing drill)
+    ///   stops the sequence instead — blind further Enters could act on a
+    ///   row the user never chose;
+    /// - a pure rewrite (`ContinuePrompt`, e.g. `/compact` →
+    ///   `/tree <id> compact`) re-derives passively and presses again —
+    ///   from the user's viewpoint that pair is still one Enter.
+    pub(crate) async fn batch_slash(
+        app_state: &Arc<AppState>,
+        input: &str,
+        output: &dyn Output,
+        history: &mut History,
+    ) -> Option<InputAction> {
+        use crate::slashdot_menu::node_impl::MenuResult;
+        use crate::slashdot_menu::HostKey;
+        // Total evals (passive derives + Enters) for one line: rewrite
+        // chains plus prepare/confirm pairs; anything beyond a handful is
+        // a cycle or an endlessly re-rendering node — stop.
+        const MAX_EVALS: usize = 8;
+        if input.is_empty() || !input.starts_with('/') || input == "/q" {
+            return None;
+        }
+        let mut menu = crate::v25_menu::build_menu(app_state);
+        let mut handle = menu.get_handle();
+        let width = crate::output::term_width();
+        let mut buf = input.to_string();
+        // Prompt of the last Continue — the node an Enter acts on. `None`
+        // means "derive passively before pressing".
+        let mut stage: Option<String> = None;
+        let mut press_enter = false;
+        let mut evals = 0;
+        loop {
+            evals += 1;
+            if evals > MAX_EVALS {
+                break;
+            }
+            let key = if press_enter {
+                HostKey::Enter
+            } else {
+                HostKey::None
+            };
+            let line = buf.trim_start_matches('/').to_string();
+            let cursor = line.len();
+            match handle
+                .eval_prompt_with_cursor(&line, key, width, cursor)
+                .await
+            {
+                MenuResult::ContinuePrompt(new_prompt) => {
+                    // Pure rewrite: adopt it, re-derive passively, then
+                    // press again (the rewrite consumed one Enter).
+                    buf = format!("/{}", new_prompt);
+                    stage = None;
+                    press_enter = false;
+                }
+                MenuResult::Continue(_plan, prompt) => {
+                    if press_enter {
+                        match &stage {
+                            // Still on the same node → the Enter armed or
+                            // re-armed a confirm → press again.
+                            Some(s) if *s == prompt => {}
+                            // Navigated (listing drill): stop uncommitted.
+                            _ => break,
+                        }
+                    } else {
+                        stage = Some(prompt);
+                    }
+                    press_enter = true;
+                }
+                MenuResult::DoneSuccess(msg, prompt) => {
+                    Self::batch_commit(output, history, &prompt, msg.as_deref());
+                    return Some(InputAction::MenuDone);
+                }
+                MenuResult::DoneError(err, prompt) => {
+                    Self::batch_commit(output, history, &prompt, Some(&err));
+                    return Some(InputAction::MenuDone);
+                }
+            }
+        }
+        // Cap exhausted or navigation without a commit: nothing written and
+        // nothing echoed (an overlay would have been showing in a REPL).
+        Some(InputAction::MenuDone)
+    }
+
+    /// Echo a batch-committed prompt to the transcript and surface the
+    /// node's message — the drawing-free counterpart of `emit_commit`
+    /// (no input region to clear, no prefill to seed).
+    fn batch_commit(output: &dyn Output, history: &mut History, prompt: &str, msg: Option<&str>) {
+        let committed = format!("/{}", prompt);
+        history.add(&committed);
+        output.display_plain(&committed);
+        if let Some(m) = msg {
+            output.display_text(m);
+        }
+    }
+
     /// Cursor policy for buffer-derived option menus (`read_input`).
     ///
     /// `active` is the overlay's current-state / default row as re-derived
@@ -2025,6 +2136,104 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Batch slash driver (`Repl::batch_slash`) — the non-REPL input path
+    // (quiet / piped stdin): a complete line commits through the v2.5
+    // engine with a virtual Enter and no overlay drawing.
+    // ------------------------------------------------------------------
+
+    fn batch_state() -> Arc<AppState> {
+        let settings = crate::settings::SettingsStore {
+            default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        AppState::for_test(settings)
+    }
+
+    /// In-memory history (no disk file) — `batch_commit` only appends.
+    fn batch_hist() -> History {
+        History {
+            entries: Vec::new(),
+            file: None,
+        }
+    }
+
+    #[test]
+    fn batch_slash_thinking_high_commits_in_one_enter() {
+        let state = batch_state();
+        let (out, lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/thinking high",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+        // The node wrote the runtime target; the loop's convergence step
+        // would apply it on the same cycle.
+        assert_eq!(state.thinking().as_deref(), Some("high"));
+        let captured = crate::output::RecordingOutput::joined(&lines);
+        assert!(
+            captured.contains("thinking high"),
+            "committed line not echoed: {:?}",
+            captured
+        );
+    }
+
+    #[test]
+    fn batch_slash_quit_latches_control_target() {
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/quit",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+        assert!(state.take_control().quit);
+    }
+
+    #[test]
+    fn batch_slash_defers_what_it_does_not_own() {
+        // Empty, prose, and the `/q` alias fall back to raw `Submit`
+        // (the agent loop's `/q`/`exit` arm keeps owning them).
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        for line in ["", "hello", "/q"] {
+            let action = crate::agent::block_on_test(Repl::batch_slash(
+                &state,
+                line,
+                out.as_ref(),
+                &mut batch_hist(),
+            ));
+            assert!(action.is_none(), "{:?} should fall through", line);
+        }
+    }
+
+    #[test]
+    fn batch_slash_unknown_command_returns_instead_of_hanging() {
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/definitely-not-a-command",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        // Whatever the engine reports for garbage input, the driver must
+        // terminate (the eval cap) and hand back control.
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+    }
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
 
