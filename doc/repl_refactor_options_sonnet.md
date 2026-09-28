@@ -120,14 +120,14 @@ with minor variation (different column names, widths, alignment, content):
 // Model overlay
 let mut table = Table::new(&["Model", "Ctx", "Cost", "?"])
     .with_aligns(&[...]).with_min_widths(&[12, 5, 14, 3])
-    .with_priorities(&[3, 1, 2, 1]).set_gap(2);
+    .with_priorities(&[3, 1, 2, 1]).set_gap(1);
 for e in &entries { table.add_row(&[...]); }
 let rows = table.render_multiline(avail);
 
 // Persona overlay
 let mut table = Table::new(&["Persona", "Description"])
     .with_aligns(&[...]).with_min_widths(&[20, 30])
-    .with_priorities(&[2, 1]).set_gap(2);
+    .with_priorities(&[2, 1]).set_gap(1);
 for c in &filtered { table.add_row(&[...]); }
 for row in table.render_multiline(avail) { opts.push(row); }
 

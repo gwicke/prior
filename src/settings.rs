@@ -926,7 +926,7 @@ mod tests {
             ])
             .with_min_widths(&[16, 18, 24])
             .with_priorities(&[2, 2, 1])
-            .set_gap(2);
+            .set_gap(1);
         for (meta, value) in &entries {
             table.add_row(&[meta.name, value.as_str(), meta.description]);
         }
@@ -1008,7 +1008,7 @@ mod tests {
             ])
             .with_min_widths(&[16, 18, 24])
             .with_priorities(&[2, 2, 1])
-            .set_gap(2);
+            .set_gap(1);
         for (meta, value) in &entries {
             table.add_row(&[meta.name, value.as_str(), meta.description]);
         }
@@ -1022,13 +1022,14 @@ mod tests {
         // The description column starts at the same column on every wrapped
         // visual line. (The value cell may also wrap when it is longer than
         // its column, which is expected.)
-        let desc_start = widths[0] + 2 + widths[1] + 2; // Setting + gap + Value + gap
+        let desc_start = widths[0] + 1 + widths[1] + 1; // Setting + gap + Value + gap
         assert_eq!(
             first_opt_lines[0].find("Default model").unwrap(),
             desc_start
         );
         assert!(first_opt_lines[1][desc_start..].starts_with("provider:model"));
-        assert!(first_opt_lines[2][desc_start..].starts_with("new sessions"));
+        // Third wrapped line continues the description text
+        assert!(first_opt_lines[2][desc_start..].starts_with("sessions"));
         // paint_plan must preserve the multi-line option as visual lines:
         // every line of the *selected* option appears (marked first line,
         // `  `-indented continuations), none of them re-wrapped. Unlike
