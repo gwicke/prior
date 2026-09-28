@@ -296,24 +296,16 @@ pub fn model_columns() -> Vec<ColumnDef> {
         ColumnDef::new("id", "Model").min(12).prio(3),
         ColumnDef::new("context", "Ctx")
             .align(Align::Right)
-            .min(5)
             .prio(1),
         ColumnDef::new("coding", "Coding")
             .align(Align::Right)
-            .min(6)
             .prio(1),
-        ColumnDef::new("price_input", "Price in")
+        ColumnDef::new("price_input", "$/m in")
             .align(Align::Right)
-            .min(8)
             .prio(2),
-        ColumnDef::new("price_output", "Price out")
+        ColumnDef::new("price_output", "$/m out")
             .align(Align::Right)
-            .min(8)
             .prio(2),
-        ColumnDef::new("reasoning", "Reason")
-            .align(Align::Right)
-            .min(3)
-            .prio(1),
     ]
 }
 
@@ -522,7 +514,7 @@ mod tests {
         let node = test_model_node(&app_state);
         let cols = node.columns();
         assert_eq!(cols.len(), 6);
-        assert!(cols.iter().any(|c| c.header == "Price in"));
+        assert!(cols.iter().any(|c| c.header == "$/1m in"));
     }
 
     #[test]
