@@ -7,6 +7,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,9 @@ pub struct SessionHeader {
     /// Thinking level (pi-compatible top-level metadata).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// User-defined display name (for fast listing without scanning for session_info).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl SessionHeader {
@@ -106,6 +110,7 @@ impl SessionHeader {
             provider: None,
             model_id: None,
             thinking_level: None,
+            name: Some(String::new()),
         }
     }
 
@@ -254,6 +259,25 @@ pub enum SessionEntryContent {
 // Session metadata (for listing)
 // ---------------------------------------------------------------------------
 
+/// Detailed metadata populated only when viewing a session's detail view.
+#[derive(Debug, Clone)]
+pub struct SessionDetail {
+    /// Number of message entries in the session (user + assistant + toolResult).
+    pub message_count: usize,
+    /// Number of user-role message entries (i.e. user prompts, one per
+    /// logical turn). Excludes assistant and `toolResult` entries. This is the
+    /// canonical "turn count" used by the `/stat` and `/session <id>` panels.
+    pub user_message_count: usize,
+    /// Total token count (from usage on the leaf branch, if tracked).
+    pub token_count: Option<u64>,
+    /// Full text of the last user message (for detail display).
+    pub last_prompt_text: Option<String>,
+    /// Timestamp of the last user message.
+    pub last_prompt_timestamp: Option<String>,
+    /// Summary from the last compaction entry (for detail display).
+    pub compaction_summary: Option<String>,
+}
+
 /// Lightweight metadata about a session, derived from the header + quick scan.
 /// Used for session listing and selection.
 #[derive(Debug, Clone)]
@@ -266,24 +290,19 @@ pub struct SessionMetadata {
     pub cwd: String,
     /// Absolute path to the `.jsonl` file.
     pub path: PathBuf,
-    /// User-assigned display name (from the most recent `SessionInfo` entry).
+    /// User-assigned display name (from header or latest `SessionInfo` entry).
     pub name: Option<String>,
     /// Absolute path to the parent session file (if forked).
     pub parent_session: Option<PathBuf>,
-    /// Number of message entries in the session (user + assistant + toolResult).
-    pub message_count: usize,
-    /// Number of user-role message entries (i.e. user prompts, one per
-    /// logical turn). Excludes assistant and `toolResult` entries. This is the
-    /// canonical "turn count" used by the `/stat` and `/session <id>` panels.
-    pub user_message_count: usize,
-    /// Total token count (from usage on the leaf branch, if tracked).
-    pub token_count: Option<u64>,
     /// A short preview of the first user message in the session.
     pub first_prompt_preview: Option<String>,
-    /// Full text of the last user message (for detail display).
-    pub last_prompt_text: Option<String>,
-    /// Timestamp of the last user message.
-    pub last_prompt_timestamp: Option<String>,
+    /// File size in bytes (for display and sorting in listing).
+    pub file_size: u64,
+    /// File modification time (for cache validation and age display).
+    pub file_mtime: Option<SystemTime>,
+    /// Detailed metadata (message counts, last message, etc.) - only populated
+    /// on demand for the detail view via `read_metadata_detail`.
+    pub detail: Option<SessionDetail>,
 }
 
 // ---------------------------------------------------------------------------

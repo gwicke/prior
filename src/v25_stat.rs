@@ -44,12 +44,13 @@ impl SlashDotNode for StatNode {
                 let all = repo.list_sessions_overlay(None).await;
                 all.into_iter().find(|m| m.id == session_id).map(|meta| {
                     let display_name = meta.name.unwrap_or_else(|| meta.id.clone());
+                    let detail = meta.detail.as_ref();
                     crate::agent::SessionStatsInfo {
                         display_name,
                         created: meta.timestamp,
-                        last_updated: meta.last_prompt_timestamp,
-                        message_count: meta.message_count,
-                        user_message_count: meta.user_message_count,
+                        last_updated: detail.and_then(|d| d.last_prompt_timestamp.clone()),
+                        message_count: detail.map(|d| d.message_count).unwrap_or(0),
+                        user_message_count: detail.map(|d| d.user_message_count).unwrap_or(0),
                     }
                 })
             } else {

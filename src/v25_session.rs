@@ -145,7 +145,7 @@ async fn find_session(app_state: &AppState, session_id: &str) -> Option<crate::r
 // ---------------------------------------------------------------------------
 
 /// Column definitions for the parent `/session` listing (description,
-/// path, turns, age — no ID column since UUIDs are not useful to the user).
+/// path, size, age — no ID column since UUIDs are not useful to the user).
 pub fn session_listing_columns() -> Vec<ColumnDef> {
     use crate::slashdot_menu::table::Align;
     vec![
@@ -154,9 +154,9 @@ pub fn session_listing_columns() -> Vec<ColumnDef> {
             .prio(3)
             .wrap(false),
         ColumnDef::new("path", "Path").min(10).prio(2).wrap(false),
-        ColumnDef::new("msgs", "Turns")
+        ColumnDef::new("size", "Size")
             .align(Align::Right)
-            .min(5)
+            .min(8)
             .prio(1)
             .wrap(false),
         ColumnDef::new("age", "Age")
@@ -180,7 +180,7 @@ pub fn session_action_columns() -> Vec<ColumnDef> {
 pub fn session_fields() -> Vec<FieldSpec> {
     vec![
         FieldSpec::new("path", false),
-        FieldSpec::new("msgs", true),
+        FieldSpec::new("size", true),
         FieldSpec::new("age", true),
     ]
 }
@@ -244,7 +244,7 @@ impl SlashDotNode for SessionListNode {
                 .collect(),
             None => Vec::new(),
         };
-        // Current session first, then by recency.
+        // Current session first, then by recency (file mtime).
         sessions.sort_by(|a, b| {
             let a_cur = a.id == current_id;
             let b_cur = b.id == current_id;
@@ -253,33 +253,65 @@ impl SlashDotNode for SessionListNode {
             } else if !a_cur && b_cur {
                 std::cmp::Ordering::Greater
             } else {
-                let a_ts = a.last_prompt_timestamp.as_ref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_ref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
+                let a_ts = a
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let b_ts = b
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                b_ts.cmp(&a_ts)
             }
         });
+
+        // Human-readable file size formatting
+        fn human_size(bytes: u64) -> String {
+            const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+            let mut size = bytes as f64;
+            let mut unit_idx = 0;
+            while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
+                size /= 1024.0;
+                unit_idx += 1;
+            }
+            if unit_idx == 0 {
+                format!("{} {}", bytes, UNITS[unit_idx])
+            } else {
+                format!("{:.1} {}", size, UNITS[unit_idx])
+            }
+        }
 
         let rows: Vec<Row> = sessions
             .iter()
             .map(|m| {
                 let desc = session_description(m);
+                let size_bytes = m.file_size;
+                let age_ts = m
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_else(|| {
+                        chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+                            .ok()
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or(0)
+                    });
+
                 Row::new(m.id.clone())
                     .desc(&desc)
                     .field("path", Value::Str(session_path_display(m)))
-                    .field("msgs", Value::Num(m.user_message_count as f64))
-                    .field(
-                        "age",
-                        Value::Num(
-                            m.last_prompt_timestamp
-                                .as_ref()
-                                .unwrap_or(&m.timestamp)
-                                .parse()
-                                .unwrap_or(0.0),
-                        ),
-                    )
+                    .field("size", Value::Num(size_bytes as f64))
+                    .display_field("size", human_size(size_bytes))
+                    .field("age", Value::Num(age_ts as f64))
                     .display_field(
                         "age",
-                        relative_time(m.last_prompt_timestamp.as_ref().unwrap_or(&m.timestamp)),
+                        relative_time(
+                            &chrono::DateTime::from_timestamp(age_ts, 0)
+                                .unwrap_or_default()
+                                .to_rfc3339(),
+                        ),
                     )
             })
             .collect();
@@ -352,31 +384,50 @@ impl SlashDotNode for SessionListNode {
             .flat_map(|row| row.split('\n').map(|s| s.to_string()).collect::<Vec<_>>())
             .collect();
 
-        // --- First / Last as a two-column wrapping table ---
+        // --- First / Summary / Last as a two-column wrapping table ---
         let first = meta
             .first_prompt_preview
             .as_deref()
             .unwrap_or("(none)")
             .to_string();
-        let last_text = meta
-            .last_prompt_text
-            .clone()
-            .or_else(|| {
-                let path = meta.path.as_ref()?;
-                let detail = crate::session::repo::JsonlSessionRepo::read_metadata_detail(path)?;
-                detail.last_prompt_text
-            })
-            .unwrap_or_else(|| "(none)".to_string());
-        let last_ts = meta.last_prompt_timestamp.as_deref().unwrap_or("?");
+
+        // Get detail for compaction summary and last prompt
+        let detail = meta
+            .path
+            .as_ref()
+            .and_then(|path| crate::session::repo::JsonlSessionRepo::read_metadata_detail(path));
+
+        let compaction_summary = detail
+            .as_ref()
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.compaction_summary.clone());
+        let last_prompt_text = detail
+            .as_ref()
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.last_prompt_text.clone());
+        let last_prompt_ts = detail
+            .as_ref()
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.last_prompt_timestamp.clone());
+
+        let last_ts = last_prompt_ts.as_deref().unwrap_or("?");
 
         let mut msg_table = SdTable::new(&["", ""])
             .with_aligns(&[Align::Left, Align::Left])
             .with_min_widths(&[6, 10])
             .with_priorities(&[1, 3]);
         msg_table.add_row(&["First:", &first]);
+        // Add Summary row if there's a compaction summary
+        if let Some(summary) = compaction_summary {
+            msg_table.add_row(&["Summary:", &summary]);
+        }
         msg_table.add_row(&[
             "Last:",
-            &format!("{} {}", compact_timestamp(last_ts), last_text),
+            &format!(
+                "{} {}",
+                compact_timestamp(last_ts),
+                last_prompt_text.as_deref().unwrap_or("(none)")
+            ),
         ]);
 
         // Append First/Last rows, splitting wrapped lines.
@@ -1166,6 +1217,8 @@ mod tests {
             last_prompt_text: None,
             last_prompt_timestamp: None,
             path: None,
+            file_size: 0,
+            file_mtime: None,
         };
         let desc = session_description(&meta);
         assert_eq!(desc, "my session: fix the bug in main.rs");
@@ -1185,6 +1238,8 @@ mod tests {
             last_prompt_text: None,
             last_prompt_timestamp: None,
             path: None,
+            file_size: 0,
+            file_mtime: None,
         };
         let desc = session_description(&meta);
         assert_eq!(desc, "fix the bug");
@@ -1204,6 +1259,8 @@ mod tests {
             last_prompt_text: None,
             last_prompt_timestamp: None,
             path: None,
+            file_size: 0,
+            file_mtime: None,
         };
         let desc = session_description(&meta);
         assert_eq!(desc, "(empty)");

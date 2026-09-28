@@ -89,23 +89,27 @@ pub fn rank_candidates<'a, T>(
         if pl.starts_with(&ql) {
             classified.push((0, pl.len(), pl, 0, idx, idx));
         } else if let Some(score) = matcher.fuzzy_match(&text_of(item), query) {
-            classified.push((1, pl.len(), pl, score, idx, idx));
+            // Add small positional bonus to score: earlier items get a slight edge.
+            // This preserves original ordering for near-equal fuzzy scores.
+            let score_with_bonus = score + (1000 - (idx as i64).min(1000));
+            classified.push((1, pl.len(), pl, score_with_bonus, idx, idx));
         }
     }
     classified.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| match a.0 {
-                // Prefix tier: shortest first, then lexicographic.
-                0 => a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)),
-                // Fuzzy tier: best score first, then shortest, then alpha.
-                _ => {
-                    b.3.cmp(&a.3)
-                        .then_with(|| a.1.cmp(&b.1))
-                        .then_with(|| a.2.cmp(&b.2))
-                }
-            })
-            // Input order breaks remaining ties (deterministic).
-            .then_with(|| a.4.cmp(&b.4))
+        a.0.cmp(&b.0).then_with(|| match a.0 {
+            // Prefix tier: shortest first, then lexicographic.
+            0 => a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)),
+            // Fuzzy tier: best score first, then ORIGINAL ORDER (input_idx),
+            // then shortest prefix, then lexicographic. This gives more
+            // weight to the original candidate ordering (e.g., newest-first
+            // for session listings) when scores are equal or close.
+            _ => {
+                b.3.cmp(&a.3)
+                    .then_with(|| a.4.cmp(&b.4))
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+            }
+        })
     });
     let ranked: Vec<&'a T> = classified
         .iter()
@@ -150,11 +154,12 @@ fn fuzzy_filter_impl<'a, T>(
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(i64, &'a T)> = items
         .iter()
-        .filter_map(|item| {
+        .enumerate()
+        .filter_map(|(idx, item)| {
             let text = to_text(item);
             let base_score = matcher.fuzzy_match(&text, query)?;
             let ql = query.to_lowercase();
-            let score = if bonus_prefix
+            let mut score = if bonus_prefix
                 && text
                     .split_whitespace()
                     .next()
@@ -171,6 +176,10 @@ fn fuzzy_filter_impl<'a, T>(
             } else {
                 base_score
             };
+            // Small positional bonus: earlier items get a slight edge.
+            // This preserves original ordering for near-equal fuzzy scores.
+            // Max bonus is small (1000) so it never overrides genuine score differences.
+            score += 1000 - (idx as i64).min(1000);
             Some((score, item))
         })
         .collect();

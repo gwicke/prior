@@ -376,23 +376,42 @@ pub struct SessionMeta {
     pub last_prompt_timestamp: Option<String>,
     /// Path to the `.jsonl` file on disk.
     pub path: Option<std::path::PathBuf>,
+    /// File size in bytes (for display and sorting in listing).
+    pub file_size: u64,
+    /// File modification time (for age display).
+    pub file_mtime: Option<std::time::SystemTime>,
 }
 
 /// Map a repo `SessionMetadata` listing entry to the lightweight
 /// [`SessionMeta`] used by the menu providers and the `/session` overlay.
 pub fn session_meta_from(m: crate::session::types::SessionMetadata) -> SessionMeta {
+    // Extract detail fields if present
+    let (message_count, user_message_count, last_prompt_text, last_prompt_timestamp) =
+        if let Some(d) = m.detail {
+            (
+                d.message_count,
+                d.user_message_count,
+                d.last_prompt_text,
+                d.last_prompt_timestamp,
+            )
+        } else {
+            (0, 0, None, None)
+        };
+
     SessionMeta {
         id: m.id,
         name: m.name,
         timestamp: m.timestamp,
         cwd: m.cwd,
         parent_session: m.parent_session.map(|p| p.display().to_string()),
-        message_count: m.message_count,
-        user_message_count: m.user_message_count,
+        message_count,
+        user_message_count,
         first_prompt_preview: m.first_prompt_preview,
-        last_prompt_text: m.last_prompt_text,
-        last_prompt_timestamp: m.last_prompt_timestamp,
+        last_prompt_text,
+        last_prompt_timestamp,
         path: Some(m.path),
+        file_size: m.file_size,
+        file_mtime: m.file_mtime,
     }
 }
 
@@ -884,36 +903,74 @@ impl Repl {
                             let _ = self.guard.start();
                         }
                     }
-                    // Ctrl-E: external editor (only when no overlay is active).
+                    // Ctrl-E: external editor for input buffer (no overlay) or header (V25Menu).
                     if let KeyCode::Char('e') = key.code {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(overlay, ActiveOverlay::None)
-                        {
-                            let _ = self.guard.stop();
-                            match edit_in_editor(&editor.text()) {
-                                Ok(new_text) => {
-                                    editor.set(&new_text);
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match &overlay {
+                                ActiveOverlay::None => {
+                                    // Edit input buffer.
+                                    let _ = self.guard.stop();
+                                    match edit_in_editor(&editor.text()) {
+                                        Ok(new_text) => {
+                                            editor.set(&new_text);
+                                        }
+                                        Err(e) => {
+                                            let _ = io::stdout().write_all(
+                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
+                                            );
+                                        }
+                                    }
+                                    let _ = self.guard.start();
+                                    // The editor owned the screen while we were
+                                    // out: re-anchor the draw cache (DSR) before
+                                    // the next paint (plan §4.2). A *height*
+                                    // change the editor caused is folded into
+                                    // `painted_size` here (the re-anchor already
+                                    // covered it), while a *width* change is left
+                                    // for the wipe + replay at the loop top.
+                                    let _ = output.cursor_row();
+                                    if let Ok((_, h)) = crossterm::terminal::size() {
+                                        let (w, _) = painted_size.get();
+                                        painted_size.set((w, h.max(1) as usize));
+                                    }
+                                    continue;
                                 }
-                                Err(e) => {
-                                    let _ = io::stdout().write_all(
-                                        format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                    );
+                                ActiveOverlay::V25Menu { plan } => {
+                                    // Edit header content from the current plan's detail lines.
+                                    let header_text = plan
+                                        .detail
+                                        .iter()
+                                        .map(|l| l.0.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    if !header_text.is_empty() {
+                                        let _ = self.guard.stop();
+                                        match edit_in_editor(&header_text) {
+                                            Ok(_) => { /* user viewed/saved; no feedback */ }
+                                            Err(e) => {
+                                                let _ = io::stdout().write_all(
+                                                    format!("\r\neditor error: {}\r\n", e)
+                                                        .as_bytes(),
+                                                );
+                                            }
+                                        }
+                                        let _ = self.guard.start();
+                                        // The editor was a foreign screen writer
+                                        // here too: re-anchor the draw cache (DSR)
+                                        // and fold any height change, exactly as
+                                        // in the `None` arm above.
+                                        let _ = output.cursor_row();
+                                        if let Ok((_, h)) = crossterm::terminal::size() {
+                                            let (w, _) = painted_size.get();
+                                            painted_size.set((w, h.max(1) as usize));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                ActiveOverlay::PathComplete { .. } => {
+                                    // No-op in prose completion dialog.
                                 }
                             }
-                            let _ = self.guard.start();
-                            // The editor owned the screen while we were out:
-                            // re-anchor the draw cache (DSR) before the next
-                            // paint (plan §4.2). A *height* change the editor
-                            // caused is folded into `painted_size` here (the
-                            // re-anchor already covered it), while a width
-                            // change is left for the wipe + replay at the
-                            // loop top.
-                            let _ = output.cursor_row();
-                            if let Ok((_, h)) = crossterm::terminal::size() {
-                                let (w, _) = painted_size.get();
-                                painted_size.set((w, h.max(1) as usize));
-                            }
-                            continue;
                         }
                     }
                     // Active overlay key dispatch via enum methods.

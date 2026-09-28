@@ -1038,7 +1038,7 @@ impl Session {
         Ok(id)
     }
 
-    /// Write a session name entry.
+    /// Write a session name entry and update the header atomically.
     pub async fn set_session_name(&self, name: &str) -> crate::Result<String> {
         self.ensure_persisted().await?;
         let parent_id = {
@@ -1053,6 +1053,16 @@ impl Session {
         let leaf = SessionEntry::new_leaf(Some(id.clone()), None);
         storage.append_entry(&leaf).await?;
 
+        // Update the header with the new name (atomic, preserves mtime)
+        let mut header = {
+            let index = self.index.lock().await;
+            index.header.clone()
+        };
+        header.name = Some(name.to_string());
+        storage.update_session_header(&header).await?;
+        // Invalidate cached file handle so subsequent appends reopen the new file
+        storage.invalidate_file_handle().await;
+
         {
             let mut index = self.index.lock().await;
             // Mirror the new name into the in-memory index so a caller that
@@ -1064,6 +1074,7 @@ impl Session {
             // straight off the live index (e.g. the `/new <name>` and
             // `/clear <name>` handlers in `agent.rs`).
             index.session_name = Some(name.to_string());
+            index.header.name = Some(name.to_string());
             index.entries.insert(entry.id.clone(), entry);
             if let Some(ref pid) = parent_id {
                 index

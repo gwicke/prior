@@ -5,11 +5,13 @@
 //! The CWD-based directory structure groups sessions by working directory.
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use memchr::memmem;
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 use crate::session::storage::*;
@@ -125,12 +127,20 @@ impl SessionMetaCache {
                 all.extend(d.sessions.iter().cloned());
             }
         }
-        // Sort by last prompt timestamp (most recent activity first),
+        // Sort by file mtime (most recent activity first),
         // falling back to session creation timestamp.
         all.sort_by(|a, b| {
-            let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
-            let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
-            b_ts.cmp(a_ts)
+            let a_ts = a
+                .file_mtime
+                .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let b_ts = b
+                .file_mtime
+                .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            b_ts.cmp(&a_ts)
         });
         all
     }
@@ -174,9 +184,11 @@ impl JsonlSessionRepo {
         dir.join(filename)
     }
 
-    /// Quick-read metadata from a single JSONL file (header only).
+    /// Quick-read metadata from a single JSONL file (full scan for compat).
     /// Does NOT populate `last_prompt_text` — use `read_metadata_detail`
     /// for the full detail (called once when viewing a single session).
+    /// This is kept for backward compatibility with tests.
+    #[allow(dead_code)]
     async fn read_metadata(path: &Path) -> Option<SessionMetadata> {
         let content = tokio::fs::read_to_string(path).await.ok()?;
         let first_line = content.lines().next()?;
@@ -223,6 +235,10 @@ impl JsonlSessionRepo {
             }
         }
 
+        let metadata = tokio::fs::metadata(path).await.ok()?;
+        let file_size = metadata.len();
+        let file_mtime = metadata.modified().ok();
+
         Some(SessionMetadata {
             id: header.id,
             timestamp: header.timestamp,
@@ -230,12 +246,17 @@ impl JsonlSessionRepo {
             path: path.to_path_buf(),
             name,
             parent_session: header.parent_session,
-            message_count,
-            user_message_count,
-            token_count: None,
             first_prompt_preview,
-            last_prompt_text: None,
-            last_prompt_timestamp,
+            file_size,
+            file_mtime,
+            detail: Some(SessionDetail {
+                message_count,
+                user_message_count,
+                token_count: None,
+                last_prompt_text: None,
+                last_prompt_timestamp,
+                compaction_summary: None,
+            }),
         })
     }
     /// Quick-read metadata from a single JSONL file (header only) — sync version.
@@ -253,6 +274,7 @@ impl JsonlSessionRepo {
         let mut first_prompt_preview = None::<String>;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
+        let mut compaction_summary: Option<String> = None;
 
         for line in content.lines().skip(1) {
             if line.contains("\"type\":\"message\"") {
@@ -285,8 +307,35 @@ impl JsonlSessionRepo {
                         }
                     }
                 }
+            } else if line.contains("\"compaction\"") {
+                // Flexible match for compaction type (handles "type":"compaction" or "type": "compaction")
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if val.get("type").and_then(|v| v.as_str()) == Some("compaction") {
+                        if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                            if !s.is_empty() {
+                                compaction_summary = Some(s.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // Get name: if header has the `name` field (even empty), use it.
+        // Empty string in header -> None in metadata.
+        let name = if let Some(hname) = header.name {
+            if hname.is_empty() {
+                None
+            } else {
+                Some(hname)
+            }
+        } else {
+            name // from session_info scan above
+        };
+
+        let metadata = std::fs::metadata(path).ok()?;
+        let file_size = metadata.len();
+        let file_mtime = metadata.modified().ok();
 
         Some(SessionMetadata {
             id: header.id,
@@ -295,13 +344,271 @@ impl JsonlSessionRepo {
             path: path.to_path_buf(),
             name,
             parent_session: header.parent_session,
-            message_count,
-            user_message_count,
-            token_count: None,
             first_prompt_preview,
-            last_prompt_text: None,
-            last_prompt_timestamp,
+            file_size,
+            file_mtime,
+            detail: Some(SessionDetail {
+                message_count,
+                user_message_count,
+                token_count: None,
+                last_prompt_text: None,
+                last_prompt_timestamp,
+                compaction_summary,
+            }),
         })
+    }
+
+    /// Efficient metadata read for session listing.
+    ///
+    /// Reads only the header and first user message line. Avoids scanning
+    /// the full file. Gets `name` from header if present, otherwise falls
+    /// back to memmap2 + reverse search for the last `session_info` entry.
+    /// Populates `file_size` and `file_mtime` from filesystem metadata.
+    /// Does NOT populate `detail` (message counts, last_prompt_text, etc.),
+    /// which are only needed for the detail view.
+    pub async fn read_metadata_listing(path: &Path) -> Option<SessionMetadata> {
+        // Get file metadata (size, mtime) - fast syscall
+        let metadata = tokio::fs::metadata(path).await.ok()?;
+        let file_size = metadata.len();
+        let file_mtime = metadata.modified().ok();
+
+        // Read header + first few lines efficiently using tokio BufReader
+        let file = tokio::fs::File::open(path).await.ok()?;
+        let mut reader = tokio::io::BufReader::new(file);
+        let mut header_line = String::new();
+        if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut header_line)
+            .await
+            .is_err()
+            || header_line.is_empty()
+        {
+            return None;
+        }
+        let header: SessionHeader = serde_json::from_str(header_line.trim()).ok()?;
+
+        // Read lines until first user message found (for first_prompt_preview)
+        let mut first_prompt_preview = None::<String>;
+        let mut _last_prompt_timestamp: Option<String> = None;
+        let mut lines_read = 0;
+        let mut line = String::new();
+
+        while lines_read < 50 {
+            // Limit lines read for listing
+            line.clear();
+            if tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line)
+                .await
+                .is_err()
+                || line.is_empty()
+            {
+                break;
+            }
+            lines_read += 1;
+
+            if line.contains("\"type\":\"message\"") && line.contains("\"role\":\"user\"") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                    let text = val
+                        .pointer("/message/content/0/text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        if first_prompt_preview.is_none() {
+                            first_prompt_preview = Some(text.chars().collect());
+                        }
+                        if !ts.is_empty() {
+                            _last_prompt_timestamp = Some(ts.to_string());
+                        }
+                        break; // Found first user message, stop reading
+                    }
+                }
+            }
+        }
+
+        // Get name: if header has the `name` field (even empty), use it.
+        // Only fall back to reverse search for pre-migration sessions without the field.
+        // Empty string in header -> None in metadata (UI doesn't need to check for empty string).
+        let name = if let Some(hname) = header.name {
+            if hname.is_empty() {
+                None
+            } else {
+                Some(hname)
+            }
+        } else {
+            Self::find_latest_session_info_name(path).await
+        };
+
+        Some(SessionMetadata {
+            id: header.id,
+            timestamp: header.timestamp,
+            cwd: header.cwd,
+            path: path.to_path_buf(),
+            name,
+            parent_session: header.parent_session,
+            first_prompt_preview,
+            file_size,
+            file_mtime,
+            detail: None,
+        })
+    }
+
+    /// Ensure the session header has a `name` field populated.
+    ///
+    /// If the header already has a name, does nothing. Otherwise, searches for
+    /// the latest session_info entry and writes the name to the header atomically
+    /// (preserving mtime). This migrates existing sessions to include the name
+    /// in the header for fast listing.
+    ///
+    /// Always writes the header with a `name` field (empty string if no name found)
+    /// to avoid repeated searches for session_info entries on startup.
+    async fn ensure_header_has_name(path: PathBuf, header: &SessionHeader, name: Option<String>) {
+        // If header already has the same name, nothing to do
+        let new_name = name.or_else(|| Some(String::new()));
+        if header.name == new_name {
+            return;
+        }
+        // Update the header with the name (empty string if none found)
+        let mut new_header = header.clone();
+        new_header.name = new_name;
+        // Write to temp file and atomically rename (preserving mtime)
+        let content = tokio::fs::read_to_string(&path).await.ok();
+        if let Some(content) = content {
+            let mut lines: Vec<&str> = content.lines().collect();
+            if !lines.is_empty() {
+                let new_header_line = serde_json::to_string(&new_header).ok();
+                if let Some(new_header_line) = new_header_line {
+                    lines[0] = &new_header_line;
+                    if let Some(parent) = path.parent() {
+                        let temp_path =
+                            parent.join(format!(".{}.tmp", uuid::Uuid::now_v7().to_string()));
+                        if tokio::fs::write(&temp_path, lines.join("\n") + "\n")
+                            .await
+                            .is_ok()
+                        {
+                            // Preserve mtime
+                            let mtime = tokio::fs::metadata(&path)
+                                .await
+                                .ok()
+                                .and_then(|m| m.modified().ok());
+                            if tokio::fs::rename(&temp_path, &path).await.is_ok() {
+                                if let Some(mtime) = mtime {
+                                    let path_for_blocking = path.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let times = [
+                                            libc::timespec {
+                                                tv_sec: mtime
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs()
+                                                    as i64,
+                                                tv_nsec: 0,
+                                            },
+                                            libc::timespec {
+                                                tv_sec: mtime
+                                                    .duration_since(UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs()
+                                                    as i64,
+                                                tv_nsec: 0,
+                                            },
+                                        ];
+                                        let path_cstr = std::ffi::CString::new(
+                                            path_for_blocking.as_os_str().as_encoded_bytes(),
+                                        )
+                                        .ok()?;
+                                        unsafe {
+                                            libc::utimensat(
+                                                libc::AT_FDCWD,
+                                                path_cstr.as_ptr(),
+                                                times.as_ptr(),
+                                                libc::AT_SYMLINK_NOFOLLOW,
+                                            );
+                                        }
+                                        Some(())
+                                    })
+                                    .await
+                                    .ok();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find the latest session_info name using memmap2 + reverse search.
+    ///
+    /// Memory-maps the file and searches backwards for `"type":"session_info"`
+    /// to extract the name from the most recent session_info entry.
+    async fn find_latest_session_info_name(path: &Path) -> Option<String> {
+        use std::fs::File;
+
+        // Use blocking IO for mmap - it's fast and we're already in async context
+        // with a small file section. Could use tokio::task::spawn_blocking if needed.
+        let file = File::open(path).ok()?;
+        let mmap = unsafe { Mmap::map(&file).ok()? };
+        if mmap.is_empty() {
+            return None;
+        }
+
+        // Search backwards for "type\":\"session_info\"
+        let needle = b"\"type\":\"session_info\"";
+        let finder = memmem::FinderRev::new(needle);
+        let pos = finder.rfind(&mmap)?;
+
+        // Find the line boundaries (newline before and after)
+        let line_start = mmap[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line_end = mmap[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| pos + p)
+            .unwrap_or(mmap.len());
+
+        let line_bytes = &mmap[line_start..line_end];
+        let line_str = std::str::from_utf8(line_bytes).ok()?;
+
+        // Parse the line and extract name
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line_str) {
+            if let Some(n) = val.get("name").and_then(|v| v.as_str()) {
+                if !n.is_empty() {
+                    return Some(n.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract the timestamp of the last entry in the session file.
+    ///
+    /// Scans backwards from the end of the file to find the last valid JSON line
+    /// and extracts its `timestamp` field. Returns the timestamp as a SystemTime
+    /// for use in mtime preservation during fork operations.
+    fn extract_last_entry_timestamp(path: &Path) -> Option<SystemTime> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() <= 1 {
+            return None; // Only header
+        }
+
+        // Scan backwards from the end to find the last valid entry with a timestamp
+        for line in lines.iter().rev().skip(1) {
+            // Skip header (first line)
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) {
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(ts_str) {
+                        let system_time: SystemTime = dt.into();
+                        return Some(system_time);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Full metadata read including `last_prompt_text`.
@@ -320,6 +627,7 @@ impl JsonlSessionRepo {
         let mut last_prompt_text: Option<String> = None;
         let mut last_prompt_timestamp: Option<String> = None;
         let mut name: Option<String> = None;
+        let mut compaction_summary: Option<String> = None;
 
         for line in content.lines().skip(1) {
             if line.contains("\"type\":\"message\"") {
@@ -352,8 +660,23 @@ impl JsonlSessionRepo {
                         }
                     }
                 }
+            } else if line.contains("\"compaction\"") {
+                // Flexible match for compaction type (handles "type":"compaction" or "type": "compaction")
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    if val.get("type").and_then(|v| v.as_str()) == Some("compaction") {
+                        if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
+                            if !s.is_empty() {
+                                compaction_summary = Some(s.to_string());
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        let metadata = std::fs::metadata(path).ok()?;
+        let file_size = metadata.len();
+        let file_mtime = metadata.modified().ok();
 
         Some(SessionMetadata {
             id: header.id,
@@ -362,12 +685,17 @@ impl JsonlSessionRepo {
             path: path.to_path_buf(),
             name,
             parent_session: header.parent_session,
-            message_count,
-            user_message_count,
-            token_count: None,
             first_prompt_preview,
-            last_prompt_text,
-            last_prompt_timestamp,
+            file_size,
+            file_mtime,
+            detail: Some(SessionDetail {
+                message_count,
+                user_message_count,
+                token_count: None,
+                last_prompt_text,
+                last_prompt_timestamp,
+                compaction_summary,
+            }),
         })
     }
 }
@@ -413,19 +741,44 @@ impl SessionRepo for JsonlSessionRepo {
             while let Some(entry) = read_dir.next_entry().await? {
                 let path = entry.path();
                 if path.extension().map_or(false, |e| e == "jsonl") {
-                    if let Some(meta) = Self::read_metadata(&path).await {
+                    if let Some(meta) = Self::read_metadata_listing(&path).await {
+                        // Migrate: ensure header has name if we found one from session_info
+                        // We need to re-read header to get the current state
+                        let content = tokio::fs::read_to_string(&path).await.ok();
+                        if let Some(content) = content {
+                            if let Some(first_line) = content.lines().next() {
+                                if let Ok(header) =
+                                    serde_json::from_str::<SessionHeader>(first_line)
+                                {
+                                    Self::ensure_header_has_name(
+                                        path.clone(),
+                                        &header,
+                                        meta.name.clone(),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
                         sessions.push(meta);
                     }
                 }
             }
         }
 
-        // Sort by last prompt timestamp (most recent activity first),
+        // Sort by file mtime (most recent activity first),
         // falling back to session creation timestamp.
         sessions.sort_by(|a, b| {
-            let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
-            let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
-            b_ts.cmp(a_ts)
+            let a_ts = a
+                .file_mtime
+                .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let b_ts = b
+                .file_mtime
+                .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            b_ts.cmp(&a_ts)
         });
         Ok(sessions)
     }
@@ -460,6 +813,7 @@ impl SessionRepo for JsonlSessionRepo {
         let orig_header: SessionHeader = serde_json::from_str(lines[0])?;
 
         let new_path = self.session_file_path(cwd);
+        let new_path_for_mtime = new_path.clone();
         // The target cwd's session dir may not exist yet (first fork into
         // a fresh directory) — `File::create` below would fail with ENOENT.
         if let Some(parent) = new_path.parent() {
@@ -500,6 +854,63 @@ impl SessionRepo for JsonlSessionRepo {
                     new_file.write_all(b"\n").await?;
                 }
 
+                new_file.flush().await?;
+
+                // Preserve mtime from source file's last entry timestamp (or file mtime)
+                let mtime = Self::extract_last_entry_timestamp(&source.path);
+                let mtime = if let Some(mtime) = mtime {
+                    Some(mtime)
+                } else {
+                    tokio::fs::metadata(&source.path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                };
+                if let Some(mtime) = mtime {
+                    if let Ok(mut _file) = tokio::fs::File::options()
+                        .write(true)
+                        .open(&new_path_for_mtime)
+                        .await
+                    {
+                        let new_path_clone = new_path_for_mtime.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let times = [
+                                libc::timespec {
+                                    tv_sec: mtime
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        as i64,
+                                    tv_nsec: 0,
+                                },
+                                libc::timespec {
+                                    tv_sec: mtime
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        as i64,
+                                    tv_nsec: 0,
+                                },
+                            ];
+                            let path_cstr = std::ffi::CString::new(
+                                new_path_clone.as_os_str().as_encoded_bytes(),
+                            )
+                            .ok()?;
+                            unsafe {
+                                libc::utimensat(
+                                    libc::AT_FDCWD,
+                                    path_cstr.as_ptr(),
+                                    times.as_ptr(),
+                                    libc::AT_SYMLINK_NOFOLLOW,
+                                );
+                            }
+                            Some(())
+                        })
+                        .await
+                        .ok();
+                    }
+                }
+
                 let new_storage = JsonlSessionStorage::open_or_create(new_path).await?;
                 // New file on disk — drop the sync-listing cache so the
                 // `/session` overlay lists it immediately (see `delete`).
@@ -520,6 +931,8 @@ impl SessionRepo for JsonlSessionRepo {
 
                 let path_to_root = source_index.get_path_to_root(effective_leaf);
 
+                // Clone new_path for later mtime preservation
+                let new_path_for_mtime = new_path.clone();
                 let new_storage = JsonlSessionStorage::open_or_create(new_path).await?;
 
                 let header = SessionHeader::forked(
@@ -539,6 +952,61 @@ impl SessionRepo for JsonlSessionRepo {
                 // Append a new Leaf pointing to the fork entry.
                 let leaf = SessionEntry::new_leaf(Some(effective_leaf.to_string()), None);
                 new_storage.append_entry(&leaf).await?;
+
+                // Preserve mtime from source file's last entry timestamp (or file mtime)
+                let mtime = Self::extract_last_entry_timestamp(&source.path);
+                let mtime = if let Some(mtime) = mtime {
+                    Some(mtime)
+                } else {
+                    tokio::fs::metadata(&source.path)
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                };
+                if let Some(mtime) = mtime {
+                    if let Ok(mut _file) = tokio::fs::File::options()
+                        .write(true)
+                        .open(&new_path_for_mtime)
+                        .await
+                    {
+                        let new_path_clone = new_path_for_mtime.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let times = [
+                                libc::timespec {
+                                    tv_sec: mtime
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        as i64,
+                                    tv_nsec: 0,
+                                },
+                                libc::timespec {
+                                    tv_sec: mtime
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                        as i64,
+                                    tv_nsec: 0,
+                                },
+                            ];
+                            let path_cstr = std::ffi::CString::new(
+                                new_path_clone.as_os_str().as_encoded_bytes(),
+                            )
+                            .ok()?;
+                            unsafe {
+                                libc::utimensat(
+                                    libc::AT_FDCWD,
+                                    path_cstr.as_ptr(),
+                                    times.as_ptr(),
+                                    libc::AT_SYMLINK_NOFOLLOW,
+                                );
+                            }
+                            Some(())
+                        })
+                        .await
+                        .ok();
+                    }
+                }
 
                 // New file on disk — drop the sync-listing cache so the
                 // `/session` overlay lists it immediately (see `delete`).
@@ -655,11 +1123,19 @@ impl JsonlSessionRepo {
             }
 
             sessions.sort_by(|a, b| {
-                // Sort by last prompt timestamp (most recent activity first),
+                // Sort by file mtime (most recent activity first),
                 // falling back to session creation timestamp.
-                let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
+                let a_ts = a
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let b_ts = b
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                b_ts.cmp(&a_ts)
             });
             cache.dirs.insert(
                 dir.clone(),
@@ -750,18 +1226,43 @@ impl JsonlSessionRepo {
                     }
 
                     // Cache miss or changed file: re-read metadata.
-                    if let Some(meta) = Self::read_metadata(&path).await {
+                    if let Some(meta) = Self::read_metadata_listing(&path).await {
                         if let Some(mt) = file_mtime {
-                            file_mtimes.insert(path, mt);
+                            file_mtimes.insert(path.clone(), mt);
+                        }
+                        // Migrate: ensure header has name if we found one from session_info
+                        let path_clone = path.clone();
+                        let content = tokio::fs::read_to_string(&path_clone).await.ok();
+                        if let Some(content) = content {
+                            if let Some(first_line) = content.lines().next() {
+                                if let Ok(header) =
+                                    serde_json::from_str::<SessionHeader>(first_line)
+                                {
+                                    Self::ensure_header_has_name(
+                                        path_clone,
+                                        &header,
+                                        meta.name.clone(),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         sessions.push(meta);
                     }
                 }
             }
             sessions.sort_by(|a, b| {
-                let a_ts = a.last_prompt_timestamp.as_deref().unwrap_or(&a.timestamp);
-                let b_ts = b.last_prompt_timestamp.as_deref().unwrap_or(&b.timestamp);
-                b_ts.cmp(a_ts)
+                let a_ts = a
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let b_ts = b
+                    .file_mtime
+                    .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                b_ts.cmp(&a_ts)
             });
             scanned.insert(
                 dir.clone(),
@@ -1132,11 +1633,20 @@ mod tests {
         };
         storage.append_entry(&entry).await.unwrap();
 
+        // The efficient listing (read_metadata_listing) doesn't populate detail.
+        // Use read_metadata_detail to get full metadata including message counts.
         let sessions = repo.list(Some(cwd)).await.unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].message_count, 2);
+        let meta = &sessions[0];
+        let detail_meta = JsonlSessionRepo::read_metadata_detail(&meta.path)
+            .expect("read_metadata_detail should work");
+        let detail = detail_meta
+            .detail
+            .as_ref()
+            .expect("detail should be populated");
+        assert_eq!(detail.message_count, 2);
         // 1 user message + 1 assistant message → 1 turn.
-        assert_eq!(sessions[0].user_message_count, 1);
+        assert_eq!(detail.user_message_count, 1);
 
         let _ = tokio::fs::remove_dir_all(&base_dir).await;
     }
