@@ -1,10 +1,10 @@
-//! Aider-style SEARCH/REPLACE "blob" edit format: parser and value-level
-//! transforms.
+//! Aider-style `@@@OLD`/`@@@NEW`/`@@@END` "blob" edit format: parser and
+//! value-level transforms.
 //!
 //! See `doc/batch_editing_v2.md`. Three representations are in play:
 //!
 //! - **Blob** — the model-facing text format, a filename line followed by one
-//!   or more `SEARCH_MARKER` / `DIVIDER` / `REPLACE_MARKER` blocks.
+//!   or more `@@@OLD` / `@@@NEW` / `@@@END` blocks.
 //! - **Canonical array** — the internal/persisted form, pi-compatible:
 //!   `{"path": ..., "edits": [{"oldText": ..., "newText": ...}, ...]}`.
 //! - **Legacy** — `oldText`/`newText` (single) and `old`/`new` (very old
@@ -16,14 +16,14 @@
 
 use serde_json::{json, Value};
 
-/// Opening marker of a SEARCH region.
+/// Opening marker of an OLD region (`@@@OLD`).
 pub const SEARCH_MARKER: &str = "@@@OLD";
-/// Divider between the SEARCH and REPLACE regions.
+/// Divider between the OLD and NEW regions (`@@@NEW`).
 pub const DIVIDER: &str = "@@@NEW";
-/// Closing marker of a REPLACE region.
+/// Closing marker of a NEW region (`@@@END`).
 pub const REPLACE_MARKER: &str = "@@@END";
 
-/// One parsed SEARCH/REPLACE block.
+/// One parsed `@@@OLD`/`@@@NEW`/`@@@END` block.
 #[derive(Debug, PartialEq, Clone)]
 pub struct ParsedEdit {
     pub old_text: String,
@@ -55,35 +55,21 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Whether a line is one of the three structural markers (trimmed comparison,
-/// so trailing whitespace from the model does not defeat detection).
+/// Whether a line is exactly one of the three structural markers.
 ///
-/// For SEARCH only, be lenient with a single hallucinated closing bracket/brace
-/// (`>`, `]`, `}`, `)`) that some models emit — e.g. `@@@OLD>`
-/// or `@@@OLD]`. The prefix must match exactly; only a single such
-/// char is allowed and nothing else may follow. REPLACE and DIVIDER remain
-/// strict.
+/// Each marker must be at the start of a line (no leading whitespace),
+/// and must be followed by nothing (for @@@END at end of text) or a newline.
+/// No trailing characters are accepted.
 fn marker_of(line: &str) -> Option<&'static str> {
-    let t = line.trim();
-    // Lenient SEARCH marker: exact `<<<<<<< SEARCH` or with exactly one
-    // trailing char from the set `>]})`.
-    if let Some(after) = t.strip_prefix(SEARCH_MARKER) {
-        if after.is_empty() {
-            return Some(SEARCH_MARKER);
-        }
-        if after.chars().count() == 1
-            && matches!(
-                after.chars().next(),
-                Some('>') | Some(']') | Some('}') | Some(')')
-            )
-        {
-            return Some(SEARCH_MARKER);
-        }
+    // @@@OLD and @@@NEW must be exact line with nothing after
+    if line == SEARCH_MARKER {
+        return Some(SEARCH_MARKER);
     }
-    if t == DIVIDER {
+    if line == DIVIDER {
         return Some(DIVIDER);
     }
-    if t == REPLACE_MARKER {
+    // @@@END can be exact line or at end of text (handled by caller)
+    if line == REPLACE_MARKER {
         return Some(REPLACE_MARKER);
     }
     None
@@ -92,41 +78,6 @@ fn marker_of(line: &str) -> Option<&'static str> {
 /// Strip a single surrounding triple-backtick fence, if present.
 fn strip_fence(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-
-    // Split any `@@@OLD>content...` (or `]`, `}`, `)`) line into the
-    // marker line and the content line. Models occasionally hallucinate the
-    // bracket without a following newline. The prefix `@@@OLD` must
-    // match exactly; the first char of `rest` must be one of `>]})`.
-    let mut i = 0;
-    while i < lines.len() {
-        // Determine whether to split, extracting any needed data without
-        // keeping a borrow across the mutation.
-        let should_split = {
-            let line = &lines[i];
-            if let Some(rest) = line.trim_start().strip_prefix(SEARCH_MARKER) {
-                let first = rest.chars().next();
-                if matches!(first, Some('>') | Some(']') | Some('}') | Some(')')) {
-                    let content_after = rest[1..].trim_start();
-                    if !content_after.is_empty() {
-                        Some(content_after.to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(content_after) = should_split {
-            lines[i] = SEARCH_MARKER.to_string();
-            lines.insert(i + 1, content_after);
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
 
     // Drop a leading fence line (``` or ```lang).
     if let Some(first) = lines.iter().position(|l| !l.trim().is_empty()) {
@@ -197,7 +148,7 @@ pub fn split_line_anchor(token: &str) -> (String, Option<u64>) {
 /// Parse a blob into [`ParsedEdit`] blocks plus the inferred path.
 ///
 /// Recognizes blocks whose markers each occupy their own (trimmed) line. The
-/// line immediately preceding a `<<<<<<< SEARCH` is treated as an optional
+/// line immediately preceding an `@@@OLD` is treated as an optional
 /// filename header when it is a single whitespace-free token; a trailing
 /// `:LINE` on that header supplies the block's line anchor.
 pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
@@ -228,40 +179,59 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             }
         }
 
-        // Collect SEARCH content up to the divider.
+        // Collect OLD content up to the divider.
+        // Fail fast if any unexpected delimiter is encountered.
         let mut j = i + 1;
         let mut search_lines: Vec<&str> = Vec::new();
-        while j < lines.len() && marker_of(&lines[j]) != Some(DIVIDER) {
+        while j < lines.len() {
+            if let Some(m) = marker_of(&lines[j]) {
+                if m == DIVIDER {
+                    break; // found the expected divider
+                }
+                // Any other delimiter (@@@OLD or @@@END) is invalid in OLD section
+                return Err(ParseError(format!(
+                    "unexpected delimiter `{m}` in OLD section; expected `@@@NEW`"
+                )));
+            }
             search_lines.push(&lines[j]);
             j += 1;
         }
         if j >= lines.len() {
             return Err(ParseError(format!(
-                "an {SEARCH_MARKER} / {DIVIDER} block is missing its `{DIVIDER}` divider"
+                "an `@@@OLD` / `@@@NEW` block is missing its `@@@NEW` divider"
             )));
         }
 
-        // Collect REPLACE content up to the closing marker.
+        // Collect NEW content up to the closing marker.
+        // Fail fast if any unexpected delimiter is encountered.
         let mut k = j + 1;
         let mut replace_lines: Vec<&str> = Vec::new();
-        while k < lines.len() && marker_of(&lines[k]) != Some(REPLACE_MARKER) {
+        while k < lines.len() {
+            if let Some(m) = marker_of(&lines[k]) {
+                if m == REPLACE_MARKER {
+                    break; // found the expected closing marker
+                }
+                // Any other delimiter (@@@OLD or @@@NEW) is invalid in NEW section
+                return Err(ParseError(format!(
+                    "unexpected delimiter `{m}` in NEW section; expected `@@@END`"
+                )));
+            }
             replace_lines.push(&lines[k]);
             k += 1;
         }
         if k >= lines.len() {
             return Err(ParseError(format!(
-                "a {SEARCH_MARKER} block is missing its `{REPLACE_MARKER}` marker"
+                "an `@@@OLD` block is missing its `@@@END` marker"
             )));
         }
 
         let old_text = search_lines.join("\n");
         if old_text.is_empty() {
             return Err(ParseError(
-                "a {SEARCH_MARKER} block has empty OLD text".to_string(),
+                "an `@@@OLD` block has empty OLD text".to_string(),
             ));
         }
         let new_text = replace_lines.join("\n");
-        validate_no_delimiters(&old_text, &new_text)?;
         edits.push(ParsedEdit {
             old_text,
             new_text,
@@ -272,9 +242,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     }
 
     if edits.is_empty() {
-        return Err(ParseError(format!(
-            "no `{SEARCH_MARKER}` / {DIVIDER} blocks found"
-        )));
+        return Err(ParseError(format!("no `@@@OLD` / `@@@NEW` blocks found")));
     }
 
     let multi_file = distinct_headers.len() > 1;
@@ -293,37 +261,6 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         multi_file,
         edits,
     })
-}
-
-/// Check if text contains any of the block delimiters.
-/// Returns the delimiter found, or None if clean.
-fn find_delimiter(text: &str) -> Option<&'static str> {
-    if text.contains(SEARCH_MARKER) {
-        return Some(SEARCH_MARKER);
-    }
-    if text.contains(DIVIDER) {
-        return Some(DIVIDER);
-    }
-    if text.contains(REPLACE_MARKER) {
-        return Some(REPLACE_MARKER);
-    }
-    None
-}
-
-/// Validate that old_text and new_text don't contain block delimiters.
-/// Returns an error if a delimiter is found, indicating which section.
-fn validate_no_delimiters(old_text: &str, new_text: &str) -> Result<(), ParseError> {
-    if let Some(d) = find_delimiter(old_text) {
-        return Err(ParseError(format!(
-            "Invalid edit: block delimiters in {d}! This is likely a mistake, and would break block editing on this file in the future. If it is deliberate, then use the OpenAI single-edit format to insert the delimiters - and use that format on this file in the future."
-        )));
-    }
-    if let Some(d) = find_delimiter(new_text) {
-        return Err(ParseError(format!(
-            "Invalid edit: block delimiters in {d}! This is likely a mistake, and would break block editing on this file in the future. If it is deliberate, then use the OpenAI single-edit format to insert the delimiters - and use that format on this file in the future."
-        )));
-    }
-    Ok(())
 }
 
 /// Compare two path strings the way the rest of the codebase does: resolve
@@ -369,7 +306,7 @@ pub fn merge_path(
         (None, Some(h)) => Ok((h, parsed.edits)),
         (None, None) => Err(
             "no file path: set the `path` argument or include a filename line before the \
-             `<<<<<<< SEARCH` marker"
+             `@@@OLD` marker"
                 .to_string(),
         ),
     }
@@ -566,75 +503,36 @@ mod tests {
     }
 
     #[test]
-    fn lenient_search_marker_accepts_trailing_bracket() {
-        // The model occasionally hallucinates a closing bracket/brace after
-        // SEARCH (e.g. `@@@OLD>` or `@@@OLD]`). Be lenient
-        // for SEARCH only — the prefix must match exactly, only one char from
-        // the set `>]})` is allowed, and nothing else may follow.
-        let text = "src/foo.py\n@@@OLD>\nold\n@@@NEW\nnew\n@@@END";
-        let p = parse_blocks(text).unwrap();
-        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
-        assert_eq!(p.edits, vec![plain("old", "new")]);
-
-        let text2 = "src/foo.py\n@@@OLD]\nold\n@@@NEW\nnew\n@@@END";
-        let p2 = parse_blocks(text2).unwrap();
-        assert_eq!(p2.edits, vec![plain("old", "new")]);
-
-        let text3 = "src/foo.py\n@@@OLD}\nold\n@@@NEW\nnew\n@@@END";
-        let p3 = parse_blocks(text3).unwrap();
-        assert_eq!(p3.edits, vec![plain("old", "new")]);
-
-        let text4 = "src/foo.py\n@@@OLD)\nold\n@@@NEW\nnew\n@@@END";
-        let p4 = parse_blocks(text4).unwrap();
-        assert_eq!(p4.edits, vec![plain("old", "new")]);
-    }
-
-    #[test]
-    fn lenient_search_marker_rejects_invalid_brackets() {
-        // A char outside the allowed set, or a space before the bracket,
-        // must NOT be accepted.
+    fn strict_markers_no_trailing_chars() {
+        // Delimiters must be exact — no trailing characters accepted
+        assert!(parse_blocks("@@@OLD>\nold\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD]\nold\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD}\nold\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD)\nold\n@@@NEW\nnew\n@@@END").is_err());
         assert!(parse_blocks("@@@OLDX\nold\n@@@NEW\nnew\n@@@END").is_err());
-        assert!(parse_blocks("@@@OLD ]\nold\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD \nold\n@@@NEW\nnew\n@@@END").is_err()); // trailing space
     }
 
     #[test]
-    fn lenient_search_marker_splits_hallucinated_bracket_from_content() {
-        // `<<<<<<< SEARCH>>` → treat as `<<<<<<< SEARCH\n>` (marker + content line ">")
-        let text = "@@@OLD>>\nold\n@@@NEW\nnew\n@@@END";
-        let p = parse_blocks(text).unwrap();
-        assert_eq!(p.edits, vec![plain(">\nold", "new")]);
+    fn strict_markers_no_content_on_same_line() {
+        // Delimiters cannot have content on the same line
+        assert!(parse_blocks("@@@OLD>old\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD]old\n@@@NEW\nnew\n@@@END").is_err());
+        assert!(parse_blocks("@@@OLD old\n@@@NEW\nnew\n@@@END").is_err()); // space + content
     }
 
     #[test]
-    fn lenient_only_for_search_not_replace() {
-        // The closing marker must remain exact — no leniency for REPLACE.
+    fn strict_end_marker_no_trailing_chars() {
+        // @@@END must also be exact
         assert!(parse_blocks("@@@OLD\nold\n@@@NEW\nnew\n@@@END>").is_err());
         assert!(parse_blocks("@@@OLD\nold\n@@@NEW\nnew\n@@@END]").is_err());
+        assert!(parse_blocks("@@@OLD\nold\n@@@NEW\nnew\n@@@ENDX").is_err());
     }
 
     #[test]
-    fn lenient_search_marker_accepts_content_on_same_line() {
-        // When the bracket is followed directly by content (no newline), the
-        // line is split and the content becomes the first SEARCH line.
-        let text = "src/foo.py\n@@@OLD>old\n@@@NEW\nnew\n@@@END";
-        let p = parse_blocks(text).unwrap();
-        assert_eq!(p.path.as_deref(), Some("src/foo.py"));
-        assert_eq!(p.edits, vec![plain("old", "new")]);
-
-        let text2 = "src/foo.py\n@@@OLD]old\n@@@NEW\nnew\n@@@END";
-        let p2 = parse_blocks(text2).unwrap();
-        assert_eq!(p2.edits, vec![plain("old", "new")]);
-
-        // Multi-line content on the same line after the bracket.
-        let text3 = "src/foo.py\n@@@OLD>line 1\nline 2\n@@@NEW\nnew\n@@@END";
-        let p3 = parse_blocks(text3).unwrap();
-        assert_eq!(p3.edits, vec![plain("line 1\nline 2", "new")]);
-    }
-
-    #[test]
-    fn lenient_search_marker_newline_style_still_works() {
-        // The original `<<<<<<< SEARCH>\n` style still parses correctly.
-        let text = "src/foo.py\n@@@OLD>\nold\n@@@NEW\nnew\n@@@END";
+    fn exact_markers_still_work() {
+        // The strict exact format should still parse correctly
+        let text = "src/foo.py\n@@@OLD\nold\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert_eq!(p.edits, vec![plain("old", "new")]);
@@ -691,7 +589,7 @@ mod tests {
     fn prose_before_block_is_not_a_header() {
         let text = "Sure, here is the change:\n\n@@@OLD\na\n@@@NEW\nb\n@@@END";
         let p = parse_blocks(text).unwrap();
-        // The immediate predecessor of SEARCH is blank → no header.
+        // The immediate predecessor of @@@OLD is blank → no header.
         assert_eq!(p.path, None);
         assert_eq!(p.edits, vec![plain("a", "b")]);
     }
@@ -803,35 +701,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_old_delimiter_in_new_text() {
-        // @@@OLD in newText should fail
+    fn rejects_old_delimiter_at_line_start_in_new_text() {
+        // @@@OLD at start of line in newText should fail
+        let text = "@@@OLD\nold\n@@@NEW\n@@@OLD\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err
+            .0
+            .contains("unexpected delimiter `@@@OLD` in NEW section"));
+    }
+
+    #[test]
+    fn rejects_new_delimiter_at_line_start_in_old_text() {
+        // @@@NEW at start of line in oldText should fail
+        // Need actual content between @@@OLD and first @@@NEW (the divider)
+        let text = "@@@OLD\nactual content\n@@@NEW\n@@@NEW\nnew\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err
+            .0
+            .contains("unexpected delimiter `@@@NEW` in NEW section"));
+    }
+
+    #[test]
+    fn rejects_end_delimiter_at_line_start_in_old_text() {
+        // @@@END at start of line in oldText should fail
+        let text = "@@@OLD\n@@@END\n@@@NEW\nnew\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(err
+            .0
+            .contains("unexpected delimiter `@@@END` in OLD section"));
+    }
+
+    #[test]
+    fn allows_delimiter_in_middle_of_line() {
+        // Delimiters NOT at start of line should be allowed (mentioned in content)
         let text = "@@@OLD\nold\n@@@NEW\nnew @@@OLD\n@@@END";
-        let err = parse_blocks(text).unwrap_err();
-        assert!(err.0.contains("Invalid edit: block delimiters in @@@OLD"));
+        let parsed = parse_blocks(text).unwrap();
+        assert_eq!(parsed.edits[0].new_text, "new @@@OLD");
     }
 
     #[test]
-    fn rejects_new_delimiter_in_old_text() {
-        // @@@NEW in oldText should fail
-        let text = "@@@OLD\nold @@@NEW\n@@@NEW\nnew\n@@@END";
-        let err = parse_blocks(text).unwrap_err();
-        assert!(err.0.contains("Invalid edit: block delimiters in @@@NEW"));
-    }
-
-    #[test]
-    fn rejects_end_delimiter_in_new_text() {
-        // @@@END in newText should fail
-        let text = "@@@OLD\nold\n@@@NEW\nnew @@@END\n@@@END";
-        let err = parse_blocks(text).unwrap_err();
-        assert!(err.0.contains("Invalid edit: block delimiters in @@@END"));
-    }
-
-    #[test]
-    fn rejects_delimiter_in_old_text() {
-        // @@@END in oldText should fail
-        let text = "@@@OLD\nold @@@END\n@@@NEW\nnew\n@@@END";
-        let err = parse_blocks(text).unwrap_err();
-        assert!(err.0.contains("Invalid edit: block delimiters in @@@END"));
+    fn allows_delimiter_with_leading_whitespace() {
+        // Indented delimiters should be allowed (not at start of line)
+        let text = "@@@OLD\nold\n@@@NEW\n  @@@OLD\n@@@END";
+        let parsed = parse_blocks(text).unwrap();
+        assert_eq!(parsed.edits[0].new_text, "  @@@OLD");
     }
 
     #[test]
