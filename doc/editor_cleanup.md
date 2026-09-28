@@ -1,6 +1,6 @@
 # Editor cleanup — one wrapper, node-driven editing
 
-Status: **E1b + E1 + E2 done**; E3–E4 pending. Rebased onto `origin/main` @ `c705add`
+Status: **E1b + E1 + E2 + E3 done**; E4 pending. Rebased onto `origin/main` @ `c705add`
 (which fixed `ui_draw_v2.md` §9 #1/#2 — see §2.3). Companion to `doc/ui_draw_v2.md` §9.
 
 | step | scope | status |
@@ -8,7 +8,7 @@ Status: **E1b + E1 + E2 done**; E3–E4 pending. Rebased onto `origin/main` @ `c
 | E1b | `draw_frame` takes the composed dims; `frame_size()`; loop records the applied pair | ✅ `3cdcbd4` |
 | E1 | `run_editor` wrapper + `EditorMode` + `pause_reader` + fold drop + Ctrl-E port | ✅ this change |
 | E2 | `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch + `v25_listing_node.rs` | ✅ this change |
-| E3 | compaction split; `prepare()`/`submit()`; drop review/confirm plumbing | pending |
+| E3 | compaction split; `prepare()`/`submit()`; drop review/confirm plumbing | ✅ this change |
 | E4 | cleanup + doc updates | pending |
 
 ## 1. Goals
@@ -139,14 +139,43 @@ height-resize-during-edit case; no correctness path depended on it.
   every `match` on `SubmitResult` — that is the engine-arm checklist.
 - Input-buffer editing (overlay `None`) never reaches a node — the REPL handles it.
 
-## 6. Compaction via `prepare()` / `submit()` — E3
+## 6. Compaction via `prepare()` / `submit()` — E3 (done)
 
-- Split `run_compaction_at_point` into **generate** (draft; LLM = `agent.summarize`) and
-  **apply** (writes the entry from a supplied summary).
-- `TreeCompact*Node::prepare(pa)`: resolve/guard → generate → `app_state.edit_text(&draft,
-  Edit)` → store the edited text → `SubmitResult::Prepared`.
-- Decision via the engine's two-phase confirm: `Enter → submit()` (apply from stored text);
-  `Esc` → abort. `header()` carries the guidance text.
+**Data layer (`agent.rs`) — one code path for every mode:**
+
+- `CompactionDraft { summary, tokens_before }` — what generation produces; callers replace
+  `summary` with the reviewed (edited) text before applying.
+- `generate_compaction(app_state, target_id, mode, llm_payload)` = validate (session,
+  known target, one "nothing before" guard for `Llm`, lazy agent) → snapshot
+  `tokens_before` at the original leaf → **one pivot dance for all modes**: move the leaf
+  to the predecessor, build the scoped context (an active previous compaction re-enters
+  as its `<summary>` wrapper — lossless iterative compaction), build the per-mode draft
+  (`Llm` summarizes *while pivoted*, so retries re-send the identical scoped prefix) →
+  **restore the original leaf on every return path**. No special case for target == leaf
+  or a missing predecessor — those are plain moves. No session writes, no display.
+- `apply_compaction(app_state, target_id, draft)` = `append_compaction` only. No
+  `display_separator`/`display_markdown`: the user just reviewed the summary, and the
+  committed input line documents the write (re-render, if ever wanted, is a UI decision).
+
+**UI layer (`v25_tree.rs`):**
+
+- Shared body for the three mode nodes: `compact_prepare` (generate →
+  `app_state.edit_text(&draft, Edit)` → stash → `SubmitResult::Prepared`),
+  `edit_draft` (no tty → accept as-is), `compact_submit` (validate stash →
+  `apply_compaction` → clear stash).
+- `CompactStash { epoch, target_id, draft }` — keyed by (target, epoch) per §4:
+  `prepare()` always regenerates (overwrites the stash, §10.3); `edit()` (Ctrl-E)
+  re-opens a fresh stash without regenerating, else regenerates; `submit()` rejects a
+  stale key with `Error` (stay open, Enter regenerates).
+- **The confirm is the engine's native workflow** — `prepare()` returns `Prepared`,
+  `NodeEntry` arms `confirm_pending`, Enter runs `submit()`, Esc aborts. No
+  confirmation dialog exists anywhere in the compaction path anymore.
+- `header()` carries the guidance ("Enter opens $EDITOR; then Enter writes, Esc aborts").
+- The typed `/tree … compact` arm drives the *same node pair* (`prepare` → `submit`
+  back-to-back; the typed Enter stands in for the engine's confirm key) — one code
+  path for generate/edit/apply. **Flagged:** that arm looks unreachable (all `/`
+  input routes through the v25 eval → `MenuDone`; `InputAction::Submit` never carries
+  slash text) — verify reachability and delete it in E4.
 
 ## 7. Async? — No, keep it blocking (decided)
 
@@ -162,8 +191,15 @@ is a blocking read by design.
 - **Done (E1):** both Ctrl-E arms' local guard/DSR/fold code; `resolve_editor` /
   `edit_in_editor` moved out of `repl.rs` (now module-private in `editor.rs`);
   `review_compaction_summary`'s local stop/edit/start/DSR (now calls `run_editor`).
-- **Pending (E3):** `confirm_compaction_summary` (trait default + impl),
-  `CompactionSummaryReview` + `run_compaction`'s `review` param.
+- **Done (E3):** `confirm_compaction_summary` (trait default + impl),
+  `CompactionSummaryReview` + `run_compaction`'s `review` param — plus the
+  now-callerless `review_compaction_summary`, `run_compaction` /
+  `run_compaction_at_point` / `CompactionResult` / `CompactionTarget` /
+  `compact_inline`, and `find_predecessor_on_active_branch` (only served the
+  removed dead guard, see §10.7).
+- **Stale docs still naming the deleted review plumbing** (E4): `tree_compaction.md`
+  (review UX §1282), `ui_draw_v2.md` ($EDITOR wrapper row), `v25_cleanup_pass_2.md`
+  (retired-API tables — historical, maybe leave).
 
 ## 9. Phases
 
@@ -182,7 +218,21 @@ is a blocking read by design.
   `view_header()` helpers; all 13 production `StaticListingNode` sites migrated; the 19
   header-bearing nodes wired to `edit()` (§4); Ctrl-E on a `V25Menu` overlay routes
   through `HostKey::Edit`. Tests: 5 engine dispatch + 4 decorator.
-- **E3** pending: compaction split + `prepare()`/`submit()`; drop review/confirm plumbing.
+- **E3** ✅ this change: `generate_compaction`/`apply_compaction`/`CompactionDraft` in
+  `agent.rs` (one pivot dance for all modes; Llm summarizes while pivoted — see §10.6);
+  shared `compact_prepare`/`edit_draft`/`compact_submit` + `CompactStash` in
+  `v25_tree.rs` wired to the native `Prepared` → `confirm_pending` → `submit()` flow;
+  the typed arm drives the same node pair; review plumbing deleted (§8).
+  **Duplication found and collapsed** (flagged per review): (a) the validation
+  preamble existed twice — `compact_inline` vs the typed arm — now one place in
+  `generate_compaction`; (b) two conflicting "nothing before" guards — the
+  `pred == leaf` variant was provably unfireable and was removed (§10.7); (c) the
+  append+render block repeated in all three mode arms — now one `apply_compaction`
+  (display dropped); (d) the seed pivot ran separately from the Llm summarize, whose
+  comment claimed a leaf move that had already been restored — now one dance.
+  Tests: 10 generate/apply (incl. leaf-restore, edited-draft, no-write-without-apply,
+  the two Llm guards), 7 node two-phase (incl. no-stash and stale-epoch rejects) with
+  the full traversal driving Enter#1/Enter#2 through `eval_prompt_resolved`.
 - **E4** pending: cleanup + doc updates.
 
 Gate: `cargo test --features test-utils` (includes `confirm_raw_mode`), `cargo fmt --check`,
@@ -200,3 +250,15 @@ clippy clean in touched regions.
 4. **`draw_frame` dims** — passed in and reported (E1b); `painted_size` loop-owned.
 5. **Header Ctrl-E** — becomes `EditorMode::View` (was: editable buffer with discarded
    edits).
+6. **One pivot dance** — every compaction mode does move → draft → restore, restore on
+   all paths; `Llm` summarizes while pivoted (the old step-7 comment claimed the leaf
+   was "already moved by step 3", but the seed pivot had already restored it — the
+   summarize ran unpivoted, i.e. against the whole context when target ≠ leaf; fixed).
+   Target == leaf / no predecessor need no special case — they're plain moves.
+7. **Single "nothing before" guard** — the two guards collapsed to
+   `predecessor.is_none()` for `Llm`. The `find_predecessor_on_active_branch(…) == leaf`
+   variant could never fire (a predecessor always precedes its target on the root→leaf
+   path, whose last entry is the leaf); fn + tests removed.
+8. **Typed-arm confirm** — the `/tree … compact` arm calls the nodes' `prepare()` then
+   `submit()` directly (typed Enter = confirmation); it never gets its own dialog.
+   Flagged: the arm itself appears unreachable (§6) — E4 candidate.

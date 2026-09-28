@@ -1301,8 +1301,8 @@ impl Repl {
         history.add(line);
         // No DSR here: the draw cache is the steady-state anchor
         // (`frame_anchor()`), content writes advance it, and a foreign
-        // screen writer ($EDITOR via `review_compaction_summary`) re-anchors
-        // on exit (plan §4.2). Clear the input region, then echo the line
+        // screen writer ($EDITOR through `run_editor`) re-anchors on exit
+        // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
         redraw(&LineEditor::new(), &[], sel, dims);
         output.display_plain(line);
@@ -1430,48 +1430,6 @@ impl Repl {
             }
             _ => None,
         }
-    }
-}
-
-/// Let the user review — and edit — a generated compaction summary before it
-/// is written to the session (doc/nested_compactions.md §review UX).
-///
-/// 1. Open `draft` in the external `$EDITOR` through the single wrapper
-///    (reader gate, raw-mode turnover, DSR re-anchor; doc/editor_cleanup.md §2).
-/// 2. Ask the user to accept (default) or cancel via `Output`'s
-///    accept/cancel dialog.
-///
-/// Returns `Some(final_text)` to store (the possibly-edited summary) on
-/// accept, or `None` on cancel / editor failure. The caller must not append a
-/// compaction entry when this returns `None`.
-///
-/// `guard` must be the REPL's term guard (only present on an interactive
-/// TTY); the editor cannot be launched without it. Callers running outside
-/// the interactive REPL (quiet / pipe / tests) should pass a review closure
-/// that simply accepts the draft — see `run_compaction`'s callers.
-pub(crate) fn review_compaction_summary(
-    guard: &TermGuard,
-    output: &dyn Output,
-    draft: &str,
-) -> Option<String> {
-    // One wrapper owns the turnover — raw mode, the reader's stdin gate, and
-    // the DSR re-anchor after the foreign screen writer (editor_cleanup §2).
-    let edited = run_editor(guard, output, draft, EditorMode::Edit);
-
-    let text = match edited {
-        Ok(t) => t,
-        Err(e) => {
-            output.display_error(&format!("editor error: {}", e));
-            return None;
-        }
-    };
-    if output.confirm_compaction_summary(
-        "Write this compaction summary into the session? (edited text is stored)",
-    ) {
-        Some(text)
-    } else {
-        output.display_text("Compaction cancelled.");
-        None
     }
 }
 

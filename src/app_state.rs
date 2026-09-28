@@ -50,12 +50,14 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-/// Compact mode for `tree_compact`.
+/// Compaction mode for the `/tree … compact` menu: names the summary
+/// flavor `agent::generate_compaction` produces; the node's `prepare()`
+/// opens the generated draft in `$EDITOR` before the engine confirm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactMode {
-    /// User-editable touched-files list (already edited in `$EDITOR`).
+    /// User-editable touched-files list.
     Manual,
-    /// Deterministic text extraction (already edited in `$EDITOR`).
+    /// Deterministic text extraction.
     TextOnly,
     /// LLM-generated summary; `payload` is the custom prompt.
     Prompt,
@@ -449,8 +451,8 @@ impl AppState {
         self.state.lock().term_guard = Some(guard);
     }
 
-    /// Clone-out of the term guard (rule 3 — the review closure holds it
-    /// across the editor, outside any lock).
+    /// Clone-out of the term guard (rule 3 — callers hold it across the
+    /// editor outside any lock; `edit_text` does exactly that).
     pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
         self.state.lock().term_guard.clone()
     }

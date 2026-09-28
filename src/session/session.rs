@@ -1451,7 +1451,7 @@ pub(crate) fn apply_compaction_transforms(entries: Vec<SessionEntry>) -> Vec<Ses
     // summary text is intentionally invisible to the runtime LLM context
     // to avoid mid-turn redundancy. Information from them is preserved
     // via the new compaction's own `previousSummary`-injected
-    // summarization step (see `run_compaction_at_point`).
+    // summarization step (see `generate_compaction`).
     for entry in &entries[keep_idx..] {
         match &entry.content {
             SessionEntryContent::Compaction { .. } => {

@@ -113,14 +113,6 @@ pub trait Output: Send + Sync {
     fn confirm_default(&self, message: &str) -> Confirmation {
         self.confirm(message)
     }
-    /// Ask the user to accept or cancel a pending compaction summary after
-    /// they have reviewed/edited it in an external editor. `true` = accept
-    /// (write the entry with the possibly-edited summary); `false` = cancel
-    /// (write nothing). Default implementations accept immediately — there is
-    /// no dialog outside the interactive `ConsoleOutput`.
-    fn confirm_compaction_summary(&self, _message: &str) -> bool {
-        true
-    }
     fn display_separator(&self);
     fn display_thinking(&self, message: &str);
     fn stop_thinking(&self);
@@ -2063,31 +2055,6 @@ impl Output for ConsoleOutput {
             crate::ui::ConfirmResult::Selected(2) => Confirmation::Always,
             _ => Confirmation::No,
         }
-    }
-
-    fn confirm_compaction_summary(&self, message: &str) -> bool {
-        use crate::slashdot_menu::node_impl::StaticRow;
-        use crate::ui::ConfirmSpec;
-
-        let spec = ConfirmSpec {
-            header: message,
-            options: &[
-                StaticRow::new("accept", "Accept"),
-                StaticRow::new("cancel", "Cancel"),
-            ],
-            quick_keys: Some(&[('a', 0), ('c', 1)]),
-            default_sel: 0, // Accept
-            divider: true,
-            // No decision line: the committed `/tree … compact …` prompt is
-            // self-documenting — the dialog simply clears away (plan §5.3).
-            subject: None,
-        };
-
-        // Run the sync dialog.
-        let result = crate::ui::confirm(self, &spec);
-
-        // Esc/dismiss -> false (Cancel - safe default)
-        matches!(result, crate::ui::ConfirmResult::Selected(0))
     }
 
     fn display_separator(&self) {
