@@ -513,8 +513,8 @@ mod tests {
         let app_state = test_app_state();
         let node = test_model_node(&app_state);
         let cols = node.columns();
-        assert_eq!(cols.len(), 6);
-        assert!(cols.iter().any(|c| c.header == "$/1m in"));
+        assert_eq!(cols.len(), 5);
+        assert!(cols.iter().any(|c| c.header == "$/m in"));
     }
 
     #[test]
