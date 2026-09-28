@@ -33,6 +33,11 @@ pub enum HostKey {
     /// Drilled into from a parent listing via Tab. Listing and leaf
     /// nodes can use this to trigger `drill_rewrite`.
     DrillTab,
+    /// Open the endpoint's editor (Ctrl-E) — dispatches to
+    /// [`crate::node_impl::SlashDotNode::edit`]. Like Enter/Esc it
+    /// bypasses the completion pass; a pending confirm swallows it
+    /// (like any non-confirm key).
+    Edit,
 }
 
 // --- Handle to a row in a child's DataResponse ---
@@ -404,6 +409,30 @@ impl NodeEntry {
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let pa = &parsed.path_args;
+        // `HostKey::Edit` first: the node decides (completion does not own
+        // this key), and a `Handled` result degrades to a passive
+        // re-derive — `key` becomes `None`, so the completion gate and the
+        // `None` arm below produce exactly what a fresh eval would
+        // (doc/editor_cleanup.md §5). A pending confirm swallows the key
+        // like any non-confirm key.
+        let mut key = key;
+        if matches!(key, HostKey::Edit) {
+            if self.epoch.confirm_pending {
+                return Self::build_continue(pa);
+            }
+            match self.inner.edit(epoch, pa).await {
+                SubmitResult::Handled => key = HostKey::None,
+                SubmitResult::Done(msg) => return MenuResult::DoneSuccess(msg, pa.full_prompt()),
+                SubmitResult::Prepared => {
+                    self.epoch.confirm_pending = true;
+                    return Self::build_continue(pa);
+                }
+                SubmitResult::NewPath(p) => return MenuResult::ContinuePrompt(p),
+                SubmitResult::Error(msg) => {
+                    return self.error_continue(parsed, &msg, render_ctx).await
+                }
+            }
+        }
         // Completion: passive frames + cursor moves + Tab. Enter/Esc/
         // Drill* bypass entirely (submit raw word / ladder / drill
         // semantics); the confirm dialog has highest precedence.
@@ -432,6 +461,11 @@ impl NodeEntry {
                         SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
                         SubmitResult::Prepared => Self::build_continue(pa),
+                        SubmitResult::Handled => {
+                            // Nothing to commit: re-derive the current frame
+                            // (the host re-evals the same prompt).
+                            Self::build_continue(pa)
+                        }
                         SubmitResult::Error(msg) => {
                             self.error_continue(parsed, &msg, render_ctx).await
                         }
@@ -444,6 +478,11 @@ impl NodeEntry {
                             Self::build_continue(pa)
                         }
                         SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
+                        SubmitResult::Handled => {
+                            // Nothing to commit: re-derive the current frame
+                            // (the host re-evals the same prompt).
+                            Self::build_continue(pa)
+                        }
                         SubmitResult::Error(msg) => {
                             self.error_continue(parsed, &msg, render_ctx).await
                         }
@@ -502,6 +541,28 @@ impl NodeEntry {
         // View args = everything before the matched tail (or entire
         // section when unmatched — `tail.start` is then the suffix end).
         let view_args_clean = pa.suffix[..parsed.tail.start].to_string();
+
+        // `HostKey::Edit` first — same contract as `handle_leaf`: the node
+        // decides, `Handled` degrades to a passive re-derive (`key = None`,
+        // completion gate + `None` path below), pending confirm swallows.
+        let mut key = key;
+        if matches!(key, HostKey::Edit) {
+            if self.epoch.confirm_pending {
+                return Self::build_continue(pa);
+            }
+            match self.inner.edit(epoch, pa).await {
+                SubmitResult::Handled => key = HostKey::None,
+                SubmitResult::Done(msg) => return MenuResult::DoneSuccess(msg, pa.full_prompt()),
+                SubmitResult::Prepared => {
+                    self.epoch.confirm_pending = true;
+                    return Self::build_continue(pa);
+                }
+                SubmitResult::NewPath(p) => return MenuResult::ContinuePrompt(p),
+                SubmitResult::Error(msg) => {
+                    return self.error_continue(parsed, &msg, render_ctx).await
+                }
+            }
+        }
 
         // Completion first: while the dialog is up it owns the passive
         // render, cursor moves, and Tab (exclusive view); Enter/Esc/
@@ -1699,6 +1760,152 @@ mod tests {
             &rctx(),
         ));
         assert!(matches!(result, MenuResult::DoneSuccess(None, _)));
+    }
+
+    // --- HostKey::Edit / SlashDotNode::edit dispatch (editor_cleanup §5) ---
+
+    enum EditReply {
+        Handled,
+        Done,
+    }
+
+    /// A leaf that records `edit()` calls; shares its flag with the test.
+    struct EditSpyNode {
+        reply: EditReply,
+        called: Rc<std::cell::RefCell<bool>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl SlashDotNode for EditSpyNode {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![crate::fields::Row::new("x").desc("ex")],
+                active_ids: Vec::new(),
+            }))
+        }
+
+        async fn edit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+            *self.called.borrow_mut() = true;
+            match self.reply {
+                EditReply::Handled => SubmitResult::Handled,
+                EditReply::Done => SubmitResult::Done(Some("edited".to_string())),
+            }
+        }
+    }
+
+    fn spy_root(reply: EditReply) -> (NodeEntry, Rc<std::cell::RefCell<bool>>) {
+        let called = Rc::new(std::cell::RefCell::new(false));
+        let mut root = NodeEntry::new_root();
+        root.children
+            .push(NodeEntry::new_child(Box::new(EditSpyNode {
+                reply,
+                called: called.clone(),
+            })));
+        (root, called)
+    }
+
+    #[test]
+    fn edit_default_stays_open_with_a_frame() {
+        // No edit() override (CmdNode): `Handled` → passive frame, stay open.
+        let mut root = root_with_cmds(vec![CmdNode::new("alpha")]);
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Edit,
+            Vec::new(),
+            "alpha t",
+            &rctx(),
+        ));
+        assert!(
+            matches!(&result, MenuResult::Continue(..)),
+            "expected a Continue frame, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn edit_at_a_listing_level_stays_open() {
+        let mut root = root_with_cmds(vec![CmdNode::new("alpha")]);
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Edit,
+            Vec::new(),
+            "",
+            &rctx(),
+        ));
+        assert!(
+            matches!(&result, MenuResult::Continue(..)),
+            "expected a Continue frame, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn edit_done_closes_the_menu() {
+        let (mut root, _called) = spy_root(EditReply::Done);
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Edit,
+            Vec::new(),
+            "x t",
+            &rctx(),
+        ));
+        match result {
+            MenuResult::DoneSuccess(Some(msg), _) => assert_eq!(msg, "edited"),
+            other => panic!("expected DoneSuccess, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn edit_is_swallowed_while_a_confirm_is_pending() {
+        let (mut root, called) = spy_root(EditReply::Done);
+        // Epoch-gate-proof: prime the child so its first traverse with `ep()`
+        // does not reset the state we set here.
+        root.children[0].cache_epoch = ep();
+        root.children[0].epoch.confirm_pending = true;
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Edit,
+            Vec::new(),
+            "x t",
+            &rctx(),
+        ));
+        assert!(
+            matches!(&result, MenuResult::ContinuePrompt(_)),
+            "expected ContinuePrompt, got {:?}",
+            result
+        );
+        assert!(
+            !*called.borrow(),
+            "edit() must not run while a confirm is pending"
+        );
+    }
+
+    #[test]
+    fn edit_handled_rederives_the_same_prompt_as_a_passive_eval() {
+        let (mut root, called) = spy_root(EditReply::Handled);
+        let edited = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Edit,
+            Vec::new(),
+            "x t",
+            &rctx(),
+        ));
+        assert!(*called.borrow(), "edit() must have run");
+
+        let (mut root2, _c2) = spy_root(EditReply::Handled);
+        let passive = futures::executor::block_on(root2.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "x t",
+            &rctx(),
+        ));
+        match (edited, passive) {
+            (MenuResult::Continue(_, p_edited), MenuResult::Continue(_, p_passive)) => {
+                assert_eq!(p_edited, p_passive)
+            }
+            other => panic!("expected two Continue frames, got {:?}", other),
+        }
     }
 
     /// A root-like node with children AND a header.

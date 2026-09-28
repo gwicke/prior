@@ -25,7 +25,7 @@ use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::{FieldSpec, Row};
 use crate::slashdot_menu::node_impl::{
     CompletionRows, DataError, DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode,
-    StaticListingNode, StaticRow, SubmitResult,
+    StaticRow, SubmitResult,
 };
 use crate::slashdot_menu::value::Value;
 
@@ -106,7 +106,9 @@ pub fn sandbox_fields() -> Vec<FieldSpec> {
 /// merged binding (config + session); when drilled into (id = sandbox
 /// path) `header()` renders the mapping info and the static action
 /// child (`SandboxRemoveNode`) is shown.
-pub struct SandboxMappingNode;
+pub struct SandboxMappingNode {
+    pub app_state: Arc<AppState>,
+}
 
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxMappingNode {
@@ -128,6 +130,12 @@ impl SlashDotNode for SandboxMappingNode {
             rows,
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -166,6 +174,12 @@ impl SlashDotNode for SandboxRemoveNode {
             rows: vec![row],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -258,6 +272,12 @@ impl SlashDotNode for AddSandboxMappingNode {
             ],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -377,20 +397,28 @@ pub fn build_sandbox_node(
     app_state: &Arc<AppState>,
 ) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
+    use crate::v25_listing_node::ListingNode;
 
-    let mut listing: SlashDotMenuNode =
-        StaticListingNode::new(&[StaticRow::new("sandbox", "Manage sandbox path mappings")])
-            .with_columns(sandbox_listing_columns())
-            .with_fields(sandbox_fields())
-            .into();
+    let mut listing: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new("sandbox", "Manage sandbox path mappings")],
+    )
+    .with_columns(sandbox_listing_columns())
+    .with_fields(sandbox_fields())
+    .into();
 
-    let mut add_node: SlashDotMenuNode =
-        StaticListingNode::new(&[StaticRow::new("add", "Add a path mapping to the sandbox")])
-            .into();
+    let mut add_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new("add", "Add a path mapping to the sandbox")],
+    )
+    .into();
     add_node.add_child(AddSandboxMappingNode::new(app_state.clone()).into());
     listing.add_child(add_node);
 
-    let mut map_node: SlashDotMenuNode = SandboxMappingNode.into();
+    let mut map_node: SlashDotMenuNode = SandboxMappingNode {
+        app_state: app_state.clone(),
+    }
+    .into();
     map_node.add_child(
         SandboxRemoveNode {
             app_state: app_state.clone(),
@@ -411,6 +439,7 @@ mod tests {
     use super::*;
     use crate::config::{BindPath, SandboxConfig};
     use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
+    use crate::slashdot_menu::node_impl::StaticListingNode;
     use crate::slashdot_menu::render::RenderPlan;
     use crate::slashdot_menu::{HostKey, MenuResult};
 

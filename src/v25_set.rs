@@ -15,8 +15,7 @@ use crate::settings::{SettingKey, ValueKind, SETTINGS};
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::menu::SlashDotMenuNode;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, StaticListingNode, StaticRow,
-    SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, StaticRow, SubmitResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,6 +88,12 @@ impl SlashDotNode for SettingLeafNode {
         }
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let meta = SETTINGS.iter().find(|m| m.key == self.key).unwrap();
         let val = self.app_state.with_settings(|s| s.value(self.key));
@@ -135,15 +140,18 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
 /// Build the `/set` subtree as a `SlashDotMenuNode`.
 pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
     use crate::slashdot_menu::fields::ColumnDef;
+    use crate::v25_listing_node::ListingNode;
 
-    let mut set_node: SlashDotMenuNode =
-        StaticListingNode::new(&[StaticRow::new("set", "view and edit settings")])
-            .with_columns(vec![
-                ColumnDef::new("id", "Setting").min(22).prio(2),
-                ColumnDef::new("value", "Value").min(18).prio(2),
-                ColumnDef::new("description", "Description").min(26).prio(1),
-            ])
-            .into();
+    let mut set_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new("set", "view and edit settings")],
+    )
+    .with_columns(vec![
+        ColumnDef::new("id", "Setting").min(22).prio(2),
+        ColumnDef::new("value", "Value").min(18).prio(2),
+        ColumnDef::new("description", "Description").min(26).prio(1),
+    ])
+    .into();
 
     // --- default_model ---
     {
@@ -154,10 +162,13 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
             None, // no recent models for /set
         );
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-            "default_model",
-            "Default model as provider:model (used for new sessions)",
-        )])
+        let mut wrapper: SlashDotMenuNode = ListingNode::new(
+            app_state,
+            &[StaticRow::new(
+                "default_model",
+                "Default model as provider:model (used for new sessions)",
+            )],
+        )
         .with_columns(crate::v25_model::model_columns())
         .into();
         wrapper = wrapper.with_value_forwarding();
@@ -176,10 +187,13 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
                 writer.set_setting(SettingKey::DefaultPersona, val)
             }),
         };
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-            "default_persona",
-            "Persona for new sessions (built-in name or file)",
-        )])
+        let mut wrapper: SlashDotMenuNode = ListingNode::new(
+            app_state,
+            &[StaticRow::new(
+                "default_persona",
+                "Persona for new sessions (built-in name or file)",
+            )],
+        )
         .into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
@@ -196,10 +210,13 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
                 writer.set_setting(SettingKey::DefaultThinking, level)
             }),
         };
-        let mut wrapper: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-            "default_thinking_level",
-            "Default thinking level: off | low | med | high",
-        )])
+        let mut wrapper: SlashDotMenuNode = ListingNode::new(
+            app_state,
+            &[StaticRow::new(
+                "default_thinking_level",
+                "Default thinking level: off | low | med | high",
+            )],
+        )
         .into();
         wrapper = wrapper.with_value_forwarding();
         wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
@@ -225,7 +242,8 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
                     app_state: app_state.clone(),
                 };
                 let mut wrapper: SlashDotMenuNode =
-                    StaticListingNode::new(&[StaticRow::new(meta.name, meta.description)]).into();
+                    ListingNode::new(app_state, &[StaticRow::new(meta.name, meta.description)])
+                        .into();
                 wrapper = wrapper.with_value_forwarding();
                 wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
                 set_node.add_child(wrapper);
@@ -273,6 +291,7 @@ mod tests {
     }
 
     fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
+        use crate::slashdot_menu::node_impl::StaticListingNode;
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         root.add_child(build_set_node(app_state));

@@ -4,22 +4,26 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
-use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
+use crate::slashdot_menu::node_impl::StaticRow;
+use crate::v25_listing_node::ListingNode;
 
 use crate::v25_thinking::ThinkingEnumNode;
 
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
-    let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
+    let mut root: SlashDotMenuNode = ListingNode::new(app_state, &[]).into();
 
     // Thinking: listing + single enum node (returns all levels via data()).
     {
         let reader = app_state.clone();
         let writer = app_state.clone();
-        let mut tl: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-            "thinking",
-            "Set thinking level: off | low | med | high | max",
-        )])
+        let mut tl: SlashDotMenuNode = ListingNode::new(
+            app_state,
+            &[StaticRow::new(
+                "thinking",
+                "Set thinking level: off | low | med | high | max",
+            )],
+        )
         .with_columns(vec![
             crate::slashdot_menu::ColumnDef::new("id", "Thinking Level"),
             crate::slashdot_menu::ColumnDef::new("description", "Description"),
@@ -40,13 +44,15 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
 
     // Persona
     {
-        let mut pl: SlashDotMenuNode =
-            StaticListingNode::new(&[StaticRow::new("persona", "set runtime persona")])
-                .with_columns(vec![
-                    crate::slashdot_menu::ColumnDef::new("id", "Persona"),
-                    crate::slashdot_menu::ColumnDef::new("description", "Description"),
-                ])
-                .into();
+        let mut pl: SlashDotMenuNode = ListingNode::new(
+            app_state,
+            &[StaticRow::new("persona", "set runtime persona")],
+        )
+        .with_columns(vec![
+            crate::slashdot_menu::ColumnDef::new("id", "Persona"),
+            crate::slashdot_menu::ColumnDef::new("description", "Description"),
+        ])
+        .into();
         crate::v25_persona::add_persona_child(&mut pl, app_state);
         root.add_child(pl);
     }

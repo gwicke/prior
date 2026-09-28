@@ -672,6 +672,12 @@ impl SlashDotNode for TreeListNode {
         tree_fields()
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(entry_id) = Self::drilled_entry_id(path_args) else {
             return vec!["Select a tree entry, then choose an action.".to_string()];
@@ -735,6 +741,12 @@ impl SlashDotNode for TreeSwitchNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Move the session leaf to this entry.".to_string(),
@@ -787,6 +799,12 @@ impl SlashDotNode for CompactNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Compact: summarize entries before the current point.".into(),
@@ -837,6 +855,12 @@ impl SlashDotNode for TreeCompactManualNode {
             rows: vec![Row::new("manual").desc("user-editable file list")],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -895,6 +919,12 @@ impl SlashDotNode for TreeCompactTextNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Text-only compaction: extract user prompts + assistant text.".into(),
@@ -944,6 +974,12 @@ impl SlashDotNode for TreeCompactPromptNode {
             rows: vec![Row::new("prompt").desc("LLM-generated summary")],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -1007,12 +1043,16 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
 pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
-    use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
+    use crate::slashdot_menu::node_impl::StaticRow;
+    use crate::v25_listing_node::ListingNode;
 
-    let mut listing: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "tree",
-        "navigate session history — select a point to continue from",
-    )])
+    let mut listing: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "tree",
+            "navigate session history — select a point to continue from",
+        )],
+    )
     .with_columns(tree_listing_columns())
     .with_fields(tree_fields())
     .into();
@@ -1026,10 +1066,13 @@ pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu:
     );
 
     // Compact subtree: a listing node with three mode children.
-    let mut compact_node: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "compact",
-        "summarize entries before this point",
-    )])
+    let mut compact_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "compact",
+            "summarize entries before this point",
+        )],
+    )
     .into();
     compact_node.add_child(TreeCompactManualNode::new(app_state.clone()).into());
     compact_node.add_child(TreeCompactTextNode::new(app_state.clone()).into());

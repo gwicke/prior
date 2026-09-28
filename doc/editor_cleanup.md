@@ -1,13 +1,13 @@
 # Editor cleanup — one wrapper, node-driven editing
 
-Status: **E1b + E1 done**; E2–E4 pending. Rebased onto `origin/main` @ `c705add`
+Status: **E1b + E1 + E2 done**; E3–E4 pending. Rebased onto `origin/main` @ `c705add`
 (which fixed `ui_draw_v2.md` §9 #1/#2 — see §2.3). Companion to `doc/ui_draw_v2.md` §9.
 
 | step | scope | status |
 |---|---|---|
 | E1b | `draw_frame` takes the composed dims; `frame_size()`; loop records the applied pair | ✅ `3cdcbd4` |
 | E1 | `run_editor` wrapper + `EditorMode` + `pause_reader` + fold drop + Ctrl-E port | ✅ this change |
-| E2 | `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch + `v25_listing_node.rs` | pending |
+| E2 | `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch + `v25_listing_node.rs` | ✅ this change |
 | E3 | compaction split; `prepare()`/`submit()`; drop review/confirm plumbing | pending |
 | E4 | cleanup + doc updates | pending |
 
@@ -92,16 +92,22 @@ height-resize-during-edit case; no correctness path depended on it.
 
 - Trait method (library; editor support optional by construction):
   ```rust
-  async fn edit(&mut self, _path_args: &PathArgs) -> SubmitResult {
+  async fn edit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
       SubmitResult::Handled   // default: no-op edit; stay open
   }
   ```
 - **Host listing decorator** `src/v25_listing_node.rs` — a *concrete* wrapper holding
   `StaticListingNode` + `Arc<AppState>`, used **exactly at the sites that use
-  `StaticListingNode` today** (static rows, no `submit`). Dynamic listing nodes
-  (`TreeListNode`, `SessionListingNode`, …) are *not* wrapped and keep the no-op default.
-  Its `edit()` opens **`header()` only**, read-only (`EditorMode::View`); rows in the view
-  can be added later once specced.
+  `StaticListingNode` today** (static rows, no `submit`). Dynamic listing nodes are *not*
+  wrapped — they get their own `edit()` where applicable (below). Its `edit()` opens
+  **`header()` only**, read-only (`EditorMode::View`); rows in the view can be added later
+  once specced.
+- **Sweep (E2):** every *other* production node that **defines `header()`** got the same
+  read-only `edit()` through the shared `view_header()` helper (20 nodes: clear/new/quit/
+  replay/stat, set leaf, sandbox mapping/remove/add, session
+  list/resume/fork/rename/delete, tree list/switch/compact + the three compact modes).
+  Nodes without `header()` get nothing — there is nothing to view. (`SandboxMappingNode`
+  was a unit struct; it gained an `app_state` field for this.)
 - **Decorator, not a look-alike**: every trait method *forwards* to the inner
   `StaticListingNode` — no logic/builder duplication, no drift — and because the inner type
   is concrete the forwarding is static: **zero runtime overhead** beyond the one `dyn` layer
@@ -114,16 +120,16 @@ height-resize-during-edit case; no correctness path depended on it.
   (parse → write → `Prepared`/`Done`), leaves editing parameter/draft text.
 - Host nodes self-serve via `app_state` — no capability threading; the library keeps its
   no-op default.
-- Note: `edit()` deliberately has no `epoch` param (host signature). The first node whose
-  `edit()` mutates *displayed* data will need a cache-invalidation story (engine row cache
-  is epoch-keyed) — revisit then; view-only and prompt edits don't need one.
+- `edit()` carries the **epoch** for cache invalidation: a node stashing state across
+  calls (e.g. the compaction draft, keyed by the prepared message ID *and* the epoch it
+  was prepared at) reuses the stash only while both still match, re-generating otherwise.
 
 ## 5. Engine dispatch (`HostKey::Edit`) — E2
 
 - Add `HostKey::Edit` (`node_entry.rs`).
 - `NodeEntry::handle_leaf` / `handle_listing`: bypass completion/confirm (an `Edit` while
-  a confirm is pending is ignored, like other non-confirm keys), call `edit(pa)`, map like
-  `prepare()`: `Done → DoneSuccess`, `Prepared → confirm_pending`,
+  a confirm is pending is ignored, like other non-confirm keys), call `edit(epoch, pa)`,
+  map like `prepare()`: `Done → DoneSuccess`, `Prepared → confirm_pending`,
   `NewPath → ContinuePrompt`, `Error → error_continue`.
 - **`SubmitResult::Handled`** (new): "handled, stay open" — `NodeEntry` returns
   `MenuResult::Continue(plan, prompt)` *directly* via the passive-render path (byte-identical
@@ -169,10 +175,13 @@ is a blocking read by design.
   module-private mechanism + 15 moved/new tests); Ctrl-E arms ported (Edit for the
   buffer, View for the header); folds removed; `review_compaction_summary` routed through
   the wrapper; `AppState::edit_text` + test (guard-less = `Unsupported`).
-- **E2** pending: `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch +
-  `v25_listing_node.rs` (decorator over `StaticListingNode`, read-only `header()` view);
-  migrate the `StaticListingNode` sites in `v25_menu.rs` to it; Ctrl-E on a `V25Menu`
-  overlay routes through `HostKey::Edit`.
+- **E2** ✅: `SubmitResult::Handled` + `SlashDotNode::edit(epoch, pa)` (default `Handled`)
+  + `HostKey::Edit` with pre-gate dispatch in `handle_leaf`/`handle_listing` (pending
+  confirm swallows; `Handled` degrades to `key = None`, i.e. the exact passive re-derive;
+  no recursion → no boxing); `v25_listing_node.rs` decorator + shared `header_ctx()`/
+  `view_header()` helpers; all 13 production `StaticListingNode` sites migrated; the 19
+  header-bearing nodes wired to `edit()` (§4); Ctrl-E on a `V25Menu` overlay routes
+  through `HostKey::Edit`. Tests: 5 engine dispatch + 4 decorator.
 - **E3** pending: compaction split + `prepare()`/`submit()`; drop review/confirm plumbing.
 - **E4** pending: cleanup + doc updates.
 

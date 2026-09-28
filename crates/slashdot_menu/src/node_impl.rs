@@ -150,6 +150,10 @@ pub enum SubmitResult {
     /// Prep step done; engine shows confirm dialog. Subsequent Enter
     /// calls `submit()` again.
     Prepared,
+    /// Handled, stay open — nothing to commit. The engine re-derives the
+    /// current frame exactly as a `HostKey::None` eval would and the menu
+    /// stays up. `edit()`'s default returns this: a no-op edit.
+    Handled,
     /// Rewrite the buffer to a new menu path (e.g. `/compact` →
     /// `/tree <id> compact `).
     NewPath(String),
@@ -225,6 +229,25 @@ pub trait SlashDotNode {
     /// show a header — use `header()` for that.
     async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
         self.submit(epoch, path_args).await
+    }
+
+    /// This endpoint's editor behavior, dispatched from `HostKey::Edit`
+    /// (Ctrl-E) — doc/editor_cleanup.md §4. **Default:** the no-op
+    /// `Handled`, so editor support is optional per node (the library
+    /// never learns about editors).
+    ///
+    /// `epoch` is the engine's data epoch, for cache invalidation: state
+    /// stashed across calls (e.g. a prepared compaction draft keyed by
+    /// message ID *and* the epoch it was made at) is reused only while
+    /// both still match — otherwise re-generate.
+    ///
+    /// Implementations open `$EDITOR` through the host (e.g.
+    /// `AppState::edit_text`) and map the outcome onto `SubmitResult`:
+    /// view-only text → `Handled`, something committed → `Done`, or
+    /// `Prepared` to run it past the engine's confirm dialog first;
+    /// failures → `Error`.
+    async fn edit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+        SubmitResult::Handled
     }
 
     /// Non-selectable header lines (replaces v2 DetailProvider).

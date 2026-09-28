@@ -930,28 +930,12 @@ impl Repl {
                                     }
                                     continue;
                                 }
-                                ActiveOverlay::V25Menu { plan } => {
-                                    // View the header from the current plan's
-                                    // detail lines — view-only: the tempfile is
-                                    // read-only (0400) and nothing is persisted.
-                                    let header_text = plan
-                                        .detail
-                                        .iter()
-                                        .map(|l| l.0.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    if !header_text.is_empty() {
-                                        if let Err(e) = run_editor(
-                                            &self.guard,
-                                            output,
-                                            &header_text,
-                                            EditorMode::View,
-                                        ) {
-                                            let _ = io::stdout().write_all(
-                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
-                                            );
-                                        }
-                                    }
+                                ActiveOverlay::V25Menu { .. } => {
+                                    // Ctrl-E on a menu endpoint dispatches to
+                                    // the node's edit() through the engine
+                                    // (doc/editor_cleanup.md §3/§5): the node
+                                    // owns what (if anything) to edit.
+                                    pending_key = Some(crate::slashdot_menu::HostKey::Edit);
                                     continue;
                                 }
                                 ActiveOverlay::PathComplete { .. } => {
