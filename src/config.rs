@@ -1161,6 +1161,18 @@ impl PathPolicy {
         normalize(&joined)
     }
 
+    /// Resolve a path to an absolute sandbox path **without remapping** to host.
+    /// This is used for display purposes so the agent sees sandbox-relative paths.
+    pub fn resolve_sandbox(&self, path: &str) -> PathBuf {
+        let p = Path::new(path);
+        let joined = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        };
+        normalize(&joined)
+    }
+
     /// Check that `host_path` (already resolved against the root) is covered by
     /// a binding and, if `write`, that the covering binding is `rw`.
     /// Returns `Ok(())` or a denial reason.

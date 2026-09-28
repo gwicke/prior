@@ -52,6 +52,7 @@ fn get_path(path: &str) -> Result<PathBuf, ToolError> {
 /// Resolve `path` for a filesystem tool, enforcing the sandbox path policy when
 /// active. `is_write` marks mutating operations (write/edit/make_dir/remove/
 /// move-dest/copy-dest), which require an `rw` binding under the policy.
+/// Returns the **host path** (after remapping) for actual filesystem operations.
 fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
     let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
 
@@ -66,6 +67,18 @@ fn get_path_with(path: &str, is_write: bool) -> Result<PathBuf, ToolError> {
     }
 
     validate_path(&base, path)
+}
+
+/// Resolve `path` to an absolute sandbox path **without remapping**.
+/// This is used for display purposes (tool results) so the agent sees
+/// sandbox-relative paths, not host paths.
+fn get_sandbox_path(path: &str) -> Result<PathBuf, ToolError> {
+    if let Some(policy) = current_path_policy() {
+        Ok(policy.resolve_sandbox(path))
+    } else {
+        let base = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
+        validate_path(&base, path)
+    }
 }
 
 fn validate_path(base: &std::path::Path, path: &str) -> Result<PathBuf, ToolError> {
@@ -143,8 +156,10 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
     // Return a structured result similar to read_file: include the path and
     // content preview so display_tool_result can render it with syntax
     // highlighting and the user sees what was written.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
-    let shown = crate::path_util::relativize_path(&p, &cwd);
+    // Use the sandbox path (not the remapped host path) for the response.
+    let sandbox_path = get_sandbox_path(&path)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
+    let shown = crate::path_util::relativize_path(&sandbox_path, &cwd);
     // Limit preview to first 50 lines, without line numbers (display handles formatting)
     let preview = content.lines().take(50).collect::<Vec<_>>().join("\n");
     Ok(serde_json::json!({
@@ -855,8 +870,10 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
     // already has cwd in its system prompt) and tokens aren't wasted on
     // the absolute prefix. We deliberately don't try to relativize paths
     // outside cwd — see `path_util::relativize_path`.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| p.clone());
-    let shown = relativize_path(&p, &cwd);
+    // Use the sandbox path (not the remapped host path) for the response.
+    let sandbox_path = get_sandbox_path(&path)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| sandbox_path.clone());
+    let shown = relativize_path(&sandbox_path, &cwd);
     // When no anchor was supplied, echo where each block actually matched. The
     // `path:LINE` idiom shown here is the same anchor syntax the blob form
     // accepts, so the model learns it from its own transcript. Only shown when
