@@ -391,7 +391,7 @@ impl EditArgs {
         // Anchors come solely from each block's `path:LINE` header.
         if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
             let parsed = crate::edit_blocks::parse_blocks(text)
-                .map_err(|e| Self::invalid(raw, &format!("invalid SEARCH/REPLACE blocks: {e}")))?;
+                .map_err(|e| Self::invalid(raw, &format!("Invalid @@@OLD / @@@NEW block: {e}")))?;
             let (path, blocks) = crate::edit_blocks::merge_path(json_path, parsed)
                 .map_err(|e| Self::invalid(raw, &e))?;
             let edits = blocks
