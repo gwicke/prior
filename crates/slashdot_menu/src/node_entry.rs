@@ -582,8 +582,13 @@ impl NodeEntry {
         let pa = &parsed.path_args;
         // Step 2: clear refinement — terms, modifiers, selection dropped.
         if !pa.args.is_empty() || parsed.matched() {
-            // Rewrite section to just the parent path (no terms/modifiers/selection).
-            return MenuResult::ContinuePrompt(pa.prompt_with(""));
+            // Rewrite section to just the parent path (no terms/modifiers/selection), but *with*
+            // trailing space so we stay in the current listing.
+            return if !pa.ids.is_empty() {
+                MenuResult::ContinuePrompt(pa.prompt_with(" "))
+            } else {
+                MenuResult::ContinuePrompt(pa.prompt_with(""))
+            };
         }
 
         // Step 3: strip trailing space → parent becomes responsible.
