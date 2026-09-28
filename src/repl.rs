@@ -14,6 +14,7 @@
 
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
+use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
 use crate::session::SessionTreeNode;
@@ -908,9 +909,16 @@ impl Repl {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match &overlay {
                                 ActiveOverlay::None => {
-                                    // Edit input buffer.
-                                    let _ = self.guard.stop();
-                                    match edit_in_editor(&editor.text()) {
+                                    // Edit the input buffer. The wrapper owns
+                                    // the whole turnover — reader gate, raw
+                                    // mode, DSR re-anchor; no local logic here
+                                    // (doc/editor_cleanup.md §2).
+                                    match run_editor(
+                                        &self.guard,
+                                        output,
+                                        &editor.text(),
+                                        EditorMode::Edit,
+                                    ) {
                                         Ok(new_text) => {
                                             editor.set(&new_text);
                                         }
@@ -920,23 +928,12 @@ impl Repl {
                                             );
                                         }
                                     }
-                                    let _ = self.guard.start();
-                                    // The editor owned the screen while we were
-                                    // out: re-anchor the draw cache (DSR) before
-                                    // the next paint (plan §4.2). A *height*
-                                    // change the editor caused is folded into
-                                    // `painted_size` here (the re-anchor already
-                                    // covered it), while a *width* change is left
-                                    // for the wipe + replay at the loop top.
-                                    let _ = output.cursor_row();
-                                    if let Ok((_, h)) = crossterm::terminal::size() {
-                                        let (w, _) = painted_size.get();
-                                        painted_size.set((w, h.max(1) as usize));
-                                    }
                                     continue;
                                 }
                                 ActiveOverlay::V25Menu { plan } => {
-                                    // Edit header content from the current plan's detail lines.
+                                    // View the header from the current plan's
+                                    // detail lines — view-only: the tempfile is
+                                    // read-only (0400) and nothing is persisted.
                                     let header_text = plan
                                         .detail
                                         .iter()
@@ -944,25 +941,15 @@ impl Repl {
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     if !header_text.is_empty() {
-                                        let _ = self.guard.stop();
-                                        match edit_in_editor(&header_text) {
-                                            Ok(_) => { /* user viewed/saved; no feedback */ }
-                                            Err(e) => {
-                                                let _ = io::stdout().write_all(
-                                                    format!("\r\neditor error: {}\r\n", e)
-                                                        .as_bytes(),
-                                                );
-                                            }
-                                        }
-                                        let _ = self.guard.start();
-                                        // The editor was a foreign screen writer
-                                        // here too: re-anchor the draw cache (DSR)
-                                        // and fold any height change, exactly as
-                                        // in the `None` arm above.
-                                        let _ = output.cursor_row();
-                                        if let Ok((_, h)) = crossterm::terminal::size() {
-                                            let (w, _) = painted_size.get();
-                                            painted_size.set((w, h.max(1) as usize));
+                                        if let Err(e) = run_editor(
+                                            &self.guard,
+                                            output,
+                                            &header_text,
+                                            EditorMode::View,
+                                        ) {
+                                            let _ = io::stdout().write_all(
+                                                format!("\r\neditor error: {}\r\n", e).as_bytes(),
+                                            );
                                         }
                                     }
                                     continue;
@@ -1462,86 +1449,11 @@ impl Repl {
     }
 }
 
-/// Resolve the external editor command from environment variables.
-/// Priority: `$VISUAL` > `$EDITOR` > `"vim"`.
-/// Returns `(command, args)` where args may include flags e.g. `("emacs", ["-nw"])`.
-fn resolve_editor() -> (String, Vec<String>) {
-    let raw = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vim".into());
-    let parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
-    let cmd = parts.first().cloned().unwrap_or_else(|| "vim".into());
-    let args: Vec<String> = parts.into_iter().skip(1).collect();
-    (cmd, args)
-}
-
-/// Open `current` in `$EDITOR` (foreground child process) and return the
-/// modified text.  The editor inherits the terminal directly (stdin/stdout/
-/// stderr), so the caller must drop raw mode beforehand and re‑enter it
-/// afterwards.
-///
-/// A single trailing `\n` is stripped on read‑back because most editors add
-/// one.  Internal newlines and intentional trailing blank lines are preserved.
-/// The tempfile is cleaned up on every return path.
-pub(crate) fn edit_in_editor(current: &str) -> io::Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let mut path = PathBuf::from(tmpdir);
-    path.push(format!("picocode_prompt_{}", std::process::id()));
-
-    // Write current content, mode 0600 so other users cannot read the
-    // prompt mid‑edit.
-    {
-        let mut f = std::fs::File::create(&path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(current.as_bytes())?;
-        f.flush()?;
-    }
-
-    // Launch editor.
-    let (cmd, mut args) = resolve_editor();
-    args.push(path.to_string_lossy().to_string());
-
-    let status = std::process::Command::new(&cmd)
-        .args(&args)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&path);
-            e
-        })?;
-
-    if !status.success() {
-        let _ = std::fs::remove_file(&path);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("editor exited with status {:?}", status.code()),
-        ));
-    }
-
-    // Read back.
-    let mut result = std::fs::read_to_string(&path).map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        e
-    })?;
-
-    // Strip exactly one trailing newline (most editors add one).
-    if result.ends_with('\n') {
-        result.pop();
-    }
-
-    let _ = std::fs::remove_file(&path);
-    Ok(result)
-}
-
 /// Let the user review — and edit — a generated compaction summary before it
 /// is written to the session (doc/nested_compactions.md §review UX).
 ///
-/// 1. Drop raw mode, open `draft` in the external `$EDITOR` (reuses the
-///    Ctrl-E prompt-editing machinery), re-enter raw mode.
+/// 1. Open `draft` in the external `$EDITOR` through the single wrapper
+///    (reader gate, raw-mode turnover, DSR re-anchor; doc/editor_cleanup.md §2).
 /// 2. Ask the user to accept (default) or cancel via `Output`'s
 ///    accept/cancel dialog.
 ///
@@ -1558,15 +1470,9 @@ pub(crate) fn review_compaction_summary(
     output: &dyn Output,
     draft: &str,
 ) -> Option<String> {
-    // Drop raw mode for the foreground editor; re-enter on return (mirrors
-    // the Ctrl-E path in read_input).
-    let _ = guard.stop();
-    let edited = edit_in_editor(draft);
-    let _ = guard.start();
-    // The editor is a foreign screen writer: re-anchor the draw cache to the
-    // real cursor (DSR) and invalidate the frame region before anything else
-    // draws (plan §4.2).
-    let _ = output.cursor_row();
+    // One wrapper owns the turnover — raw mode, the reader's stdin gate, and
+    // the DSR re-anchor after the foreign screen writer (editor_cleanup §2).
+    let edited = run_editor(guard, output, draft, EditorMode::Edit);
 
     let text = match edited {
         Ok(t) => t,
@@ -3447,196 +3353,6 @@ mod tests {
             // Caret on the (single-row) input: 0-idx row 7, col 2 (prompt end).
             assert_eq!((cr, cc), (7, 2));
         }
-    }
-
-    // ===== resolve_editor / edit_in_editor tests =====
-    //
-    // These tests modify environment variables (VISUAL / EDITOR) and must
-    // run serially to avoid races.  `ENV_LOCK` serialises them.
-
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    /// Global mutex that serialises all env-var-modifying tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Save and restore environment variables around a test closure.
-    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-            .collect();
-        for (k, v) in vars {
-            match v {
-                Some(val) => unsafe {
-                    std::env::set_var(k, val);
-                },
-                None => unsafe {
-                    std::env::remove_var(k);
-                },
-            }
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(val) => unsafe {
-                    std::env::set_var(&k, &val);
-                },
-                None => unsafe {
-                    std::env::remove_var(&k);
-                },
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_editor_prefers_visual() {
-        with_env(
-            &[("VISUAL", Some("myeditor")), ("EDITOR", Some("other"))],
-            || {
-                let (cmd, args) = super::resolve_editor();
-                assert_eq!(cmd, "myeditor", "VISUAL must take priority");
-                assert!(args.is_empty(), "no flags: {:?}", args);
-            },
-        );
-    }
-
-    #[test]
-    fn resolve_editor_falls_back_to_editor() {
-        with_env(&[("VISUAL", None), ("EDITOR", Some("nano"))], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "nano", "EDITOR fallback");
-            assert!(args.is_empty());
-        });
-    }
-
-    #[test]
-    fn resolve_editor_defaults_to_vim() {
-        with_env(&[("VISUAL", None), ("EDITOR", None)], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "vim", "default to vim");
-            assert!(args.is_empty());
-        });
-    }
-
-    #[test]
-    fn resolve_editor_splits_flags() {
-        with_env(
-            &[
-                ("VISUAL", Some("emacs -nw --no-site-file")),
-                ("EDITOR", None),
-            ],
-            || {
-                let (cmd, args) = super::resolve_editor();
-                assert_eq!(cmd, "emacs");
-                assert_eq!(args, vec!["-nw", "--no-site-file"]);
-            },
-        );
-    }
-
-    /// Helper: run `edit_in_editor` with `current` content by setting
-    /// `EDITOR` to a shell script that writes `expected_output` to the file.
-    fn mock_edit(current: &str, editor_body: &str, expected_output: &str) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("mock_editor.sh");
-        {
-            let mut f = std::fs::File::create(&script).expect("create script");
-            f.write_all(b"#!/bin/sh\n").unwrap();
-            f.write_all(editor_body.as_bytes()).unwrap();
-            f.flush().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor(current);
-                assert!(result.is_ok(), "edit_in_editor failed: {:?}", result.err());
-                assert_eq!(result.unwrap(), expected_output);
-            },
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_roundtrip() {
-        mock_edit(
-            "hello world",
-            "printf '%s' 'edited content' > \"$1\"\n",
-            "edited content",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_empty_buffer() {
-        mock_edit("", "printf '%s' 'new content' > \"$1\"\n", "new content");
-    }
-
-    #[test]
-    fn edit_in_editor_trailing_newline_stripped() {
-        mock_edit(
-            "hello",
-            "printf '%s\\n' 'hello world' > \"$1\"\n",
-            "hello world",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_preserves_internal_newlines() {
-        mock_edit(
-            "line1\nline2\nline3",
-            "printf '%s\\n%s\\n%s' 'aaa' 'bbb' 'ccc' > \"$1\"\n",
-            "aaa\nbbb\nccc",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_keeps_trailing_blank_lines() {
-        // If the file ends with "a\n\n" (a, plus one blank line), stripping
-        // one trailing \n must leave "a\n" — the blank line is preserved.
-        mock_edit("a\n\n", "printf '%s\\n\\n' 'a' > \"$1\"\n", "a\n");
-    }
-
-    #[test]
-    fn edit_in_editor_nonzero_exit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("failing_editor.sh");
-        {
-            let mut f = std::fs::File::create(&script).expect("create script");
-            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
-            f.flush().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor("original");
-                assert!(result.is_err(), "non-zero exit must return error");
-            },
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_nonexistent_command() {
-        with_env(
-            &[
-                ("VISUAL", Some("/nonexistent/editor_binary")),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor("hello");
-                assert!(result.is_err(), "nonexistent command must return error");
-            },
-        );
     }
 
     // --- compute_space_budget tests ---

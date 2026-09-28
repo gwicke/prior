@@ -455,6 +455,26 @@ impl AppState {
         self.state.lock().term_guard.clone()
     }
 
+    /// Run the external editor over `current` through the single wrapper
+    /// (`crate::editor::run_editor`): reader gate, raw-mode turnover, DSR
+    /// re-anchor (doc/editor_cleanup.md §2). Requires an interactive term
+    /// guard — without one (quiet/pipe) there is no tty to hand over, so
+    /// this reports `Unsupported`.
+    pub fn edit_text(
+        &self,
+        current: &str,
+        mode: crate::editor::EditorMode,
+    ) -> std::io::Result<String> {
+        let guard = self.term_guard().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "editor requires an interactive terminal",
+            )
+        })?;
+        let output = self.with_config(|c| c.output.clone());
+        crate::editor::run_editor(&guard, output.as_ref(), current, mode)
+    }
+
     // --- test constructor ---
 
     /// Minimal state bundle for in-crate tests (no repo).
@@ -538,6 +558,16 @@ mod tests {
             app_state.with_config(|c| c.model.clone()),
             "tencent/hy3:free"
         );
+    }
+
+    #[test]
+    fn edit_text_requires_an_interactive_guard() {
+        let app_state = AppState::for_test(test_settings());
+        // No term guard (quiet/pipe): there is no tty to hand to $EDITOR.
+        let err = app_state
+            .edit_text("draft", crate::editor::EditorMode::Edit)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]

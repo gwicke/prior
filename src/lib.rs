@@ -4,6 +4,7 @@ pub mod agent;
 pub mod config;
 pub mod edit_blocks;
 pub mod edit_match;
+pub mod editor;
 pub mod output;
 pub mod persona;
 pub mod platform;
