@@ -616,18 +616,17 @@ impl Repl {
         // frame's top (so a tall pop-up's scroll is followed without a row
         // counter), the scroll `delta` and the bounded clear live in
         // `plan_apply`. Content *above* the frame (greeter / status / session)
-        // is never touched. The closure carries no state.
-        let redraw = |editor: &LineEditor, overlay: &[&str], focus: usize| {
-            let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
-            let frame = Self::compose_frame(
-                editor,
-                prompt,
-                overlay,
-                focus,
-                w.max(1) as usize,
-                h.max(1) as usize,
-            );
-            output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame);
+        // is never touched. The closure's one piece of state is
+        // `painted_size`: compose and apply both receive the same `dims`, so
+        // they cannot disagree on the frame's size (ui_draw_v2 §9 #3), and
+        // the applied pair `draw_frame` reports is what gets recorded — the
+        // repaint bookkeeping is the engine's fact, not a secondhand read.
+        let redraw = |editor: &LineEditor, overlay: &[&str], focus: usize, dims: (usize, usize)| {
+            let dims = (dims.0.max(1), dims.1.max(1));
+            let frame = Self::compose_frame(editor, prompt, overlay, focus, dims.0, dims.1);
+            let applied =
+                output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame, dims);
+            painted_size.set(applied);
         };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
@@ -722,6 +721,7 @@ impl Repl {
                             &mut editor,
                             &redraw,
                             sel,
+                            (cur_w, cur_h),
                             &committed,
                             "",
                             false,
@@ -744,6 +744,7 @@ impl Repl {
                             &mut editor,
                             &redraw,
                             sel,
+                            (cur_w, cur_h),
                             &committed,
                             "",
                             false,
@@ -763,7 +764,7 @@ impl Repl {
                         // re-anchor (DSR) rather than trusting the wrap count
                         // ("any uncertainty → clear it", plan §4.2): the next
                         // iteration anchors below the error.
-                        redraw(&LineEditor::new(), &[], sel);
+                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
                         output.display_text(&err);
                         let _ = output.cursor_row();
                         editor.set("");
@@ -834,8 +835,7 @@ impl Repl {
                     .map(|o| o.matches('\n').count() + 1)
                     .sum::<usize>()
             };
-            redraw(&editor, &overlay_vec, focus);
-            painted_size.set((cur_w, cur_h));
+            redraw(&editor, &overlay_vec, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -1093,7 +1093,7 @@ impl Repl {
                                     prompt,
                                 ) {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel);
+                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
                                     }
                                     return Some(a);
                                 }
@@ -1124,7 +1124,7 @@ impl Repl {
                                     prompt,
                                 ) {
                                     if let InputAction::Submit(_) = &a {
-                                        redraw(&LineEditor::new(), &[], sel);
+                                        redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
                                     }
                                     return Some(a);
                                 }
@@ -1139,7 +1139,7 @@ impl Repl {
                         Self::edit_key(key, &mut editor, history, &mut nav, &mut draft, prompt)
                     {
                         if let InputAction::Submit(_) = &a {
-                            redraw(&LineEditor::new(), &[], sel);
+                            redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
                         }
                         return Some(a);
                     }
@@ -1312,11 +1312,12 @@ impl Repl {
     /// *return* an `InputAction`, so `agent.rs` draws a separator before the
     /// next `read_input` (its per-prompt framing); passing `false` here avoids
     /// a doubled separator.
-    fn emit_commit<F: Fn(&LineEditor, &[&str], usize)>(
+    fn emit_commit<F: Fn(&LineEditor, &[&str], usize, (usize, usize))>(
         output: &dyn Output,
         editor: &mut LineEditor,
         redraw: &F,
         sel: usize,
+        dims: (usize, usize),
         line: &str,
         next_input: &str,
         sep: bool,
@@ -1332,7 +1333,7 @@ impl Repl {
         // screen writer ($EDITOR via `review_compaction_summary`) re-anchors
         // on exit (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
-        redraw(&LineEditor::new(), &[], sel);
+        redraw(&LineEditor::new(), &[], sel, dims);
         output.display_plain(line);
         if sep {
             output.display_separator();

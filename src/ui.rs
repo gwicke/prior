@@ -89,9 +89,9 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
     let _ = out.cursor_row();
 
     let plan = build_confirm_plan(spec);
-    let mut size = crossterm::terminal::size()
-        .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
-        .unwrap_or((80, 24));
+    // Initial size from the output's shared source (ui_draw_v2 §9 #3); every
+    // apply below gets this same pair (Resize replaces it and re-composes).
+    let mut size = out.frame_size();
 
     // Initial render.
     let mut sel: usize = spec.default_sel;
@@ -126,7 +126,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
             })) => {
                 if let Some(idx) = quick_key_index(spec, c) {
                     if idx < spec.options.len() {
-                        return resolve(out, spec, ConfirmResult::Selected(idx));
+                        return resolve(out, spec, size, ConfirmResult::Selected(idx));
                     }
                 }
             }
@@ -135,14 +135,14 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
                 modifiers: KeyModifiers::NONE,
                 ..
             })) => {
-                return resolve(out, spec, ConfirmResult::Selected(sel));
+                return resolve(out, spec, size, ConfirmResult::Selected(sel));
             }
             Ok(Event::Key(KeyEvent {
                 code: KeyCode::Esc,
                 modifiers: KeyModifiers::NONE,
                 ..
             })) => {
-                return resolve(out, spec, ConfirmResult::Dismissed);
+                return resolve(out, spec, size, ConfirmResult::Dismissed);
             }
             Ok(Event::Resize(w, h)) => {
                 // Re-compose for the new size; the cached size mismatch
@@ -180,7 +180,7 @@ fn draw_dialog(
     let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
     let heights = allocate(&extents, live_budget(term_h));
     let frame = render(&elements, &heights, term_w);
-    out.draw_frame(&frame, out.frame_anchor(), ApplyPolicy::Frame);
+    out.draw_frame(&frame, out.frame_anchor(), ApplyPolicy::Frame, size);
 }
 
 /// Resolve the dialog: erase its region through the frame pipeline — a
@@ -189,7 +189,12 @@ fn draw_dialog(
 /// clean for whatever the caller appends next (plan §4.3/§5.3). The clear
 /// parks the cursor on the region's first row, so the optional decision
 /// line lands exactly where the dialog was.
-fn resolve(out: &dyn Output, spec: &ConfirmSpec<'_>, result: ConfirmResult) -> ConfirmResult {
+fn resolve(
+    out: &dyn Output,
+    spec: &ConfirmSpec<'_>,
+    size: (usize, usize),
+    result: ConfirmResult,
+) -> ConfirmResult {
     // Release the in-flight reader gate raised on entry: the dialog is done
     // with stdin, and a gate left raised would leave every later in-flight
     // reader born paused — Esc/Ctrl-C dead for the rest of the session
@@ -198,7 +203,12 @@ fn resolve(out: &dyn Output, spec: &ConfirmSpec<'_>, result: ConfirmResult) -> C
     if let Some(gate) = out.confirm_gate() {
         gate.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    out.draw_frame(&Frame::empty(), out.frame_anchor(), ApplyPolicy::Frame);
+    out.draw_frame(
+        &Frame::empty(),
+        out.frame_anchor(),
+        ApplyPolicy::Frame,
+        size,
+    );
     if let Some(subject) = &spec.subject {
         // `yes` / `always` / `accept` record; `no` / `cancel` and a dismiss
         // record the refusal.
@@ -274,7 +284,9 @@ fn quick_key_index(spec: &ConfirmSpec<'_>, c: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::confirm_subject;
+    use super::*;
+    use crate::output::NoOutput;
+    use std::sync::Mutex;
 
     #[test]
     fn confirm_subject_follows_the_tool_confirm_convention() {
@@ -288,5 +300,94 @@ mod tests {
         assert_eq!(confirm_subject("tool BASH call?"), "tool BASH");
         assert_eq!(confirm_subject("Confirm tool BASH"), "tool BASH");
         assert_eq!(confirm_subject("something else"), "something else");
+    }
+
+    // --- composed dims reach the apply (ui_draw_v2 §9 #3) ---
+
+    /// Records the dims it was asked to apply; everything else no-ops.
+    struct SizeRecorder(Mutex<Option<(usize, usize)>>);
+
+    impl Output for SizeRecorder {
+        fn draw_frame(
+            &self,
+            _frame: &Frame,
+            _anchor: usize,
+            _policy: ApplyPolicy,
+            dims: (usize, usize),
+        ) -> (usize, usize) {
+            *self.0.lock().unwrap() = Some(dims);
+            (dims.0.max(1), dims.1.max(1))
+        }
+        fn frame_anchor(&self) -> usize {
+            1
+        }
+        fn display_text(&self, _text: &str) {}
+        fn display_tool_call(&self, _name: &str, _args: &serde_json::Value) {}
+        fn display_tool_result(&self, _result: &str) {}
+        fn get_user_input(&self) -> String {
+            String::new()
+        }
+        fn display_error(&self, _error: &str) {}
+        fn display_system(&self, _text: &str) {}
+        fn confirm(&self, _message: &str) -> Confirmation {
+            Confirmation::No
+        }
+        fn display_separator(&self) {}
+        fn display_thinking(&self, _message: &str) {}
+        fn stop_thinking(&self) {}
+        fn display_header(
+            &self,
+            _provider: &str,
+            _model: &str,
+            _yolo: bool,
+            _limit: usize,
+            _persona: Option<&str>,
+        ) {
+        }
+    }
+
+    fn spec<'a>(opts: &'a [StaticRow]) -> ConfirmSpec<'a> {
+        ConfirmSpec {
+            header: "Confirm?",
+            options: opts,
+            quick_keys: None,
+            default_sel: 0,
+            divider: false,
+            subject: None,
+        }
+    }
+
+    fn recorder() -> SizeRecorder {
+        SizeRecorder(Mutex::new(None))
+    }
+
+    #[test]
+    fn draw_dialog_applies_at_the_dims_it_composed_for() {
+        let opts = [StaticRow::new("yes", "do it")];
+        let s = spec(&opts);
+        let plan = build_confirm_plan(&s);
+        let rec = recorder();
+        draw_dialog(&rec, &s, &plan, 0, (42, 11));
+        assert_eq!(*rec.0.lock().unwrap(), Some((42, 11)));
+    }
+
+    #[test]
+    fn resolve_clears_at_the_dims_the_dialog_used() {
+        let opts = [StaticRow::new("yes", "do it")];
+        let s = spec(&opts);
+        let rec = recorder();
+        resolve(&rec, &s, (42, 11), ConfirmResult::Dismissed);
+        assert_eq!(*rec.0.lock().unwrap(), Some((42, 11)));
+    }
+
+    #[test]
+    fn default_draw_frame_reports_clamped_dims() {
+        // `NoOutput` doesn't override `draw_frame`, so this exercises the
+        // trait default: it applies nothing but still reports the clamped
+        // dims it was asked to apply.
+        assert_eq!(
+            NoOutput.draw_frame(&Frame::empty(), 1, ApplyPolicy::Frame, (0, 7)),
+            (1, 7)
+        );
     }
 }

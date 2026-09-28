@@ -156,11 +156,34 @@ pub trait Output: Send + Sync {
             .unwrap_or(24)
     }
 
+    /// The size frames are composed and applied for (ui_draw_v2 §9 #3) — the
+    /// one shared source for callers that don't carry their own read (e.g. a
+    /// dialog's initial size). Callers that *do* hold a read (the REPL loop's
+    /// per-iteration size) pass it into [`Self::draw_frame`] instead.
+    /// Default: a fresh terminal query.
+    fn frame_size(&self) -> (usize, usize) {
+        crossterm::terminal::size()
+            .map(|(w, h)| (w.max(1) as usize, h.max(1) as usize))
+            .unwrap_or((80, 24))
+    }
+
     /// Draw a composed UI frame (ui_draw_v2 §5.1) with its top row at absolute
-    /// `anchor` (1-based). Default: drop it — non-console outputs carry no
-    /// interactive UI, so the raw-mode REPL never runs against them. This is
-    /// the *UI* surface; content output (`display_*`) stays separate.
-    fn draw_frame(&self, _frame: &Frame, _anchor: usize, _policy: ApplyPolicy) {}
+    /// `anchor` (1-based). `dims` is the (width, height) the frame was
+    /// composed for: the apply uses exactly these, so the frame's bounding
+    /// box can never disagree with its content (§9 #3). Returns the dims
+    /// actually applied (clamped), for the caller's repaint bookkeeping.
+    /// Default: drop the frame — non-console outputs carry no interactive
+    /// UI, so the raw-mode REPL never runs against them. This is the *UI*
+    /// surface; content output (`display_*`) stays separate.
+    fn draw_frame(
+        &self,
+        _frame: &Frame,
+        _anchor: usize,
+        _policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        (dims.0.max(1), dims.1.max(1))
+    }
 
     /// Where the next frame belongs (ui_draw_v2 §5.1): the intact frame's top
     /// row when there is one, else the current cursor row. Default:
@@ -1452,24 +1475,32 @@ impl Output for ConsoleOutput {
         self.draw.lock().unwrap().reanchor(row)
     }
 
-    fn draw_frame(&self, frame: &Frame, anchor: usize, policy: ApplyPolicy) {
+    fn frame_size(&self) -> (usize, usize) {
+        (term_width(), term_height())
+    }
+
+    fn draw_frame(
+        &self,
+        frame: &Frame,
+        anchor: usize,
+        policy: ApplyPolicy,
+        dims: (usize, usize),
+    ) -> (usize, usize) {
+        // Paint exactly the size the caller composed for (`dims`) — one
+        // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
+        // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
+        let (tw, th) = (dims.0.max(1), dims.1.max(1));
         // Lock the writer before the cache so the byte emission and the cache
         // advance are one atomic step, and so we never hold `draw` while
         // acquiring `writer` (matching `display_*`: writer, then `note_lines`).
         let mut out = self.writer.lock().unwrap();
         let bytes = {
             let mut cache = self.draw.lock().unwrap();
-            plan_apply(
-                &mut cache,
-                frame,
-                anchor,
-                policy,
-                term_width(),
-                term_height(),
-            )
+            plan_apply(&mut cache, frame, anchor, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();
+        (tw, th)
     }
 
     fn frame_anchor(&self) -> usize {

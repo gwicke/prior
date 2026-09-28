@@ -437,13 +437,20 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 
 ### Small robustness cleanups
 
-3. **Unify the size source.** `redraw`/`draw_dialog` compose with
-   `crossterm::terminal::size()` while `ConsoleOutput::draw_frame` applies
+3. **Unify the size source.** *(resolved)* `Output::draw_frame` now **takes**
+   the composed `dims` and applies exactly them, returning them so callers
+   record the engine's fact: the `redraw` closure threads the loop's single
+   per-iteration read through compose → apply and records the report into
+   `painted_size` (the loop's own `painted_size.set((cur_w, cur_h))` is
+   gone); `draw_dialog`/`resolve` pass the dialog's tracked `size`; and
+   `Output::frame_size()` is the shared source for callers without a read
+   (dialog init). Original report: `redraw`/`draw_dialog` composed with
+   `crossterm::terminal::size()` while `ConsoleOutput::draw_frame` applied
    with `term_width()`/`term_height()` (width via the `TERMINAL_WIDTH`
-   static). They agree at steady state, but a resize landing between the two
-   reads fails the partial predicate's `term_w` check → one harmless extra
-   full repaint. Passing the composed size into the apply (or reading one
-   shared source) removes the class.
+   static) — a resize landing between the reads failed the partial
+   predicate's `term_w` check (one harmless extra full repaint), and could
+   split a frame's content from its bounding box. Passing the composed size
+   into the apply removes the class.
 
 4. **`confirm_subject` parses a message convention.** The decision line's
    subject comes from stripping `Confirm … call?` off the tool-confirm
