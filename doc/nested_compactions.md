@@ -74,7 +74,8 @@ nested-compaction sessions.
 predecessor, summarize with the live prefix, restore) now makes the
 `previousSummary` semantics **emergent from the tree structure**:
 
-- `run_compaction_at_point` moves the session leaf to the entry strictly
+- `generate_compaction` (editor cleanup E3; was `run_compaction_at_point`)
+  moves the session leaf to the entry strictly
   before `target_id`, then calls `summarize_with_session_context`, which
   builds the request prefix via `session_context_messages` — the SAME
   helper (`Session::build_context()` + `maybe_strip_reasoning`) a normal

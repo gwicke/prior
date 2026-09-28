@@ -1,7 +1,8 @@
 # Editor cleanup — one wrapper, node-driven editing
 
-Status: **E1b + E1 + E2 + E3 done**; E4 pending. Rebased onto `origin/main` @ `c705add`
-(which fixed `ui_draw_v2.md` §9 #1/#2 — see §2.3). Companion to `doc/ui_draw_v2.md` §9.
+Status: **E1b + E1 + E2 + E3 + E4 done** — all phases complete. Rebased onto
+`origin/main` @ `c705add` (which fixed `ui_draw_v2.md` §9 #1/#2 — see §2.3).
+Companion to `doc/ui_draw_v2.md` §9.
 
 | step | scope | status |
 |---|---|---|
@@ -9,7 +10,7 @@ Status: **E1b + E1 + E2 + E3 done**; E4 pending. Rebased onto `origin/main` @ `c
 | E1 | `run_editor` wrapper + `EditorMode` + `pause_reader` + fold drop + Ctrl-E port | ✅ this change |
 | E2 | `SubmitResult::Handled` + `HostKey::Edit` + `edit()` dispatch + `v25_listing_node.rs` | ✅ this change |
 | E3 | compaction split; `prepare()`/`submit()`; drop review/confirm plumbing | ✅ this change |
-| E4 | cleanup + doc updates | pending |
+| E4 | cleanup + doc updates | ✅ this change |
 
 ## 1. Goals
 
@@ -173,9 +174,10 @@ height-resize-during-edit case; no correctness path depended on it.
 - `header()` carries the guidance ("Enter opens $EDITOR; then Enter writes, Esc aborts").
 - The typed `/tree … compact` arm drives the *same node pair* (`prepare` → `submit`
   back-to-back; the typed Enter stands in for the engine's confirm key) — one code
-  path for generate/edit/apply. **Flagged:** that arm looks unreachable (all `/`
-  input routes through the v25 eval → `MenuDone`; `InputAction::Submit` never carries
-  slash text) — verify reachability and delete it in E4.
+  path for generate/edit/apply. **Verified reachable in E4 (§10.9)**: it is the
+  non-REPL (quiet / piped stdin) command path — interactive slash input never
+  reaches `Submit`, but scripted input does, so the arm stays (carries a
+  reachability comment on the arm).
 
 ## 7. Async? — No, keep it blocking (decided)
 
@@ -197,9 +199,15 @@ is a blocking read by design.
   `run_compaction_at_point` / `CompactionResult` / `CompactionTarget` /
   `compact_inline`, and `find_predecessor_on_active_branch` (only served the
   removed dead guard, see §10.7).
-- **Stale docs still naming the deleted review plumbing** (E4): `tree_compaction.md`
-  (review UX §1282), `ui_draw_v2.md` ($EDITOR wrapper row), `v25_cleanup_pass_2.md`
-  (retired-API tables — historical, maybe leave).
+- **Stale docs naming the deleted review plumbing — fixed (E4):** `tree_compaction.md`
+  (Status backend paragraph, §6.7b review UX, supersession banners on §6.8 and the
+  Phase-7 record), `ui_draw_v2.md` ($EDITOR wrapper row), plus the sweep:
+  `todo.md` (Phase-7 backend + `Abandoned` note), `slash_menu.md` (the
+  `CompactionResult` cancel-re-entry bullet), `nested_compactions.md`
+  (`run_compaction_at_point` name), `slashdot/tree_design.md` (the
+  `AsyncOp::TreeCompact` section + the deferred-editor follow-up),
+  `v25_cleanup_pass_2.md` (overlay_lines row; Phase 4 marked moot — the
+  historical phase records elsewhere were left as written).
 
 ## 9. Phases
 
@@ -233,7 +241,26 @@ is a blocking read by design.
   Tests: 10 generate/apply (incl. leaf-restore, edited-draft, no-write-without-apply,
   the two Llm guards), 7 node two-phase (incl. no-stash and stale-epoch rejects) with
   the full traversal driving Enter#1/Enter#2 through `eval_prompt_resolved`.
-- **E4** pending: cleanup + doc updates.
+- **E4** ✅ this change: **reachability verification — the delete suggestion is
+  refuted.** Interactive `Submit` provably never carries `/` text (a `/`-buffer
+  is owned by the v2.5 engine from the first keystroke; Enter queues
+  `HostKey::Enter` into the engine, whose `DoneSuccess`/`DoneError` returns
+  `MenuDone` — `edit_key`'s `Submit` arm can never see a `/` buffer, and the
+  `Done*` non-Enter arms clear the buffer before dismissing). The typed
+  `/tree … compact` arm **is** reached through `use_repl = stdin().is_terminal()
+  && !config.quiet` being false (raw `get_user_input` lines) — the quiet/scripted
+  command path shared with `/session` / `/clear` / `/new`; scripted compaction
+  is functional (no tty → `edit_draft` accepts the draft as-is) and covered by
+  the node prepare/submit + `parse_tree_args` tests. Kept; documented with an
+  inline reachability note on the arm.
+  **Doc sweep:** stale present-tense references to the deleted review plumbing
+  fixed in `tree_compaction.md`, `ui_draw_v2.md`, `todo.md`, `slash_menu.md`,
+  `nested_compactions.md`, `slashdot/tree_design.md`, `v25_cleanup_pass_2.md`
+  (§8); historical phase records left as written; supersession banners added
+  where a section would otherwise read as current (`tree_compaction.md` §6.8 /
+  Phase 7). No new pty test: `e2e_session_state.rs` already drives interactive
+  slash commands through `read_input`'s engine path, and the node-level tests
+  cover the arm's mechanics.
 
 Gate: `cargo test --features test-utils` (includes `confirm_raw_mode`), `cargo fmt --check`,
 clippy clean in touched regions.
@@ -261,4 +288,11 @@ clippy clean in touched regions.
    path, whose last entry is the leaf); fn + tests removed.
 8. **Typed-arm confirm** — the `/tree … compact` arm calls the nodes' `prepare()` then
    `submit()` directly (typed Enter = confirmation); it never gets its own dialog.
-   Flagged: the arm itself appears unreachable (§6) — E4 candidate.
+9. **Typed-arm reachability (E4)** — refuted the "unreachable → delete" flag:
+   interactive `/` input routes through the engine and commits as `MenuDone`
+   (repl.rs `read_input` + the `emit_commit` history note), so `Submit` never
+   carries slash text — but the arm is the **non-REPL command path** (`repl == None`
+   when stdin is not a tty or `--quiet`): raw lines reach `parse_tree_args` and the
+   node pair exactly as designed (quiet/pipe compaction accepted without an
+   editor). The arm survives with a reachability comment; only the stale claim in
+   §6/the E3 record was corrected.

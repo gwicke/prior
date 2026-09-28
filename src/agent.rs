@@ -4152,8 +4152,17 @@ pub async fn run_interactive(
                     continue;
                 }
                 // Handle `/tree <target_id>` commands — navigate or compact.
-                if input.starts_with("/tree") {
-                    let rest = input["/tree".len()..].trim();
+                //
+                // Reachability (doc/editor_cleanup.md §10.9): typed slash
+                // input reaches this block ONLY in non-REPL mode
+                // (`use_repl = stdin().is_terminal() && !config.quiet` is
+                // false → raw `get_user_input` lines). Interactively every
+                // `/`-prefixed buffer is owned by the v2.5 engine inside
+                // `Repl::read_input`, whose Enter commits as `MenuDone` —
+                // `Submit` never carries `/` text, and the engine's tree
+                // nodes do the work there.
+                if let Some(rest) = input.strip_prefix("/tree") {
+                    let rest = rest.trim();
                     let (target_id, action, mode, summarize, llm_payload) = parse_tree_args(rest);
                     if target_id.is_empty() {
                         // No target: the overlay is already open from from_buffer.

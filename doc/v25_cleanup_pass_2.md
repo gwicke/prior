@@ -20,7 +20,9 @@
 | `ModelFilter::title_suffix` | `pub` | **deleted** (unused) |
 
 ### Keep as-is (production dependencies)
-- `overlay_lines` — used by `ConsoleOutput::confirm()` and `confirm_compaction_summary()` (will be retired after Phase 3)
+- `overlay_lines` — used by `ConsoleOutput::confirm()` (will be retired
+  after Phase 3; `confirm_compaction_summary` was deleted in editor
+  cleanup E3)
 
 ---
 
@@ -90,7 +92,7 @@ fn confirm_default(&self, message: &str) -> Confirmation {
 | Dialog | `spec.options` (id, desc) | default | quick_keys | Esc maps to |
 |---|---|---|---|---|
 | `confirm()` (tool) | `("yes","Yes")`, `("no","No")`, `("always","Always (session)")` | 1 (`no`) | `[('y',0), ('s',2)]` | `no` |
-| `confirm_compaction_summary()` | `("accept","Accept")`, `("cancel","Cancel")` | 0 (`accept`) | `[('a',0), ('c',1)]` | `cancel` |
+| `confirm_compaction_summary()` (deleted in editor cleanup E3 — now the nodes' native `Prepared` confirm) | `("accept","Accept")`, `("cancel","Cancel")` | 0 (`accept`) | `[('a',0), ('c',1)]` | `cancel` |
 
 ⚠️ **Semantic note:** Driver returns `Dismissed` on Esc; callers **must** map to the safe option for THAT dialog (not the default). Documented on the driver.
 
@@ -106,11 +108,15 @@ fn confirm_default(&self, message: &str) -> Confirmation {
 
 ### Phase 4 — (Optional) `review_compaction_summary` to async
 
+**Moot (editor cleanup E3).** `review_compaction_summary` and both
+callers were deleted — the compaction review is now the nodes' native
+`prepare()` / `submit()` flow (`doc/editor_cleanup.md` §6). Nothing to
+make async.
+
 ```rust
-// repl.rs
+// repl.rs (deleted in editor cleanup E3)
 pub async fn review_compaction_summary(guard: &TermGuard, out: &dyn Output, draft: &str) -> Option<String>
 ```
-Callers: `agent.rs:4579` (already async) and `agent.rs:3387` (sync closure → becomes async closure). Small ripple.
 
 ---
 

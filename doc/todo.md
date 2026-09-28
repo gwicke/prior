@@ -4,11 +4,16 @@
   - [x] /compact command — same as `/tree <id> compact` but at current position.
         Resolves `target_id` to the last user message on the active branch and
         commits a canonical `/tree <last_user_id> compact <mode>` line so the
-        existing /tree handler is the single entry point. Shared
-        `run_compaction` backend; three modes (truncate / text-only / llm);
-        same `llm_compact_prompt` setting; same prompt-customization path.
+        existing /tree handler is the single entry point. Three modes
+        (manual / text-only / llm; `truncate` aliases `manual`); same
+        `llm_compact_prompt` setting; same prompt-customization path.
+        Backend: the Phase-7 `run_compaction` was replaced by the
+        editor-cleanup E3 `generate_compaction` / `apply_compaction` split
+        (doc/editor_cleanup.md §6).
   - [ ] `/tree <id> switch --summarize` - use same menu / mechanism as others
-        (backend ready: `CompactionTarget::Abandoned`; UI TBD)
+        (UI TBD; the old `CompactionTarget::Abandoned` backend hook was
+        deleted in editor cleanup E3 — a menu version would add a target
+        kind to `generate_compaction`)
         `/tree <id> switch`, `/tree <id> switch llm <prompt>`, `/tree <id> switch simple`
 - [ ] Thinking-level restore on `/session <id> resume` (single input field
       currently can only carry one prefill — model or thinking. Bundle both
