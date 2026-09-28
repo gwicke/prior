@@ -399,3 +399,105 @@ emit logic" into a real safety net for P2–P3.
    - Up to you - if caret-only diffing is easy enough, then do so. If keeping
      it bundled with rows makes it simpler, then I think that would be fine
      too.
+
+---
+
+## 9. Follow-ups & take-aways (post-implementation)
+
+Recorded while implementing P0–P5. None of these block the shipped pipeline;
+the first two are latent bugs that pre-date ui_draw_v2.
+
+### Latent issues
+
+1. **The confirm gate is never released.** `ui::confirm` stores `true` into
+   `confirm_gate()` before drawing, and nothing ever stores `false` — but the
+   in-flight reader checks that flag every tick. So after the *first*
+   interactive confirm, every later in-flight reader is born paused and
+   ignores Esc/Ctrl-C for the rest of the session. Fix: release the gate when
+   the dialog resolves (every post-pause exit goes through `resolve()`).
+   Pre-dates the draw work; orthogonal to it, hence untouched in P4.
+
+2. **DSR fallback leaves `live` intact.** `ConsoleOutput::cursor_row()`
+   clears `live` only when the terminal *answers*; on timeout it returns the
+   tracked `caret_row()` without invalidating. A foreign writer on a silent
+   terminal (headless pty) can therefore still take the partial path against
+   a changed screen. The §4.2 contract says "any uncertainty → clear it" —
+   the fallback should clear `live` too. Costs nothing (the next apply just
+   takes the full path).
+
+### Small robustness cleanups
+
+3. **Unify the size source.** `redraw`/`draw_dialog` compose with
+   `crossterm::terminal::size()` while `ConsoleOutput::draw_frame` applies
+   with `term_width()`/`term_height()` (width via the `TERMINAL_WIDTH`
+   static). They agree at steady state, but a resize landing between the two
+   reads fails the partial predicate's `term_w` check → one harmless extra
+   full repaint. Passing the composed size into the apply (or reading one
+   shared source) removes the class.
+
+4. **`confirm_subject` parses a message convention.** The decision line's
+   subject comes from stripping `Confirm … call?` off the tool-confirm
+   header. If the `agent.rs` message wording ever changes, the line silently
+   degrades to the full header (correct, just noisy). An explicit subject
+   parameter threaded through `Output::confirm` would drop the coupling.
+
+5. **`draw_dialog` sniffs the `> ` marker** to find the overlay's windowing
+   focus. Fine for today's specs (no detail line starts with `> `), but a
+   spec whose detail ever does would window around the wrong row. Robust
+   form: `focus = plan.detail visual height + selected row's height offset`,
+   the same arithmetic the REPL's pre-computed `focus` uses.
+
+6. **`display_text` line counts can drift.** The count comes from
+   `wrap(text)` while the bytes include the `⏺ ` prefix and
+   `termimad::inline` output — which is the only reason the DoneError path
+   re-anchors (DSR) after `display_text`. Accurate accounting would let that
+   DSR go.
+
+### Known limitations
+
+7. **`paint_plan` under-buffers multi-line plans on large terminals**
+   (found while porting the P5 tests; lives in `slashdot_menu`, not the draw
+   pipeline). `compute_space_budget`'s "rows fit" branch returns `total_rows`
+   — a *logical* count — as the *visual* budget, so every multi-line row is
+   budgeted as one line and `visual_row_window` windows it even when the
+   terminal has room to spare. Probe (9 rows × 3 visual lines, width 60):
+   painted lines = **15 at term_h 24, but 9 at term_h 40 and 80** — a bigger
+   terminal shows *less*. The fit branch should return the rows' visual
+   height sum. Single-line rows (the normal menu case) are unaffected.
+
+8. **Tiny terminals lose the pop-up, not the input.** Allocation serves
+   floors in element order (input → divider → overlay), so on a ~2-row
+   terminal the menu gets zero rows while the input keeps its row. Intended
+   (budget ≥ 1, input floor first); just worth knowing when testing in tiny
+   windows.
+
+### Deferred design pieces (allowed for in code)
+
+- **`Element::Lines`** — §3.2's fixed-row element carries a targeted
+  `#[allow(dead_code)]`: commit lines go through `display_plain` today; the
+  §4.5 fixed-bottom/status-line composition is its first production user.
+- **`Frame::spans`** — §4.4's dirty-span refinement; the row diff is
+  deliberately the sole reader until profiling asks for more.
+- **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production
+  user yet; reserved for §4.5's chunked writes (no-clear on content chunks).
+- **Per-row backgrounds (`row_bgs`)** — dropped with `overlay_lines` in P5;
+  if per-row tinting is ever wanted it belongs in `RenderPlan` (engine
+  side), not in the painter.
+
+### Process take-aways
+
+- **A feature-gated suite is not a gate.** `confirm_raw_mode` requires
+  `--features test-utils`, so plain `cargo test` skipped it through P0–P3 —
+  which is how the missing `('n', 1)` quick key survived until P4's gate run
+  (it failed at baseline too). Run `cargo test --features test-utils` in CI,
+  or drop the gate.
+- **The P0 bet paid off.** Keeping the vt100 suite on production bytes meant
+  the P3 pipeline swap was validated by the same carefully-tuned assertions.
+  Exactly one intentional behavior change needed a re-pin — the frame-wide
+  2/3 budget (pop-up gets `budget − input − divider` rows, scrolls less) —
+  and manual testing has since confirmed it.
+- **Streaming still doesn't track rows** (`stream_text`/`stream_thinking`
+  bypass `note_lines`), so the cache's `caret` drifts mid-turn. That is why
+  dialogs and `read_input` keep an entry DSR. Anything that wants a
+  mid-turn `frame_anchor()` with no DSR (e.g. a live status line drawn
+  while streaming) needs row accounting in the streaming writers first.
