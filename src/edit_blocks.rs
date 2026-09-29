@@ -73,6 +73,33 @@ fn marker_of(line: &str) -> Option<&'static str> {
     None
 }
 
+/// A marker the line *almost* is: it starts with one of the three markers but
+/// carries trailing characters, so [`marker_of`] does not recognize it — e.g.
+/// `@@@OLD>`, `@@@OLD the old text`, or `@@@END ` (with a trailing space).
+///
+/// This is a common model slip, and `marker_of` alone reports it only
+/// indirectly (usually as a missing-divider or missing-marker error, or by
+/// silently folding the line into the file content). Returns the marker the
+/// line appears to start with.
+fn near_miss_marker(line: &str) -> Option<&'static str> {
+    for m in [SEARCH_MARKER, DIVIDER, REPLACE_MARKER] {
+        if line != m && line.starts_with(m) {
+            return Some(m);
+        }
+    }
+    None
+}
+
+/// The error for a line that starts a marker but does not end there.
+fn malformed_marker_error(marker: &str, line: &str) -> ParseError {
+    ParseError(format!(
+        "malformed `{marker}` marker: `{line}`. A marker must occupy its whole line, \
+         with nothing after it. If you meant to write the literal text `{marker}` \
+         into the file, use the OpenAI single-edit format (path/oldText/newText) \
+         instead, and use that format for this file going forward."
+    ))
+}
+
 /// Strip a single surrounding triple-backtick fence, if present.
 fn strip_fence(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
@@ -191,6 +218,11 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                     "unexpected delimiter `{m}` in @@@OLD section; expected `@@@NEW`"
                 )));
             }
+            // A line that *starts* a marker but trails garbage is a near miss
+            // for it, not content — report it as the malformed marker it is.
+            if let Some(m) = near_miss_marker(&lines[j]) {
+                return Err(malformed_marker_error(m, &lines[j]));
+            }
             search_lines.push(&lines[j]);
             j += 1;
         }
@@ -213,6 +245,9 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 return Err(ParseError(format!(
                     "unexpected delimiter `{m}` in @@@NEW section; expected `@@@END`"
                 )));
+            }
+            if let Some(m) = near_miss_marker(&lines[k]) {
+                return Err(malformed_marker_error(m, &lines[k]));
             }
             replace_lines.push(&lines[k]);
             k += 1;
@@ -240,6 +275,14 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
     }
 
     if edits.is_empty() {
+        // No block parsed. If some line merely *looked* like a marker, say so —
+        // otherwise the model is told "no blocks found" for what is really a
+        // formatting slip on its opening `@@@OLD`. Scanned only here, so a
+        // near miss in ordinary prose outside any block stays harmless.
+        if let Some(line) = lines.iter().find(|l| near_miss_marker(l).is_some()) {
+            let m = near_miss_marker(line).expect("just checked");
+            return Err(malformed_marker_error(m, line));
+        }
         return Err(ParseError(format!("no `@@@OLD` / `@@@NEW` blocks found")));
     }
 
@@ -608,6 +651,67 @@ mod tests {
     fn empty_search_errors() {
         let text = "@@@OLD\n@@@NEW\nb\n@@@END";
         assert!(parse_blocks(text).is_err());
+    }
+
+    #[test]
+    fn near_miss_detection_basics() {
+        assert_eq!(near_miss_marker("@@@OLD>"), Some(SEARCH_MARKER));
+        assert_eq!(near_miss_marker("@@@OLD the old text"), Some(SEARCH_MARKER));
+        assert_eq!(near_miss_marker("@@@NEWx"), Some(DIVIDER));
+        assert_eq!(near_miss_marker("@@@END "), Some(REPLACE_MARKER));
+        // Exact markers are not near misses.
+        assert_eq!(near_miss_marker("@@@OLD"), None);
+        assert_eq!(near_miss_marker("@@@NEW"), None);
+        assert_eq!(near_miss_marker("@@@END"), None);
+        // Indented, or mid-line, is content — not a near miss.
+        assert_eq!(near_miss_marker("  @@@OLD>"), None);
+        assert_eq!(near_miss_marker("see @@@OLD> here"), None);
+    }
+
+    #[test]
+    fn malformed_marker_in_old_section_names_the_line() {
+        let text = "@@@OLD\n@@@OLD>\n@@@NEW\nb\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0.contains("malformed `@@@OLD` marker: `@@@OLD>`"),
+            "{err}"
+        );
+        assert!(err.0.contains("single-edit format"), "{err}");
+    }
+
+    #[test]
+    fn malformed_marker_in_new_section_names_the_line() {
+        let text = "@@@OLD\na\n@@@NEW\n@@@END>\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0.contains("malformed `@@@END` marker: `@@@END>`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn malformed_opening_marker_reported_instead_of_no_blocks_found() {
+        // The opening `@@@OLD` has trailing garbage, so no block parses at all.
+        // We want the specific complaint, not "no blocks found".
+        let text = "@@@OLD>\na\n@@@NEW\nb\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0.contains("malformed `@@@OLD` marker: `@@@OLD>`"),
+            "{err}"
+        );
+        assert!(!err.0.contains("no `@@@OLD`"), "{err}");
+    }
+
+    #[test]
+    fn malformed_divider_reports_missing_garbage_precisely() {
+        // `@@@NEW>` no longer closes the OLD section, so this is a near miss
+        // rather than a bare "missing @@@NEW divider".
+        let text = "@@@OLD\na\n@@@NEW>\nb\n@@@END";
+        let err = parse_blocks(text).unwrap_err();
+        assert!(
+            err.0.contains("malformed `@@@NEW` marker: `@@@NEW>`"),
+            "{err}"
+        );
     }
 
     fn one_block(path: Option<&str>) -> ParsedBlocks {
