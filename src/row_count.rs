@@ -8,11 +8,13 @@
 //! source knows about. So the count is taken at the only place the answer
 //! exists: the bytes, on their way out.
 //!
-//! One line occupies `1 + (display_width - 1) / width` rows (a wide character
-//! is two columns, an escape sequence none), each `\n` closes a row, and a
-//! trailing unterminated line counts as one more. That matches the terminal's
-//! own cursor movement, which is what makes the count usable as a caret
-//! delta.
+//! The quantity is **how far the cursor moves down**, which is what
+//! `note_lines` needs: a line of `w` columns at `width` pushes the cursor down
+//! `(w - 1) / width` times (it ends *on* the last row, not past it), and each
+//! `\n` moves it down one more. An unterminated final line therefore counts
+//! only its wraps — writing `abc` leaves the cursor on the same row, so the
+//! caret delta is zero. Rows *occupied* would be a different number, and
+//! using it would push every following anchor one row too low.
 //!
 //! Design notes (doc/row_accounting.md §6, phase B):
 //! - Counting happens per *block*, not per delta, so the streaming path pays
@@ -88,8 +90,8 @@ fn escape_end(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
-/// Extra rows a run of `width_cols` columns adds beyond its first, i.e. the
-/// number of times it wraps.
+/// How far a run of `width_cols` columns moves the cursor down: once per wrap,
+/// since the cursor ends *on* the run's last row.
 fn wrap_rows(width_cols: usize, term_w: usize) -> usize {
     if width_cols == 0 {
         0
@@ -98,18 +100,14 @@ fn wrap_rows(width_cols: usize, term_w: usize) -> usize {
     }
 }
 
-/// Terminal rows `text` occupies at `term_w` columns — the count for a writer
-/// that has its bytes in hand (a message, a rendered markdown block, a
-/// pre-wrapped panel line).
+/// How far the cursor moves down when `text` is written at `term_w` columns —
+/// the count for a writer that has its bytes in hand (a message, a rendered
+/// markdown block, a pre-wrapped panel line).
 ///
-/// One row per `\n` (the newline ends the row before it), plus the wraps of
-/// each line, plus one for a final line that has no newline yet: the cursor
-/// sits on it. Empty text is zero rows, and a trailing `\n` adds nothing —
-/// the row after it is where the cursor is, not a row that was written.
+/// One row per `\n` (the newline moves off the row it ends) plus the wraps of
+/// each line. A final line with no newline adds only its wraps: the cursor
+/// comes to rest *on* it. Empty text moves nothing.
 pub fn rows_of(text: &str, term_w: usize) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
     let term_w = term_w.max(1);
     let mut rows = 0;
     for (i, line) in text.split('\n').enumerate() {
@@ -118,11 +116,7 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
         }
         rows += wrap_rows(display_width_ansi(line), term_w);
     }
-    if text.ends_with('\n') {
-        rows
-    } else {
-        rows + 1
-    }
+    rows
 }
 
 /// A writer that counts the terminal rows passing through it.
@@ -159,12 +153,12 @@ impl<W: Write> RowCounter<W> {
         }
     }
 
-    /// Terminal rows the stream occupies, including a final unterminated
-    /// line. Call once, after the last write.
+    /// How far the cursor moved down over the whole stream. Call once, after
+    /// the last write.
     pub fn rows(&self) -> usize {
-        // A line still open occupies its own row plus its wraps; an empty tail
-        // (the stream ended with `\n`) is the cursor's row, not a written one.
-        self.rows + wrap_rows(self.col, self.term_w) + usize::from(self.col > 0)
+        // The open line contributes its wraps: the cursor comes to rest on it,
+        // it does not move past it.
+        self.rows + wrap_rows(self.col, self.term_w)
     }
 
     /// The wrapped writer, for handing back after the count is taken.
@@ -246,29 +240,43 @@ mod tests {
     }
 
     #[test]
-    fn short_line_is_one_row() {
-        assert_eq!(rows_of("hello", 80), 1);
+    fn a_line_without_a_newline_does_not_move_the_cursor_down() {
+        // The distinction this whole module turns on: the text occupies a row,
+        // but the cursor stays *on* it, so the caret delta is zero. Counting
+        // the occupied row instead would push every later anchor one row low.
+        assert_eq!(rows_of("hello", 80), 0);
+        assert_eq!(rows_of("", 80), 0);
     }
 
     #[test]
-    fn trailing_newline_is_not_an_extra_row() {
-        // The terminal's cursor lands on the next line, having written one.
+    fn each_newline_moves_one_row_down() {
         assert_eq!(rows_of("a\n", 80), 1);
         assert_eq!(rows_of("a\n\n", 80), 2);
         assert_eq!(rows_of("\n", 80), 1, "a blank line is still a row");
+        // "a\nb": one newline, and the cursor comes to rest on the b row.
+        assert_eq!(rows_of("a\nb", 80), 1);
     }
 
     #[test]
     fn exact_fit_does_not_wrap() {
-        assert_eq!(rows_of(&"x".repeat(80), 80), 1);
-        assert_eq!(rows_of(&"x".repeat(81), 80), 2);
+        assert_eq!(rows_of(&"x".repeat(80), 80), 0);
+        assert_eq!(rows_of(&format!("{}\n", "x".repeat(80)), 80), 1);
+        assert_eq!(rows_of(&"x".repeat(81), 80), 1, "one char wraps");
+        assert_eq!(rows_of(&format!("{}\n", "x".repeat(81)), 80), 2);
     }
 
     #[test]
     fn wraps_are_counted_per_line() {
-        // Two full lines plus one wrapped character.
+        // A full line + newline, then 81 columns: 1 + (1 wrap) = 2.
         let text = format!("{}\n{}", "x".repeat(80), "y".repeat(81));
-        assert_eq!(rows_of(&text, 80), 3);
+        assert_eq!(rows_of(&text, 80), 2);
+    }
+
+    #[test]
+    fn wide_tail_wraps_without_a_newline() {
+        // 6 columns at width 5: the cursor wraps once and rests there.
+        assert_eq!(rows_of("日本語", 5), 1);
+        assert_eq!(rows_of("日本語\n", 5), 2);
     }
 
     #[test]
@@ -291,10 +299,9 @@ mod tests {
     #[test]
     fn wide_characters_count_as_two_columns() {
         assert_eq!(display_width_ansi("日本"), 4);
-        // 6 columns at width 5: wraps onto a second row.
-        assert_eq!(rows_of("日本語", 5), 2);
-        // Padded to a full row by a writer that wants a background.
-        assert_eq!(rows_of(&format!("日本{}", " ".repeat(76)), 80), 1);
+        // Padded to a full row by a writer that wants a background: exactly 80
+        // columns, so no wrap and no movement.
+        assert_eq!(rows_of(&format!("日本{}", " ".repeat(76)), 80), 0);
     }
 
     #[test]
@@ -334,7 +341,7 @@ mod tests {
             counter.write_all(b"abc\nde\n").unwrap();
             assert_eq!(counter.rows(), 2, "before the tail is written");
             counter.write_all(b"0123456789").unwrap();
-            assert_eq!(counter.rows(), 3, "an exact-width tail is one row");
+            assert_eq!(counter.rows(), 2, "an exact-width tail does not wrap");
         }
         assert_eq!(String::from_utf8(buf).unwrap(), "abc\nde\n0123456789");
     }
@@ -343,7 +350,9 @@ mod tests {
     fn counter_sees_a_wrapped_tail() {
         let mut counter = RowCounter::new(Vec::new(), 4);
         counter.write_all(b"abcdefghij").unwrap();
-        assert_eq!(counter.rows(), 3, "10 columns at width 4");
+        assert_eq!(counter.rows(), 2, "10 columns at width 4 wrap twice");
+        counter.write_all(b"klmno").unwrap();
+        assert_eq!(counter.rows(), 3, "16 columns at width 4 wrap three times");
     }
 
     #[test]
@@ -391,7 +400,7 @@ mod tests {
         // show up in the count rather than hide in the slack.
         let mut counter = RowCounter::new(Vec::new(), 3);
         counter.write_all(b"ab\x1b[3").unwrap();
-        assert_eq!(counter.rows(), 1, "the partial escape is not text yet");
+        assert_eq!(counter.rows(), 0, "the partial escape is not text yet");
         counter.write_all(b"1mcd\n").unwrap();
         assert_eq!(counter.rows(), 2, "\"abcd\\n\" is 2 rows at width 3");
         assert_eq!(rows_of("abcd\n", 3), counter.rows());

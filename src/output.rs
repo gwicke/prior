@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use termimad;
 use unicode_width::UnicodeWidthStr;
 
+use crate::row_count::RowCounter;
+
 #[derive(Debug, PartialEq)]
 pub enum Confirmation {
     Yes,
@@ -1261,6 +1263,54 @@ impl ConsoleOutput {
         self.draw.lock().unwrap().note_lines(n, h as usize);
     }
 
+    /// Write content bytes, then advance the draw cache by the number of
+    /// terminal rows they occupy.
+    ///
+    /// The count is *measured from the bytes*, not predicted from the source:
+    /// a message is a prefix plus rendered markdown, a panel row is padded to
+    /// the full width, a long line wraps — none of which the caller knows
+    /// (doc/row_accounting.md §6, phase B). Everything content-related goes
+    /// through here or [`Self::with_content_writer`], so the count cannot be
+    /// forgotten; a writer that bypassed both is a bug the frame tests find.
+    fn write_content(&self, bytes: &[u8]) {
+        let width = term_width();
+        self.with_content_writer(width, |out| {
+            let _ = out.write_all(bytes);
+        });
+    }
+
+    /// Run `f` with the writer lock wrapped in a [`RowCounter`], then advance
+    /// the draw cache by the rows `f` wrote. For the writers that produce
+    /// their own bytes — the streaming markdown renderers, which want a
+    /// `Write` to feed.
+    ///
+    /// `f` gets a `&mut dyn io::Write`, which keeps the counter's type (and
+    /// its borrow of the lock) out of the signature. A caller handing it to
+    /// something generic over `W: Write` — `Renderer::feed`,
+    /// `commit_thinking` — passes `&mut out`, which is itself a `Write` and
+    /// satisfies the `Sized` bound that `&mut dyn Write` cannot.
+    ///
+    /// `width` is the width the content is being rendered for; pass the
+    /// renderer's own width so a line that wrapped at render time is counted
+    /// at that width.
+    fn with_content_writer<T, F>(&self, width: usize, f: F) -> T
+    where
+        F: FnOnce(&mut dyn io::Write) -> T,
+    {
+        let mut out = self.writer.lock().unwrap();
+        let mut counter = RowCounter::new(&mut **out, width);
+        let r = f(&mut counter);
+        let rows = counter.rows();
+        let _ = counter.flush();
+        drop(counter);
+        drop(out);
+        // Zero rows means nothing moved, and a frame stays live.
+        if rows > 0 {
+            self.note_lines(rows);
+        }
+        r
+    }
+
     /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
     /// start a fresh thinking parser.
     ///
@@ -1302,52 +1352,51 @@ impl ConsoleOutput {
         if buffer.is_empty() {
             return false;
         }
-        let mut out = self.writer.lock().unwrap();
-        // Commit the (dimmed) thinking paragraph first, mirroring the
-        // thinking→answer boundary handling in `stream_text`.
-        let was_thinking = *self.dim_on.lock().unwrap();
-        if was_thinking {
-            self.commit_thinking(&mut *out);
-        }
-        // Turn off dimming and emit one blank line so the answer starts on a
-        // fresh paragraph. The blank line MUST come *after* `ensure_dim(false)`
-        // (the dim-reset SGR): a GFM list/table emits no trailing newline of its
-        // own, so a `\n` placed before the reset would be swallowed as the
-        // block's closing newline instead of a blank separator. Ordering this
-        // exactly like `stream_text`'s transition is what guarantees the gap.
-        self.ensure_dim(false, &mut *out);
-        // Blank line between reasoning and answer, written to `out` (the same
-        // handle the reasoning/answer use) so it lands in the right place.
-        // Skipped when the previous write already ended with a blank (a prior
-        // segment or response boundary), so the gap stays a single empty line.
-        if !self.ended_blank() {
-            let _ = out.write_all(b"\n");
-            self.note_lines(1);
+        let width = current_term_width();
+        // Everything below is one counted block: the thinking commit, the
+        // boundary blank, and the answer itself.
+        self.with_content_writer(width, |mut out| {
+            // Commit the (dimmed) thinking paragraph first, mirroring the
+            // thinking→answer boundary handling in `stream_text`.
+            let was_thinking = *self.dim_on.lock().unwrap();
+            if was_thinking {
+                self.commit_thinking(&mut out);
+            }
+            // Turn off dimming and emit one blank line so the answer starts on a
+            // fresh paragraph. The blank line MUST come *after* `ensure_dim(false)`
+            // (the dim-reset SGR): a GFM list/table emits no trailing newline of its
+            // own, so a `\n` placed before the reset would be swallowed as the
+            // block's closing newline instead of a blank separator. Ordering this
+            // exactly like `stream_text`'s transition is what guarantees the gap.
+            self.ensure_dim(false, out);
+            // Blank line between reasoning and answer, written to `out` (the same
+            // handle the reasoning/answer use) so it lands in the right place.
+            // Skipped when the previous write already ended with a blank (a prior
+            // segment or response boundary), so the gap stays a single empty line.
+            if !self.ended_blank() {
+                let _ = out.write_all(b"\n");
+                self.set_blank(true);
+            }
+            // Render the answer with a local parser so `self.parser` is left empty
+            // for the caller's renderer reset. `flush()` (not just `write`) so the
+            // answer's final, blank-line-unterminated paragraph is emitted rather
+            // than dropped (a `write`-only parser holds the last block back).
+            let mut local_parser = StreamParser::new_gfm_stream();
+            let mut events = local_parser.write(buffer.as_bytes());
+            events.extend(local_parser.flush());
+            let mut renderer = self.renderer.lock().unwrap();
+            let _ = renderer.feed(&events, &mut out);
+            self.set_blank(false);
+            let _ = writeln!(out);
             self.set_blank(true);
-        }
-        // Render the answer with a local parser so `self.parser` is left empty
-        // for the caller's renderer reset. `flush()` (not just `write`) so the
-        // answer's final, blank-line-unterminated paragraph is emitted rather
-        // than dropped (a `write`-only parser holds the last block back).
-        let mut local_parser = StreamParser::new_gfm_stream();
-        let mut events = local_parser.write(buffer.as_bytes());
-        events.extend(local_parser.flush());
-        let mut renderer = self.renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut *out);
-        self.set_blank(false);
-        let _ = writeln!(out);
-        self.note_lines(1);
-        self.set_blank(true);
-        self.note_text();
-        drop(out);
+            self.note_text();
+        });
         true
     }
 
     fn separator(&self) {
         let width = term_width();
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out, "{}", style("─".repeat(width)).dim());
-        drop(out);
+        self.write_content(format!("{}\n", style("─".repeat(width)).dim()).as_bytes());
         // The rule is content, not a blank separator.
         self.set_blank(false);
     }
@@ -1411,10 +1460,7 @@ impl ConsoleOutput {
             format!("{BG}"),
             format!("{}{}", " ".repeat(pad), RESET),
         );
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out, "{}", row);
-        drop(out);
-        self.note_lines(1);
+        self.write_content(format!("{row}\n").as_bytes());
         self.note_tool();
         // A panel row is content, not a blank separator.
         self.set_blank(false);
@@ -1515,16 +1561,9 @@ impl Output for ConsoleOutput {
 
     fn display_plain(&self, text: &str) {
         self.stop_thinking();
-        let w = term_width();
-        let n = if text.is_empty() {
-            1
-        } else {
-            wrap(&strip_ansi(text), w).len().max(1)
-        };
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out, "{}", text);
-        drop(out);
-        self.note_lines(n);
+        // The count comes from the bytes: `writeln!` adds the newline, and a
+        // caller-supplied line is padded or not as it likes.
+        self.write_content(format!("{}\n", text).as_bytes());
         // Plain text is content, not a blank separator.
         self.set_blank(false);
     }
@@ -1533,44 +1572,44 @@ impl Output for ConsoleOutput {
         self.stop_thinking();
         let color = std::io::stdout().is_terminal();
         let rendered = render_markdown(text, term_width(), color);
-        let mut out = self.writer.lock().unwrap();
         // Leading blank separates the block from the content above; skipped when
         // the previous write already ended with a blank line so consecutive
         // blocks (e.g. an error right after `end_response`) stay one line apart.
         let skipped_blank = self.ended_blank();
+        let mut block = String::new();
         if !skipped_blank {
-            let _ = writeln!(out);
+            block.push('\n');
             self.set_blank(true);
         }
-        let _ = write!(out, "{}", rendered);
-        let _ = writeln!(out);
-        drop(out);
-        // +2 for the leading/trailing blank lines (minus the skipped leading
-        // blank); the DSR query corrects drift.
-        let n = rendered.lines().count().max(1) + 2 - usize::from(skipped_blank);
-        self.note_lines(n);
+        block.push_str(&rendered);
+        block.push('\n');
+        // Measured, not predicted: a long rendered line wraps, and `rendered`
+        // is a count of *logical* lines, not screen rows (§9 #6/#10).
+        self.write_content(block.as_bytes());
         // Rendered markdown is content, not a blank separator.
         self.set_blank(false);
     }
 
     fn display_text(&self, text: &str) {
         self.stop_thinking();
-        let mut out = self.writer.lock().unwrap();
         // Leading blank separates the message from the content above; skipped
         // when the previous write already ended with a blank line (e.g. the
         // error path, where `end_response` printed its trailing blank first), so
         // the message sits exactly one empty line below the prior block.
         let skipped_blank = self.ended_blank();
+        let mut block = String::new();
         if !skipped_blank {
-            let _ = writeln!(out);
+            block.push('\n');
             self.set_blank(true);
         }
-        let _ = write!(out, "{} ", style("⏺").cyan());
-        let _ = write!(out, "{}", termimad::inline(text));
-        let _ = writeln!(out);
-        drop(out);
-        let n = wrap(text, term_width()).len() + usize::from(!skipped_blank);
-        self.note_lines(n);
+        // The bytes, not the source, decide the height: the `⏺ ` prefix is two
+        // columns the old `wrap(text).len()` count never saw, inline markdown
+        // rewrites the text, and a message that exactly fills the width wraps
+        // onto another row (§9 #6). Measuring the bytes removes the guess *and*
+        // the DSR that used to correct for it.
+        block.push_str(&format!("{} {}", style("⏺").cyan(), termimad::inline(text)));
+        block.push('\n');
+        self.write_content(block.as_bytes());
         // The message line is content, not a blank separator.
         self.set_blank(false);
     }
@@ -1614,42 +1653,43 @@ impl Output for ConsoleOutput {
         // (code lines line-by-line, paragraphs on close), so there is no whole
         // document re-render, no in-place cursor gymnastics, and scrollback
         // stays clean.
-        let mut out = self.writer.lock().unwrap();
-        let was_thinking = *self.dim_on.lock().unwrap();
-        if was_thinking {
-            // Thinking just ended: normalize the thinking→answer boundary to a
-            // single paragraph gap. Commit all still-buffered thinking (while dim
-            // is still on) and emit one blank line, so the answer starts on a
-            // fresh paragraph regardless of whether a tool call intervened in
-            // between (the tool path already prints its own gap).
-            self.commit_thinking(&mut *out);
-            self.ensure_dim(false, &mut *out);
-            // Blank line between reasoning and answer, written to `out` so it
-            // lands in the right place (a `println!` here can land in a
-            // different write buffer and be lost).
-            if !self.ended_blank() {
-                let _ = out.write_all(b"\n");
-                self.note_lines(1);
-                self.set_blank(true);
+        // One counted block: the boundary blank (if any) and the rendered
+        // blocks. The renderer produced the bytes, so the counter measures
+        // them rather than the delta text (§9 #10).
+        self.with_content_writer(current_width, |mut out| {
+            let was_thinking = *self.dim_on.lock().unwrap();
+            if was_thinking {
+                // Thinking just ended: normalize the thinking→answer boundary to a
+                // single paragraph gap. Commit all still-buffered thinking (while dim
+                // is still on) and emit one blank line, so the answer starts on a
+                // fresh paragraph regardless of whether a tool call intervened in
+                // between (the tool path already prints its own gap).
+                self.commit_thinking(&mut out);
+                self.ensure_dim(false, &mut out);
+                // Blank line between reasoning and answer, written to `out` so it
+                // lands in the right place (a `println!` here can land in a
+                // different write buffer and be lost).
+                if !self.ended_blank() {
+                    let _ = out.write_all(b"\n");
+                    self.set_blank(true);
+                }
+                self.note_text();
+            } else if *self.last_was_tool.lock().unwrap() {
+                if !self.ended_blank() {
+                    let _ = out.write_all(b"\n");
+                    self.set_blank(true);
+                }
+                self.ensure_dim(false, &mut out);
             }
-            self.note_text();
-        } else if *self.last_was_tool.lock().unwrap() {
-            if !self.ended_blank() {
-                let _ = out.write_all(b"\n");
-                self.note_lines(1);
-                self.set_blank(true);
+            let mut parser = self.parser.lock().unwrap();
+            let events = parser.write(delta.as_bytes());
+            let mut renderer = self.renderer.lock().unwrap();
+            let _ = renderer.feed(&events, &mut out);
+            // Emitted text is content, not a blank separator.
+            if !events.is_empty() {
+                self.set_blank(false);
             }
-            self.ensure_dim(false, &mut *out);
-        }
-        let mut parser = self.parser.lock().unwrap();
-        let events = parser.write(delta.as_bytes());
-        let mut renderer = self.renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut *out);
-        drop(out);
-        // Emitted text is content, not a blank separator.
-        if !events.is_empty() {
-            self.set_blank(false);
-        }
+        });
     }
 
     fn stream_thinking(&self, delta: &str) {
@@ -1678,17 +1718,17 @@ impl Output for ConsoleOutput {
         // renderer using a faded theme whose `reset` re-applies the dim SGR,
         // so inline formatting (bold/code) does not clear the fading. The
         // initial dim is turned on once per run via `ensure_dim`.
-        let mut out = self.writer.lock().unwrap();
-        self.ensure_dim(true, &mut *out);
-        let mut parser = self.thinking_parser.lock().unwrap();
-        let events = parser.write(delta.as_bytes());
-        let mut renderer = self.thinking_renderer.lock().unwrap();
-        let _ = renderer.feed(&events, &mut *out);
-        drop(out);
-        // Streamed thinking is content, not a blank separator.
-        if !events.is_empty() {
-            self.set_blank(false);
-        }
+        self.with_content_writer(current_width, |mut out| {
+            self.ensure_dim(true, &mut out);
+            let mut parser = self.thinking_parser.lock().unwrap();
+            let events = parser.write(delta.as_bytes());
+            let mut renderer = self.thinking_renderer.lock().unwrap();
+            let _ = renderer.feed(&events, &mut out);
+            // Streamed thinking is content, not a blank separator.
+            if !events.is_empty() {
+                self.set_blank(false);
+            }
+        });
     }
 
     fn end_response_segment(&self) {
@@ -1698,50 +1738,51 @@ impl Output for ConsoleOutput {
             // Call flush_held_answer BEFORE locking the writer (it locks it
             // internally).
             let flushed = self.flush_held_answer();
-            let mut out = self.writer.lock().unwrap();
-            // Commit any open answer paragraph so the tool call/result prints
-            // below, then start a *fresh* answer renderer for the next segment.
-            // This drops the renderer's `pending_gap`, which otherwise fires at
-            // the next answer segment's first block and would double the blank
-            // line at the thinking→answer boundary in multi-turn turns (the
-            // transition already emits one blank).
-            {
-                let mut parser = self.parser.lock().unwrap();
-                // `flush()` (not `write("\n\n")`) so a segment whose answer text
-                // ends in a list/table is emitted now rather than stranded; then
-                // start a fresh answer parser + renderer for the next segment.
-                let events = parser.flush();
-                *parser = StreamParser::new_gfm_stream();
-                let mut renderer = self.renderer.lock().unwrap();
-                let _ = renderer.feed(&events, &mut *out);
-                if !events.is_empty() {
-                    // Committed answer text is content, not a blank separator.
-                    self.set_blank(false);
+            let current_width = current_term_width();
+            // One counted block: the answer commit, the thinking commit, the
+            // boundary blank and the dim reset.
+            self.with_content_writer(current_width, |mut out| {
+                // Commit any open answer paragraph so the tool call/result prints
+                // below, then start a *fresh* answer renderer for the next segment.
+                // This drops the renderer's `pending_gap`, which otherwise fires at
+                // the next answer segment's first block and would double the blank
+                // line at the thinking→answer boundary in multi-turn turns (the
+                // transition already emits one blank).
+                {
+                    let mut parser = self.parser.lock().unwrap();
+                    // `flush()` (not `write("\n\n")`) so a segment whose answer text
+                    // ends in a list/table is emitted now rather than stranded; then
+                    // start a fresh answer parser + renderer for the next segment.
+                    let events = parser.flush();
+                    *parser = StreamParser::new_gfm_stream();
+                    let mut renderer = self.renderer.lock().unwrap();
+                    let _ = renderer.feed(&events, &mut out);
+                    if !events.is_empty() {
+                        // Committed answer text is content, not a blank separator.
+                        self.set_blank(false);
+                    }
+                    let mut theme = Theme::default();
+                    theme.clickable_links = true; // real TTY path
+                    *renderer = Renderer::new(theme, current_width);
                 }
-                let current_width = current_term_width();
-                let mut theme = Theme::default();
-                theme.clickable_links = true; // real TTY path
-                *renderer = Renderer::new(theme, current_width);
-            }
-            if !flushed {
-                // Commit thinking (the thinking renderer is kept — post-tool
-                // thinking continues as one continuous faded stream; only the
-                // parser is reset, inside `commit_thinking`).
-                self.commit_thinking(&mut *out);
-                self.ensure_dim(false, &mut *out);
-                // Blank line between the answer/reasoning block and the tool
-                // panel below. Skipped when the stream already ends with a blank
-                // (e.g. a held answer was just flushed, or an empty terminal
-                // `CompletionCall` follows a prior segment's blank), so stacked
-                // segment boundaries collapse to one empty line.
-                if !self.ended_blank() {
-                    let _ = out.write_all(b"\n");
-                    self.note_lines(1);
-                    self.set_blank(true);
+                if !flushed {
+                    // Commit thinking (the thinking renderer is kept — post-tool
+                    // thinking continues as one continuous faded stream; only the
+                    // parser is reset, inside `commit_thinking`).
+                    self.commit_thinking(&mut out);
+                    self.ensure_dim(false, &mut out);
+                    // Blank line between the answer/reasoning block and the tool
+                    // panel below. Skipped when the stream already ends with a blank
+                    // (e.g. a held answer was just flushed, or an empty terminal
+                    // `CompletionCall` follows a prior segment's blank), so stacked
+                    // segment boundaries collapse to one empty line.
+                    if !self.ended_blank() {
+                        let _ = out.write_all(b"\n");
+                        self.set_blank(true);
+                    }
+                    self.note_text();
                 }
-                self.note_text();
-            }
-            drop(out);
+            });
         } else {
             self.flush_text();
         }
@@ -1754,45 +1795,47 @@ impl Output for ConsoleOutput {
             // Call flush_held_answer BEFORE locking the writer (it locks it
             // internally).
             let flushed = self.flush_held_answer();
-            let mut out = self.writer.lock().unwrap();
-            if !flushed {
-                // Finalize the answer document.
-                {
-                    let mut parser = self.parser.lock().unwrap();
-                    let events = parser.flush();
-                    let mut renderer = self.renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut *out);
-                    if !events.is_empty() {
-                        // Flushed answer text is content, not a blank separator.
-                        self.set_blank(false);
+            let current_width = current_term_width();
+            // One counted block: the answer and thinking flushes and the
+            // trailing blank.
+            self.with_content_writer(current_width, |mut out| {
+                if !flushed {
+                    // Finalize the answer document.
+                    {
+                        let mut parser = self.parser.lock().unwrap();
+                        let events = parser.flush();
+                        let mut renderer = self.renderer.lock().unwrap();
+                        let _ = renderer.feed(&events, &mut out);
+                        if !events.is_empty() {
+                            // Flushed answer text is content, not a blank separator.
+                            self.set_blank(false);
+                        }
                     }
-                }
-                // Finalize thinking (it was rendered inline + dimmed as it streamed).
-                {
-                    let mut parser = self.thinking_parser.lock().unwrap();
-                    let events = parser.flush();
-                    let mut renderer = self.thinking_renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut *out);
-                    if !events.is_empty() {
-                        // Flushed thinking is content, not a blank separator.
-                        self.set_blank(false);
+                    // Finalize thinking (it was rendered inline + dimmed as it streamed).
+                    {
+                        let mut parser = self.thinking_parser.lock().unwrap();
+                        let events = parser.flush();
+                        let mut renderer = self.thinking_renderer.lock().unwrap();
+                        let _ = renderer.feed(&events, &mut out);
+                        if !events.is_empty() {
+                            // Flushed thinking is content, not a blank separator.
+                            self.set_blank(false);
+                        }
                     }
+                    self.ensure_dim(false, &mut out);
+                    // Trailing blank so the separator that opens the next loop
+                    // iteration does not butt against the last line of the response.
+                    // Skipped when the turn already ended with a blank (the terminal
+                    // `CompletionCall`'s `end_response_segment` — or a held-answer
+                    // flush — printed one), which is what collapses the previously
+                    // observed double empty line to a single one.
+                    if !self.ended_blank() {
+                        let _ = writeln!(out);
+                        self.set_blank(true);
+                    }
+                    self.note_text();
                 }
-                self.ensure_dim(false, &mut *out);
-                // Trailing blank so the separator that opens the next loop
-                // iteration does not butt against the last line of the response.
-                // Skipped when the turn already ended with a blank (the terminal
-                // `CompletionCall`'s `end_response_segment` — or a held-answer
-                // flush — printed one), which is what collapses the previously
-                // observed double empty line to a single one.
-                if !self.ended_blank() {
-                    let _ = writeln!(out);
-                    self.note_lines(1);
-                    self.set_blank(true);
-                }
-                self.note_text();
-            }
-            drop(out);
+            });
         } else {
             self.flush_text();
             // Non-TTY thinking already streamed to stderr; stdout stays clean.
@@ -1813,10 +1856,7 @@ impl Output for ConsoleOutput {
         // result, so this is safe to read back on the result.
         *self.last_tool.lock().unwrap() = Some((name.to_string(), args.clone()));
         if *self.last_was_tool.lock().unwrap() {
-            let mut out = self.writer.lock().unwrap();
-            let _ = writeln!(out);
-            drop(out);
-            self.note_lines(1);
+            self.write_content(b"\n");
             // The divider is a blank line; the panel content below resets it.
             self.set_blank(true);
         }
@@ -2026,18 +2066,14 @@ impl Output for ConsoleOutput {
 
     fn display_error(&self, error: &str) {
         self.stop_thinking();
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out, "{} Error: {}", style("⏺").red(), error);
-        drop(out);
-        self.note_lines(1);
+        // Measured: a long error wraps, and the message carries a 2-column
+        // prefix the row count has to include.
+        self.write_content(format!("{} Error: {}\n", style("⏺").red(), error).as_bytes());
     }
 
     fn display_system(&self, text: &str) {
         self.stop_thinking();
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out, "{}", style(text).bold().dim());
-        drop(out);
-        self.note_lines(1);
+        self.write_content(format!("{}\n", style(text).bold().dim()).as_bytes());
     }
 
     fn confirm(&self, message: &str) -> Confirmation {
@@ -2073,8 +2109,9 @@ impl Output for ConsoleOutput {
 
     fn display_separator(&self) {
         self.stop_thinking();
+        // `separator` writes through the row counter; noting again here would
+        // count the same row twice.
         self.separator();
-        self.note_lines(1);
     }
 
     fn display_thinking(&self, message: &str) {
@@ -2114,13 +2151,15 @@ impl Output for ConsoleOutput {
             "  ██       ██  ",
         ];
 
-        let mut out = self.writer.lock().unwrap();
-        let _ = writeln!(out);
+        // One counted block: the greeter's height used to be a hardcoded 9
+        // (blank + 3 avatar lines + blank + status), which is a guess like the
+        // ones this phase exists to remove.
+        let mut block = String::from("\n");
         for line in avatar {
             let padding = width.saturating_sub(15) / 2;
-            let _ = writeln!(out, "{}{}", " ".repeat(padding), style(line).cyan());
+            block.push_str(&format!("{}{}\n", " ".repeat(padding), style(line).cyan()));
         }
-        let _ = writeln!(out);
+        block.push('\n');
 
         let status = |active, label, color: fn(StyledObject<String>) -> StyledObject<String>| {
             let s = style(format!("[{}] {}", if active { "x" } else { " " }, label));
@@ -2135,27 +2174,24 @@ impl Output for ConsoleOutput {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into());
 
-        let _ = write!(
-            out,
+        block.push_str(&format!(
             "{} | {} ({})",
             style("picocode").bold(),
             style(provider).cyan(),
             style(model).blue(),
-        );
+        ));
 
         if let Some(p) = persona {
-            let _ = write!(out, " | {}", style(p).magenta());
+            block.push_str(&format!(" | {}", style(p).magenta()));
         }
 
-        let _ = writeln!(
-            out,
-            " | {} | {} | {}",
+        block.push_str(&format!(
+            " | {} | {} | {}\n",
             status(yolo, "yolo", |s| s.red()),
             style(format!("limit:{}", limit)).yellow(),
             style(cwd).dim()
-        );
-        self.note_lines(9);
-        drop(out);
+        ));
+        self.write_content(block.as_bytes());
         // The header is content, not a blank separator.
         self.set_blank(false);
     }
@@ -2259,6 +2295,134 @@ impl Output for ScrollbackOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
+    //
+    // A wrong row count does not show up as a wrong number in isolation: the
+    // *next* frame anchors one row off, and the visible damage is a clear that
+    // lands in the wrong place (row_accounting §6 B2). So the assertion is
+    // against the screen: run a writer, replay its bytes through a terminal
+    // emulator, and require the tracked row to be the row the cursor is on.
+
+    /// A `ConsoleOutput` writing into a capture buffer, with the shared width
+    /// pinned so the expected geometry does not depend on the test runner's
+    /// terminal. Height is not pinned (the clamp in `note_lines` needs a real
+    /// terminal size), so the cases stay well under one screen.
+    fn capturing_output(width: u16) -> (ConsoleOutput, crate::settings::ShowReasoningHandle) {
+        crate::repl::TERMINAL_WIDTH.store(width as usize, std::sync::atomic::Ordering::SeqCst);
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        (ConsoleOutput::new(reasoning.clone()), reasoning)
+    }
+
+    /// Tracked cursor row of `out` (0-based, as the screen reports it).
+    fn tracked_row(out: &ConsoleOutput) -> usize {
+        out.draw.lock().unwrap().tracked_row() - 1
+    }
+
+    /// Row the cursor ends on when `bytes` are replayed into a `width`x24
+    /// terminal.
+    ///
+    /// The ONLCR shim is the one ui_draw_v2 P0 established: production emits
+    /// bare `\n` and the tty line discipline turns it into CRLF, so the
+    /// emulator has to be fed what the terminal would actually receive.
+    /// Without it every LF leaves the column untouched and the whole model
+    /// drifts sideways instead of down.
+    fn screen_row(bytes: &[u8], width: u16) -> usize {
+        let mut p = vt100::Parser::new(24, width, 100_000);
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        p.screen().cursor_position().0 as usize
+    }
+
+    #[test]
+    fn display_text_row_is_measured_not_predicted() {
+        // A message that exactly fills the width, and one that is a column
+        // wider: the old `wrap(text).len()` count called both one row.
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response_inner(true);
+        out.display_text(&"x".repeat(36)); // + "⏺ " = 38 columns
+        out.display_text(&"y".repeat(39)); // + "⏺ " = 41 -> wraps
+        let bytes = out.end_capture();
+        assert_eq!(
+            tracked_row(&out),
+            screen_row(&bytes, 40),
+            "a message that wraps must be counted as two rows"
+        );
+    }
+
+    #[test]
+    fn display_text_counts_a_wide_character_as_two_columns() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response_inner(true);
+        // 19 CJK chars = 38 columns, plus the 2-column marker: wraps at 40.
+        out.display_text(&"漢".repeat(19));
+        let bytes = out.end_capture();
+        assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    #[test]
+    fn streamed_answer_is_counted() {
+        // The untracked path (§9 #10): a streamed paragraph used to leave the
+        // tracked row where it was.
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response_inner(true);
+        out.stream_text("First paragraph of the answer.\n\n");
+        out.stream_text("Second paragraph, streamed.\n\n");
+        out.end_response();
+        let bytes = out.end_capture();
+        assert_eq!(
+            tracked_row(&out),
+            screen_row(&bytes, 40),
+            "streamed content is not accounted for"
+        );
+    }
+
+    #[test]
+    fn streamed_thinking_is_counted() {
+        let (out, reasoning) = capturing_output(40);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.begin_capture();
+        out.begin_response_inner(true);
+        out.stream_thinking("Thinking about the problem.\n\n");
+        let bytes = out.end_capture();
+        assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    #[test]
+    fn tool_panel_is_counted() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response_inner(true);
+        out.display_tool_call("Bash", &serde_json::json!({"command": "ls -la"}));
+        out.display_tool_result("a\nb\nc");
+        let bytes = out.end_capture();
+        assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    #[test]
+    fn markdown_and_error_and_plain_are_counted() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response_inner(true);
+        out.display_markdown("# Title\n\nA paragraph long enough to wrap at forty columns.\n");
+        out.display_error("an error long enough to wrap onto a second row at forty");
+        out.display_plain("plain text that is long enough to wrap at forty columns ok");
+        out.display_system("a system line long enough to wrap at forty columns");
+        let bytes = out.end_capture();
+        assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
 
     #[test]
     fn wrap_word_boundary() {

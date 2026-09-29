@@ -378,6 +378,14 @@ impl DrawCache {
         }
     }
 
+    /// The tracked cursor row (1-based), for the host's row-accounting tests:
+    /// they compare it against where a terminal emulator puts the cursor after
+    /// replaying the same bytes (row_accounting §6 B2).
+    #[cfg(test)]
+    pub(crate) fn tracked_row(&self) -> usize {
+        self.caret.0
+    }
+
     /// Where the next frame belongs (plan §5.1): the intact frame's top row if
     /// there is one, else the tracked cursor row.
     pub(crate) fn anchor(&self) -> usize {
