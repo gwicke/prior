@@ -723,14 +723,31 @@ supplies them. A guessed number is worse than silence, and guessing was already
 shown to be wrong: the published defaults are {0.3, 0.7, 0.9, 1.0} / {0.95, 1.0},
 not the 1.0/0.95 anyone would type from memory.
 
-**P3 — catalog enrichment.** `ModelEntry` fields; parse `description`,
-`supported_parameters` → two booleans, `reasoning.supported_efforts`, and
-`default_parameters` → the two display-only defaults; extend `model_row`
-fields/columns if useful. *Tests:* `parse_openrouter` with a trimmed
-fixture asserting the derived booleans, the level list, and that a
-`default_parameters` of `{"temperature": null}` yields `default_temperature:
-None` (not `Some(0)`); the direct-entry path in `extrapolate` copies the new
-fields onto the derived `ModelEntry`; dedupe keeps them.
+**P3 — catalog enrichment.** **Done (2026-09-29).** `ModelEntry` gains
+`description`, `supports_temperature`, `supports_top_p`, `reasoning_levels`,
+`default_temperature`, `default_top_p`; all parsed from the OpenRouter
+payload. `model_catalog::reasoning_support()` now reads the cached catalog, so
+the P1 remapper is live. *Tests:* a trimmed payload covering all six fields
+(including that a blank blurb and a `null` default both degrade to "absent"),
+the direct-entry path carrying the facts over, the composition from parsed
+entry to remapper input, and `unknown` for a model the catalog cannot see.
+
+**P3 addendum — three implementation decisions.**
+- **`ModelEntry` derives `Default`** and the literals that genuinely have
+  nothing to say (`static_fallback`, `liveness_prune`, test fixtures) end in
+  `..Default::default()`. Six new fields on thirteen literals would have been
+  a wall of `None`, and a wall of `None` hides the sites that *do* carry data.
+- **`support_for_entry` is split out of `reasoning_support`** so the parse →
+  support composition is testable without seeding the process-wide catalog
+  cache, which every other catalog-reading test shares.
+- **`/reasoning` row descriptions carry the landing** (`balanced reasoning →
+  deepseek high`), which is where the disclosure is most useful — visible while
+  scanning the rows, not only after opening the header. `header()` keeps the
+  fuller table, since the rows have no room for it.
+- Live-API check (40 most-popular models, 2026-09-29): `description` 40/40,
+  `temperature` listed 32/40, effort lists 31/40, `default_temperature` 11/40.
+  So the last one is genuinely sparse, and the header says "not published"
+  rather than guessing in the two-thirds of cases.
 
 **P4 — per-model storage + the editor.** `[models.*]` in `Config` and
 `SettingsStore`; `put_model_settings`; `src/settings_editor.rs` with comments,
@@ -831,3 +848,10 @@ Settled in design review (2026-09-29), in the order they were taken:
     `default_thinking_level` auto-migrates into it on load (P0 addendum).
     Chosen over failing on the old key: a rename that makes the tool refuse to
     start is a different class of breakage from a command that changed name.
+18. **The reasoning disclosure lives in the row descriptions, not only the
+    header.** `balanced reasoning → deepseek high` sits on the row the user is
+    looking at. The header keeps the full table, which does not fit in a row.
+19. **Absent catalog data is shown as absent.** "provider default: not
+    published" and "this model does not list top_p in supported_parameters" are
+    real answers — the second for 8 of the 40 most-popular models, the first
+    for 29 of 40.

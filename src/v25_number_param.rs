@@ -112,6 +112,46 @@ fn display_value(p: NumberParam, params: &ModelParams) -> String {
     }
 }
 
+/// What the catalog publishes about this knob for the active model.
+///
+/// Two facts, both worth having and neither worth guessing: whether the model
+/// accepts the knob at all (a fair number do not — the most-popular
+/// `openai/gpt-*` entries list neither `temperature` nor `top_p`), and the
+/// provider's own default when it publishes one. The default is shown and
+/// never sent: `None` means "leave it alone", and sending a default we merely
+/// know about would put an explicit value on the wire for every model —
+/// changing sampling on models that were fine, and breaking the reasoning
+/// models that reject a non-default temperature.
+fn catalog_notes(p: NumberParam, app_state: &AppState) -> Vec<String> {
+    let active = app_state.model();
+    let Some((provider, model)) = active.split_once(':') else {
+        return Vec::new();
+    };
+    let Some(entry) = crate::model_catalog::lookup(provider, model) else {
+        return Vec::new();
+    };
+    let (supported, published) = match p {
+        NumberParam::Temperature => (entry.supports_temperature, entry.default_temperature),
+        NumberParam::TopP => (entry.supports_top_p, entry.default_top_p),
+    };
+    vec![
+        if supported {
+            format!("this model accepts {}", p.name())
+        } else {
+            format!(
+                "this model does not list {} in supported_parameters",
+                p.name()
+            )
+        },
+        // An explicit `null` in `default_parameters` and an absent key mean the
+        // same thing here: the provider publishes no default.
+        match published {
+            Some(v) => format!("provider default: {}", fmt_value(v)),
+            None => "provider default: not published".to_string(),
+        },
+    ]
+}
+
 pub struct NumberParamNode {
     param: NumberParam,
     app_state: Arc<AppState>,
@@ -203,11 +243,11 @@ impl SlashDotNode for NumberParamNode {
             format!("default: provider (empty clears it back to that)"),
             format!("effect: {}", self.param.effect()),
         ];
-        // Catalog-derived facts (whether the model exposes this knob at all,
-        // and the provider's own published default) land here in P3, when
-        // `ModelEntry` carries them. Until then there is nothing to show, and
-        // a guessed number would be worse than silence.
-        lines.retain(|l| !l.is_empty());
+        // The catalog-derived facts (does the model accept this knob, and
+        // what is the provider's own default) come from `ModelEntry`. They
+        // are absent for a model the catalog does not cover — and absent is
+        // the right answer there, where a guess would be worse than silence.
+        lines.extend(catalog_notes(self.param, &self.app_state));
         lines
     }
 }

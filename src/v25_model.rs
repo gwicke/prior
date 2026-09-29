@@ -183,7 +183,11 @@ impl SlashDotNode for ModelNode {
 /// `slash_menu_bridge::model_row`.
 fn model_row(e: &crate::model_catalog::ModelEntry) -> Row {
     use crate::slashdot_menu::value::Value;
-    let mut r = Row::new(e.qualified()).desc(e.display.clone());
+    // The OpenRouter blurb is the only human-readable text we have about a
+    // model, and as the row description it also makes the fuzzy filter match
+    // on something other than the id.
+    let mut r =
+        Row::new(e.qualified()).desc(e.description.clone().unwrap_or_else(|| e.display.clone()));
     if let Some(v) = e.context_length {
         r = r.field("context", Value::Num(v as f64));
     }
@@ -459,6 +463,7 @@ mod tests {
             coding_index: coding,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         // Free model: price 0, coding 80.
         let free = entry(Some(0.0), Some(80.0));

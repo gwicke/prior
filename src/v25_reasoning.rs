@@ -46,6 +46,17 @@ impl ReasoningEnumNode {
         ("max", "maximum reasoning"),
     ];
 
+    /// Provider + support list for the active model, or `None` when there is
+    /// no active model to report on (`/set default_reasoning_level`).
+    fn level_context(&self) -> Option<LevelContext> {
+        let model_fn = self.active_model_fn.as_ref()?;
+        let active = model_fn();
+        let (provider, model) = active.split_once(':')?;
+        let (provider, model) = (provider.to_string(), model.to_string());
+        let support = crate::model_catalog::reasoning_support(&provider, &model);
+        Some(LevelContext { provider, support })
+    }
+
     /// Explain what each preset will actually run, so the user can choose
     /// working backwards from the effort they want.
     ///
@@ -54,40 +65,51 @@ impl ReasoningEnumNode {
     /// Emits nothing for a provider with no documented table and a model with
     /// no published list — there is nothing to disclose.
     fn mapping_lines(&self) -> Vec<String> {
-        let Some(model_fn) = self.active_model_fn.as_ref() else {
+        let Some(c) = self.level_context() else {
             return Vec::new();
         };
-        let active = model_fn();
-        let Some((provider, model)) = active.split_once(':') else {
-            return Vec::new();
-        };
-        let (provider, model) = (provider.to_string(), model.to_string());
-
         let mut lines = Vec::new();
-        if let Some(summary) = crate::params::provider_effort_mapping_summary(&provider) {
-            lines.push(format!("{provider} maps: {summary}"));
+        if let Some(summary) = crate::params::provider_effort_mapping_summary(&c.provider) {
+            lines.push(format!("{} maps: {summary}", c.provider));
         }
-        let support = crate::model_catalog::reasoning_support(&provider, &model);
-        if support.is_known() {
-            lines.push(format!("{model} supports: {}", support.levels().join(", ")));
+        if c.support.is_known() {
+            lines.push(format!(
+                "this model supports: {}",
+                c.support.levels().join(", ")
+            ));
         }
         if lines.is_empty() {
             return lines;
         }
         lines.push("your presets land on:".to_string());
         for (name, _) in Self::LEVELS {
-            let Ok(level) = name.parse::<crate::params::ReasoningLevel>() else {
-                continue;
-            };
-            let sent = crate::params::resolve_effort_for(&provider, level, &support);
-            let served = sent
-                .as_deref()
-                .and_then(|request| crate::params::provider_served_effort(&provider, request))
-                .unwrap_or("as sent");
-            lines.push(format!("  {name} → {served}"));
+            if let Some(landed) = landing(name, &c) {
+                lines.push(format!("  {name} → {landed}"));
+            }
         }
         lines
     }
+}
+
+/// The active provider plus the model's published effort list — everything
+/// needed to say where a preset lands.
+struct LevelContext {
+    provider: String,
+    support: crate::params::ReasoningSupport,
+}
+
+/// Where a preset actually lands on this provider+model, as the user should
+/// read it: what the service *serves*, which may differ from what we send
+/// (`medium` in, `high` out on DeepSeek). `None` when the level is `off` or
+/// the provider has no effort vocabulary to speak of.
+fn landing(name: &str, c: &LevelContext) -> Option<String> {
+    let level: crate::params::ReasoningLevel = name.parse().ok()?;
+    let sent = crate::params::resolve_effort_for(&c.provider, level, &c.support)?;
+    Some(
+        crate::params::provider_served_effort(&c.provider, &sent)
+            .unwrap_or(sent.as_str())
+            .to_string(),
+    )
 }
 
 #[async_trait::async_trait(?Send)]
@@ -96,7 +118,18 @@ impl SlashDotNode for ReasoningEnumNode {
         let active = (self.active_fn)();
         let rows = Self::LEVELS
             .iter()
-            .map(|(l, d)| crate::slashdot_menu::fields::Row::new(*l).desc(*d))
+            .map(|(l, d)| {
+                // Descriptions carry where the level actually lands, so the
+                // answer shows while scanning rows, not only in `header()`.
+                let desc = match self.level_context() {
+                    Some(c) => match landing(*l, &c) {
+                        Some(landed) if landed != *l => format!("{d} → {landed}"),
+                        _ => (*d).to_string(),
+                    },
+                    None => (*d).to_string(),
+                };
+                crate::slashdot_menu::fields::Row::new(*l).desc(desc)
+            })
             .collect();
         Ok(Rc::new(DataResponse {
             rows,
@@ -295,9 +328,66 @@ mod tests {
             joined.contains("med \u{2192} high"),
             "med must disclose it lands on high: {joined}"
         );
-        // All five presets are listed, so the user can read the whole ladder.
-        for preset in ["off", "low", "med", "high", "max"] {
+        // Every preset that is an actual effort is listed, so the whole ladder
+        // is readable. `off` is deliberately absent: it is the absence of
+        // reasoning, not an effort, and there is nothing to disclose about it.
+        for preset in ["low", "med", "high", "max"] {
             assert!(joined.contains(preset), "missing preset {preset}: {joined}");
+        }
+        assert!(
+            !joined.contains("off →"),
+            "off must not be given a landing: {joined}"
+        );
+    }
+
+    /// The picker rows carry the landing inline, so the mapping is visible
+    /// while scanning rather than only after opening the header.
+    #[test]
+    fn row_descriptions_carry_where_each_level_lands() {
+        let app_state = test_app_state();
+        app_state.set_model("deepseek:deepseek-v4.1-flash");
+        let reader = app_state.clone();
+        let reader2 = app_state.clone();
+        let mut node = ReasoningEnumNode {
+            active_fn: Box::new(move || reader.reasoning().unwrap_or_else(|| "off".to_string())),
+            submit_fn: Box::new(|_| Ok(())),
+            active_model_fn: Some(Box::new(move || reader2.model())),
+        };
+        let resp = futures::executor::block_on(node.data(1, &PathArgs::new(vec![], ""))).unwrap();
+        let by_id = |id: &str| {
+            resp.rows
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.description.clone().unwrap_or_default())
+                .unwrap_or_default()
+        };
+        // DeepSeek serves `high` for a `medium` request: the row must say so.
+        let med = by_id("med");
+        assert!(med.contains("→ high"), "med row must disclose: {med}");
+        // An effort that survives unchanged keeps its plain blurb.
+        let high = by_id("high");
+        assert!(!high.contains('→'), "high lands as requested: {high}");
+        // `off` is not an effort and gets no landing.
+        assert!(!by_id("off").contains('→'), "{}", by_id("off"));
+    }
+
+    /// With nothing to disclose the rows keep their plain blurbs, so the
+    /// picker never shows an empty or noisy arrow.
+    #[test]
+    fn row_descriptions_stay_plain_when_there_is_nothing_to_disclose() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:claude-3-5-sonnet-20241022");
+        let reader = app_state.clone();
+        let reader2 = app_state.clone();
+        let mut node = ReasoningEnumNode {
+            active_fn: Box::new(move || reader.reasoning().unwrap_or_else(|| "off".to_string())),
+            submit_fn: Box::new(|_| Ok(())),
+            active_model_fn: Some(Box::new(move || reader2.model())),
+        };
+        let resp = futures::executor::block_on(node.data(1, &PathArgs::new(vec![], ""))).unwrap();
+        for row in &resp.rows {
+            let desc = row.description.clone().unwrap_or_default();
+            assert!(!desc.contains('→'), "{}: {desc}", row.id);
         }
     }
 
