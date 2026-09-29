@@ -272,7 +272,7 @@ A row is:
 [indent: depth × SPUR_STEP spaces]
 [spur-start connector, only on a spur's first visible row: ┗ at the parent's bar column, ━ filling up to this bar]
 [bar cell: 1 column, glyph from the table above, background = branch hue faded by depth]
-[1 space, assistant rows only]
+[reply mark: ╸ in neutral ink, assistant rows only]
 [text]
 ```
 
@@ -280,18 +280,28 @@ and it renders as:
 
 ```
 ┃kick off               main,  user               bar@0
-┗ reply 1               main,  assistant           bar@0, branch ends
+┗╸ reply 1              main,  assistant           bar@0, branch ends
 ┗━━┓experiment prompt   spur1, user              ┗@0, ━@1..2, bar@3
-   ┗ experiment reply   spur1, assistant         bar@3, branch ends
+   ┗╸ experiment reply   spur1, assistant         bar@3, branch ends
 ┗━━┓a different idea   spur2, user              ┗@0, ━@1..2, bar@3
-   ┣ its reply          spur2, assistant         bar@3
+   ┣╸ its reply          spur2, assistant         bar@3
    ┃last question       spur2, user              bar@3
-   ┗ last reply         spur2, assistant         bar@3, branch ends
+   ┗╸ last reply         spur2, assistant         bar@3, branch ends
 ┃third message          main,  user               bar@0
 ```
 
-(The connector is drawn in neutral dim ink with no wash; the bar cells in
-branch ink on a branch wash — in a plain terminal they look identical.)
+The reply mark is what `┣`/`┗` arms into: its horizontal continues the
+junction's arm into the text and its stem hooks up to the row above. It is
+needed because the reply indent is down to a *single* column — with a 2-space
+step the offset itself identified a reply, and at one column the mark
+carries that instead. It sits in the same neutral ink as the spur
+connector: both are structural annotations, not branch identity. A user
+row's cell in that column is blank, so a conversation reads as a column of
+`╸` marking every reply.
+
+(The connector and the reply mark are drawn in neutral dim ink with no
+wash; the bar cells in branch ink on a branch wash — in a plain terminal
+they look identical.)
 
 ### 5.1 The two connectors
 
@@ -364,9 +374,11 @@ added to it. (The alternative, a bar per level *after* the indent, would
 cost 5 columns per level; not worth it, especially now that the main line
 sits at the margin and deep spurs are the only thing pushing right.)
 
-The assistant step is **1 column** (confirmed): the junction's arm is the
-horizontal step, so `┃` + text for a user row and `┣` + one space + text
-for a reply.
+The assistant step is **1 column** (confirmed): the junction's arm and the
+reply mark share it, so `┃` + text for a user row and `┣` + `╸` + text for
+a reply. Note what that costs: the *absolute* column of a reply's text is
+the same as in the space-only layout, but the gap to the user row above is
+one column instead of two — hence the reply mark.
 
 ### 5.3 Ink and wash
 
@@ -500,7 +512,7 @@ across the session) was considered and dropped.
 | 7 | Hue | **Warm orange** anchor for the main line; rainbow rotated per level starting after the anchor, ordered by descending height; fade = depth; layout-relative (§6). |
 | 8 | Opt-out | A `tree_color` setting (`auto | on | off`) + `NO_COLOR`; neither exists today (§3.5). |
 | 9 | Defensive fix | Make `extract_snippet` escape-aware even though the recommended path does not reach it (§3.4). |
-| 10 | Assistant step | **1 column** — the junction's arm is the step (§5.2). |
+| 10 | Assistant step | **1 column** — the junction's arm and the reply mark `╸` share it, in the same neutral ink as the connector (§5.2). |
 | 11 | Spur-level width | **4 columns per level, unchanged from the shipped layout**: the bar replaces the last indent column rather than being added after it (§5.2). |
 | 12 | Tunables | The fade curve (§6.2), the palette constants and the connector's dim ink are single constants; the exact anchor orange wants a look on a real terminal (§6.1). |
 

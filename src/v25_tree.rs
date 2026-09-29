@@ -561,10 +561,16 @@ fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
         bar.glyph()
     ));
 
-    // A reply sits one column right of the bar; the junction's arm is the
-    // horizontal step.
+    // A reply sits one column right of the bar. The junction's arm already
+    // points right, so the step carries a grey `╸` that continues that
+    // horizontal into the text and hooks up to the row above: with the
+    // reply indent down to a single column, the mark is what keeps replies
+    // scannable.
     if assistant {
-        out.push(' ');
+        out.push_str(&format!(
+            "\x1b[38;2;{};{};{}m\u{2578}\x1b[0m",
+            CONNECTOR_RGB.0, CONNECTOR_RGB.1, CONNECTOR_RGB.2,
+        ));
     }
     out
 }
@@ -2565,11 +2571,11 @@ mod tests {
         let rows = plain_rows(&resp);
         for (id, want) in [
             ("u1", "┃"),
-            ("a1", "┣ "),
+            ("a1", "┣╸"),
             ("u2", "┃"),
-            ("a2", "┣ "),
+            ("a2", "┣╸"),
             ("u3", "┃"),
-            ("a3", "┗ "),
+            ("a3", "┗╸"),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -2594,7 +2600,7 @@ mod tests {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
                 assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "┃");
-                assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "┗ ");
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "┗╸");
             }
             other => panic!(
                 "expected Continue, got {:?}",
@@ -2634,7 +2640,7 @@ mod tests {
                 assert_eq!(plan.rows.len(), 6);
                 // Main line all the way: the bar is at column 0 for every
                 // row, and only the final reply turns the ladder off.
-                let expected = ["┃", "┣ ", "┃", "┣ ", "┃", "┗ "];
+                let expected = ["┃", "┣╸", "┃", "┣╸", "┃", "┗╸"];
                 for (i, want) in expected.iter().enumerate() {
                     let got = prefix_of(&strip_sgr(&plan.rows[i].0));
                     assert_eq!(got, *want, "row {} prefix: {got:?}", i);
@@ -2801,9 +2807,9 @@ mod tests {
                 // open connectors and step right.
                 let expected = [
                     "┃",    // u1
-                    "┣ ",   // a1
+                    "┣╸",   // a1
                     "┃",    // u2
-                    "┣ ",   // a2
+                    "┣╸",   // a2
                     "┃",    // mc1, a non-reply marker on the main line
                     "┗━━┓", // mc2, spur
                     "┗━━┓", // mc3, spur
@@ -2865,10 +2871,10 @@ mod tests {
         // main line, and the reply after it still gets its junction.
         for (id, want) in [
             ("u1", "┃"),
-            ("a1", "┣ "),
+            ("a1", "┣╸"),
             ("mc1", "┃"),
             ("u2", "┃"),
-            ("a2", "┗ "),
+            ("a2", "┗╸"),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -2979,7 +2985,7 @@ mod tests {
         // both rows are still the main line, and the reply still gets the
         // junction arm.
         assert_eq!(prefix_of(&plain_of(&rows, "u1")), "┃");
-        assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "┗ ");
+        assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "┗╸");
     }
 
     // --- Spine indentation (doc/tree_indent_refinement.md) ---
@@ -3212,15 +3218,15 @@ mod tests {
         let rows = plain_rows(&resp);
         for (id, want) in [
             ("u1", "┃"),
-            ("a1", "┣ "),
+            ("a1", "┣╸"),
             ("x1", "┗━━┓"),   // spur: connector from the bar above
-            ("x2a", "   ┗ "), // …its reply turns the ladder off
+            ("x2a", "   ┗╸"), // …its reply turns the ladder off
             ("u2", "┃"),
             ("y1", "┗━━┓"),
-            ("y2", "   ┗ "),
-            ("a2", "┣ "),
+            ("y2", "   ┗╸"),
+            ("a2", "┣╸"),
             ("u3", "┃"),
-            ("a3", "┗ "),
+            ("a3", "┗╸"),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -3318,7 +3324,7 @@ mod tests {
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "a2")),
-            "   ┗ ",
+            "   ┗╸",
             "spur keeps the reply cue"
         );
     }
@@ -3567,15 +3573,15 @@ mod tests {
             .collect();
         let want = vec![
             "┃",
-            "┣ ",
+            "┣╸",
             "┗━━┓",
-            "   ┗ ",
+            "   ┗╸",
             "┃",
             "┗━━┓",
-            "   ┗ ",
-            "┣ ",
+            "   ┗╸",
+            "┣╸",
             "┃",
-            "┗ ",
+            "┗╸",
         ];
         assert_eq!(got, want, "{plan:?}");
         // The wash must survive to the terminal too, not just the glyph —
