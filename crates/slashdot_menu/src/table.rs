@@ -327,6 +327,76 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(1)
 }
 
+/// Split `s` into renderable units: `(byte length, visible width,
+/// is_escape)`. An SGR sequence is one atomic unit of width 0, so
+/// truncation can never cut a styled run in half.
+fn style_units(s: &str) -> Vec<(usize, usize, bool)> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let (off, c) = chars[i];
+        if c == '\x1b' {
+            let mut j = i + 1;
+            while j < chars.len() && !chars[j].1.is_ascii_alphabetic() {
+                j += 1;
+            }
+            let end = if j < chars.len() {
+                chars[j].0 + chars[j].1.len_utf8()
+            } else {
+                s.len()
+            };
+            out.push((end - off, 0, true));
+            i = j + 1;
+        } else {
+            out.push((c.len_utf8(), char_width(c), false));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Keep the first (`from_end == false`) or last `visible` display columns
+/// of `s`, ANSI-aware: escape sequences ride along without consuming
+/// width, and a sequence is never cut in half. `fit` re-emits the reset
+/// once the ellipsis is composed — that is where the style would
+/// otherwise bleed out of the row.
+fn keep_visible(s: &str, visible: usize, from_end: bool) -> String {
+    let units = style_units(s);
+    let mut w = 0;
+    if from_end {
+        let mut start = units.len();
+        while start > 0 {
+            let (_, cw, _) = units[start - 1];
+            if w + cw > visible {
+                break;
+            }
+            w += cw;
+            start -= 1;
+        }
+        let mut off = 0;
+        for (len, _, _) in units.iter().take(start) {
+            off += len;
+        }
+        s[off..].to_string()
+    } else {
+        let mut end = 0;
+        while end < units.len() {
+            let (_, cw, _) = units[end];
+            if w + cw > visible {
+                break;
+            }
+            w += cw;
+            end += 1;
+        }
+        let mut off = 0;
+        for (len, _, _) in units.iter().take(end) {
+            off += len;
+        }
+        s[..off].to_string()
+    }
+}
+
 /// Pad `s` (already <= `width` visible) to `width` per `align`.
 fn pad(s: &str, width: usize, align: Align) -> String {
     let w = display_width(s);
@@ -345,34 +415,16 @@ fn pad(s: &str, width: usize, align: Align) -> String {
     }
 }
 
-/// Keep the first `visible` display columns of `s` (char-safe).
+/// Keep the first `visible` display columns of `s` (char-safe,
+/// ANSI-aware).
 fn keep_first(s: &str, visible: usize) -> String {
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = char_width(c);
-        if w + cw > visible {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out
+    keep_visible(s, visible, false)
 }
 
-/// Keep the last `visible` display columns of `s` (char-safe).
+/// Keep the last `visible` display columns of `s` (char-safe,
+/// ANSI-aware).
 fn keep_last(s: &str, visible: usize) -> String {
-    let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars().rev() {
-        let cw = char_width(c);
-        if w + cw > visible {
-            break;
-        }
-        out.insert(0, c);
-        w += cw;
-    }
-    out
+    keep_visible(s, visible, true)
 }
 
 /// Fit `cell` into `width` visible columns, ellipsizing on overflow. The
@@ -383,7 +435,7 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
         return pad(cell, width, align);
     }
     let content_w = width.saturating_sub(1).max(1);
-    let with_ell = match align {
+    let mut with_ell = match align {
         Align::Left => format!("{}{}", keep_first(cell, content_w), ellipsis),
         Align::Right => format!("{}{}", ellipsis, keep_last(cell, content_w)),
         Align::Center => {
@@ -392,6 +444,11 @@ fn fit(cell: &str, width: usize, align: Align, ellipsis: char) -> String {
             format!("{}{}{}", keep_first(cell, l), ellipsis, keep_last(cell, r))
         }
     };
+    // A styled cell truncated mid-run would bleed its SGR past the row
+    // (and past the terminal line). Close the style after the ellipsis.
+    if cell.contains('\x1b') && !with_ell.ends_with("\x1b[0m") {
+        with_ell.push_str("\x1b[0m");
+    }
     // with_ell is exactly `width` visible columns wide; pad is a no-op.
     pad(&with_ell, width, align)
 }
@@ -1076,5 +1133,67 @@ mod tests {
                 "column A must be blank on continuation lines"
             );
         }
+    }
+
+    /// A styled cell that overflows the column must keep its reset: the
+    /// old char-based truncation cut the sequence in half, so the
+    /// highlight bled past the row (and lost ~7 columns of text to the
+    /// escape bytes being counted as visible).
+    #[test]
+    fn styled_cell_truncation_keeps_reset_and_full_budget() {
+        let styled = "\x1b[1;35mhello world this is a long message\x1b[0m";
+        let mut t = Table::new(&[""])
+            .with_aligns(&[Align::Left])
+            .with_min_widths(&[20])
+            .with_priorities(&[3])
+            .set_gap(1);
+        t.add_row(&[styled.to_string()]);
+        let out = t.render(20);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].trim_end().ends_with("\x1b[0m"),
+            "truncated styled cell must be reset: {:?}",
+            out[0]
+        );
+        // The escape bytes must not eat the text budget: 19 columns of
+        // text + the ellipsis.
+        assert_eq!(
+            display_width(&out[0]),
+            20,
+            "styled cell must still fill its column: {:?}",
+            out[0]
+        );
+        assert!(
+            out[0].contains("hello world this "),
+            "truncation must keep the full column budget: {:?}",
+            out[0]
+        );
+    }
+
+    /// Unstyled cells keep byte-identical truncation behaviour.
+    #[test]
+    fn unstyled_truncation_is_unchanged() {
+        assert_eq!(keep_first("hello world", 5), "hello");
+        assert_eq!(keep_last("hello world", 5), "world");
+        // Escape sequences occupy no width.
+        let styled = "\x1b[1;35mhello\x1b[0m";
+        assert_eq!(display_width(&keep_first(styled, 5)), 5);
+        assert_eq!(display_width(&keep_last(styled, 5)), 5);
+    }
+
+    /// Right-aligned styled cells truncate from the left without cutting
+    /// an escape sequence.
+    #[test]
+    fn styled_cell_right_align_truncation() {
+        let styled = "\x1b[1;35mhello world this is a long message\x1b[0m";
+        let mut t = Table::new(&[""])
+            .with_aligns(&[Align::Right])
+            .with_min_widths(&[20])
+            .with_priorities(&[3])
+            .set_gap(1);
+        t.add_row(&[styled.to_string()]);
+        let out = t.render(20);
+        assert_eq!(display_width(&out[0]), 20, "{:?}", out[0]);
+        assert!(out[0].ends_with("age\x1b[0m"), "{:?}", out[0]);
     }
 }

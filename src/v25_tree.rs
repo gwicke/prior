@@ -3146,6 +3146,61 @@ mod tests {
         assert_eq!(indents, vec![0, 2, 4, 6, 0, 4, 6, 2, 0, 2], "{plan:?}");
     }
 
+    /// Guard for the highlight path (found while scoping the follow-up
+    /// visual work). Today the fuzzy path pre-truncates via
+    /// `extract_snippet`, so `Table::fit` never sees an overflowing styled
+    /// cell and this passes either way — it is here so that stays true,
+    /// and so the follow-up colour work (which *will* put SGR in cells
+    /// the snippet path can see) has a tripwire. The `fit`-level
+    /// truncation bug and its fix are covered in `slashdot_menu::table`.
+    #[test]
+    fn fuzzy_filtered_row_is_not_cut_inside_a_style() {
+        const OPEN: &str = "\x1b[1;35m";
+        let tree = vec![node(
+            make_entry(
+                "u1",
+                None,
+                "user",
+                "please refactor the tree indentation logic today",
+            ),
+            vec![node(
+                make_entry(
+                    "a1",
+                    Some("u1"),
+                    "assistant",
+                    "done, the spine rule is in place",
+                ),
+                vec![],
+            )],
+        )];
+        let app_state = app_state_with_tree(tree);
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+        // Narrow terminal ⇒ the description column must ellipsize.
+        let (plan, _) = expect_continue(futures::executor::block_on(handle.eval_prompt(
+            "tree refactor",
+            HostKey::None,
+            40,
+        )));
+        let styled: Vec<&String> = plan
+            .rows
+            .iter()
+            .map(|r| &r.0)
+            .filter(|text| text.contains('\x1b'))
+            .collect();
+        assert!(!styled.is_empty(), "expected a highlighted row: {plan:?}");
+        for text in styled {
+            assert!(
+                !text.trim_end().ends_with(OPEN),
+                "row was cut inside the highlight, so the style bleeds: {text:?}"
+            );
+            assert!(
+                text.contains("the tree indentation"),
+                "escape bytes must not eat the column budget: {text:?}"
+            );
+        }
+    }
+
     // --- drill_rewrite tests ---
 
     #[test]
