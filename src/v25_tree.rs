@@ -202,7 +202,17 @@ fn find_entry<'a>(nodes: &'a [SessionTreeNode], id: &str) -> Option<&'a SessionT
 /// display, fuzzy rank, filters, and `header()` all read it (design:
 /// "header() → entry detail from the same cached row data").
 struct FlatRow {
-    indent: usize,
+    /// The rendered tree prefix: connector + bar cell + reply step
+    /// (doc/tree_visual_affordances.md §5). Carries its own SGR, so it is
+    /// kept out of `desc` — the fuzzy haystack and `header()` read that.
+    prefix: String,
+    /// Spur level; `0` = main line. Replaces the old space-padding indent.
+    depth: usize,
+    /// Branch ordinal for colour: `0` = the spine (main line), `1..n` = the
+    /// n-th spur of the parent in descending-height order.
+    branch: u8,
+    /// First visible row of a spur — the row that draws the connector.
+    spur_start: bool,
     /// Full row text (markers + body, newlines kept). The listing's
     /// wrap-disabled table flattens it to one line for display.
     desc: String,
@@ -336,38 +346,29 @@ fn visible_terminals(
     terminals
 }
 
-/// Columns added when a node hangs off the main line instead of continuing
-/// it. Same scale as the pre-refinement fork step, so a one-level spur
-/// looks exactly like a fork did.
-const SPUR_STEP: usize = 4;
-
-/// Entry IDs that continue their parent's main line: for every node, the
-/// child with the deepest visible path downward, ties going to the newest
-/// branch — the same policy applied recursively at every level, so the
-/// leftmost branch at each fork is the longest one and spurs shorten the
-/// further right you go. One ID per forking node; empty for a purely
-/// linear tree.
+/// Each node's children ranked by `(height, write order)`, deepest first.
 ///
-/// Height is the number of visible rows on the longest downward path,
-/// measured over the *visible* projection: invisible entries (tool
-/// results, tool-call-only assistant segments) must not make a spur look
-/// deep. Ties are broken by slice position, which IS recency — siblings
-/// are stored in write order (`SessionIndex::children`), so a later child
-/// is the newer branch. Heights and slice positions are both distinct
-/// per sibling, so the key is a total order and the layout is a pure
-/// function of the tree.
+/// `ranked[node][0]` is therefore the **spine** — the child that continues
+/// the parent's line — and the rest are spurs, tallest first, which is the
+/// order hues are handed out in (§6.1). Heights are measured over the
+/// *visible* projection: invisible entries (tool results, tool-call-only
+/// assistant segments) must not make a spur look deep.
+///
+/// A purely linear tree ranks every child first, so every child is a spine.
 ///
 /// Iterative post-order — a 1000-entry linear session overflows recursion
-/// (same constraint as `visible_terminals`).
-fn spine_children<'a>(
+/// (same constraint as `visible_terminals`). Write positions are distinct,
+/// so the ranking is a total order and the layout is a pure function of the
+/// tree.
+fn ranked_children<'a>(
     nodes: &'a [SessionTreeNode],
     labels: &HashMap<String, String>,
-) -> HashSet<&'a str> {
+) -> HashMap<&'a str, Vec<&'a str>> {
     let visible = |n: &SessionTreeNode| -> bool {
         !entry_display_label_ext(&n.entry, n.label.as_deref(), labels).is_empty()
     };
     let mut height: HashMap<&'a str, usize> = HashMap::new();
-    let mut spine: HashSet<&'a str> = HashSet::new();
+    let mut ranked: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
 
     let mut stack: Vec<(&'a SessionTreeNode, bool)> = Vec::new();
     for n in nodes.iter().rev() {
@@ -383,95 +384,299 @@ fn spine_children<'a>(
         }
         let vis = usize::from(visible(node));
         let mut h = vis;
-        let mut best: Option<(usize, usize, &'a str)> = None;
+        let mut children: Vec<(usize, usize, &'a str)> = Vec::with_capacity(node.children.len());
         for (i, child) in node.children.iter().enumerate() {
             let id = child.entry.id.as_str();
             let ch = height.get(id).copied().unwrap_or(0);
             h = h.max(vis + ch);
-            let key = (ch, i);
-            if best.is_none_or(|(bh, bi, _)| key > (bh, bi)) {
-                best = Some((ch, i, id));
-            }
+            children.push((ch, i, id));
         }
+        // Descending, so index 0 is the spine; ties in height go to the
+        // newer (later-written) branch, as in the spine rule.
+        children.sort_by(|a, b| b.cmp(a));
         height.insert(node.entry.id.as_str(), h);
-        if let Some((_, _, id)) = best {
-            spine.insert(id);
+        ranked.insert(
+            node.entry.id.as_str(),
+            children.into_iter().map(|(_, _, id)| id).collect(),
+        );
+    }
+    ranked
+}
+
+// ---------------------------------------------------------------------------
+// Row prefix (doc/tree_visual_affordances.md §5-§6)
+// ---------------------------------------------------------------------------
+//
+// The prefix is pure presentation: depth, branch ordinal and the glyph are
+// decided by the data layer, and this section turns them into cells. It
+// lives here for now so `/tree` is reviewable end to end; the generic
+// gutter work owns this in the end, and `row_prefix` is the seam — it is
+// the only function that knows about glyphs, colour or column arithmetic.
+
+/// Columns per spur level. The bar occupies the *last* column of its
+/// branch's indent block, so the text column is exactly where the
+/// space-only layout put it: `text_col(d) = d * SPUR_STEP`.
+const SPUR_STEP: usize = 4;
+
+/// Column of a branch's bar. The main line has no indent, so its bar is at
+/// column 0; a spur's bar is the last column of its indent.
+fn bar_col(depth: usize) -> usize {
+    if depth == 0 {
+        0
+    } else {
+        depth * SPUR_STEP - 1
+    }
+}
+
+/// What the bar cell draws. The vertical is per *branch*: it runs through
+/// the branch's rows and stops at its end, so a spur that forks in a new
+/// turn still shows one continuous pipe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bar {
+    /// `│` — the branch continues below.
+    Line,
+    /// `├` — a reply whose branch continues below (the arm points at it).
+    Reply,
+    /// `└` — a reply on the branch's last row: the ladder turns off.
+    ReplyEnd,
+    /// `╵` — a non-reply on the branch's last row: the pipe ends.
+    End,
+    /// `┐` — a spur's first visible row: the connector arrives from the
+    /// left and turns down into this branch.
+    SpurStart,
+}
+
+impl Bar {
+    fn glyph(self) -> char {
+        match self {
+            Bar::Line => '\u{2502}',      // │
+            Bar::Reply => '\u{251c}',     // ├
+            Bar::ReplyEnd => '\u{2514}',  // └
+            Bar::End => '\u{2575}',       // ╵
+            Bar::SpurStart => '\u{2510}', // ┐
         }
     }
-    spine
+}
+
+/// Main-line anchor: warm orange, fully saturated. Red would read as an
+/// error in most terminals; orange carries the same warmth without it.
+const ANCHOR_RGB: (u8, u8, u8) = (0xf9, 0x73, 0x16);
+
+/// Spur hues, in the order they are handed out. Starts just after the
+/// anchor and warms back up at the end, so the common two-or-three-spur
+/// case gets warm, clearly distinct hues.
+const SPUR_RGB: [(u8, u8, u8); 8] = [
+    (0xf4, 0x72, 0xb6), // rose
+    (0xa7, 0x8b, 0xfa), // violet
+    (0x60, 0xa5, 0xfa), // azure
+    (0x22, 0xd3, 0xee), // cyan
+    (0x2d, 0xd4, 0xbf), // teal
+    (0x6e, 0xe7, 0xa8), // green
+    (0xa3, 0xe6, 0x35), // lime
+    (0xfb, 0xbf, 0x24), // amber
+];
+
+/// Unselected row background (`48;5;235`) — the wash fades toward it.
+const ROW_BG_RGB: (u8, u8, u8) = (0x26, 0x26, 0x26);
+
+/// Connector ink: neutral and dim, never a branch hue. Weight (light
+/// `└`/`─` against the heavy verticals) and ink together keep two adjacent
+/// sub-trees from reading as one pipe.
+const CONNECTOR_RGB: (u8, u8, u8) = (0x6e, 0x6e, 0x6e);
+
+/// Wash strength by spur depth. The main line is the most saturated thing
+/// on screen (it is the anchor); each level in recedes. The ink stays
+/// black, so the lines remain crisp however far out a branch is.
+const FADE: [f64; 6] = [1.00, 0.75, 0.58, 0.45, 0.36, 0.30];
+
+fn fade_at(depth: usize) -> f64 {
+    *FADE.get(depth).unwrap_or_else(|| FADE.last().unwrap())
+}
+
+/// Blend `c` toward the row background by `f` (1.0 = untouched).
+fn blend(c: (u8, u8, u8), f: f64) -> (u8, u8, u8) {
+    let mix = |from: u8, to: u8| -> u8 {
+        (to as f64 + (from as f64 - to as f64) * f)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (
+        mix(c.0, ROW_BG_RGB.0),
+        mix(c.1, ROW_BG_RGB.1),
+        mix(c.2, ROW_BG_RGB.2),
+    )
+}
+
+/// The hue for a branch ordinal: 0 is the anchor, `n` the n-th spur in
+/// cycle order.
+fn branch_rgb(branch: u8) -> (u8, u8, u8) {
+    if branch == 0 {
+        ANCHOR_RGB
+    } else {
+        SPUR_RGB[(branch as usize - 1) % SPUR_RGB.len()]
+    }
+}
+
+/// Build the prefix for one row: the connector (on a spur's first visible
+/// row), the bar cell, and the assistant step.
+///
+/// The spur connector is not decorative: pre-order DFS guarantees a node's
+/// first child is emitted on the row immediately below it, so the row above
+/// a spur's first row *is* its parent.
+fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
+    let bar_at = bar_col(depth);
+    let mut out = String::new();
+
+    // Connector: an elbow in the parent's bar column, a run to our bar.
+    if bar == Bar::SpurStart {
+        let parent_at = bar_col(depth.saturating_sub(1));
+        out.push_str(&" ".repeat(parent_at));
+        let run = bar_at.saturating_sub(parent_at + 1);
+        out.push_str(&format!(
+            "\x1b[38;2;{};{};{}m\u{2570}{}\x1b[0m",
+            CONNECTOR_RGB.0,
+            CONNECTOR_RGB.1,
+            CONNECTOR_RGB.2,
+            "\u{2500}".repeat(run),
+        ));
+    } else {
+        out.push_str(&" ".repeat(bar_at));
+    }
+
+    // The bar cell: wash (hue faded by depth) with black ink, so the wash
+    // recedes while the line stays legible.
+    let wash = blend(branch_rgb(branch), fade_at(depth));
+    out.push_str(&format!(
+        "\x1b[48;2;{};{};{}m\x1b[38;2;0;0;0m{}\x1b[0m",
+        wash.0,
+        wash.1,
+        wash.2,
+        bar.glyph()
+    ));
+
+    // A reply sits one column right of the bar; the junction's arm is the
+    // horizontal step.
+    if assistant {
+        out.push(' ');
+    }
+    out
 }
 
 /// Recursively flatten the tree into rows.
 fn flatten_turns(
     nodes: &[SessionTreeNode],
-    indent: usize,
     leaf_id: Option<&str>,
     active_path: &HashSet<String>,
     labels: &HashMap<String, String>,
     terminals: &HashSet<String>,
     out: &mut Vec<FlatRow>,
 ) {
-    let spine = spine_children(nodes, labels);
-    // The spine child continues the parent's line; every other child is a
-    // spur and steps right. Single-child nodes are always the spine, so a
-    // linear chain stays at column 0 regardless of length.
-    let child_indent = |child: &SessionTreeNode, cur: usize| {
-        if spine.contains(child.entry.id.as_str()) {
-            cur
-        } else {
-            cur + SPUR_STEP
-        }
-    };
+    let ranked = ranked_children(nodes, labels);
+    // Global spur counter: hues are handed out once per spur, tallest
+    // first within each fork, so two different level-1 excursions get
+    // different colours (a per-parent ordinal would make every single-spur
+    // branch the same colour, which says nothing about identity). Starts at
+    // 1 — 0 is the spine/anchor.
+    let mut next_spur: u8 = 1;
+
+    // A frame carries the branch state of the row it will emit:
+    // `(node, depth, branch, spur_start)`. `spur_start` is set on a spur's
+    // first child and *propagated* through invisible nodes to the first
+    // visible row of that spur, so a marker never lands on a hidden entry.
+    type Frame<'a> = (&'a SessionTreeNode, usize, u8, bool);
 
     // Iterative DFS to avoid stack overflow on deep linear sessions.
     // Push root nodes in reverse so the first sibling is processed first.
-    let mut stack: Vec<(&SessionTreeNode, usize)> = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
     for node in nodes.iter().rev() {
-        stack.push((node, indent));
+        stack.push((node, 0, 0, false));
     }
 
-    while let Some((node, cur_indent)) = stack.pop() {
+    while let Some((node, depth, branch, spur_start)) = stack.pop() {
         let label = entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
+
+        let mut child_frames = |pending: bool| -> Vec<Frame> {
+            // Hand out hues in the node's ranked order: rank 0 is the spine
+            // (branch 0), the rest take the next colours.
+            let order = ranked
+                .get(node.entry.id.as_str())
+                .map(|ids| ids.as_slice())
+                .unwrap_or(&[]);
+            // Returns (branch, is_spur). "Spur" is a *rank*, not a colour:
+            // a spine inside a spur inherits a non-zero branch but does not
+            // step right and does not open a new connector.
+            let mut branch_of = |child: &SessionTreeNode| -> (u8, bool) {
+                match order.iter().position(|id| *id == child.entry.id.as_str()) {
+                    // The spine continues the current branch, so it
+                    // inherits its hue — a spur's replies are the same
+                    // colour as the spur's first row.
+                    None | Some(0) => (branch, false),
+                    Some(_) => {
+                        let n = next_spur;
+                        next_spur = next_spur.saturating_add(1);
+                        (n, true)
+                    }
+                }
+            };
+            let mut frames: Vec<Frame> = Vec::with_capacity(node.children.len());
+            for (i, child) in node.children.iter().enumerate() {
+                let (b, spur) = branch_of(child);
+                // A spur's own first row is its start. `pending` (this
+                // node's flag) is only alive because the node is invisible
+                // and emitted nothing, and it travels to the *first* child
+                // — the only one whose subtree can emit the next row.
+                frames.push((
+                    child,
+                    if spur { depth + 1 } else { depth },
+                    b,
+                    spur || (pending && i == 0),
+                ));
+            }
+            frames
+        };
 
         if label.is_empty() {
             // Meta entry: skip visual row but descend into children. The
             // spine rule applies here too — a meta entry can be a fork
             // point even though it has no row of its own.
-            for child in node.children.iter().rev() {
-                stack.push((child, child_indent(child, cur_indent)));
-            }
+            stack.extend(child_frames(spur_start).into_iter().rev());
             continue;
         }
 
-        // Indent rule: assistant → +2, everything else → base indent.
-        let row_indent = if is_assistant(&node.entry) {
-            cur_indent + 2
+        let assistant = is_assistant(&node.entry);
+        // The bar glyph (§5.1): the vertical runs per branch, so the
+        // ladder turns off / the pipe ends on the branch's last row, not
+        // at the end of each turn.
+        let bar = if spur_start {
+            Bar::SpurStart
+        } else if terminals.contains(&node.entry.id) {
+            if assistant {
+                Bar::ReplyEnd
+            } else {
+                Bar::End
+            }
+        } else if assistant {
+            Bar::Reply
         } else {
-            cur_indent
+            Bar::Line
         };
 
-        let is_active = active_path.contains(&node.entry.id);
-        let is_current = leaf_id == Some(node.entry.id.as_str());
-        let role = entry_role(&node.entry);
-        let desc = entry_row_desc(&node.entry, node.label.as_deref(), labels);
-        let timestamp = node.entry.timestamp.clone();
-        let is_terminal = terminals.contains(&node.entry.id);
-
         out.push(FlatRow {
-            indent: row_indent,
-            desc,
+            prefix: row_prefix(depth, branch, bar, assistant),
+            depth,
+            branch,
+            spur_start,
+            desc: entry_row_desc(&node.entry, node.label.as_deref(), labels),
             entry_id: node.entry.id.clone(),
-            on_active_path: is_active,
-            is_current,
-            role,
-            timestamp,
-            is_terminal,
+            on_active_path: active_path.contains(&node.entry.id),
+            is_current: leaf_id == Some(node.entry.id.as_str()),
+            role: entry_role(&node.entry),
+            timestamp: node.entry.timestamp.clone(),
+            is_terminal: terminals.contains(&node.entry.id),
         });
 
         // Push children in reverse so first child is processed first.
-        for child in node.children.iter().rev() {
-            stack.push((child, child_indent(child, cur_indent)));
-        }
+        stack.extend(child_frames(false).into_iter().rev());
     }
 }
 
@@ -558,9 +763,18 @@ pub fn tree_listing_columns() -> Vec<ColumnDef> {
 pub fn tree_fields() -> Vec<FieldSpec> {
     let mut tags = FieldSpec::new("tags", false);
     tags.description = Some("leaf = branch endpoint".to_string());
+    let mut depth = FieldSpec::new("depth", false);
+    depth.description = Some("spur level (0 = main line)".to_string());
+    let mut branch = FieldSpec::new("branch", false);
+    branch.description = Some("colour ordinal: 0 = main line".to_string());
+    let mut spur_start = FieldSpec::new("spur_start", false);
+    spur_start.description = Some("1 = first row of a sub-tree".to_string());
     vec![
         FieldSpec::new("role", false),
         FieldSpec::new("timestamp", false),
+        depth,
+        branch,
+        spur_start,
         tags,
     ]
 }
@@ -683,7 +897,6 @@ impl SlashDotNode for TreeListNode {
         let mut flat = Vec::new();
         flatten_turns(
             &tree_rc,
-            0,
             leaf.as_deref(),
             &active_path,
             &labels,
@@ -694,11 +907,20 @@ impl SlashDotNode for TreeListNode {
         let rows: Vec<Row> = flat
             .iter()
             .map(|r| {
-                let padded = format!("{:indent$}{}", "", r.desc, indent = r.indent);
+                // The listing cell is prefix + text. It carries SGR, which
+                // is why `desc` stays bare: it is the fuzzy haystack
+                // (cursor.rs) and the `header()` source, neither of which
+                // wants escape bytes or box-drawing glyphs in it.
                 let mut row = Row::new(r.entry_id.clone())
-                    .desc(padded)
+                    .desc(format!("{}{}", r.prefix, r.desc))
+                    .field("text", Value::Str(r.desc.clone()))
+                    .field("depth", Value::Num(r.depth as f64))
+                    .field("branch", Value::Num(r.branch as f64))
                     .field("role", Value::Str(r.role.clone()))
                     .field("timestamp", Value::Str(r.timestamp.clone()));
+                if r.spur_start {
+                    row = row.field("spur_start", Value::Str("1".into()));
+                }
                 if r.on_active_path {
                     row = row.field("on_path", Value::Str("1".into()));
                 }
@@ -770,8 +992,19 @@ impl SlashDotNode for TreeListNode {
         };
         let role = field_str("role");
         let ts = field_str("timestamp");
-        // Full text incl. markers; drop the tree indent for display.
-        let body = row.description.as_deref().unwrap_or_default().trim_start();
+        // The bare text (no prefix): the listing cell is `prefix + text`,
+        // and the header shows only the text.
+        let body: String = row
+            .fields
+            .iter()
+            .find(|(k, _)| k == "text")
+            .and_then(|(_, v)| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .or_else(|| row.description.clone())
+            .unwrap_or_default();
+        let body = body.as_str();
         let tw = render_ctx.term_width.max(1).saturating_sub(2);
         match role.as_str() {
             "compaction" => {
@@ -2314,36 +2547,31 @@ mod tests {
         let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         assert_eq!(resp.rows.len(), 6, "should have 6 visible entries");
 
-        let mut flat = Vec::new();
-        for row in resp.rows.iter() {
-            let desc = row.description.clone().unwrap_or_default();
-            let indent = desc.len() - desc.trim_start().len();
-            flat.push((row.id.clone(), indent));
-        }
-
-        // u1=0, a1=2, u2=0, a2=2, u3=0, a3=2
-        let expected = vec![
-            ("u1", 0),
-            ("a1", 2),
-            ("u2", 0),
-            ("a2", 2),
-            ("u3", 0),
-            ("a3", 2),
-        ];
-        assert_eq!(flat.len(), expected.len());
-        for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
-            assert_eq!(flat[i].0, *exp_id, "row {} id", i);
-            assert_eq!(
-                flat[i].1, *exp_indent,
-                "row {} ({}) indent: expected {}, got {}",
-                i, exp_id, exp_indent, flat[i].1
-            );
+        // All on the main line, so depth 0 and the bar at column 0; the
+        // last reply turns the ladder off (doc/tree_visual_affordances.md
+        // §5.1: the vertical runs per branch, ending at its last row).
+        assert!(
+            row_depths(&resp).iter().all(|(_, d)| *d == 0),
+            "a linear session is all main line: {:?}",
+            row_depths(&resp)
+        );
+        let rows = plain_rows(&resp);
+        for (id, want) in [
+            ("u1", "│"),
+            ("a1", "├ "),
+            ("u2", "│"),
+            ("a2", "├ "),
+            ("u3", "│"),
+            ("a3", "└ "),
+        ] {
+            assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
     }
 
     #[test]
     fn linear_session_indent_render_plan() {
-        // Verify the full render plan preserves indent spacing.
+        // The prefix must survive the whole pipeline into the render plan,
+        // SGR and all.
         let tree = vec![node(
             make_entry("u1", None, "user", "hello"),
             vec![node(
@@ -2358,20 +2586,8 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
-                let u1_text = &plan.rows[0].0;
-                let a1_text = &plan.rows[1].0;
-                let u1_indent = u1_text.len() - u1_text.trim_start().len();
-                let a1_indent = a1_text.len() - a1_text.trim_start().len();
-                assert_eq!(
-                    u1_indent, 0,
-                    "user row should have no indent: {:?}",
-                    u1_text
-                );
-                assert_eq!(
-                    a1_indent, 2,
-                    "assistant row should have 2-space indent: {:?}",
-                    a1_text
-                );
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "│");
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "└ ");
             }
             other => panic!(
                 "expected Continue, got {:?}",
@@ -2409,22 +2625,12 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 6);
-                let expected = vec![
-                    ("u1", 0),
-                    ("a1", 2),
-                    ("u2", 0),
-                    ("a2", 2),
-                    ("u3", 0),
-                    ("a3", 2),
-                ];
-                for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
-                    let text = &plan.rows[i].0;
-                    let indent = text.len() - text.trim_start().len();
-                    assert_eq!(
-                        indent, *exp_indent,
-                        "row {} ({}) indent wrong in rendered output: {:?}",
-                        i, exp_id, text
-                    );
+                // Main line all the way: the bar is at column 0 for every
+                // row, and only the final reply turns the ladder off.
+                let expected = ["│", "├ ", "│", "├ ", "│", "└ "];
+                for (i, want) in expected.iter().enumerate() {
+                    let got = prefix_of(&strip_sgr(&plan.rows[i].0));
+                    assert_eq!(got, *want, "row {} prefix: {got:?}", i);
                 }
             }
             other => panic!(
@@ -2581,29 +2787,24 @@ mod tests {
                     eprintln!("  row {}: indent={} {:?}", i, indent, row.0);
                 }
                 assert_eq!(plan.rows.len(), 8);
-                // Spine rule (doc/tree_indent_refinement.md): one child of a
-                // fork continues the parent's line at the same column, the
-                // rest are spurs (+SPUR_STEP). mc1's three children are all
-                // leaves, so heights tie and the recency tie-break picks the
-                // newest one (mc4) for the margin; mc2/mc3 step right.
-                let expected = vec![
-                    ("u1", 0),
-                    ("a1", 2),
-                    ("u2", 0),
-                    ("a2", 2),
-                    ("mc1", 0), // fork point: own column, not a boundary reset
-                    ("mc2", 4), // spur
-                    ("mc3", 4), // spur
-                    ("mc4", 0), // spine: newest of three equal-height children
+                // Spine rule: one child of a fork continues the parent's
+                // line at the same column, the rest are spurs. mc1's three
+                // children are all leaves, so heights tie and the recency
+                // tie-break picks the newest (mc4) for the margin; mc2/mc3
+                // open connectors and step right.
+                let expected = [
+                    "│",    // u1
+                    "├ ",   // a1
+                    "│",    // u2
+                    "├ ",   // a2
+                    "│",    // mc1, a non-reply marker on the main line
+                    "╰──┐", // mc2, spur
+                    "╰──┐", // mc3, spur
+                    "╵",    // mc4, the spine, and the branch's last row
                 ];
-                for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
-                    let text = &plan.rows[i].0;
-                    let indent = text.len() - text.trim_start().len();
-                    assert_eq!(
-                        indent, *exp_indent,
-                        "row {} ({}) indent wrong: {:?}",
-                        i, exp_id, text
-                    );
+                for (i, want) in expected.iter().enumerate() {
+                    let got = prefix_of(&strip_sgr(&plan.rows[i].0));
+                    assert_eq!(got, *want, "row {} prefix: {got:?}", i);
                 }
             }
             other => panic!(
@@ -2652,34 +2853,17 @@ mod tests {
             args: Default::default(),
         };
         let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
-
-        let mut flat = Vec::new();
-        for row in resp.rows.iter() {
-            let desc = row.description.clone().unwrap_or_default();
-            let indent = desc.len() - desc.trim_start().len();
-            flat.push((row.id.clone(), indent));
-        }
-
-        let expected = vec![
-            ("u1", 0),  // user
-            ("a1", 2),  // assistant (+2)
-            ("mc1", 0), // model change: back to base
-            ("u2", 0),  // user: base indent
-            ("a2", 2),  // assistant (+2)
-        ];
-        assert_eq!(
-            flat.len(),
-            expected.len(),
-            "rows: {:?}",
-            flat.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
-        );
-        for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
-            assert_eq!(flat[i].0, *exp_id, "row {} id", i);
-            assert_eq!(
-                flat[i].1, *exp_indent,
-                "row {} ({}) indent: expected {}, got {}",
-                i, exp_id, exp_indent, flat[i].1
-            );
+        let rows = plain_rows(&resp);
+        // A model-change marker is a non-reply row: it keeps the bar on the
+        // main line, and the reply after it still gets its junction.
+        for (id, want) in [
+            ("u1", "│"),
+            ("a1", "├ "),
+            ("mc1", "│"),
+            ("u2", "│"),
+            ("a2", "└ "),
+        ] {
+            assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
     }
 
@@ -2783,45 +2967,113 @@ mod tests {
         let resp = futures::executor::block_on(tree_node.data(0, &path_args)).unwrap();
         // Only 2 visible rows: user + assistant
         assert_eq!(resp.rows.len(), 2, "should have 2 visible entries");
-        let u1_desc = resp.rows[0].description.clone().unwrap_or_default();
-        let a_desc = resp.rows[1].description.clone().unwrap_or_default();
-        let u1_indent = u1_desc.len() - u1_desc.trim_start().len();
-        let a_indent = a_desc.len() - a_desc.trim_start().len();
-        assert_eq!(u1_indent, 0, "user should have indent 0: {:?}", u1_desc);
-        assert_eq!(
-            a_indent, 2,
-            "assistant should have indent 2 after tool chain: {:?}",
-            a_desc
-        );
+        let rows = plain_rows(&resp);
+        // The invisible tool-call/tool-result chain must not break the turn:
+        // both rows are still the main line, and the reply still gets the
+        // junction arm.
+        assert_eq!(prefix_of(&plain_of(&rows, "u1")), "│");
+        assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "└ ");
     }
 
     // --- Spine indentation (doc/tree_indent_refinement.md) ---
 
-    /// (entry id, indent) for every row, in listing order.
-    fn row_indents(resp: &DataResponse) -> Vec<(String, usize)> {
+    /// (entry id, spur depth) for every row, in listing order. The prefix
+    /// owns the columns now, so depth is the structural fact to assert on.
+    fn row_depths(resp: &DataResponse) -> Vec<(String, usize)> {
         resp.rows
             .iter()
             .map(|r| {
-                let desc = r.description.clone().unwrap_or_default();
-                (r.id.clone(), desc.len() - desc.trim_start().len())
+                let depth = match r.field_value("depth") {
+                    Some(Value::Num(n)) => *n as usize,
+                    other => panic!("depth field missing: {other:?}"),
+                };
+                (r.id.clone(), depth)
             })
             .collect()
     }
 
-    fn indent_of(rows: &[(String, usize)], id: &str) -> usize {
+    /// (entry id, listing cell with SGR removed) — for asserting on the
+    /// visible prefix.
+    fn plain_rows(resp: &DataResponse) -> Vec<(String, String)> {
+        resp.rows
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    strip_sgr(&r.description.clone().unwrap_or_default()),
+                )
+            })
+            .collect()
+    }
+
+    /// Drop SGR sequences from a styled cell. Fragments with no escape in
+    /// them (the text before the first one) must be kept.
+    fn strip_sgr(s: &str) -> String {
+        s.split('\x1b')
+            .map(|part| match part.split_once('m') {
+                Some((_, rest)) => rest.to_string(),
+                None => part.to_string(),
+            })
+            .collect()
+    }
+
+    /// The visible prefix of a row: the leading run of spaces and
+    /// box-drawing glyphs before its text.
+    fn prefix_of(plain: &str) -> String {
+        plain
+            .chars()
+            .take_while(|c| *c == ' ' || ('\u{2500}'..='\u{257f}').contains(c))
+            .collect()
+    }
+
+    /// The plain listing text of one row.
+    fn plain_of(rows: &[(String, String)], id: &str) -> String {
+        rows.iter()
+            .find(|(rid, _)| rid == id)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| panic!("no row for {id}"))
+    }
+
+    fn depth_of(rows: &[(String, usize)], id: &str) -> usize {
         rows.iter()
             .find(|(rid, _)| rid == id)
             .map(|(_, i)| *i)
             .unwrap_or_else(|| panic!("no row for {id}"))
     }
 
-    /// Rows + indents for a tree with the given leaf.
-    fn indents_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Vec<(String, usize)> {
+    /// The `branch` ordinal of a row (0 = main line).
+    fn branch_of(resp: &DataResponse, id: &str) -> u8 {
+        let row = resp.rows.iter().find(|r| r.id == id).expect("row");
+        match row.field_value("branch") {
+            Some(Value::Num(n)) => *n as u8,
+            other => panic!("branch field missing on {id}: {other:?}"),
+        }
+    }
+
+    /// True if the row carries the `spur_start` marker field.
+    fn is_spur_start(resp: &DataResponse, id: &str) -> bool {
+        resp.rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.field_value("spur_start").is_some())
+            .unwrap_or(false)
+    }
+
+    /// (id, depth) for every row of a tree, with the given leaf.
+    fn depths_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Vec<(String, usize)> {
         let app_state = app_state_with_tree(tree);
         app_state.set_leaf_id(leaf.map(|s| s.to_string()));
         let mut node = TreeListNode::new(app_state);
         let resp = futures::executor::block_on(node.data(0, &tree_path(&["tree"]))).expect("data");
-        row_indents(&resp)
+        row_depths(&resp)
+    }
+
+    /// The raw `DataResponse` for a tree with the given leaf.
+    fn data_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Rc<DataResponse> {
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(leaf.map(|s| s.to_string()));
+        let mut node = TreeListNode::new(app_state);
+        futures::executor::block_on(node.data(0, &tree_path(&["tree"]))).expect("data")
     }
 
     /// The §1 session: a 6-row main flow, an experiment spur off `a1` and a
@@ -2920,32 +3172,50 @@ mod tests {
         // No forks ⇒ every node is its parent's spine ⇒ column 0 forever,
         // at any length. 1000 entries also covers the stack-safety
         // constraint on the post-order pass.
-        let rows = indents_for(linear_chain(1000), Some("e0"));
+        let rows = depths_for(linear_chain(1000), Some("e0"));
         assert_eq!(rows.len(), 1000);
         assert!(
-            rows.iter().all(|(_, indent)| *indent == 0),
-            "a fork-free chain must stay at column 0"
+            rows.iter().all(|(_, depth)| *depth == 0),
+            "a fork-free chain must stay at depth 0"
         );
     }
 
     #[test]
     fn longest_branch_stays_at_left_margin() {
-        // The main flow owns the left margin; both spurs step right.
-        let rows = indents_for(main_flow_with_spur(1), Some("a3"));
-        assert_eq!(rows.len(), 10);
-        for (id, indent) in [
+        // The main flow keeps the bar at column 0; both spurs draw their
+        // connector from the bar above and step right. Text columns are
+        // unchanged from the space-only layout: depth d puts text at
+        // d * SPUR_STEP.
+        let resp = data_for(main_flow_with_spur(1), Some("a3"));
+        assert_eq!(resp.rows.len(), 10);
+        let depths = row_depths(&resp);
+        for (id, depth) in [
             ("u1", 0),
-            ("a1", 2), // assistant turn cue, on the margin
             ("u2", 0),
-            ("a2", 2),
+            ("a2", 0),
             ("u3", 0),
-            ("a3", 2),
-            ("x1", 4),  // experiment spur
-            ("x2a", 6), // …its assistant reply
-            ("y1", 4),  // side-quest spur
-            ("y2", 6),
+            ("a3", 0),
+            ("x1", 1),
+            ("x2a", 1),
+            ("y1", 1),
+            ("y2", 1),
         ] {
-            assert_eq!(indent_of(&rows, id), indent, "indent of {id}");
+            assert_eq!(depth_of(&depths, id), depth, "depth of {id}");
+        }
+        let rows = plain_rows(&resp);
+        for (id, want) in [
+            ("u1", "│"),
+            ("a1", "├ "),
+            ("x1", "╰──┐"),   // spur: connector from the bar above
+            ("x2a", "   └ "), // …its reply turns the ladder off
+            ("u2", "│"),
+            ("y1", "╰──┐"),
+            ("y2", "   └ "),
+            ("a2", "├ "),
+            ("u3", "│"),
+            ("a3", "└ "),
+        ] {
+            assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
     }
 
@@ -2954,13 +3224,13 @@ mod tests {
         // Growing a spur must not move the main flow — the spur is still
         // the shorter path, however many turns it gains.
         let flow = ["u1", "a1", "u2", "a2", "u3", "a3"];
-        let short = indents_for(main_flow_with_spur(1), Some("a3"));
+        let short = plain_rows(&data_for(main_flow_with_spur(1), Some("a3")));
         for turns in 2..6 {
-            let longer = indents_for(main_flow_with_spur(turns), Some("a3"));
+            let longer = plain_rows(&data_for(main_flow_with_spur(turns), Some("a3")));
             for id in flow {
                 assert_eq!(
-                    indent_of(&longer, id),
-                    indent_of(&short, id),
+                    prefix_of(&plain_of(&longer, id)),
+                    prefix_of(&plain_of(&short, id)),
                     "main-flow row {id} moved when the spur grew to {turns} turns"
                 );
             }
@@ -2981,12 +3251,13 @@ mod tests {
                 )],
             )],
         )];
-        let rows = indents_for(tree, Some("u2"));
-        assert_eq!(
-            indent_of(&rows, "u2"),
-            0,
-            "an invisible sibling is not a fork: {rows:?}"
-        );
+        let resp = data_for(tree, Some("u2"));
+        let rows = plain_rows(&resp);
+        let depths = row_depths(&resp);
+        // Still the main line: the bar is at column 0 and no connector is
+        // drawn. `╵` because it is the branch's last visible row.
+        assert_eq!(depth_of(&depths, "u2"), 0, "{rows:?}");
+        assert_eq!(prefix_of(&plain_of(&rows, "u2")), "╵", "{rows:?}");
     }
 
     #[test]
@@ -3016,27 +3287,58 @@ mod tests {
                 ],
             )],
         )];
-        let rows = indents_for(tree, Some("v1"));
-        assert_eq!(indent_of(&rows, "v1"), 0, "newest tie-winner at margin");
-        assert_eq!(indent_of(&rows, "w1"), 4, "its spur steps right");
-        assert_eq!(indent_of(&rows, "x1"), 0, "its own spine stays on the line");
+        let resp = data_for(tree, Some("v1"));
+        let rows = plain_rows(&resp);
         assert_eq!(
-            indent_of(&rows, "u2"),
-            4,
+            prefix_of(&plain_of(&rows, "v1")),
+            "│",
+            "newest tie-winner keeps the margin"
+        );
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "w1")),
+            "╰──┐",
+            "its spur connects from the bar above and steps right"
+        );
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "x1")),
+            "╵",
+            "its own spine stays on the line, and it is the branch's last row"
+        );
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "u2")),
+            "╰──┐",
             "older equal-depth branch is a spur"
         );
-        assert_eq!(indent_of(&rows, "a2"), 6, "spur keeps the assistant cue");
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "a2")),
+            "   └ ",
+            "spur keeps the reply cue"
+        );
     }
 
     #[test]
     fn layout_survives_navigation() {
         // The spine key does not read the leaf, so moving the leaf (a
         // `/tree <id> switch`) must not re-lay-out the listing.
-        let with_leaf = indents_for(main_flow_with_spur(1), Some("a3"));
-        let in_spur = indents_for(main_flow_with_spur(1), Some("x2a"));
-        let at_root = indents_for(main_flow_with_spur(1), None);
+        let with_leaf = depths_for(main_flow_with_spur(1), Some("a3"));
+        let in_spur = depths_for(main_flow_with_spur(1), Some("x2a"));
+        let at_root = depths_for(main_flow_with_spur(1), None);
         assert_eq!(with_leaf, in_spur, "navigation into a spur moved columns");
         assert_eq!(with_leaf, at_root, "no-leaf layout differs");
+
+        // …and neither does it move the colours.
+        let branches = |leaf: &str| -> Vec<(String, String)> {
+            data_for(main_flow_with_spur(1), Some(leaf))
+                .rows
+                .iter()
+                .map(|r| (r.id.clone(), r.description.clone().unwrap_or_default()))
+                .collect()
+        };
+        assert_eq!(
+            branches("a3"),
+            branches("x2a"),
+            "branch hues moved on switch"
+        );
     }
 
     #[test]
@@ -3094,42 +3396,153 @@ mod tests {
                 ],
             )],
         )];
-        let rows = indents_for(tree, Some("u4"));
+        let resp = data_for(tree, Some("u4"));
+        let depths = row_depths(&resp);
+        let rows = plain_rows(&resp);
         // The chain holds the margin.
-        for (id, indent) in [("u2", 0), ("a2", 2), ("u3", 0), ("a3", 2), ("u4", 0)] {
-            assert_eq!(indent_of(&rows, id), indent, "chain row {id}");
+        for id in ["u2", "a2", "u3", "a3", "u4"] {
+            assert_eq!(depth_of(&depths, id), 0, "chain row {id}");
         }
-        // The bush is a spur: it steps right at its root and never comes
-        // back left (its own spine, `d1`, inherits the spur's column).
-        assert_eq!(indent_of(&rows, "v1"), 4, "bush steps right");
-        assert!(
-            rows.iter()
-                .filter(|(id, _)| ["b1", "b2", "c1", "c2", "d1", "d2"].contains(&id.as_str()))
-                .all(|(_, indent)| *indent >= 4),
-            "no bush row returns left of the spur column: {rows:?}"
+        // The bush is a spur: its root connects from the bar above, and two
+        // of its own three children are spurs of *it* (a third level).
+        assert_eq!(
+            prefix_of(&plain_of(&rows, "v1")),
+            "╰──┐",
+            "bush steps right"
         );
-        // …and the chain is the deeper branch, which is why it won the
-        // margin: its last row is at 0 while the bush only reaches column 4.
-        assert_eq!(indent_of(&rows, "u4"), 0);
-        assert!(rows
-            .iter()
-            .all(|(_, indent)| *indent == 0 || *indent == 2 || *indent >= 4));
+        for id in ["d1", "d2"] {
+            assert_eq!(depth_of(&depths, id), 1, "bush spine {id}");
+        }
+        for id in ["b1", "b2", "c1", "c2"] {
+            assert_eq!(depth_of(&depths, id), 2, "bush fork {id}");
+        }
+        // The chain is the deeper branch, which is why it won the margin.
+        assert_eq!(depth_of(&depths, "u4"), 0);
     }
 
     #[test]
     fn layout_is_deterministic() {
-        // Same tree ⇒ same layout, from a cold cache each time.
-        let a = indents_for(main_flow_with_spur(1), Some("a3"));
-        let b = indents_for(main_flow_with_spur(1), Some("a3"));
-        assert_eq!(a, b);
+        // Same tree ⇒ same layout (and same hues), from a cold cache.
+        let render = |leaf: Option<&str>| -> Vec<String> {
+            data_for(main_flow_with_spur(1), leaf)
+                .rows
+                .iter()
+                .map(|r| r.description.clone().unwrap_or_default())
+                .collect()
+        };
+        assert_eq!(render(Some("a3")), render(Some("a3")));
+    }
+
+    #[test]
+    fn branch_ordinals_identify_each_spur() {
+        // Each spur gets its own colour ordinal, and its replies inherit
+        // it — a per-parent ordinal would make every single-spur branch the
+        // same colour, which says nothing about identity.
+        let resp = data_for(main_flow_with_spur(1), Some("a3"));
+        assert_eq!(branch_of(&resp, "u1"), 0, "main line is the anchor");
+        assert_eq!(branch_of(&resp, "a1"), 0);
+        assert_eq!(branch_of(&resp, "u2"), 0);
+        assert_eq!(branch_of(&resp, "a3"), 0);
+        // Two spurs, two ordinals — and the reply inside a spur keeps it.
+        assert_eq!(branch_of(&resp, "x1"), 1);
+        assert_eq!(branch_of(&resp, "x2a"), 1, "reply inherits its spur's hue");
+        assert_eq!(branch_of(&resp, "y1"), 2);
+        assert_eq!(branch_of(&resp, "y2"), 2);
+    }
+
+    #[test]
+    fn spur_start_marks_only_the_first_visible_row() {
+        // The marker rides on the spur's first *visible* row; every other
+        // row of the spur, and every main-line row, is unmarked.
+        let resp = data_for(main_flow_with_spur(1), Some("a3"));
+        assert!(is_spur_start(&resp, "x1"));
+        assert!(is_spur_start(&resp, "y1"));
+        for id in ["u1", "a1", "x2a", "u2", "a2", "u3", "a3", "y2"] {
+            assert!(!is_spur_start(&resp, id), "{id} must not be a spur start");
+        }
+    }
+
+    #[test]
+    fn spur_start_skips_invisible_entries() {
+        // A spur whose root is an invisible tool-call segment: the connector
+        // must land on the first *visible* row of that spur, not on the
+        // hidden one (which emits no row at all). The spur is the older
+        // child, so the main line is chosen as the spine.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![
+                node(
+                    tool_call_entry("tc1", Some("u1")),
+                    vec![node(
+                        make_entry("x1", Some("tc1"), "user", "spur row"),
+                        vec![],
+                    )],
+                ),
+                node(make_entry("u2", Some("u1"), "user", "main line"), vec![]),
+            ],
+        )];
+        let resp = data_for(tree, Some("x1"));
+        let rows = plain_rows(&resp);
+        assert!(
+            is_spur_start(&resp, "x1"),
+            "the connector must land on the first visible spur row: {rows:?}"
+        );
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "╰──┐");
+    }
+
+    #[test]
+    fn wash_fades_with_depth_and_ink_stays_black() {
+        // Saturation is depth; the glyph is always black, so the lines stay
+        // crisp however far out a branch is.
+        let row = |depth: usize, branch: u8, bar: Bar| row_prefix(depth, branch, bar, false);
+        let (deep, shallow) = (row(3, 1, Bar::Line), row(1, 1, Bar::Line));
+        assert_ne!(
+            deep, shallow,
+            "a deeper spur must fade relative to its parent"
+        );
+        for r in [deep, shallow] {
+            assert!(r.contains("38;2;0;0;0m"), "ink must stay black: {r:?}");
+        }
+        // Main line: the anchor, unfaded.
+        assert!(row(0, 0, Bar::Line).contains(&format!(
+            "48;2;{};{};{}m",
+            ANCHOR_RGB.0, ANCHOR_RGB.1, ANCHOR_RGB.2
+        )));
+    }
+
+    #[test]
+    fn connector_is_thin_and_neutral() {
+        // Two adjacent sub-trees must not read as one pipe: the connector is
+        // light box-drawing in a neutral ink, never a branch hue, while the
+        // bar it runs into carries the wash.
+        let prefix = row_prefix(1, 1, Bar::SpurStart, false);
+        assert!(prefix.contains('\u{2570}'), "light elbow: {prefix:?}");
+        assert!(prefix.contains('\u{2500}'), "light run: {prefix:?}");
+        assert!(
+            !prefix.contains('\u{2502}'),
+            "no heavy vertical: {prefix:?}"
+        );
+        assert!(prefix.contains(&format!(
+            "38;2;{};{};{}m",
+            CONNECTOR_RGB.0, CONNECTOR_RGB.1, CONNECTOR_RGB.2
+        )));
+        // The elbow sits in the parent's bar column, so it lines up with the
+        // bar directly above it. Measured in *visible* columns: the SGR
+        // bytes carry no width.
+        let col_of = |needle: char| {
+            let at = prefix.find(needle).expect("glyph");
+            crate::slashdot_menu::table::display_width(&prefix[..at])
+        };
+        assert_eq!(col_of('\u{2570}'), bar_col(0), "elbow column");
+        assert_eq!(col_of('\u{2510}'), bar_col(1), "bar column");
     }
 
     #[test]
     fn spine_indent_survives_render_plan() {
-        // The data rows carry the indent; this checks it still reaches the
-        // terminal through the table (the generic leading-space case is
-        // covered by `indent_survives_table_render` — this is the spine
-        // shape, where the margin and the spur columns coexist).
+        // The prefix must reach the terminal through the table, SGR and all
+        // (the generic leading-space case is covered by
+        // `indent_survives_table_render` — this is the spine shape, where
+        // the margin and the spur columns coexist).
         let app_state = app_state_with_tree(main_flow_with_spur(1));
         let mut menu = build_tree_menu(&app_state);
         let mut handle = menu.get_handle();
@@ -3138,12 +3551,34 @@ mod tests {
             HostKey::None,
             72,
         )));
-        let indents: Vec<usize> = plan
+        let got: Vec<String> = plan
             .rows
             .iter()
-            .map(|r| r.0.len() - r.0.trim_start().len())
+            .map(|r| prefix_of(&strip_sgr(&r.0)))
             .collect();
-        assert_eq!(indents, vec![0, 2, 4, 6, 0, 4, 6, 2, 0, 2], "{plan:?}");
+        let want = vec![
+            "│",
+            "├ ",
+            "╰──┐",
+            "   └ ",
+            "│",
+            "╰──┐",
+            "   └ ",
+            "├ ",
+            "│",
+            "└ ",
+        ];
+        assert_eq!(got, want, "{plan:?}");
+        // The wash must survive to the terminal too, not just the glyph —
+        // and it is the *faded* hue (depth 1), not the raw palette entry.
+        let wash = blend(SPUR_RGB[0], fade_at(1));
+        assert!(
+            plan.rows[2]
+                .0
+                .contains(&format!("48;2;{};{};{}m", wash.0, wash.1, wash.2)),
+            "spur wash missing in the rendered row: {:?}",
+            plan.rows[2].0
+        );
     }
 
     /// Guard for the highlight path (found while scoping the follow-up

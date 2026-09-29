@@ -484,17 +484,43 @@ pub fn extract_snippet(cell: &str, match_indices: &[usize], max_width: usize) ->
     }
 
     // Per-character tables: byte → char index, char → byte index / visible col.
+    // ANSI-aware: an SGR sequence occupies characters but no columns, so
+    // the window arithmetic below is in *visible* columns while the slice
+    // still re-emits the escapes verbatim. (A styled cell reaching this
+    // path is the norm: the caller highlights before rendering.)
     let chars: Vec<char> = cell.chars().collect();
     let n_chars = chars.len();
     let mut byte_to_char = vec![0usize; cell.len() + 1];
     let mut char_to_visible = Vec::with_capacity(n_chars + 1);
     let mut visible = 0;
     char_to_visible.push(0);
+    // Mark the characters that belong to SGR sequences (ESC .. final
+    // letter) so they occupy characters but no visible columns.
+    let mut in_escape = vec![false; n_chars];
+    let mut k = 0;
+    while k < n_chars {
+        if chars[k] == '\x1b' {
+            let mut j = k + 1;
+            while j < n_chars && !chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let end = (j + 1).min(n_chars);
+            for slot in in_escape.iter_mut().take(end).skip(k) {
+                *slot = true;
+            }
+            k = end;
+        } else {
+            k += 1;
+        }
+    }
+
     let mut byte_off = 0usize;
     for (i, c) in chars.iter().enumerate() {
         byte_to_char[byte_off] = i;
         byte_off += c.len_utf8();
-        visible += char_width(*c);
+        if !in_escape[i] {
+            visible += char_width(*c);
+        }
         char_to_visible.push(visible);
     }
     let vis = |ci: usize| char_to_visible[ci];
@@ -1195,5 +1221,43 @@ mod tests {
         let out = t.render(20);
         assert_eq!(display_width(&out[0]), 20, "{:?}", out[0]);
         assert!(out[0].ends_with("age\x1b[0m"), "{:?}", out[0]);
+    }
+
+    /// A styled cell that has to be snippeted: the window is measured in
+    /// visible columns (the SGR bytes must not eat the budget) and the
+    /// escapes ride through the slice verbatim.
+    #[test]
+    fn styled_cell_snippet_is_escape_aware() {
+        let styled = "\x1b[1;35mrefactor the tree indentation\x1b[0m and more text here";
+        // Match "indentation": byte offset of 'i' inside the styled string.
+        // Match indices are byte offsets into the cell.
+        let byte_off = styled.find("indentation").expect("needle present");
+        let out = extract_snippet(styled, &[byte_off], 24);
+        assert!(
+            out.contains("\x1b[1;35m"),
+            "the leading escape must survive the slice: {out:?}"
+        );
+        assert!(
+            display_width(&out) <= 24,
+            "snippet must fit its window: {:?} ({})",
+            out,
+            display_width(&out)
+        );
+        // The match is present, though the highlight escapes split the
+        // word, so compare against the unstyled form.
+        let plain = strip_sgr(&out);
+        assert!(plain.contains("indentation"), "match lost: {out:?}");
+    }
+
+    /// Drop SGR sequences — for asserting on the text of a styled cell.
+    /// Fragments with no escape in them (the text before the first one)
+    /// must be kept.
+    fn strip_sgr(s: &str) -> String {
+        s.split('\x1b')
+            .map(|part| match part.split_once('m') {
+                Some((_, rest)) => rest.to_string(),
+                None => part.to_string(),
+            })
+            .collect()
     }
 }
