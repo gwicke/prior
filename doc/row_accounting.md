@@ -1,11 +1,15 @@
-# Row accounting, the live footer, and what they unblock
+# The screen is a composition: content, status, input
 
 **Status:** design discussion — nothing implemented yet
 **Context:** follows `doc/ui_draw_v2.md` §9 #6 (content row counts drift) and #10
 (streaming doesn't track rows). Those two are not two bugs: they are one missing
-capability, and it is the gate on a live footer.
-**Supersedes:** nothing. `ui_draw_v2` §4.5 ("contraction and fixed bottom
-elements (future)") is the sketch this fleshes out.
+capability, and it is the gate on a live status line.
+**Revises:** `doc/ui_draw_v2.md` §2 (apply policies) and §4.5 (fixed bottom
+elements) — see §3.4. My own first draft of this doc proposed a narrower
+"reserved band at the bottom" and deferred `ApplyPolicy::Append` as having no
+producer. Both were wrong in the same way: `Append` is not a chunked-write
+policy, it is the *content* policy, and the content is a first-class part of the
+screen's composition.
 
 ---
 
@@ -27,10 +31,10 @@ cache is supposed to follow. It follows for some writers and not others:
 
 And the fallback that papers over the drift has a second defect: `note_lines`
 **clamps** the tracked row to the terminal height (it models "the terminal
-scrolled and kept the cursor on the bottom row"). So every writer that skips a
-count does not just under-count — after enough unaccounted output the tracked
-row is pinned at the bottom, and the *next* counted write puts the anchor in
-the wrong place.
+scrolled and kept the cursor on the bottom row"). So a writer that skips a count
+does not just under-count — after enough unaccounted output the tracked row is
+pinned at the bottom, and the *next* counted write puts the anchor in the wrong
+place.
 
 ### 1.1 The artifact this explains
 
@@ -39,280 +43,296 @@ the wrong place.
 
 `/session … resume` ends with `replay_last_turn_silent` (`repl.rs:658-670`,
 reused from the width-resize path): `\x1b[0J` from the cursor, replay the last
-turn, then a DSR re-anchor. The reasoning, as reported:
+turn, then a DSR re-anchor. The chain, as reported:
 
-1. The menu was mid-draw: `ui::confirm` does a `cursor_row()` (DSR) re-anchor on
-   entry and then composes `[Divider?, Overlay]` **at the tracked cursor row**.
+1. `ui::confirm` DSR-re-anchors on entry, then composes `[Divider?, Overlay]`
+   **at the tracked cursor row**.
 2. The turn had streamed, so the tracked row was the clamped bottom row — the
-   real cursor was elsewhere. A stale *frame region* is tracked too
-   (`live`), and a stale `caret` points the clear at the wrong place.
-3. The menu was torn down with `Frame::empty()`, which clears the union of the
-   old region and the rows below it. If the region was wrong, the clear is
-   wrong — and the replay writes *over* whatever it did not clear.
+   real cursor was elsewhere, and `live` tracked a frame region that was no
+   longer where it had been painted.
+3. The menu resolved with `Frame::empty()`, whose union clear is anchored to that
+   region. Wrong region → wrong clear → the replay paints over what it did not
+   clear.
 
-So yes: content starting before the menu was fully closed, with the draw path
-blind to where the cursor actually was. Row accounting removes the cause
-(every writer, including the streaming ones, maintains the cache — ui_draw_v2
-§4.2's contract, which the streaming writers do not honour), and a cheaper
-guard removes the failure mode (a **scoped** re-anchor, below).
-
-I have not reproduced it pixel-for-pixel yet; phase B pins it before it fixes
-it, so the fix is verified against the report and not against my theory of it.
+Row accounting removes the cause; a scoped re-anchor removes the failure mode.
+Phase B pins the artifact against the report before fixing it.
 
 ---
 
-## 2. Why a footer needs *both* halves
+## 2. The screen is a composition
 
-A footer is a fixed row at the bottom of the screen that content must not
-disturb. Two things have to be true.
+Not "a frame painted at an anchor over some content that happens to be there",
+but:
 
-**(a) The cursor must be tracked** — otherwise the frame's anchor after a turn
-is wherever the clamped guess ended up, and the clear region is anchored to the
-wrong row. This is §1.
+```
+┌──────────────────────────────┐  row 1
+│ scrollback content            │  … the LLM turn, in order, written once
+├──────────────────────────────┤  content_bottom + 1
+│ status line   (min 1, max 2)  │  ┐
+├──────────────────────────────┤  ├ the *frame*: an ordered stack
+│ menu / overlay  (variable)    │  │ of elements, each with (must, might)
+├──────────────────────────────┤  ┘
+│ input         (1 … n rows)    │  the caret lives here
+└──────────────────────────────┘  row term_h
+```
 
-**(b) The frame must know the footer exists** — and this is the part that is
-easy to get wrong. Today `read_input` returns and the REPL applies an
-*empty-input* frame before returning (ui_draw_v2 §5.2), which makes the input
-row the last thing on screen. If content then streams, the terminal scrolls and
-the input row — and any footer under it — is consumed. No amount of tracking
-fixes that; the frame simply has nowhere reserved to put itself.
+One solve answers where the frame goes and whether the content moves. With
+`H` = the frame's height after allocation and `cb` = the content's last row:
 
-The invariant, then:
+```
+frame_top = min(cb + 1, term_h - H + 1)        // following (default)
+frame_top = term_h - H + 1                      // pinned
+content_bottom ≤ frame_top - 1                  // always
+```
 
-> The last `F` rows are reserved for the footer. The live region is
-> `1 ..= term_h − F`; a frame apply may not write or clear below `term_h − F`,
-> and the budget is computed against `term_h − F`, not `term_h`.
+Both regimes are the same rule with one term dropped, and both descriptions in
+the design discussion are its two ends:
 
-The consequence has to be stated plainly, because it decides the phase order:
+- **Following** — the frame sits directly below the content and the empty rows
+  are at the bottom. After a tall menu closes, the content is mid-terminal with
+  the status line just below it; each later append pushes both down until the
+  content reaches the bottom of the live region.
+- **Pinned** — the frame is always the bottom `H` rows; a short turn leaves a
+  gap between the content and the frame. This is "a status line in the last
+  row", and it is what the streaming prototype wants: the line is *stable*
+  instead of sliding down after every block.
 
-> **Content can never scroll past the footer's top edge.** The live region is
-> bounded; once the cursor reaches `term_h − F`, further output scrolls the live
-> region while the footer row stays put. So the footer row is not "dipped into"
-> and recovered — a turn long enough to reach the bottom *fills the live region
-> and stays there*, and the footer's row is appended to.
+Which is the default is an open question (§5.1). Everything below is the same
+machinery either way.
 
-That is what "the live region" already means in this codebase (ui_draw_v2 §4.3:
-the top 1/3 is guaranteed scrollback; the bottom 2/3 is the working area), and
-it is why the same mechanism serves the 2/3 budget and the footer: the frame
-already scrolls itself into the live region via `delta`, it just needs the live
-region to end at the right row.
+### 2.1 Appending content
+
+`write_content` of `n` rows, with the current `H`:
+
+1. `cb' = cb + n`.
+2. If `cb' > frame_top - 1`, the content must move up by `delta = cb' - (frame_top - 1)`.
+   Scroll first (bare LFs from the bottom row — never `CSI S`, ui_draw_v2 §4.3),
+   so the reclaimed rows come from the top of the content into scrollback.
+3. **Clear the frame's old region first**, if the scroll moved the frame (see
+   §2.2) — otherwise the first `delta` rows of the old frame survive *above* the
+   new content, which is exactly the class of artifact in §1.1.
+4. Write the bytes; `cb = min(cb', frame_top - 1)`.
+5. Re-apply the frame if the solve moved it (row-diff against `live`).
+
+The cost of a footer is now explicit and small: step 5 is one `CUP` + one row
+for a static status line, `H` rows for a growing input area.
+
+### 2.2 The frame moves in two directions, and that is new
+
+Today the frame is a lone rectangle above the cursor, so `plan_apply`'s union
+clear is one region. With the composition there are two regions that can swap
+order:
+
+- **The frame grows** (a menu opens, the input wraps, a compose area appears):
+  the content gives way upward. The frame's top moves *down* past the content's
+  bottom; the content scrolls by the difference.
+- **The frame shrinks** (the menu closes, the input goes away): the frame's top
+  moves *up*, back to just below the content, and the rows it vacated are
+  cleared — while the *new* content appended after that can be mid-screen with
+  blank rows beneath it.
+
+Both are the same solve with a different `H`; the delta emission is
+`clear(old frame region)`, `scroll(delta)`, `write(content)`, `paint(frame at
+the new top)`. The ordering constraint is that the old frame region is cleared
+*before* the content is written, and that the clear never reaches below the new
+frame's bottom. That is a two-region union clear where today there is one.
+
+### 2.3 A dynamic input field makes the cursor interesting
+
+When the input is a real editor rather than a prompt line:
+
+- Its height changes as the user types, so `H` changes per keystroke *and* per
+  streamed delta during a mid-turn compose. Every content append re-solves.
+- The terminal cursor is the input's caret, but a content write moves it. Each
+  append therefore ends with a `CUP` back to the input's caret — one escape per
+  block, not a redraw.
+- The input must be able to *take* rows from the content while the content is
+  still arriving, and the content must be able to push the input down. Neither
+  is a special case of the solve; they are the solve, run more often.
+- Queued follow-up prompts add the semantic question (what does a mid-turn
+  prompt *mean*) on top of the layout. Its own document.
 
 ---
 
-## 3. Design
+## 3. API
 
-### 3.1 The `Output` surface is split (the foundation)
+### 3.1 Two mutators, one solve, one diff
 
-`Output` today is one trait carrying two unrelated kinds of byte: **content**
-(assistant text, tool panels, `⏺ …` messages — written once, in order, and
-never rewritten) and **UI** (the input frame, overlays, dialogs — a rectangle
-that is repainted every keystroke). The frame pipeline is built entirely around
-the second kind and knows nothing about the first, which is precisely why
-content writers have to maintain the cache by hand.
+The `ApplyPolicy` enum existed to say *what kind of apply is this*. Once the
+screen is a composition, that question dissolves: the two things that can change
+are the content and the frame, and each has one mutator.
 
 ```rust
-pub trait ContentOut {
-    // ... every display_*/stream_*/begin_response method, unchanged ...
+/// Content changed by `n` terminal rows (measured, never guessed — §4).
+fn write_content(&self, block: &ContentBlock<'_>);
+
+/// The frame changed: recompose from the elements and re-solve.
+fn set_frame(&self, elements: &[Element], focus: usize, dims: (usize, usize));
+```
+
+Each re-solves the composition and emits only the delta. `plan_apply` becomes
+the solve plus the delta computation, with the content region as a second
+participant; `DrawCache` grows `content_bottom` and `frame_top` next to `live`.
+`live_bottom()` stays the one place that knows where the live region ends, so
+callers do not re-derive it.
+
+### 3.2 One content entry point
+
+Yes — and it is the point of the whole design. Every content writer funnels
+through `write_content`, so the layout is consulted in exactly one place:
+
+```rust
+pub struct ContentBlock<'a> {
+    /// The bytes to write, ANSI and all.
+    pub bytes: &'a str,
+    /// What the block is, for the separator rule (§4.2).
+    pub kind: BlockKind,     // Text | Reasoning | ToolCall | ToolResult | Error | …
 }
-
-pub trait UiOut {
-    /// Draw a composed UI frame (ui_draw_v2 §5.1) — unchanged signature.
-    fn draw_frame(&self, frame: &Frame, anchor: usize, policy: ApplyPolicy, dims: (usize, usize)) -> (usize, usize);
-    fn frame_anchor(&self) -> usize;
-    /// The live region's bottom edge (1-based, absolute). Today `term_h`;
-    /// `term_h - footer_rows` once a footer is reserved. Content writers and
-    /// the frame allocator both need this, so it is one method, not two
-    /// copies of the arithmetic.
-    fn live_bottom(&self) -> usize;
-}
-
-pub trait Output: ContentOut + UiOut {}
 ```
 
-`draw_frame` moves to `UiOut`; `ConsoleOutput` is split into `content: ContentOut`
-and `ui: UiOut` state so the one writer lock and the one `DrawCache` are shared
-without a self-referential struct. Existing `&dyn Output` call sites keep
-compiling — `dyn Output` is still a thing — so the split is mechanical and
-reviewable in isolation.
+`display_text` builds `⏺ ` + `termimad::inline(text)` and calls it.
+`stream_text` renders into a local buffer, calls it, and the count comes from
+the bytes. `paint_panel` calls it per line. Footers and menus are injected at
+the same point, which is what makes "one place to inject them" true rather than
+aspirational: they are part of the composition, not side effects of a write.
 
-The win is not tidiness. It is that with a separate object per stream, the
-**anchor** each stream writes under is explicit rather than "wherever the shared
-cursor happens to be":
+### 3.3 What this does to the `Output` split
 
-- `UiOut` has its own `anchor` field: the row it owns. It moves only on
-  `reanchor` (DSR) and through the scroll compensation below.
-- `ContentOut` has its own `caret`: the row it last wrote, maintained by the
-  counting writer.
-- A `UiOut` apply that would *cross* the content's cursor (the content ended
-  mid-screen, so the input frame would have to overwrite it) does not guess: it
-  **scopes an anchor down** (below) and hands the reclaimed rows to the content.
+The split sketched in the first draft (`ContentOut` / `UiOut`, two anchors) is
+still right, and this design is *why*: the frame's anchor and the content's
+caret are different facts about the same screen, and today they share one
+field. With the composition they are separate values with an explicit
+relationship (`frame_top = min(cb + 1, …)`), and `live` is invalidated whenever
+either moves.
 
-The last point is what needs a decision; see §6.1.
+### 3.4 Revisions to settled design (ui_draw_v2)
 
-### 3.2 Counting rows where the bytes are written
+- **§4.5's `Append`** is the content policy, not a chunked-write policy. It gets
+  a producer (every content write) instead of staying deferred. The "fixed
+  bottom elements establish the lower bound the cursor may write to" in §4.5 is
+  precisely `content_bottom ≤ frame_top - 1`.
+- **§2's "Commit lines" row** ("clear the region with a Frame apply, then write
+  the line where the caret lands") is the `write_content` path: the commit line
+  is content, and the frame is re-applied under it.
+- **§4.3's full-apply clear floor** (`min(term_h, screen_bottom)`) becomes
+  `min(frame_top - 1, screen_bottom)`: the live region ends at the frame, not at
+  the terminal edge.
+- **§4.4's partial predicate** gains a condition: the frame may only take the
+  partial path if the content did not move since the last apply (otherwise the
+  row indices in `live` are stale by the scroll delta).
 
-One helper, used by every writer that currently guesses:
+### 3.5 The status line's data
 
-```rust
-/// A `Write` adapter that accumulates the terminal rows the bytes it
-/// receives will occupy at `width`: `1 + (display_width(segment) - 1) / width`
-/// per `\n`-separated segment, ANSI-transparent and display-width aware.
-struct RowCounter { width: usize, rows: usize }
-```
+Live values (session name, provider:model, thinking level, ctx %) come from a
+`StatusHandle` of atomics the agent updates as it runs, read once per solve.
+A separate, small surface; its own paragraph when we get to phase A2.
 
-A writer renders into a local buffer, measures the buffer, and calls
-`note_lines(rows)` with the truth. No second pass over the content, and the
-upstream `markdown_terminal::Renderer` needs no change: the count comes from the
-bytes, which is the only place the answer exists. Because the count is per
-*block* and not per delta, the streaming hot path barely notices.
+---
 
-What that buys, concretely:
+## 4. Padding, the cursor column, and ANSI
 
-- §9 #6 disappears: `display_text` measures `⏺ ` + `termimad::inline(text)`.
-- §9 #10 disappears: every `feed` site counts its own output.
-- The compensating DSR at `repl.rs:770` (the `DoneError` path) can go.
-- The entry DSRs in `read_input` and `ui::confirm` become removable once
-  replay uses the scoped re-anchor (§3.3) — they are kept until then.
+### 4.1 The cursor column belongs to the painter
 
-### 3.3 `ApplyPolicy::Reserve` — the footer's anchor
-
-The footer is an `Element::Lines` (ui_draw_v2 §3.2, currently the crate's only
-`#[allow(dead_code)]` variant — the §4.5 sketch was right about the first
-production user) at the bottom of the frame, and the input/menu frame is
-composed *above* it. Under the existing `Frame` policy that already works: the
-frame is one rectangle, the footer is its last row, and the union clear covers
-exactly what the frame painted.
-
-What is missing is the *scroll* path. When a frame anchored at row `R` with
-height `H` overflows the bottom, the apply scrolls by `delta` and repaints at
-`R - delta` (ui_draw_v2 §4.3). With a footer the content that must not be
-touched is not the terminal edge but the reserved band, so:
-
-```rust
-ApplyPolicy::Reserve { floor: usize }   // absolute row: the footer's top - 1
-```
-
-- The clear floor becomes `min(floor, screen_bottom)` instead of
-  `min(term_h, screen_bottom)`.
-- The budget is `⌈2/3 · (floor - anchor + 1)⌉`-ish — more precisely,
-  `allocate(&extents, live_budget(floor - anchor + 1))` — so the frame fits
-  *above* the footer, and if it cannot, the scroll compensates and the terminal
-  pushes the reclaimed rows into the content above.
-- `DrawCache` grows a `live_bottom: usize` (the footer's top − 1) alongside
-  `live`, set by the same apply. Content writers clamp to it, so content stops
-  exactly at the band.
-
-`Reserve` is the policy §4.5 reserved `Append` for, minus the chunking: one
-frame that owns the bottom rows. `Append` itself stays deferred (it has no
-producer).
-
-### 3.4 A first, static footer
-
-Phase A2, deliberately the smallest thing that proves the tracking:
-
-```
-[my-session | anthropic:claude-sonnet-4 | high | ctx 34% · 78k]
-```
-
-- Composed as `Element::Lines` at the bottom of the frame; `Lines` is all-or-
-  nothing in `allocate` (ui_draw_v2 §3.2), so a tight terminal gives up the
-  footer before it gives up input rows. Correct default.
-- Live data (session name, provider:model, thinking level, ctx %) has to be
-  published by the agent as it runs: a `RenderContext`-like `StatusHandle` with
-  atomics, read once per frame. That is a small new surface on the app state,
-  and worth its own line in the design when we get there.
-- Typed input mid-turn stays out of scope for the prototype — it is the same
-  tracking plus a concurrent editor, which is a much bigger conversation.
-
-### 3.5 Two sub-items this surfaces
-
-**(a) The marker column should be the painter's, not the producer's.** Today's
-contract is that row text is laid out for `term_w - 2` (the cursor column),
-which every row producer has to remember; a new client that lays out at
-`term_w` gets its last two columns split onto a second row. The fix is to hand
-producers the *content* width and let the painter own the column:
+Row text must currently be laid out for `term_w - 2` because the painter adds a
+two-column marker — a contract every producer has to remember, and one that will
+be multiplied by the status line and the compose area. It should be the
+painter's:
 
 ```rust
 pub struct RenderContext { pub content_width: usize }   // was term_width
+
+/// How a row's cursor is indicated, and how many columns it costs.
+pub enum RowCursor { Columns, BackgroundOnly }           // 2 cols, 0 cols
 ```
 
-- `paint_row` gains a `cursor: RowCursor` (columns today, background-only
-  tomorrow) and pads the row to the full width itself.
-- `Row`/`StaticRow` consumers stop subtracting 2; the engine's
-  `render_multiline(tw - 2)` calls become `render_multiline(ctx.content_width)`.
-- Nothing else moves: the painter's output is byte-identical for
-  `cursor: Columns`, so this can land as its own commit and be verified by the
-  existing paint tests.
-- Cost: every `RenderContext { term_width }` construction (about a dozen, mostly
-  tests), and one honest name change. The one decision: whether the *painter*
-  also owns the padding (recommended) or producers still pad to
-  `content_width` and the painter only owns the column.
+`paint_row` gains a `cursor: RowCursor` and pads the row itself. Changing the
+cursor indication later is then a one-line change with no producer touched, and
+`render_multiline(tw - 2)` becomes `render_multiline(ctx.content_width)`. Output
+is byte-identical for `Columns`, so it can land as its own commit and be
+verified against the existing paint tests.
 
-**(b) Separator logic is distributed** across `set_blank`/`ended_blank`/
-`last_was_tool` in `output.rs`, `ensure_dim` at the streaming/answer boundary,
-per-commit separators in `repl.rs::emit_commit`, and the frame's own divider.
-Each site decides "does this block need a blank line above it?" from partial
-state. This is the same shape as (a) — knowledge that belongs in one place
-re-derived in several — and the same fix: one function that says where a
-separator belongs, called by every writer. Worth folding into the §3.2 sweep
-while every writer is open, or as its own pass; not worth doing before it.
+### 4.2 The ANSI interaction (the question that prompted this)
+
+The painter owns padding **for the rows it paints** — overlay rows, the status
+line, the input. Content rows are not painted by the frame at all (the frame
+knows only their height), so syntax-highlighted content — tool panels, diffs,
+highlighted code — keeps its own full-width padding and nothing about
+highlighting changes.
+
+For the rows the painter does paint, the composition order is
+`[bg][fg][cursor][content][pad][reset]`, and three rules make that safe against
+ANSI:
+
+1. **The pad goes inside the style**, after the content and before the reset, so
+   a background or an underline reaches the right edge instead of stopping at
+   the text.
+2. **A content-internal `\x1b[0m` re-opens the style.** Highlighted content
+   carries its own resets; a reset mid-row would drop the background for the
+   rest of the line. `paint_panel` already solves this by substituting
+   `RESET` → `RESET + BG` (output.rs:1374-1381); the painter needs the same
+   rule, and it is the reason that trick exists.
+3. **Width is measured ANSI-transparently and in display columns**, not chars or
+   bytes: `display_width` (already in `slashdot_menu::table`) skips escapes and
+   counts wide chars as 2. A highlighted token's escapes must not inflate the
+   pad, and a CJK cell must not under-pad.
+
+None of this is new machinery; it is `paint_panel`'s contract generalised to
+every row the frame paints, and it is why the painter — not the producer — has
+to own the pad.
+
+### 4.3 Separators
+
+Folded into phase B (agreed): the counts would be wrong otherwise, since a
+separator is a content block of height 1 or 0. The decision "does this block
+need a blank line above it?" currently lives in five places (`set_blank` /
+`ended_blank` / `last_was_tool`, `ensure_dim` at the streaming boundary, and
+per-commit separators in `repl.rs::emit_commit`). With `write_content` as the
+choke point and `BlockKind` as the input, it becomes one function
+(`needs_separator(prev, next)`) called by every writer.
 
 ---
 
-## 4. Phases
+## 5. Open questions
+
+**5.1 (blocking A2) Following or pinned?** `frame_top = min(cb + 1, …)` keeps
+today's look — the prompt sits directly under the last line of output, and a
+static status line slides down as a long turn accumulates, then pins. Dropping
+the `min` puts the frame at the bottom always: the status line is stable and the
+prompt sits at the bottom of the screen, with a gap after a short turn. The
+design discussion asked for a status line "in the last row" (pinned) and
+described the following behaviour for appends; both are the same solve, so the
+only cost of choosing is the look. Recommendation: pinned — a status line that
+moves is distracting, and it is what every comparable CLI does — but it is a
+visible change to where the prompt appears, so it is your call.
+
+**5.2 Does the menu case need the content's history, or only its bottom?**
+A tall menu pushes the content up; the solve needs to know how far to scroll,
+which needs the content's *height* (or just that it exceeds the live region —
+scroll by the difference). I believe the bottom row plus `live` is enough, but
+a menu taller than the whole live region needs the 2/3 budget to still hold
+(ui_draw_v2 §8 OQ1), and that is an argument for keeping the budget on the
+frame's *own* elements, not on the composition.
+
+**5.3 What is the cursor during a mid-turn compose?** The input's caret, by
+definition — but then the status line and the content are painted *around* a
+cursor the reader is not using, and Esc/Ctrl-C have to reach the compose area
+rather than the (absent) REPL. The confirm gate (§1 of ui_draw_v2 §9) is the
+existing precedent for "something else owns stdin", so the mechanism exists; the
+policy does not. Deferred to the queued-prompt document, but the phase A2
+prototype should at least not paint over a live caret.
+
+---
+
+## 6. Phases
 
 | Phase | Work | Gate |
 |---|---|---|
-| **B** | Row counting (§3.2) across all writers; drop the compensating DSR; the two entry DSRs stay. New `tests/` pty case reproducing the session-resume artifact, asserted against the report, then shown fixed. | full suite green; a `note_lines`-drift unit test (a wide-char and a boundary-width message) |
-| **A1** | The `ContentOut`/`UiOut` split, the two anchors, the scoped re-anchor for replay, `live_bottom`. No visible change to the frame. | full suite green; the B artifact still fixed |
-| **A2** | `ApplyPolicy::Reserve` + a static footer + the status handle. | full suite green; vt100 case pinning that a long turn stops above the footer and the footer survives |
+| **B** | `write_content` + the row counter across all writers (§9 #6, #10); the separator rule (§4.3); drop the compensating DSR; the two entry DSRs stay. A `tests/` pty case reproducing the session-resume artifact, asserted against the report, then shown fixed. | full suite green; a `note_lines`-drift unit test (wide-char and boundary-width messages) |
+| **A1** | The composition: `ContentOut`/`UiOut`, `content_bottom` + `frame_top` in the cache, the two-mutator solve, the two-region clear, the §3.4 revisions. A scoped re-anchor for replay. Cursor-column change (§4.1) as its own commit. | full suite green; the B artifact still fixed; existing paint tests byte-identical |
+| **A2** | `StatusHandle` + a static status line as the frame's bottom element, following or pinned per §5.1. | full suite green; a vt100 case pinning that a long turn stops above the line and the line survives |
 
-B is the prerequisite for everything and is worth doing on its own merits: it
-is §9 #6 and #10, plus the artifact.
-
----
-
-## 5. Related, not here
-
-- **Queued follow-up prompts** (typing mid-turn opens an input area that pushes
-  output up) need A1's split objects *and* a concurrent editor, and a real
-  decision about what a mid-turn prompt means for the turn that is running. Its
-  own document.
-- **`ApplyPolicy::Append`** stays deferred: no producer. `Reserve` is the policy
-  §4.5 actually wanted.
-
----
-
-## 6. Open questions
-
-**6.1 (blocking A1) What happens when the input frame and the content would
-overlap?** Today: DSR re-anchor, and the frame paints over whatever is below the
-real cursor (or scrolls if it doesn't fit). The two honest alternatives:
-
-- **(a) Scope the anchor down** — reclaim rows above the content's caret for the
-  frame, pushing that content up. Costs a scroll (which is fine — the content is
-  just scrollback by then) and needs a `UiOut`-side "content ended at row R"
-  fact, which A1's split provides. Cost: one scroll, and the top-most lines of a
-  long turn move out of view when a menu opens.
-- **(b) Anchor at the content's caret as today** and accept that a menu opened
-  right after a turn paints over the tail of the turn, pushing it into scrollback
-  on the next scroll. Cost: the same class of surprise the resume artifact is,
-  one interaction away from the REPL's steady state.
-- (c) Keep the DSR for this case only (today's behavior), and let A1 own the
-  tracking. Cheapest, honest, and still fixes the artifact.
-
-Recommendation: (a) for the footer prototype — the reclaim is invisible, because
-content that the frame displaces is content the user has already read — and (c)
-until the queued-prompt work makes overlapping frames a first-class case.
-
-**6.2 Does the REPL's input frame keep the reserved row, or move above it?**
-With `F = 1` the input's last row is `term_h - 1` and the footer is the last row.
-That means the input is never on the very bottom row, which is a small visual
-change from today (today, after a short turn, the input sits right below the
-output with empty space beneath it — so in the common case nothing moves; after
-a long turn the input is at the bottom and would now be one row up).
-
-**6.3 (§3.5a) Does the painter own the padding as well as the cursor column?**
+A2 is what proves the tracking end to end; B is worth doing on its own merits —
+it is §9 #6 and #10 plus the artifact.
 
 ---
 
@@ -320,3 +340,8 @@ a long turn the input is at the bottom and would now be one row up).
 
 - 2026-09-28: written after the §9 #5/#11 painter work; #6 and #10 folded in as
   the phases of one capability. No code changed.
+- 2026-09-28: revised after review. The first draft modelled a reserved band at
+  the bottom and deferred `ApplyPolicy::Append`; the composition model above
+  subsumes it, explains `Append` as the content policy, and answers the cursor
+  question the reserved band left open. Added §4 on the painter-owned cursor
+  column and its ANSI rules.
