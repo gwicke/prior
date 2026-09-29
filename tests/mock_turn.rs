@@ -554,14 +554,20 @@ fn the_status_line_keeps_one_blank_row_above_it() {
             .map(|(i, _)| i)
             .collect::<Vec<_>>()
     };
-    // The **second** paint, not the first. The first one goes up right after the
-    // greeter, and the greeter has left a blank row above it on its own — so
-    // that one passes with the gap switched off entirely, which is exactly the
-    // kind of test that looks like it is covering something and is not.
+    // The **first** paint after content — and with a fence, the first paint is
+    // the one that reproduces the bug, which is why this scenario exists.
+    //
+    // A fence is emitted line by line, so after its last line the stream ends on
+    // a single newline and the next row is the one the bar wants. Nothing has
+    // left a blank there: the trailing blank that makes the *later* paints look
+    // fine is written by the segment flush at the end of the turn, which is two
+    // paints too late. So a test that samples a later paint passes with the gap
+    // switched off — which is exactly what mine did before this scenario was
+    // driven through every paint.
     let paints = all(b"\x1b[48;5;237m");
     let bar_start = *paints
-        .get(1)
-        .unwrap_or_else(|| panic!("expected two bar paints, got {}", paints.len()));
+        .first()
+        .unwrap_or_else(|| panic!("the bar should be painted at all"));
     // Stop just after that bar's own trailing reset: mid-turn, bar up, nothing
     // painted after it yet. The search is *after* the bar's `SGR` — the
     // transcript is full of resets from earlier styling, and the first one in the
