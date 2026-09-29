@@ -589,8 +589,13 @@ way to write files, and a second writer is exactly what this design removes.
   skipped, and files are visited in **sorted order** so two runs over one tree are
   diffable. Files that are not UTF-8 text are counted and named in the banner
   rather than failing the run; a tree is allowed to contain binaries.
+* **`-g`/`--glob`** narrows the walk: repeatable, any match wins, matched against
+  the path relative to the walk root. It uses the same matcher and the same
+  semantics as the `find` tool, so one mental model covers both — which means a
+  recursive match is written `**/*.rs`, not `*.rs`.
 * **The banner** reports files, not blocks: `2 of 4 file(s) under src changed,
-  3 block(s) total`, plus a note when files were skipped.
+  3 block(s) total`, plus a note when files were skipped or when a file matched
+  but could not be expressed as blocks (§7.4).
 
 ### 7.2 Apply is atomic *per file*
 
@@ -604,12 +609,19 @@ the only workflow that scales. So:
 * each file is applied on its own — **all-or-nothing per file**;
 * a file whose blocks no longer resolve is reported and **left untouched**, while
   every other file still goes through;
-* the **failed blocks are echoed back**, with their paths and their anchors
-  intact, so they can be fixed and re-piped through `apply` unchanged. This is
-  what `ApplyOutcome::Failed { failed }` carries: the rendered report says *what*
-  went wrong, the indices say *which* blocks, and a caller can hand back exactly
-  those. (The `edit` tool does not need the indices — it shows the model
-  everything — but it is the same type either way.)
+* the **failed blocks are echoed back**, and the report is *itself a valid blocks
+  file*: the diagnosis goes in prose, the blocks come out bare at the end. So
+  after fixing one you re-pipe the report with no detangling —
+  `bsed apply -i < report.txt` — and nothing is lost but the failures themselves.
+  This is what `ApplyOutcome::Failed { failed }` carries: the rendered report
+  says *what* went wrong, the indices say *which* blocks, and a caller can hand
+  back exactly those. (The `edit` tool does not need the indices — it shows the
+  model everything — but it is the same type either way.)
+
+  That trick leans on one property of the blob parser: prose between blocks is
+  ignored. It holds only while no diagnostic line is a *bare token*, which the
+  parser would read as a `path:LINE` header, so `prose()` enforces it rather than
+  trusting the wording. A unit test pins the invariant.
 * the run's report goes to **stdout**, because it is the result: which files
   applied, and the blocks to fix for the ones that did not. stderr carries the
   one-line failure count, and the exit code is 2, so a script that reads neither
@@ -620,7 +632,48 @@ the only workflow that scales. So:
 the first block. Re-piping a bare-path block for a duplicated line would resolve
 by content alone on the retry, and fail.
 
-### 7.3 The multi-file seam
+### 7.2a Losing the output to a scrollback
+
+When stdout is a **terminal**, any output carrying blocks is also written to
+`$TMPDIR/bsed-<pid>-<n>.blocks`, and the path is named:
+
+```
+bsed: wrote a copy to /tmp/bsed-5-1790649955849874731.blocks
+      edit it, then apply with: bsed apply -i < /tmp/bsed-5-1790649955849874731.blocks
+```
+
+The reasoning is narrow and practical: scrolling back through a terminal to copy
+a block verbatim is exactly how you produce a wrong edit, and the report is meant
+to be *re-piped* rather than retyped. A **piped** run is already capturing the
+bytes, so it spools nothing and leaves the filesystem alone. Output with no
+blocks in it is not spooled either — there would be nothing to re-pipe, and a
+pointer would be noise. `BSED_SPOOL_DIR` overrides the location.
+
+### 7.3 A file that cannot be expressed as blocks
+
+Previewing a file that is *itself* a blocks file (`bsed preview -r > blocks.txt`
+is a normal thing to do, and then previewing `blocks.txt`) puts literal
+`@@@NEW` lines inside a block, because that is what the file contains. The blob
+format cannot express it: those lines are structure, not content.
+
+`blocks::verify` existed for this, but `preview_text` built its own banner and
+dropped the result — so **both** paths emitted a block set they described as
+appliable, and `apply` then rejected it. Now:
+
+* the check runs over the in-memory blocks *first*, so the message names the
+  block and the offending line instead of the parser's generic "unexpected
+  delimiter";
+* it then re-parses as confirmation, which also catches a silent round-trip
+  failure — a block that does not survive `parse_blocks` unchanged is an internal
+  error, not something to hand to the user;
+* **single file**: refused, exit 2, with the `edit` tool's `oldText`/`newText`
+  form suggested as the way through;
+* **recursive**: the file is *named* and left out, and the rest of the tree still
+  previews. One unrepresentable file must not sink a tree — but silence would
+  read as "that file needed no change", which is the failure mode this tool
+  exists to prevent.
+
+### 7.4 The multi-file seam
 
 `blockedit::group_by_file(parsed, fallback_path)` is where "a blob may span
 files" meets "a write is atomic per file": it splits a parsed blob into one batch
