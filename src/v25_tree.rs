@@ -19,6 +19,7 @@ use crate::slashdot_menu::node_impl::{
     DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
 };
 use crate::slashdot_menu::value::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ---------------------------------------------------------------------------
 // Entry display helpers (ported from repl.rs entry_display_label)
@@ -792,50 +793,70 @@ pub fn tree_fields() -> Vec<FieldSpec> {
     ]
 }
 
+/// Split `line` into chunks of at most `max` display columns, breaking at a
+/// space where one is available and hard-splitting a word too long to fit on
+/// its own. Returns slices of `line`, so every chunk is valid UTF-8 by
+/// construction — `line` is arbitrary user/model text and may carry
+/// multi-byte chars at any offset, so a byte-indexed cut can land inside one.
+fn split_to_width(line: &str, max: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0; // byte offset where the current chunk begins
+    let mut col = 0; // display columns occupied by line[start..i]
+    let mut last_space = None; // byte offset of the last breakable space
+    for (i, ch) in line.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + w > max && i > start {
+            let at = match last_space {
+                Some(s) if s > start => s,
+                _ => i,
+            };
+            out.push(&line[start..at]);
+            start = if at == i { i } else { at + 1 }; // consume the break space
+            col = UnicodeWidthStr::width(&line[start..i]);
+            last_space = None;
+        }
+        if ch == ' ' {
+            last_space = Some(i);
+        }
+        col += w;
+    }
+    if start < line.len() {
+        out.push(&line[start..]);
+    }
+    out
+}
+
 /// Wrap `text` to `width` columns, prefixing the first line with `prefix`.
 /// Subsequent continuation lines are indented to align with the text start.
+///
+/// `width` is a budget in display *columns*, not bytes, and the text is
+/// whatever the session contains — so both the measurement and the cut are
+/// column/char aware.
 fn wrap_with_prefix(prefix: &str, text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![format!("{}(empty)", prefix)];
     }
-    let first_width = width.saturating_sub(prefix.len());
-    let cont_width = width.saturating_sub(2); // 2-space indent for continuations
+    // Budgets are never zero: with a zero budget no cut can advance, so the
+    // wrap loop would spin forever. That is reachable here — a full ISO
+    // timestamp in the prefix is 32 columns, so any terminal narrower than
+    // that would starve the first line of its budget entirely.
+    let first_width = width.saturating_sub(prefix.width()).max(1);
+    let cont_width = width.saturating_sub(2).max(1); // 2-space indent
     let mut result = Vec::new();
-    let mut first = true;
 
-    for line in text.split('\n') {
-        let eff_width = if first { first_width } else { cont_width };
-        let indent = if first { String::new() } else { "  ".into() };
-        if line.len() <= eff_width {
-            result.push(format!("{}{}", if first { prefix } else { &indent }, line));
+    for (i, line) in text.split('\n').enumerate() {
+        let (pfx, eff_width) = if i == 0 {
+            (prefix, first_width)
         } else {
-            let mut remaining = line;
-            let mut first_chunk = true;
-            while remaining.len() > eff_width {
-                let pfx = if first && first_chunk {
-                    prefix
-                } else {
-                    &indent
-                };
-                if let Some(break_at) = remaining[..eff_width].rfind(' ') {
-                    result.push(format!("{}{}", pfx, &remaining[..break_at]));
-                    remaining = &remaining[break_at + 1..];
-                } else {
-                    result.push(format!("{}{}", pfx, &remaining[..eff_width]));
-                    remaining = &remaining[eff_width..];
-                }
-                first_chunk = false;
-            }
-            if !remaining.is_empty() {
-                let pfx = if first && first_chunk {
-                    prefix
-                } else {
-                    &indent
-                };
-                result.push(format!("{}{}", pfx, remaining));
-            }
+            ("  ", cont_width)
+        };
+        if line.is_empty() {
+            result.push(pfx.to_string());
+            continue;
         }
-        first = false;
+        for chunk in split_to_width(line, eff_width) {
+            result.push(format!("{pfx}{chunk}"));
+        }
     }
     result
 }
@@ -3695,5 +3716,77 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    /// Regression for two ways this render used to take the TUI down, both
+    /// reachable by ordinary session text in the `/tree` entry detail:
+    ///
+    /// 1. It cut by byte offset against a *column* budget, so a multi-byte
+    ///    char (em dash, `§`, CJK) could put the cut inside the char — panic.
+    /// 2. A zero budget could not make progress (`&remaining[0..]`), so the
+    ///    wrap loop never terminated and grew a `Vec` until the process was
+    ///    OOM-killed. The prefix is 32 columns with a full ISO timestamp, so
+    ///    any narrow terminal starved the first line of its budget.
+    ///
+    /// Stated as properties over a spread of inputs, so it covers the cases
+    /// nobody thought to enumerate — not just the one that happened to fire.
+    #[test]
+    fn wrap_survives_multibyte_text() {
+        const PREFIX: &str = "[USER 2025-01-01T00:00:00.000Z] ";
+        const TEXTS: &[&str] = &[
+            "—x",
+            "—",
+            "a — b",
+            "alpha beta — gamma delta epsilon zeta eta theta iota kappa",
+            "§6b A3.2 — no row in the API either",
+            "plain ascii only, with a good many words to wrap around",
+            "日本語のテキストはここにあります，折り返しの確認",
+            "emoji 🎉 in the middle of a fairly long sentence here",
+            "mixed — ascii 日本語 🎉 § text that runs on and on for a while",
+            // No spaces at all: forces the hard-split path.
+            "—a—b—c—d—e—f—g—h—i—j—k—l—m—n—o—p",
+            "a\n—b\nccc — ddd",
+            "",
+        ];
+        let pfx_width = UnicodeWidthStr::width(PREFIX);
+        for text in TEXTS {
+            // From narrower than the prefix itself (budget of zero/one) up to
+            // comfortably wide, so the degenerate budgets are covered too.
+            for width in 1..=60usize {
+                // The call returning at all is the termination half of the
+                // regression: the old loop span here, allocating without end.
+                let out = wrap_with_prefix(PREFIX, text, width);
+                assert!(!out.is_empty(), "empty output for {text:?}@{width}");
+                // The empty-body `(empty)` marker is a sentinel, not wrappable
+                // content, and may outgrow a narrow terminal.
+                if !text.is_empty() {
+                    // Width is only enforceable when the prefix leaves room
+                    // for content; below that the row is prefix plus a sliver.
+                    if width > pfx_width + 2 {
+                        for line in &out {
+                            assert!(
+                                UnicodeWidthStr::width(line.as_str()) <= width,
+                                "row overflowed width {width}: {line:?} (from {text:?})"
+                            );
+                        }
+                    }
+                    // No data loss: the text survives, modulo the prefix and
+                    // the spaces a wrap point is allowed to consume.
+                    let strip = |l: &str| {
+                        l.strip_prefix(PREFIX)
+                            .unwrap_or(l)
+                            .trim_start_matches("  ")
+                            .replace(' ', "")
+                    };
+                    let joined: String = out.iter().map(|l| strip(l)).collect();
+                    let want: String = text
+                        .split('\n')
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .replace(' ', "");
+                    assert_eq!(joined, want, "text lost for {text:?}@{width}");
+                }
+            }
+        }
     }
 }
