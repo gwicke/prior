@@ -523,17 +523,34 @@ Two preconditions, both already available:
 turn boundaries (`end_response`) and when the frame changes — not per streamed
 block. The per-content cost is the 4-byte erase.
 
-**This removes most of A1.** The composition's purpose was to reserve space for
-a bottom element. With a transient line there is nothing to reserve, so the
-placement solve, `Reserve`, and the status as an `Element::Lines` all go. What
-survives is the part that was never about placement:
+**This removes most of A1** — and the piece that remains turned out to be the
+resume artifact itself. The composition's purpose was to reserve space for a
+bottom element; with a transient line there is nothing to reserve, so the
+placement solve, `Reserve`, and the status as an `Element::Lines` all go.
 
-- the **two-region clear** — a content write while a frame is live must clear
-  the frame's old region (above the content) first, or a replay's `ESC[0J`
-  leaves frame residue above the cursor. That is the resume artifact, and it is
-  a *clear*, not a placement.
-- the **partial-predicate condition** — a frame may only take the row-diff path
-  if the content did not move, or `live`'s row indices are stale.
+What survived is the part that was never about placement, and it is **done**
+(2026-09-28): a content write while a frame is live now erases that frame
+first (`ui::frame::plan_clear_live_frame`). Reproduced before the fix — a menu
+frame plus one `display_text` left
+
+```
+⏺ Cannot start agent: Missing API key fo
+r provider.      CTX    PRICE
+  gpt-5          400k   1.00
+```
+
+i.e. the message with the menu's table header and rows *underneath* it. The
+replay that runs while `/session`'s menu is still up is the real path:
+`emit_commit`'s frame collapse happens *after* the node's submit, so it is too
+late. The clear is the whole region (EL per row) plus a caret restore, because
+a content line shorter than the terminal also leaves the frame's background to
+its right; and it costs nothing while a turn runs, since streaming has no live
+frame to clear.
+
+The **partial-predicate condition** turned out to be unnecessary: `note_lines`
+already cleared `live` on every content write, so the row-diff path was
+unreachable once content moved. The condition was implied by the very
+invalidation that made this bug possible in the other direction.
 
 **And an input line cannot join zone 2**, which is the right answer to the
 uncertainty in the review: an input needs a stable caret that editing redraws
