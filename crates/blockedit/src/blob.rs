@@ -31,6 +31,13 @@ pub struct ParsedEdit {
     /// 1-based line the block's header anchored to (`path:LINE`), if any. Used
     /// as a nearest-match hint by the backend; never persisted or rendered.
     pub start_line: Option<u64>,
+    /// The file this block's header named, if it had one.
+    ///
+    /// Needed because a blob may legitimately span files — a recursive `bsed`
+    /// preview emits one header per file — and the single-file agreement check
+    /// in [`parse_blocks`] only *validates* headers, it does not keep them. The
+    /// anchor is split off `header`; this is the path part. Not persisted.
+    pub header: Option<String>,
 }
 
 /// Result of parsing a blob.
@@ -210,11 +217,13 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
         // A `path:LINE` suffix supplies this block's anchor; the path part is
         // what participates in the (per-file) agreement check.
         let mut header_anchor: Option<u64> = None;
+        let mut header_path: Option<String> = None;
         if i > 0 {
             if let Some(h) = header_candidate(&lines[i - 1]) {
                 let (path_part, anchor) = split_line_anchor(&h);
                 saw_any_header = true;
                 header_anchor = anchor;
+                header_path = Some(path_part.clone());
                 if !distinct_headers.iter().any(|d| same_path(d, &path_part)) {
                     distinct_headers.push(path_part);
                 }
@@ -297,6 +306,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
             old_text,
             new_text,
             start_line: header_anchor,
+            header: header_path,
         });
 
         i = k + 1;
@@ -507,6 +517,7 @@ pub fn array_to_blob_value(args: &Value) -> Value {
                 .unwrap_or("")
                 .to_string(),
             start_line: None,
+            header: None,
         })
         .collect();
     let blob = render_blob(path, &parsed);
@@ -517,12 +528,22 @@ pub fn array_to_blob_value(args: &Value) -> Value {
 mod tests {
     use super::*;
 
-    /// A block with no anchor, for terse comparisons.
+    /// A block as it comes back from parsing a blob that named `path` on its
+    /// header line.
+    fn headed(path: &str, old: &str, new: &str) -> ParsedEdit {
+        ParsedEdit {
+            header: Some(path.to_string()),
+            ..plain(old, new)
+        }
+    }
+
+    /// A block with no anchor and no header, for terse comparisons.
     fn plain(old: &str, new: &str) -> ParsedEdit {
         ParsedEdit {
             old_text: old.to_string(),
             new_text: new.to_string(),
             start_line: None,
+            header: None,
         }
     }
 
@@ -534,7 +555,8 @@ mod tests {
         assert!(!p.multi_file);
         assert_eq!(
             p.edits,
-            vec![plain(
+            vec![headed(
+                "src/foo.py",
                 "def foo():\n    return 1",
                 "def foo():\n    return 2"
             )]
@@ -548,7 +570,12 @@ mod tests {
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
         assert!(!p.multi_file);
-        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
+        // The first block carries the header; the second inherits the file but
+        // not the header line, so only the first keeps it.
+        assert_eq!(
+            p.edits,
+            vec![headed("src/foo.py", "a", "A"), plain("b", "B")]
+        );
     }
 
     #[test]
@@ -605,7 +632,7 @@ mod tests {
         let text = "src/foo.py\n@@@OLD\nold\n@@@NEW\nnew\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/foo.py"));
-        assert_eq!(p.edits, vec![plain("old", "new")]);
+        assert_eq!(p.edits, vec![headed("src/foo.py", "old", "new")]);
     }
 
     #[test]
@@ -652,7 +679,7 @@ mod tests {
         let text = "```\nsrc/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END\n```";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(p.edits, vec![plain("a", "b")]);
+        assert_eq!(p.edits, vec![headed("src/x.rs", "a", "b")]);
     }
 
     #[test]
@@ -714,7 +741,10 @@ mod tests {
         let text = "some/path\n@@@OLD\nsome text\n@@@NEW\n@@@END>\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("some/path"));
-        assert_eq!(p.edits, vec![plain("some text", "@@@END>")]);
+        assert_eq!(
+            p.edits,
+            vec![headed("some/path", "some text", "@@@END>")]
+        );
     }
 
     #[test]
@@ -844,7 +874,10 @@ mod tests {
         let text = blob.get("edits").and_then(|x| x.as_str()).unwrap();
         let parsed = parse_blocks(text).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(parsed.edits, vec![plain("a", "b"), plain("c", "d")]);
+        assert_eq!(
+            parsed.edits,
+            vec![headed("src/x.rs", "a", "b"), plain("c", "d")]
+        );
     }
 
     #[test]
@@ -859,7 +892,9 @@ mod tests {
         let edits = vec![plain("fn a() {\n    x\n}", "fn a() {\n    y\n}")];
         let blob = render_blob("src/m.rs", &edits);
         let parsed = parse_blocks(&blob).unwrap();
-        assert_eq!(parsed.edits, edits);
+        // render_blob writes the path once, above the first block, so the parse
+        // recovers the same texts plus that header.
+        assert_eq!(parsed.edits, vec![headed("src/m.rs", "fn a() {\n    x\n}", "fn a() {\n    y\n}")]);
     }
 
     #[test]
@@ -938,7 +973,10 @@ mod tests {
         let text = "src/x.rs\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
+        assert_eq!(
+            p.edits,
+            vec![headed("src/x.rs", "a", "A"), plain("b", "B")]
+        );
     }
 
     #[test]
@@ -969,5 +1007,103 @@ mod tests {
         assert_eq!(parsed.edits.len(), 1);
         assert_eq!(parsed.edits[0].old_text, "old");
         assert_eq!(parsed.edits[0].new_text, "new");
+    }
+}
+
+/// One file's worth of blocks, in blob order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileBatch {
+    /// The path, as the header spelled it (or the caller's `path` argument).
+    pub path: String,
+    pub edits: Vec<ParsedEdit>,
+}
+
+/// Split a parsed blob into one batch per file, in first-seen order.
+///
+/// This is the seam between "a blob may span files" and "a write is atomic per
+/// file": a recursive `bsed preview` emits headers for many files, and both
+/// `bsed apply` and the agent's multi-file path need to turn that into one
+/// batch per file rather than one giant batch nobody can apply safely.
+///
+/// Blocks with no header of their own go to `fallback` — the caller's `path`
+/// argument — which is the single-file case, and the reason a header-less blob
+/// still works. Errors only when a block names no file and there is no fallback
+/// to attribute it to.
+pub fn group_by_file(parsed: ParsedBlocks, fallback: Option<&str>) -> Result<Vec<FileBatch>, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut batches: std::collections::HashMap<String, Vec<ParsedEdit>> =
+        std::collections::HashMap::new();
+
+    for edit in parsed.edits {
+        let path = match edit.header.as_deref().or(fallback) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => {
+                return Err(format!(
+                    "block {idx} names no file: set the `path` argument, or put a filename line \
+                     above every `@@@OLD`",
+                    idx = order.len() + 1
+                ))
+            }
+        };
+        if !batches.contains_key(&path) {
+            order.push(path.clone());
+        }
+        batches.entry(path).or_default().push(edit);
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|path| {
+            let edits = batches.remove(&path).unwrap_or_default();
+            FileBatch { path, edits }
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    fn parse(text: &str) -> ParsedBlocks {
+        parse_blocks(text).unwrap()
+    }
+
+    #[test]
+    fn a_recursive_blob_groups_by_header_in_first_seen_order() {
+        // What `bsed preview -r` emits: headers interleaved per file.
+        let text = "a.rs:1\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\nb.rs:4\n@@@OLD\ny\n@@@NEW\nY\n@@@END\n\na.rs:9\n@@@OLD\nz\n@@@NEW\nZ\n@@@END";
+        let g = group_by_file(parse(text), None).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].path, "a.rs");
+        assert_eq!(g[0].edits.len(), 2);
+        assert_eq!(g[0].edits[0].start_line, Some(1));
+        assert_eq!(g[0].edits[1].start_line, Some(9));
+        assert_eq!(g[1].path, "b.rs");
+        assert_eq!(g[1].edits.len(), 1);
+    }
+
+    #[test]
+    fn header_less_blocks_fall_back_to_the_given_path() {
+        let text = "@@@OLD\nx\n@@@NEW\nX\n@@@END";
+        let g = group_by_file(parse(text), Some("src/x.rs")).unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].path, "src/x.rs");
+    }
+
+    #[test]
+    fn a_header_beats_the_fallback() {
+        // The blob names its own file; `path` only fills gaps.
+        let text = "b.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let g = group_by_file(parse(text), Some("a.rs")).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].path, "b.rs");
+        assert_eq!(g[1].path, "a.rs");
+    }
+
+    #[test]
+    fn no_header_and_no_fallback_is_an_error() {
+        let text = "@@@OLD\nx\n@@@NEW\nX\n@@@END";
+        let err = group_by_file(parse(text), None).unwrap_err();
+        assert!(err.contains("names no file"), "{err}");
     }
 }
