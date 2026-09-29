@@ -532,6 +532,55 @@ mod tests {
         assert!(e.contains("no recognizable edit arguments"), "{e}");
     }
 
+    /// Every shape this tool has *ever* accepted on the wire, and what each one
+    /// does now.
+    ///
+    /// This test exists because the rename broke one of them silently. Three
+    /// shapes were accepted before it, and the suite passed with two of the
+    /// three gone: the array went on purpose, and the blob string went by
+    /// accident — the tests did not miss that, they *specified* it
+    /// (`a_blob_under_the_old_field_name_is_inert` asserted that the break was
+    /// correct). Nothing then asked the only question a rename has to ask:
+    /// *did every caller I never migrated stop working?*
+    ///
+    /// So the contract is a table here rather than something re-derived per
+    /// change. The rule is narrow and worth stating: a field name this tool
+    /// has published is either still **accepted**, or **refused by name** —
+    /// never silently unrecognised. The array is the only shape allowed to be
+    /// removed, and it paid for that with a correction naming the field to use.
+    #[test]
+    fn every_wire_shape_this_tool_has_ever_accepted_is_accounted_for() {
+        // (1) `edits` as a blob string — the name from before the rename.
+        // Retired, but still working: `blocks` is what we ask for, not what we
+        // require.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .expect("a pre-rename blob must still be accepted");
+        assert_eq!(a.edits.len(), 1);
+
+        // (2) `edits` as an array — removed on purpose, refused by name.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("`blocks`"), "a removal must name the field: {e}");
+
+        // (3) the single-edit scalars — never touched.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "oldText": "a", "newText": "b"
+        }))
+        .unwrap();
+        assert_eq!(a.edits.len(), 1);
+
+        // (4) the current name.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.edits.len(), 1);
+    }
+
     #[test]
     fn an_empty_edits_array_is_rejected_too() {
         // Belt and braces: a mangled array must never produce zero EditOps and
