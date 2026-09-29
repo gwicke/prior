@@ -164,21 +164,30 @@ Handler in agent.rs moves the leaf pointer via `session.move_leaf()`.
 
 ### Node structure
 
-- `TreeCompactManualNode` — submit sets `AsyncOp::TreeCompact { Manual }`
-- `TreeCompactTextNode` — submit sets `AsyncOp::TreeCompact { TextOnly }`
-- `TreeCompactPromptNode` — submit reads suffix as LLM prompt
+- `TreeCompactManualNode` — manual (touched-files) mode
+- `TreeCompactTextNode` — deterministic text-only summary
+- `TreeCompactPromptNode` — LLM summary (reads suffix as prompt)
 
-All three share `AsyncOp::TreeCompact { target_id, mode, payload }`.
+### Shared prepare/submit flow (editor cleanup E3)
 
-### AsyncOp::TreeCompact handler in agent.rs
+The three nodes share `compact_prepare` / `edit_draft` / `compact_submit`
+(`v25_tree.rs`), called from the node trait's `prepare()` / `edit()` /
+`submit()`:
 
-Ports the existing `/tree <id> compact` handler. Validates target entry,
-computes tokens_before, resolves mode, lazy-builds agent for LLM mode,
-runs `run_compaction()`.
+- `prepare()` validates and drafts via `agent::generate_compaction`,
+  opens `$EDITOR` (`AppState::edit_text`), stashes the result under
+  `(target, epoch)` and returns `SubmitResult::Prepared` — the engine's
+  `NodeEntry` confirm then gates `submit()` behind Enter (apply via
+  `agent::apply_compaction`) / Esc (cancel in place).
+- Non-REPL hosts (in-process / scripted input) run the same nodes through
+  `Repl::batch_slash` — a batch eval (passive derive + virtual Enter,
+  `Prepared` confirms take a second press) with no overlay drawing; the
+  old typed `/tree … compact` arm in `agent.rs` was deleted
+  (doc/editor_cleanup.md §9 E5).
 
-**Note:** Editor integration (`prepare()` opens `$EDITOR`) is deferred —
-the nodes are currently single-phase. The agent loop handler does the
-full compaction flow.
+(The original `AsyncOp::TreeCompact` control-target design sketched in
+this plan was never built that way — there is no `AsyncOp` in the code;
+the nodes call the helpers directly.)
 
 ---
 
@@ -244,9 +253,11 @@ Rewrites to `/tree <last-user> compact`. Deferred until
 and `DoneError`. The next prompt draws its own separator.
 
 ### Revisit editor integration in compact prepare()
-`prepare()` opens `$EDITOR` for manual/text-only draft editing.
-Requires session access from the node (currently deferred to agent loop).
-This works, so this is low priority.
+**Done (editor cleanup E3).** The nodes own the whole flow:
+`prepare()` → `agent::generate_compaction` → `$EDITOR` (via
+`AppState::edit_text`) → stash → engine confirm → `submit()` applies
+via `agent::apply_compaction`. No session access is deferred to the
+agent loop anymore (doc/editor_cleanup.md §6).
 
 ### Box-drawing characters
 Branch visualization with box-drawing. Deferred — simple indentation

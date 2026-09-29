@@ -195,19 +195,20 @@ Mechanics:
   *before* committing — is rendered as non-selectable **header rows** in the
   menu (`BG_HEADER`), the same place `SessionAction` shows its session info.
   After the committed line is printed, nothing informational follows it.
-- **Cancel during review → re-enter the prompt.** Some commands have a
-  **review step** after commit: the user is shown a generated artifact
-  (e.g. a compaction summary draft) in `$EDITOR`, then asked to Accept or
-  Cancel. When the user cancels (or presses `Esc`), do **not** print a cancel
-  message. Instead, set `pending_prefill = Some(input.clone())` in the main
-  loop (where `input` is the committed prompt, e.g. `/tree <id> compact
-  llm`) and `continue`. The next `read_input` call will seed the editor with
-  the same line, dropping the user back into the menu/overlay state so they
-  can switch modes, tune a parameter, or abandon the action entirely — without
-  any extra output. The `CompactionResult` enum in `src/agent.rs`
-  (`Done / Cancelled / Err`) encodes this three-way distinction at the
-  handler level, keeping the re-entry logic in one place. This pattern is
-  applicable to any slash command that has a review/edit step before writing.
+- **Cancel during review → stay in place.** Some commands have a
+  **review step**: the node's `prepare()` opens a generated artifact
+  (e.g. a compaction summary draft) in `$EDITOR` and returns
+  `SubmitResult::Prepared`; the engine's native confirm (`NodeEntry`)
+  then gates `submit()` behind Enter / Esc. When the user cancels
+  (`Esc`), do **not** print a cancel message or re-seed the prompt —
+  the confirm disarms and the menu stays open on the node, so the user
+  can re-edit (Ctrl-E re-opens the stashed draft), switch modes, tune a
+  parameter, or navigate away, all without extra output. A stale epoch
+  or consumed stash rejects `submit()` with a regenerate hint, and the
+  next Enter re-runs `prepare()`. This applies to any slash command
+  that grows a review/edit step before writing (the pre-E3
+  `pending_prefill` re-entry + `CompactionResult` enum were deleted;
+  doc/editor_cleanup.md §6).
 
 Why: the scrollback becomes a clean, greppable transcript of *what the user
 did* (`/model anthropic:claude-…`, `/session <id> fork`, `/tree <id> switch

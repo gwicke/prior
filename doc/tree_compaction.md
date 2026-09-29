@@ -9,18 +9,23 @@ instead of forking a new session. The session file stays in-place and remains
 bidirectionally compatible with pi's session format.
 
 **Phase 7** added a `/compact` slash command that surfaces the same
-three-mode compaction sub-menu (`truncate` / `text-only` / `llm`) and
-auto-resolves the target to the **last user message** on the active branch.
-The command is fully driven by a shared `run_compaction` backend that also
-serves `/tree <id> compact`; the LLM mode's prompt customization, the
-`llm_compact_prompt` setting, and the predecessor / move-back dance are
-all reused unchanged. A `CompactionTarget::Abandoned` variant is wired
-up in the backend (currently `#[allow(dead_code)]`) so a future
-`/tree <id> switch --summarize` UI extension can drop in without
-touching the shared logic.
+three-mode compaction sub-menu (`manual` / `text-only` / `llm`; `truncate`
+is a deprecated alias of `manual`) and auto-resolves the target to the
+**last user message** on the active branch.
 
-**Scope:** `truncate` (empty `summary`), `text-only` (deterministic
-text summary), and `llm` (LLM-generated summary) compaction. The LLM mode
+**Editor cleanup E3** (`doc/editor_cleanup.md` §6) replaced the Phase-7
+`run_compaction` backend: `agent::generate_compaction` validates, snapshots
+`tokens_before`, and drafts the summary (one pivot dance for all modes;
+prompt customization and `llm_compact_prompt` unchanged),
+`agent::apply_compaction` appends the entry, and the UI is the nodes'
+native two-phase flow — `prepare()` (draft → `$EDITOR`) → `Prepared` →
+Enter submits / Esc cancels in place. The `run_compaction` /
+`CompactionTarget` APIs (including the dormant `Abandoned` variant) were
+deleted in E3.
+
+**Scope:** `manual` (touched-files pre-fill; empty summary when the dropped
+span touches no files), `text-only` (deterministic text summary), and
+`llm` (LLM-generated summary) compaction. The LLM mode
 runs the dropped span through `agent.summarize()` after temporarily
 moving the leaf to the entry just before the compaction point; the leaf is
 restored before the compaction entry is appended, leaving the session
@@ -1270,27 +1275,47 @@ output after the commit.
 
 ### 6.7b Summary review & edit (before the entry is written)
 
-For the summary-producing modes (`text only`, `llm`), the generated draft
-is **reviewed by the user before** the `Compaction` entry is appended:
+For the summary-producing modes (`text-only`, `llm`), the generated draft
+is **reviewed by the user before** the `Compaction` entry is appended.
+Since editor cleanup E3 (`doc/editor_cleanup.md` §6) this is the nodes'
+native two-phase workflow — there is no separate review hook or
+Accept/Cancel overlay:
 
-1. `run_compaction` builds the draft (deterministic text-only summary, or
-   the LLM summary after the leaf dance), then calls the caller-supplied
-   review hook (`CompactionSummaryReview` in `src/agent.rs`).
-2. In the interactive REPL, the hook drops raw mode and opens the draft in
-   `$EDITOR` (reuses `edit_in_editor` — the Ctrl-E prompt editor), re-enters
-   raw mode, then shows an **Accept / Cancel** overlay via
-   `Output::confirm_compaction_summary` with **Accept as the Enter default**
-   (Esc / `c` cancels).
-3. On **Accept**, the (possibly edited) text is stored as the entry's
-   `summary`. On **Cancel** (or editor failure), `run_compaction` returns
-   `Ok(())` without appending — no compaction entry is written and the
-   session is untouched (for `llm` mode the leaf was already restored).
+1. **Prepare.** Enter on a compact node runs `prepare()` →
+   `compact_prepare` (`src/v25_tree.rs`): `agent::generate_compaction`
+   builds the draft (deterministic text-only summary, or the LLM summary
+   after the leaf dance), the draft opens in `$EDITOR` (shared
+   `run_editor` wrapper via `AppState::edit_text`), and the result is
+   stashed under `(target, epoch)` — `SubmitResult::Prepared` arms the
+   engine's `NodeEntry` confirm.
+2. **Confirm.** The `Prepared` state shows the node's guidance header.
+   Enter → `submit()` → `compact_submit` applies the stashed draft via
+   `agent::apply_compaction` and commits silently (the committed line
+   documents the write); **Esc cancels in place** — no cancel message,
+   the menu stays open (Ctrl-E then re-opens the stashed draft). A stale
+   epoch or a consumed stash is rejected with
+   `[ERROR]: No fresh prepared summary — press Enter to generate one.`
+   and the next Enter regenerates.
+3. Entry points: interactively the engine drives the flow key by key; a
+   non-REPL host (in-process / scripted input) runs the same line through
+   `Repl::batch_slash` — passive derive + virtual Enter (`Prepared` takes
+   a second press; a navigating Enter stops the sequence) with no overlay
+  drawing.
 
-Outside the interactive REPL (quiet / pipe / tests) the hook is absent and
-the draft is stored as-is — behavior is unchanged from before this step.
-`truncate` (empty summary) never opens the editor.
+Without an interactive tty (quiet / pipe / tests) `edit_text` reports
+`Unsupported` and the generated draft is accepted as-is — the pre-split
+review closure behaved the same outside the REPL. A failed `prepare`
+reports its message and closes without appending; the session is
+untouched (for `llm` mode the leaf was already restored by
+`generate_compaction`'s error path).
 
 ### 6.8 Handler implementation sketch (`src/agent.rs`)
+
+> **Superseded (editor cleanup E3).** The sketch below shows the pre-E3
+> inline handler. Today `agent.rs` keeps only parse/dispatch (plus a
+> reachability note); validation, the draft, the editor, and the write
+> live in `generate_compaction` / `apply_compaction` and the nodes'
+> `prepare()` / `submit()` (§6.7b, `doc/editor_cleanup.md` §6).
 
 The `TreeAction::Compact` arm of the main-loop `/tree` block gains an `Llm`
 mode branch, slotted into the same `match mode.unwrap_or(CompactSummaryMode::Truncate)`
@@ -1561,6 +1586,12 @@ to use (`/set <key> <free-text-value>` is the closest precedent).
 | Phase 7 — last user message is itself a compaction | **Superseded.** The compaction-refuse check was removed (doc/nested_compactions.md phase C); `/compact` now resolves normally and may write a new compaction over a compaction leaf. |
 
 ## Phase 7 — Compaction unification: shared `run_compaction` + `/compact`
+
+> **Historical record.** Phase 7 shipped as described; editor cleanup E3
+> later deleted `run_compaction` / `CompactionTarget` in favor of the
+> generate/apply split (`doc/editor_cleanup.md` §6). The "wired up but
+> dormant" `CompactionTarget::Abandoned` went with them — see
+> `doc/todo.md` for the still-open `/tree … switch --summarize` UI item.
 
 **Goal:** extract the per-mode mechanics of `/tree <id> compact` into a
 shared `run_compaction` helper so the same backend serves both the

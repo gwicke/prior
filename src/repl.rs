@@ -14,6 +14,7 @@
 
 use crate::agent::SessionUsage;
 use crate::app_state::AppState;
+use crate::editor::{run_editor, EditorMode};
 use crate::model_catalog;
 use crate::output::Output;
 use crate::session::SessionTreeNode;
@@ -908,9 +909,16 @@ impl Repl {
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match &overlay {
                                 ActiveOverlay::None => {
-                                    // Edit input buffer.
-                                    let _ = self.guard.stop();
-                                    match edit_in_editor(&editor.text()) {
+                                    // Edit the input buffer. The wrapper owns
+                                    // the whole turnover — reader gate, raw
+                                    // mode, DSR re-anchor; no local logic here
+                                    // (doc/editor_cleanup.md §2).
+                                    match run_editor(
+                                        &self.guard,
+                                        output,
+                                        &editor.text(),
+                                        EditorMode::Edit,
+                                    ) {
                                         Ok(new_text) => {
                                             editor.set(&new_text);
                                         }
@@ -920,51 +928,14 @@ impl Repl {
                                             );
                                         }
                                     }
-                                    let _ = self.guard.start();
-                                    // The editor owned the screen while we were
-                                    // out: re-anchor the draw cache (DSR) before
-                                    // the next paint (plan §4.2). A *height*
-                                    // change the editor caused is folded into
-                                    // `painted_size` here (the re-anchor already
-                                    // covered it), while a *width* change is left
-                                    // for the wipe + replay at the loop top.
-                                    let _ = output.cursor_row();
-                                    if let Ok((_, h)) = crossterm::terminal::size() {
-                                        let (w, _) = painted_size.get();
-                                        painted_size.set((w, h.max(1) as usize));
-                                    }
                                     continue;
                                 }
-                                ActiveOverlay::V25Menu { plan } => {
-                                    // Edit header content from the current plan's detail lines.
-                                    let header_text = plan
-                                        .detail
-                                        .iter()
-                                        .map(|l| l.0.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    if !header_text.is_empty() {
-                                        let _ = self.guard.stop();
-                                        match edit_in_editor(&header_text) {
-                                            Ok(_) => { /* user viewed/saved; no feedback */ }
-                                            Err(e) => {
-                                                let _ = io::stdout().write_all(
-                                                    format!("\r\neditor error: {}\r\n", e)
-                                                        .as_bytes(),
-                                                );
-                                            }
-                                        }
-                                        let _ = self.guard.start();
-                                        // The editor was a foreign screen writer
-                                        // here too: re-anchor the draw cache (DSR)
-                                        // and fold any height change, exactly as
-                                        // in the `None` arm above.
-                                        let _ = output.cursor_row();
-                                        if let Ok((_, h)) = crossterm::terminal::size() {
-                                            let (w, _) = painted_size.get();
-                                            painted_size.set((w, h.max(1) as usize));
-                                        }
-                                    }
+                                ActiveOverlay::V25Menu { .. } => {
+                                    // Ctrl-E on a menu endpoint dispatches to
+                                    // the node's edit() through the engine
+                                    // (doc/editor_cleanup.md §3/§5): the node
+                                    // owns what (if anything) to edit.
+                                    pending_key = Some(crate::slashdot_menu::HostKey::Edit);
                                     continue;
                                 }
                                 ActiveOverlay::PathComplete { .. } => {
@@ -1258,6 +1229,117 @@ impl Repl {
         V25Frame::DoneError(msg, buf.trim_start_matches('/').to_string())
     }
 
+    /// Non-REPL slash driver (quiet / piped stdin): run one complete `/…`
+    /// line through the v2.5 menu engine as if it had been typed and
+    /// submitted, with **no overlay drawing** — `Continue` plans are
+    /// dropped, commits echo through the same `Output` methods an
+    /// interactive `emit_commit` uses (messages, confirm, and the
+    /// no-tty `$EDITOR` fallback all stay `Output`/`AppState` concerns;
+    /// menu painting is host-side and never happens here).
+    ///
+    /// Returns `None` for input this driver does not own (empty, non-slash,
+    /// `/q`) so the caller falls back to raw `Submit`.
+    ///
+    /// Key mapping — a passive derive (`HostKey::None`, exactly what typing
+    /// does), then virtual `Enter` presses:
+    /// - ordinary endpoints finish on the first Enter (`prepare` defaults to
+    ///   `submit`);
+    /// - two-phase nodes (`Prepared`, e.g. compaction) take a second one —
+    ///   an Enter whose returned prompt still matches the stage re-presses;
+    /// - an Enter that *navigates* (returned prompt moved: a listing drill)
+    ///   stops the sequence instead — blind further Enters could act on a
+    ///   row the user never chose;
+    /// - a pure rewrite (`ContinuePrompt`, e.g. `/compact` →
+    ///   `/tree <id> compact`) re-derives passively and presses again —
+    ///   from the user's viewpoint that pair is still one Enter.
+    pub(crate) async fn batch_slash(
+        app_state: &Arc<AppState>,
+        input: &str,
+        output: &dyn Output,
+        history: &mut History,
+    ) -> Option<InputAction> {
+        use crate::slashdot_menu::node_impl::MenuResult;
+        use crate::slashdot_menu::HostKey;
+        // Total evals (passive derives + Enters) for one line: rewrite
+        // chains plus prepare/confirm pairs; anything beyond a handful is
+        // a cycle or an endlessly re-rendering node — stop.
+        const MAX_EVALS: usize = 8;
+        if input.is_empty() || !input.starts_with('/') || input == "/q" {
+            return None;
+        }
+        let mut menu = crate::v25_menu::build_menu(app_state);
+        let mut handle = menu.get_handle();
+        let width = crate::output::term_width();
+        let mut buf = input.to_string();
+        // Prompt of the last Continue — the node an Enter acts on. `None`
+        // means "derive passively before pressing".
+        let mut stage: Option<String> = None;
+        let mut press_enter = false;
+        let mut evals = 0;
+        loop {
+            evals += 1;
+            if evals > MAX_EVALS {
+                break;
+            }
+            let key = if press_enter {
+                HostKey::Enter
+            } else {
+                HostKey::None
+            };
+            let line = buf.trim_start_matches('/').to_string();
+            let cursor = line.len();
+            match handle
+                .eval_prompt_with_cursor(&line, key, width, cursor)
+                .await
+            {
+                MenuResult::ContinuePrompt(new_prompt) => {
+                    // Pure rewrite: adopt it, re-derive passively, then
+                    // press again (the rewrite consumed one Enter).
+                    buf = format!("/{}", new_prompt);
+                    stage = None;
+                    press_enter = false;
+                }
+                MenuResult::Continue(_plan, prompt) => {
+                    if press_enter {
+                        match &stage {
+                            // Still on the same node → the Enter armed or
+                            // re-armed a confirm → press again.
+                            Some(s) if *s == prompt => {}
+                            // Navigated (listing drill): stop uncommitted.
+                            _ => break,
+                        }
+                    } else {
+                        stage = Some(prompt);
+                    }
+                    press_enter = true;
+                }
+                MenuResult::DoneSuccess(msg, prompt) => {
+                    Self::batch_commit(output, history, &prompt, msg.as_deref());
+                    return Some(InputAction::MenuDone);
+                }
+                MenuResult::DoneError(err, prompt) => {
+                    Self::batch_commit(output, history, &prompt, Some(&err));
+                    return Some(InputAction::MenuDone);
+                }
+            }
+        }
+        // Cap exhausted or navigation without a commit: nothing written and
+        // nothing echoed (an overlay would have been showing in a REPL).
+        Some(InputAction::MenuDone)
+    }
+
+    /// Echo a batch-committed prompt to the transcript and surface the
+    /// node's message — the drawing-free counterpart of `emit_commit`
+    /// (no input region to clear, no prefill to seed).
+    fn batch_commit(output: &dyn Output, history: &mut History, prompt: &str, msg: Option<&str>) {
+        let committed = format!("/{}", prompt);
+        history.add(&committed);
+        output.display_plain(&committed);
+        if let Some(m) = msg {
+            output.display_text(m);
+        }
+    }
+
     /// Cursor policy for buffer-derived option menus (`read_input`).
     ///
     /// `active` is the overlay's current-state / default row as re-derived
@@ -1330,8 +1412,8 @@ impl Repl {
         history.add(line);
         // No DSR here: the draw cache is the steady-state anchor
         // (`frame_anchor()`), content writes advance it, and a foreign
-        // screen writer ($EDITOR via `review_compaction_summary`) re-anchors
-        // on exit (plan §4.2). Clear the input region, then echo the line
+        // screen writer ($EDITOR through `run_editor`) re-anchors on exit
+        // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
         redraw(&LineEditor::new(), &[], sel, dims);
         output.display_plain(line);
@@ -1459,129 +1541,6 @@ impl Repl {
             }
             _ => None,
         }
-    }
-}
-
-/// Resolve the external editor command from environment variables.
-/// Priority: `$VISUAL` > `$EDITOR` > `"vim"`.
-/// Returns `(command, args)` where args may include flags e.g. `("emacs", ["-nw"])`.
-fn resolve_editor() -> (String, Vec<String>) {
-    let raw = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vim".into());
-    let parts: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
-    let cmd = parts.first().cloned().unwrap_or_else(|| "vim".into());
-    let args: Vec<String> = parts.into_iter().skip(1).collect();
-    (cmd, args)
-}
-
-/// Open `current` in `$EDITOR` (foreground child process) and return the
-/// modified text.  The editor inherits the terminal directly (stdin/stdout/
-/// stderr), so the caller must drop raw mode beforehand and re‑enter it
-/// afterwards.
-///
-/// A single trailing `\n` is stripped on read‑back because most editors add
-/// one.  Internal newlines and intentional trailing blank lines are preserved.
-/// The tempfile is cleaned up on every return path.
-pub(crate) fn edit_in_editor(current: &str) -> io::Result<String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let mut path = PathBuf::from(tmpdir);
-    path.push(format!("picocode_prompt_{}", std::process::id()));
-
-    // Write current content, mode 0600 so other users cannot read the
-    // prompt mid‑edit.
-    {
-        let mut f = std::fs::File::create(&path)?;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(current.as_bytes())?;
-        f.flush()?;
-    }
-
-    // Launch editor.
-    let (cmd, mut args) = resolve_editor();
-    args.push(path.to_string_lossy().to_string());
-
-    let status = std::process::Command::new(&cmd)
-        .args(&args)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&path);
-            e
-        })?;
-
-    if !status.success() {
-        let _ = std::fs::remove_file(&path);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("editor exited with status {:?}", status.code()),
-        ));
-    }
-
-    // Read back.
-    let mut result = std::fs::read_to_string(&path).map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        e
-    })?;
-
-    // Strip exactly one trailing newline (most editors add one).
-    if result.ends_with('\n') {
-        result.pop();
-    }
-
-    let _ = std::fs::remove_file(&path);
-    Ok(result)
-}
-
-/// Let the user review — and edit — a generated compaction summary before it
-/// is written to the session (doc/nested_compactions.md §review UX).
-///
-/// 1. Drop raw mode, open `draft` in the external `$EDITOR` (reuses the
-///    Ctrl-E prompt-editing machinery), re-enter raw mode.
-/// 2. Ask the user to accept (default) or cancel via `Output`'s
-///    accept/cancel dialog.
-///
-/// Returns `Some(final_text)` to store (the possibly-edited summary) on
-/// accept, or `None` on cancel / editor failure. The caller must not append a
-/// compaction entry when this returns `None`.
-///
-/// `guard` must be the REPL's term guard (only present on an interactive
-/// TTY); the editor cannot be launched without it. Callers running outside
-/// the interactive REPL (quiet / pipe / tests) should pass a review closure
-/// that simply accepts the draft — see `run_compaction`'s callers.
-pub(crate) fn review_compaction_summary(
-    guard: &TermGuard,
-    output: &dyn Output,
-    draft: &str,
-) -> Option<String> {
-    // Drop raw mode for the foreground editor; re-enter on return (mirrors
-    // the Ctrl-E path in read_input).
-    let _ = guard.stop();
-    let edited = edit_in_editor(draft);
-    let _ = guard.start();
-    // The editor is a foreign screen writer: re-anchor the draw cache to the
-    // real cursor (DSR) and invalidate the frame region before anything else
-    // draws (plan §4.2).
-    let _ = output.cursor_row();
-
-    let text = match edited {
-        Ok(t) => t,
-        Err(e) => {
-            output.display_error(&format!("editor error: {}", e));
-            return None;
-        }
-    };
-    if output.confirm_compaction_summary(
-        "Write this compaction summary into the session? (edited text is stored)",
-    ) {
-        Some(text)
-    } else {
-        output.display_text("Compaction cancelled.");
-        None
     }
 }
 
@@ -2177,6 +2136,104 @@ fn history_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Batch slash driver (`Repl::batch_slash`) — the non-REPL input path
+    // (quiet / piped stdin): a complete line commits through the v2.5
+    // engine with a virtual Enter and no overlay drawing.
+    // ------------------------------------------------------------------
+
+    fn batch_state() -> Arc<AppState> {
+        let settings = crate::settings::SettingsStore {
+            default_model: "anthropic:claude-3-5-sonnet-20241022".into(),
+            security_mode: "confirm".into(),
+            tool_call_limit: 10,
+            default_persona: None,
+            default_thinking_level: "off".into(),
+            show_reasoning: "indicator".into(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            session_resume_replay_turns: 3,
+            llm_compact_prompt: String::new(),
+            path: None,
+        };
+        AppState::for_test(settings)
+    }
+
+    /// In-memory history (no disk file) — `batch_commit` only appends.
+    fn batch_hist() -> History {
+        History {
+            entries: Vec::new(),
+            file: None,
+        }
+    }
+
+    #[test]
+    fn batch_slash_thinking_high_commits_in_one_enter() {
+        let state = batch_state();
+        let (out, lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/thinking high",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+        // The node wrote the runtime target; the loop's convergence step
+        // would apply it on the same cycle.
+        assert_eq!(state.thinking().as_deref(), Some("high"));
+        let captured = crate::output::RecordingOutput::joined(&lines);
+        assert!(
+            captured.contains("thinking high"),
+            "committed line not echoed: {:?}",
+            captured
+        );
+    }
+
+    #[test]
+    fn batch_slash_quit_latches_control_target() {
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/quit",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+        assert!(state.take_control().quit);
+    }
+
+    #[test]
+    fn batch_slash_defers_what_it_does_not_own() {
+        // Empty, prose, and the `/q` alias fall back to raw `Submit`
+        // (the agent loop's `/q`/`exit` arm keeps owning them).
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        for line in ["", "hello", "/q"] {
+            let action = crate::agent::block_on_test(Repl::batch_slash(
+                &state,
+                line,
+                out.as_ref(),
+                &mut batch_hist(),
+            ));
+            assert!(action.is_none(), "{:?} should fall through", line);
+        }
+    }
+
+    #[test]
+    fn batch_slash_unknown_command_returns_instead_of_hanging() {
+        let state = batch_state();
+        let (out, _lines) = crate::output::RecordingOutput::new();
+        let action = crate::agent::block_on_test(Repl::batch_slash(
+            &state,
+            "/definitely-not-a-command",
+            out.as_ref(),
+            &mut batch_hist(),
+        ));
+        // Whatever the engine reports for garbage input, the driver must
+        // terminate (the eval cap) and hand back control.
+        assert!(matches!(action, Some(InputAction::MenuDone)));
+    }
 
     // --- Phase 2: string-hierarchy parsing (pure) ---
 
@@ -3447,196 +3504,6 @@ mod tests {
             // Caret on the (single-row) input: 0-idx row 7, col 2 (prompt end).
             assert_eq!((cr, cc), (7, 2));
         }
-    }
-
-    // ===== resolve_editor / edit_in_editor tests =====
-    //
-    // These tests modify environment variables (VISUAL / EDITOR) and must
-    // run serially to avoid races.  `ENV_LOCK` serialises them.
-
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::Mutex;
-
-    /// Global mutex that serialises all env-var-modifying tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Save and restore environment variables around a test closure.
-    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(String, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-            .collect();
-        for (k, v) in vars {
-            match v {
-                Some(val) => unsafe {
-                    std::env::set_var(k, val);
-                },
-                None => unsafe {
-                    std::env::remove_var(k);
-                },
-            }
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(val) => unsafe {
-                    std::env::set_var(&k, &val);
-                },
-                None => unsafe {
-                    std::env::remove_var(&k);
-                },
-            }
-        }
-    }
-
-    #[test]
-    fn resolve_editor_prefers_visual() {
-        with_env(
-            &[("VISUAL", Some("myeditor")), ("EDITOR", Some("other"))],
-            || {
-                let (cmd, args) = super::resolve_editor();
-                assert_eq!(cmd, "myeditor", "VISUAL must take priority");
-                assert!(args.is_empty(), "no flags: {:?}", args);
-            },
-        );
-    }
-
-    #[test]
-    fn resolve_editor_falls_back_to_editor() {
-        with_env(&[("VISUAL", None), ("EDITOR", Some("nano"))], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "nano", "EDITOR fallback");
-            assert!(args.is_empty());
-        });
-    }
-
-    #[test]
-    fn resolve_editor_defaults_to_vim() {
-        with_env(&[("VISUAL", None), ("EDITOR", None)], || {
-            let (cmd, args) = super::resolve_editor();
-            assert_eq!(cmd, "vim", "default to vim");
-            assert!(args.is_empty());
-        });
-    }
-
-    #[test]
-    fn resolve_editor_splits_flags() {
-        with_env(
-            &[
-                ("VISUAL", Some("emacs -nw --no-site-file")),
-                ("EDITOR", None),
-            ],
-            || {
-                let (cmd, args) = super::resolve_editor();
-                assert_eq!(cmd, "emacs");
-                assert_eq!(args, vec!["-nw", "--no-site-file"]);
-            },
-        );
-    }
-
-    /// Helper: run `edit_in_editor` with `current` content by setting
-    /// `EDITOR` to a shell script that writes `expected_output` to the file.
-    fn mock_edit(current: &str, editor_body: &str, expected_output: &str) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("mock_editor.sh");
-        {
-            let mut f = std::fs::File::create(&script).expect("create script");
-            f.write_all(b"#!/bin/sh\n").unwrap();
-            f.write_all(editor_body.as_bytes()).unwrap();
-            f.flush().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor(current);
-                assert!(result.is_ok(), "edit_in_editor failed: {:?}", result.err());
-                assert_eq!(result.unwrap(), expected_output);
-            },
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_roundtrip() {
-        mock_edit(
-            "hello world",
-            "printf '%s' 'edited content' > \"$1\"\n",
-            "edited content",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_empty_buffer() {
-        mock_edit("", "printf '%s' 'new content' > \"$1\"\n", "new content");
-    }
-
-    #[test]
-    fn edit_in_editor_trailing_newline_stripped() {
-        mock_edit(
-            "hello",
-            "printf '%s\\n' 'hello world' > \"$1\"\n",
-            "hello world",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_preserves_internal_newlines() {
-        mock_edit(
-            "line1\nline2\nline3",
-            "printf '%s\\n%s\\n%s' 'aaa' 'bbb' 'ccc' > \"$1\"\n",
-            "aaa\nbbb\nccc",
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_keeps_trailing_blank_lines() {
-        // If the file ends with "a\n\n" (a, plus one blank line), stripping
-        // one trailing \n must leave "a\n" — the blank line is preserved.
-        mock_edit("a\n\n", "printf '%s\\n\\n' 'a' > \"$1\"\n", "a\n");
-    }
-
-    #[test]
-    fn edit_in_editor_nonzero_exit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script = dir.path().join("failing_editor.sh");
-        {
-            let mut f = std::fs::File::create(&script).expect("create script");
-            f.write_all(b"#!/bin/sh\nexit 1\n").unwrap();
-            f.flush().unwrap();
-        }
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod script");
-
-        with_env(
-            &[
-                ("VISUAL", Some(script.to_string_lossy().as_ref())),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor("original");
-                assert!(result.is_err(), "non-zero exit must return error");
-            },
-        );
-    }
-
-    #[test]
-    fn edit_in_editor_nonexistent_command() {
-        with_env(
-            &[
-                ("VISUAL", Some("/nonexistent/editor_binary")),
-                ("EDITOR", None),
-            ],
-            || {
-                let result = super::edit_in_editor("hello");
-                assert!(result.is_err(), "nonexistent command must return error");
-            },
-        );
     }
 
     // --- compute_space_budget tests ---

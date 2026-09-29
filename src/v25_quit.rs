@@ -25,6 +25,12 @@ impl SlashDotNode for QuitNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec!["Quit the session.".to_string()]
     }

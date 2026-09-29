@@ -334,6 +334,12 @@ impl SlashDotNode for SessionListNode {
         session_fields()
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(session_id) = drilled_session_id(path_args) else {
             return vec!["Select a session, then choose an action.".to_string()];
@@ -469,6 +475,12 @@ impl SlashDotNode for SessionResumeNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Resume the session and replay the last N turns.".to_string(),
@@ -535,6 +547,12 @@ impl SlashDotNode for SessionForkNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Fork this session into a new one in the current directory.".to_string(),
@@ -581,6 +599,12 @@ impl SlashDotNode for SessionRenameNode {
             rows: vec![Row::new("rename").desc("rename the session")],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
@@ -664,6 +688,12 @@ impl SlashDotNode for SessionDeleteNode {
             rows: vec![Row::new("delete").desc("delete from disk")],
             active_ids: Vec::new(),
         }))
+    }
+
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
     }
 
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {

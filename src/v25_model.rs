@@ -12,7 +12,7 @@ use crate::app_state::AppState;
 use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, StaticListingNode, StaticRow, SubmitResult,
+    DataResponse, DataResult, PathArgs, SlashDotNode, StaticRow, SubmitResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,6 +318,7 @@ pub fn model_columns() -> Vec<ColumnDef> {
 pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::fields::{FieldSpec, SortDir};
     use crate::slashdot_menu::menu::SlashDotMenuNode;
+    use crate::v25_listing_node::ListingNode;
 
     let desc_of = |name: &str| -> &'static str {
         crate::model_catalog::MODEL_MODIFIERS
@@ -327,48 +328,50 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
             .unwrap_or("")
     };
 
-    let mut node: SlashDotMenuNode =
-        StaticListingNode::new(&[StaticRow::new("model", "select a model (provider:name)")])
-            .with_columns(model_columns())
-            .with_fields(vec![
-                FieldSpec::new("context", true)
-                    .dir(SortDir::Asc)
-                    .description(desc_of("context")),
-                FieldSpec::new("price_input", true)
-                    .dir(SortDir::Asc)
-                    .description(desc_of("price_input")),
-                FieldSpec::new("price_output", true)
-                    .dir(SortDir::Asc)
-                    .description(desc_of("price_output")),
-                FieldSpec::new("price", true)
-                    .dir(SortDir::Asc)
-                    .description(desc_of("price")),
-                FieldSpec::new("coding", true)
-                    .dir(SortDir::Desc)
-                    .description(desc_of("coding")),
-                FieldSpec::new("intelligence", true)
-                    .dir(SortDir::Desc)
-                    .description(desc_of("intelligence")),
-                FieldSpec::new("agentic", true)
-                    .dir(SortDir::Desc)
-                    .description(desc_of("agentic")),
-                FieldSpec::new("reasoning", true)
-                    .dir(SortDir::Desc)
-                    .description("reasoning capability"),
-                FieldSpec::new("created", false)
-                    .dir(SortDir::Desc)
-                    .description("creation date"),
-                FieldSpec::new("coding_price", true)
-                    .dir(SortDir::Desc)
-                    .description("coding_price"),
-                FieldSpec::new("intelligence_price", true)
-                    .dir(SortDir::Desc)
-                    .description("intelligence_price"),
-                FieldSpec::new("agentic_price", true)
-                    .dir(SortDir::Desc)
-                    .description("agentic_price"),
-            ])
-            .into();
+    let mut node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new("model", "select a model (provider:name)")],
+    )
+    .with_columns(model_columns())
+    .with_fields(vec![
+        FieldSpec::new("context", true)
+            .dir(SortDir::Asc)
+            .description(desc_of("context")),
+        FieldSpec::new("price_input", true)
+            .dir(SortDir::Asc)
+            .description(desc_of("price_input")),
+        FieldSpec::new("price_output", true)
+            .dir(SortDir::Asc)
+            .description(desc_of("price_output")),
+        FieldSpec::new("price", true)
+            .dir(SortDir::Asc)
+            .description(desc_of("price")),
+        FieldSpec::new("coding", true)
+            .dir(SortDir::Desc)
+            .description(desc_of("coding")),
+        FieldSpec::new("intelligence", true)
+            .dir(SortDir::Desc)
+            .description(desc_of("intelligence")),
+        FieldSpec::new("agentic", true)
+            .dir(SortDir::Desc)
+            .description(desc_of("agentic")),
+        FieldSpec::new("reasoning", true)
+            .dir(SortDir::Desc)
+            .description("reasoning capability"),
+        FieldSpec::new("created", false)
+            .dir(SortDir::Desc)
+            .description("creation date"),
+        FieldSpec::new("coding_price", true)
+            .dir(SortDir::Desc)
+            .description("coding_price"),
+        FieldSpec::new("intelligence_price", true)
+            .dir(SortDir::Desc)
+            .description("intelligence_price"),
+        FieldSpec::new("agentic_price", true)
+            .dir(SortDir::Desc)
+            .description("agentic_price"),
+    ])
+    .into();
     // Live session model: reads the runtime-target config, writes it, and
     // records the explicit user commit in one place.
     let reader = app_state.clone();
@@ -571,6 +574,7 @@ mod tests {
     }
 
     fn build_test_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
+        use crate::slashdot_menu::node_impl::StaticListingNode;
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut ml: SlashDotMenuNode =

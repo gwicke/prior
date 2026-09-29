@@ -172,7 +172,7 @@ derived as `frame_top_row + frame.caret.row`; never stored twice. `frame_anchor(
 | Our own frame apply | updates `caret`, `live`, `screen_bottom` itself |
 | `display_text`/`display_plain`/tool panels (`note_lines`) | advance `caret`; `live = None` |
 | `emit_commit`-style frames (`Append`) | advance `caret` past the written rows; `live = None` |
-| `$EDITOR` wrapper (`review_compaction_summary`, Ctrl-E) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
+| `$EDITOR` wrapper (`run_editor`: Ctrl-E prompt edit, compaction draft edit) | `cursor_row()` (DSR) after exit → `caret`; `live = None` |
 | Resize | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Ctrl-Z resume | `cursor_row()` (DSR) re-anchor; `live = None` |
 | Dialog entry (`ui::confirm`) | `cursor_row()` (DSR) re-anchor — mid-turn the tracked caret does not follow streamed content; `live = None`. Afterwards the dialog itself maintains the cache through `draw_frame` |

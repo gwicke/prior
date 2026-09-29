@@ -672,6 +672,12 @@ impl SlashDotNode for TreeListNode {
         tree_fields()
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
         let Some(entry_id) = Self::drilled_entry_id(path_args) else {
             return vec!["Select a tree entry, then choose an action.".to_string()];
@@ -735,6 +741,12 @@ impl SlashDotNode for TreeSwitchNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Move the session leaf to this entry.".to_string(),
@@ -787,6 +799,12 @@ impl SlashDotNode for CompactNode {
         }))
     }
 
+    async fn edit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let render_ctx = crate::v25_listing_node::header_ctx();
+        let header = self.header(path_args, &render_ctx).await;
+        crate::v25_listing_node::view_header(&self.app_state, &header)
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Compact: summarize entries before the current point.".into(),
@@ -813,19 +831,21 @@ impl SlashDotNode for CompactNode {
 // TreeCompactManualNode
 // ---------------------------------------------------------------------------
 
-/// Leaf node: compact with manual (touched-files) mode.
-/// `prepare()` opens $EDITOR with a template; `submit()` writes the
-/// `tree_compact` control target (`mode: Manual`).
+/// Leaf node: compact with manual (touched-files) mode — the shared
+/// two-phase compaction flow (doc/editor_cleanup.md §6): `prepare()`
+/// generates the template and opens $EDITOR, NodeEntry's confirm
+/// (`Prepared` → Enter/Esc) decides, `submit()` appends the compaction
+/// from the stashed draft.
 pub struct TreeCompactManualNode {
     pub app_state: Arc<AppState>,
-    edited: std::cell::RefCell<Option<String>>,
+    stash: std::cell::RefCell<Option<CompactStash>>,
 }
 
 impl TreeCompactManualNode {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
             app_state,
-            edited: std::cell::RefCell::new(None),
+            stash: std::cell::RefCell::new(None),
         }
     }
 }
@@ -839,29 +859,41 @@ impl SlashDotNode for TreeCompactManualNode {
         }))
     }
 
+    async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::Manual,
+            "",
+            &self.stash,
+            false,
+        )
+        .await
+    }
+
+    async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::Manual,
+            "",
+            &self.stash,
+            true,
+        )
+        .await
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Manual compaction: scan touched files, open in editor.".into(),
-            "Save and close to confirm; discard to cancel.".into(),
+            "Enter opens $EDITOR; then Enter writes, Esc aborts.".into(),
         ]
     }
 
-    // Default prepare() delegates to submit() (single-phase).
-    // Future: override prepare() to open $EDITOR for draft editing,
-    // then return Prepared → confirm → submit. Requires session access
-    // to compute drafts, which the node doesn't have.
-
-    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let target_id = extract_target_id(path_args);
-        let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        // Data-plane inline: session/agent/guard/output are all reachable
-        // via the slot; errors come back as the stay-open message.
-        match crate::agent::compact_inline(&self.app_state, &target_id, CompactMode::Manual, &draft)
-            .await
-        {
-            None => SubmitResult::Done(None),
-            Some(msg) => SubmitResult::Done(Some(msg)),
-        }
+    async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
     }
 }
 
@@ -869,19 +901,18 @@ impl SlashDotNode for TreeCompactManualNode {
 // TreeCompactTextNode
 // ---------------------------------------------------------------------------
 
-/// Leaf node: compact with text-only mode.
-/// `prepare()` opens $EDITOR with extracted conversation text; `submit()`
-/// writes the `tree_compact` control target (`mode: TextOnly`).
+/// Leaf node: compact with text-only mode — same two-phase flow as the
+/// manual node: generate → $EDITOR → confirm → apply.
 pub struct TreeCompactTextNode {
     pub app_state: Arc<AppState>,
-    edited: std::cell::RefCell<Option<String>>,
+    stash: std::cell::RefCell<Option<CompactStash>>,
 }
 
 impl TreeCompactTextNode {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
             app_state,
-            edited: std::cell::RefCell::new(None),
+            stash: std::cell::RefCell::new(None),
         }
     }
 }
@@ -895,27 +926,42 @@ impl SlashDotNode for TreeCompactTextNode {
         }))
     }
 
+    async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::TextOnly,
+            "",
+            &self.stash,
+            false,
+        )
+        .await
+    }
+
+    async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::TextOnly,
+            "",
+            &self.stash,
+            true,
+        )
+        .await
+    }
+
     async fn header(&mut self, _path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         vec![
             "Text-only compaction: extract user prompts + assistant text.".into(),
-            "No reasoning, tool calls, or tool output. Edit in editor.".into(),
+            "No reasoning, tool calls, or tool output.".into(),
+            "Enter opens $EDITOR; then Enter writes, Esc aborts.".into(),
         ]
     }
 
-    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let target_id = extract_target_id(path_args);
-        let draft = self.edited.borrow_mut().take().unwrap_or_default();
-        match crate::agent::compact_inline(
-            &self.app_state,
-            &target_id,
-            CompactMode::TextOnly,
-            &draft,
-        )
-        .await
-        {
-            None => SubmitResult::Done(None),
-            Some(msg) => SubmitResult::Done(Some(msg)),
-        }
+    async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
     }
 }
 
@@ -923,17 +969,21 @@ impl SlashDotNode for TreeCompactTextNode {
 // TreeCompactPromptNode
 // ---------------------------------------------------------------------------
 
-/// Leaf node: compact with LLM prompt mode.
-/// `submit()` reads the custom prompt from `path_args.suffix` and
-/// writes the `tree_compact` control target (`mode: Prompt`).
-/// The LLM call happens in the agent loop's applier.
+/// Leaf node: compact with LLM prompt mode — same two-phase flow: the
+/// agent generates against the pivoted context (custom instruction from
+/// `path_args.suffix`, else the setting), the draft opens in $EDITOR,
+/// confirm, apply.
 pub struct TreeCompactPromptNode {
     pub app_state: Arc<AppState>,
+    stash: std::cell::RefCell<Option<CompactStash>>,
 }
 
 impl TreeCompactPromptNode {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        Self { app_state }
+        Self {
+            app_state,
+            stash: std::cell::RefCell::new(None),
+        }
     }
 }
 
@@ -946,17 +996,45 @@ impl SlashDotNode for TreeCompactPromptNode {
         }))
     }
 
+    async fn prepare(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::Prompt,
+            &path_args.suffix,
+            &self.stash,
+            false,
+        )
+        .await
+    }
+
+    async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_prepare(
+            &self.app_state,
+            epoch,
+            path_args,
+            CompactMode::Prompt,
+            &path_args.suffix,
+            &self.stash,
+            true,
+        )
+        .await
+    }
+
     async fn header(&mut self, path_args: &PathArgs, _render_ctx: &RenderContext) -> Vec<String> {
         let prompt = &path_args.suffix;
         if prompt.is_empty() {
             vec![
-                "LLM compaction: generate summary via agent.".into(),
+                "LLM compaction: generate summary via agent, then edit.".into(),
                 "Type a custom instruction after 'prompt', or use the default.".into(),
+                "Enter generates + opens $EDITOR; then Enter writes, Esc aborts.".into(),
             ]
         } else {
             vec![
                 "LLM compaction with custom prompt:".into(),
                 format!("  {}", prompt),
+                "Enter generates + opens $EDITOR; then Enter writes, Esc aborts.".into(),
             ]
         }
     }
@@ -967,20 +1045,8 @@ impl SlashDotNode for TreeCompactPromptNode {
         Some(path_args.prompt_with("Summarize the conversation up to this point."))
     }
 
-    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let target_id = extract_target_id(path_args);
-        let prompt = path_args.suffix.trim().to_string();
-        match crate::agent::compact_inline(
-            &self.app_state,
-            &target_id,
-            CompactMode::Prompt,
-            &prompt,
-        )
-        .await
-        {
-            None => SubmitResult::Done(None),
-            Some(msg) => SubmitResult::Done(Some(msg)),
-        }
+    async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        compact_submit(&self.app_state, epoch, path_args, &self.stash).await
     }
 }
 
@@ -1000,6 +1066,114 @@ fn extract_target_id(path_args: &PathArgs) -> String {
     }
 }
 
+/// Stashed result of a compact node's `prepare()`: the reviewed draft,
+/// keyed by the target it was generated for *and* the engine epoch it
+/// was made at (doc/editor_cleanup.md §4 — reused only while both
+/// match).
+struct CompactStash {
+    epoch: u64,
+    target_id: String,
+    draft: crate::agent::CompactionDraft,
+}
+
+/// `prepare()` / `edit()` body shared by the three compact mode nodes:
+/// generate the draft (data layer), open it in $EDITOR (UI layer),
+/// stash the reviewed text, return `Prepared` — NodeEntry's two-phase
+/// confirm takes it from there (Enter → [`compact_submit`], Esc →
+/// abort; the stash then just waits for the next `prepare()` to
+/// overwrite it, so no abort hook is needed).
+///
+/// `reuse_stash` (`edit()`, Ctrl-E): re-open the stashed draft while
+/// its key still matches, regenerate otherwise (§4).
+async fn compact_prepare(
+    app_state: &Arc<AppState>,
+    epoch: u64,
+    path_args: &PathArgs,
+    mode: CompactMode,
+    payload: &str,
+    stash: &std::cell::RefCell<Option<CompactStash>>,
+    reuse_stash: bool,
+) -> SubmitResult {
+    let target_id = extract_target_id(path_args);
+    if reuse_stash {
+        let fresh = stash
+            .borrow()
+            .as_ref()
+            .and_then(|s| (s.epoch == epoch && s.target_id == target_id).then(|| s.draft.clone()));
+        if let Some(draft) = fresh {
+            return edit_draft(app_state, stash, epoch, target_id, draft);
+        }
+    }
+    let summary_mode = match mode {
+        CompactMode::Manual => crate::agent::CompactSummaryMode::Manual,
+        CompactMode::TextOnly => crate::agent::CompactSummaryMode::TextOnly,
+        CompactMode::Prompt => crate::agent::CompactSummaryMode::Llm,
+    };
+    match crate::agent::generate_compaction(app_state, &target_id, summary_mode, payload).await {
+        Ok(draft) => edit_draft(app_state, stash, epoch, target_id, draft),
+        // Validation/generation failures close the menu with the
+        // data-level message (the pre-split compact_inline shape).
+        Err(msg) => SubmitResult::Done(Some(msg)),
+    }
+}
+
+/// Open `draft` in $EDITOR and stash the outcome. Without an
+/// interactive tty (quiet/pipe/tests) the draft is accepted as-is —
+/// the pre-split review closure behaved the same outside the REPL.
+fn edit_draft(
+    app_state: &Arc<AppState>,
+    stash: &std::cell::RefCell<Option<CompactStash>>,
+    epoch: u64,
+    target_id: String,
+    mut draft: crate::agent::CompactionDraft,
+) -> SubmitResult {
+    match app_state.edit_text(&draft.summary, crate::editor::EditorMode::Edit) {
+        Ok(text) => {
+            draft.summary = text;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            // No interactive tty: accept the generated draft as-is.
+        }
+        Err(e) => return SubmitResult::Done(Some(format!("editor error: {}", e))),
+    }
+    *stash.borrow_mut() = Some(CompactStash {
+        epoch,
+        target_id,
+        draft,
+    });
+    SubmitResult::Prepared
+}
+
+/// `submit()` body: apply the stashed draft. The stash must still be
+/// keyed to this (target, epoch) — a stale one means the data epoch
+/// moved under us; error out and let the next Enter regenerate.
+async fn compact_submit(
+    app_state: &Arc<AppState>,
+    epoch: u64,
+    path_args: &PathArgs,
+    stash: &std::cell::RefCell<Option<CompactStash>>,
+) -> SubmitResult {
+    let target_id = extract_target_id(path_args);
+    let prepared = stash
+        .borrow()
+        .as_ref()
+        .and_then(|s| (s.epoch == epoch && s.target_id == target_id).then(|| s.draft.clone()));
+    let Some(draft) = prepared else {
+        return SubmitResult::Error(
+            "No fresh prepared summary — press Enter to generate one.".to_string(),
+        );
+    };
+    match crate::agent::apply_compaction(app_state, &target_id, &draft).await {
+        Ok(()) => {
+            *stash.borrow_mut() = None;
+            // Silent: the user just reviewed the summary, and the
+            // committed line documents the write.
+            SubmitResult::Done(None)
+        }
+        Err(msg) => SubmitResult::Done(Some(msg)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Menu builder
 // ---------------------------------------------------------------------------
@@ -1007,12 +1181,16 @@ fn extract_target_id(path_args: &PathArgs) -> String {
 /// Build the `/tree` subtree as a `SlashDotMenuNode`.
 pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu::SlashDotMenuNode {
     use crate::slashdot_menu::menu::SlashDotMenuNode;
-    use crate::slashdot_menu::node_impl::{StaticListingNode, StaticRow};
+    use crate::slashdot_menu::node_impl::StaticRow;
+    use crate::v25_listing_node::ListingNode;
 
-    let mut listing: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "tree",
-        "navigate session history — select a point to continue from",
-    )])
+    let mut listing: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "tree",
+            "navigate session history — select a point to continue from",
+        )],
+    )
     .with_columns(tree_listing_columns())
     .with_fields(tree_fields())
     .into();
@@ -1026,10 +1204,13 @@ pub fn build_tree_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu:
     );
 
     // Compact subtree: a listing node with three mode children.
-    let mut compact_node: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-        "compact",
-        "summarize entries before this point",
-    )])
+    let mut compact_node: SlashDotMenuNode = ListingNode::new(
+        app_state,
+        &[StaticRow::new(
+            "compact",
+            "summarize entries before this point",
+        )],
+    )
     .into();
     compact_node.add_child(TreeCompactManualNode::new(app_state.clone()).into());
     compact_node.add_child(TreeCompactTextNode::new(app_state.clone()).into());
@@ -1704,10 +1885,147 @@ mod tests {
         );
     }
 
-    // --- Compact: mode submit tests ---
+    // --- Compact: two-phase prepare/submit tests ---
+
+    /// True when the session has any `Compaction` entry.
+    fn compaction_appended(session: &std::sync::Arc<crate::session::Session>) -> bool {
+        let idx = session.index().blocking_lock();
+        idx.entries.values().any(|e| {
+            matches!(
+                &e.content,
+                crate::session::SessionEntryContent::Compaction { .. }
+            )
+        })
+    }
 
     #[test]
-    fn compact_manual_submit_appends_compaction() {
+    fn compact_manual_prepare_then_submit_appends_compaction() {
+        // The native NodeEntry flow: prepare() generates + stashes the
+        // draft and arms the confirm (Prepared — nothing written yet);
+        // submit() applies the stashed draft.
+        let app_state = test_app_state();
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = TreeCompactManualNode::new(app_state.clone());
+        let path_args = PathArgs {
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "manual".into(),
+            ],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
+        assert!(
+            matches!(result, SubmitResult::Prepared),
+            "prepare must arm the confirm with Prepared"
+        );
+        assert!(
+            !compaction_appended(&session),
+            "prepare must not write — only the confirm's submit does"
+        );
+
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        assert!(
+            compaction_appended(&session),
+            "manual compact must append a Compaction entry"
+        );
+    }
+
+    #[test]
+    fn compact_text_only_prepare_then_submit_appends_compaction() {
+        let app_state = test_app_state();
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
+        app_state.set_session(Some(session.clone()));
+        let mut node = TreeCompactTextNode::new(app_state.clone());
+        let path_args = PathArgs {
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "text-only".into(),
+            ],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
+        assert!(matches!(result, SubmitResult::Prepared));
+        assert!(!compaction_appended(&session), "prepare must not write");
+
+        let result = crate::agent::block_on_test(node.submit(1, &path_args));
+        assert!(matches!(result, SubmitResult::Done(None)));
+        assert!(
+            compaction_appended(&session),
+            "text-only compact must append a Compaction entry"
+        );
+    }
+
+    #[test]
+    fn compact_prompt_unknown_entry_errors_on_prepare() {
+        // Validation lives in prepare(): the unknown target closes the
+        // menu with the data-level message before any agent/LLM work.
+        let app_state = test_app_state();
+        let session =
+            crate::agent::test_session_with_entries(vec![make_entry("other", None, "user", "hi")]);
+        app_state.set_session(Some(session));
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
+        let path_args = PathArgs {
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "prompt".into(),
+            ],
+            suffix: "summarize the key decisions".into(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("unknown tree entry"), "msg: {msg}")
+            }
+            other => panic!(
+                "expected unknown-entry error from prepare, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn compact_prompt_without_session_reports_error_on_prepare() {
+        let app_state = test_app_state();
+        let mut node = TreeCompactPromptNode::new(app_state.clone());
+        let path_args = PathArgs {
+            ids: vec![
+                "tree".into(),
+                "u1".into(),
+                "compact".into(),
+                "prompt".into(),
+            ],
+            suffix: String::new(),
+            args: Default::default(),
+        };
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
+        match result {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("no active session"), "msg: {msg}")
+            }
+            other => panic!(
+                "expected no-session error from prepare, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn compact_submit_without_prepare_is_rejected() {
+        // submit() applies a *stashed* draft: with nothing prepared the
+        // stash key misses and nothing is written.
         let app_state = test_app_state();
         let session =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
@@ -1724,105 +2042,44 @@ mod tests {
             args: Default::default(),
         };
         let result = crate::agent::block_on_test(node.submit(1, &path_args));
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let appended = crate::agent::block_on_test(async {
-            let idx = session.index().lock().await;
-            idx.entries.values().any(|e| {
-                matches!(
-                    &e.content,
-                    crate::session::SessionEntryContent::Compaction { .. }
-                )
-            })
-        });
-        assert!(appended, "manual compact must append a Compaction entry");
+        assert!(
+            matches!(result, SubmitResult::Error(_)),
+            "submit without a prepared stash must error, got {:?}",
+            std::mem::discriminant(&result)
+        );
+        assert!(!compaction_appended(&session), "nothing may be written");
     }
 
     #[test]
-    fn compact_text_only_submit_appends_compaction() {
+    fn compact_submit_rejects_stale_epoch() {
+        // The stash is keyed by (target, epoch): a prepare at epoch 1
+        // cannot feed a submit at epoch 2 — the data moved under us, so
+        // submit errors and lets the next Enter regenerate.
         let app_state = test_app_state();
         let session =
             crate::agent::test_session_with_entries(vec![make_entry("u1", None, "user", "hi")]);
         app_state.set_session(Some(session.clone()));
-        let mut node = TreeCompactTextNode::new(app_state.clone());
+        let mut node = TreeCompactManualNode::new(app_state.clone());
         let path_args = PathArgs {
             ids: vec![
                 "tree".into(),
                 "u1".into(),
                 "compact".into(),
-                "text-only".into(),
+                "manual".into(),
             ],
             suffix: String::new(),
             args: Default::default(),
         };
-        let result = crate::agent::block_on_test(node.submit(1, &path_args));
-        assert!(matches!(result, SubmitResult::Done(None)));
-        let appended = crate::agent::block_on_test(async {
-            let idx = session.index().lock().await;
-            idx.entries.values().any(|e| {
-                matches!(
-                    &e.content,
-                    crate::session::SessionEntryContent::Compaction { .. }
-                )
-            })
-        });
-        assert!(appended, "text-only compact must append a Compaction entry");
-    }
+        let result = crate::agent::block_on_test(node.prepare(1, &path_args));
+        assert!(matches!(result, SubmitResult::Prepared));
 
-    #[test]
-    fn compact_prompt_unknown_entry_errors() {
-        let app_state = test_app_state();
-        let session =
-            crate::agent::test_session_with_entries(vec![make_entry("other", None, "user", "hi")]);
-        app_state.set_session(Some(session));
-        let mut node = TreeCompactPromptNode::new(app_state.clone());
-        let path_args = PathArgs {
-            ids: vec![
-                "tree".into(),
-                "u1".into(),
-                "compact".into(),
-                "prompt".into(),
-            ],
-            suffix: "summarize the key decisions".into(),
-            args: Default::default(),
-        };
-        // Guarded before any agent/LLM work: unknown target stays open
-        // with the message (the Llm path itself needs a live model).
-        let result = crate::agent::block_on_test(node.submit(1, &path_args));
-        match result {
-            SubmitResult::Done(Some(msg)) => {
-                assert!(msg.contains("unknown tree entry"), "msg: {msg}")
-            }
-            other => panic!(
-                "expected stay-open unknown-entry error, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    #[test]
-    fn compact_prompt_without_session_reports_error() {
-        let app_state = test_app_state();
-        let mut node = TreeCompactPromptNode::new(app_state.clone());
-        let path_args = PathArgs {
-            ids: vec![
-                "tree".into(),
-                "u1".into(),
-                "compact".into(),
-                "prompt".into(),
-            ],
-            suffix: String::new(),
-            args: Default::default(),
-        };
-        let result = crate::agent::block_on_test(node.submit(1, &path_args));
-        match result {
-            SubmitResult::Done(Some(msg)) => {
-                assert!(msg.contains("no active session"), "msg: {msg}")
-            }
-            other => panic!(
-                "expected stay-open no-session error, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
+        let result = crate::agent::block_on_test(node.submit(2, &path_args));
+        assert!(
+            matches!(result, SubmitResult::Error(_)),
+            "stale-epoch submit must error, got {:?}",
+            std::mem::discriminant(&result)
+        );
+        assert!(!compaction_appended(&session), "stale draft not applied");
     }
 
     // --- Compact: full traversal ---
@@ -1868,24 +2125,31 @@ mod tests {
         ));
         assert!(matches!(r, MenuResult::Continue(_, _)));
 
-        // 5. Enter → submit (inline compact drives session IO — tokio
-        // driver; review is None without a term guard → non-interactive
-        // append).
-        let _ = crate::agent::block_on_test(handle.eval_prompt(
+        // 5. Enter #1 → prepare(): generate (the editor accepts the
+        //    draft as-is without a tty) + stash → Prepared arms the
+        //    engine's confirm. Nothing is written yet.
+        let r = crate::agent::block_on_test(handle.eval_prompt_resolved(
             "tree u1 compact manual ",
             HostKey::Enter,
             80,
         ));
-        let appended = crate::agent::block_on_test(async {
-            let idx = session.index().lock().await;
-            idx.entries.values().any(|e| {
-                matches!(
-                    &e.content,
-                    crate::session::SessionEntryContent::Compaction { .. }
-                )
-            })
-        });
-        assert!(appended, "traversal must end in an appended Compaction");
+        assert!(matches!(r, MenuResult::Continue(_, _)));
+        assert!(
+            !compaction_appended(&session),
+            "the first Enter must only arm the confirm"
+        );
+
+        // 6. Enter #2 → submit(): apply the stashed draft.
+        let r = crate::agent::block_on_test(handle.eval_prompt_resolved(
+            "tree u1 compact manual ",
+            HostKey::Enter,
+            80,
+        ));
+        assert!(matches!(r, MenuResult::DoneSuccess(..)));
+        assert!(
+            compaction_appended(&session),
+            "traversal must end in an appended Compaction"
+        );
     }
 
     // --- Compact: header tests ---

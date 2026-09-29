@@ -50,12 +50,14 @@ use crate::AgentConfig;
 // fields, not a queue; see design doc "Decisions")
 // ---------------------------------------------------------------------------
 
-/// Compact mode for `tree_compact`.
+/// Compaction mode for the `/tree … compact` menu: names the summary
+/// flavor `agent::generate_compaction` produces; the node's `prepare()`
+/// opens the generated draft in `$EDITOR` before the engine confirm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactMode {
-    /// User-editable touched-files list (already edited in `$EDITOR`).
+    /// User-editable touched-files list.
     Manual,
-    /// Deterministic text extraction (already edited in `$EDITOR`).
+    /// Deterministic text extraction.
     TextOnly,
     /// LLM-generated summary; `payload` is the custom prompt.
     Prompt,
@@ -276,8 +278,8 @@ impl AppState {
     }
 
     /// Snapshot of the settings store for read-only use across `.await`s
-    /// (helpers like `handle_session_command` take `&SettingsStore`): clone
-    /// out under the lock, then await against the private copy (rule 3).
+    /// (helpers taking `&SettingsStore`): clone out under the lock, then
+    /// await against the private copy (rule 3).
     pub fn settings(&self) -> SettingsStore {
         self.state.lock().settings.clone()
     }
@@ -449,10 +451,30 @@ impl AppState {
         self.state.lock().term_guard = Some(guard);
     }
 
-    /// Clone-out of the term guard (rule 3 — the review closure holds it
-    /// across the editor, outside any lock).
+    /// Clone-out of the term guard (rule 3 — callers hold it across the
+    /// editor outside any lock; `edit_text` does exactly that).
     pub fn term_guard(&self) -> Option<Arc<crate::repl::TermGuard>> {
         self.state.lock().term_guard.clone()
+    }
+
+    /// Run the external editor over `current` through the single wrapper
+    /// (`crate::editor::run_editor`): reader gate, raw-mode turnover, DSR
+    /// re-anchor (doc/editor_cleanup.md §2). Requires an interactive term
+    /// guard — without one (quiet/pipe) there is no tty to hand over, so
+    /// this reports `Unsupported`.
+    pub fn edit_text(
+        &self,
+        current: &str,
+        mode: crate::editor::EditorMode,
+    ) -> std::io::Result<String> {
+        let guard = self.term_guard().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "editor requires an interactive terminal",
+            )
+        })?;
+        let output = self.with_config(|c| c.output.clone());
+        crate::editor::run_editor(&guard, output.as_ref(), current, mode)
     }
 
     // --- test constructor ---
@@ -538,6 +560,16 @@ mod tests {
             app_state.with_config(|c| c.model.clone()),
             "tencent/hy3:free"
         );
+    }
+
+    #[test]
+    fn edit_text_requires_an_interactive_guard() {
+        let app_state = AppState::for_test(test_settings());
+        // No term guard (quiet/pipe): there is no tty to hand to $EDITOR.
+        let err = app_state
+            .edit_text("draft", crate::editor::EditorMode::Edit)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]
