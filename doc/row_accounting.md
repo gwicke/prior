@@ -255,6 +255,64 @@ That was a *proxy* for "not addressed", and styling made the proxy wrong rather
 than the behaviour: the assertion is now a real `CUP` scan, and the bar's `SGR`
 is checked to be geometry-free.
 
+**Tuned further (2026-09-28):** the bar leads with a **dot** — green while a
+response streams, the bar's own grey when not — which is the spinner's job in
+one cell. The spinner is gone (§3.6), so the flag is carried rather than pinned
+to green: the prompt-side carrier will show the bar between turns too, and that
+is when grey will mean something.
+
+Three things the bar had to learn, each a bug first:
+
+- **It must not inherit the ambient SGR.** `ensure_dim` emits `\x1b[2m` /
+  `\x1b[0m` only when the tracked `dim_on` *changes*, and the bar went straight
+  to the writer without touching that state. So it broke the toggle in both
+  directions: it inherited the terminal's dim (a colour is not an *attribute*, so
+  `38;5;245m` did not clear dim) and its own trailing reset then silenced the
+  *next* reasoning write, which saw no change to re-assert. The bar now opens
+  with a full reset, and `paint_status` restores the tracked dim after it.
+  Restores, not toggles.
+- **The parked cursor is hidden** (`?25l`) and a frame apply shows it again
+  (`?25h`): a block cursor at column 0 of a dark full-width bar is the brightest
+  thing on screen, and there is nothing to type into mid-turn. `TermGuard::stop`
+  emits the show unconditionally as the net, or an interrupted turn leaves the
+  user with an invisible cursor in their shell.
+- **Its width is a contract.** The text is truncated against the row *minus* the
+  dot cell, and a budget of zero drops the text rather than passing it through
+  (`truncate_to_width(_, 0)` returns its input, which is right for a "no limit"
+  caller). A terminal narrower than the padded cell gets the bare dot: the cell
+  gives way, not the invariant — a bar wider than the row wraps, and the wrap is
+  the one row movement this path has to report.
+
+The **ctx figure** stands in for the first turn. There is no reported usage yet
+when the bar first appears — the first completion call is still in flight — so
+`estimate_ctx_with(prior, input)` supplies it, the same arithmetic
+`/tree compact` uses, with the provider's own count replacing it from turn two.
+A model missing from the catalog no longer makes the whole figure disappear:
+without a context window there is no percentage, but the count still shows.
+
+### 3.6 The spinner is gone
+
+`ShowReasoning` had a third mode, `Indicator`: show a "Thinking…" spinner and
+*not* the reasoning text. The status line's dot now says "something is
+happening", in one cell, on a row the user is already looking at — so the
+indicator was a second answer to a question that had one.
+
+Deleting it also deleted a **hazard**, which is the better reason. The spinner
+was indicatif, writing at the cursor 8×/s: precisely the foreign-writer
+behaviour the relative frame path has to defend against (§6b), and it had only
+*incidental* protection — `ui::confirm` happened to call `stop_thinking` before
+painting, and nothing enforced that. Gone: the dependency, both
+`Output::display_thinking` and `Output::stop_thinking` (they existed only to
+drive it), the two spinner fields, both `create_spinner` helpers, and the ten
+`stop_thinking` calls that only existed to halt it.
+
+The setting is now the two-way question it always was — is the reasoning text
+shown. One judgement call: `indicator`/`spinner`/`status` parse to
+**`Disabled`**, not to the default. Someone who chose the spinner chose it *to
+not see the reasoning text*, and that half of the behaviour still exists;
+mapping them to `Content` would start showing them text they had asked not to
+see. The other half they got is the dot.
+
 ---
 
 ## 4. Padding, the cursor column, and ANSI
