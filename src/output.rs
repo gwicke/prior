@@ -1120,7 +1120,7 @@ impl Default for ConsoleOutput {
 
 /// Remove ANSI/CSI escape sequences (e.g. `\x1b[1;36m`) so that
 /// downstream width/wrap math only counts *visible* characters.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
@@ -1142,9 +1142,23 @@ fn strip_ansi(s: &str) -> String {
                 while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
                     i += 1;
                 }
-                if i < bytes.len() {
-                    i += 1;
-                } // consume BEL or ST
+                if i < bytes.len() && bytes[i] == 0x1b {
+                    // ST is ESC \ — both bytes belong to the sequence, and
+                    // leaving the backslash behind put a phantom column in
+                    // every width measured from a hyperlink-terminated string
+                    // (row_count::display_width_ansi is pinned against this).
+                    i += 2;
+                } else if i < bytes.len() {
+                    i += 1; // consume BEL
+                }
+                continue;
+            }
+            if i + 1 < bytes.len() && (0x20..=0x7e).contains(&bytes[i + 1]) {
+                // Any other two-character escape (a bare ST after a truncated
+                // sequence, for instance): ESC plus its final byte, zero
+                // width. Without this the ESC became U+FFFD and the final
+                // byte a visible column.
+                i += 2;
                 continue;
             }
         }
