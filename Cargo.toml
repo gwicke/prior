@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/slashdot_menu"]
+members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/safe_sed"]
 resolver = "2"
 
 [package]
@@ -20,6 +20,8 @@ exclude = ["picocode.gif", ".github/"]
 [dependencies]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 slashdot_menu = { path = "crates/slashdot_menu" }
+blockedit = { path = "crates/blockedit" }
+safe_sed = { path = "crates/safe_sed" }
 rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
 tokio = { version = "1.0", features = ["full"] }

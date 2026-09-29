@@ -1,0 +1,722 @@
+# `sed` tool — a preview-only GNU sed (`bsed`) that emits `edit`-tool blocks
+
+*Status: research + proposal, reviewed. Nothing implemented yet. Decisions in
+§12, open tuning questions in §12, deferred work in §13.*
+
+## 1. The problem this solves
+
+The agent prompt currently tells the model:
+
+> Be precise: When editing files, use `edit`. … **Avoid editing with sed or python
+> scripts - you are likely to make mistakes. If you MUST use them, always save all
+> outstanding work with a snapshot commit first, and double check the results right
+> after.** — `src/agent.rs:1923`
+
+That is a workaround, not a fix. The failure mode is real and observed: `sed -i`
+with a line range computed against a *stale* read of the file, on a working tree
+with uncommitted work, silently eats the uncommitted work. Real expressions seen
+in logs:
+
+```
+1498,1499s/if count > 0 {/if count > 0 {/
+177s/edits: EditInput,/edits: serde_json::Value,/
+s/const MAG_VAR_THRESH_LOW: f32 = 2.0;/const MAG_VAR_THRESH_LOW: f32 = 5.0;/
+870,874d
+326d;327d
+279r /tmp/model_filter.rs
+/^            $/{ N; /^\n$/d; }
+```
+
+The idea: **sed becomes advisory.** The model formulates GNU sed expressions, gets
+back a reviewable, line-anchored `@@@OLD`/`@@@NEW`/`@@@END` preview, and applies
+(all or part of) it through the existing `edit` tool — already anchor-aware,
+uniqueness-checked, overlap-checked, all-or-nothing. `bsed preview` never writes.
+If the preview is wrong, nothing was lost.
+
+This is not "sed that is safer at writing". It is a **sed-to-block-edit
+compiler**: a preview, in the one format the agent already knows how to apply.
+
+## 2. Architecture (agreed shape)
+
+```
+ picocode (agent)                          crates/safe_sed
+ ┌────────────────────────┐                ┌──────────────────────────────┐
+ │ tool `sed`             │                │ lib: script → engine → diff  │
+ │  path / expressions    │   argv         │      → hunks → blocks        │
+ │  context               │ ─────────────► │ bin `bsed`                   │
+ │ get_path() policy      │   read-only    │   preview | apply | (later)   │
+ │ run_sandboxed_ro()     │ ◄───────────── │        replace -r            │
+ │ (bwrap, no shell)      │   stdout+exit  └──────────────────────────────┘
+ └────────────────────────┘
+        │                                        ▲
+        │  paste blocks                          │ deny-list (AST)
+        ▼                                        │ enforced inside the
+ ┌────────────────────────┐                       │ binary, whoever calls it
+ │ tool `edit` (existing) │                       └──────────────┐
+ └────────────────────────┘                                      │
+        ▲                                                         │
+        └──── crates/blockedit  (parse / match / apply, shared) ──┘
+             extracted from src/edit_blocks.rs + src/edit_match.rs + edit_file
+```
+
+Three independent layers, each sufficient on its own to prevent "sed ate my
+uncommitted work":
+
+1. **AST deny-list** inside `bsed` — `w`/`W`/`r`/`R`/`e`/`q` are rejected before
+   the engine runs, by `match`ing the closed `Command` enum with **no wildcard
+   arm** (§5.1).
+2. **Process boundary** — a separate binary on `$PATH`. Model-supplied text is
+   only ever file *content*/argv *data*; it is never argv structure, and it is
+   never interpreted by a shell. The engine's `q`/`Q` handler calls
+   `std::process::exit` (§5.2) — a subprocess is the only place that is harmless.
+3. **Read-only bwrap namespace** — the same machinery `rg`/grep uses
+   (`run_sandboxed_ro`, `src/tools.rs:1256`): cwd ro-bound, `/tmp` a scratch
+   tmpfs, `--unshare-net`, `--cap-drop ALL`, `--die-with-parent`, memory cap,
+   120 s default timeout. The agent only ever runs `bsed preview` there.
+
+`bsed` is genuinely useful standalone (`bsed apply` from a shell, later
+`replace -r` recursive search/replace), which is what makes extracting the block
+edit core worth doing.
+
+## 3. Tool contract
+
+Tool name `sed`, registered **only when `bsed` is found on `$PATH`** (§9).
+
+```jsonc
+{
+  "path":        "string",           // required; same semantics as `edit` (accepts file:LINE)
+  "expressions": "string",           // required; ONE GNU sed expression per line
+  "context":     "integer|string"    // optional; see §4.1
+}
+```
+
+* `expressions` — one expression per line, nothing else. No multi-line
+  continuations (`a\`+newline is rejected with a pointed message; it never appears
+  in observed usage), and deliberately **no JSON array form** — weak harnesses
+  stringify array parameters wholesale, and the string form is what survives.
+  Lines are joined with `\n` into one script, which is byte-for-byte what
+  `sed -e A -e B` does (GNU concatenates `-e` scripts with newlines), so
+  `326d;327d` on one line and two separate lines are equivalent. Blank lines are
+  ignored. NUL bytes are rejected up front (they cannot cross an argv boundary).
+* `context` — integer or numeric string, same shape as `ReadLimit`
+  (`src/config.rs:100`), because harnesses stringify numbers. Default **0**;
+  clamped to `[0, 20]`. Effective padding is `leading = context`,
+  `trailing = max(context, 2)` — a free 2-line tail, symmetric on request. See
+  §4.1.
+* Returns a string: a one-line banner, then the block blob (§7). Never writes.
+  Not wrapped in `guard()` — it is a read-only preview.
+
+## 4. Producing the preview
+
+### 4.1 What `context` is, and why the default is 0
+
+**`context` is not "print N lines around the match"** (that is `grep -C`). It is
+the number of **unchanged** lines of the original file carried *into each emitted
+block*, inside `OLD` and `NEW`. Only regions that actually changed are ever
+emitted; `context` pads each one.
+
+**The rule is asymmetric by default and symmetric on request:**
+`leading = context`, `trailing = max(context, TAIL)`, `TAIL = 2`
+(`[tool_config.sed].trailing_context`). `context` defaults to **0**, so an
+unadorned call gets 0 lines before and 2 after; asking for `context: n` sets both
+sides to `n`, with the trailing value acting as a floor. Rationale: the *following*
+lines are where a change most often continues, and a 2-line tail turns a 1-line
+`OLD` into a 3-line one, which lifts `anchor_tolerance` from 0 to 1 (below) —
+cheap insurance against a stale anchor. It also covers the smallest multi-line
+call shape (`compute(` / `a,` / `b,`). It does not *close* the construct, but it
+signals that a multi-line statement is in play, which should trigger a
+`context: 4` re-run or the balance-growth pass (§4.6).
+
+**Line anchoring is what makes small blocks viable — that is the entire reason
+the blocks are anchored.** Reading `edit`'s anchored pass (Pass 1,
+`src/tools.rs:666-738`) against a 40-occurrence duplicate such as `    run();`:
+
+* Candidates are ranked by `|line − anchor|`; the nearest wins.
+* The window is `anchor_tolerance = min(4, old_lines/3)`, so a 1-line `OLD` gets
+  tolerance **0** — and tolerance 0 still accepts an *exact* anchor, which is
+  exactly what `bsed` emits (derived from the file it just read).
+* Beyond the window the skew rule rescues a stale anchor: accept only if
+  `d1 ≤ 60` and the runner-up is `≥ 3×` farther (`edit_match::anchor_accepts`,
+  `src/edit_match.rs:53`).
+* Ties are rejected — two copies at equal distance is an error, not a coin flip.
+* If `old_text` occurs exactly once, the anchor is not consulted at all
+  (`src/tools.rs:676`).
+
+So a mass rename — 40 identical lines, each previewed as its own 1-line block with
+its own `path:LINE` — applies correctly with **zero** context and no uniqueness
+requirement. The uniqueness rules (`src/tools.rs:767`, `:781`) bind only
+*unanchored* blocks, a shape `bsed` never emits.
+
+What `context` then buys is three things, none of which is "makes the edit apply":
+
+1. **Stale-anchor tolerance.** Tolerance scales with `old_text` length (1 line → 0,
+   3 lines → 1, 6 lines → 2, 12 lines → 4). A bare 1-line block has *zero* slack:
+   if the file shifted between preview and apply — the model applied an earlier
+   batch first, or something else touched the file — the 40-duplicate case fails
+   the skew rule outright (`d2 = 1 < 3 × d1` for any `d1 ≥ 1`) and `edit` reports
+   "anchor out of tolerance". Correct behaviour, but a wasted round-trip. The
+   default 2-line tail largely closes this: a 1-line change becomes a 3-line `OLD`
+   and gets ±1 of tolerance for the price of two lines of the file the model was
+   going to read anyway. The remaining workflow rule (which the banner should
+   state) is: apply the whole blob in **one** `edit` call, and re-preview before
+   any follow-up batch.
+2. **Legibility of the preview** — `run(); → walk();` alone does not show the
+   enclosing `if count > 0 {`. Largely free via §4.6 (the TUI panel renders a
+   context-rich diff; only the *model* payload is terse), so there is no reason to
+   pay for it in tokens.
+3. **Guarding the model against reasoning about a truncated construct** — the one
+   correctness-adjacent case, and the motivation for the v2 growth heuristic in
+   §4.6. The edit is byte-exact either way; the risk is the model *rewriting* `NEW`
+   on the assumption that it is looking at a whole statement.
+
+Cost when used: blocks grow, so the 50 KB preview budget (§5.5) is consumed
+faster, and hunks within `2*context` merge into one larger block (harmless —
+`similar` guarantees they cannot overlap). With `context: 0` the only growth is
+the 2-line tail, clamped so it can never reach the next block (§4.5, rule 8).
+
+### 4.2 Pipeline (inside `bsed`)
+
+```
+file ──read──> original text
+                   │
+ expressions ──────┼──> sed-rs eval(script, text) ──> transformed text
+                   │            (deny-list already passed)
+                   └──> similar::TextDiff::from_lines(orig, new)
+                             └── .grouped_ops(context) ──> hunks ──> blocks ──> blob
+```
+
+`sed-rs` only: single engine, no fallback to a system `sed` (agreed).
+
+### 4.3 Options considered for "which lines are affected?"
+
+| Option | Verdict |
+| --- | --- |
+| **A. Diff old vs new** | Works for *every* command (`s`, `d`, `a`, `i`, `c`, hold space, `{}`). One code path, no sed internals parsed, `similar` already in the tree. **Chosen.** |
+| B. `sed -n '/re/='` probing | Only expresses address *selection*; useless for `a`/`i`/`c` and anything that mutates the pattern space; needs per-expression address rewriting; reports sed's line counter, not file line numbers (which is what anchors must be). |
+| C. `sed --debug` | GNU-only, unbounded, version-fragile, logs pattern space not final state. |
+| D. External `diff -u` + temp files | Extra binary, tmpfs writes, cleanup — for a result `similar` computes in-process. |
+| E. Engine-side per-line hooks | Unavailable (sed-rs has none) and unnecessary once we diff. |
+
+Option A also has a property that matters: **the preview is derived from the same
+bytes `edit` will match against.** Line numbers in the file, not in sed.
+
+### 4.4 Verified hunk mechanics (`similar` 2.7)
+
+`TextDiff::from_lines(old,new).grouped_ops(ctx)` → groups of ops;
+`first().old_range().start` … `last().old_range().end` gives the OLD span (0-based),
+likewise for NEW. Measured:
+
+| change | ctx=0 | ctx=1 | ctx=2 |
+| --- | --- | --- | --- |
+| `C`→`X` at line 3 and `J`→`Y` at line 10 | OLD=`["C"]` / OLD=`["J"]` | OLD=`["b","C","d"]` | OLD=`["a","b","C","d","e"]` |
+| prepend 2 lines | `old_range (0,0)` — **empty OLD** | `(0,1)` | `(0,2)` |
+| truncate last line | `old_range (2,3)`, `new_range (2,2)` — **empty NEW** | `(1,3)/(1,2)` | — |
+
+`similar` merges ops whose gap is `<= 2*ctx` into one group, so separate groups
+are always more than `2*context` apart — **symmetric context cannot make
+neighbouring hunks overlap**, which matters because the `edit` tool rejects
+overlapping claims (`src/tools.rs:719`). That guarantee covers `similar`'s own
+context but *not* the asymmetric trailing floor added afterwards, which is what
+rule 8 has to clamp.
+
+### 4.5 Hunk → block rules
+
+1. **Anchor** = `path:<first OLD line, 1-based>` — the same `path:LINE` idiom the
+   blob parser already accepts (`split_line_anchor`, `src/edit_blocks.rs:123`).
+   Anchors are exact (derived from the file just read), so `edit`'s anchored pass
+   resolves them at distance 0.
+2. **Empty `NEW` is fine** — `d` produces `@@@NEW` immediately followed by
+   `@@@END`; only empty *OLD* is rejected by the parser.
+3. **Empty `OLD` is not fine** — pure insertions yield `old_range (n,n)`. The
+   trailing context (rule 8) normally supplies the missing line for free, since it
+   extends the *end* of the hunk; only if `OLD` is *still* empty (insertion at EOF)
+   do we borrow the *preceding* line. Verified: `2a\ let w = 0;` → `src/foo.rs:3`,
+   `OLD=["    let y = 2;"]`, `NEW=["    let w = 0;","    let y = 2;"]`. An
+   insertion into an *empty* file has no neighbour → "file is empty; use `write`".
+4. **Whole-file rewrite** (e.g. `1,$d`) → one giant block; the §5.5 budget stops it.
+5. **Marker-line hazard** — a line that is exactly `@@@OLD`/`@@@NEW`/`@@@END`
+   inside `OLD`/`NEW` would be read as structure. Detect and return a specific
+   error pointing at `edit`'s `oldText`/`newText` JSON form, which bypasses the
+   blob parser.
+6. **Trailing newline** must be preserved exactly (§6, gap 5), so a no-op
+   expression on a file without a final newline reports "unchanged".
+7. **Anchors never move.** The tail (rule 8) and any growth (§4.6) extend a
+   hunk's end only, so a block's first `OLD` line — and its `path:LINE` header —
+   is always the first line the diff reported.
+8. **The trailing context is clamped against the next block.** With `context: 0`,
+   `grouped_ops(0)` splits hunks maximally, so a naive 2-line tail can reach into
+   the next hunk's first line and produce two blocks with overlapping `OLD`
+   ranges — which `edit` rejects outright. Rule: extend the tail only up to (not
+   including) the next block's first line. Adjacent mass edits therefore get
+   1-line blocks even with the floor, which is correct: there is no unchanged room
+   to show.
+9. **Order of operations**, each step able to expose the next:
+   `grouped_ops(context)` → tail floor → balance growth (§4.6) →
+   borrow-if-still-empty-`OLD` → budget truncation (§5.5) → marker-hazard re-check
+   (rule 5) → render. The marker check runs *last* because the tail and growth can
+   pull a marker line into a block; truncation runs before rendering so it always
+   lands on a whole block.
+
+### 4.6 Two audiences: terse payload for the model, rich view for the human
+
+`context = 0` is cheap for the model but thin for the person watching the TUI.
+Those are separate surfaces, and only one of them is a token cost:
+
+* **Model-facing payload** — the blob, exactly as specified, at `context = 0`.
+  Reused verbatim as the `edit` tool's `edits` argument.
+* **UI panel** — `display_tool_result` already renders a context-rich unified diff
+  for `edit` results (`refined_diff_lines`, `src/output.rs:966`, 2 lines of
+  context, `-`/`+`/space markers). Extend the same renderer to the `sed` result:
+  the panel shows the blocks *with* surrounding context, so the human review that
+  motivates `context` never consumes model tokens. This is the main reason
+  `context = 0` is safe to default to.
+
+**Balance-based growth — "do as I mean, not do as I say".** When a hunk's `OLD`
+ends inside an unbalanced construct — an open `(`/`[`/`{`/`<`, or an unterminated
+string — the block is still *applied* correctly (it is a byte-exact replacement of
+exactly those lines), but the model cannot see what it is editing, and may "fix"
+the `NEW` side against an imagined wider statement. That is the one case where
+enlarging the block serves what the model meant, so it is worth doing.
+
+**Complexity: ~300 lines, and the scanner is not the expensive part.** A balance
+scanner (~150 lines: string states for `"` and `'`, escapes, `//` and `/* */`
+comments, a depth stack over four bracket kinds — the work is *state*, not
+counting, and it is a pure `&str -> bool`, trivially unit-tested), a growth walk
+(~60: extend until balanced, clamp at the next hunk, cap the span — the clamp is
+what makes it safe), wiring into rule 9's ordering (~40), tests (~120). The same
+scanner also serves `bsed replace -r` later.
+
+The safety argument for **trailing-only** growth: it appends only lines the diff
+already reported as unchanged, and stops before the next hunk's first line. So a
+grown block can never contain a line `sed` actually modified — that is precisely
+the failure mode that would silently revert another edit. `NEW` needs no separate
+handling: for unchanged lines `old[i] == new[i]`, so the same text goes into both.
+
+Angle brackets need one guard or the heuristic misfires constantly: count `<`
+only when it is not part of `->`/`<-` **and** a matching `>` appears within the
+growth cap. Then `a < b` never triggers growth while `Vec<String>` does. Same care
+for `'`: in Rust that is a lifetime, not a char literal, so track char-literal
+state that requires a closing `'` within a few characters.
+
+**Recommendation: ship growth in v1, not only the hint.** The residual risk is
+cosmetic and bounded (a mis-scan can only add unchanged, capped lines), the
+scanner is needed by `replace -r` anyway, and "a one-line replacement inside a
+five-line call" is exactly the case this tool exists to serve. Keep the hint too,
+for what growth cannot fix (unbalanced source, heredocs, macros):
+`2 block(s) end mid-expression; re-run with context: 4 if you need more.`
+
+## 5. Safety model
+
+### 5.1 Layer 1 — AST deny-list (verified against the sed-rs source)
+
+`command::parse` returns `Vec<SedCommand>`, `SedCommand { address, command }`,
+`command: Command` — a **closed** enum. I read `sed-rs`'s `engine.rs` and located
+every filesystem/exec touch point in it; all six are inside the cycle executor and
+each maps 1:1 to an AST node:
+
+| engine.rs site | operation | AST node | decision |
+| --- | --- | --- | --- |
+| `:575` `fs::read_to_string(path)` | read a file into the stream | `ReadFile` (`r`) | **allow** — see §5.4 |
+| `:604` `fs::File::open(path)` | one line per cycle | `ReadLine` (`R`) | **allow** — see §5.4 |
+| `:580` `OpenOptions::create(true).append(true)` | append to a file | `WriteFile` (`w`) | **reject** |
+| `:592` same | append first line | `WriteFirstLine` (`W`) | **reject** |
+| `:435` same, inside `Substitute` | `s///w FILE` | `SubstituteCmd.write_file` | **reject** |
+| `:625` `Command::new("sh").arg("-c")` | shell execution | `Execute` (`e`, incl. the `e` flag) | **reject** |
+| `:304`/`:310` `std::process::exit(code)` | `q N` / `Q N` with N≠0 | `Quit` / `QuitNoprint` | **reject** — see §5.4 |
+| `:222`/`:245`/`:1014` `File::open` / `fs::copy` / `tempfile::NamedTempFile` | in-place editing, backups | *entry points* `Engine::run` / `run_in_place` | never called — `bsed` uses only `eval(script, text) -> String` |
+
+Allowed (everything else, including the pure text transforms `s`, `y`, `d`, `D`,
+`p`, `P`, `=`, `l`, `n`, `N`, `h H g G x`, `a`, `i`, `c`, `:label`, `b`, `t`,
+`T`, `{ }`, `z`, `F`, `v`, and the file *readers* `r`/`R`): the deny-list is now
+write, exec, and early-exit only. §5.4 argues each.
+
+The walk is written as a `match` **without a wildcard arm**, so if `sed-rs` ever
+adds a variant the crate fails to compile rather than silently permitting it.
+Rejections name the offending expression and line: `expression 3: 'r FILE' reads a
+file from disk, which the sed tool does not allow — use the 'edit' tool to splice
+the file in manually.`
+
+### 5.2 Layer 2 — process boundary (the question: "is the tall order avoidable?")
+
+Short answer: **no, it is not a tall order — and we should still take it.**
+
+*Provable side.* Everything above is enumerable, and the "no I/O in the hot path"
+claim is checkable: `Engine::new` only compiles regexes (`engine.rs:172-180`), the
+only I/O in the cycle executor is the six sites tabulated, and the two I/O entry
+points (`run`, `run_in_place`) are never reachable from `eval`. So an in-process
+design can be made structurally I/O-free with a compile-time-exhaustive deny-list.
+
+*But there is a class the AST does not cover.* `q N` / `Q N` (N≠0) call
+`std::process::exit(code)` — that is not an I/O side effect, it is a **process
+exit**, and in-process it would kill the agent mid-turn. It is deny-listable, but
+it is a good illustration that "I audited the enum" and "the library cannot hurt
+the process" are different claims. A future release could add something similar
+that is *not* a new enum variant (a panic in a pathological regex, an
+`unwrap`, a stack overflow on a pathological script).
+
+*Why the boundary anyway, now that it is cheap:*
+
+* The blast radius of being wrong is precisely the thing we are building to
+  protect: the user's uncommitted work. "We reasoned correctly about a
+  third-party crate's internals" is a weaker guarantee than "even if we were
+  wrong, that process could not write to your workspace".
+* With `bsed` as a binary, the sandbox costs one `run_sandboxed_ro` call we were
+  going to make anyway. There is no extra process, no extra dependency, no
+  plumbing.
+* Defence in depth has *different* failure modes per layer, which is the point:
+  a deny-list hole degrades to "can write inside an ephemeral tmpfs, with no
+  network, no caps, no host filesystem, and a 120 s timeout"; a sandbox
+  misconfiguration degrades to "deny-list still holds".
+
+So: keep all three layers. The deny-list is not redundant with the sandbox — it
+is what makes `bsed preview` safe when a *human* runs it outside any sandbox, and
+it produces a good error message instead of an opaque `sed: can't read` from
+inside a namespace.
+
+### 5.3 Layer 3 — read-only sandbox
+
+`bsed preview` runs via `run_sandboxed_ro(argv, cfg, timeout)` (`src/tools.rs:1256`),
+identical to the grep/`rg` path:
+
+* argv only, never a shell; the model never supplies a subcommand, a flag name, or
+  a path — picocode templates the whole argv and the expressions ride as one argv
+  element (data, not structure).
+* read-only namespace: cwd ro-bound, `/tmp` an ephemeral tmpfs, `--unshare-net`,
+  `--cap-drop ALL`, `--die-with-parent`, `prlimit --as` memory cap, watchdog
+  timeout with `<Esc>` cancellation (all already implemented).
+* Consequence to document: the file must be visible inside the namespace. With
+  the default config (cwd ro-bound) it is. With a custom `bindings` list that
+  excludes it, `bsed` reports a clear error: *file not visible inside the sandbox
+  — add it to `[tool_config.bash.sandbox]` `ro` bindings*. (`grep` has the same
+  constraint today.)
+* Output cap: `capture_bounded` truncates at `max_output_bytes` (default 20 KiB),
+  which is *below* our 50 KB preview budget. Pass an explicit cap of
+  `budget + 8 KiB` slack and treat a short read as an error rather than parsing a
+  truncated blob (§5.5).
+* `run_sandboxed_ro` currently discards the exit code. `bsed` needs a
+  three-valued contract: `0` = blob on stdout, `2` = model-fixable error (message
+  on stderr, forwarded as a normal tool result so the UI doesn't paint it as a
+  crash), `1` = internal error. Add a status-returning RO variant next to
+  `run_sandboxed_with_status`.
+
+### 5.4 Resolved: what the deny-list rejects, and why
+
+**`q` / `Q` — reject.** The question was whether allowing them has any value, and
+it does not, in this tool. Every useful use of `q` is about *not* processing the
+rest of a stream: bounded reads in a pipeline (`sed -n '1,10p;10q'`), early exit
+from a huge input, `-n 'q'` used as a grep-like scanner. None of that applies —
+`bsed` already holds the whole file, diffs it, and the preview is the *result*, not
+a filtered stream. The only effect `q` can have here is to stop the output early,
+which the diff then renders as "every line after N was deleted". That is a
+maximally misleading preview, and it is misleading in exactly the direction that
+loses work. Reject with the reason spelled out, so the model can route around it:
+
+```
+expression 1: 'q' stops processing early, which this tool would report as
+"delete the rest of the file". There is no useful form of it here — the whole
+file is already loaded. Use an address or a range instead (e.g. '1,400d').
+```
+
+`Q` is the same thing with a variant spelling, and `q N` (N≠0) additionally
+reaches `std::process::exit` (§5.2).
+
+**`r` / `R` — allow.** The deny-list adds nothing here: everything readable inside
+the namespace is already reachable through `read`, `grep` or `bash`, so refusing
+`r` is not a security boundary, only a functional restriction. And `279r
+/tmp/model_filter.rs` is a real refactor idiom ("splice this file in here") that
+the model reaches for. Two consequences to handle rather than block:
+
+* **Budget.** Spliced content flows through the same diff and the same 50 KB cap,
+  so `r` of a large file truncates like anything else — and the banner says so.
+* **Marker hazard, now reachable via a file the tool never read.** The §4.5 rule 5
+  check runs last, over the *final* block text, precisely so a marker line arriving
+  through `r` is caught like one from the source file. It returns the
+  `oldText`/`newText` error rather than emitting an unappliable blob.
+
+**Truncation — banner + `exit 0`.** Agreed: report and guide, don't fail. The
+model gets a usable prefix plus an explicit "these 37 blocks are complete, the
+other 115 are not" line and the instruction to apply this batch first and
+re-preview for the rest. A hard error would throw away work the model can already
+put to use, and the failure mode it guards against (a model believing it saw
+everything) is covered by stating the count in the first line.
+
+### 5.5 Size budget
+
+Per your call: **no input-size cap** (the file being previewed is unbounded), and
+a **~50 KB preview cap**. Concretely:
+
+* `bsed` builds blocks in order, appending while the rendered blob stays under
+  `[tool_config.sed] max_preview_bytes` (default 50 KiB), and stops **at a block
+  boundary** — never mid-block.
+* The banner then states exactly what happened:
+  `preview: 37 of 152 block(s) for src/foo.rs (preview budget 50 KiB reached — the remaining 115 blocks are NOT shown). Apply these first, then re-run with narrower expressions (e.g. add line ranges) for the rest.`
+* The trailer repeats it, so a partially-read result is visible from either end.
+* Truncation is a normal result (`exit 0`) with the banner, **not** an error: an
+  error would hide a perfectly usable prefix, and the intended workflow is
+  preview → apply → preview → apply (§5.4).
+* Block count is reported either way, so the model always knows whether it is
+  looking at everything.
+
+## 6. Engine fidelity — `sed-rs` 2.0.0 vs GNU sed 4.9
+
+Identical output across ~60 scripts: `s///`, `s///g`, `s///I`, `s///N`, `s///2g`,
+`s///I2`, delimiters `| # ,`, addresses `N` `$` `/re/` `N~M` ranges `a,b` negation
+`a!b`, `d`, `p`, `=`, `y///`, `a`/`i`/`c` (single line), `{ }` with labels and
+`b`/`t`, hold space, `n`/`N`/`D`/`z`, BRE `\( \)` `\{ \}` `\+` `\?` `\|`, `\<`/`\>`
+in patterns, POSIX classes, replacement backrefs, `\n`/`\t` in replacements, empty
+input, no-match scripts.
+
+Nine divergences found. The split that decides the work is not
+popular/unpopular but **silent-wrong vs loud-error**:
+
+| # | Construct | GNU | sed-rs | Class | Decision |
+| --- | --- | --- | --- | --- | --- |
+| 5 | input has no trailing newline | preserved | a `\n` is added | **silent-wrong** | **normalize before diffing** (mandatory — this is about ordinary files, not exotic syntax) |
+| 1 | `\u \l \U \L \E` in the replacement | applies case transform | literal passthrough | **silent-wrong** | **shim**, ~80 lines by the sentinel method in §6.1 |
+| 2 | `c` over a line **range** | whole range → one copy | one copy per line | **silent-wrong** | **reject**: "range `c` is a rewrite; use the `edit` tool". Emulating delete-range+insert is where a diff-based preview stops being trustworthy. |
+| 3 | `/re/,+1` relative address | ok | parse error | loud | none — improve the error hint |
+| 4 | `s///M` (GNU 4.8 modifier) | ok | parse error | loud | none |
+| 6 | `s/x/9/ 2` (space before flags) | ok | parse error | loud | none (hint: "no space between the closing delimiter and the flags") |
+| 7 | `s/a/b/gg` (invalid flag) | error | applied as `g` | loud-ish | none — it errs toward *more* change, visible in the preview |
+| 8 | `\<`/`\>` in the *replacement* | backslashes consumed | kept literally | loud | none — the literal `\<` is visible in the block |
+| 9 | `s/a/b/e` | executes RHS via `sh -c` | parses as `Substitute` + `Execute` | **safety-positive** | already rejected by the deny-list |
+
+Net: one normalization, one shim, one rejection. Everything else already fails
+loudly, and loud is fine — the model gets a clear error and retries.
+
+### 6.1 The case-escape shim, and why it is ~80 lines and not ~40
+
+`\u \l \U \L \E` are the only *silent-wrong* gap a model is likely to hit by
+accident, so it gets fixed. The naive approach — re-implement `s///` for these
+commands — is the wrong shape: `sed-rs` exposes no hook into how it builds a
+replacement, so that means a second substitution engine (BRE translation, `&`,
+backrefs, `g`/`I`) and two implementations to keep agreeing. Instead, note what the
+divergence actually is: GNU *case-transforms a span that is otherwise copied
+verbatim from the old text*. `sed-rs` copies it verbatim and leaves the `\U`
+characters sitting there. So the transform can be recovered afterwards.
+
+**Sentinel method** — three steps, all inside `script.rs` / `engine.rs`:
+
+1. **Rewrite the replacement before it reaches the engine.** For each `s` command
+   whose replacement contains a case escape, replace the escapes with a pair of
+   sentinel strings around the affected span, carrying the intended mode:
+   `s/pat/\U&/g` becomes `s/pat/<OPEN-U>&<CLOSE>/g`. `\E` closes the current span
+   and resets the mode, so `s/a/\Ufoo\Ebar\lbaz/` becomes
+   `<OPEN-U>foo<CLOSE>bar<OPEN-L>baz<CLOSE>`. Everything else in the replacement
+   (`&`, `\1`, literals) is left as written, because the engine still expands it —
+   and it expands it *before* we ever look at the output.
+2. **Run the engine normally.** The sentinels are ordinary characters to it (we
+   verified `sed-rs` passes unknown bytes through literally — which is exactly why
+   it currently leaves `\U` in place). Each match emits its own sentinel pair, so
+   the `g` flag needs no special handling.
+3. **Collapse the sentinels after evaluation, before the diff.** Scan the output;
+   between an opener and its closer apply the carried mode (`to_uppercase`,
+   `to_lowercase`, `to_titlecase` for `\u`/`\l`); then drop the sentinels. The
+   result is byte-identical to what GNU sed prints for this flag set.
+
+Three details make it safe rather than merely clever:
+
+* **Nonce the sentinels.** Generate a per-run random token (private-use
+  codepoints plus a nonce) and regenerate it if it occurs in the input, so a file
+  cannot forge one.
+* **Verify they survived.** If a case-escape command was present and the nonce is
+  *absent* from the output, a later command in the script ate it. That is a hard
+  error, not a silent wrong preview. This guard is what makes step 1 trustworthy
+  in a multi-expression script, where a subsequent `s/…/…/g` could otherwise
+  match the sentinel bytes and corrupt the transform.
+* **Order.** Collapse *after* the full script has run and *before* the trailing
+  newline normalization and the diff, so nothing downstream ever sees a sentinel.
+
+Scope: this covers `\u \l \U \L \E` together with `&`, backrefs, `g` and `I` — the
+whole GNU surface for these escapes. Each `s` command carries its own sentinels,
+which is also GNU's per-command scoping.
+
+## 7. `bsed` — the standalone tool
+
+```
+bsed preview [-c N] [-p PATH] <expressions>     # print the block blob (default)
+bsed apply  [-p PATH] [-i] [FILE]               # read blob from stdin, apply, write
+bsed apply  [-p PATH] -f blob.txt               # ...or from a file
+bsed --version                                 # "bsed 0.1.0" (probe + handshake)
+```
+
+* `preview` never writes. It is what the agent calls, always inside the sandbox.
+* `apply` is for humans (and for the future `picocode edit` backend if it ever
+  wants to). `--in-place` mirrors GNU `sed -i`; without it, the result goes to
+  stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review loop.
+* `preview -p -` reads the file from stdin and writes the blob to stdout (for
+  pipelines). Not used by the agent.
+* Exit codes: `0` ok, `2` model/user-fixable, `1` internal.
+* No dependencies on an external `sed` binary, no shell, no config file. Later:
+  `bsed replace -r 'old' 'new' [dir]` (recursive search/replace emitting the same
+  block format) — the natural third mode, and the reason the block core is worth
+  extracting.
+
+**Distribution: one `cargo install --path .`, two binaries.** Cargo installs every
+`[[bin]]` target of the package you point it at, so the only question is whether
+`bsed` is a target of the `picocode` package or of a different one. It should be a
+target of `picocode`, as a two-line shim that delegates to the crate:
+
+```rust
+// picocode/src/bin/bsed.rs
+fn main() -> std::process::ExitCode { safe_sed::cli::main() }
+```
+
+with `safe_sed = { path = "crates/safe_sed" }` as a dependency.
+
+Then `cargo install --path .` installs **both** binaries, while `crates/safe_sed`
+stays self-contained and separately installable later (`cargo install --path
+crates/safe_sed`, or published and installed by name). The release build already
+produces both, so `release.yml` needs only the archive step updated and
+`install.sh` only two names. The cost is honest and small: `picocode` gains a
+compile-time dependency on `sed-rs`, and the tarball grows by one binary — worth
+paying for "the tool is simply there after a normal install", which is what turns
+the conditional advertisement in §9 into graceful degradation rather than a
+feature most users never get.
+
+## 8. Crate layout
+
+```
+crates/safe_sed/            # package: lib + bin bsed. No dependency from picocode.
+  Cargo.toml                # sed-rs = "2", similar = "2", thiserror = "2", clap? (hand-rolled argv is fine)
+  src/lib.rs                # pub fn preview(req) -> Result<Preview, Error>
+  src/script.rs             # split lines, parse each, walk the AST (deny-list), join
+  src/engine.rs             # eval + trailing-newline normalization + \u\l\U\L\E shim
+  src/hunks.rs              # TextDiff -> Vec<Hunk>  (non-empty OLD, borrow rule)
+  src/blocks.rs             # Hunk -> blob, budget enforcement, banner
+  src/bin/bsed.rs           # argv parsing, exit codes
+  tests/                    # golden + contract tests
+
+crates/blockedit/           # NEW: the pure block-edit core, extracted from picocode
+  src/parse.rs              # from src/edit_blocks.rs   (parse/render/canonicalize)
+  src/match.rs              # from src/edit_match.rs     (resolve/diagnose; `similar`)
+  src/apply.rs              # from src/tools.rs         (resolve_edits + apply-on-text)
+  src/types.rs              # EditOp / EditStartLine, serde names unchanged
+```
+
+`blockedit` is what makes §7's `apply` and the round-trip contract possible, and
+it is the risky part of this proposal: `src/edit_blocks.rs` (759 lines),
+`src/edit_match.rs` (928 lines) and `edit_file`/`resolve_edits` in `src/tools.rs`
+must move with their tests, keeping the persisted JSON shape
+(`{"oldText","newText","startLine"}`) byte-identical for session replay.
+`picocode` re-exports the types; `safe_sed` depends on `blockedit` for the markers
+and to self-validate the blob it emits.
+
+The extraction should be its own PR, before any `sed` work: it is a refactor with
+no behaviour change, and it de-risks the crate work.
+
+## 9. Integration in picocode
+
+| Where | Change |
+| --- | --- |
+| `Cargo.toml` | `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/safe_sed"]`; `blockedit = { path = … }`. add `safe_sed` as a dep, purely for the `bsed` shim binary (§7). |
+| `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed","preview","-c",n,"-p",rel,"-e",expressions]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
+| `src/tools.rs` | `bsed_available()` probe (`LazyLock<bool>` = `Command::new("bsed").arg("--version").status().is_ok()`), mirroring `is_executable` in `src/main.rs:97`. |
+| `src/agent.rs:1967` | register conditionally: `if bsed_available() { builder = builder.tool(SedPreview) }` — same conditional-advertisement shape as `guard(..., yolo, …)` for the mutating tools. |
+| `src/agent.rs:1923` | prompt: replace the "avoid sed … snapshot commit first" sentence with "use `sed` to preview bulk line changes — it never writes; review the returned blocks and apply them with `edit`." Only append the `sed` bullet when the tool is registered. |
+| `src/output.rs:804` | panel title: `sed <path> (N expressions)`, body rendered with the existing context-rich diff renderer (§4.6) — the human sees context the model never pays for. |
+| `src/session/storage.rs:23` | `CANONICAL_NAMES`: `("sed_preview", "sed")`; no arg renames needed. |
+| `src/config.rs` | `[tool_config.sed] { max_preview_bytes = 51200 }` (optional, default 50 KiB). |
+| `install.sh` | extract and install both names from the one archive; warn when the second is missing. |
+| `.github/workflows/release.yml` | `cargo build --release --target …` already builds every workspace member, so the archive step just needs both binaries: `tar … picocode bsed`. |
+
+## 10. Worked example (real prototype output)
+
+`src/foo.rs`:
+
+```
+1  fn main() {
+2      let x = 1;
+3      let y = 2;
+4      if count > 0 {
+5          run();
+6      }
+7      // trailing
+8      let z = 3;
+9  }
+```
+
+| `expressions` (ctx) | result |
+| --- | --- |
+| `5s/run/walk/` (0, **default**) | one block at `src/foo.rs:5`, OLD = `        run();`, NEW = `        walk();` |
+| `5s/run/walk/` (1) | one block at `src/foo.rs:4`, OLD = 3 lines (context + change + context), NEW = same with `walk()` |
+| `6,7d` (0) | one block at `src/foo.rs:6`, OLD = `}` + `// trailing`, NEW = *(empty)* |
+| `2a\⏎    let w = 0;` (0) | one block at `src/foo.rs:3`, OLD = `let y = 2;`, NEW = `let w = 0;` + `let y = 2;` (borrow rule) |
+| `1i\⏎// header` (0) | one block at `src/foo.rs:1`, OLD = `fn main() {`, NEW = `// header` + `fn main() {` |
+| `999s/zzz/yyy/` (0) | `no lines matched — src/foo.rs is unchanged` |
+| `s/run/walk/g` over a file with 40 `run();` lines (0) | 40 one-line blocks, each anchored to its own line; all apply in one `edit` call (§4.1, test 6a) |
+| `1,$d` | exceeds the budget → truncated at a block boundary; the banner states the remaining blocks are NOT shown |
+
+All rows are real output from a prototype built on `sed-rs` + `similar`, not
+hand-written.
+
+## 11. Test plan
+
+1. `script.rs` — deny-list unit tests per rejected node, **including nested inside
+   `{}`**, and `s///e` (which parses as `Execute`); a test asserting the `match`
+   has no wildcard arm is enforced by the compiler, not by a test.
+2. `engine.rs` — golden `expression -> text` table for every construct in §6, plus
+   a test pinning the *known* gaps so a `sed-rs` upgrade that changes them is
+   noticed rather than silently altering previews.
+3. `hunks.rs` — modify / insert-at-BOF / insert-at-EOF / delete-tail / delete-all /
+   two-close-hunks (assert no overlap) / file without trailing newline.
+4. `blocks.rs` — golden blobs + budget truncation at a block boundary.
+5. **Round-trip contract** (the most valuable test in the project):
+   `blocks.rs` output → `blockedit::parse_blob` → assert parsed
+   `(old_text, new_text, anchor)` equals the hunk slices and anchors are exact.
+   Run it as an integration test in *picocode* too, so the two sides cannot drift.
+6. **Anchored-resolution tests against the real `edit` backend** — the assumption
+   §4.1 rests on, pinned as an executable claim rather than a comment:
+   (a) a file with 40 identical lines, previewed at `context = 0` as 40 one-line
+   anchored blocks, applied in one `edit` call → all 40 land, none rejected;
+   (b) the same blob with one block's anchor deliberately shifted by 3 lines →
+   must fail cleanly ("anchor out of tolerance"), not apply to the wrong line;
+   (c) a blob with its headers stripped → falls to the unanchored pass and is
+   rejected as non-unique, which is exactly the argument for anchoring every block.
+7. `blockedit` extraction — existing tests move with the code; add a session-replay
+   test over a recorded `edit` call to prove the JSON shape is unchanged.
+8. Tool-level — `sed` absent from `$PATH` ⇒ tool not advertised; exit 2 ⇒ message;
+   file outside the sandbox's visible bindings ⇒ clear error. Panel rendering
+   (§4.6) shows context even though the model payload has none.
+
+## 12. Decisions taken, and what is left
+
+All of the review questions are settled; the reasoning lives in the section each
+row points to.
+
+| # | Question | Decision | Where |
+| --- | --- | --- | --- |
+| 1 | Truncation signalling | banner + `exit 0`, with shown/total counts and "apply this batch first, then re-preview" | §5.5 |
+| 2 | `q` / `Q` | **reject** — no useful form exists once the whole file is loaded, and its only effect is a maximally misleading preview | §5.4 |
+| 3 | `r` / `R` | **allow** — the sandbox already exposes those files to the model; the deny-list is for write/exec/early-exit only | §5.4 |
+| 4 | `\u \l \U \L \E` | **implement** via the sentinel method (~80 lines, not a second `s///` engine) | §6.1 |
+| 5 | Distribution | one `cargo install --path .` installs both, via a `[[bin]]` shim; `crates/safe_sed` stays independently installable | §7 |
+| 6 | `crates/blockedit` | **separate crate** — keeps the binary separable later | §8 |
+| 7 | Per-expression detail | **deferred**, low priority | §13 |
+| 8 | Balance growth | **ship growth in v1** (~300 lines), keeping the hint for what growth cannot fix | §4.6 |
+| 9 | Default `context` | `0` with a free 2-line trailing floor; symmetric on request | §4.1 |
+
+Still open — small tuning decisions, not architecture:
+
+1. **`TAIL` value.** Is 2 right for `[tool_config.sed].trailing_context`? 2 buys
+   a ±1 anchor tolerance (§4.1) and covers the 3-line call shape; 1 is cheaper; 3
+   starts covering 4-line calls at a real token cost on every single-line change.
+2. **Growth cap.** How many lines may a grown block add before we give up and emit
+   the banner hint instead? 40 was the sketch value; 20 is probably the honest one
+   for code review.
+3. **Angle brackets.** Keep the "count `<` only if a `>` appears within the cap"
+   guard, or drop `<`/`>` from balancing entirely? Dropping is safer but stops
+   `Vec<T>` and `HashMap<K, V>` in a changed line from triggering growth.
+4. **`bsed apply` in v1** or with `replace -r` later? `apply` is the piece a shell
+   user reaches for first, but it is not available until `blockedit` is extracted.
+
+## 13. Deferred
+
+* Per-expression match report (`expression 2 's/a/b/g' changed 12 lines`), behind
+  `--explain` or a config flag. The banner's aggregate covers the common case.
+* `bsed replace -r` — recursive search/replace emitting the same block format, with
+  the balance scanner reused for whole-file syntax checks.
+* Publishing `safe_sed` to crates.io, so `cargo install bsed` works without a
+  git checkout.
+* A `--json` output mode for `bsed preview`, for tooling that wants the blocks
+  without parsing the blob text.

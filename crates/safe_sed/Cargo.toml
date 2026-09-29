@@ -1,0 +1,12 @@
+[package]
+name = "safe_sed"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Preview a GNU sed script as line-anchored @@@OLD/@@@NEW/@@@END block edits. Ships the `bsed` binary."
+
+[dependencies]
+blockedit = { path = "../blockedit" }
+sed-rs = "2"
+similar = "2"
+thiserror = "2"

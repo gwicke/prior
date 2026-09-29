@@ -190,6 +190,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockedit"
+version = "0.1.0"
+dependencies = [
+ "path-clean",
+ "schemars",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "similar",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,6 +292,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+ "terminal_size",
 ]
 
 [[package]]
@@ -1624,6 +1637,7 @@ name = "picocode"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "blockedit",
  "chrono",
  "clap",
  "codewandler-markdown-stream",
@@ -1647,6 +1661,7 @@ dependencies = [
  "rig-agent",
  "rig-core",
  "rig-reqwest",
+ "safe_sed",
  "schemars",
  "serde",
  "serde_json",
@@ -2234,6 +2249,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "safe_sed"
+version = "0.1.0"
+dependencies = [
+ "blockedit",
+ "sed-rs",
+ "similar",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2303,6 +2328,18 @@ checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "sed-rs"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf04c4dee52cf554352c6e60408d0161d207ad37a3deb5ae2991676088fc5bd4"
+dependencies = [
+ "clap",
+ "regex",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2737,6 +2774,16 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

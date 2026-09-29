@@ -733,91 +733,11 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
     }
 }
 
-/// Wrapper type for a 1-indexed line number (the `edit` tool's `startLine`
-/// anchor, and the same numbers a `path:LINE` header parses to).
-/// Handles deserialization from JSON numbers and strings.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    schemars::JsonSchema,
-    Default,
-    serde::Serialize,
-)]
-pub struct EditStartLine(pub u64);
-
-impl<'de> serde::Deserialize<'de> for EditStartLine {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = u64;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a positive integer for start line (1-indexed, not a string)")
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value == 0 {
-                    return Err(E::custom("invalid start line: must be >= 1 (1-indexed)"));
-                }
-                Ok(value)
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if value <= 0 {
-                    return Err(E::custom("invalid start line: must be >= 1 (1-indexed)"));
-                }
-                Ok(value as u64)
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if let Ok(parsed) = value.parse::<u64>() {
-                    if parsed == 0 {
-                        return Err(E::custom("invalid start line: must be >= 1 (1-indexed)"));
-                    }
-                    Ok(parsed)
-                } else {
-                    Err(E::custom(format!(
-                        "invalid start line: '{}' - must be number",
-                        value
-                    )))
-                }
-            }
-        }
-
-        deserializer.deserialize_any(Visitor).map(EditStartLine)
-    }
-}
-
-impl EditStartLine {
-    pub fn map<U, F: FnOnce(u64) -> U>(self, f: F) -> U {
-        f(self.0)
-    }
-}
-
-impl From<EditStartLine> for u64 {
-    fn from(w: EditStartLine) -> u64 {
-        w.0
-    }
-}
+/// The `edit` tool's 1-indexed `startLine` anchor (and the same numbers a
+/// `path:LINE` header parses to). Defined in the `blockedit` crate so the
+/// `bsed` binary shares one type; re-exported here for the existing
+/// `crate::config::EditStartLine` call sites.
+pub use blockedit::EditStartLine;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
