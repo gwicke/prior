@@ -789,9 +789,22 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             (format!("ls {}", path), Vec::new())
         }
         "edit" | "edit_file" => {
-            let path = get_str("path").unwrap_or("");
-            // Try canonical format (edits array) first, then the legacy
-            // single-edit top-level shape, then the old "old/new" fields.
+            // The canonical form (`edits` array) is what `on_tool_call` hands us;
+            // the model-facing blob (`blocks` string) is what we get when
+            // canonicalization failed, so resolve that here rather than printing
+            // a phantom diff. A blob that still won't resolve (malformed, or
+            // spanning files) yields no edits at all, and the label below then
+            // carries no range and no diff — which is the honest rendering.
+            let canonical = crate::edit_blocks::canonicalize_edit_value(args);
+            // Prefer the canonical `path`: resolving a blob can *supply* one
+            // from a header line, which the raw args may not carry at all.
+            let path = canonical
+                .get("path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| get_str("path"))
+                .unwrap_or("");
+            let obj = canonical.as_object();
             let edits: Vec<EditOp> = if let Some(edits_array) =
                 obj.and_then(|o| o.get("edits")).and_then(|v| v.as_array())
             {
@@ -1029,7 +1042,7 @@ fn short_banner(banner: &str) -> String {
 mod sed_preview_body_tests {
     use super::{get_preview, sed_preview_body, short_banner};
 
-    const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `edits` argument.
+    const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `blocks` argument.
 src/x.rs:5
 @@@OLD
     run();
@@ -1091,7 +1104,7 @@ src/x.rs:9
         assert_eq!(
             short_banner(
                 "sed preview: 3 blocks for src/x.rs (2 expressions). Review the blocks below, \
-                 then pass them to the `edit` tool as its `edits` argument."
+                 then pass them to the `edit` tool as its `blocks` argument."
             ),
             "3 blocks in src/x.rs, from 2 expressions"
         );
@@ -3292,6 +3305,31 @@ mod tests {
             get_preview("read_file", &args).0,
             "read src/output.rs [20..]"
         );
+    }
+
+    /// A blob that will not canonicalize — here a multi-file one, which is
+    /// rejected at ingress — must render as a label and nothing else. The bug
+    /// this pins: the old `edit` branch fell through to the legacy `old`/`new`
+    /// arm with two empty strings, so `content.find("")` hit line 1 and the
+    /// panel printed `edit b.rs [1]` above an empty diff.
+    #[test]
+    fn an_uncanonicalizable_blob_renders_no_range_and_no_diff() {
+        let multi = "a.rs\n@@@OLD\nx\n@@@NEW\nX\n@@@END\n\nb.rs\n@@@OLD\ny\n@@@NEW\nY\n@@@END";
+        let (label, diff) = get_preview("edit", &serde_json::json!({ "blocks": multi }));
+        assert!(!label.contains('['), "no fabricated range: {label}");
+        assert!(diff.is_empty(), "no fabricated diff: {diff:?}");
+    }
+
+    /// The mirror: a blob that *does* canonicalize renders fully, and takes
+    /// `path` from the blob's own header even though the args carry none.
+    #[test]
+    fn a_resolvable_blob_renders_its_diff_and_its_header_path() {
+        let args = serde_json::json!({
+            "blocks": "src/x.rs\n@@@OLD\na\n@@@NEW\nb\n@@@END"
+        });
+        let (label, diff) = get_preview("edit", &args);
+        assert_eq!(label, "edit src/x.rs");
+        assert!(!diff.is_empty(), "expected a diff: {diff:?}");
     }
 
     #[test]

@@ -3218,7 +3218,7 @@ mod tests {
                     provider: None,
                     function: ToolFunction::new(
                         "edit".into(),
-                        serde_json::json!({"path": "src/x.rs", "edits": blob}),
+                        serde_json::json!({"path": "src/x.rs", "blocks": blob}),
                     ),
                     signature: None,
                     additional_params: None,

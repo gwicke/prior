@@ -177,6 +177,31 @@ pub async fn write_file(path: String, content: String) -> Result<String, ToolErr
     .to_string())
 }
 
+/// The block syntax, shown to the model.
+///
+/// Defined once and interpolated into both the tool description and the
+/// `blocks` parameter description. These were two byte-identical copies, which
+/// is two chances to drift — and a stale copy is a bug the model feels, not one
+/// a compiler catches. The backticks in [`BLOCK_POLICY`] are why this is a const
+/// and not a `concat!`: the policy needs a format string, and the syntax is
+/// pasted into a markdown fence where braces must survive it.
+const BLOCK_SYNTAX: &str = "\
+some/path
+@@@OLD
+the original text
+@@@NEW
+the replacement text
+@@@END";
+
+/// The batch policy sentence that follows the syntax: atomicity, and the
+/// `path:LINE` anchor the model needs for repeated text.
+const BLOCK_POLICY: &str = "Multiple blocks are executed as an all-or-nothing batch, \
+but all blocks need to be within the same file. Each edit's text must occur \
+exactly once: if it repeats, anchor it near the right occurrence with a \
+`path:LINE` hint, which specifies the start line location of the original text. \
+So in the example block, `some/path` becomes `some/path:1234`, 1-based line \
+numbers e.g. from `read`.";
+
 /// Static tool facade for `edit`. Hand-written (rather than `#[rig_tool]`) so
 /// the args deserializer can select a variant from the raw JSON and accept the
 /// legacy shapes without advertising them — see [`EditArgs`]. The `Bash` tool
@@ -191,17 +216,11 @@ impl rig_core::tool::Tool for EditFile {
     const NAME: &'static str = "edit";
 
     fn description(&self) -> String {
-        "Replace text in a file. Prefer the `edits` batch string using block syntax:
-```
-some/path
-@@@OLD
-the original text
-@@@NEW
-the replacement text
-@@@END
-```
-Multiple blocks are executed as an all-or-nothing batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`).
-For single edits, the traditional OpenAI path / oldText / newText API is available as well.".into()
+        format!(
+            "Replace text in a file. Prefer the `blocks` block string:\n```\n{BLOCK_SYNTAX}\n```\n\
+             {BLOCK_POLICY}\n\
+             For single edits, the traditional OpenAI path / oldText / newText API is available as well."
+        )
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -226,18 +245,9 @@ For single edits, the traditional OpenAI path / oldText / newText API is availab
                     "type": "integer",
                     "description": "Single-edit form only: a 1-indexed anchor line. When oldText occurs more than once, the occurrence nearest this line (within a small, context-scaled tolerance) is chosen. It is a hint, not a search range, and sets no end line. A `path:LINE` suffix is an equivalent alias; if both are given they must agree. Ignored in the block form — use a `path:LINE` block header there instead."
                 },
-                "edits": {
+                "blocks": {
                     "type": "string",
-                    "description": "Main edit entry point with batching support, using block syntax:
-```
-some/path
-@@@OLD
-the original text
-@@@NEW
-the replacement text
-@@@END
-```
-Multiple blocks are executed as an all-or-nothing batch, but all blocks need to be within the same file. Each edit's text must occur exactly once: if it repeats, anchor it near the right occurrence with a `path:LINE` hint, which specifies the start line location of the original text. So in the example block, `some/path` becomes `some/path:1234`, 1-based line numbers e.g. from `read`)."
+                    "description": format!("Main edit entry point, with batching support, using block syntax:\n```\n{BLOCK_SYNTAX}\n```\n{BLOCK_POLICY}")
                 }
             },
             "required": []
@@ -340,7 +350,7 @@ const BSED_BIN: &str = "bsed";
     description = "Preview what GNU sed expressions would change in a file, as editable blocks. \
 This tool NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
 anchored to a line with a `path:LINE` header. Review them, then pass them to the `edit` tool \
-as its `edits` argument to apply. One expression per line, GNU sed syntax (s///, d, a, c, y///, \
+as its `blocks` argument to apply. One expression per line, GNU sed syntax (s///, d, a, c, y///, \
 addresses, ranges). `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
     required(path, expressions)
 )]
@@ -2685,7 +2695,10 @@ mod edit_args_wire_tests {
 
     #[tokio::test]
     #[serial]
-    async fn canonical_edits_array_parses_and_applies() {
+    async fn an_edits_array_is_rejected_and_writes_nothing() {
+        // `edits: [...]` is pi's storage form, not a wire one. The point of
+        // refusing it is that a harness which stringifies the array cannot get
+        // far enough to half-apply a batch, so the file must be untouched.
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("canon.txt", "hello\nworld\n")
             .await
@@ -2695,32 +2708,11 @@ mod edit_args_wire_tests {
             "edits": [{"oldText": "hello", "newText": "goodbye"}]
         }))
         .await;
-        assert!(result.is_success(), "expected success, got: {result:?}");
-        assert!(
-            result.output().render().starts_with("Replaced"),
-            "unexpected output: {}",
-            result.output().render()
-        );
+        assert!(result.is_error(), "array must not dispatch: {result:?}");
+        let text = result.output().render();
+        assert!(text.contains("`blocks`"), "must name the field: {text}");
         let after = tokio::fs::read_to_string("canon.txt").await.unwrap();
-        assert_eq!(after, "goodbye\nworld\n");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn canonical_multi_edit_applies_all() {
-        let _cwd = super::edit_file_tests::CwdGuard::new();
-        tokio::fs::write("multi.txt", "a\nb\nc\n").await.unwrap();
-        let result = execute_edit(serde_json::json!({
-            "path": "multi.txt",
-            "edits": [
-                {"oldText": "a", "newText": "A"},
-                {"oldText": "c", "newText": "C"}
-            ]
-        }))
-        .await;
-        assert!(result.is_success(), "expected success, got: {result:?}");
-        let after = tokio::fs::read_to_string("multi.txt").await.unwrap();
-        assert_eq!(after, "A\nb\nC\n");
+        assert_eq!(after, "hello\nworld\n", "the file must be untouched");
     }
 
     // ---- Single shape (accepted, undocumented) ----
@@ -2838,7 +2830,7 @@ mod edit_args_wire_tests {
         let blob = "win.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
 
         let result = execute_edit(serde_json::json!({
-            "path": "win.txt", "edits": blob, "startLine": 3
+            "path": "win.txt", "blocks": blob, "startLine": 3
         }))
         .await;
         assert!(
@@ -2860,7 +2852,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("win2.txt", "x\nkeep\nx\n").await.unwrap();
         // The header anchors the block to line 3 (the second `x`).
         let blob = "win2.txt:3\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "win2.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "win2.txt", "blocks": blob})).await;
         assert!(result.is_success(), "got: {result:?}");
         assert_eq!(
             tokio::fs::read_to_string("win2.txt").await.unwrap(),
@@ -2914,7 +2906,7 @@ mod edit_args_wire_tests {
         // rather than silently aiming an unrelated block.
         let result = execute_edit(serde_json::json!({
             "path": "pb.txt:3",
-            "edits": "pb.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END"
+            "blocks": "pb.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END"
         }))
         .await;
         assert!(
@@ -2936,7 +2928,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("m.txt", "a\nb\nc\n").await.unwrap();
         let result = execute_edit(serde_json::json!({
-            "path": "m.txt", "edits": "m.txt\n@@@OLD\nb\n@@@NEW\nB\n@@@END"
+            "path": "m.txt", "blocks": "m.txt\n@@@OLD\nb\n@@@NEW\nB\n@@@END"
         }))
         .await;
         assert!(result.is_success(), "got: {result:?}");
@@ -2954,7 +2946,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("ma.txt", "x\nkeep\nx\n").await.unwrap();
         let result = execute_edit(serde_json::json!({
-            "path": "ma.txt", "edits": "ma.txt:3\n@@@OLD\nx\n@@@NEW\ny\n@@@END"
+            "path": "ma.txt", "blocks": "ma.txt:3\n@@@OLD\nx\n@@@NEW\ny\n@@@END"
         }))
         .await;
         assert!(result.is_success(), "got: {result:?}");
@@ -2977,7 +2969,7 @@ mod edit_args_wire_tests {
         // Two identical 2-line bodies (lines 2 and 7). The header anchors to
         // line 7, so the *second* occurrence must be replaced.
         let blob = "anchor.txt:7\n@@@OLD\n    let x = 1;\n    let y = 2;\n@@@NEW\n    let x = 9;\n    let y = 9;\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "anchor.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "anchor.txt", "blocks": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         let after = tokio::fs::read_to_string("anchor.txt").await.unwrap();
         assert_eq!(
@@ -2996,7 +2988,7 @@ mod edit_args_wire_tests {
         // 3-line context → tolerance 1. Occurrences start at lines 1 and 5;
         // anchoring to line 6 lands within 1 of the second.
         let blob = "tol.txt:6\n@@@OLD\nalpha\nbeta\ngamma\n@@@NEW\nA\nB\nC\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "tol.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "tol.txt", "blocks": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         assert_eq!(
             tokio::fs::read_to_string("tol.txt").await.unwrap(),
@@ -3014,7 +3006,7 @@ mod edit_args_wire_tests {
         // Anchor line 3 is 2 lines from *both* occurrences (lines 1 and 5):
         // outside the ±1 tolerance and not decisively nearer (d1 == d2, a tie).
         let blob = "far.txt:3\n@@@OLD\nalpha\nbeta\ngamma\n@@@NEW\nA\nB\nC\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "far.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "far.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(
             out.contains("not decisive"),
@@ -3036,7 +3028,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("uniq.txt", "only\nhere\n").await.unwrap();
         // A wildly-off anchor is harmless when oldText occurs exactly once.
         let blob = "uniq.txt:100\n@@@OLD\nhere\n@@@NEW\nthere\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "uniq.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "uniq.txt", "blocks": blob})).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         assert_eq!(
             tokio::fs::read_to_string("uniq.txt").await.unwrap(),
@@ -3051,7 +3043,7 @@ mod edit_args_wire_tests {
         // Two occurrences on the same line, equidistant from the anchor.
         tokio::fs::write("amb.txt", "x x\n").await.unwrap();
         let blob = "amb.txt:1\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "amb.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "amb.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(
             out.contains("ambiguous"),
@@ -3082,7 +3074,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         write_alpha_lines_1_50().await;
         let blob = "skew.txt:52\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "skew.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "skew.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(
             out.starts_with("Replaced"),
@@ -3108,7 +3100,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob = "tie.txt:43\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "tie.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "tie.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(
             looks_like_edit_failure(&out),
@@ -3143,7 +3135,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob = "cap.txt:66\n@@@OLD\nalpha\n@@@NEW\nhit\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "cap.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "cap.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "cap must reject, got: {out}");
         assert!(out.contains("not decisive"), "got: {out}");
@@ -3171,7 +3163,7 @@ mod edit_args_wire_tests {
         tokio::fs::write("dup.txt", "hello world\n").await.unwrap();
         let blob =
             "dup.txt\n@@@OLD\nhello\n@@@NEW\nbye\n@@@END\n\n@@@OLD\nhello\n@@@NEW\nhi\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "dup.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "dup.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "must fail, got: {out}");
         assert!(
@@ -3196,7 +3188,7 @@ mod edit_args_wire_tests {
             .await
             .unwrap();
         let blob = "mot.txt\n@@@OLD\nfoo\n@@@NEW\nAAA\n@@@END\n\nmot.txt:3\n@@@OLD\nfoo\n@@@NEW\nBBB\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "mot.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "mot.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
         assert_eq!(
@@ -3217,7 +3209,7 @@ mod edit_args_wire_tests {
             .unwrap();
         let blob =
             "chain.txt\n@@@OLD\nfoo bar\n@@@NEW\nAAA\n@@@END\n\n@@@OLD\nbar\n@@@NEW\nBBB\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "chain.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "chain.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(out.starts_with("Replaced"), "expected success, got: {out}");
         assert_eq!(
@@ -3234,7 +3226,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("ov.txt", "hello world\n").await.unwrap();
         let blob = "ov.txt:1\n@@@OLD\nhello\n@@@NEW\nA\n@@@END\n\nov.txt:1\n@@@OLD\nhello world\n@@@NEW\nB\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "ov.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "ov.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "must conflict, got: {out}");
         assert!(
@@ -3260,7 +3252,7 @@ mod edit_args_wire_tests {
             .unwrap();
         let blob =
             "noclaim.txt:3\n@@@OLD\ndup\n@@@NEW\nX\n@@@END\n\n@@@OLD\ndup\n@@@NEW\nY\n@@@END";
-        let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "edits": blob})).await;
+        let result = execute_edit(serde_json::json!({"path": "noclaim.txt", "blocks": blob})).await;
         let out = result.output().render();
         assert!(looks_like_edit_failure(&out), "batch must fail, got: {out}");
         // Pass-1 failure: anchor not decisive (d1=2 at line 1, d2=3 at line 5... anchor 3 → |3-1|=2, |3-5|=2 tie).
@@ -3301,24 +3293,47 @@ mod edit_args_wire_tests {
         );
 
         let props = schema.get("properties").expect("properties present");
-        for key in ["path", "oldText", "newText", "startLine", "edits"] {
+        for key in ["path", "oldText", "newText", "startLine", "blocks"] {
             assert!(
                 props.get(key).is_some(),
                 "missing property `{key}`: {schema}"
             );
         }
+        let desc = EditFile.description();
         assert!(
             props.get("endLine").is_none(),
             "`endLine` must no longer be advertised: {schema}"
         );
-        // `edits` is a *string* (the blob), not an array.
+        // The blob is advertised as `blocks`, a *string*. `edits` is not
+        // advertised at all: it is the canonical array pi reads off disk, and
+        // advertising it is what invites the nested array back onto the wire.
         assert_eq!(
             props
-                .get("edits")
+                .get("blocks")
                 .and_then(|e| e.get("type"))
                 .and_then(|t| t.as_str()),
             Some("string"),
-            "`edits` must be advertised as a string"
+            "`blocks` must be advertised as a string"
+        );
+        assert!(
+            props.get("edits").is_none(),
+            "`edits` must not be advertised: it is storage-only: {schema}"
+        );
+        // No property may be a JSON array — weak harnesses stringify those.
+        for (key, prop) in props.as_object().expect("properties is an object") {
+            let ty = prop.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            assert_ne!(ty, "array", "`{key}` must not be an array: {schema}");
+        }
+        // The block syntax and the policy sentence live in one const each, so
+        // the description and the parameter cannot drift apart.
+        assert_eq!(
+            desc.matches("@@@OLD").count(),
+            1,
+            "the syntax example must appear once in the description: {desc}"
+        );
+        assert!(
+            desc.contains(&format!("\n{BLOCK_SYNTAX}\n")),
+            "the description must interpolate BLOCK_SYNTAX"
         );
 
         let required = schema
@@ -3339,7 +3354,7 @@ mod edit_args_wire_tests {
         let blob = "blob.txt\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nc\n@@@NEW\nC\n@@@END";
         let result = execute_edit(serde_json::json!({
             "path": "blob.txt",
-            "edits": blob
+            "blocks": blob
         }))
         .await;
         assert!(result.is_success(), "expected success, got: {result:?}");
@@ -3353,7 +3368,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("infer.txt", "hello\n").await.unwrap();
         let blob = "infer.txt\n@@@OLD\nhello\n@@@NEW\nworld\n@@@END";
-        let result = execute_edit(serde_json::json!({ "edits": blob })).await;
+        let result = execute_edit(serde_json::json!({ "blocks": blob })).await;
         assert!(result.is_success(), "expected success, got: {result:?}");
         let after = tokio::fs::read_to_string("infer.txt").await.unwrap();
         assert_eq!(after, "world\n");
@@ -3365,7 +3380,7 @@ mod edit_args_wire_tests {
         let _cwd = super::edit_file_tests::CwdGuard::new();
         tokio::fs::write("a.txt", "x\n").await.unwrap();
         let blob = "b.txt\n@@@OLD\nx\n@@@NEW\ny\n@@@END";
-        let result = execute_edit(serde_json::json!({ "path": "a.txt", "edits": blob })).await;
+        let result = execute_edit(serde_json::json!({ "path": "a.txt", "blocks": blob })).await;
         assert!(result.is_error(), "conflicting path must fail: {result:?}");
         let msg = result.output().render();
         assert!(msg.contains("path mismatch"), "got: {msg}");
@@ -3386,5 +3401,73 @@ mod edit_args_wire_tests {
             }],
         ));
         assert!(looks_like_edit_failure(&s));
+    }
+}
+
+#[cfg(test)]
+mod rename_verification {
+    //! Pins the post-rename contract end-to-end, at the boundary a real model
+    //! call crosses. Written to fail loudly if any layer drifts back.
+    use super::*;
+    use crate::edit_match::looks_like_edit_failure;
+    use rig_core::tool::{ErasedTool, ToolContext};
+    use serial_test::serial;
+
+    async fn call(args: serde_json::Value) -> rig_core::tool::ToolResult {
+        let ctx = &mut ToolContext::new();
+        EditFile
+            .execute(serde_json::to_string(&args).unwrap(), ctx)
+            .await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn blocks_applies_and_the_array_is_refused_without_touching_the_file() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("v.txt", "hello\nworld\n").await.unwrap();
+
+        // 1. the blob field works end to end
+        let ok = call(serde_json::json!({
+            "path": "v.txt",
+            "blocks": "v.txt\n@@@OLD\nhello\n@@@NEW\ngoodbye\n@@@END"
+        }))
+        .await;
+        assert!(ok.is_success(), "{ok:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("v.txt").await.unwrap(),
+            "goodbye\nworld\n"
+        );
+
+        // 2. the array is refused, by name, and changes nothing
+        let bad = call(serde_json::json!({
+            "path": "v.txt",
+            "edits": [{"oldText": "world", "newText": "there"}]
+        }))
+        .await;
+        assert!(bad.is_error(), "array must not dispatch: {bad:?}");
+        let text = bad.output().render();
+        assert!(text.contains("blocks"), "must name the field: {text}");
+        assert!(
+            !looks_like_edit_failure(&text),
+            "an arg error is not a batch-failure envelope: {text}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string("v.txt").await.unwrap(),
+            "goodbye\nworld\n",
+            "the refused array must not write"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_blob_getting_the_file_from_a_header_alone_still_works() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("h.txt", "one\n").await.unwrap();
+        let r = call(serde_json::json!({
+            "blocks": "h.txt\n@@@OLD\none\n@@@NEW\n1\n@@@END"
+        }))
+        .await;
+        assert!(r.is_success(), "{r:?}");
+        assert_eq!(tokio::fs::read_to_string("h.txt").await.unwrap(), "1\n");
     }
 }

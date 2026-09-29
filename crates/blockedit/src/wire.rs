@@ -13,14 +13,24 @@
 //!
 //! The advertised shape is a **flat bag of optional fields** (see the tool's
 //! `parameters()`), so variant selection happens here, on the raw JSON, and no
-//! `anyOf` union is ever advertised. Accepted shapes:
+//! `anyOf` union is ever advertised. Accepted shapes — and only these two:
 //!
 //! - single edit: `{path, oldText, newText, startLine?}` — `startLine` is the
 //!   anchor.
-//! - block edit:  `{path?, edits: "<SEARCH/REPLACE blocks>"}` — anchors come
+//! - block edit:  `{path?, blocks: "<@@@OLD/@@@NEW blocks>"}` — anchors come
 //!   from each block's `path:LINE` header; a top-level `startLine` is ignored
 //!   in this shape.
-//! - legacy batch (replay only): `{path, edits: [{oldText, newText, startLine?}]}`
+//!
+//! # The `edits` array is not a wire shape
+//!
+//! `{path, edits: [{oldText, newText}]}` was accepted here for pi parity, and
+//! is gone: the whole reason this module exists is that weak tool-calling
+//! harnesses mangle nested arrays — most often by *stringifying* them, which
+//! turns a batch into a JSON string and loses the edit entirely. `edits` is now
+//! storage-only, where nothing has to encode it for a provider: pi's canonical
+//! array, written to and read back from the session file. A model that still
+//! sends one gets a named correction rather than a generic "no recognizable
+//! edit arguments", because pi-shaped training makes that a likely slip.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -218,9 +228,7 @@ fn is_path_header(line: &str) -> bool {
 /// block above it. Any other shape (the single-edit fields, a non-object) is
 /// short, so it is shown as-is via [`truncate_wire_repr`].
 fn actual_summary(raw: &Value) -> String {
-    if let Some(text) = raw
-        .get("edits")
-        .and_then(|v| v.as_str())
+    if let Some(text) = blob::blob_text(raw)
         .filter(|_| raw.get("oldText").is_none() && raw.get("newText").is_none())
     {
         return char_truncate(&render_blob_structure(text), MAX_ECHOED_ARGS);
@@ -243,18 +251,6 @@ impl EditArgs {
             "{why}\n\nExpected:\n{EDIT_ARGS_EXAMPLE}\n\nActual:\n{}",
             actual_summary(raw),
         )
-    }
-
-    /// Parse one legacy `edits[]` entry.
-    fn op_from_value(e: &Value) -> Option<EditOp> {
-        Some(EditOp {
-            old_text: e.get("oldText")?.as_str()?.to_string(),
-            new_text: e.get("newText")?.as_str()?.to_string(),
-            start_line: e
-                .get("startLine")
-                .and_then(|v| v.as_u64())
-                .map(EditStartLine),
-        })
     }
 
     /// Parse the wire JSON. The `path` argument is authoritative; a filename
@@ -297,9 +293,9 @@ impl EditArgs {
             .and_then(|v| v.as_u64())
             .map(EditStartLine);
 
-        // Block form: `edits` is a string of Aider SEARCH/REPLACE blocks.
+        // Block form: `blocks` is a string of @@@OLD/@@@NEW blocks.
         // Anchors come solely from each block's `path:LINE` header.
-        if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
+        if let Some(text) = blob::blob_text(raw) {
             let parsed = blob::parse_blocks(text)
                 .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
             let (path, blocks) =
@@ -315,23 +311,15 @@ impl EditArgs {
             return Ok(EditArgs { path, edits });
         }
 
-        // Legacy batch form: `edits` is an array.
-        if let Some(arr) = obj.get("edits").and_then(|v| v.as_array()) {
-            let path =
-                json_path.ok_or_else(|| Self::invalid(raw, "missing required field 'path'"))?;
-            let mut edits = Vec::with_capacity(arr.len());
-            for e in arr {
-                edits.push(Self::op_from_value(e).ok_or_else(|| {
-                    Self::invalid(
-                        raw,
-                        "each `edits[]` entry needs string 'oldText' and 'newText'",
-                    )
-                })?);
-            }
-            return Ok(EditArgs {
-                path: path.to_string(),
-                edits,
-            });
+        // `edits` as an array is the canonical *storage* form, not a wire one.
+        // A model that sends it (pi-shaped training makes that likely) gets a
+        // correction naming the field it should use instead of a dead end.
+        if obj.get("edits").map(Value::is_array).unwrap_or(false) {
+            return Err(Self::invalid(
+                raw,
+                "`edits` is a list; it is not a form this tool accepts. Use `blocks` \
+                 (a block string) or the single-edit fields `oldText` + `newText`",
+            ));
         }
 
         // Single form: top-level oldText/newText. Both `path:LINE` and
@@ -369,7 +357,7 @@ impl EditArgs {
 
         Err(Self::invalid(
             raw,
-            "no recognizable edit arguments (expected `oldText`+`newText`, or `edits`)",
+            "no recognizable edit arguments (expected `oldText`+`newText`, or `blocks`)",
         ))
     }
 }
@@ -397,7 +385,7 @@ mod tests {
         let old: String = (0..40).map(|i| format!("old line {i}\n")).collect();
         let new: String = (0..40).map(|i| format!("new line {i}\n")).collect();
         let blob = format!("@@@OLD\n{old}@@@NEW\n{new}@@@END");
-        let v = json!({ "path": "p", "edits": blob });
+        let v = json!({ "path": "p", "blocks": blob });
         let out = truncate_wire_repr(&v);
 
         assert!(out.contains("@@@OLD"), "opening marker lost: {out}");
@@ -414,7 +402,7 @@ mod tests {
         // which is exactly the failure the echo should surface.
         let body: String = (0..60).map(|i| format!("line {i}\n")).collect();
         let blob = format!("@@@OLD>\n{body}");
-        let v = json!({ "path": "p", "edits": blob });
+        let v = json!({ "path": "p", "blocks": blob });
         let out = truncate_wire_repr(&v);
         assert!(out.contains("@@@OLD>"), "marker lost: {out}");
         assert!(out.contains("elided"), "no elision notice: {out}");
@@ -452,7 +440,7 @@ mod tests {
         let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs",
             "startLine": 20,
-            "edits": "src/x.rs:7\n@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "src/x.rs:7\n@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.edits[0].start_line, Some(EditStartLine(7)));
@@ -462,7 +450,7 @@ mod tests {
     fn path_argument_anchor_is_peeled_in_block_form_too() {
         let a = EditArgs::from_wire(&json!({
             "path": "src/x.rs:12",
-            "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+            "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
         }))
         .unwrap();
         assert_eq!(a.path, "src/x.rs");
@@ -470,13 +458,48 @@ mod tests {
     }
 
     #[test]
-    fn legacy_array_shape_still_parses() {
-        let a = EditArgs::from_wire(&json!({
+    fn the_edits_array_is_rejected_with_a_named_correction() {
+        // The array is pi's storage form, not a wire one. A model that sends it
+        // must be told which field to use, not left at "unrecognized args".
+        let e = EditArgs::from_wire(&json!({
             "path": "src/x.rs",
             "edits": [{"oldText": "a", "newText": "b", "startLine": 3}]
         }))
+        .unwrap_err();
+        assert!(e.contains("`edits` is a list"), "{e}");
+        assert!(e.contains("`blocks`"), "{e}");
+        // The self-correcting envelope is intact around the correction.
+        assert!(e.contains("Expected:"), "{e}");
+        assert!(e.contains("Actual:"), "{e}");
+    }
+
+    #[test]
+    fn the_two_field_names_are_not_interchangeable() {
+        // `blocks` is the blob and is not a list; `edits` is the canonical list
+        // and is not a blob. Neither reading may be reached through the other's
+        // field, or the rename has bought nothing.
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
         .unwrap();
-        assert_eq!(a.edits[0].start_line, Some(EditStartLine(3)));
+        assert_eq!(a.path, "src/x.rs");
+        assert_eq!(a.edits.len(), 1);
+
+        // `blocks` as an array is not the block form, and not the single-edit
+        // form either, so it is simply unrecognised.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "blocks": [{"oldText": "a", "newText": "b"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("no recognizable edit arguments"), "{e}");
+    }
+
+    #[test]
+    fn an_empty_edits_array_is_rejected_too() {
+        // Belt and braces: a mangled array must never produce zero EditOps and
+        // a vacuous "success".
+        let e = EditArgs::from_wire(&json!({ "path": "src/x.rs", "edits": [] })).unwrap_err();
+        assert!(e.contains("`blocks`"), "{e}");
     }
 
     #[test]
@@ -484,7 +507,7 @@ mod tests {
         // The blob never closes its OLD section, so the parser runs on and
         // trips over the later @@@END — and says so.
         let e = EditArgs::from_wire(&json!({
-            "path": "src/x.rs", "edits": "@@@OLD\na\n@@@END"
+            "path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"
         }))
         .unwrap_err();
         assert!(e.contains("@@@OLD section"), "{e}");
@@ -497,7 +520,7 @@ mod tests {
         // one problem, show the block format line-based, and show the offending
         // blob the same way — no JSON string full of `\n` escapes, no ceremony.
         let e = EditArgs::from_wire(&json!({
-            "edits": "src/x.rs\n@@@OLD\nold\n@@@NEWEND@@@OLD2@@@NEW2"
+            "blocks": "src/x.rs\n@@@OLD\nold\n@@@NEWEND@@@OLD2@@@NEW2"
         }))
         .unwrap_err();
         assert!(e.starts_with("Invalid block:"), "{e}");
@@ -519,7 +542,7 @@ mod tests {
         assert!(!e.contains("sed or python"), "no sed/python lecture: {e}");
         // Bounded: a huge blob cannot blow up the message.
         let big = format!("@@@OLD\n{}\n@@@NEWEND", "x".repeat(50_000));
-        let e2 = EditArgs::from_wire(&json!({ "edits": big })).unwrap_err();
+        let e2 = EditArgs::from_wire(&json!({ "blocks": big })).unwrap_err();
         assert!(e2.len() < 4 * MAX_ECHOED_ARGS, "len {}", e2.len());
     }
 }

@@ -119,7 +119,7 @@ impl Preview {
         let n = r.shown;
         let mut s = format!(
             "sed preview: {n} block{} for {path} ({} expression{}). \
-             Review the blocks below, then pass them to the `edit` tool as its `edits` argument.",
+             Review the blocks below, then pass them to the `edit` tool as its `blocks` argument.",
             if n == 1 { "" } else { "s" },
             self.expressions,
             if self.expressions == 1 { "" } else { "s" },
