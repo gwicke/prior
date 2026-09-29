@@ -310,8 +310,8 @@ pub struct ReplCtx {
     pub context_tokens: u64,
     /// Current model filter/sort state for the `/model` overlay.
     pub model_filter: ModelFilter,
-    /// Currently-active thinking level (for the `*` marker in `/thinking`).
-    pub thinking_level: Option<String>,
+    /// Currently-active reasoning level (for the `*` marker in `/reasoning`).
+    pub reasoning_level: Option<String>,
     /// The session's name, for the prompt-side status bar. `None` when unnamed,
     /// in which case the bar falls back to the session's opening message — the
     /// mid-turn bar reads the same two fields off the session index, and the two
@@ -641,7 +641,7 @@ impl Repl {
         // The prompt-side status bar: the same `status_line` the mid-turn bar
         // uses, with the dot **grey** — the two states are the whole reason the
         // bar is permanent. Built once per `read_input`, not per keystroke: the
-        // pieces it needs (session name, model, thinking level, context tokens)
+        // pieces it needs (session name, model, reasoning level, context tokens)
         // cannot change while the input is being typed, and the frame's partial
         // row-diff keeps the row itself current.
         //
@@ -657,7 +657,7 @@ impl Repl {
                     crate::agent::BarModel {
                         provider: &ctx.provider,
                         model: &ctx.model,
-                        thinking: ctx.thinking_level.as_deref(),
+                        thinking: ctx.reasoning_level.as_deref(),
                         context_tokens: ctx.context_tokens,
                     },
                     dims.0,
@@ -753,10 +753,10 @@ impl Repl {
                         if matches!(key, crate::slashdot_menu::HostKey::Enter) =>
                     {
                         // The node's submit() wrote to `AppState` (target
-                        // config for `/thinking`/`/model`/…, control fields
+                        // config for `/reasoning`/`/model`/…, control fields
                         // for `/session`/`/replay`/…). Use the
                         // engine-provided self-documenting prompt
-                        // (e.g. "/thinking low").
+                        // (e.g. "/reasoning low").
                         let committed = format!("/{}", prompt);
                         Repl::emit_commit(
                             output,
@@ -1428,7 +1428,7 @@ impl Repl {
     /// Echo a committed-invocation `line` to the transcript (a record of the
     /// change), draw a separator, then begin the next input prompt pre-filled
     /// with `next_input` (empty string for a leaf command). This unifies the
-    /// `/model`, `/thinking`, and `/set <key> <value>` commits so each
+    /// `/model`, `/reasoning`, and `/set <key> <value>` commits so each
     /// leaves exactly one separator directly below the emitted line — the next
     /// prompt's own divider (drawn below its input) no longer has to do that
     /// job, which previously left `/set` value commits looking
@@ -1454,7 +1454,7 @@ impl Repl {
         next_input: &str,
         history: &mut History,
     ) {
-        // v2.5 menu commits (`/replay 1`, `/thinking low`, …) return
+        // v2.5 menu commits (`/replay 1`, `/reasoning low`, …) return
         // `MenuDone` and never pass through the `Submit` arm in agent.rs
         // where typed input is recorded — record the committed line here
         // so recall (Up/Down) sees every command the user actually ran.
@@ -2195,7 +2195,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -2214,22 +2214,22 @@ mod tests {
     }
 
     #[test]
-    fn batch_slash_thinking_high_commits_in_one_enter() {
+    fn batch_slash_reasoning_high_commits_in_one_enter() {
         let state = batch_state();
         let (out, lines) = crate::output::RecordingOutput::new();
         let action = crate::agent::block_on_test(Repl::batch_slash(
             &state,
-            "/thinking high",
+            "/reasoning high",
             out.as_ref(),
             &mut batch_hist(),
         ));
         assert!(matches!(action, Some(InputAction::MenuDone)));
         // The node wrote the runtime target; the loop's convergence step
         // would apply it on the same cycle.
-        assert_eq!(state.thinking().as_deref(), Some("high"));
+        assert_eq!(state.reasoning().as_deref(), Some("high"));
         let captured = crate::output::RecordingOutput::joined(&lines);
         assert!(
-            captured.contains("thinking high"),
+            captured.contains("reasoning high"),
             "committed line not echoed: {:?}",
             captured
         );

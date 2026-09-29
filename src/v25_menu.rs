@@ -7,7 +7,7 @@ use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 use crate::slashdot_menu::node_impl::StaticRow;
 use crate::v25_listing_node::ListingNode;
 
-use crate::v25_thinking::ThinkingEnumNode;
+use crate::v25_reasoning::ReasoningEnumNode;
 
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
@@ -20,8 +20,8 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let mut tl: SlashDotMenuNode = ListingNode::new(
             app_state,
             &[StaticRow::new(
-                "thinking",
-                "Set thinking level: off | low | med | high | max",
+                "reasoning",
+                "Set reasoning level: off | low | med | high | max",
             )],
         )
         .with_columns(vec![
@@ -30,10 +30,12 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         ])
         .into();
         tl.add_child(
-            ThinkingEnumNode {
-                active_fn: Box::new(move || reader.thinking().unwrap_or_else(|| "off".to_string())),
+            ReasoningEnumNode {
+                active_fn: Box::new(move || {
+                    reader.reasoning().unwrap_or_else(|| "off".to_string())
+                }),
                 submit_fn: Box::new(move |level| {
-                    writer.set_thinking(Some(level.to_string()));
+                    writer.set_reasoning(Some(level.to_string()));
                     Ok(())
                 }),
             }
@@ -162,7 +164,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -187,8 +189,19 @@ mod tests {
                     .filter_map(|l| l.0.split_whitespace().next())
                     .collect();
                 for cmd in [
-                    "thinking", "persona", "model", "set", "stat", "replay", "session", "new",
-                    "clear", "compact", "tree", "sandbox", "quit",
+                    "reasoning",
+                    "persona",
+                    "model",
+                    "set",
+                    "stat",
+                    "replay",
+                    "session",
+                    "new",
+                    "clear",
+                    "compact",
+                    "tree",
+                    "sandbox",
+                    "quit",
                 ] {
                     assert!(
                         ids.contains(&cmd),
@@ -198,6 +211,12 @@ mod tests {
                 assert!(
                     !ids.contains(&"help"),
                     "'help' must stay removed from the root listing: {ids:?}"
+                );
+                // The rename was a hard break (doc/model_settings_v2.md A.11):
+                // the old spelling must be gone, not aliased.
+                assert!(
+                    !ids.contains(&"thinking"),
+                    "'thinking' must not answer any more: {ids:?}"
                 );
             }
             other => panic!(

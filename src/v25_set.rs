@@ -199,21 +199,23 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         set_node.add_child(wrapper);
     }
 
-    // --- default_thinking_level ---
+    // --- default_reasoning_level ---
     {
         let reader = app_state.clone();
         let writer = app_state.clone();
-        let child = crate::v25_thinking::ThinkingEnumNode {
-            active_fn: Box::new(move || reader.with_settings(|s| s.default_thinking_level.clone())),
+        let child = crate::v25_reasoning::ReasoningEnumNode {
+            active_fn: Box::new(move || {
+                reader.with_settings(|s| s.value(SettingKey::DefaultReasoning))
+            }),
             submit_fn: Box::new(move |level| {
-                writer.set_setting(SettingKey::DefaultThinking, level)
+                writer.set_setting(SettingKey::DefaultReasoning, level)
             }),
         };
         let mut wrapper: SlashDotMenuNode = ListingNode::new(
             app_state,
             &[StaticRow::new(
-                "default_thinking_level",
-                "Default thinking level: off | low | med | high",
+                "default_reasoning_level",
+                "Default reasoning level: off | low | med | high | max",
             )],
         )
         .into();
@@ -228,7 +230,7 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
     for meta in SETTINGS {
         if matches!(
             meta.key,
-            SettingKey::DefaultModel | SettingKey::DefaultPersona | SettingKey::DefaultThinking
+            SettingKey::DefaultModel | SettingKey::DefaultPersona | SettingKey::DefaultReasoning
         ) {
             continue;
         }
@@ -280,7 +282,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 50,
             default_persona: Some("architect".into()),
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,

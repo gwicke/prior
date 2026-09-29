@@ -190,7 +190,7 @@ pub enum SettingKey {
     /// built-in persona name or file path; empty = none.
     DefaultPersona,
     /// `off` | `low` | `med` | `high`.
-    DefaultThinking,
+    DefaultReasoning,
     /// `disabled` | `indicator` | `content`.
     ShowReasoning,
     /// `always` | `never` | `aborted_turns_only` — how reasoning blocks are kept in context.
@@ -249,8 +249,8 @@ pub static SETTINGS: &[SettingMeta] = &[
         kind: ValueKind::Persona,
     },
     SettingMeta {
-        key: SettingKey::DefaultThinking,
-        name: "default_thinking_level",
+        key: SettingKey::DefaultReasoning,
+        name: "default_reasoning_level",
         description: "Default thinking level: off | low | med | high",
         kind: ValueKind::Enum(&["off", "low", "med", "high"]),
     },
@@ -288,7 +288,13 @@ pub struct SettingsStore {
     pub security_mode: String,
     pub tool_call_limit: usize,
     pub default_persona: Option<String>,
-    pub default_thinking_level: String,
+    /// `off` | `low` | `med` | `high` | `max`, or `None` for "no default
+    /// recorded" — which is the same effective state as `off`, and is what an
+    /// untouched file carries. Optional on purpose (doc/model_settings_v2.md
+    /// A.5): the key is written only when the user actually picks a level, so
+    /// "off" is represented by the key's *absence* rather than by a literal
+    /// that would sit in every settings file forever.
+    pub default_reasoning_level: Option<String>,
     /// `disabled` | `indicator` | `content` (how reasoning is shown).
     pub show_reasoning: String,
     /// How reasoning blocks are kept in the LLM context. Default `Never`.
@@ -318,10 +324,13 @@ impl SettingsStore {
             },
             tool_call_limit: cfg.tool_call_limit,
             default_persona: cfg.persona_name.clone(),
-            default_thinking_level: cfg
-                .thinking_level
+            // A resolved "off" (i.e. `reasoning_level: None`) is stored as "no
+            // key" rather than a literal "off" — the two are the same effective
+            // state, and the absent form is what a file should carry.
+            default_reasoning_level: cfg
+                .reasoning_level
                 .clone()
-                .unwrap_or_else(|| "off".to_string()),
+                .filter(|l| !l.eq_ignore_ascii_case("off")),
             show_reasoning: cfg
                 .show_reasoning_handle
                 .lock()
@@ -346,10 +355,7 @@ impl SettingsStore {
                 .unwrap_or_else(|| "confirm".to_string()),
             tool_call_limit: cfg.tool_call_limit.unwrap_or(50),
             default_persona: cfg.default_persona.clone(),
-            default_thinking_level: cfg
-                .default_thinking_level
-                .clone()
-                .unwrap_or_else(|| "off".to_string()),
+            default_reasoning_level: cfg.default_reasoning_level.clone(),
             show_reasoning: cfg
                 .show_reasoning
                 .clone()
@@ -380,11 +386,12 @@ impl SettingsStore {
             .default_persona
             .as_ref()
             .and_then(|p| crate::persona::get_persona(p));
-        cfg.thinking_level = if self.default_thinking_level.eq_ignore_ascii_case("off") {
-            None
-        } else {
-            Some(self.default_thinking_level.clone())
-        };
+        // `None` (key absent) and an explicit "off" are the same effective
+        // state; both mean "no reasoning requested".
+        cfg.reasoning_level = self
+            .default_reasoning_level
+            .clone()
+            .filter(|l| !l.eq_ignore_ascii_case("off"));
         // Live-update the shared `show_reasoning` handle so the `Output` impl
         // (which holds a clone) honors the new mode on the very next response.
         if let Ok(mode) = self.show_reasoning.parse::<ShowReasoning>() {
@@ -400,8 +407,9 @@ impl SettingsStore {
             return Ok(Self::from_config(&crate::Config::default(), Some(path)));
         }
         let content = std::fs::read_to_string(path).map_err(crate::PicocodeError::Io)?;
-        let cfg: crate::Config = toml_edit::de::from_str(&content)
-            .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
+        // `Config::parse` (not a bare `toml_edit::de::from_str`) so this path
+        // gets the same forward migrations as `Config::load`.
+        let cfg = crate::Config::parse(&content)?;
         Ok(Self::from_config(&cfg, Some(path)))
     }
 
@@ -412,7 +420,10 @@ impl SettingsStore {
             SettingKey::SecurityMode => self.security_mode.clone(),
             SettingKey::ToolCallLimit => self.tool_call_limit.to_string(),
             SettingKey::DefaultPersona => self.default_persona.clone().unwrap_or_default(),
-            SettingKey::DefaultThinking => self.default_thinking_level.clone(),
+            SettingKey::DefaultReasoning => self
+                .default_reasoning_level
+                .clone()
+                .unwrap_or_else(|| "off".to_string()),
             SettingKey::ShowReasoning => self.show_reasoning.clone(),
             SettingKey::ReasoningInContext => self.reasoning_in_context.to_string(),
             SettingKey::SessionResumeReplayTurns => self.session_resume_replay_turns.to_string(),
@@ -477,9 +488,9 @@ impl SettingsStore {
                     ))
                 }
             }
-            SettingKey::DefaultThinking => value
+            SettingKey::DefaultReasoning => value
                 .trim()
-                .parse::<crate::thinking::ThinkingLevel>()
+                .parse::<crate::params::ReasoningLevel>()
                 .map(|_| ())
                 .map_err(|e| e),
             SettingKey::ShowReasoning => value
@@ -586,10 +597,20 @@ impl SettingsStore {
                 table.remove("default_persona");
             }
         }
-        table.insert(
-            "default_thinking_level",
-            toml_edit::value(self.default_thinking_level.clone()),
-        );
+        // default_reasoning_level: written only when a level is recorded, and
+        // removed when there is none — same shape as `default_persona` above.
+        // "off" is stored as absence, so an untouched file never carries it.
+        match &self.default_reasoning_level {
+            Some(level) => {
+                table.insert("default_reasoning_level", toml_edit::value(level.clone()));
+            }
+            None => {
+                table.remove("default_reasoning_level");
+            }
+        }
+        // The pre-rename key is never written back: `Config` folds it into
+        // `default_reasoning_level` on load, and the next save drops it.
+        table.remove("default_thinking_level");
         table.insert(
             "show_reasoning",
             toml_edit::value(self.show_reasoning.clone()),
@@ -631,8 +652,16 @@ impl SettingsStore {
                     Some(value.to_string())
                 }
             }
-            SettingKey::DefaultThinking => {
-                self.default_thinking_level = normalize_thinking(value).to_string()
+            SettingKey::DefaultReasoning => {
+                // "off" is stored as absence, so `/set default_reasoning_level
+                // off` removes the key rather than pinning a literal that
+                // means the same thing.
+                let level = normalize_reasoning(value);
+                self.default_reasoning_level = if level == "off" {
+                    None
+                } else {
+                    Some(level.to_string())
+                };
             }
             SettingKey::ShowReasoning => {
                 self.show_reasoning = normalize_show_reasoning(value).to_string()
@@ -663,9 +692,9 @@ fn normalize_security(v: &str) -> &'static str {
     }
 }
 
-fn normalize_thinking(v: &str) -> &'static str {
+fn normalize_reasoning(v: &str) -> &'static str {
     v.trim()
-        .parse::<crate::thinking::ThinkingLevel>()
+        .parse::<crate::params::ReasoningLevel>()
         .map(|l| l.as_str())
         .unwrap_or("off")
 }
@@ -680,7 +709,7 @@ fn normalize_show_reasoning(v: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thinking::ThinkingLevel;
+    use crate::params::ReasoningLevel;
 
     fn store(path: &Path) -> SettingsStore {
         SettingsStore {
@@ -688,7 +717,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 50,
             default_persona: Some("architect".into()),
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -728,10 +757,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_default_thinking() {
-        assert!(SettingsStore::validate(SettingKey::DefaultThinking, "off").is_ok());
-        assert!(SettingsStore::validate(SettingKey::DefaultThinking, "high").is_ok());
-        assert!(SettingsStore::validate(SettingKey::DefaultThinking, "bogus").is_err());
+    fn validate_default_reasoning() {
+        assert!(SettingsStore::validate(SettingKey::DefaultReasoning, "off").is_ok());
+        assert!(SettingsStore::validate(SettingKey::DefaultReasoning, "high").is_ok());
+        assert!(SettingsStore::validate(SettingKey::DefaultReasoning, "bogus").is_err());
     }
 
     #[test]
@@ -790,7 +819,7 @@ mod tests {
             output: std::sync::Arc::new(crate::QuietOutput::new()),
             yolo: false,
             quiet: true,
-            thinking_level: None,
+            reasoning_level: None,
             tool_call_limit: 50,
             system_message_extension: None,
             persona_prompt: None,
@@ -812,7 +841,9 @@ mod tests {
         s.set_value(SettingKey::ToolCallLimit, "12").unwrap();
         s.set_value(SettingKey::DefaultPersona, "architect")
             .unwrap();
-        s.set_value(SettingKey::DefaultThinking, "high").unwrap();
+        // My renamed key, upstream's value: `ShowReasoning::Indicator` no
+        // longer exists upstream, so the "disabled" arm is the live one.
+        s.set_value(SettingKey::DefaultReasoning, "high").unwrap();
         s.set_value(SettingKey::ShowReasoning, "disabled").unwrap();
         s.set_value(SettingKey::ReasoningInContext, "always")
             .unwrap();
@@ -826,7 +857,7 @@ mod tests {
             cfg.persona_prompt.is_some(),
             "persona prompt should resolve"
         );
-        assert_eq!(cfg.thinking_level.as_deref(), Some("high"));
+        assert_eq!(cfg.reasoning_level.as_deref(), Some("high"));
         // `show_reasoning` is applied live via the shared handle.
         assert_eq!(
             *cfg.show_reasoning_handle.lock().unwrap(),
@@ -843,9 +874,9 @@ mod tests {
         );
 
         // "off" thinking level maps back to `None`.
-        s.set_value(SettingKey::DefaultThinking, "off").unwrap();
+        s.set_value(SettingKey::DefaultReasoning, "off").unwrap();
         s.apply_to_config(&mut cfg);
-        assert_eq!(cfg.thinking_level, None);
+        assert_eq!(cfg.reasoning_level, None);
 
         // Non-settings fields are preserved.
         assert!(cfg.quiet);
@@ -879,6 +910,88 @@ mod tests {
         assert_eq!(reloaded.tool_call_limit, 50);
     }
 
+    // ---- default_reasoning_level is optional (doc/model_settings_v2.md A.5) ----
+
+    /// An unrecorded level is the ABSENCE of the key, not a literal "off" —
+    /// so a settings file that the user never touched reasoning in does not
+    /// carry one. `value()` still reports "off" so the menu shows the right
+    /// current state.
+    #[test]
+    fn unset_reasoning_level_is_omitted_from_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("picocode.toml");
+        let mut s = store(path.as_path());
+        assert_eq!(s.value(SettingKey::DefaultReasoning), "off");
+        s.set_value(SettingKey::DefaultModel, "openrouter:foo")
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("default_reasoning_level"),
+            "an unset level must not be written: {content}"
+        );
+        assert!(s.default_reasoning_level.is_none());
+        // Still reported as "off" on read-back.
+        assert_eq!(
+            SettingsStore::load(&path)
+                .unwrap()
+                .value(SettingKey::DefaultReasoning),
+            "off"
+        );
+    }
+
+    /// A chosen level round-trips; choosing "off" again removes the key rather
+    /// than pinning a literal that means the same thing.
+    #[test]
+    fn reasoning_level_round_trips_and_off_removes_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("picocode.toml");
+        let mut s = store(path.as_path());
+        s.set_value(SettingKey::DefaultReasoning, "max").unwrap();
+        assert_eq!(s.default_reasoning_level.as_deref(), Some("max"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(r#"default_reasoning_level = "max""#),
+            "{content}"
+        );
+        assert_eq!(
+            SettingsStore::load(&path)
+                .unwrap()
+                .default_reasoning_level
+                .as_deref(),
+            Some("max")
+        );
+
+        s.set_value(SettingKey::DefaultReasoning, "off").unwrap();
+        assert!(s.default_reasoning_level.is_none());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("default_reasoning_level"),
+            "'off' must be stored as absence: {content}"
+        );
+    }
+
+    /// Saving never writes the pre-rename key back, and drops it from a file
+    /// that still carries it (the read side folded it into the new key).
+    #[test]
+    fn save_drops_the_pre_rename_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("picocode.toml");
+        std::fs::write(&path, "default_thinking_level = \"high\"\n").unwrap();
+        let mut s = SettingsStore::load(&path).unwrap();
+        assert_eq!(s.default_reasoning_level.as_deref(), Some("high"));
+        s.set_value(SettingKey::DefaultModel, "openrouter:foo")
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("default_thinking_level"),
+            "the old spelling must not survive a save: {content}"
+        );
+        assert!(
+            content.contains(r#"default_reasoning_level = "high""#),
+            "the migrated level must be written under the new key: {content}"
+        );
+    }
+
     #[test]
     fn set_value_invalid_does_not_persist() {
         let tmp = tempfile::tempdir().unwrap();
@@ -904,9 +1017,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_thinking_round_trips() {
-        assert_eq!(normalize_thinking("high"), ThinkingLevel::High.as_str());
-        assert_eq!(normalize_thinking("bogus"), "off");
+    fn normalize_reasoning_round_trips() {
+        assert_eq!(normalize_reasoning("high"), ReasoningLevel::High.as_str());
+        assert_eq!(normalize_reasoning("bogus"), "off");
     }
 
     #[test]

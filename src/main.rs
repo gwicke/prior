@@ -251,7 +251,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .tool_call_limit
         .or(config.tool_call_limit)
         .unwrap_or(50);
-    let thinking_level = config.default_thinking_level.clone();
+    let reasoning_level = config.default_reasoning_level.clone();
     let settings_path = picocode::platform::resolve_config_path(args.config.as_deref());
 
     let persona_name = args
@@ -311,7 +311,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.agent_prompt.clone(),
             config.agent_prompt_file.clone(),
         )?,
-        thinking_level,
+        reasoning_level,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         sandbox,

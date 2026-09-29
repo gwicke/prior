@@ -10,14 +10,14 @@ use crate::slashdot_menu::node_impl::{
 };
 
 // ---------------------------------------------------------------------------
-// ThinkingEnumNode — returns all thinking levels from a single node.
+// ReasoningEnumNode — returns all thinking levels from a single node.
 //
 // The parent listing shows off/low/med/high as rows. On submit, the
 // selected level is read from path_args (the drilled row ID) and written
 // to the shared cell.
 // ---------------------------------------------------------------------------
 
-pub struct ThinkingEnumNode {
+pub struct ReasoningEnumNode {
     /// Read the current thinking level.
     pub active_fn: Box<dyn Fn() -> String>,
     /// Write the selected thinking level. `Ok(())` on success.
@@ -25,7 +25,7 @@ pub struct ThinkingEnumNode {
 }
 
 #[async_trait::async_trait(?Send)]
-impl SlashDotNode for ThinkingEnumNode {
+impl SlashDotNode for ReasoningEnumNode {
     async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
         let active = (self.active_fn)();
         let levels: &[(&str, &str)] = &[
@@ -69,7 +69,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -80,20 +80,22 @@ mod tests {
     }
 
     /// Mini menu mirroring the `v25_menu` wiring: root → listing row
-    /// "thinking" → `ThinkingEnumNode` bound to the target config.
-    fn build_thinking_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
+    /// "reasoning" → `ReasoningEnumNode` bound to the target config.
+    fn build_reasoning_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         let reader = app_state.clone();
         let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = StaticListingNode::new(&[StaticRow::new(
-            "thinking",
-            "Set thinking level: off | low | med | high",
+            "reasoning",
+            "Set reasoning level: off | low | med | high | max",
         )])
         .into();
         tl.add_child(
-            ThinkingEnumNode {
-                active_fn: Box::new(move || reader.thinking().unwrap_or_else(|| "off".to_string())),
+            ReasoningEnumNode {
+                active_fn: Box::new(move || {
+                    reader.reasoning().unwrap_or_else(|| "off".to_string())
+                }),
                 submit_fn: Box::new(move |level| {
-                    writer.set_thinking(Some(level.to_string()));
+                    writer.set_reasoning(Some(level.to_string()));
                     Ok(())
                 }),
             }
@@ -110,16 +112,16 @@ mod tests {
 
     /// Root listing shows the `thinking` command row.
     #[test]
-    fn thinking_root_row_present() {
+    fn reasoning_root_row_present() {
         let app_state = test_app_state();
-        let mut menu = build_thinking_menu(&app_state);
+        let mut menu = build_reasoning_menu(&app_state);
         let mut h = menu.get_handle();
         match futures::executor::block_on(h.eval_prompt("", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 assert!(
                     rows.iter()
-                        .any(|r| r.split_whitespace().next() == Some("thinking")),
+                        .any(|r| r.split_whitespace().next() == Some("reasoning")),
                     "root should list 'thinking': {rows:?}"
                 );
             }
@@ -133,12 +135,12 @@ mod tests {
     /// The current level gets the `*` marker: `plan.active_rows` points at
     /// the row whose id is the active level.
     #[test]
-    fn thinking_active_marker_on_current_level() {
+    fn reasoning_active_marker_on_current_level() {
         let app_state = test_app_state();
-        app_state.set_thinking(Some("med".to_string()));
-        let mut menu = build_thinking_menu(&app_state);
+        app_state.set_reasoning(Some("med".to_string()));
+        let mut menu = build_reasoning_menu(&app_state);
         let mut h = menu.get_handle();
-        match futures::executor::block_on(h.eval_prompt("thinking ", HostKey::None, 80)) {
+        match futures::executor::block_on(h.eval_prompt("reasoning ", HostKey::None, 80)) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 let idx = rows
@@ -160,12 +162,12 @@ mod tests {
 
     /// Tab selects a level, Enter submits it → the target config's thinking.
     #[test]
-    fn thinking_submit_sets_target_config() {
+    fn reasoning_submit_sets_target_config() {
         let app_state = test_app_state();
-        let mut menu = build_thinking_menu(&app_state);
+        let mut menu = build_reasoning_menu(&app_state);
         let mut h = menu.get_handle();
         let prompt = match futures::executor::block_on(h.eval_prompt_resolved(
-            "thinking ",
+            "reasoning ",
             HostKey::Tab,
             80,
         )) {
@@ -187,6 +189,6 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
-        assert_eq!(app_state.thinking().as_deref(), Some(sel.as_str()));
+        assert_eq!(app_state.reasoning().as_deref(), Some(sel.as_str()));
     }
 }

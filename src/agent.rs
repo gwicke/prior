@@ -1,12 +1,12 @@
 use crate::app_state::AppState;
 use crate::model_catalog;
 use crate::output::Confirmation;
+use crate::params;
 use crate::repl::{InputAction, ModelFilter, Repl, ReplCtx};
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::session::Session;
 use crate::settings::SettingsStore;
-use crate::thinking;
 use crate::tools::{
     bsed_available, set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText,
     ListDir, MakeDir, MoveFile, ReadFile, Remove, SedPreview, WriteFile,
@@ -330,7 +330,9 @@ impl PicoAgent for CodeAgent {
             BarModel {
                 provider: &self.provider,
                 model: &self.model,
-                thinking: self.thinking_level.as_deref(),
+                // The status bar's own field is upstream's `thinking`; the
+                // value it reads is now the renamed reasoning level.
+                thinking: self.reasoning_level.as_deref(),
                 // Reported wins: it is the provider's own count of what it was
                 // sent. The estimate only stands in while there is none — turn
                 // one, where the alternative is no figure at all.
@@ -1368,11 +1370,11 @@ pub struct CodeAgent {
     tool_call_limit: usize,
     provider: String,
     model: String,
-    /// The active thinking level, for the status readout. A snapshot taken when
+    /// The active reasoning level, for the status readout. A snapshot taken when
     /// the agent is built: the level only changes on an explicit commit, and the
     /// bar is painted once per content block, so reading the config per block
     /// would only add a lock to a path that has no reason to be fresh.
-    thinking_level: Option<String>,
+    reasoning_level: Option<String>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -1397,7 +1399,7 @@ pub struct AgentConfig {
     pub output: Arc<dyn Output>,
     pub yolo: bool,
     pub quiet: bool,
-    pub thinking_level: Option<String>,
+    pub reasoning_level: Option<String>,
     pub tool_call_limit: usize,
     pub system_message_extension: Option<String>,
     pub persona_prompt: Option<String>,
@@ -1499,7 +1501,7 @@ fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
-    let think_json = thinking::mapping_opt(&provider, config.thinking_level.as_deref());
+    let reasoning_json = params::mapping_opt(&provider, config.reasoning_level.as_deref());
 
     // OAuth credentials live in a `token` sub-directory of the settings dir
     // (see `platform::app_config_dir`), kept private so refresh tokens aren't
@@ -1532,14 +1534,14 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             let cached_model = $client
                 .completion_model(&model)
                 .with_prompt_caching();
-            let merged = merge_openrouter_params(think_json.clone());
+            let merged = merge_openrouter_params(reasoning_json.clone());
             build!(@builder_with_params AgentBuilder::new(cached_model), merged)
         }};
         ($client:expr) => {{
             build!(@builder $client.agent(&model))
         }};
         (@builder $builder:expr) => {{
-            build!(@builder_with_params $builder, think_json.clone())
+            build!(@builder_with_params $builder, reasoning_json.clone())
         }};
         (@builder_with_params $builder:expr, $params:expr) => {{
             let rig_agent = build_rig_agent(
@@ -1566,7 +1568,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.tool_call_limit,
                 config.provider,
                 model,
-                config.thinking_level,
+                config.reasoning_level,
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
@@ -2803,9 +2805,9 @@ async fn session_recorded_model_id(session: &Session) -> Option<String> {
     }
 }
 
-/// The thinking level a session has recorded: latest `ThinkingLevelChange`
+/// The reasoning level a session has recorded: latest `ThinkingLevelChange`
 /// on the branch, else the header, else `None`.
-async fn session_recorded_thinking(session: &Session) -> Option<String> {
+async fn session_recorded_reasoning(session: &Session) -> Option<String> {
     let branch = session.get_branch().await;
     if let Some(level) = crate::session::session::derive_thinking_level(&branch) {
         return Some(level);
@@ -2840,8 +2842,8 @@ pub(crate) async fn record_model_change(session: &Session, qualified_id: &str) {
 /// Record a thinking-level change — same rules as [`record_model_change`]:
 /// skip when already recorded; fold into the in-memory header (no file)
 /// while the session is still unpersisted.
-async fn record_thinking_change(session: &Session, level: &str) {
-    if session_recorded_thinking(session).await.as_deref() == Some(level) {
+async fn record_reasoning_change(session: &Session, level: &str) {
+    if session_recorded_reasoning(session).await.as_deref() == Some(level) {
         return;
     }
     if !session.is_persisted() {
@@ -3227,7 +3229,7 @@ pub(crate) async fn ensure_session(
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
     provider: Option<String>,
     model: Option<String>,
-    thinking_level: Option<String>,
+    reasoning_level: Option<String>,
 ) -> Option<Arc<Session>> {
     if current.is_some() {
         return current;
@@ -3251,7 +3253,7 @@ pub(crate) async fn ensure_session(
                             &cwd,
                             provider,
                             model,
-                            thinking_level,
+                            reasoning_level,
                         ),
                         entries: std::collections::HashMap::new(),
                         leaf_id: None,
@@ -3388,7 +3390,7 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
         (
             c.provider.clone(),
             c.model.clone(),
-            c.thinking_level.clone(),
+            c.reasoning_level.clone(),
         )
     });
     let repo = app_state.repo();
@@ -3558,7 +3560,7 @@ pub async fn run_interactive(
         &repo,
         Some(config.provider.clone()),
         Some(config.model.clone()),
-        config.thinking_level.clone(),
+        config.reasoning_level.clone(),
     )
     .await;
     let first_id = first
@@ -3664,7 +3666,7 @@ pub async fn run_interactive(
                     leaf_id,
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
-                    thinking_level: config.thinking_level.clone(),
+                    reasoning_level: config.reasoning_level.clone(),
                     // The prompt-side bar names the session the same way the
                     // mid-turn one does: off the session index, with the opening
                     // message as the fallback when it has no name. Read here, at
@@ -3734,9 +3736,9 @@ pub async fn run_interactive(
         // `nth(1)`-style truncation reads a different value than what is
         // configured, making every menu commit look like a model change.
         let model_changed = config.qualified_model_id() != target.qualified_model_id();
-        let thinking_changed = config.thinking_level != target.thinking_level;
+        let reasoning_changed = config.reasoning_level != target.reasoning_level;
         let persona_changed = config.persona_name != target.persona_name;
-        let target_thinking = target.thinking_level.clone();
+        let target_reasoning = target.reasoning_level.clone();
 
         // One rebuild attempt per distinct target: re-running a failed
         // attempt would reprint the same error every cycle while the user
@@ -3746,22 +3748,22 @@ pub async fn run_interactive(
         // for a given target, so recovery really is "change the target".)
         let target_fp = (
             target.qualified_model_id(),
-            target.thinking_level.clone(),
+            target.reasoning_level.clone(),
             target.persona_name.clone(),
         );
         // Re-arm = a *different* target than the last attempt (the old
         // explicit-commit re-arm died with `model_commit`; re-selecting
         // an identical target is a no-op by definition — target unchanged).
         let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp);
-        if (model_changed || thinking_changed || persona_changed) && rebuild_armed {
+        if (model_changed || reasoning_changed || persona_changed) && rebuild_armed {
             last_attempted_target = Some(target_fp);
             let mut new_cfg = config.clone();
             if model_changed {
                 new_cfg.provider = target.provider.clone();
                 new_cfg.model = target.model.clone();
             }
-            if thinking_changed {
-                new_cfg.thinking_level = target.thinking_level.clone();
+            if reasoning_changed {
+                new_cfg.reasoning_level = target.reasoning_level.clone();
             }
             if persona_changed {
                 new_cfg.persona_name = target.persona_name.clone();
@@ -3783,7 +3785,7 @@ pub async fn run_interactive(
                 Err(e) => {
                     let kind = if model_changed {
                         "switch model"
-                    } else if thinking_changed {
+                    } else if reasoning_changed {
                         "set thinking"
                     } else {
                         "set persona"
@@ -3802,9 +3804,9 @@ pub async fn run_interactive(
         // unpersisted). Runs AFTER the rebuild so `config` matches the
         // target when we record.
         let recording_session = app_state.session();
-        if thinking_changed && config.thinking_level == target_thinking {
+        if reasoning_changed && config.reasoning_level == target_reasoning {
             if let Some(ref s) = recording_session {
-                record_thinking_change(s, target_thinking.as_deref().unwrap_or("off")).await;
+                record_reasoning_change(s, target_reasoning.as_deref().unwrap_or("off")).await;
             }
         }
         // Control appliers — each field's sole consumer. `take_control()`
@@ -3897,7 +3899,7 @@ pub async fn run_interactive(
                     &repo,
                     Some(config.provider.clone()),
                     Some(config.model.clone()),
-                    config.thinking_level.clone(),
+                    config.reasoning_level.clone(),
                 )
                 .await;
                 let guarded_id = guarded
@@ -5059,7 +5061,7 @@ impl CodeAgent {
         tool_call_limit: usize,
         provider: String,
         model: String,
-        thinking_level: Option<String>,
+        reasoning_level: Option<String>,
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
@@ -5073,7 +5075,7 @@ impl CodeAgent {
             tool_call_limit,
             provider,
             model,
-            thinking_level,
+            reasoning_level,
             yolo,
             persona_name,
             user_cancel,
@@ -5286,8 +5288,8 @@ mod tests {
         apply_compaction, blob_edit_tool_calls, build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir, estimate_context_tokens, generate_compaction,
         is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role, persist_turn,
-        reasoning_text, record_model_change, record_thinking_change, retry_summarization,
-        session_recorded_model_id, session_recorded_thinking, MessageLogger,
+        reasoning_text, record_model_change, record_reasoning_change, retry_summarization,
+        session_recorded_model_id, session_recorded_reasoning, MessageLogger,
     };
     use super::{model_facing_tool_text, CompactSummaryMode, ReplayUnit};
     use crate::session::storage::SessionStorage;
@@ -5653,7 +5655,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert!(!path.exists(), "precondition: no file yet");
 
         record_model_change(&session, "openai:gpt-4o").await;
-        record_thinking_change(&session, "high").await;
+        record_reasoning_change(&session, "high").await;
 
         assert!(
             !path.exists(),
@@ -5667,13 +5669,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             Some("openai:gpt-4o")
         );
         assert_eq!(
-            session_recorded_thinking(&session).await.as_deref(),
+            session_recorded_reasoning(&session).await.as_deref(),
             Some("high")
         );
 
         // Recording the same values again is a no-op (no state change).
         record_model_change(&session, "openai:gpt-4o").await;
-        record_thinking_change(&session, "high").await;
+        record_reasoning_change(&session, "high").await;
         assert!(!path.exists());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -5944,7 +5946,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -6911,7 +6913,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: Arc::new(out),
             yolo: true,
             quiet: true,
-            thinking_level: None,
+            reasoning_level: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -7007,7 +7009,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // arrived and the `unwrap_or_else("/q")` fallback would mask it.
         // So: exactly two lines, and the queue must be empty afterwards.
         let inputs = Arc::new(Mutex::new(VecDeque::from([
-            "/thinking high".to_string(),
+            "/reasoning high".to_string(),
             "/quit".to_string(),
         ])));
         let shown = Arc::new(Mutex::new(String::new()));
@@ -7023,7 +7025,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: Arc::new(out),
             yolo: true,
             quiet: true,
-            thinking_level: None,
+            reasoning_level: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -7046,7 +7048,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
         let shown = shown.lock().unwrap().clone();
         assert!(
-            shown.contains("thinking high"),
+            shown.contains("reasoning high"),
             "expected the batch commit echo for `/thinking high`, got:\n{shown}"
         );
         assert!(

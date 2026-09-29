@@ -7,7 +7,7 @@
 //! no network and no LLM turn required.
 //!
 //! Test 1 is THE regression for the historical empty-session bug: menu
-//! commits (thinking switch → convergence → `record_thinking_change`, and
+//! commits (thinking switch → convergence → `record_reasoning_change`, and
 //! a `/session` delete) used to leak through `ensure_persisted` and create
 //! header+marker "empty" session files. The session file count must be
 //! exactly what we seeded — nothing more — after arbitrary menu traffic.
@@ -332,10 +332,10 @@ fn menu_traffic_never_creates_empty_session_files() {
     // --- Thinking switch → convergence rebuild + journal record against
     // the UNPERSISTED auto-created current session. Historically this is
     // where `ensure_persisted` leaked a header+marker "empty" file.
-    type_line(&mut writer, "/thinking high ");
+    type_line(&mut writer, "/reasoning high ");
     thread::sleep(Duration::from_millis(200));
     press_enter(&mut writer);
-    assert_wait(&bytes, "/thinking high", "the committed thinking line");
+    assert_wait(&bytes, "/reasoning high", "the committed thinking line");
     // Give convergence + recording a beat, then demand: no new files.
     thread::sleep(Duration::from_millis(1500));
     assert_eq!(

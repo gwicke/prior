@@ -224,12 +224,13 @@ impl AppState {
         }
     }
 
-    pub fn thinking(&self) -> Option<String> {
-        self.state.lock().config.thinking_level.clone()
+    /// Canonical reasoning level of the target model.
+    pub fn reasoning(&self) -> Option<String> {
+        self.state.lock().config.reasoning_level.clone()
     }
 
-    pub fn set_thinking(&self, level: Option<String>) {
-        self.state.lock().config.thinking_level = level;
+    pub fn set_reasoning(&self, level: Option<String>) {
+        self.state.lock().config.reasoning_level = level;
     }
 
     pub fn persona(&self) -> Option<String> {
@@ -498,7 +499,7 @@ impl AppState {
             output,
             yolo: false,
             quiet: true,
-            thinking_level: None,
+            reasoning_level: None,
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -531,7 +532,7 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,

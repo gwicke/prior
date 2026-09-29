@@ -607,15 +607,32 @@ same split runs in the quiet/pipe path — both funnel through this arm.
 
 Each phase is independently green; P0–P1 are the prerequisite for the rest.
 
-**P0 — rename (no behavior change).** `thinking.rs` → `params.rs` with
-`ReasoningLevel`; `/thinking` → `/reasoning`; `default_thinking_level` →
-`default_reasoning_level`; `record_thinking_change` →
-`record_reasoning_change`. `AgentConfig.thinking_level` keeps its name in this
+**P0 — rename (no behavior change).** **Done (2026-09-29).** `thinking.rs` →
+`params.rs` with `ReasoningLevel`; `/thinking` → `/reasoning`;
+`default_thinking_level` → `default_reasoning_level`; `record_thinking_change`
+→ `record_reasoning_change`. `AgentConfig.thinking_level` keeps its name in this
 phase (only its type is `Option<ReasoningLevel>`) so the diff is a pure
 rename; P1 folds it into `ModelParams`.
-*Tests:* the existing `thinking_*` suites renamed; one new test pinning that an
-old `settings.toml` with `default_thinking_level` now errors (hard break, but
-it must be a *clear* error, not silence).
+*Tests:* the existing `thinking_*` suites renamed; a root-listing test pinning
+that `thinking` no longer answers; migration + optional-key tests (§A.5, below).
+
+**P0 addendum — the setting became optional, and the old key auto-migrates.**
+Two decisions taken during implementation, both superseding the original P0
+note that an old key should error:
+
+- `default_reasoning_level` is `Option<String>` in `SettingsStore` and is
+  written **only when a level is recorded** — `/set … off` removes the key
+  rather than pinning a literal that means the same thing. An untouched
+  settings file therefore carries no reasoning key at all, and `value()` still
+  reports `off` so the menu shows the right state. Same shape as the existing
+  `default_persona` / `llm_compact_prompt` handling in the same `save()`.
+- A pre-rename `default_thinking_level` is **folded into the new key** on load
+  (`Config::parse` → `Config::migrate`, the single read path shared by
+  `Config::load` and `SettingsStore::load`), and `save()` then drops the old
+  spelling. The new key wins when both are present, so a file edited since the
+  rename keeps its explicit value. Upgrading never silently resets the level.
+- The session journal keeps `thinking_level_change` / `thinkingLevel`: a
+  compatibility surface, not part of this rename.
 
 **P1 — `ModelParams` + provider mapping.** `ModelParams` on `AgentConfig`;
 `params::additional_params`; `AgentBuilder::temperature`; `top_p` map with the
@@ -728,3 +745,7 @@ Settled in design review (2026-09-29), in the order they were taken:
     and only a third of models publish one. Sending a known default would put
     an explicit `temperature` on the wire for every model and break the
     reasoning models that reject it.
+16. **`default_reasoning_level` is optional**, and the pre-rename
+    `default_thinking_level` auto-migrates into it on load (P0 addendum).
+    Chosen over failing on the old key: a rename that makes the tool refuse to
+    start is a different class of breakage from a command that changed name.

@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         yolo: false,
         tool_call_limit: 10,
         quiet: false,
-        thinking_level: None,
+        reasoning_level: None,
         system_message_extension: None,
         persona_prompt: None,
         persona_name: None,

@@ -7,7 +7,11 @@ default_model = "anthropic:claude-3-5-sonnet-20241022"  # provider:model
 security_mode = "confirm"          # yolo | confirm
 tool_call_limit = 50
 default_persona = "architect"      # built-in name or file path; omit for none
-default_thinking_level = "off"     # off | low | med | high
+# Default reasoning level. Optional: omit it (or set "off" — the same thing)
+# and no reasoning is requested. Was `default_thinking_level` before the
+# /thinking -> /reasoning rename; the old key is migrated on load and dropped
+# on the next save.
+# default_reasoning_level = "high"  # off | low | med | high | max
 show_reasoning = "content"         # disabled | indicator | content
 reasoning_in_context = "never"     # always | never | aborted_turns_only
 # llm_compact_prompt = "Summarize the conversation in less than 2000 words. Preserve the key documents, technical decisions, file paths, current task state, and any unresolved questions." 
