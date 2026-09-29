@@ -104,10 +104,9 @@ fn near_miss_marker(line: &str) -> Option<&'static str> {
 /// The error for a line that starts a marker but does not end there.
 fn malformed_marker_error(marker: &str, line: &str) -> ParseError {
     ParseError(format!(
-        "malformed `{marker}` marker: `{line}`. A marker must occupy its whole line, \
-         with nothing after it. If you meant to write the literal text `{marker}` \
-         into the file, use the OpenAI single-edit format (path/oldText/newText) \
-         instead, and use that format for this file going forward."
+        "malformed `{marker}` marker `{line}`: a marker must be alone on its line, \
+         with nothing after it. To write the literal text `{marker}` into the file, \
+         use the single-edit fields (path + oldText + newText) for that file instead."
     ))
 }
 
@@ -147,7 +146,7 @@ fn strip_fence(text: &str) -> Vec<String> {
 /// what distinguishes a filename line from surrounding prose (which has
 /// spaces). A path with embedded spaces is not recognized as a header — such
 /// calls still work when the `path` argument is supplied.
-fn header_candidate(line: &str) -> Option<String> {
+pub(crate) fn header_candidate(line: &str) -> Option<String> {
     let t = line.trim();
     if t.is_empty() || t.chars().any(char::is_whitespace) || marker_of(t).is_some() {
         return None;
@@ -758,7 +757,7 @@ mod tests {
         let text = "@@@OLD>\na\n@@@NEW\nb\n@@@END";
         let err = parse_blocks(text).unwrap_err();
         assert!(
-            err.0.contains("malformed `@@@OLD` marker: `@@@OLD>`"),
+            err.0.contains("malformed `@@@OLD` marker `@@@OLD>`"),
             "{err}"
         );
         assert!(!err.0.contains("no `@@@OLD`"), "{err}");
@@ -772,7 +771,7 @@ mod tests {
         let text = "@@@OLD\na\n@@@NEW>\nb\n@@@END";
         let err = parse_blocks(text).unwrap_err();
         assert!(
-            err.0.contains("malformed `@@@NEW` marker: `@@@NEW>`"),
+            err.0.contains("malformed `@@@NEW` marker `@@@NEW>`"),
             "{err}"
         );
     }
@@ -784,7 +783,7 @@ mod tests {
         let text = "@@@OLD\nold\n@@@NEW\nnew\n@@@END>\n@@@OLD";
         let err = parse_blocks(text).unwrap_err();
         assert!(
-            err.0.contains("malformed `@@@END` marker: `@@@END>`"),
+            err.0.contains("malformed `@@@END` marker `@@@END>`"),
             "{err}"
         );
     }
