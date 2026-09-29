@@ -143,11 +143,12 @@ mod tests {
             security_mode: String::new(),
             tool_call_limit: 0,
             default_persona: None,
-            default_thinking_level: String::new(),
+            default_reasoning_level: None,
             show_reasoning: String::new(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 0,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         }
     }

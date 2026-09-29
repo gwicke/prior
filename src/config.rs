@@ -897,8 +897,19 @@ pub struct Config {
     /// Persona for new sessions (built-in name or file path); `None` = no persona.
     #[serde(default)]
     pub default_persona: Option<String>,
-    /// Default thinking level: `off` | `low` | `med` | `high`.
+    /// Default reasoning level: `off` | `low` | `med` | `high` | `max`.
+    /// `None` = no level recorded, which is the same effective state as `off`
+    /// (doc/model_settings_v2.md A.5) — the key is written only once the user
+    /// actually picks one.
     #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    /// Pre-rename spelling of [`Self::default_reasoning_level`]. Read-only:
+    /// [`Config::parse`] folds it into the new key when the new one is absent,
+    /// and [`SettingsStore::save`](crate::settings::SettingsStore::save) never
+    /// writes it back, so the old name disappears on the first save. Kept as a
+    /// field only because `Config` is permissive about unknown keys — without
+    /// it the old value would be dropped silently instead of migrated.
+    #[serde(default, skip_serializing)]
     pub default_thinking_level: Option<String>,
     /// How reasoning is shown: `disabled` | `indicator` | `content`.
     #[serde(default)]
@@ -917,6 +928,12 @@ pub struct Config {
     /// the built-in `DEFAULT_LLM_COMPACT_PROMPT` is used.
     #[serde(default)]
     pub llm_compact_prompt: Option<String>,
+    /// Per-model defaults and metadata overrides, keyed by the canonical
+    /// `provider:model`. One `[models."provider:model"]` table each; see
+    /// `model_settings`. Read through the shared validator, so a typo in a
+    /// hand-edited file is a load error naming the key.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: std::collections::HashMap<String, crate::model_settings::ModelSettings>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1373,12 +1390,56 @@ impl Config {
         if let Some(path) = crate::platform::resolve_config_path(path) {
             if path.exists() {
                 let content = std::fs::read_to_string(&path).map_err(crate::PicocodeError::Io)?;
-                let config = toml_edit::de::from_str::<Config>(&content)
-                    .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
-                return Ok(config);
+                return Self::parse(&content);
             }
         }
         Ok(Config::default())
+    }
+
+    /// Deserialize a `settings.toml` body and apply forward migrations.
+    ///
+    /// The single read path for the config (both `Config::load` and
+    /// `SettingsStore::load` go through here) so a migration can never be
+    /// applied on one path and forgotten on the other.
+    pub fn parse(content: &str) -> crate::Result<Self> {
+        // Parse twice: serde for the typed scalar fields, and `toml_edit` for
+        // the per-model tables, which go through the shared validator so the
+        // file and the $EDITOR route cannot disagree about what is acceptable.
+        // The per-model tables are read *first*, deliberately.
+        // `ModelSettings` has `deny_unknown_fields`, so serde would also catch
+        // a typo — but with a bare "unknown field", no suggestion, and it stops
+        // at the first one. Our validator says "did you mean
+        // 'temperature'?", names the range when a value is merely out of
+        // bounds, and lists every problem at once. Serde remains the backstop
+        // for the scalar fields.
+        let doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e: toml_edit::TomlError| crate::PicocodeError::Toml(e.to_string()))?;
+        let models = crate::model_settings::read_from_doc(&doc)
+            .map_err(|m| crate::PicocodeError::Toml(format!("invalid per-model settings: {m}")))?;
+        let mut config: Config = toml_edit::de::from_str(content)
+            .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
+        config.models = models;
+        config.migrate();
+        Ok(config)
+    }
+
+    /// Fold deprecated keys into their replacements. Idempotent, and a no-op
+    /// once the file carries the new spelling — which is what makes it safe to
+    /// run on every load rather than once at upgrade time.
+    ///
+    /// * `default_thinking_level` → `default_reasoning_level` (the `/thinking`
+    ///   → `/reasoning` rename, doc/model_settings_v2.md A.11). The new key
+    ///   wins when both are present: a file that has been edited since the
+    ///   rename must not have its explicit value clobbered by a stale one.
+    fn migrate(&mut self) {
+        if self.default_reasoning_level.is_none() {
+            if let Some(old) = self.default_thinking_level.take() {
+                self.default_reasoning_level = Some(old);
+            }
+        }
+        // The old spelling is never carried forward.
+        self.default_thinking_level = None;
     }
 
     pub fn get_bash_auto_allow(&self) -> Vec<String> {
@@ -1691,7 +1752,7 @@ default_model = "anthropic:claude-3-5-sonnet-20241022"
 security_mode = "confirm"
 tool_call_limit = 50
 default_persona = "architect"
-default_thinking_level = "off"
+default_reasoning_level = "off"
 
 [tool_config.bash]
 auto_allow = ["^ls -la"]
@@ -1710,7 +1771,7 @@ model = "claude-3-5-sonnet-20241022"
         assert_eq!(cfg.security_mode.as_deref(), Some("confirm"));
         assert_eq!(cfg.tool_call_limit, Some(50));
         assert_eq!(cfg.default_persona.as_deref(), Some("architect"));
-        assert_eq!(cfg.default_thinking_level.as_deref(), Some("off"));
+        assert_eq!(cfg.default_reasoning_level.as_deref(), Some("off"));
         assert_eq!(cfg.recipes.len(), 1);
         assert!(cfg.tool_config.contains_key("bash"));
     }
@@ -1723,7 +1784,53 @@ model = "claude-3-5-sonnet-20241022"
         assert!(cfg.security_mode.is_none());
         assert!(cfg.tool_call_limit.is_none());
         assert!(cfg.default_persona.is_none());
+        assert!(cfg.default_reasoning_level.is_none());
+    }
+
+    // ---- the /thinking -> /reasoning rename (doc/model_settings_v2.md A.11) ----
+
+    /// A pre-rename file keeps its level: the old key is folded into the new
+    /// one, so upgrading never silently resets the user's reasoning level.
+    #[test]
+    fn migrate_folds_default_thinking_level_into_the_new_key() {
+        let cfg = Config::parse("default_thinking_level = \"high\"\n")
+            .expect("pre-rename config should parse");
+        assert_eq!(cfg.default_reasoning_level.as_deref(), Some("high"));
+        assert!(cfg.default_thinking_level.is_none(), "old key is consumed");
+    }
+
+    /// Migration is idempotent and never clobbers an explicit new value: a
+    /// file edited since the rename keeps what the user last chose.
+    #[test]
+    fn migrate_lets_the_new_key_win_over_the_old_one() {
+        let cfg =
+            Config::parse("default_thinking_level = \"high\"\ndefault_reasoning_level = \"low\"\n")
+                .expect("both spellings should parse");
+        assert_eq!(cfg.default_reasoning_level.as_deref(), Some("low"));
+    }
+
+    /// A file with neither key is untouched — the absent key is a valid state
+    /// (it means "off"), not a missing one.
+    #[test]
+    fn migrate_is_a_noop_without_either_key() {
+        let cfg = Config::parse("default_model = \"anthropic:x\"\n").expect("should parse");
+        assert!(cfg.default_reasoning_level.is_none());
         assert!(cfg.default_thinking_level.is_none());
+    }
+
+    /// The migration runs on the `SettingsStore` read path too, not just
+    /// `Config::load` — both go through `Config::parse`.
+    #[test]
+    fn settings_store_load_applies_the_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "default_thinking_level = \"max\"\n").unwrap();
+        let store = crate::settings::SettingsStore::load(&path).expect("load should succeed");
+        assert_eq!(
+            store.default_reasoning_level.as_deref(),
+            Some("max"),
+            "the store must see the migrated level"
+        );
     }
 
     #[test]

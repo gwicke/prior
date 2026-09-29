@@ -3716,7 +3716,7 @@ mod tests {
         let _ = renderer.feed(&parser.flush(), &mut buf);
         let _ = write!(buf, "\x1b[0m"); // reset (mirrors `ensure_dim(false)`)
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("\x1b[2m"), "thinking must be dimmed");
+        assert!(out.contains("\x1b[2m"), "reasoning must be dimmed");
         assert!(
             out.contains("\x1b[0m\x1b[2m"),
             "inline formatting must re-apply dim (reset re-dim), not clear it"

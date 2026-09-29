@@ -38,15 +38,16 @@ pub fn catalog_generation() -> u64 {
     CATALOG_GENERATION.load(Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CostSource {
     /// Price taken from the curated `DIRECT_PRICING` table (direct access).
+    #[default]
     Direct,
     /// Price taken from OpenRouter's markup (estimate for direct access).
     OpenRouterEstimate,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelEntry {
     /// Provider namespace, e.g. `deepseek` or `openrouter`.
     pub provider: String,
@@ -70,6 +71,26 @@ pub struct ModelEntry {
     pub intelligence_index: Option<f32>,
     /// Artificial Analysis agentic index (0-100)
     pub agentic_index: Option<f32>,
+    /// OpenRouter's ~200-character blurb, shown in the `/model` header. Kept
+    /// per-entry rather than globally: it is the only human-readable text
+    /// about a model we have, and it makes the picker filter meaningfully.
+    pub description: Option<String>,
+    /// Whether the model accepts `temperature` / `top_p` at all. Derived from
+    /// `supported_parameters` at parse time — the array itself is a ~20-element
+    /// per entry across 460 entries, so only the two answers are kept.
+    pub supports_temperature: bool,
+    pub supports_top_p: bool,
+    /// The reasoning efforts this model accepts, e.g. `["low","high","max"]`
+    /// (`data[].reasoning.supported_efforts`). Drives backend effort remapping
+    /// and the disclosure in `/reasoning`'s header. Empty = no data, never
+    /// remap.
+    pub reasoning_levels: Vec<String>,
+    /// The provider's *own* default, when OpenRouter publishes one
+    /// (`default_parameters`). Display only — see the note in
+    /// `params::ModelParams`: knowing a default must never turn into sending
+    /// it, or every model would get an explicit `temperature` on the wire.
+    pub default_temperature: Option<f64>,
+    pub default_top_p: Option<f64>,
 }
 
 impl ModelEntry {
@@ -302,6 +323,45 @@ pub fn parse_openrouter(value: &Value) -> Vec<ModelEntry> {
             .and_then(|aa| aa.get("agentic_index"))
             .and_then(|v| v.as_f64())
             .map(|v| v as f32);
+        let description = m
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        // `supported_parameters` answers three questions and is not retained
+        // itself. Sampling support is per-model and not universal: as of
+        // 2026-09 the most-popular `openai/gpt-*` entries list neither
+        // `temperature` nor `top_p`, so "this knob does nothing here" is a
+        // real answer worth carrying.
+        let supported = m.get("supported_parameters").and_then(|v| v.as_array());
+        let supports = |name: &str| {
+            supported
+                .map(|a| a.iter().any(|x| x.as_str() == Some(name)))
+                .unwrap_or(false)
+        };
+        let supports_temperature = supports("temperature");
+        let supports_top_p = supports("top_p");
+        let reasoning_levels = m
+            .get("reasoning")
+            .and_then(|r| r.get("supported_efforts"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // `default_parameters` carries explicit `null`s for knobs the model
+        // does not default, plus `top_k` / penalties we do not model. Read the
+        // two we model; `null` means "no default published".
+        let default_param = |name: &str| {
+            m.get("default_parameters")
+                .and_then(|d| d.get(name))
+                .and_then(|v| v.as_f64())
+        };
+        let default_temperature = default_param("temperature");
+        let default_top_p = default_param("top_p");
         out.push(ModelEntry {
             provider: "openrouter".to_string(),
             id: id.clone(),
@@ -315,6 +375,12 @@ pub fn parse_openrouter(value: &Value) -> Vec<ModelEntry> {
             coding_index,
             intelligence_index,
             agentic_index,
+            description,
+            supports_temperature,
+            supports_top_p,
+            reasoning_levels,
+            default_temperature,
+            default_top_p,
         });
     }
     out
@@ -429,6 +495,15 @@ fn extrapolate(or_entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                         coding_index: e.coding_index,
                         intelligence_index: e.intelligence_index,
                         agentic_index: e.agentic_index,
+                        // A direct entry is the *same model* reached another
+                        // way, so the published facts carry over. Only the
+                        // price differs, and that is already handled above.
+                        description: e.description.clone(),
+                        supports_temperature: e.supports_temperature,
+                        supports_top_p: e.supports_top_p,
+                        reasoning_levels: e.reasoning_levels.clone(),
+                        default_temperature: e.default_temperature,
+                        default_top_p: e.default_top_p,
                     });
                     debug_count += 1;
                 }
@@ -727,6 +802,10 @@ fn static_fallback() -> Vec<ModelEntry> {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            // Curated offline fallback: we have no published data, so every
+            // derived fact (description, sampling support, effort list,
+            // provider defaults) stays absent rather than guessed.
+            ..Default::default()
         })
         .collect();
     if DEBUG_PROVIDERS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -892,6 +971,9 @@ async fn liveness_prune(mut entries: Vec<ModelEntry>) -> Vec<ModelEntry> {
                     coding_index: None,
                     intelligence_index: None,
                     agentic_index: None,
+                    // Newly surfaced from a provider's own /models: we know
+                    // it exists, nothing about its parameters.
+                    ..Default::default()
                 });
                 if debug {
                     eprintln!(
@@ -1011,6 +1093,28 @@ pub fn lookup(provider: &str, model: &str) -> Option<ModelEntry> {
         let (p, m) = e.qualified_parts();
         p.eq_ignore_ascii_case(provider) && m.eq_ignore_ascii_case(model)
     })
+}
+
+/// The reasoning efforts this model accepts, for backend effort remapping and
+/// for the disclosure in `/reasoning` (doc/model_settings_v2.md A.4).
+///
+/// Reads the cached catalog, so this is non-blocking and cheap; the network
+/// fetch that fills the cache happens in the background. A model we have no
+/// entry for — offline, a provider the catalog does not cover, or one surfaced
+/// late by liveness pruning — resolves to `unknown()`, which means "never
+/// remap", i.e. exactly the pre-P3 behavior.
+pub fn reasoning_support(provider: &str, model: &str) -> crate::params::ReasoningSupport {
+    match lookup(provider, model) {
+        Some(e) => support_for_entry(&e),
+        None => crate::params::ReasoningSupport::unknown(),
+    }
+}
+
+/// The support implied by one entry's published effort list. Split out from
+/// [`reasoning_support`] so the composition is testable without seeding the
+/// process-wide catalog cache, which every other catalog-reading test shares.
+fn support_for_entry(e: &ModelEntry) -> crate::params::ReasoningSupport {
+    crate::params::ReasoningSupport::new(e.reasoning_levels.clone())
 }
 
 /// Remove entries that share the same `id`. `extrapolate` keeps the
@@ -1155,6 +1259,126 @@ mod tests {
         assert!(parse_openrouter(&json!({"nope": 1})).is_empty());
     }
 
+    /// The fields P3 added, from a payload trimmed to the keys they read.
+    /// Shaped after real entries: `deepseek/v4.1-flash` publishes efforts and
+    /// defaults, and the popular `openai/gpt-*` entries publish neither
+    /// `temperature` nor `top_p` in `supported_parameters`.
+    #[test]
+    fn parse_openrouter_reads_the_p3_fields() {
+        let payload = json!({
+            "data": [
+                {
+                    "id": "deepseek/deepseek-v4.1-flash",
+                    "description": "DeepSeek V4.1 Flash is a sparse MoE model…",
+                    "supported_parameters": ["tools", "reasoning", "temperature", "top_p"],
+                    "reasoning": {"supported_efforts": ["max", "high", "low"]},
+                    "default_parameters": {"temperature": 0.9, "top_p": 0.95, "top_k": 40}
+                },
+                {
+                    "id": "openai/gpt-5.6-luna",
+                    "description": "  ",
+                    "supported_parameters": ["tools", "reasoning_effort"],
+                    "reasoning": {"supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"]},
+                    "default_parameters": {"temperature": null, "top_p": null, "top_k": null}
+                }
+            ]
+        });
+        let entries = parse_openrouter(&payload);
+        let ds = &entries[0];
+        assert_eq!(
+            ds.description.as_deref(),
+            Some("DeepSeek V4.1 Flash is a sparse MoE model…")
+        );
+        assert!(ds.supports_temperature && ds.supports_top_p);
+        assert_eq!(ds.reasoning_levels, vec!["max", "high", "low"]);
+        assert_eq!(ds.default_temperature, Some(0.9));
+        assert_eq!(ds.default_top_p, Some(0.95));
+
+        let gpt = &entries[1];
+        // A blank blurb is not a description.
+        assert!(gpt.description.is_none(), "{:?}", gpt.description);
+        // Sampling support is genuinely per-model, not universal.
+        assert!(!gpt.supports_temperature, "gpt-5.6-luna lists neither");
+        assert!(!gpt.supports_top_p);
+        // `null` must read as "no default published", not as 0.
+        assert_eq!(gpt.default_temperature, None);
+        assert_eq!(gpt.default_top_p, None);
+        // `xhigh` and `none` survive parsing; ranking happens in params.
+        assert_eq!(gpt.reasoning_levels.len(), 6);
+    }
+
+    /// Absent keys must degrade to absent facts, never to wrong ones.
+    #[test]
+    fn parse_openrouter_tolerates_a_bare_entry() {
+        let payload = json!({"data": [{"id": "vendor/thing"}]});
+        let e = &parse_openrouter(&payload)[0];
+        assert!(e.description.is_none());
+        assert!(!e.supports_temperature);
+        assert!(!e.supports_top_p);
+        assert!(e.reasoning_levels.is_empty());
+        assert_eq!(e.default_temperature, None);
+        assert_eq!(e.default_top_p, None);
+    }
+
+    /// A direct entry is the same model reached another way, so the published
+    /// facts must ride along — only the price differs.
+    #[test]
+    fn extrapolate_copies_the_p3_fields_to_the_direct_entry() {
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+        let payload = json!({
+            "data": [{
+                "id": "anthropic/claude-3-7-sonnet",
+                "description": "Claude 3.7 Sonnet…",
+                "supported_parameters": ["tools", "reasoning", "temperature"],
+                "reasoning": {"supported_efforts": ["high", "max"]}
+            }]
+        });
+        let entries = extrapolate(parse_openrouter(&payload));
+        let direct = entries
+            .iter()
+            .find(|e| e.provider == "anthropic" && e.display == "anthropic:claude-3-7-sonnet")
+            .expect("direct entry");
+        assert_eq!(direct.description.as_deref(), Some("Claude 3.7 Sonnet…"));
+        assert!(direct.supports_temperature);
+        assert!(!direct.supports_top_p, "not listed, so not carried");
+        assert_eq!(direct.reasoning_levels, vec!["high", "max"]);
+    }
+
+    /// The link that makes remapping live: a parsed entry's published list
+    /// becomes the support the remapper consults. Exercised through
+    /// `support_for_entry` rather than the global cache, which every other
+    /// catalog-reading test shares.
+    #[test]
+    fn a_parsed_entry_yields_the_support_the_remapper_uses() {
+        use crate::params::ReasoningLevel;
+        let payload = json!({
+            "data": [{
+                "id": "deepseek/deepseek-v4.1-flash",
+                "supported_parameters": ["reasoning", "temperature"],
+                "reasoning": {"supported_efforts": ["max", "high", "low"]}
+            }]
+        });
+        let entry = &parse_openrouter(&payload)[0];
+        let support = support_for_entry(entry);
+        assert!(support.is_known());
+        assert_eq!(support.levels(), ["max", "high", "low"]);
+        // The point of the whole chain: `med` is not advertised, so it lands
+        // on an effort the model does accept.
+        assert_eq!(support.resolve(ReasoningLevel::Med).as_deref(), Some("low"));
+
+        // An entry with no published list stays unknown → never remap.
+        let bare = support_for_entry(&parse_openrouter(&json!({"data": [{"id": "v/t"}]}))[0]);
+        assert!(!bare.is_known());
+        assert_eq!(bare.resolve(ReasoningLevel::High), None);
+    }
+
+    /// A model the catalog cannot see must resolve to `unknown` — the
+    /// pre-P3 behavior, and the safe one.
+    #[test]
+    fn reasoning_support_is_unknown_for_a_model_the_catalog_lacks() {
+        assert!(!reasoning_support("no-such-provider", "no-such-model").is_known());
+    }
+
     // OpenRouter entries carry `provider == "openrouter"` and an `id` that is
     // the full (namespaced) model path; the qualified `provider:model` form
     // must keep the namespace (e.g. `openrouter:tencent/hy3:free`), not drop
@@ -1174,6 +1398,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(
             or.qualified_parts(),
@@ -1194,6 +1419,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(
             direct.qualified_parts(),
@@ -1268,6 +1494,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(
             format_option(&direct),
@@ -1287,6 +1514,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         let s = format_option(&est);
         assert!(s.contains("(est)"), "{}", s);
@@ -1305,6 +1533,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         let s = format_option(&missing);
         assert!(!s.contains("per M"), "{}", s);
@@ -1327,6 +1556,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(ctx_cell(&direct), "128000");
         assert_eq!(cost_cell(&direct), "$0.00/$0.00");
@@ -1345,6 +1575,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(ctx_cell(&est), "1048576");
         let c = cost_cell(&est);
@@ -1366,6 +1597,7 @@ mod tests {
             coding_index: None,
             intelligence_index: None,
             agentic_index: None,
+            ..Default::default()
         };
         assert_eq!(ctx_cell(&missing), "—");
         assert_eq!(cost_cell(&missing), "—");

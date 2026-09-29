@@ -49,15 +49,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ThinkingEnumNode — single node returning all four levels.
+    // ReasoningEnumNode — single node returning all four levels.
     // -----------------------------------------------------------------------
 
-    struct ThinkingEnumNode {
+    struct ReasoningEnumNode {
         app_state: Rc<RefCell<Option<String>>>,
     }
 
     #[async_trait::async_trait(?Send)]
-    impl SlashDotNode for ThinkingEnumNode {
+    impl SlashDotNode for ReasoningEnumNode {
         async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
             let current = self.app_state.borrow();
             let active = current.as_deref().unwrap_or("off").to_string();
@@ -82,13 +82,13 @@ mod tests {
     // Menu construction
     // -----------------------------------------------------------------------
 
-    fn build_thinking_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
+    fn build_reasoning_menu(state: &Rc<RefCell<Option<String>>>) -> SlashDotMenu {
         use crate::slashdot_menu::SlashDotMenuNode;
         let mut root: SlashDotMenuNode = StaticListingNode::new(&[]).into();
         let mut tl: SlashDotMenuNode =
-            StaticListingNode::new(&[StaticRow::new("thinking", "set thinking level")]).into();
+            StaticListingNode::new(&[StaticRow::new("reasoning", "set thinking level")]).into();
         tl.add_child(
-            ThinkingEnumNode {
+            ReasoningEnumNode {
                 app_state: state.clone(),
             }
             .into(),
@@ -102,11 +102,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn thinking_lists_values() {
+    fn reasoning_lists_values() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        match eval(&mut h, "thinking ", HostKey::None) {
+        match eval(&mut h, "reasoning ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
                 assert_eq!(row_texts.len(), 5);
@@ -121,11 +121,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_active_marker() {
+    fn reasoning_active_marker() {
         let state = Rc::new(RefCell::new(Some("med".to_string())));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        match eval(&mut h, "thinking ", HostKey::None) {
+        match eval(&mut h, "reasoning ", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 assert!(
                     !plan.active_rows.is_empty(),
@@ -137,18 +137,18 @@ mod tests {
     }
 
     #[test]
-    fn thinking_tab_drills_to_value() {
+    fn reasoning_tab_drills_to_value() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let r = eval(&mut h, "thinking ", HostKey::None);
+        let r = eval(&mut h, "reasoning ", HostKey::None);
         match &r {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 5);
             }
             other => panic!("expected Continue, got {:?}", other),
         }
-        match eval(&mut h, "thinking ", HostKey::Tab) {
+        match eval(&mut h, "reasoning ", HostKey::Tab) {
             MenuResult::Continue(plan, prompt) => {
                 assert!(
                     plan.rows.len() == 0 || plan.rows.iter().any(|l| l.0.contains("off")),
@@ -166,12 +166,12 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enter_submits() {
+    fn reasoning_enter_submits() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        let r = eval(&mut h, "thinking ", HostKey::Tab);
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        let r = eval(&mut h, "reasoning ", HostKey::Tab);
         let prompt = match &r {
             MenuResult::Continue(_, p) => p.clone(),
             _ => panic!(),
@@ -185,12 +185,12 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enter_drills_and_submits() {
+    fn reasoning_enter_drills_and_submits() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        match eval(&mut h, "thinking ", HostKey::Enter) {
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        match eval(&mut h, "reasoning ", HostKey::Enter) {
             MenuResult::DoneSuccess(..) => {
                 assert_eq!(
                     *state.borrow(),
@@ -203,13 +203,13 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enter_drills_cursor_position() {
+    fn reasoning_enter_drills_cursor_position() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
-        match eval(&mut h, "thinking ", HostKey::Enter) {
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        let _ = eval(&mut h, "reasoning ", HostKey::MoveCursor(3));
+        match eval(&mut h, "reasoning ", HostKey::Enter) {
             MenuResult::DoneSuccess(..) => {
                 assert_eq!(
                     *state.borrow(),
@@ -222,16 +222,16 @@ mod tests {
     }
 
     #[test]
-    fn thinking_esc_pops() {
+    fn reasoning_esc_pops() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        let _ = eval(&mut h, "thinking ", HostKey::Tab);
-        match eval(&mut h, "thinking off ", HostKey::Esc) {
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        let _ = eval(&mut h, "reasoning ", HostKey::Tab);
+        match eval(&mut h, "reasoning off ", HostKey::Esc) {
             MenuResult::Continue(_, prompt) => {
                 assert!(
-                    prompt.contains("thinking"),
+                    prompt.contains("reasoning"),
                     "should be back at thinking: {}",
                     prompt
                 );
@@ -241,11 +241,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_fuzzy_filter() {
+    fn reasoning_fuzzy_filter() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        match eval(&mut h, "thinking h", HostKey::None) {
+        match eval(&mut h, "reasoning h", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let rows = row_texts(&plan);
                 assert!(rows.iter().any(|t| t.contains("high")));
@@ -259,12 +259,12 @@ mod tests {
     }
 
     #[test]
-    fn thinking_move_cursor() {
+    fn reasoning_move_cursor() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        match eval(&mut h, "thinking ", HostKey::MoveCursor(2)) {
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        match eval(&mut h, "reasoning ", HostKey::MoveCursor(2)) {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.selected, Some(2));
             }
@@ -273,27 +273,27 @@ mod tests {
     }
 
     #[test]
-    fn root_listing_shows_thinking() {
+    fn root_listing_shows_reasoning() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
         match eval(&mut h, "", HostKey::None) {
             MenuResult::Continue(plan, _) => {
                 let row_texts: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
-                assert!(row_texts.iter().any(|t| t.contains("thinking")));
+                assert!(row_texts.iter().any(|t| t.contains("reasoning")));
             }
             other => panic!("expected Continue, got {:?}", other),
         }
     }
 
     #[test]
-    fn thinking_move_cursor_then_tab() {
+    fn reasoning_move_cursor_then_tab() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(3));
-        match eval(&mut h, "thinking ", HostKey::Tab) {
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        let _ = eval(&mut h, "reasoning ", HostKey::MoveCursor(3));
+        match eval(&mut h, "reasoning ", HostKey::Tab) {
             MenuResult::Continue(_, prompt) => {
                 assert!(
                     prompt.contains("high"),
@@ -306,13 +306,13 @@ mod tests {
     }
 
     #[test]
-    fn thinking_enter_different_value() {
+    fn reasoning_enter_different_value() {
         let state = Rc::new(RefCell::new(None));
-        let mut menu = build_thinking_menu(&state);
+        let mut menu = build_reasoning_menu(&state);
         let mut h = menu.get_handle();
-        let _ = eval(&mut h, "thinking ", HostKey::None);
-        let _ = eval(&mut h, "thinking ", HostKey::MoveCursor(2));
-        let r = eval(&mut h, "thinking ", HostKey::Tab);
+        let _ = eval(&mut h, "reasoning ", HostKey::None);
+        let _ = eval(&mut h, "reasoning ", HostKey::MoveCursor(2));
+        let r = eval(&mut h, "reasoning ", HostKey::Tab);
         let prompt = match &r {
             MenuResult::Continue(_, p) => p.clone(),
             _ => panic!(),

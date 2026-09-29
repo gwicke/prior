@@ -275,7 +275,7 @@ fn entry_full_text(entry: &SessionEntry) -> String {
         }
         SessionEntryContent::Compaction { summary, .. } => summary.clone(),
         SessionEntryContent::ThinkingLevelChange { thinking_level } => {
-            format!("thinking: {}", thinking_level)
+            format!("reasoning: {}", thinking_level)
         }
         SessionEntryContent::ModelChange { provider, model_id } => {
             format!("model: {}/{}", provider, model_id)
@@ -294,7 +294,7 @@ fn entry_role(entry: &SessionEntry) -> String {
             .unwrap_or("unknown")
             .to_string(),
         SessionEntryContent::Compaction { .. } => "compaction".into(),
-        SessionEntryContent::ThinkingLevelChange { .. } => "thinking".into(),
+        SessionEntryContent::ThinkingLevelChange { .. } => "reasoning".into(),
         SessionEntryContent::ModelChange { .. } => "model".into(),
         SessionEntryContent::BranchSummary { .. } => "summary".into(),
         SessionEntryContent::Label { .. } => "label".into(),
@@ -1050,7 +1050,7 @@ impl SlashDotNode for TreeListNode {
                 wrap_with_prefix(&format!("[SUMMARY {}] ", ts), text, tw)
             }
             // Marker already in the body; timestamp goes in parens.
-            "model" | "thinking" => vec![format!("{} ({})", body, ts)],
+            "model" | "reasoning" => vec![format!("{} ({})", body, ts)],
             "user" | "assistant" => {
                 wrap_with_prefix(&format!("[{} {}] ", role.to_uppercase(), ts), body, tw)
             }
@@ -1583,11 +1583,12 @@ mod tests {
             security_mode: String::new(),
             tool_call_limit: 0,
             default_persona: None,
-            default_thinking_level: String::new(),
+            default_reasoning_level: None,
             show_reasoning: String::new(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 0,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         }
     }

@@ -251,7 +251,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .tool_call_limit
         .or(config.tool_call_limit)
         .unwrap_or(50);
-    let thinking_level = config.default_thinking_level.clone();
+    // Only the global default sets a level at startup; temperature and top_p
+    // have no global — they arrive with the per-model config in P4, and are
+    // `None` (provider default) until then.
+    let params = picocode::params::ModelParams {
+        reasoning: config
+            .default_reasoning_level
+            .as_deref()
+            .and_then(|l| l.parse().ok()),
+        temperature: None,
+        top_p: None,
+    };
     let settings_path = picocode::platform::resolve_config_path(args.config.as_deref());
 
     let persona_name = args
@@ -311,7 +321,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.agent_prompt.clone(),
             config.agent_prompt_file.clone(),
         )?,
-        thinking_level,
+        params,
         user_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         sandbox,

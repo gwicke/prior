@@ -218,7 +218,7 @@ fn vertical_resize_drag_does_not_consume_history() {
     t.pump(Duration::from_millis(600));
     t.assert_history_present(&top);
     let after = t.rows();
-    let thinking = after.iter().filter(|l| l.contains("thinking")).count();
+    let thinking = after.iter().filter(|l| l.contains("reasoning")).count();
     assert_eq!(
         thinking,
         1,
@@ -248,10 +248,10 @@ fn horizontal_resize_drag_leaves_no_stale_frames() {
 
     t.assert_history_present(&top);
     // A stranded overlay frame would duplicate the menu: the item that sits
-    // just below the input ("thinking") must appear exactly once.
+    // just below the input ("reasoning") must appear exactly once.
     let check = |t: &Term, when: &str| {
         let after = t.rows();
-        let thinking = after.iter().filter(|l| l.contains("thinking")).count();
+        let thinking = after.iter().filter(|l| l.contains("reasoning")).count();
         assert_eq!(
             thinking,
             1,

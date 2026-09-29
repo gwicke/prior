@@ -1,12 +1,12 @@
 use crate::app_state::AppState;
 use crate::model_catalog;
 use crate::output::Confirmation;
+use crate::params;
 use crate::repl::{InputAction, ModelFilter, Repl, ReplCtx};
 use crate::session::repo::{ForkMode, SessionRepo};
 use crate::session::storage::SessionStorage;
 use crate::session::Session;
 use crate::settings::SettingsStore;
-use crate::thinking;
 use crate::tools::{
     bsed_available, set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText,
     ListDir, MakeDir, MoveFile, ReadFile, Remove, SedPreview, WriteFile,
@@ -330,7 +330,9 @@ impl PicoAgent for CodeAgent {
             BarModel {
                 provider: &self.provider,
                 model: &self.model,
-                thinking: self.thinking_level.as_deref(),
+                // The status bar's own field is upstream's `thinking`; the
+                // value it reads is now the renamed reasoning level.
+                thinking: self.reasoning_level.as_deref(),
                 // Reported wins: it is the provider's own count of what it was
                 // sent. The estimate only stands in while there is none — turn
                 // one, where the alternative is no figure at all.
@@ -1368,11 +1370,11 @@ pub struct CodeAgent {
     tool_call_limit: usize,
     provider: String,
     model: String,
-    /// The active thinking level, for the status readout. A snapshot taken when
+    /// The active reasoning level, for the status readout. A snapshot taken when
     /// the agent is built: the level only changes on an explicit commit, and the
     /// bar is painted once per content block, so reading the config per block
     /// would only add a lock to a path that has no reason to be fresh.
-    thinking_level: Option<String>,
+    reasoning_level: Option<String>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -1397,7 +1399,12 @@ pub struct AgentConfig {
     pub output: Arc<dyn Output>,
     pub yolo: bool,
     pub quiet: bool,
-    pub thinking_level: Option<String>,
+    /// The request-shaping knobs for this model: reasoning level, temperature,
+    /// top_p. Each is `None` = "unspecified, leave the provider's default".
+    /// Replaces the old `reasoning_level: Option<String>`
+    /// (doc/model_settings_v2.md A.2); `PartialEq` here is what the rebuild
+    /// gate compares.
+    pub params: crate::params::ModelParams,
     pub tool_call_limit: usize,
     pub system_message_extension: Option<String>,
     pub persona_prompt: Option<String>,
@@ -1499,7 +1506,14 @@ fn merge_openrouter_params(existing: Option<serde_json::Value>) -> Option<serde_
 pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
     let provider = config.provider.to_lowercase();
     let model = config.model.clone();
-    let think_json = thinking::mapping_opt(&provider, config.thinking_level.as_deref());
+    let reasoning_json = {
+        // What this model accepts, so a level it cannot serve is remapped
+        // instead of sent and rejected. Unknown until the catalog publishes
+        // it (P3 wires the data in); until then every level goes out as-is,
+        // which is exactly the pre-P1 behavior.
+        let support = crate::model_catalog::reasoning_support(&config.provider, &model);
+        params::additional_params(&provider, &config.params, &support)
+    };
 
     // OAuth credentials live in a `token` sub-directory of the settings dir
     // (see `platform::app_config_dir`), kept private so refresh tokens aren't
@@ -1532,14 +1546,14 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
             let cached_model = $client
                 .completion_model(&model)
                 .with_prompt_caching();
-            let merged = merge_openrouter_params(think_json.clone());
+            let merged = merge_openrouter_params(reasoning_json.clone());
             build!(@builder_with_params AgentBuilder::new(cached_model), merged)
         }};
         ($client:expr) => {{
             build!(@builder $client.agent(&model))
         }};
         (@builder $builder:expr) => {{
-            build!(@builder_with_params $builder, think_json.clone())
+            build!(@builder_with_params $builder, reasoning_json.clone())
         }};
         (@builder_with_params $builder:expr, $params:expr) => {{
             let rig_agent = build_rig_agent(
@@ -1551,6 +1565,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.bash_auto_allow.unwrap_or_default(),
                 config.agent_prompt,
                 $params,
+                config.params.temperature,
                 config.sandbox.clone(),
             );
 
@@ -1566,7 +1581,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.tool_call_limit,
                 config.provider,
                 model,
-                config.thinking_level,
+                config.params.reasoning_str(),
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
@@ -2031,6 +2046,7 @@ fn build_rig_agent(
     bash_auto_allow: Vec<String>,
     agent_prompt: Option<String>,
     additional_params: Option<serde_json::Value>,
+    temperature: Option<f64>,
     sandbox: Option<crate::config::SandboxConfig>,
 ) -> Agent {
     let cwd = std::env::current_dir()
@@ -2076,6 +2092,13 @@ fn build_rig_agent(
 
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);
+    }
+    // Temperature rides the typed `CompletionRequest` field, so rig spells it
+    // per provider (flat for OpenAI/Anthropic, `generationConfig.temperature`
+    // for Gemini). `None` leaves the provider's own default in place — we
+    // never send a default we merely know about.
+    if let Some(t) = temperature {
+        builder = builder.temperature(t);
     }
 
     builder = builder
@@ -2803,9 +2826,9 @@ async fn session_recorded_model_id(session: &Session) -> Option<String> {
     }
 }
 
-/// The thinking level a session has recorded: latest `ThinkingLevelChange`
+/// The reasoning level a session has recorded: latest `ThinkingLevelChange`
 /// on the branch, else the header, else `None`.
-async fn session_recorded_thinking(session: &Session) -> Option<String> {
+async fn session_recorded_reasoning(session: &Session) -> Option<String> {
     let branch = session.get_branch().await;
     if let Some(level) = crate::session::session::derive_thinking_level(&branch) {
         return Some(level);
@@ -2840,8 +2863,8 @@ pub(crate) async fn record_model_change(session: &Session, qualified_id: &str) {
 /// Record a thinking-level change — same rules as [`record_model_change`]:
 /// skip when already recorded; fold into the in-memory header (no file)
 /// while the session is still unpersisted.
-async fn record_thinking_change(session: &Session, level: &str) {
-    if session_recorded_thinking(session).await.as_deref() == Some(level) {
+async fn record_reasoning_change(session: &Session, level: &str) {
+    if session_recorded_reasoning(session).await.as_deref() == Some(level) {
         return;
     }
     if !session.is_persisted() {
@@ -3227,7 +3250,7 @@ pub(crate) async fn ensure_session(
     repo: &Option<crate::session::repo::JsonlSessionRepo>,
     provider: Option<String>,
     model: Option<String>,
-    thinking_level: Option<String>,
+    reasoning_level: Option<String>,
 ) -> Option<Arc<Session>> {
     if current.is_some() {
         return current;
@@ -3251,7 +3274,7 @@ pub(crate) async fn ensure_session(
                             &cwd,
                             provider,
                             model,
-                            thinking_level,
+                            reasoning_level,
                         ),
                         entries: std::collections::HashMap::new(),
                         leaf_id: None,
@@ -3388,7 +3411,7 @@ pub(crate) async fn start_fresh_session(app_state: &AppState, name: &str) {
         (
             c.provider.clone(),
             c.model.clone(),
-            c.thinking_level.clone(),
+            c.params.reasoning_str(),
         )
     });
     let repo = app_state.repo();
@@ -3459,6 +3482,56 @@ fn save_recent_models(models: &[String]) {
 /// so slash commands that change model/provider/thinking can rebuild the agent
 /// via `create_agent` (required because `CodeAgent<M>` is generic over the
 /// provider's completion-model type).
+/// Fingerprint of the target state the REPL has *attempted* to build an agent
+/// for. Equality is the whole point: the loop rebuilds once per distinct
+/// fingerprint, so a failed `create_agent` is reported once instead of every
+/// cycle while the user navigates back to the menu.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RebuildFingerprint {
+    pub model: String,
+    pub params: params::ModelParams,
+    pub persona: Option<String>,
+}
+
+/// Decide whether the convergence step should rebuild the agent this cycle.
+///
+/// Returns the fingerprint to record on a rebuild, or `None` to leave the
+/// running agent alone. Two invariants, both easy to break and awkward to
+/// test through the REPL loop, so they live here:
+///
+/// 1. **Only a real change rebuilds.** The applied config and the runtime
+///    target are compared field by field — never by re-deriving the model id
+///    from segments, which would make every commit look like a model change.
+/// 2. **One attempt per distinct target.** Re-arming requires a *different*
+///    fingerprint, so a target that already failed is not retried until
+///    something actually changes. Recovery is "change the target", because
+///    `create_agent` errors (missing key, bad model id) are final for a given
+///    target.
+///
+/// Any param field counts as a change: temperature and top_p are baked into
+/// the agent's request builder, so there is no in-place path for them.
+pub(crate) fn plan_rebuild(
+    applied: &AgentConfig,
+    target: &AgentConfig,
+    last_attempt: Option<&RebuildFingerprint>,
+) -> Option<RebuildFingerprint> {
+    let changed = applied.qualified_model_id() != target.qualified_model_id()
+        || applied.params != target.params
+        || applied.persona_name != target.persona_name;
+    if !changed {
+        return None;
+    }
+    let attempt = RebuildFingerprint {
+        model: target.qualified_model_id(),
+        params: target.params,
+        persona: target.persona_name.clone(),
+    };
+    if last_attempt == Some(&attempt) {
+        return None;
+    }
+    Some(attempt)
+}
+
 pub async fn run_interactive(
     config: AgentConfig,
     settings: SettingsStore,
@@ -3558,7 +3631,7 @@ pub async fn run_interactive(
         &repo,
         Some(config.provider.clone()),
         Some(config.model.clone()),
-        config.thinking_level.clone(),
+        config.params.reasoning_str(),
     )
     .await;
     let first_id = first
@@ -3574,7 +3647,7 @@ pub async fn run_interactive(
     // apply. A failed attempt (bad id, missing key) stays silent and
     // un-retried until the target changes — one error per distinct target,
     // not one per cycle while the user navigates back to the menu.
-    let mut last_attempted_target: Option<(String, Option<String>, Option<String>)> = None;
+    let mut last_attempted_target: Option<RebuildFingerprint> = None;
     // Guard handle for the reader thread (suspend/resume / hard-exit).
     let guard = repl.as_ref().map(|r| r.guard());
     // Publish to the slot: the inline compact node's review closure
@@ -3664,7 +3737,9 @@ pub async fn run_interactive(
                     leaf_id,
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
-                    thinking_level: config.thinking_level.clone(),
+                    // P1's accessor (the level now lives in `ModelParams`)
+                    // plus upstream's two new status-bar fields.
+                    reasoning_level: config.params.reasoning_str(),
                     // The prompt-side bar names the session the same way the
                     // mid-turn one does: off the session index, with the opening
                     // message as the fallback when it has no name. Read here, at
@@ -3733,10 +3808,17 @@ pub async fn run_interactive(
         // themselves contain colons (openrouter `…:free`), and a
         // `nth(1)`-style truncation reads a different value than what is
         // configured, making every menu commit look like a model change.
+        // Narrower flag for the journal: only a *level* change is worth a
+        // `ThinkingLevelChange` entry, and recording it for a temperature
+        // tweak would be noise.
+        let reasoning_changed = config.params.reasoning != target.params.reasoning;
+        let target_reasoning = target.params.reasoning_str();
+        // What the loop's rebuild gate should do this cycle. Extracted so the
+        // once-per-target invariant is testable without running the REPL.
+        let rebuild = plan_rebuild(&config, &target, last_attempted_target.as_ref());
         let model_changed = config.qualified_model_id() != target.qualified_model_id();
-        let thinking_changed = config.thinking_level != target.thinking_level;
+        let params_changed = config.params != target.params;
         let persona_changed = config.persona_name != target.persona_name;
-        let target_thinking = target.thinking_level.clone();
 
         // One rebuild attempt per distinct target: re-running a failed
         // attempt would reprint the same error every cycle while the user
@@ -3744,24 +3826,15 @@ pub async fn run_interactive(
         // explicit `/model` re-commit of the same model — arms the next
         // attempt. (`create_agent` is local: key/config errors are final
         // for a given target, so recovery really is "change the target".)
-        let target_fp = (
-            target.qualified_model_id(),
-            target.thinking_level.clone(),
-            target.persona_name.clone(),
-        );
-        // Re-arm = a *different* target than the last attempt (the old
-        // explicit-commit re-arm died with `model_commit`; re-selecting
-        // an identical target is a no-op by definition — target unchanged).
-        let rebuild_armed = last_attempted_target.as_ref() != Some(&target_fp);
-        if (model_changed || thinking_changed || persona_changed) && rebuild_armed {
-            last_attempted_target = Some(target_fp);
+        if let Some(attempt) = rebuild {
+            last_attempted_target = Some(attempt);
             let mut new_cfg = config.clone();
             if model_changed {
                 new_cfg.provider = target.provider.clone();
                 new_cfg.model = target.model.clone();
             }
-            if thinking_changed {
-                new_cfg.thinking_level = target.thinking_level.clone();
+            if params_changed {
+                new_cfg.params = target.params;
             }
             if persona_changed {
                 new_cfg.persona_name = target.persona_name.clone();
@@ -3783,8 +3856,8 @@ pub async fn run_interactive(
                 Err(e) => {
                     let kind = if model_changed {
                         "switch model"
-                    } else if thinking_changed {
-                        "set thinking"
+                    } else if params_changed {
+                        "set model params"
                     } else {
                         "set persona"
                     };
@@ -3802,9 +3875,9 @@ pub async fn run_interactive(
         // unpersisted). Runs AFTER the rebuild so `config` matches the
         // target when we record.
         let recording_session = app_state.session();
-        if thinking_changed && config.thinking_level == target_thinking {
+        if reasoning_changed && config.params.reasoning_str() == target_reasoning {
             if let Some(ref s) = recording_session {
-                record_thinking_change(s, target_thinking.as_deref().unwrap_or("off")).await;
+                record_reasoning_change(s, target_reasoning.as_deref().unwrap_or("off")).await;
             }
         }
         // Control appliers — each field's sole consumer. `take_control()`
@@ -3897,7 +3970,7 @@ pub async fn run_interactive(
                     &repo,
                     Some(config.provider.clone()),
                     Some(config.model.clone()),
-                    config.thinking_level.clone(),
+                    config.params.reasoning_str(),
                 )
                 .await;
                 let guarded_id = guarded
@@ -5095,7 +5168,7 @@ impl CodeAgent {
         tool_call_limit: usize,
         provider: String,
         model: String,
-        thinking_level: Option<String>,
+        reasoning_level: Option<String>,
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
@@ -5109,7 +5182,7 @@ impl CodeAgent {
             tool_call_limit,
             provider,
             model,
-            thinking_level,
+            reasoning_level,
             yolo,
             persona_name,
             user_cancel,
@@ -5322,8 +5395,8 @@ mod tests {
         apply_compaction, blob_edit_tool_calls, build_replay_units, compute_resume_model_prefill,
         count_turns, create_private_dir, estimate_context_tokens, generate_compaction,
         is_anthropic_family, last_turns_start, maybe_strip_reasoning, message_role, persist_turn,
-        reasoning_text, record_model_change, record_thinking_change, retry_summarization,
-        session_recorded_model_id, session_recorded_thinking, MessageLogger,
+        reasoning_text, record_model_change, record_reasoning_change, retry_summarization,
+        session_recorded_model_id, session_recorded_reasoning, MessageLogger,
     };
     use super::{model_facing_tool_text, CompactSummaryMode, ReplayUnit};
     use crate::session::storage::SessionStorage;
@@ -5689,7 +5762,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         assert!(!path.exists(), "precondition: no file yet");
 
         record_model_change(&session, "openai:gpt-4o").await;
-        record_thinking_change(&session, "high").await;
+        record_reasoning_change(&session, "high").await;
 
         assert!(
             !path.exists(),
@@ -5703,13 +5776,13 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             Some("openai:gpt-4o")
         );
         assert_eq!(
-            session_recorded_thinking(&session).await.as_deref(),
+            session_recorded_reasoning(&session).await.as_deref(),
             Some("high")
         );
 
         // Recording the same values again is a no-op (no state change).
         record_model_change(&session, "openai:gpt-4o").await;
-        record_thinking_change(&session, "high").await;
+        record_reasoning_change(&session, "high").await;
         assert!(!path.exists());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -5980,7 +6053,8 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
+            models: Default::default(),
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
@@ -6947,7 +7021,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: Arc::new(out),
             yolo: true,
             quiet: true,
-            thinking_level: None,
+            params: Default::default(),
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -7043,7 +7117,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         // arrived and the `unwrap_or_else("/q")` fallback would mask it.
         // So: exactly two lines, and the queue must be empty afterwards.
         let inputs = Arc::new(Mutex::new(VecDeque::from([
-            "/thinking high".to_string(),
+            "/reasoning high".to_string(),
             "/quit".to_string(),
         ])));
         let shown = Arc::new(Mutex::new(String::new()));
@@ -7059,7 +7133,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             output: Arc::new(out),
             yolo: true,
             quiet: true,
-            thinking_level: None,
+            params: Default::default(),
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
@@ -7082,7 +7156,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
 
         let shown = shown.lock().unwrap().clone();
         assert!(
-            shown.contains("thinking high"),
+            shown.contains("reasoning high"),
             "expected the batch commit echo for `/thinking high`, got:\n{shown}"
         );
         assert!(
@@ -8206,6 +8280,154 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             .position(|l| l.starts_with("model:"))
             .expect("model section must be present");
         assert!(model_idx >= 1);
+    }
+
+    // ---- the rebuild gate (doc/model_settings_v2.md A.7) ----
+
+    /// Minimal `AgentConfig` for gate decisions — the plan only reads the
+    /// model id, params, and persona, so the rest is filler.
+    fn gate_cfg(provider: &str, model: &str, params: crate::params::ModelParams) -> AgentConfig {
+        AgentConfig {
+            provider: provider.into(),
+            model: model.into(),
+            output: Arc::new(crate::output::NoOutput),
+            yolo: false,
+            quiet: true,
+            params,
+            tool_call_limit: 10,
+            system_message_extension: None,
+            persona_prompt: None,
+            persona_name: None,
+            bash_auto_allow: None,
+            agent_prompt: None,
+            user_cancel: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            sandbox: None,
+            show_reasoning_handle: crate::settings::default_show_reasoning_handle(),
+            reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
+            message_log_path: None,
+            sessions_dir: None,
+        }
+    }
+
+    /// Nothing changed: no rebuild, whatever the last attempt was.
+    #[test]
+    fn plan_rebuild_is_a_noop_when_target_matches_applied() {
+        use super::plan_rebuild;
+        let p = crate::params::ModelParams {
+            reasoning: Some(crate::params::ReasoningLevel::Med),
+            temperature: Some(0.5),
+            top_p: None,
+        };
+        let cfg = gate_cfg("openai", "gpt-4o", p);
+        assert!(plan_rebuild(&cfg, &cfg, None).is_none());
+        assert!(plan_rebuild(
+            &cfg,
+            &cfg,
+            Some(&super::RebuildFingerprint {
+                model: "openai:gpt-4o".into(),
+                params: p,
+                persona: None,
+            })
+        )
+        .is_none());
+    }
+
+    /// A temperature-only change rebuilds: it is baked into the agent's request
+    /// builder, so there is no in-place path. Same for top_p and the level.
+    #[test]
+    fn plan_rebuild_fires_for_each_param_field() {
+        use super::plan_rebuild;
+        let base = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        for next in [
+            crate::params::ModelParams {
+                temperature: Some(0.7),
+                ..Default::default()
+            },
+            crate::params::ModelParams {
+                top_p: Some(0.9),
+                ..Default::default()
+            },
+            crate::params::ModelParams {
+                reasoning: Some(crate::params::ReasoningLevel::High),
+                ..Default::default()
+            },
+        ] {
+            let target = gate_cfg("openai", "gpt-4o", next);
+            assert!(
+                plan_rebuild(&base, &target, None).is_some(),
+                "{next:?} must rebuild"
+            );
+        }
+    }
+
+    /// The once-per-target invariant: the same target that already failed is
+    /// not retried, so a bad model id reports once instead of every cycle.
+    /// Changing anything about the target re-arms it.
+    #[test]
+    fn plan_rebuild_attempts_once_per_distinct_target() {
+        use super::plan_rebuild;
+        let applied = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        let target = gate_cfg(
+            "openai",
+            "gpt-4o",
+            crate::params::ModelParams {
+                temperature: Some(0.7),
+                ..Default::default()
+            },
+        );
+        let first = plan_rebuild(&applied, &target, None).expect("first attempt");
+        // Same target, already attempted: silence.
+        assert!(plan_rebuild(&applied, &target, Some(&first)).is_none());
+        // A different param value is a different target: re-armed.
+        let other = gate_cfg(
+            "openai",
+            "gpt-4o",
+            crate::params::ModelParams {
+                temperature: Some(0.9),
+                ..Default::default()
+            },
+        );
+        assert!(plan_rebuild(&applied, &other, Some(&first)).is_some());
+    }
+
+    /// The model id is compared as one canonical string. A model id that
+    /// itself contains a colon (`openrouter:tencent/hy3:free`) must not read
+    /// as a change on every cycle, which a segment-wise compare would cause.
+    #[test]
+    fn plan_rebuild_compares_the_whole_qualified_id() {
+        use super::plan_rebuild;
+        let applied = gate_cfg(
+            "openrouter",
+            "tencent/hy3:free",
+            crate::params::ModelParams::default(),
+        );
+        let same = gate_cfg(
+            "openrouter",
+            "tencent/hy3:free",
+            crate::params::ModelParams::default(),
+        );
+        assert!(plan_rebuild(&applied, &same, None).is_none());
+        let different = gate_cfg(
+            "openrouter",
+            "z-ai/glm-5.3",
+            crate::params::ModelParams::default(),
+        );
+        assert!(plan_rebuild(&applied, &different, None).is_some());
+    }
+
+    /// Switching model with identical params still rebuilds — the agent is
+    /// generic over its model, so this is a real change.
+    #[test]
+    fn plan_rebuild_fires_on_a_model_switch_with_unchanged_params() {
+        use super::plan_rebuild;
+        let applied = gate_cfg("openai", "gpt-4o", crate::params::ModelParams::default());
+        let target = gate_cfg(
+            "anthropic",
+            "claude-3-5-sonnet-20241022",
+            crate::params::ModelParams::default(),
+        );
+        assert!(plan_rebuild(&applied, &target, None).is_some());
     }
 }
 

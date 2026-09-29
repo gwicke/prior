@@ -7,7 +7,7 @@ use crate::slashdot_menu::menu::{SlashDotMenu, SlashDotMenuNode};
 use crate::slashdot_menu::node_impl::StaticRow;
 use crate::v25_listing_node::ListingNode;
 
-use crate::v25_thinking::ThinkingEnumNode;
+use crate::v25_reasoning::ReasoningEnumNode;
 
 /// Build the v2.5 `SlashDotMenu` tree with all ported commands.
 pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
@@ -16,12 +16,13 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
     // Thinking: listing + single enum node (returns all levels via data()).
     {
         let reader = app_state.clone();
+        let reader2 = app_state.clone();
         let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = ListingNode::new(
             app_state,
             &[StaticRow::new(
-                "thinking",
-                "Set thinking level: off | low | med | high | max",
+                "reasoning",
+                "Set reasoning level: off | low | med | high | max",
             )],
         )
         .with_columns(vec![
@@ -30,16 +31,37 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         ])
         .into();
         tl.add_child(
-            ThinkingEnumNode {
-                active_fn: Box::new(move || reader.thinking().unwrap_or_else(|| "off".to_string())),
+            ReasoningEnumNode {
+                active_fn: Box::new(move || {
+                    reader.reasoning().unwrap_or_else(|| "off".to_string())
+                }),
                 submit_fn: Box::new(move |level| {
-                    writer.set_thinking(Some(level.to_string()));
+                    // Rows are the canonical five, so this cannot fail in
+                    // practice — but the config is typed now, so an
+                    // unparsable value must be reported rather than stored.
+                    let parsed = level
+                        .parse::<crate::params::ReasoningLevel>()
+                        .map_err(|e| e)?;
+                    writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),
+                // The live node reports the active model, so `header()` can
+                // disclose what each preset runs as on it.
+                active_model_fn: Some(Box::new(move || reader2.model())),
             }
             .into(),
         );
         root.add_child(tl);
+    }
+
+    // Sampling params: `/temperature` and `/top_p`. Leaf nodes directly under
+    // the root — each supplies its own root row from `data()`, prefills on
+    // drill, and takes a typed value on submit (doc/model_settings_v2.md A.8).
+    for param in [
+        crate::v25_number_param::NumberParam::Temperature,
+        crate::v25_number_param::NumberParam::TopP,
+    ] {
+        root.add_child(crate::v25_number_param::NumberParamNode::new(param, app_state).into());
     }
 
     // Persona
@@ -162,11 +184,12 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         };
         crate::app_state::AppState::for_test(settings)
@@ -187,8 +210,19 @@ mod tests {
                     .filter_map(|l| l.0.split_whitespace().next())
                     .collect();
                 for cmd in [
-                    "thinking", "persona", "model", "set", "stat", "replay", "session", "new",
-                    "clear", "compact", "tree", "sandbox", "quit",
+                    "reasoning",
+                    "persona",
+                    "model",
+                    "set",
+                    "stat",
+                    "replay",
+                    "session",
+                    "new",
+                    "clear",
+                    "compact",
+                    "tree",
+                    "sandbox",
+                    "quit",
                 ] {
                     assert!(
                         ids.contains(&cmd),
@@ -198,6 +232,12 @@ mod tests {
                 assert!(
                     !ids.contains(&"help"),
                     "'help' must stay removed from the root listing: {ids:?}"
+                );
+                // The rename was a hard break (doc/model_settings_v2.md A.11):
+                // the old spelling must be gone, not aliased.
+                assert!(
+                    !ids.contains(&"thinking"),
+                    "'thinking' must not answer any more: {ids:?}"
                 );
             }
             other => panic!(

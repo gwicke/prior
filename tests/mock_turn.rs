@@ -241,7 +241,7 @@ fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> boo
 
 /// Run one full turn against the mock and print the vt100 screen.
 /// Returns the raw byte stream for analysis. When `thinking` is set, the agent
-/// runs with `default_thinking_level = "high"` (answer-hold / reasoning path).
+/// runs with `default_reasoning_level = "high"` (answer-hold / reasoning path).
 fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     run_turn_typing(scenario, label, thinking, "run the command")
 }
@@ -277,7 +277,7 @@ fn run_turn_typing(scenario: u32, label: &str, thinking: bool, typed: &str) -> V
     if thinking {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = tmp.path().join("picocode.toml");
-        std::fs::write(&cfg, "default_thinking_level = \"high\"\n").unwrap();
+        std::fs::write(&cfg, "default_reasoning_level = \"high\"\n").unwrap();
         args.extend(["-c".into(), cfg.display().to_string()]);
         // Keep the tempdir alive for the duration of the run.
         _cfg_keep = Some(tmp);

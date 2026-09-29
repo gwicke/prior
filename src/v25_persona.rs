@@ -94,11 +94,12 @@ mod tests {
             security_mode: "confirm".into(),
             tool_call_limit: 10,
             default_persona: None,
-            default_thinking_level: "off".into(),
+            default_reasoning_level: None,
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         };
         crate::app_state::AppState::for_test(settings)
