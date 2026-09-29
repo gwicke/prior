@@ -93,7 +93,7 @@ impl NumberParam {
 
 /// Format a value for display without trailing-zero noise: `0.8`, not
 /// `0.8000000000000001`, and `1` rather than `1.0`.
-fn fmt_value(v: f64) -> String {
+pub fn fmt_value(v: f64) -> String {
     let s = format!("{v:.3}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() {
@@ -273,6 +273,7 @@ mod tests {
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         };
         crate::app_state::AppState::for_test(settings)

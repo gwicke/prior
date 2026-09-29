@@ -813,6 +813,7 @@ mod tests {
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 0,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         }
     }

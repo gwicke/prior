@@ -546,6 +546,7 @@ mod tests {
             tool_call_limit: 10,
             default_persona: None,
             default_reasoning_level: None,
+            models: Default::default(),
             show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,

@@ -307,6 +307,11 @@ pub struct SettingsStore {
     /// committed line has no trailing prompt after `llm`. Empty falls back
     /// to [`DEFAULT_LLM_COMPACT_PROMPT`] at the call site.
     pub llm_compact_prompt: String,
+    /// Per-model defaults and metadata overrides, keyed `provider:model`
+    /// (doc/model_settings_v2.md A.5). The durable side of the live/live-vs-
+    /// stored split: this is what `/model <id> save` writes and what the
+    /// seeding rule (A.6) reads on a model's first activation.
+    pub models: std::collections::HashMap<String, crate::model_settings::ModelSettings>,
     pub path: Option<PathBuf>,
 }
 
@@ -340,6 +345,10 @@ impl SettingsStore {
             reasoning_in_context: cfg.reasoning_in_context,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            // No per-model defaults at startup: the store mirrors the running
+            // session's view, and the file's records are loaded by
+            // `SettingsStore::load` / threaded in by `main`.
+            models: std::collections::HashMap::new(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -365,6 +374,7 @@ impl SettingsStore {
             reasoning_in_context: cfg.reasoning_in_context.unwrap_or_default(),
             session_resume_replay_turns: 3,
             llm_compact_prompt: cfg.llm_compact_prompt.clone().unwrap_or_default(),
+            models: cfg.models.clone(),
             path: path.map(|p| p.to_path_buf()),
         }
     }
@@ -578,21 +588,39 @@ impl SettingsStore {
             d
         };
         let table = doc.as_table_mut();
-        table.insert(
+        // `Table::insert` replaces the key, and a key's leading comment lives
+        // on the key — so a naive replace silently drops a comment the user
+        // wrote above a managed key. This has always happened here; the
+        // module's claim that comments survive only held for keys we did not
+        // touch. Carry the decor across on every managed write.
+        let put = |table: &mut toml_edit::Table, key: &str, item: toml_edit::Item| {
+            // A key's leading comment lives on the KEY's leaf decor, not on
+            // the value's — so the decor must be carried onto the new key
+            // after the insert, or the note lands inside the value.
+            let decor = table.key(key).map(|k| k.leaf_decor().clone());
+            table.insert(key, item);
+            if let (Some(decor), Some(mut new_key)) = (decor, table.key_mut(key)) {
+                *new_key.leaf_decor_mut() = decor;
+            }
+        };
+        put(
+            table,
             "default_model",
             toml_edit::value(self.default_model.clone()),
         );
-        table.insert(
+        put(
+            table,
             "security_mode",
             toml_edit::value(self.security_mode.clone()),
         );
-        table.insert(
+        put(
+            table,
             "tool_call_limit",
             toml_edit::value(self.tool_call_limit as i64),
         );
         match &self.default_persona {
             Some(p) => {
-                table.insert("default_persona", toml_edit::value(p.clone()));
+                put(table, "default_persona", toml_edit::value(p.clone()));
             }
             None => {
                 table.remove("default_persona");
@@ -603,7 +631,11 @@ impl SettingsStore {
         // "off" is stored as absence, so an untouched file never carries it.
         match &self.default_reasoning_level {
             Some(level) => {
-                table.insert("default_reasoning_level", toml_edit::value(level.clone()));
+                put(
+                    table,
+                    "default_reasoning_level",
+                    toml_edit::value(level.clone()),
+                );
             }
             None => {
                 table.remove("default_reasoning_level");
@@ -612,23 +644,33 @@ impl SettingsStore {
         // The pre-rename key is never written back: `Config` folds it into
         // `default_reasoning_level` on load, and the next save drops it.
         table.remove("default_thinking_level");
-        table.insert(
+        put(
+            table,
             "show_reasoning",
             toml_edit::value(self.show_reasoning.clone()),
         );
-        table.insert(
+        put(
+            table,
             "reasoning_in_context",
             toml_edit::value(self.reasoning_in_context.as_str()),
         );
         // llm_compact_prompt: only written when set (non-empty); an absent
         // key falls back to DEFAULT_LLM_COMPACT_PROMPT on load.
         if !self.llm_compact_prompt.trim().is_empty() {
-            table.insert(
+            put(
+                table,
                 "llm_compact_prompt",
                 toml_edit::value(self.llm_compact_prompt.clone()),
             );
         } else {
             table.remove("llm_compact_prompt");
+        }
+        // Per-model tables are written back wholesale, each through the
+        // shared writer so comments survive and an empty record leaves no
+        // trace.
+        for (id, settings) in &self.models {
+            crate::model_settings::write_to_doc(&mut doc, id, settings)
+                .map_err(|e| crate::PicocodeError::Other(format!("{id}: {e}")))?;
         }
         // Ensure the parent directory (e.g. ~/.config/picocode) exists before
         // writing, mirroring how the history file is created.
@@ -637,6 +679,26 @@ impl SettingsStore {
         }
         std::fs::write(path, doc.to_string()).map_err(crate::PicocodeError::Io)?;
         Ok(())
+    }
+
+    /// Store one model's settings and persist. Used by `/model <id> save` and
+    /// by the `$EDITOR` round-trip.
+    ///
+    /// A record with nothing set **removes** the table: "not configured" and
+    /// "configured to nothing" are the same state, and keeping an empty table
+    /// would only invite the reader to wonder what it was for.
+    pub fn put_model_settings(
+        &mut self,
+        id: &str,
+        settings: &crate::model_settings::ModelSettings,
+    ) -> Result<(), String> {
+        self.models.insert(id.to_string(), settings.clone());
+        self.save().map_err(|e| e.to_string())
+    }
+
+    /// The stored record for a model, if the file has one.
+    pub fn model_settings(&self, id: &str) -> Option<&crate::model_settings::ModelSettings> {
+        self.models.get(id)
     }
 
     fn apply(&mut self, key: SettingKey, value: &str) {
@@ -723,6 +785,7 @@ mod tests {
             reasoning_in_context: ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            models: std::collections::HashMap::new(),
             path: Some(path.to_path_buf()),
         }
     }
@@ -1184,5 +1247,132 @@ mod tests {
                 "first option's continuation line missing: {sub:?}\n{lines:?}"
             );
         }
+    }
+    // ---- per-model tables (doc/model_settings_v2.md A.5 / P4) ----
+
+    fn model_settings(reasoning: &str, temperature: f64) -> crate::model_settings::ModelSettings {
+        crate::model_settings::ModelSettings {
+            reasoning: reasoning.parse().ok(),
+            temperature: Some(temperature),
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of writing through `toml_edit`: a hand-written file
+    /// with comments, `[recipes.*]` and `[tool_config]` must come back
+    /// byte-for-byte on the parts we did not touch, with the per-model table
+    /// added.
+    #[test]
+    fn per_model_table_lands_without_disturbing_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "# my settings\ndefault_model = \"openrouter:tencent/hy3:free\"\n\n\
+             [recipes.review]\nprompt = \"Review this.\"\n",
+        )
+        .unwrap();
+        let mut s = SettingsStore::load(&path).unwrap();
+        s.put_model_settings("openrouter:tencent/hy3:free", &model_settings("high", 0.8))
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# my settings"),
+            "comment kept:\n{content}"
+        );
+        assert!(
+            content.contains("default_model = \"openrouter:tencent/hy3:free\""),
+            "root key kept:\n{content}"
+        );
+        assert!(
+            content.contains("prompt = \"Review this.\""),
+            "recipes kept:\n{content}"
+        );
+        // The model id needs quoting: it contains `:` and `/`.
+        assert!(
+            content.contains("[models.\"openrouter:tencent/hy3:free\"]"),
+            "quoted table header:\n{content}"
+        );
+        assert!(content.contains("reasoning = \"high\""), "{content}");
+        assert!(content.contains("temperature = 0.8"), "{content}");
+    }
+
+    /// A file that already has per-model tables loads them, and saving keeps
+    /// them while changing something else.
+    #[test]
+    fn per_model_tables_load_and_survive_an_unrelated_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "# nightly\n[models.\"p:m\"]\n# only for the batch job\nreasoning = \"max\"\ntop_p = 0.9\n",
+        )
+        .unwrap();
+        let mut s = SettingsStore::load(&path).unwrap();
+        let record = s.model_settings("p:m").expect("table must load");
+        assert_eq!(record.reasoning, Some(crate::params::ReasoningLevel::Max));
+        assert_eq!(record.top_p, Some(0.9));
+        assert!(
+            record
+                .comments
+                .get("reasoning")
+                .is_some_and(|c| c.contains("batch job")),
+            "comment must load: {:?}",
+            record.comments
+        );
+
+        s.set_value(SettingKey::ToolCallLimit, "42").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("tool_call_limit = 42"), "{content}");
+        assert!(content.contains("reasoning = \"max\""), "kept: {content}");
+        assert!(content.contains("batch job"), "comment kept: {content}");
+    }
+
+    /// A typo in a per-model table fails the load loudly, naming the key.
+    #[test]
+    fn a_typo_in_a_per_model_table_is_a_load_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        std::fs::write(&path, "[models.\"p:m\"]\ntemprature = 0.8\n").unwrap();
+        let err = SettingsStore::load(&path).unwrap_err().to_string();
+        assert!(err.contains("temprature"), "{err}");
+        assert!(err.contains("did you mean 'temperature'"), "{err}");
+    }
+
+    /// Storing an empty record removes the table, so a model the user cleared
+    /// leaves no trace and reads as unconfigured again.
+    #[test]
+    fn storing_an_empty_record_removes_the_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        let mut s = store(path.as_path());
+        s.put_model_settings("p:m", &model_settings("high", 0.8))
+            .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("models"));
+        s.put_model_settings("p:m", &crate::model_settings::ModelSettings::default())
+            .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("models"),
+            "table should be gone: {content}"
+        );
+        assert!(s.model_settings("p:m").is_some_and(|r| r.is_empty()));
+    }
+
+    /// `params()` is the seam the seeding rule (A.6) reads, so a record must
+    /// hand over exactly its three knobs and nothing else.
+    #[test]
+    fn a_records_params_are_its_three_knobs() {
+        let record = crate::model_settings::ModelSettings {
+            reasoning: Some(crate::params::ReasoningLevel::Med),
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            context_length: Some(1_000),
+            ..Default::default()
+        };
+        let p = record.params();
+        assert_eq!(p.reasoning, Some(crate::params::ReasoningLevel::Med));
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.top_p, Some(0.9));
     }
 }

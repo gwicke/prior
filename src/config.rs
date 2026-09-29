@@ -928,6 +928,12 @@ pub struct Config {
     /// the built-in `DEFAULT_LLM_COMPACT_PROMPT` is used.
     #[serde(default)]
     pub llm_compact_prompt: Option<String>,
+    /// Per-model defaults and metadata overrides, keyed by the canonical
+    /// `provider:model`. One `[models."provider:model"]` table each; see
+    /// `model_settings`. Read through the shared validator, so a typo in a
+    /// hand-edited file is a load error naming the key.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub models: std::collections::HashMap<String, crate::model_settings::ModelSettings>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1396,8 +1402,24 @@ impl Config {
     /// `SettingsStore::load` go through here) so a migration can never be
     /// applied on one path and forgotten on the other.
     pub fn parse(content: &str) -> crate::Result<Self> {
+        // Parse twice: serde for the typed scalar fields, and `toml_edit` for
+        // the per-model tables, which go through the shared validator so the
+        // file and the $EDITOR route cannot disagree about what is acceptable.
+        // The per-model tables are read *first*, deliberately.
+        // `ModelSettings` has `deny_unknown_fields`, so serde would also catch
+        // a typo — but with a bare "unknown field", no suggestion, and it stops
+        // at the first one. Our validator says "did you mean
+        // 'temperature'?", names the range when a value is merely out of
+        // bounds, and lists every problem at once. Serde remains the backstop
+        // for the scalar fields.
+        let doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|e: toml_edit::TomlError| crate::PicocodeError::Toml(e.to_string()))?;
+        let models = crate::model_settings::read_from_doc(&doc)
+            .map_err(|m| crate::PicocodeError::Toml(format!("invalid per-model settings: {m}")))?;
         let mut config: Config = toml_edit::de::from_str(content)
             .map_err(|e| crate::PicocodeError::Toml(e.to_string()))?;
+        config.models = models;
         config.migrate();
         Ok(config)
     }

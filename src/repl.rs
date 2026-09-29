@@ -2200,6 +2200,7 @@ mod tests {
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),
+            models: Default::default(),
             path: None,
         };
         AppState::for_test(settings)
