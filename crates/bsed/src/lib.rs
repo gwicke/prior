@@ -414,7 +414,7 @@ mod tests {
                 .collect();
             let applied = match blockedit::apply_to_text(FILE, &edits) {
                 ApplyOutcome::Applied { text, .. } => text,
-                ApplyOutcome::Failed { report } => panic!("{script}: {report}"),
+                ApplyOutcome::Failed { report, .. } => panic!("{script}: {report}"),
             };
             assert_eq!(applied, reference, "{script}: preview did not round-trip");
         }

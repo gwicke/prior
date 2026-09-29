@@ -741,10 +741,7 @@ mod tests {
         let text = "some/path\n@@@OLD\nsome text\n@@@NEW\n@@@END>\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("some/path"));
-        assert_eq!(
-            p.edits,
-            vec![headed("some/path", "some text", "@@@END>")]
-        );
+        assert_eq!(p.edits, vec![headed("some/path", "some text", "@@@END>")]);
     }
 
     #[test]
@@ -894,7 +891,14 @@ mod tests {
         let parsed = parse_blocks(&blob).unwrap();
         // render_blob writes the path once, above the first block, so the parse
         // recovers the same texts plus that header.
-        assert_eq!(parsed.edits, vec![headed("src/m.rs", "fn a() {\n    x\n}", "fn a() {\n    y\n}")]);
+        assert_eq!(
+            parsed.edits,
+            vec![headed(
+                "src/m.rs",
+                "fn a() {\n    x\n}",
+                "fn a() {\n    y\n}"
+            )]
+        );
     }
 
     #[test]
@@ -973,10 +977,7 @@ mod tests {
         let text = "src/x.rs\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
         let p = parse_blocks(text).unwrap();
         assert_eq!(p.path.as_deref(), Some("src/x.rs"));
-        assert_eq!(
-            p.edits,
-            vec![headed("src/x.rs", "a", "A"), plain("b", "B")]
-        );
+        assert_eq!(p.edits, vec![headed("src/x.rs", "a", "A"), plain("b", "B")]);
     }
 
     #[test]
@@ -1029,7 +1030,10 @@ pub struct FileBatch {
 /// argument — which is the single-file case, and the reason a header-less blob
 /// still works. Errors only when a block names no file and there is no fallback
 /// to attribute it to.
-pub fn group_by_file(parsed: ParsedBlocks, fallback: Option<&str>) -> Result<Vec<FileBatch>, String> {
+pub fn group_by_file(
+    parsed: ParsedBlocks,
+    fallback: Option<&str>,
+) -> Result<Vec<FileBatch>, String> {
     let mut order: Vec<String> = Vec::new();
     let mut batches: std::collections::HashMap<String, Vec<ParsedEdit>> =
         std::collections::HashMap::new();

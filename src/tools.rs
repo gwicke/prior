@@ -269,7 +269,9 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
             text,
             matched_lines,
         } => (text, matched_lines),
-        ApplyOutcome::Failed { report } => return Ok(report),
+        // The model is shown the whole report; the per-edit indices are for
+        // callers that re-emit only the failures (`bsed apply`).
+        ApplyOutcome::Failed { report, .. } => return Ok(report),
     };
 
     fs::write(&p, result).await?;

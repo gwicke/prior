@@ -19,7 +19,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use blockedit::{apply::ApplyOutcome, EditOp};
+use blockedit::{apply::ApplyOutcome, EditOp, ParsedEdit};
 
 use crate::{Context, Options};
 
@@ -31,21 +31,31 @@ USAGE:
     bsed apply   [OPTIONS] [FILE]
 
 PREVIEW (never writes; the default):
-    -p, --path <PATH>     File to preview (default: - for stdin)
+    -p, --path <PATH>     File to preview, or a directory with -r
+    -r, --recursive       Walk a directory (.gitignore-aware, hidden files
+                          skipped) and preview every file, emitting one blob
+                          with a header per file. No budget: a human is reading
+                          this, not a model.
     -c, --context <N>     Unchanged lines each side; trailing is always at
                           least 2 (default 0)
     -t, --trailing <N>    Minimum unchanged lines after a change (default 2)
         --no-grow         Do not extend blocks to a balanced bracket
-    -b, --budget <BYTES>  Preview budget (default 51200)
+    -b, --budget <BYTES>  Preview budget, single-file mode only (default 51200)
     -h, --help
 
 APPLY (writes):
     -p, --path <PATH>     File to edit (default: the FILE argument, else -)
-    -i, --in-place        Write the file; without it the result goes to stdout
+    -i, --in-place        Write the file; without it the result goes to stdout.
+                          Required for a multi-file blob.
+    A blob may span files. Each file is applied independently -- a file whose
+    blocks do not resolve is reported and left alone, and the others still go
+    through. The failed blocks are echoed back so they can be fixed and
+    re-piped.
 
 EXAMPLES:
     bsed preview '177s/edits: EditInput,/edits: serde_json::Value,/' -p src/x.rs
-    bsed preview 's/foo/bar/g' < expressions.txt -p src/x.rs
+    bsed preview -r -p src 's/EditInput/serde_json::Value/g' > blocks.txt
+    bsed apply -i < blocks.txt
     bsed apply src/x.rs < blocks.txt | diff src/x.rs -
 ";
 
@@ -68,6 +78,16 @@ pub fn main() -> ExitCode {
             eprintln!("{m}");
             ExitCode::from(2)
         }
+        Err(Failure::Partial(m)) => {
+            // The report is the *result* of the run -- which files applied, and
+            // the blocks to fix for the ones that did not -- so it goes to
+            // stdout where a redirect or a pager will catch it. stderr carries
+            // only the one-line signal a script needs to notice.
+            print!("{m}");
+            let failed = m.matches("FAILED").count();
+            eprintln!("bsed: {failed} file(s) failed; see the report above");
+            ExitCode::from(2)
+        }
         Err(Failure::Internal(m)) => {
             eprintln!("bsed: {m}");
             ExitCode::FAILURE
@@ -79,6 +99,9 @@ pub fn main() -> ExitCode {
 enum Failure {
     /// Bad invocation: wrong flags, missing argument.
     Usage(String),
+    /// Some files applied and some did not. The message says both; the exit
+    /// code is 2, because a caller that ignores it now has a half-done tree.
+    Partial(String),
     /// The caller's input is wrong (a rejected expression, an unresolvable
     /// block). Model-fixable.
     User(String),
@@ -105,6 +128,7 @@ fn run(args: &[String]) -> Result<String, Failure> {
 
 fn preview(args: &[String]) -> Result<String, Failure> {
     let mut path: Option<PathBuf> = None;
+    let mut recursive = false;
     let mut context: usize = 0;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
@@ -123,6 +147,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             "-h" | "--help" => return Ok(USAGE.to_string()),
             "--version" | "-V" => return Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
             "-p" | "--path" => path = Some(PathBuf::from(need(it.next(), "-p")?)),
+            "-r" | "--recursive" => recursive = true,
             "-c" | "--context" => context = need_num(it.next(), "-c")?,
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
             "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
@@ -151,34 +176,155 @@ fn preview(args: &[String]) -> Result<String, Failure> {
         ));
     }
 
-    // `-p -` (or no `-p` at all) means the file arrives on stdin, which is the
-    // pipeline form: `cat f.rs | bsed preview 's/x/y/'`.
-    let (text, shown) = if path.as_deref().map(|p| p.as_os_str()) == Some(std::ffi::OsStr::new("-"))
-        || path.is_none()
-    {
-        (read_stdin()?, "(stdin)".to_string())
-    } else {
-        let p = path.as_ref().expect("checked above");
-        let text = std::fs::read_to_string(p)
-            .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
-        (text, p.display().to_string())
+    let ctx = Context {
+        leading: context,
+        trailing: trailing.unwrap_or(2),
+        grow,
+        growth_cap: 20,
     };
 
+    let Some(p) = path.as_ref() else {
+        // No `-p` at all: the file arrives on stdin (`cat f.rs | bsed preview
+        // 's/x/y/'`), which cannot be recursive.
+        let text = read_stdin()?;
+        return single(&text, "(stdin)", &expressions, ctx, budget);
+    };
+    if p == Path::new("-") {
+        let text = read_stdin()?;
+        return single(&text, "(stdin)", &expressions, ctx, budget);
+    }
+    if p.is_dir() {
+        if !recursive {
+            return Err(Failure::Usage(format!(
+                "{} is a directory. Use `bsed preview -r -p {}` to preview every file under it.",
+                p.display(),
+                p.display()
+            )));
+        }
+        return recursive_preview(p, &expressions, ctx);
+    }
+    if recursive {
+        return Err(Failure::Usage(
+            "--recursive needs a directory; -p named a file".into(),
+        ));
+    }
+    let text = std::fs::read_to_string(p)
+        .map_err(|e| Failure::Internal(format!("{}: {e}", p.display())))?;
+    single(&text, &p.display().to_string(), &expressions, ctx, budget)
+}
+
+/// One file, with the agent-facing preview budget applied.
+fn single(
+    text: &str,
+    shown: &str,
+    expressions: &str,
+    ctx: Context,
+    budget: usize,
+) -> Result<String, Failure> {
     let opts = Options {
-        context: Context {
-            leading: context,
-            trailing: trailing.unwrap_or(2),
-            grow,
-            growth_cap: 20,
-        },
+        context: ctx,
         max_preview_bytes: budget,
     };
-    let (banner, blob) = crate::preview_text(&text, &shown, &expressions, opts)
+    let (banner, blob) = crate::preview_text(text, shown, expressions, opts)
         .map_err(|e| Failure::User(e.to_string()))?;
     if blob.is_empty() {
         return Ok(format!("{banner}\n"));
     }
     Ok(format!("{banner}\n{blob}\n"))
+}
+
+/// Preview every file under `root`, emitting one blob with a header per file.
+///
+/// The recursive mode has no preview budget: a human is reading the output, not
+/// a model paying per token, and a silently truncated tree refactor is the worst
+/// possible outcome. Files that cannot be read as UTF-8 are skipped and counted
+/// rather than failing the run — a tree is allowed to contain binaries.
+fn recursive_preview(root: &Path, expressions: &str, ctx: Context) -> Result<String, Failure> {
+    let opts = Options {
+        context: ctx,
+        // Unbounded: see above. `Options` still needs *a* value; the renderer
+        // is only consulted per file below, with usize::MAX.
+        max_preview_bytes: usize::MAX,
+    };
+
+    let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        // Respect .gitignore outside a repository too: skipping node_modules
+        // and target should not depend on whether the tree happens to be
+        // under version control.
+        .require_git(false)
+        .parents(false)
+        .follow_links(false)
+        .build()
+        .filter_map(|e| match e {
+            Ok(e) if e.file_type().map(|t| t.is_file()).unwrap_or(false) => Some(e.into_path()),
+            // A walker error (permission, broken link) should not sink the run.
+            _ => None,
+        })
+        .collect();
+    // Deterministic order, so two runs over the same tree are diffable.
+    files.sort();
+
+    let mut blob = String::new();
+    let mut changed_files = 0usize;
+    let mut blocks = 0usize;
+    let mut skipped = 0usize;
+
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            skipped += 1; // binary or unreadable
+            continue;
+        };
+        let (_, b) = crate::preview_text(&text, &f.display().to_string(), expressions, opts)
+            .map_err(|e| Failure::User(e.to_string()))?;
+        if b.is_empty() {
+            continue;
+        }
+        if !blob.is_empty() {
+            blob.push('\n');
+        }
+        blob.push_str(&b);
+        changed_files += 1;
+        blocks += count_blocks(&b);
+    }
+
+    if changed_files == 0 {
+        return Ok(format!(
+            "no lines matched — none of the {} file(s) under {} changed{}\n",
+            files.len() - skipped,
+            root.display(),
+            if skipped > 0 {
+                format!(" ({skipped} skipped: not UTF-8 text)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    let mut out = format!(
+        "sed preview: {changed_files} of {} file(s) under {} changed, {blocks} block(s) \
+         total. Review the blocks below, then apply them with `bsed apply -i`.\n",
+        files.len(),
+        root.display(),
+    );
+    if skipped > 0 {
+        out.push_str(&format!(
+            "NOTE: {skipped} file(s) skipped (not UTF-8 text).\n"
+        ));
+    }
+    out.push_str(&blob);
+    out.push('\n');
+    Ok(out)
+}
+
+/// How many blocks a rendered blob carries: one `@@@OLD` per block.
+fn count_blocks(blob: &str) -> usize {
+    blob.lines()
+        .filter(|l| l.trim() == blockedit::SEARCH_MARKER)
+        .count()
 }
 
 fn read_stdin() -> Result<String, Failure> {
@@ -205,9 +351,9 @@ fn apply(args: &[String]) -> Result<String, Failure> {
         }
     }
     // Blocks arrive on stdin, so a file named on the command line wins and the
-    // blob's own header is the fallback -- the same precedence as the `edit`
-    // tool's `path` argument. Parse first, because the header is where the
-    // fallback comes from.
+    // blob's own headers are the fallback -- the same precedence as the `edit`
+    // tool's `path` argument. Parse first, because the headers are where the
+    // fallback comes from and because a blob may span many files.
     let named = match path {
         Some(p) if p.as_os_str().is_empty() || p == PathBuf::from("-") => None,
         Some(p) => Some(p),
@@ -215,51 +361,146 @@ fn apply(args: &[String]) -> Result<String, Failure> {
     };
     let blob = read_stdin()?;
     let parsed = blockedit::parse_blocks(&blob).map_err(|e| Failure::User(e.to_string()))?;
+    let batches =
+        blockedit::group_by_file(parsed, named.as_deref().map(|p| p.to_str().unwrap_or("")))
+            .map_err(Failure::User)?;
 
-    let resolved: PathBuf = match (named, parsed.path.clone()) {
-        (Some(p), Some(h)) if same_file(&p, &h) => p,
-        (Some(p), _) => p,
-        (None, Some(h)) => PathBuf::from(h),
-        (None, None) => {
-            return Err(Failure::User(
-                "no file to apply to: pass a path, or include a filename line above the first \
-                 @@@OLD marker"
-                    .into(),
-            ))
-        }
-    };
-    let edits: Vec<EditOp> = to_ops(parsed.edits);
-    let text = std::fs::read_to_string(&resolved)
-        .map_err(|e| Failure::Internal(format!("{}: {e}", resolved.display())))?;
-
-    let applied = match blockedit::apply_to_text(&text, &edits) {
-        ApplyOutcome::Applied { text, .. } => text,
-        ApplyOutcome::Failed { report } => return Err(Failure::User(report)),
-    };
-
-    if in_place {
-        std::fs::write(&resolved, &applied)
-            .map_err(|e| Failure::Internal(format!("{}: {e}", resolved.display())))?;
-        Ok(format!(
-            "{}\n",
-            blockedit::success_note(&edits, &[], &resolved.display().to_string())
-        ))
-    } else {
-        Ok(applied)
+    if batches.len() > 1 && !in_place {
+        return Err(Failure::Usage(format!(
+            "this blob covers {} files, so there is no single result to print. Re-run with \
+             `-i` to write each file, or split the blob per file.",
+            batches.len()
+        )));
     }
+
+    let mut written: Vec<(String, usize)> = Vec::new();
+    let mut failed: Vec<(String, String, Vec<ParsedEdit>)> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+
+    // Each file is applied independently: a file whose blocks do not resolve is
+    // reported and left untouched, and the rest still go through. That is the
+    // per-file atomicity the recursive flow needs -- one stale file in a tree of
+    // two hundred should not block the other hundred and ninety-nine.
+    for batch in &batches {
+        let path = &batch.path;
+        let edits: Vec<EditOp> = to_ops(batch.edits.clone());
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                problems.push(format!("{}: {e}", path));
+                continue;
+            }
+        };
+        match blockedit::apply_to_text(&text, &edits) {
+            ApplyOutcome::Applied { text, .. } => {
+                if in_place {
+                    if let Err(e) = std::fs::write(path, &text) {
+                        problems.push(format!("{}: {e}", path));
+                        continue;
+                    }
+                }
+                written.push((path.clone(), edits.len()));
+            }
+            ApplyOutcome::Failed {
+                report,
+                failed: bad,
+            } => {
+                // Echo back only the blocks that failed, so they can be fixed
+                // and re-piped without re-deciding the ones that were fine.
+                let echo: Vec<ParsedEdit> = bad
+                    .iter()
+                    .filter_map(|i| batch.edits.get(*i).cloned())
+                    .collect();
+                let why = human_reason(&report);
+                failed.push((path.clone(), why, echo));
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for (path, n) in &written {
+        out.push_str(&format!("{path}: {n} block(s) applied\n"));
+    }
+    for (path, why, echo) in &failed {
+        out.push_str(&format!("{path}: FAILED — {why}\n"));
+        if !echo.is_empty() {
+            out.push_str(&format!(
+                "  the {n} block(s) below did not apply to {path}; fix them (or re-preview \
+                 with a narrower expression) and re-pipe this file:\n",
+                n = echo.len()
+            ));
+            // Re-render with the *anchored* headers `preview` emits, so the
+            // failed blocks can be fixed and re-piped through `apply` exactly as
+            // they came out — anchors included, or a duplicate would resolve by
+            // content alone on the retry.
+            let blocks: Vec<crate::Block> = echo
+                .iter()
+                .map(|e| crate::Block {
+                    anchor: e.start_line.unwrap_or(1) as usize,
+                    old_text: e.old_text.clone(),
+                    new_text: e.new_text.clone(),
+                })
+                .collect();
+            let blob = crate::blocks::render(path, &blocks, usize::MAX).blob;
+            out.push_str(&indent(&blob));
+            out.push('\n');
+        }
+    }
+    for p in &problems {
+        out.push_str(&format!("{p}\n"));
+    }
+    if out.is_empty() {
+        out.push_str("nothing to do\n");
+    }
+    if !failed.is_empty() || !problems.is_empty() {
+        out.push_str(&format!(
+            "{} file(s) applied, {} file(s) failed. Nothing was written for the failures.\n",
+            written.len(),
+            failed.len()
+        ));
+        return Err(Failure::Partial(out));
+    }
+    // Single file, no -i: the result itself is the output, so it can be diffed.
+    if !in_place && batches.len() == 1 {
+        let path = &batches[0].path;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| Failure::Internal(format!("{}: {e}", path)))?;
+        let edits: Vec<EditOp> = to_ops(batches[0].edits.clone());
+        if let ApplyOutcome::Applied { text, .. } = blockedit::apply_to_text(&text, &edits) {
+            return Ok(text);
+        }
+    }
+    Ok(out)
 }
 
-/// Compare a command-line path with a header path the way the blob parser
-/// does, so `./src/x.rs` and `src/x.rs` agree.
-fn same_file(a: &Path, b: &str) -> bool {
-    let cwd = match std::env::current_dir() {
-        Ok(c) => c,
-        Err(_) => return a == Path::new(b),
+/// Turn the JSON failure report into one human-readable line.
+///
+/// The structured report is for a model; a terminal wants the sentence, and the
+/// per-block detail is re-emitted as real blocks right after it.
+fn human_reason(report: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(report) else {
+        return "blocks did not resolve".to_string();
     };
-    blockedit::path::resolve_normalized(&a.to_string_lossy(), &cwd)
-        == blockedit::path::resolve_normalized(b, &cwd)
+    let raw = v
+        .get("ui_view")
+        .and_then(|x| x.as_str())
+        .unwrap_or("blocks did not resolve");
+    // The report's own "edit failed:" header duplicates what the line already
+    // says, and its newlines are layout, not content.
+    raw.strip_prefix("edit failed:")
+        .unwrap_or(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
+/// Indent a rendered blob so it reads as quoted text under its error line.
+fn indent(blob: &str) -> String {
+    blob.lines()
+        .map(|l| format!("    {l}\n"))
+        .collect::<Vec<_>>()
+        .join("")
+}
 fn to_ops(edits: Vec<blockedit::ParsedEdit>) -> Vec<EditOp> {
     edits
         .into_iter()

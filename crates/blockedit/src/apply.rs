@@ -26,6 +26,12 @@ pub enum ApplyOutcome {
     Failed {
         /// The rendered batch failure, ready to hand back to the model.
         report: String,
+        /// 0-based indices of the edits that failed, in batch order. The
+        /// rendered report says *what* went wrong; this says *which* blocks, so
+        /// a caller can hand back exactly those for a retry instead of the whole
+        /// batch. (The `edit` tool does not need it — it shows the model
+        /// everything — but `bsed apply` does, to re-emit just the failures.)
+        failed: Vec<usize>,
     },
 }
 
@@ -40,9 +46,12 @@ pub fn apply_to_text(text: &str, edits: &[EditOp]) -> ApplyOutcome {
     let (_claims, resolved) = resolve_edits(text, edits, &mut failures);
 
     if !failures.is_empty() {
+        // `resolve_edits` sorts failures by index, so this is batch order.
+        let failed: Vec<usize> = failures.iter().map(|f| f.edit_index).collect();
         let batch = diagnose::BatchEditFailure::build(total, failures);
         return ApplyOutcome::Failed {
             report: diagnose::render_batch(&batch),
+            failed,
         };
     }
 

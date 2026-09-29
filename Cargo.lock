@@ -206,8 +206,11 @@ name = "bsed"
 version = "0.1.0"
 dependencies = [
  "blockedit",
+ "ignore",
  "sed-rs",
+ "serde_json",
  "similar",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 

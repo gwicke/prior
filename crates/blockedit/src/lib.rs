@@ -29,9 +29,9 @@ pub mod wire;
 
 pub use apply::{apply_to_file, apply_to_text, success_note, ApplyOutcome};
 pub use blob::{
-    array_to_blob_value, canonicalize_edit_value, merge_path, parse_blocks, render_blob,
-    split_line_anchor, ParseError, ParsedBlocks, ParsedEdit, DIVIDER, REPLACE_MARKER,
-    SEARCH_MARKER,
+    array_to_blob_value, canonicalize_edit_value, group_by_file, merge_path, parse_blocks,
+    render_blob, split_line_anchor, FileBatch, ParseError, ParsedBlocks, ParsedEdit, DIVIDER,
+    REPLACE_MARKER, SEARCH_MARKER,
 };
 pub use types::{EditOp, EditStartLine};
 pub use wire::EditArgs;

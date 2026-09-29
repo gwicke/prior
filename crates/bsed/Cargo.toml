@@ -7,6 +7,13 @@ description = "Preview a GNU sed script as line-anchored @@@OLD/@@@NEW/@@@END bl
 
 [dependencies]
 blockedit = { path = "../blockedit" }
+# The walker for `preview -r`: .gitignore-aware, skips hidden files, and
+# already in the tree via picocode, so this is no new download.
+ignore = "0.4.25"
 sed-rs = "2"
 similar = "2"
 thiserror = "2"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.24.0"
