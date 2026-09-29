@@ -2,10 +2,15 @@
 
 ## Status
 
-**Exploration. Nothing implemented.** Follow-up to
+**Geometry and colour decided; not yet implemented.** Follow-up to
 `doc/tree_indent_refinement.md`, which settled the indentation (spine) rule
 and explicitly deferred markers and box-drawing connectors to "one coherent
-follow-up design". This is that follow-up's investigation.
+follow-up design". This is that follow-up.
+
+The row anatomy (§5) and the colour scheme (§6) are settled in review; the
+split into *data* (the tree emits fields) and *paint* (the generic gutter
+layer draws the prefix) is the ownership model that falls out of the gutter
+being generic. One open question remains — hue policy (§6.3).
 
 One prerequisite landed in the meantime: `Table::fit` now truncates
 ANSI-aware (commit `8657429`) — see §3.4.
@@ -237,106 +242,200 @@ depth. Three mechanisms, three questions, no overlap.
 
 ---
 
-## 5. Recommended shape
+## 5. Row anatomy (decided)
+
+The bar is **not** a left-edge column: it is drawn **at the indentation
+level of the branch it belongs to**, so the main line's bar sits at the
+left edge and every spur's bar sits at that spur's own indent, immediately
+followed by the text. The assistant "response" slot sits *between* the bar
+and the text, and is deliberately **not** counted inside the bar's indent.
+
+A row is therefore:
 
 ```
- col 0        col 1-2   col 3+
-┌──────────┬──────────┬──────────────────────────────┐
-│ * > (2ch)│ band(1ch)│ description (indent = spaces)│
-└──────────┴──────────┴──────────────────────────────┘
-   existing    new       existing
+[indent: depth × SPUR_STEP columns][bar: 1 col][turn slot: 0 or 2 cols][text]
 ```
 
-or fold the band into the existing 2-column gutter, which is cheaper and
-avoids a new column. Both are open (§7).
-
-Rendering sketch (the `╰` case):
+with the bar occupying the **last** column of its branch's indent block,
+so a spur still costs exactly `SPUR_STEP` and the text column does not
+move from today's layout:
 
 ```
-▎* kick off
-▎  reply 1
-▎╰ experiment prompt          ▎ = excursion A band
-▎  experiment reply
-▎  second message             ▎ = main line band (or none)
-▎╰ a different idea           ▎ = excursion B band (different hue)
-▎  its reply
-▎  third message
+▌kick off               main,  user        bar@0, no slot
+▌│ reply 1              main,  assistant   bar@0, slot '│ '
+   ▌experiment prompt   spur1, user        bar@3, no slot
+   ▌│ experiment reply   spur1, assistant   bar@3, slot '│ '
+▌second message         main,  user        bar@0, no slot
+▌│ reply 2              main,  assistant   bar@0, slot '│ '
+   ╰a different idea     spur2, user        bar@3 + spur-start marker
+   ▌│ its reply          spur2, assistant   bar@3, slot '│ '
+▌third message          main,  user        bar@0, no slot
 ```
 
-Where the pieces come from:
+`╰` replaces the bar glyph on the spur's first row; the cell behind it is
+still painted with the branch hue.
 
-- **structure** — `spine_children` already produces the spine set, which is
-  exactly "is this child a spur". No new traversal is needed to find spur
-  first-rows or fork rows.
-- **band hue** — a per-row field (`branch`) emitted by
-  `TreeListNode::data()` as a *plain* small integer, per §3.1.
-- **paint** — a style hook consumed in `view.rs::rebuild_rows`, after
-  snippet extraction, so it never meets `extract_snippet` (§3.4).
+Column arithmetic, for `SPUR_STEP = 4`:
+
+| row | bar column | text column |
+|---|---|---|
+| main, user | 0 | 1 |
+| main, assistant | 0 | 3 |
+| depth-1, user | 3 | 4 |
+| depth-1, assistant | 3 | 6 |
+| depth-2, user | 7 | 8 |
+
+The assistant slot keeps today's "+2 relative to the user row above"
+meaning, measured from *after* the bar rather than from the margin — which
+is exactly "exclude the colour bar indent from the user/assistant 2-space
+indent". The slot replaces the blank two spaces with a drawn line that
+reads as "attached to the bar above", i.e. "this is a response within that
+branch".
+
+### 5.1 What the bar cell contains
+
+The cell is a 1-column paint area, and every row has one so the geometry
+is uniform:
+
+- **main line** — drawn in the default (or dimmed) foreground, with **no
+  hue fill**: colour is reserved for excursions, matching "the main line is
+  the spine";
+- **spur rows** — background = the branch hue, faded by depth (§6.2);
+  glyph = `▌` (or empty, if a full-bleed cell reads better);
+- **spur's first visible row** — the same background, with the marker glyph
+  inset **in black** (or white, chosen by the faded background's
+  luminance — a deep spur fades toward the row background, and black on a
+  nearly-black fill is unreadable).
+
+### 5.2 The data contract, and why the description must stay bare
+
+This geometry puts non-whitespace glyphs where the indent used to be. If
+they went into `Row::description`, three things break:
+
+1. `header()` strips the indent with `trim_start()` (`v25_tree.rs:774`) —
+   it would have to start stripping glyphs, and the preview would carry
+   bar-coloured noise;
+2. the description is the **fuzzy haystack** (`cursor.rs:154`) — the bar
+   and line glyphs would be searchable and would shift the match indices;
+3. `extract_snippet` windows the cell around the match and drops whatever
+   precedes it — the prefix is the first thing to go, so a filtered
+   listing would lose the very thing the geometry is for.
+
+So the tree emits **fields**, and the prefix is drawn by the render layer:
+
+| field | type | meaning |
+|---|---|---|
+| `depth` | int | spur level; replaces today's `FlatRow.indent` |
+| `branch` | int | hue index; `0` = main line, else the line-of-work ordinal |
+| `spur_start` | flag | first *visible* row of a spur (the marker row) |
+| `role` | str | already emitted — the render layer needs it to decide the slot |
+
+and the **description becomes bare text with no leading spaces**. That is
+a net simplification of the current code: `header()` no longer needs
+`trim_start`, the indent tests assert on `depth` instead of counting
+leading spaces, and the prefix is a rendering concern rather than data.
+
+The generic gutter work owns the painting (it is a generic concern, and
+the tree should not know it is there). The tree's remaining job is the
+four fields above and the tests that pin their values.
 
 ---
 
-## 6. Hue policy — the one real design fork
+## 6. Colour: hue and fade (decided)
 
-**Layout-relative** (hue = the highest-level spur ancestor, derived from
-the spine set): main line neutral, every excursion tinted, and the colour
-always agrees with the indent. It moves when the layout reflows — a branch
-that outgrows the main flow changes colour when it takes the margin.
+### 6.1 Hue = identity, at a single level
+
+Hue identifies the *line of work*, not the depth: all rows of an excursion
+share a hue at any depth. Sibling excursions **at the same depth** get
+different hues, rotating through a warm-leaning rainbow (24-bit; full-colour
+terminals assumed, no 16-colour budget):
+
+```
+1 #ffb000 amber    2 #ff6b35 orange   3 #ff4d6d rose    4 #d16bff violet
+5 #6b8cff azure    6 #2dd4bf teal     7 #7bd44a green    8 #c9b800 olive  → wrap
+```
+
+Warm first (1-3), cool through the middle, warm again at the end; adjacent
+assignments are far apart in the wheel. Avoid anything near the selection
+cyan (`1;36`) or the match-highlight magenta (`1;35`).
+
+With truecolor, "bold elementary colours" is better expressed by setting the
+RGB directly than by relying on the bold attribute's palette effects.
+
+### 6.2 Fade = depth
+
+Brightness is a second, independent reading of the same cell: hue says
+*which* branch, fade says *how far out*. The fade is a redundancy cue
+(indent already encodes depth), which is why it can be gentle. Blend the
+hue toward the row background (`48;5;235` = `#262626` for unselected rows):
+
+```
+f(1) = 1.00   f(2) = 0.78   f(3) = 0.60   f(4) = 0.46   f(5) = 0.36   f(6+) = 0.30
+```
+
+A 0.30 floor keeps deep excursions legible while making them recessive.
+An explicit RGB blend is preferred over SGR `dim`, whose result depends on
+the terminal's own palette handling.
+
+### 6.3 One decision left: layout-relative or creation-relative
+
+**Layout-relative** (hue = the highest-level spur ancestor, from the spine
+set): colour and indent always agree — one mental model, and free, since
+the spine set is already computed. It moves when the layout reflows.
 
 **Creation-relative** (hue = the fork ordinal in time; main line = the
-original chain): a stable label for a line of work across the session. It
-can disagree with the indent — a branch that became the main line keeps its
-tint while sitting at column 0.
+original chain): a stable label for a line of work, but a branch that grew
+into the main line keeps its tint while sitting at the left edge.
 
-- **Pro layout-relative (recommended):** one mental model — "indent *and*
-  colour both say this is an excursion, and this one is further out" — and
-  it is free, since the spine set is already computed. The reflow is not a
-  bug: it is the layout doing the job we just built, and a branch visibly
-  *taking over* the margin is information.
-- **Pro creation-relative:** if `/tree` is ever used as a *stable map* of a
-  long session ("show me everything from the Postgres migration attempt"),
-  a colour that never moves is more useful. Worth revisiting if people
-  report losing track of a branch.
-
-Palette: colour by *line of work*, not by level, so all rows of an
-excursion share a hue at any depth. Three or four hues cover the realistic
-case (one main line plus a few explorations); beyond that, cycle and let the
-glyph (§4 B) disambiguate. Mid-tone hues on the existing near-black rows
-(`48;5;235`) read well; avoid anything near the selection cyan
-(`1;36`) or the match highlight magenta (`1;35`).
+Recommended: **layout-relative** — the reflow *is* the feature just
+implemented, and a branch visibly taking over the margin is information.
+Creation-relative becomes the better choice if `/tree` is ever used as a
+stable map of a long session.
 
 ---
 
-## 7. Decisions needed
+## 7. Decisions
 
-1. **Placement** — a separate 1–2 column band, or fold the colour into the
-   existing 2-column gutter (`*`/`>`)? The latter is cheaper; the former
-   keeps selection styling and branch styling independent.
-2. **Hue policy** — layout-relative (recommended) or creation-relative
-   (§6).
-3. **Markers** — spur-start glyph only, or spur-start *and* a dim marker on
-   the fork row? The second answers "where exactly did it split", the first
-   is enough to navigate.
-4. **Opt-out** — a `tree_color` setting (`auto | on | off`, default `auto`)
-   in the `SETTINGS` registry (`src/settings.rs:176-274`), plus `NO_COLOR`
-   respect. §3.5 says neither exists today; colour-only affordances need
-   both.
-5. **Defensive fix** — make `extract_snippet` escape-aware even though the
-   recommended application path does not reach it (§3.4).
-
-## 8. Implementation outline (if approved)
-
-| Step | File | Change |
+| # | Question | Decision |
 |---|---|---|
-| 1 | `crates/slashdot_menu/src/table.rs` | `extract_snippet` escape-aware (defensive) |
-| 2 | `crates/slashdot_menu/src/fields.rs` | `ColumnDef` style hook (tint by field value) + `Value::Str` → cell styling |
-| 3 | `crates/slashdot_menu/src/view.rs` | Apply the tint in `rebuild_rows` after snippet extraction; keep it out of the fuzzy haystack |
-| 4 | `src/v25_tree.rs` | `FlatRow` gains `branch: u8` + `spur_start: bool`; derive both from `spine_children`; emit as row fields; declare the gutter column |
-| 5 | `src/settings.rs` | `tree_color` setting (`auto | on | off`) + `NO_COLOR` |
-| 6 | `src/output.rs` | tilde-colour gate shared by the paint paths |
-| 7 | `doc/slashdot/tree_design.md` | Document the gutter, the hue policy and the settings key |
+| 1 | Rails, markers, or colour? | **Markers + colour, no rails** (§2: rails assert contiguity that interleaving breaks). |
+| 2 | Gutter | Owned by the generic render layer; the tree emits fields and does not know the gutter exists (§5.2). |
+| 3 | Bar geometry | Aligned to the branch's own indent, last column of its indent block; text column unchanged (§5). |
+| 4 | Assistant indent | Kept as +2, drawn as a line in the slot, measured from after the bar (§5). |
+| 5 | Bar width / fade / hue | 1 column, hue = line of work, fade = depth, warm-leaning rainbow (§6). |
+| 6 | Markers | Spur start only, inset in the bar cell, in black (luminance-picked) (§5.1). |
+| 7 | Hue policy | **Open** — layout-relative (recommended) or creation-relative (§6.3). |
+| 8 | Opt-out | A `tree_color` setting (`auto | on | off`) + `NO_COLOR`; neither exists today (§3.5). |
+| 9 | Defensive fix | Make `extract_snippet` escape-aware even though the recommended path does not reach it (§3.4). |
 
-Tests: hue/identity invariants (all rows of an excursion share a band;
-main line is neutral), marker placement (first visible row of a spur, not
-the invisible ones), stability under navigation (the band must not change
-when the leaf moves), and the existing truncation tests extended to a
-coloured gutter column.
+---
+
+## 8. Implementation outline
+
+Split by ownership — the tree side is implementable and testable now; the
+paint side lands with the gutter work.
+
+**Ours (`src/v25_tree.rs`, `src/settings.rs`)**
+
+| Step | Change |
+|---|---|
+| 1 | `FlatRow`: `indent: usize` → `depth: usize`; add `branch: u8`, `spur_start: bool`. Derive all three from the spine set that `spine_children` already produces (no new traversal). |
+| 2 | `data()`: stop padding the description; emit `depth` / `branch` / `spur_start` as row fields. |
+| 3 | `header()`: drop the `trim_start` (the description is bare now). |
+| 4 | Tests: rewrite the indent assertions against `depth`; add `branch` identity (all rows of an excursion agree, main line is `0`), `spur_start` placement (first *visible* row, skipping invisible entries), and stability under navigation. |
+| 5 | `tree_color` setting in the `SETTINGS` registry (`src/settings.rs:176-274`). |
+
+**Theirs (the generic gutter / render layer)**
+
+| Step | Change |
+|---|---|
+| 6 | Draw the prefix `[indent][bar][turn slot]` from the row fields, after the table cell is built. |
+| 7 | Apply hue + fade + marker per §6; pick the marker fg by the faded background's luminance. |
+| 8 | Keep the existing cursor (`>`) and active (`*`) indicators; the bar does not replace them. |
+
+**Shared**
+
+| Step | Change |
+|---|---|
+| 9 | `extract_snippet` escape-aware (defensive, §3.4). |
+| 10 | `doc/slashdot/tree_design.md`: document the prefix contract and the settings key. |
