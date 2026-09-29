@@ -121,8 +121,13 @@ v2.5 engine.
 ### Deferred (not blocking, pick up as needed)
 
 **RenderPlan / rendering - DONE**
-- No confirm dialog lines — `confirm_pending` is tracked in `EpochState`
-  but no dialog text is rendered in the plan.
+- Confirm dialog: **rendered by the engine** (`NodeEntry::confirm_plan` —
+  `header()` as detail, the two arms as rows on the shared `dialog_view`).
+  `Prepared` arms it; Enter resolves the cursor row (`accept` → `submit()`,
+  `cancel` → drop in place), Esc cancels, cursor keys move, a buffer
+  rewrite disarms. Arm values are engine-owned (`accept` / `cancel`);
+  nodes phrase them in the `SubmitResult::Prepared` payload
+  (`Some((accept, cancel))`, or `None` for the defaults).
 
 **Row uniformity: - DONE**
 - Only enforces non-empty `id`. Description optional. Rendering tolerant of

@@ -161,10 +161,37 @@ pub struct SandboxRemoveNode {
     pub app_state: Arc<AppState>,
 }
 
+impl SandboxRemoveNode {
+    /// Confirm-arm text for a binding — names the effect `submit()`
+    /// will have, so the dialog never says "Accept" for an irreversible
+    /// delete.
+    fn arms_for(b: Option<&CombinedBind>) -> (String, String) {
+        match b {
+            Some(b) if b.is_excluded => (
+                "Re-enable this mapping".to_string(),
+                "Leave it excluded".to_string(),
+            ),
+            Some(b) if b.is_session => (
+                "Remove this session mapping (deletes it)".to_string(),
+                "Keep the mapping".to_string(),
+            ),
+            Some(_) => (
+                "Exclude this config mapping for this session".to_string(),
+                "Keep the mapping".to_string(),
+            ),
+            None => (
+                "Apply this change".to_string(),
+                "Leave it unchanged".to_string(),
+            ),
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl SlashDotNode for SandboxRemoveNode {
     async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
-        let row = match find_binding(&path_args.ids) {
+        let binding = find_binding(&path_args.ids);
+        let row = match binding.as_ref() {
             None => Row::new("remove").desc("mapping not found"),
             Some(b) if b.is_excluded => Row::new("restore").desc("re-enable this mapping"),
             Some(b) if b.is_session => Row::new("remove").desc("remove this session mapping"),
@@ -210,8 +237,10 @@ impl SlashDotNode for SandboxRemoveNode {
         lines
     }
 
-    async fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
-        SubmitResult::Prepared
+    /// The action is picked from the binding's state, so the arm text
+    /// names the effect `submit()` will actually have.
+    async fn prepare(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        SubmitResult::Prepared(Some(Self::arms_for(find_binding(&path_args.ids).as_ref())))
     }
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -641,7 +670,7 @@ mod tests {
         // Session bind → Remove.
         assert!(matches!(
             futures::executor::block_on(node.prepare(1, &pa(&host_s))),
-            SubmitResult::Prepared
+            SubmitResult::Prepared(_)
         ));
         assert!(matches!(
             futures::executor::block_on(node.submit(1, &pa(&host_s))),
@@ -691,9 +720,8 @@ mod tests {
         let mut h = menu.get_handle();
 
         // Enter #1: drill into `remove` + arm the confirm (Prepared).
-        // The arming step is a prompt-only rewrite; resolving it (as
-        // repl::v25_eval does) re-derives the rendered confirm frame
-        // from the rewritten prompt.
+        // The arming step returns the dialog frame directly (no prompt
+        // round trip); the passive re-derive must reproduce it.
         let (_, prompt) = expect_continue(futures::executor::block_on(h.eval_prompt_resolved(
             "sandbox /cfg-ro remove",
             HostKey::Enter,
@@ -714,6 +742,13 @@ mod tests {
             "confirm frame must show the header: {:?}",
             detail_of(&plan)
         );
+        // The dialog itself: two arms, accept first and selected, with
+        // this node's phrasing for a config exclude.
+        let arms = rows_of(&plan);
+        assert_eq!(arms.len(), 2, "confirm dialog arms: {arms:?}");
+        assert!(arms[0].contains("Exclude this config mapping"), "{arms:?}");
+        assert!(arms[1].contains("Keep the mapping"), "{arms:?}");
+        assert_eq!(plan.selected, Some(0), "accept carries the cursor");
 
         // Enter #2: submit → Exclude op.
         let result = futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 100));
@@ -726,6 +761,41 @@ mod tests {
             take_sandbox_op(&app_state),
             Some(SandboxOp::Exclude { sandbox_path }) if sandbox_path == "/cfg-ro"
         ));
+    }
+
+    /// The `cancel` arm: a second Enter on it drops the confirm in
+    /// place — no control target written, menu still open.
+    #[test]
+    #[serial_test::serial]
+    fn remove_confirm_cancel_arm_does_not_commit() {
+        setup();
+        crate::sandbox_state::set_base(Some(base_config()));
+
+        let app_state = test_app_state();
+        let mut menu = sandbox_menu(&app_state);
+        let mut h = menu.get_handle();
+
+        let (_, prompt) = expect_continue(futures::executor::block_on(h.eval_prompt_resolved(
+            "sandbox /cfg-ro remove",
+            HostKey::Enter,
+            100,
+        )));
+        // Move onto `cancel`, then resolve.
+        let (moved, _) = expect_continue(futures::executor::block_on(h.eval_prompt(
+            &prompt,
+            HostKey::MoveCursor(1),
+            100,
+        )));
+        assert_eq!(moved.selected, Some(1), "cursor on the cancel arm");
+        let result = futures::executor::block_on(h.eval_prompt(&prompt, HostKey::Enter, 100));
+        assert!(
+            matches!(result, MenuResult::Continue(..)),
+            "cancel stays open: {result:?}"
+        );
+        assert!(
+            take_sandbox_op(&app_state).is_none(),
+            "cancel must not write a control target"
+        );
     }
 
     #[test]

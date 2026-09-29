@@ -9,7 +9,8 @@ use crate::fields::ColumnDef;
 use crate::fields::{row_field_value, FieldSpace, Row};
 use crate::filter::compile_query;
 use crate::node_impl::{
-    CompletionRows, DataError, MenuResult, PathArgs, RenderContext, SlashDotNode, SubmitResult,
+    CompletionRows, ConfirmLabels, DataError, MenuResult, PathArgs, RenderContext, SlashDotNode,
+    SubmitResult, CONFIRM_ACCEPT, CONFIRM_ACCEPT_LABEL, CONFIRM_CANCEL, CONFIRM_CANCEL_LABEL,
 };
 use crate::render::LogicalLine;
 use crate::value::Value;
@@ -102,8 +103,21 @@ struct EpochState {
     view_args: String,
     /// Set when this node drills into a child; consumed on bare-ID re-entry.
     should_restore_view_args: bool,
-    /// Confirm dialog pending (§9).
+    /// Confirm dialog armed (§9). The engine owns the dialog itself —
+    /// this flag is only the arm; the rows and cursor live in
+    /// `dialog_view`.
     confirm_pending: bool,
+    /// The prompt this node was reached with when `confirm_pending` was
+    /// armed. A prompt that no longer matches disarms the dialog
+    /// (§9: a buffer rewrite cancels), so an armed confirm can never
+    /// resolve against arguments it was not prepared for. Empty when
+    /// no confirm is armed.
+    confirm_prompt: String,
+    /// Arm descriptions from the `SubmitResult::Prepared` that armed
+    /// the dialog — `None` for the engine defaults. Captured at arm
+    /// time so every frame of one confirm renders the same text
+    /// without re-asking the node.
+    confirm_labels: Option<ConfirmLabels>,
 }
 
 impl Default for EpochState {
@@ -112,6 +126,8 @@ impl Default for EpochState {
             view_args: String::new(),
             should_restore_view_args: false,
             confirm_pending: false,
+            confirm_prompt: String::new(),
+            confirm_labels: None,
         }
     }
 }
@@ -143,12 +159,22 @@ pub(crate) struct NodeEntry {
     pub(crate) value_forwarding: bool,
     /// Presentation side: cursor + row-line cache + plan assembly (view.rs).
     view: RowView,
-    /// Completion dialog view — the second RowView instance (exclusive
-    /// view: candidates fully replace rows while the dialog is up).
-    completion_view: RowView,
+    /// The exclusive dialog view — the second `RowView` instance. Owned
+    /// by whichever dialog owns the current frame: completion candidates
+    /// (implicit open) or the confirm arms (§9). The two are mutually
+    /// exclusive by construction (a confirm arms only from a key the
+    /// completion pass does not own, and suppresses the pass while
+    /// armed), so one instance serves both — with a `reset()` at each
+    /// dialog boundary so neither leaks its cursor into the other.
+    dialog_view: RowView,
     /// Completer-response → ViewRows wrap memo (ptr_eq passthrough for
     /// handler-cached responses).
     completion_wrap: Option<(Rc<CompletionRows>, Rc<ViewRows>)>,
+    /// Confirm-arm rows → ViewRows, memoized on the descriptions they
+    /// were minted from. The arms are fixed; only the text a
+    /// `SubmitResult::Prepared` carried varies, so the rebuild is a
+    /// two-string compare.
+    confirm_wrap: Option<(ConfirmLabels, Rc<ViewRows>)>,
 }
 
 impl NodeEntry {
@@ -168,8 +194,9 @@ impl NodeEntry {
             cache_epoch: 0,
             value_forwarding: false,
             view: RowView::new(),
-            completion_view: RowView::new(),
+            dialog_view: RowView::new(),
             completion_wrap: None,
+            confirm_wrap: None,
         }
     }
 
@@ -297,12 +324,21 @@ impl NodeEntry {
                 self.epoch = EpochState::default();
                 self.cache_epoch = epoch;
                 self.view.reset();
-                self.completion_view.reset();
+                self.dialog_view.reset();
             }
 
             // Materialize this level's PathArgs by value: `ids` moved in,
             // `suffix` copied once. Everything downstream borrows this local.
             let path_args = PathArgs::new(path, prompt_suffix);
+
+            // A confirm armed for a different prompt no longer applies
+            // (§9: a buffer rewrite cancels). The node keeps ownership of
+            // its own staged payload — this only drops the engine's arm,
+            // so a rewritten buffer can never resolve a confirm that was
+            // prepared for other arguments.
+            if self.epoch.confirm_pending && self.epoch.confirm_prompt != path_args.full_prompt() {
+                self.disarm_confirm();
+            }
 
             // Phase 0.5: Drill rewrite — if the parent drilled into us
             // (DrillEnter / DrillTab), let the node optionally rewrite the
@@ -409,23 +445,24 @@ impl NodeEntry {
         render_ctx: &RenderContext,
     ) -> MenuResult {
         let pa = &parsed.path_args;
+        // The confirm dialog owns the frame while armed (§9) — before
+        // `Edit` (a pending confirm swallows that key) and before the
+        // completion pass (lower precedence).
+        if let Some(m) = self.confirm_pass(epoch, key, parsed, render_ctx).await {
+            return m;
+        }
         // `HostKey::Edit` first: the node decides (completion does not own
         // this key), and a `Handled` result degrades to a passive
         // re-derive — `key` becomes `None`, so the completion gate and the
         // `None` arm below produce exactly what a fresh eval would
-        // (doc/editor_cleanup.md §5). A pending confirm swallows the key
-        // like any non-confirm key.
+        // (doc/editor_cleanup.md §5).
         let mut key = key;
         if matches!(key, HostKey::Edit) {
-            if self.epoch.confirm_pending {
-                return Self::build_continue(pa);
-            }
             match self.inner.edit(epoch, pa).await {
                 SubmitResult::Handled => key = HostKey::None,
                 SubmitResult::Done(msg) => return MenuResult::DoneSuccess(msg, pa.full_prompt()),
-                SubmitResult::Prepared => {
-                    self.epoch.confirm_pending = true;
-                    return Self::build_continue(pa);
+                SubmitResult::Prepared(labels) => {
+                    return self.arm_confirm(parsed, labels, render_ctx).await
                 }
                 SubmitResult::NewPath(p) => return MenuResult::ContinuePrompt(p),
                 SubmitResult::Error(msg) => {
@@ -435,14 +472,11 @@ impl NodeEntry {
         }
         // Completion: passive frames + cursor moves + Tab. Enter/Esc/
         // Drill* bypass entirely (submit raw word / ladder / drill
-        // semantics); the confirm dialog has highest precedence.
-        // A completer `Err` falls through carrying its message — passed
-        // straight to `view_plan` below (rendered this frame, stored
-        // nowhere).
+        // semantics). A completer `Err` falls through carrying its
+        // message — passed straight to `view_plan` below (rendered this
+        // frame, stored nowhere).
         let mut frame_err: Option<String> = None;
-        if !self.epoch.confirm_pending
-            && matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab)
-        {
+        if matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab) {
             match self
                 .completion_pass(parsed, cursor_pos, key, render_ctx)
                 .await
@@ -453,51 +487,24 @@ impl NodeEntry {
             }
         }
         match key {
+            // An armed confirm never reaches here — `confirm_pass` owns
+            // the frame while it is up (§9).
             HostKey::Enter | HostKey::DrillEnter => {
-                if self.epoch.confirm_pending {
-                    // Confirm dialog: yea → submit.
-                    self.epoch.confirm_pending = false;
-                    match self.inner.submit(epoch, pa).await {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
-                        SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
-                        SubmitResult::Prepared => Self::build_continue(pa),
-                        SubmitResult::Handled => {
-                            // Nothing to commit: re-derive the current frame
-                            // (the host re-evals the same prompt).
-                            Self::build_continue(pa)
-                        }
-                        SubmitResult::Error(msg) => {
-                            self.error_continue(parsed, &msg, render_ctx).await
-                        }
+                match self.inner.prepare(epoch, pa).await {
+                    SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
+                    SubmitResult::Prepared(labels) => {
+                        self.arm_confirm(parsed, labels, render_ctx).await
                     }
-                } else {
-                    match self.inner.prepare(epoch, pa).await {
-                        SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
-                        SubmitResult::Prepared => {
-                            self.epoch.confirm_pending = true;
-                            Self::build_continue(pa)
-                        }
-                        SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
-                        SubmitResult::Handled => {
-                            // Nothing to commit: re-derive the current frame
-                            // (the host re-evals the same prompt).
-                            Self::build_continue(pa)
-                        }
-                        SubmitResult::Error(msg) => {
-                            self.error_continue(parsed, &msg, render_ctx).await
-                        }
+                    SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
+                    SubmitResult::Handled => {
+                        // Nothing to commit: re-derive the current frame
+                        // (the host re-evals the same prompt).
+                        Self::build_continue(pa)
                     }
+                    SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx).await,
                 }
             }
-            HostKey::Esc => {
-                if self.epoch.confirm_pending {
-                    // Cancel confirm dialog.
-                    self.epoch.confirm_pending = false;
-                    Self::build_continue(pa)
-                } else {
-                    Self::handle_esc(parsed)
-                }
-            }
+            HostKey::Esc => Self::handle_esc(parsed),
             HostKey::None => {
                 // Tab-drill or bare entry: show header/listing.
                 let rows = self.ensure_rows(&parsed.path_args);
@@ -527,6 +534,172 @@ impl NodeEntry {
         MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
     }
 
+    // --- Confirm dialog (§9) ---
+
+    /// Drive the confirm dialog while it is armed. `None` when no
+    /// confirm is armed, so both `handle_leaf` and `handle_listing` can
+    /// call it unconditionally as their first step.
+    ///
+    /// The dialog owns the frame: every key renders it, and only Enter
+    /// (resolving the cursor row) and Esc (nay) change state. `accept`
+    /// runs `submit()`; `cancel` drops the arm in place. The staged
+    /// payload is the node's own — a cancel leaves it to the node to
+    /// invalidate (its `submit()` keys on the same `PathArgs`).
+    async fn confirm_pass(
+        &mut self,
+        epoch: u64,
+        key: HostKey,
+        parsed: &ParsedSection,
+        render_ctx: &RenderContext,
+    ) -> Option<MenuResult> {
+        if !self.epoch.confirm_pending {
+            return None;
+        }
+        let pa = &parsed.path_args;
+        // Plan first, then dispatch on the key — the same shape as
+        // `completion_pass`: Enter needs the cursor row the plan
+        // resolves, and every other key needs the frame itself.
+        let delta = match key {
+            HostKey::MoveCursor(d) => Some(d),
+            _ => None,
+        };
+        let out = self.confirm_plan(parsed, delta, render_ctx).await;
+        match key {
+            HostKey::Enter | HostKey::DrillEnter => {
+                let accepted = out
+                    .cursor_row
+                    .as_ref()
+                    .is_some_and(|row| row.id == CONFIRM_ACCEPT);
+                self.disarm_confirm();
+                if !accepted {
+                    // Nay: drop the arm, re-derive this level's frame.
+                    return Some(self.passive_continue(parsed, render_ctx).await);
+                }
+                Some(match self.inner.submit(epoch, pa).await {
+                    SubmitResult::Done(msg) => MenuResult::DoneSuccess(msg, pa.full_prompt()),
+                    SubmitResult::NewPath(p) => MenuResult::ContinuePrompt(p),
+                    // Re-arming: a `submit()` that preps another step
+                    // (compaction stages, then commits) — dialog stays up.
+                    SubmitResult::Prepared(labels) => {
+                        self.arm_confirm(parsed, labels, render_ctx).await
+                    }
+                    // Nothing to commit: re-derive the current frame.
+                    SubmitResult::Handled => Self::build_continue(pa),
+                    SubmitResult::Error(msg) => self.error_continue(parsed, &msg, render_ctx).await,
+                })
+            }
+            HostKey::Esc => {
+                self.disarm_confirm();
+                Some(self.passive_continue(parsed, render_ctx).await)
+            }
+            // Everything else (None, MoveCursor, Tab, Edit, DrillTab)
+            // just re-renders the dialog.
+            _ => Some(MenuResult::Continue(out.plan, pa.full_prompt())),
+        }
+    }
+
+    /// Arm the confirm dialog and render it. `labels` is the optional
+    /// `(accept, cancel)` phrasing from the `Prepared` that armed it.
+    /// The direct `Continue` is the same shape as `error_continue`: the
+    /// plan *is* the frame, so the host paints it without a prompt-rewrite
+    /// round trip. The prompt is unchanged either way, which is what
+    /// keeps `Repl::batch_slash`'s re-press heuristic working.
+    async fn arm_confirm(
+        &mut self,
+        parsed: &ParsedSection,
+        labels: Option<ConfirmLabels>,
+        render_ctx: &RenderContext,
+    ) -> MenuResult {
+        self.epoch.confirm_pending = true;
+        self.epoch.confirm_prompt = parsed.path_args.full_prompt();
+        self.epoch.confirm_labels = labels;
+        // Fresh cursor at the `accept` arm (row 0) — a dialog view left
+        // over from a completion dialog must not inherit its cursor.
+        self.dialog_view.reset();
+        let out = self.confirm_plan(parsed, None, render_ctx).await;
+        MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
+    }
+
+    /// Drop the arm. Resets the shared dialog view so the next
+    /// completion dialog starts from its own reconcile.
+    fn disarm_confirm(&mut self) {
+        self.epoch.confirm_pending = false;
+        self.epoch.confirm_prompt.clear();
+        self.epoch.confirm_labels = None;
+        self.dialog_view.reset();
+    }
+
+    /// This level's ordinary frame — the post-cancel render, shared by
+    /// both resolve paths.
+    async fn passive_continue(
+        &mut self,
+        parsed: &ParsedSection,
+        render_ctx: &RenderContext,
+    ) -> MenuResult {
+        let rows = self.ensure_rows(&parsed.path_args);
+        let out = self
+            .view_plan(parsed, None, rows, None, None, render_ctx)
+            .await;
+        MenuResult::Continue(out.plan, parsed.path_args.full_prompt())
+    }
+
+    /// The dialog's frame: the node's `header()` as detail, the two arms
+    /// as rows on the shared dialog view. No columns — the implicit
+    /// `id`/`description` pair renders the arms as plain text, and no
+    /// table header is drawn.
+    async fn confirm_plan(
+        &mut self,
+        parsed: &ParsedSection,
+        cursor_delta: Option<i32>,
+        render_ctx: &RenderContext,
+    ) -> ViewPlan {
+        let rows = self.confirm_rows();
+        let detail: Vec<LogicalLine> = self
+            .inner
+            .header(&parsed.path_args, render_ctx)
+            .await
+            .into_iter()
+            .map(LogicalLine::new)
+            .collect();
+        self.dialog_view.plan(
+            rows,
+            &ViewRequest {
+                columns: &[],
+                detail,
+                seed_id: None,
+                pin: None,
+                cursor_delta,
+                render_ctx: *render_ctx,
+            },
+        )
+    }
+
+    /// The arm rows as a `ViewRows`, memoized on the descriptions they
+    /// were minted from — the arms and their text are fixed for the
+    /// life of an arm, so this rebuilds only when a new `Prepared`
+    /// phrases them differently. Keeping one `Rc` across frames is what
+    /// lets the dialog cursor survive a re-render (`ptr_eq` skips the
+    /// reconcile).
+    fn confirm_rows(&mut self) -> Rc<ViewRows> {
+        let (accept, cancel) = self.epoch.confirm_labels.clone().unwrap_or_else(|| {
+            (
+                CONFIRM_ACCEPT_LABEL.to_string(),
+                CONFIRM_CANCEL_LABEL.to_string(),
+            )
+        });
+        if let Some(((a, c), view)) = &self.confirm_wrap {
+            if *a == accept && *c == cancel {
+                return Rc::clone(view);
+            }
+        }
+        let view = ViewRows::of(vec![
+            Row::new(CONFIRM_ACCEPT).desc(accept.clone()),
+            Row::new(CONFIRM_CANCEL).desc(cancel.clone()),
+        ]);
+        self.confirm_wrap = Some(((accept, cancel), Rc::clone(&view)));
+        view
+    }
+
     // --- Listing handling ---
 
     async fn handle_listing(
@@ -542,20 +715,24 @@ impl NodeEntry {
         // section when unmatched — `tail.start` is then the suffix end).
         let view_args_clean = pa.suffix[..parsed.tail.start].to_string();
 
+        // The confirm dialog owns the frame while armed (§9). A listing
+        // can arm one from `edit()` → `Prepared`; this arm is what makes
+        // it resolvable — without it Enter would drill and Esc would run
+        // the ladder, stranding the flag (and suppressing completion) for
+        // the rest of the epoch.
+        if let Some(m) = self.confirm_pass(epoch, key, parsed, render_ctx).await {
+            return m;
+        }
         // `HostKey::Edit` first — same contract as `handle_leaf`: the node
         // decides, `Handled` degrades to a passive re-derive (`key = None`,
-        // completion gate + `None` path below), pending confirm swallows.
+        // completion gate + `None` path below).
         let mut key = key;
         if matches!(key, HostKey::Edit) {
-            if self.epoch.confirm_pending {
-                return Self::build_continue(pa);
-            }
             match self.inner.edit(epoch, pa).await {
                 SubmitResult::Handled => key = HostKey::None,
                 SubmitResult::Done(msg) => return MenuResult::DoneSuccess(msg, pa.full_prompt()),
-                SubmitResult::Prepared => {
-                    self.epoch.confirm_pending = true;
-                    return Self::build_continue(pa);
+                SubmitResult::Prepared(labels) => {
+                    return self.arm_confirm(parsed, labels, render_ctx).await
                 }
                 SubmitResult::NewPath(p) => return MenuResult::ContinuePrompt(p),
                 SubmitResult::Error(msg) => {
@@ -570,9 +747,7 @@ impl NodeEntry {
         // falls through carrying its message (rendered below, stored
         // nowhere).
         let mut frame_err: Option<String> = None;
-        if !self.epoch.confirm_pending
-            && matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab)
-        {
+        if matches!(key, HostKey::None | HostKey::MoveCursor(_) | HostKey::Tab) {
             match self
                 .completion_pass(parsed, cursor_pos, key, render_ctx)
                 .await
@@ -913,13 +1088,13 @@ impl NodeEntry {
     ) -> Result<Option<MenuResult>, String> {
         let pa = &parsed.path_args;
         if cursor_pos != pa.suffix.len() {
-            self.completion_view.reset();
+            self.dialog_view.reset();
             return Ok(None);
         }
         let word_range = match pa.word_before(cursor_pos) {
             Some(w) => w,
             None => {
-                self.completion_view.reset();
+                self.dialog_view.reset();
                 return Ok(None);
             }
         };
@@ -933,12 +1108,12 @@ impl NodeEntry {
             Err(e) => {
                 // No dialog; caller renders the message above header()
                 // on the normal detail line this frame.
-                self.completion_view.reset();
+                self.dialog_view.reset();
                 return Err(e.message);
             }
         };
         if rc.rows.is_empty() {
-            self.completion_view.reset();
+            self.dialog_view.reset();
             return Ok(None);
         }
         // Wrap the completer response — memoized on the response ptr so
@@ -967,7 +1142,7 @@ impl NodeEntry {
             HostKey::MoveCursor(d) => Some(d),
             _ => None,
         };
-        let out = self.completion_view.plan(
+        let out = self.dialog_view.plan(
             wrap,
             &ViewRequest {
                 columns: &columns,
@@ -1429,6 +1604,9 @@ fn parse_section(mut path_args: PathArgs, row_index: &HashMap<String, u16>) -> P
 mod tests {
     use super::*;
     use crate::node_impl::{CompletionRows, DataError, DataResponse, DataResult};
+    use crate::node_impl::{
+        CONFIRM_ACCEPT, CONFIRM_ACCEPT_LABEL, CONFIRM_CANCEL, CONFIRM_CANCEL_LABEL,
+    };
     use std::rc::Rc;
 
     /// A trivial command node: returns a fixed set of rows.
@@ -1517,6 +1695,16 @@ mod tests {
 
     fn ep() -> u64 {
         1
+    }
+
+    /// Arm a confirm the way `arm_confirm` does — flag *and* the prompt
+    /// it was armed for, which the buffer-rewrite check reads. Tests
+    /// that only want the armed state (rather than driving a real
+    /// `Prepared`) set both through here.
+    fn arm(node: &mut NodeEntry, prompt: &str) {
+        node.epoch.confirm_pending = true;
+        node.epoch.confirm_prompt = prompt.to_string();
+        node.dialog_view.reset();
     }
 
     /// Test render context: 80 columns.
@@ -1866,7 +2054,7 @@ mod tests {
         // Epoch-gate-proof: prime the child so its first traverse with `ep()`
         // does not reset the state we set here.
         root.children[0].cache_epoch = ep();
-        root.children[0].epoch.confirm_pending = true;
+        arm(&mut root.children[0], "x t");
         let result = futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::Edit,
@@ -1874,11 +2062,17 @@ mod tests {
             "x t",
             &rctx(),
         ));
-        assert!(
-            matches!(&result, MenuResult::ContinuePrompt(_)),
-            "expected ContinuePrompt, got {:?}",
-            result
-        );
+        // The armed dialog owns the frame (§9): Edit re-renders it
+        // rather than reaching the node.
+        match result {
+            MenuResult::Continue(plan, prompt) => {
+                assert_eq!(prompt, "x t");
+                let arms: Vec<&str> = plan.rows.iter().map(|l| l.0.as_str()).collect();
+                assert_eq!(arms.len(), 2, "{arms:?}");
+                assert!(arms[0].contains(CONFIRM_ACCEPT), "{arms:?}");
+            }
+            other => panic!("expected the confirm dialog, got {:?}", other),
+        }
         assert!(
             !*called.borrow(),
             "edit() must not run while a confirm is pending"
@@ -1911,6 +2105,613 @@ mod tests {
             }
             other => panic!("expected two Continue frames, got {:?}", other),
         }
+    }
+
+    // --- Confirm dialog (§9) ---
+
+    /// A two-phase leaf: `prepare()` always arms, carrying `descs` as
+    /// the confirm arms' text; `submit()` records what it was handed.
+    /// `edit()` answers `EditReply` so a listing can arm through the
+    /// editor path too. With `completer` set it also opens a completion
+    /// dialog — the two share one `RowView`, which is what the
+    /// cursor-leak test is about.
+    struct ConfirmLeaf {
+        row: &'static str,
+        header: Vec<String>,
+        prepares: Rc<std::cell::Cell<usize>>,
+        submits: Rc<std::cell::RefCell<Vec<String>>>,
+        edit_reply: EditReply,
+        descs: Option<ConfirmLabels>,
+        completer: bool,
+    }
+
+    impl ConfirmLeaf {
+        fn new(row: &'static str) -> Self {
+            ConfirmLeaf {
+                row,
+                header: vec!["node guidance".into()],
+                prepares: Rc::new(std::cell::Cell::new(0)),
+                submits: Rc::new(std::cell::RefCell::new(Vec::new())),
+                edit_reply: EditReply::Handled,
+                descs: None,
+                completer: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl SlashDotNode for ConfirmLeaf {
+        async fn data(&mut self, _epoch: u64, _path_args: &PathArgs) -> DataResult {
+            Ok(Rc::new(DataResponse {
+                rows: vec![Row::new(self.row).desc("an action")],
+                active_ids: Vec::new(),
+            }))
+        }
+
+        async fn header(
+            &mut self,
+            _path_args: &PathArgs,
+            _render_ctx: &RenderContext,
+        ) -> Vec<String> {
+            self.header.clone()
+        }
+
+        async fn prepare(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+            self.prepares.set(self.prepares.get() + 1);
+            SubmitResult::Prepared(self.descs.clone())
+        }
+
+        async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+            self.submits
+                .borrow_mut()
+                .push(path_args.args().collect::<Vec<_>>().join(" "));
+            SubmitResult::Done(Some("committed".into()))
+        }
+
+        async fn edit(&mut self, _epoch: u64, _path_args: &PathArgs) -> SubmitResult {
+            match self.edit_reply {
+                EditReply::Handled => SubmitResult::Handled,
+                EditReply::Done => SubmitResult::Done(Some("edited".into())),
+            }
+        }
+
+        async fn complete_parameter(
+            &mut self,
+            _args: &PathArgs,
+            _cursor_pos: usize,
+        ) -> Result<Rc<CompletionRows>, DataError> {
+            Ok(Rc::new(CompletionRows {
+                rows: if self.completer {
+                    vec![
+                        Row::new("alpha").desc("first"),
+                        Row::new("beta").desc("second"),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                labels: None,
+                match_indices: None,
+            }))
+        }
+    }
+
+    /// The confirm arms' row ids, in order, from a rendered plan.
+    fn confirm_arms(result: MenuResult) -> Vec<String> {
+        match result {
+            MenuResult::Continue(plan, _) => plan
+                .rows
+                .iter()
+                .map(|l| l.0.split_whitespace().next().unwrap_or("").to_string())
+                .collect(),
+            other => panic!("expected a Continue frame, got {:?}", other),
+        }
+    }
+
+    /// The selected row index of a rendered plan.
+    fn confirm_sel(result: &MenuResult) -> Option<usize> {
+        match result {
+            MenuResult::Continue(plan, _) => plan.selected,
+            other => panic!("expected a Continue frame, got {:?}", other),
+        }
+    }
+
+    fn confirm_detail(result: &MenuResult) -> Vec<String> {
+        match result {
+            MenuResult::Continue(plan, _) => plan.detail.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected a Continue frame, got {:?}", other),
+        }
+    }
+
+    /// root → ConfirmLeaf("act"), reached at `act `.
+    fn confirm_leaf_root() -> (
+        NodeEntry,
+        Rc<std::cell::Cell<usize>>,
+        Rc<std::cell::RefCell<Vec<String>>>,
+    ) {
+        let mut root = NodeEntry::new_root();
+        let leaf = ConfirmLeaf::new("act");
+        let p = Rc::clone(&leaf.prepares);
+        let s = Rc::clone(&leaf.submits);
+        root.children.push(NodeEntry::new_child(Box::new(leaf)));
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        (root, p, s)
+    }
+
+    #[test]
+    fn prepare_arms_the_dialog_with_accept_first() {
+        let (mut root, prepares, submits) = confirm_leaf_root();
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(prepares.get(), 1, "prepare must have run");
+        assert!(
+            submits.borrow().is_empty(),
+            "the arm must not submit: {:?}",
+            submits.borrow()
+        );
+        // The dialog is the frame: two arms, accept first and selected.
+        assert_eq!(
+            confirm_arms(result),
+            vec![CONFIRM_ACCEPT.to_string(), CONFIRM_CANCEL.to_string()]
+        );
+        assert_eq!(
+            confirm_sel(&futures::executor::block_on(root.node_traverse(
+                ep(),
+                HostKey::None,
+                Vec::new(),
+                "act ",
+                &rctx(),
+            ))),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn confirm_frame_keeps_the_node_header_as_detail() {
+        let (mut root, _p, _s) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let passive = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(confirm_detail(&passive), vec!["node guidance".to_string()]);
+    }
+
+    #[test]
+    fn enter_on_accept_submits() {
+        let (mut root, _p, submits) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(
+            matches!(result, MenuResult::DoneSuccess(Some(_), _)),
+            "accept must submit, got {:?}",
+            result
+        );
+        assert_eq!(submits.borrow().len(), 1, "{:?}", submits.borrow());
+    }
+
+    #[test]
+    fn enter_on_cancel_does_not_submit_and_stays_open() {
+        let (mut root, _p, submits) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        // Move the dialog cursor onto `cancel`, then resolve.
+        let moved = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(1),
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(confirm_sel(&moved), Some(1), "cursor must be on cancel");
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(
+            matches!(result, MenuResult::Continue(..)),
+            "cancel stays open, got {:?}",
+            result
+        );
+        assert!(
+            submits.borrow().is_empty(),
+            "cancel must not submit: {:?}",
+            submits.borrow()
+        );
+    }
+
+    #[test]
+    fn esc_cancels_in_place_without_submitting() {
+        let (mut root, _p, submits) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Esc,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(
+            matches!(result, MenuResult::Continue(..)),
+            "Esc cancels in place, got {:?}",
+            result
+        );
+        assert!(submits.borrow().is_empty(), "{:?}", submits.borrow());
+        // Disarmed: the next Enter re-prepares rather than submitting.
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(submits.borrow().is_empty(), "still not submitted");
+    }
+
+    #[test]
+    fn cursor_clamps_within_the_two_arms() {
+        let (mut root, _p, _s) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        for _ in 0..3 {
+            let r = futures::executor::block_on(root.node_traverse(
+                ep(),
+                HostKey::MoveCursor(1),
+                Vec::new(),
+                "act ",
+                &rctx(),
+            ));
+            assert_eq!(confirm_sel(&r), Some(1), "clamped to the last arm");
+        }
+        for _ in 0..3 {
+            let r = futures::executor::block_on(root.node_traverse(
+                ep(),
+                HostKey::MoveCursor(-1),
+                Vec::new(),
+                "act ",
+                &rctx(),
+            ));
+            assert_eq!(confirm_sel(&r), Some(0), "clamped to the first arm");
+        }
+    }
+
+    /// `Prepared(None)` takes the engine's defaults — a node that has no
+    /// phrasing to offer still gets a working dialog.
+    #[test]
+    fn prepared_without_labels_falls_back_to_the_engine_defaults() {
+        let (mut root, _p, _s) = confirm_leaf_root();
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let rows: Vec<String> = match &result {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].contains(CONFIRM_ACCEPT_LABEL), "{rows:?}");
+        assert!(rows[1].contains(CONFIRM_CANCEL_LABEL), "{rows:?}");
+        // The arm ids are engine-owned either way.
+        assert!(rows[0].starts_with(CONFIRM_ACCEPT), "{rows:?}");
+        assert!(rows[1].starts_with(CONFIRM_CANCEL), "{rows:?}");
+    }
+
+    /// The phrasing is captured at arm time: the node is not re-asked on
+    /// later frames, so every frame of one confirm renders the same text
+    /// even if the node's answer would have changed.
+    #[test]
+    fn arm_text_is_captured_at_arm_time() {
+        let mut root = NodeEntry::new_root();
+        root.children
+            .push(NodeEntry::new_child(Box::new(ConfirmLeaf::new("act"))));
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        // Arm with the default phrasing.
+        let armed = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let armed_rows: Vec<String> = match &armed {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(
+            armed_rows[0].contains(CONFIRM_ACCEPT_LABEL),
+            "{armed_rows:?}"
+        );
+
+        // A later frame of the *same* confirm keeps that text — the
+        // engine does not re-derive labels mid-confirm.
+        let again = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let again_rows: Vec<String> = match &again {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert_eq!(armed_rows, again_rows, "the dialog text must be stable");
+    }
+
+    #[test]
+    fn a_rewritten_buffer_disarms_the_dialog() {
+        let (mut root, _p, submits) = confirm_leaf_root();
+        let _ = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        // The user edits the buffer: the confirm was armed for `act `.
+        let r = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act other args",
+            &rctx(),
+        ));
+        let arms = confirm_arms(r);
+        assert!(
+            !arms.iter().any(|a| a == CONFIRM_ACCEPT),
+            "a rewrite must disarm, got {arms:?}"
+        );
+        // And Enter re-prepares rather than submitting the old payload.
+        let r = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act other args",
+            &rctx(),
+        ));
+        assert_eq!(
+            confirm_arms(r),
+            vec![CONFIRM_ACCEPT.to_string(), CONFIRM_CANCEL.to_string()],
+            "Enter must re-arm, not submit the stale payload"
+        );
+        assert!(submits.borrow().is_empty(), "{:?}", submits.borrow());
+    }
+
+    #[test]
+    fn node_can_phrase_the_arm_descriptions() {
+        let mut root = NodeEntry::new_root();
+        let mut leaf = ConfirmLeaf::new("act");
+        leaf.descs = Some((
+            "write this summary to the session".into(),
+            "discard the draft".into(),
+        ));
+        root.children.push(NodeEntry::new_child(Box::new(leaf)));
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let rows: Vec<String> = match &result {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(rows[0].contains("write this summary"), "{rows:?}");
+        assert!(rows[1].contains("discard the draft"), "{rows:?}");
+        // The values stay engine-owned regardless of the phrasing.
+        assert!(rows[0].starts_with(CONFIRM_ACCEPT), "{rows:?}");
+        assert!(rows[1].starts_with(CONFIRM_CANCEL), "{rows:?}");
+    }
+
+    #[test]
+    fn default_arm_descriptions_are_accept_and_cancel() {
+        let mut root = NodeEntry::new_root();
+        root.children
+            .push(NodeEntry::new_child(Box::new(ConfirmLeaf::new("act"))));
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+        let result = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        let rows: Vec<String> = match &result {
+            MenuResult::Continue(plan, _) => plan.rows.iter().map(|l| l.0.clone()).collect(),
+            other => panic!("expected Continue, got {:?}", other),
+        };
+        assert!(rows[0].contains(CONFIRM_ACCEPT_LABEL), "{rows:?}");
+        assert!(rows[1].contains(CONFIRM_CANCEL_LABEL), "{rows:?}");
+    }
+
+    /// A listing node that arms through `edit()`: before the dialog arm
+    /// existed this state was unreachable — Enter drilled and Esc ran
+    /// the ladder, stranding the flag for the rest of the epoch.
+    #[test]
+    fn a_listing_level_confirm_is_resolvable() {
+        let mut root = NodeEntry::new_root();
+        let mut listing = ConfirmLeaf::new("act");
+        listing.edit_reply = EditReply::Handled;
+        // Arm through prepare() at the listing level: `Enter` on a
+        // listing drills, so the editor path is the only arm — drive it
+        // directly to keep the test about resolvability.
+        let submits = Rc::clone(&listing.submits);
+        let mut listing_entry = NodeEntry::new_child(Box::new(listing));
+        // A child so this is a listing, not a leaf.
+        listing_entry
+            .children
+            .push(NodeEntry::new_child(Box::new(ConfirmLeaf::new("nested"))));
+        root.children.push(listing_entry);
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+
+        // Epoch-gate-proof: prime the child so its first traverse at
+        // `ep()` does not reset the state we set here.
+        root.children[0].cache_epoch = ep();
+        // Arm the listing's confirm directly (as `edit()` → Prepared
+        // would), then check both resolve paths.
+        arm(&mut root.children[0], "act ");
+        let dialog = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(
+            confirm_arms(dialog),
+            vec![CONFIRM_ACCEPT.to_string(), CONFIRM_CANCEL.to_string()],
+            "the listing's confirm must render its arms"
+        );
+
+        // Enter on accept submits the listing, rather than drilling.
+        let accepted = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(
+            matches!(accepted, MenuResult::DoneSuccess(..)),
+            "accept must submit at a listing, got {:?}",
+            accepted
+        );
+        assert_eq!(submits.borrow().len(), 1, "{:?}", submits.borrow());
+
+        // Esc disarms instead of running the ladder.
+        arm(&mut root.children[0], "act ");
+        let cancelled = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Esc,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert!(
+            matches!(cancelled, MenuResult::Continue(..)),
+            "Esc must cancel in place, got {:?}",
+            cancelled
+        );
+        // Disarmed: the completion gate is live again (a dot word opens
+        // the dialog instead of being swallowed by a stuck flag).
+        let after = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act .a",
+            &rctx(),
+        ));
+        assert!(
+            !confirm_arms(after).iter().any(|a| a.starts_with('.')),
+            "flag must be cleared, not stranded"
+        );
+    }
+
+    /// The dialog view is shared with the completion dialog, so neither
+    /// may inherit the other's cursor.
+    #[test]
+    fn a_completion_cursor_does_not_leak_into_the_confirm_dialog() {
+        // One node drives both dialogs, so they really do share the
+        // `RowView` the leak would travel through.
+        let mut root = NodeEntry::new_root();
+        let mut leaf = ConfirmLeaf::new("act");
+        leaf.completer = true;
+        root.children.push(NodeEntry::new_child(Box::new(leaf)));
+        futures::executor::block_on(root.refresh_data(ep(), &[], ""));
+
+        // Open the completion dialog on the leaf's in-flight word and
+        // walk its cursor off row 0.
+        let opened = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act al",
+            &rctx(),
+        ));
+        assert!(
+            matches!(&opened, MenuResult::Continue(plan, _) if plan.table_header.is_some()),
+            "the completion dialog was up: {opened:?}"
+        );
+        let walked = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::MoveCursor(1),
+            Vec::new(),
+            "act al",
+            &rctx(),
+        ));
+        assert_eq!(confirm_sel(&walked), Some(1), "dialog cursor moved");
+
+        // Arming the confirm resets the shared view to `accept`.
+        let armed = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::Enter,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(
+            confirm_arms(armed),
+            vec![CONFIRM_ACCEPT.to_string(), CONFIRM_CANCEL.to_string()],
+        );
+        // And the completion dialog is down (the confirm owns the frame).
+        let after = futures::executor::block_on(root.node_traverse(
+            ep(),
+            HostKey::None,
+            Vec::new(),
+            "act ",
+            &rctx(),
+        ));
+        assert_eq!(confirm_sel(&after), Some(0), "confirm starts on accept");
     }
 
     /// A root-like node with children AND a header.
@@ -2852,7 +3653,7 @@ mod tests {
             "",
             &rctx(),
         ));
-        root.epoch.confirm_pending = true;
+        arm(&mut root, ".t");
         let rows = rows_of(futures::executor::block_on(root.node_traverse(
             ep(),
             HostKey::None,

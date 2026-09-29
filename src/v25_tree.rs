@@ -1478,7 +1478,13 @@ fn edit_draft(
         target_id,
         draft,
     });
-    SubmitResult::Prepared
+    // The arms name what accepting does: `submit()` appends the drafted
+    // compaction to the session. Same text for all three modes — the
+    // effect is identical, only the draft's provenance differs.
+    SubmitResult::Prepared(Some((
+        "Write this summary to the session".into(),
+        "Discard it (regenerate with Enter)".into(),
+    )))
 }
 
 /// `submit()` body: apply the stashed draft. The stash must still be
@@ -2257,7 +2263,7 @@ mod tests {
         };
         let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         assert!(
-            matches!(result, SubmitResult::Prepared),
+            matches!(result, SubmitResult::Prepared(_)),
             "prepare must arm the confirm with Prepared"
         );
         assert!(
@@ -2291,7 +2297,7 @@ mod tests {
             args: Default::default(),
         };
         let result = crate::agent::block_on_test(node.prepare(1, &path_args));
-        assert!(matches!(result, SubmitResult::Prepared));
+        assert!(matches!(result, SubmitResult::Prepared(_)));
         assert!(!compaction_appended(&session), "prepare must not write");
 
         let result = crate::agent::block_on_test(node.submit(1, &path_args));
@@ -2408,7 +2414,7 @@ mod tests {
             args: Default::default(),
         };
         let result = crate::agent::block_on_test(node.prepare(1, &path_args));
-        assert!(matches!(result, SubmitResult::Prepared));
+        assert!(matches!(result, SubmitResult::Prepared(_)));
 
         let result = crate::agent::block_on_test(node.submit(2, &path_args));
         assert!(

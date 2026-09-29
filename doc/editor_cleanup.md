@@ -170,9 +170,16 @@ height-resize-during-edit case; no correctness path depended on it.
   re-opens a fresh stash without regenerating, else regenerates; `submit()` rejects a
   stale key with `Error` (stay open, Enter regenerates).
 - **The confirm is the engine's native workflow** — `prepare()` returns `Prepared`,
-  `NodeEntry` arms `confirm_pending`, Enter runs `submit()`, Esc aborts. No
-  confirmation dialog exists anywhere in the compaction path anymore.
-- `header()` carries the guidance ("Enter opens $EDITOR; then Enter writes, Esc aborts").
+  `NodeEntry` arms `confirm_pending`, and the engine renders the dialog: Enter
+  on the `accept` arm runs `submit()`, `cancel` (or Esc) drops it in place. No
+  confirmation *dialog* exists anywhere in the **data** layer of the
+  compaction path — the `prepared`/stash state and its invalidation are
+  `CompactStash`'s alone; the dialog is presentation, owned by `NodeEntry`
+  (design §9). The previous `confirm_compaction_summary` overlay was the
+  data-layer dialog E3 removed.
+- `header()` carries the node's own guidance; the arms are phrased in
+  the `Prepared` payload `edit_draft` returns (here: "Write this summary
+  to the session" / "Discard it (regenerate with Enter)").
 - Non-REPL slash input has no typed arms anymore (E5): `Repl::batch_slash` runs
   a complete line through the v2.5 engine as a batch — passive derive +
   virtual `Enter` presses (`Prepared` confirms take a second press; an Enter
