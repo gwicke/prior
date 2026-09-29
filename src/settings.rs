@@ -787,9 +787,7 @@ mod tests {
         let mut cfg = crate::AgentConfig {
             provider: "anthropic".into(),
             model: "claude-3-5-sonnet-20241022".into(),
-            output: std::sync::Arc::new(crate::QuietOutput::new(
-                crate::settings::default_show_reasoning_handle(),
-            )),
+            output: std::sync::Arc::new(crate::QuietOutput::new()),
             yolo: false,
             quiet: true,
             thinking_level: None,

@@ -445,21 +445,24 @@ impl DrawCache {
 ///
 /// The bytes are **relative**: nothing in a frame apply addresses an absolute
 /// row, so the plan cannot land on a row it did not mean to
-/// (row_accounting §6b). `anchor` and the `top`/`delta` arithmetic that follows
-/// it survive only to keep `cache`'s row bookkeeping — the tracked cursor row
-/// row accounting compares against a terminal, and the partial-apply predicate
-/// — and are never used for addressing.
+/// (row_accounting §6b). The `top`/`delta` arithmetic that follows is
+/// bookkeeping only — the tracked cursor row that row accounting compares
+/// against a terminal, and the bounded clear below the block — and is never
+/// used for addressing.
 pub(crate) fn plan_apply(
     cache: &mut DrawCache,
     frame: &Frame,
-    anchor: usize,
     policy: ApplyPolicy,
     term_w: usize,
     term_h: usize,
 ) -> String {
     let tw = term_w.max(1);
     let th = term_h.max(1);
-    let anchor = anchor.clamp(1, th);
+    // The block goes where the cursor is: the live frame's own top if one is
+    // intact, else the tracked cursor row. That is `DrawCache::anchor`, which
+    // used to be a parameter — a caller could name a row, and all it could do
+    // with it was contradict the block's own position (row_accounting §6b).
+    let anchor = cache.anchor().clamp(1, th);
     let h = frame.height();
 
     if policy == ApplyPolicy::Append {
@@ -1148,6 +1151,18 @@ mod apply_tests {
             .collect()
     }
 
+    /// Put the tracked cursor on 1-based `row` — where a run of content lines
+    /// would have left it.
+    ///
+    /// The frame path's block now follows the cursor, so this is how a test says
+    /// "put the block at row n". It is `note_lines` rather than a test-only
+    /// setter because that is the real mechanism: in production the cursor gets
+    /// there by content writing lines, and a test seam that skipped that would
+    /// not be testing the path anything takes.
+    fn cursor_to(cache: &mut DrawCache, row: usize, th: usize) {
+        cache.note_lines(row.saturating_sub(1), th);
+    }
+
     /// A frame of fixed text rows (self-contained: `Lines` appends the `EL`).
     fn lines_frame(rows: &[&str], tw: usize) -> Frame {
         let rows: Vec<String> = rows.iter().map(|s| s.to_string()).collect();
@@ -1193,19 +1208,20 @@ mod apply_tests {
         let f3 = lines_frame(&["aa", "bb", "cc"], 20);
         let mut plans = Vec::new();
         // First paint, from the cursor.
-        plans.push(plan_apply(&mut cache, &f3, 5, ApplyPolicy::Frame, 20, 24));
+        cursor_to(&mut cache, 5, 24);
+        plans.push(plan_apply(&mut cache, &f3, ApplyPolicy::Frame, 20, 24));
         // In-place repaint of one row.
         let f3b = lines_frame(&["aa", "XX", "cc"], 20);
-        plans.push(plan_apply(&mut cache, &f3b, 5, ApplyPolicy::Frame, 20, 24));
+        plans.push(plan_apply(&mut cache, &f3b, ApplyPolicy::Frame, 20, 24));
         // Shrink: the orphaned rows are erased by a walk, not by addressing.
         let f1 = lines_frame(&["aa"], 20);
-        plans.push(plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24));
+        plans.push(plan_apply(&mut cache, &f1, ApplyPolicy::Frame, 20, 24));
         // A frame too tall for the screen, so the apply must scroll.
         let mut tall = DrawCache::new(10);
+        cursor_to(&mut tall, 8, 10);
         plans.push(plan_apply(
             &mut tall,
             &lines_frame(&["a", "b", "c", "d", "e"], 20),
-            8,
             ApplyPolicy::Frame,
             20,
             10,
@@ -1214,7 +1230,8 @@ mod apply_tests {
         plans.push(plan_clear_live_frame(&mut cache));
         // Append, which writes the rows as content.
         let mut app = DrawCache::new(24);
-        plans.push(plan_apply(&mut app, &f3, 5, ApplyPolicy::Append, 20, 24));
+        cursor_to(&mut app, 5, 24);
+        plans.push(plan_apply(&mut app, &f3, ApplyPolicy::Append, 20, 24));
         for p in &plans {
             assert!(cups(p).is_empty(), "apply addressed a row: {p:?}");
         }
@@ -1228,10 +1245,11 @@ mod apply_tests {
     fn reanchor_is_the_one_addressing_path() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
+        cursor_to(&mut cache, 5, 24);
         let mut p = at(24, 20, 4);
         feed(
             &mut p,
-            &plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24),
+            &plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24),
         );
         let (_, clear) = cache.reanchor(Some(9));
         // Erase the block's rows where they are, then park on the new row.
@@ -1247,7 +1265,8 @@ mod apply_tests {
     fn full_paints_rows_and_clears_below() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
-        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
         feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
@@ -1264,7 +1283,8 @@ mod apply_tests {
     fn full_clears_stale_rows_below() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
-        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         // Seed stale content the frame must erase, then put the cursor back on
         // row 5: the frame applies relative to wherever the cursor is.
         let seed = "\x1b[8;1Hstale8\x1b[9;1Hstale9\x1b[5;1H";
@@ -1280,9 +1300,10 @@ mod apply_tests {
     fn partial_repaints_only_changed_rows() {
         let mut cache = DrawCache::new(24);
         let f1 = lines_frame(&["aa", "bb", "cc"], 20);
-        let s1 = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s1 = plan_apply(&mut cache, &f1, ApplyPolicy::Frame, 20, 24);
         let f2 = lines_frame(&["aa", "XX", "cc"], 20);
-        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
+        let s2 = plan_apply(&mut cache, &f2, ApplyPolicy::Frame, 20, 24);
         assert!(s2.contains("XX"), "changed row repainted");
         assert!(!s2.contains("aa"), "unchanged rows skipped");
         let mut p = at(24, 20, 4);
@@ -1298,9 +1319,10 @@ mod apply_tests {
     fn partial_clears_orphaned_row_on_shrink() {
         let mut cache = DrawCache::new(24);
         let f1 = lines_frame(&["aa", "bb", "cc"], 20);
-        let s1 = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s1 = plan_apply(&mut cache, &f1, ApplyPolicy::Frame, 20, 24);
         let f2 = lines_frame(&["aa"], 20);
-        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
+        let s2 = plan_apply(&mut cache, &f2, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
         feed(&mut p, &s1);
         feed(&mut p, &s2);
@@ -1334,18 +1356,12 @@ mod apply_tests {
         };
         let mut cache = DrawCache::new(24);
         e.insert_str("abc");
-        let s1 = plan_apply(&mut cache, &input(&e, &[1]), 5, ApplyPolicy::Frame, 20, 24);
-        // Shift+Enter: a second row appears and the caret moves onto it.
+        cursor_to(&mut cache, 5, 24);
+        let s1 = plan_apply(&mut cache, &input(&e, &[1]), ApplyPolicy::Frame, 20, 24);
+        // Shift+Enter: a second row appears and the caret moves onto it. The
+        // apply needs no row from anyone — it follows the live frame.
         e.insert_newline();
-        let anchor = cache.anchor();
-        let s2 = plan_apply(
-            &mut cache,
-            &input(&e, &[2]),
-            anchor,
-            ApplyPolicy::Frame,
-            20,
-            24,
-        );
+        let s2 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
         feed(&mut p, &s1);
         feed(&mut p, &s2);
@@ -1357,15 +1373,7 @@ mod apply_tests {
         );
         // The next keystroke lands on the new row, and the first keeps its text.
         e.insert_str("d");
-        let anchor = cache.anchor();
-        let s3 = plan_apply(
-            &mut cache,
-            &input(&e, &[2]),
-            anchor,
-            ApplyPolicy::Frame,
-            20,
-            24,
-        );
+        let s3 = plan_apply(&mut cache, &input(&e, &[2]), ApplyPolicy::Frame, 20, 24);
         feed(&mut p, &s3);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "> abc");
@@ -1377,7 +1385,8 @@ mod apply_tests {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["a", "b", "c"], 20);
         // anchor 9 + 3 rows = row 11 > 10 → delta 1.
-        let s = plan_apply(&mut cache, &f, 9, ApplyPolicy::Frame, 20, 10);
+        cursor_to(&mut cache, 9, 10);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
         let mut p = at(10, 20, 8);
         feed(&mut p, &s);
         let rows = screen(&p, 10, 20);
@@ -1392,7 +1401,8 @@ mod apply_tests {
         // screen_bottom was 24; terminal is now 40 with no apply in between.
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["head"], 20);
-        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 40);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 40);
         // 19 rows below the block (6..=24) plus the painted row's own `EL` —
         // and not the 35 down to 40, which is what a clear to the new bottom
         // would have been. The absolute path expressed the same floor as
@@ -1415,13 +1425,16 @@ mod apply_tests {
     fn reanchor_to_new_row_clears_old_rows() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
-        let s1 = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s1 = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         // A foreign writer moved the cursor to row 8. The re-anchor both records
         // where it went and erases the block's old rows — the one absolute
         // address in a frame apply, and the reason it exists: from row 8 a
         // relative walk cannot reach rows 5 and 6 at all.
-        let (row, clear) = cache.reanchor(Some(8));
-        let s2 = plan_apply(&mut cache, &f, row, ApplyPolicy::Frame, 20, 24);
+        let (_row, clear) = cache.reanchor(Some(8));
+        // The re-anchor's answer is now *only* bookkeeping — the apply reads the
+        // cache, not a caller's row (A3.2).
+        let s2 = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
         feed(&mut p, &s1);
         feed(&mut p, &clear);
@@ -1440,9 +1453,10 @@ mod apply_tests {
     fn width_change_forces_full_repaint() {
         let mut cache = DrawCache::new(24);
         let f1 = lines_frame(&["aa"], 20);
-        let _ = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let _ = plan_apply(&mut cache, &f1, ApplyPolicy::Frame, 20, 24);
         let f2 = lines_frame(&["aa"], 20);
-        let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 40, 24);
+        let s2 = plan_apply(&mut cache, &f2, ApplyPolicy::Frame, 40, 24);
         assert!(s2.contains("aa"), "width change repaints the row");
         let mut p = at(24, 20, 4);
         feed(&mut p, &s2);
@@ -1452,7 +1466,8 @@ mod apply_tests {
     fn append_writes_content_and_advances_caret() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["div", "line"], 20);
-        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Append, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Append, 20, 24);
         assert!(s.ends_with('\n'), "append ends on a fresh line");
         let mut p = at(24, 20, 4);
         feed(&mut p, &s);
@@ -1468,7 +1483,8 @@ mod apply_tests {
     fn clamps_anchor_to_screen() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["x"], 20);
-        let s = plan_apply(&mut cache, &f, 999, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 999, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 23);
         feed(&mut p, &s);
         assert_eq!(screen(&p, 24, 20)[23], "x");
@@ -1488,7 +1504,8 @@ mod apply_tests {
             &[1],
             20,
         );
-        let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
+        cursor_to(&mut cache, 5, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 24);
         let mut p = at(24, 20, 4);
         feed(&mut p, &s);
         // "> hi" at 1-based row 5; caret after "hi" → col 4.
@@ -1500,7 +1517,8 @@ mod apply_tests {
     fn note_lines_advances_and_invalidates() {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
-        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        cursor_to(&mut cache, 5, 10);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
         assert_eq!(cache.anchor(), 5);
         cache.note_lines(3, 10);
         assert_eq!(cache.caret.0, 8);
@@ -1513,7 +1531,8 @@ mod apply_tests {
     fn reanchor_sets_row_and_invalidates() {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
-        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        cursor_to(&mut cache, 5, 10);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
         assert_eq!(cache.reanchor(Some(3)).0, 3);
         assert_eq!(cache.anchor(), 3);
     }
@@ -1527,13 +1546,13 @@ mod apply_tests {
     fn reanchor_fallback_keeps_row_but_invalidates() {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
-        let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
+        cursor_to(&mut cache, 5, 10);
+        let _ = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
         assert_eq!(cache.reanchor(None).0, 5, "tracked row stands");
         assert!(cache.live.is_none(), "live frame must be invalidated");
         // Identical frame, same anchor: the partial path would emit nothing
         // but the caret; the full path clears the region below the frame.
-        let anchor = cache.anchor();
-        let s = plan_apply(&mut cache, &f, anchor, ApplyPolicy::Frame, 20, 10);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 10);
         assert!(s.contains("\x1b[K"), "full path required: {s:?}");
     }
 
@@ -1547,14 +1566,14 @@ mod apply_tests {
         let mut cache = DrawCache::new(40);
         let tall = lines_frame(&["a", "b", "c", "d"], 20);
         // anchor 38 + 4 rows - 1 = 41 > 40 → delta 1, top 37.
-        let s1 = plan_apply(&mut cache, &tall, 38, ApplyPolicy::Frame, 20, 40);
+        cursor_to(&mut cache, 38, 40);
+        let s1 = plan_apply(&mut cache, &tall, ApplyPolicy::Frame, 20, 40);
         assert_eq!(cache.anchor(), 37, "scroll must be tracked");
-        // The next redraw anchors where the live frame is (the REPL's
-        // `frame_anchor()`): no scroll, same top — a shrinking frame leaves
-        // the region where the tallest one put it.
+        // The next redraw follows the live frame: no scroll, same top — a
+        // shrinking frame leaves the region where the tallest one put it. No
+        // caller names a row (A3.2).
         let short = lines_frame(&["a"], 20);
-        let anchor = cache.anchor();
-        let s = plan_apply(&mut cache, &short, anchor, ApplyPolicy::Frame, 20, 40);
+        let s = plan_apply(&mut cache, &short, ApplyPolicy::Frame, 20, 40);
         assert_eq!(cache.anchor(), 37, "shrink must not scroll back down");
         let mut p = at(40, 20, 37);
         feed(&mut p, &s1);
@@ -1572,7 +1591,8 @@ mod apply_tests {
     fn full_clears_nothing_when_frame_sits_below_the_old_bottom() {
         let mut cache = DrawCache::new(24); // screen_bottom = 24
         let f = lines_frame(&["here"], 20);
-        let s = plan_apply(&mut cache, &f, 40, ApplyPolicy::Frame, 20, 40);
+        cursor_to(&mut cache, 40, 24);
+        let s = plan_apply(&mut cache, &f, ApplyPolicy::Frame, 20, 40);
         // floor = min(40, 24) = 24 < frame top: only the frame row's own
         // trailing `EL` is emitted — no clear addresses any other row.
         assert_eq!(

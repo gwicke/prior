@@ -175,18 +175,10 @@ pub trait Output: Send + Sync {
     fn draw_frame(
         &self,
         _frame: &Frame,
-        _anchor: usize,
         _policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
         (dims.0.max(1), dims.1.max(1))
-    }
-
-    /// Where the next frame belongs (ui_draw_v2 §5.1): the intact frame's top
-    /// row when there is one, else the current cursor row. Default:
-    /// [`Self::cursor_row`].
-    fn frame_anchor(&self) -> usize {
-        self.cursor_row()
     }
 
     /// Gate the background in-flight reader should honor. While it is `true`,
@@ -201,13 +193,17 @@ pub trait Output: Send + Sync {
     }
 }
 
-pub struct QuietOutput {
-    show_reasoning: ShowReasoningHandle,
-}
+/// Output for a non-terminal consumer (`picocode "q" | cat`): no interactive UI
+/// and no reasoning text, because there is no screen to show it on and the
+/// answer is what the caller piped for. It therefore has no state at all — it
+/// used to hold a `show_reasoning` handle for the spinner, and the spinner is
+/// gone (row_accounting §3.6).
+#[derive(Default)]
+pub struct QuietOutput;
 
 impl QuietOutput {
-    pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
-        Self { show_reasoning }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -1868,7 +1864,6 @@ impl Output for ConsoleOutput {
     fn draw_frame(
         &self,
         frame: &Frame,
-        anchor: usize,
         policy: ApplyPolicy,
         dims: (usize, usize),
     ) -> (usize, usize) {
@@ -1888,7 +1883,7 @@ impl Output for ConsoleOutput {
         let mut out = self.writer.lock().unwrap();
         let bytes = {
             let mut cache = self.draw.lock().unwrap();
-            plan_apply(&mut cache, frame, anchor, policy, tw, th)
+            plan_apply(&mut cache, frame, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
         // The status line hid the cursor; a frame is where the user types again,
@@ -1900,10 +1895,6 @@ impl Output for ConsoleOutput {
         self.frame_owns_tail
             .store(true, std::sync::atomic::Ordering::Relaxed);
         (tw, th)
-    }
-
-    fn frame_anchor(&self) -> usize {
-        self.draw.lock().unwrap().anchor()
     }
 
     fn display_plain(&self, text: &str) {
@@ -3875,7 +3866,10 @@ mod tests {
             "the dim must come straight back after the bar's reset: {after:?}"
         );
         // And the flag is untouched — the bar restores, it does not toggle.
-        assert!(*out.dim_on.lock().unwrap(), "the tracked dim should still be on");
+        assert!(
+            *out.dim_on.lock().unwrap(),
+            "the tracked dim should still be on"
+        );
     }
 
     /// The cursor is hidden while the bar is up and shown when the input frame
@@ -3891,15 +3885,7 @@ mod tests {
         out.set_status("bar");
         out.stream_text("a block\n\n");
         out.draw_frame(
-            &crate::repl::Repl::compose_frame(
-                &crate::repl::LineEditor::new(),
-                "",
-                &[],
-                0,
-                60,
-                20,
-            ),
-            3,
+            &crate::repl::Repl::compose_frame(&crate::repl::LineEditor::new(), "", &[], 0, 60, 20),
             crate::ui::frame::ApplyPolicy::Frame,
             (60, 20),
         );
@@ -3986,7 +3972,7 @@ mod tests {
         out.set_status("[sess | m]");
         let frame =
             crate::repl::Repl::compose_frame(&crate::repl::LineEditor::new(), "", &[], 0, 40, 10);
-        out.draw_frame(&frame, 3, ApplyPolicy::Frame, (40, 24));
+        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("a message");
         out.display_plain("more content");
         let bytes = out.end_capture();
@@ -4057,7 +4043,7 @@ mod tests {
             40,
             10,
         );
-        out.draw_frame(&frame, 3, ApplyPolicy::Frame, (40, 24));
+        out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("Cannot start agent: Missing API key for provider.");
         let bytes = out.end_capture();
 

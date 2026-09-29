@@ -543,8 +543,8 @@ impl Repl {
     /// entry) and is *not* forced to the screen bottom, so closing an overlay
     /// never leaves a gap in the scrollback. Drawing goes through the unified
     /// frame pipeline (plan `doc/ui_draw_v2.md` §5.2): `redraw` composes
-    /// `[Input, Divider?, Overlay?]`, and `Output::draw_frame` anchors
-    /// (`frame_anchor()`), scrolls and clears within the live region — all
+    /// `[Input, Divider?, Overlay?]`, and `Output::draw_frame` draws from the
+    /// cursor, scrolls and clears within the live region — all
     /// clearing is confined to the frame region and below, so the greeter /
     /// status / session content above the input is never touched. The whole
     /// frame uses at most 2/3 of the terminal height (≥ 1 row).
@@ -560,7 +560,8 @@ impl Repl {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
         // paint: content streamed since the last prompt is not tracked row by
         // row, and the input must start at the natural cursor row (plan §4.2).
-        // From here the REPL anchors through the cache (`frame_anchor()`).
+        // From here the frame follows the cursor, via the draw cache's tracked
+        // row — which is what this DSR corrects.
         let _ = output.cursor_row();
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -621,9 +622,9 @@ impl Repl {
 
         // Compose → allocate → render → apply the input frame (plan §5.2):
         // `[Input]`, or `[Input, Divider, Overlay]` while a pop-up shows.
-        // The apply phase owns the rest — `frame_anchor()` tracks the live
-        // frame's top (so a tall pop-up's scroll is followed without a row
-        // counter), the scroll `delta` and the bounded clear live in
+        // The apply phase owns the rest — an intact live frame means a partial
+        // row-diff (so a tall pop-up's scroll is followed without a row
+        // counter), and the scroll `delta` and bounded clear live in
         // `plan_apply`. Content *above* the frame (greeter / status / session)
         // is never touched. The closure's one piece of state is
         // `painted_size`: compose and apply both receive the same `dims`, so
@@ -634,8 +635,7 @@ impl Repl {
             |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
                 let dims = (dims.0.max(1), dims.1.max(1));
                 let frame = Self::compose_frame(editor, prompt, overlay, focus, dims.0, dims.1);
-                let applied =
-                    output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame, dims);
+                let applied = output.draw_frame(&frame, ApplyPolicy::Frame, dims);
                 painted_size.set(applied);
             };
         loop {
@@ -1413,8 +1413,8 @@ impl Repl {
         // where typed input is recorded — record the committed line here
         // so recall (Up/Down) sees every command the user actually ran.
         history.add(line);
-        // No DSR here: the draw cache is the steady-state anchor
-        // (`frame_anchor()`), content writes advance it, and a foreign
+        // No DSR here: the draw cache's tracked row is the steady-state
+        // anchor, content writes advance it, and a foreign
         // screen writer ($EDITOR through `run_editor`) re-anchors on exit
         // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
@@ -3201,14 +3201,10 @@ mod tests {
         ) -> (usize, usize, Vec<String>, usize) {
             let frame = Repl::compose_frame(editor, prompt, overlay, focus, width, term_rows);
             let mut cache = DrawCache::new(term_rows);
-            let s = plan_apply(
-                &mut cache,
-                &frame,
-                anchor,
-                ApplyPolicy::Frame,
-                width,
-                term_rows,
-            );
+            // The tracked row is the block's position (A3.2): the apply reads it
+            // from the cache, so the test sets it the way content would.
+            cache.note_lines(anchor.saturating_sub(1), term_rows);
+            let s = plan_apply(&mut cache, &frame, ApplyPolicy::Frame, width, term_rows);
             let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
             // A frame apply is relative to the cursor (row_accounting §6b), so
             // the cursor has to be where the tracked anchor says the block

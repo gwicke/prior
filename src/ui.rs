@@ -156,7 +156,7 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
 
 /// Compose `[Divider?, Overlay]` and apply it as a frame: the first draw
 /// anchors at the cursor row, every later one at the live frame's top
-/// (`frame_anchor()` → partial row-diff). Re-composed per key and per
+/// (an intact live frame → partial row-diff). Re-composed per key and per
 /// resize — cheap, and the one place the dialog's bytes come from.
 fn draw_dialog(
     out: &dyn Output,
@@ -185,7 +185,7 @@ fn draw_dialog(
     let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
     let heights = allocate(&extents, live_budget(term_h));
     let frame = render(&elements, &heights, term_w);
-    out.draw_frame(&frame, out.frame_anchor(), ApplyPolicy::Frame, size);
+    out.draw_frame(&frame, ApplyPolicy::Frame, size);
 }
 
 /// Resolve the dialog: erase its region through the frame pipeline — a
@@ -208,12 +208,7 @@ fn resolve(
     if let Some(gate) = out.confirm_gate() {
         gate.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-    out.draw_frame(
-        &Frame::empty(),
-        out.frame_anchor(),
-        ApplyPolicy::Frame,
-        size,
-    );
+    out.draw_frame(&Frame::empty(), ApplyPolicy::Frame, size);
     if let Some(subject) = &spec.subject {
         // `yes` / `always` / `accept` record; `no` / `cancel` and a dismiss
         // record the refusal.
@@ -316,15 +311,11 @@ mod tests {
         fn draw_frame(
             &self,
             _frame: &Frame,
-            _anchor: usize,
             _policy: ApplyPolicy,
             dims: (usize, usize),
         ) -> (usize, usize) {
             *self.0.lock().unwrap() = Some(dims);
             (dims.0.max(1), dims.1.max(1))
-        }
-        fn frame_anchor(&self) -> usize {
-            1
         }
         fn display_text(&self, _text: &str) {}
         fn display_tool_call(&self, _name: &str, _args: &serde_json::Value) {}
@@ -389,7 +380,7 @@ mod tests {
         // trait default: it applies nothing but still reports the clamped
         // dims it was asked to apply.
         assert_eq!(
-            NoOutput.draw_frame(&Frame::empty(), 1, ApplyPolicy::Frame, (0, 7)),
+            NoOutput.draw_frame(&Frame::empty(), ApplyPolicy::Frame, (0, 7)),
             (1, 7)
         );
     }

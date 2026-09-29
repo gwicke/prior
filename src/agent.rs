@@ -329,7 +329,6 @@ impl PicoAgent for CodeAgent {
             first_message.as_deref(),
             &self.provider,
             &self.model,
-            None,
             // Reported wins: it is the provider's own count of what it was
             // sent. The estimate only stands in while there is none — turn
             // one, where the alternative is no figure at all.
@@ -3643,8 +3642,8 @@ pub async fn run_interactive(
                 let prefill = app_state.take_prefill();
                 let prefill_ref = prefill.as_deref();
                 // `read_input` re-anchors the draw cache itself on entry
-                // (DSR) and tracks its frame through `frame_anchor()`
-                // afterwards (ui_draw_v2 §5.2).
+                // (DSR); afterwards the frame follows the cursor, which the
+                // cache tracks (ui_draw_v2 §5.2).
                 r.read_input(
                     &prompt_str,
                     prefill_ref,
@@ -4214,7 +4213,6 @@ pub fn status_line(
     first_message: Option<&str>,
     provider: &str,
     model: &str,
-    level: Option<&str>,
     context_tokens: u64,
     width: usize,
     streaming: bool,
@@ -4229,12 +4227,6 @@ pub fn status_line(
     }
     if !provider.is_empty() || !model.is_empty() {
         parts.push(format!("{provider}:{model}"));
-    }
-    if let Some(level) = level
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && *l != "off")
-    {
-        parts.push(level.to_string());
     }
     if context_tokens > 0 {
         // The percentage needs the catalog's context window, and a model
@@ -4368,7 +4360,7 @@ mod status_line_tests {
     /// than the start of a line.
     #[test]
     fn the_bar_fills_the_row_and_right_aligns_the_text() {
-        let s = status_line(Some("main"), None, "llamacpp", "test", None, 0, 40, true);
+        let s = status_line(Some("main"), None, "llamacpp", "test", 0, 40, true);
         assert_eq!(
             crate::row_count::display_width_ansi(&s),
             40,
@@ -4405,7 +4397,7 @@ mod status_line_tests {
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);
         for w in [1_usize, 10, 40, 200] {
-            let s = status_line(Some(&long), None, "p", "m", None, 0, w, true);
+            let s = status_line(Some(&long), None, "p", "m", 0, w, true);
             assert_eq!(
                 crate::row_count::rows_of(&s, w),
                 0,
@@ -4417,7 +4409,7 @@ mod status_line_tests {
     /// A long line is cut to the terminal, not spilled past it.
     #[test]
     fn a_long_bar_is_truncated_to_the_terminal() {
-        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", None, 0, 20, true);
+        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", 0, 20, true);
         assert_eq!(crate::row_count::display_width_ansi(&s), 20, "{s:?}");
         assert!(crate::output::strip_ansi(&s).contains('…'), "{s:?}");
     }
@@ -4431,7 +4423,6 @@ mod status_line_tests {
             Some("fix the flaky resize test"),
             "llamacpp",
             "test",
-            None,
             0,
             60,
             true,
@@ -4443,7 +4434,6 @@ mod status_line_tests {
             Some("fix the flaky resize test"),
             "llamacpp",
             "test",
-            None,
             0,
             60,
             true,
@@ -4460,7 +4450,7 @@ mod status_line_tests {
     /// line.
     #[test]
     fn no_name_and_no_message_still_shows_the_model() {
-        let s = status_line(None, None, "llamacpp", "test", None, 0, 40, true);
+        let s = status_line(None, None, "llamacpp", "test", 0, 40, true);
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
         assert_eq!(display(&s), 40, "{visible:?}");
@@ -4472,8 +4462,8 @@ mod status_line_tests {
     /// tell "working" from "idle" then.
     #[test]
     fn the_dot_is_green_while_streaming_and_grey_when_not() {
-        let streaming = status_line(Some("main"), None, "p", "m", None, 0, 40, true);
-        let idle = status_line(Some("main"), None, "p", "m", None, 0, 40, false);
+        let streaming = status_line(Some("main"), None, "p", "m", 0, 40, true);
+        let idle = status_line(Some("main"), None, "p", "m", 0, 40, false);
         assert!(
             streaming.contains("\x1b[38;5;41m"),
             "a streaming bar should carry a green dot: {streaming:?}"
@@ -4499,7 +4489,7 @@ mod status_line_tests {
     /// A leading full reset is what makes the bar self-contained.
     #[test]
     fn the_bar_resets_first_so_ambient_dim_cannot_reach_it() {
-        let s = status_line(Some("main"), None, "p", "m", None, 0, 40, true);
+        let s = status_line(Some("main"), None, "p", "m", 0, 40, true);
         let body = s.trim_start_matches("\x1b[0m");
         assert!(
             s.starts_with("\x1b[0m"),
