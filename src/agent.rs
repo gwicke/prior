@@ -258,6 +258,14 @@ impl PicoAgent for CodeAgent {
             },
             None => Vec::new(),
         };
+        // The stand-in label for a session with no name: its opening user
+        // message. `prior` holds everything before this turn, so from the second
+        // turn onward that *is* the first message; on the first turn it is empty
+        // and this turn's own prompt is. Captured here, before `prior` moves
+        // into the agent.
+        let first_message: Option<String> = first_user_text(&prior)
+            .or_else(|| (!input.trim().is_empty()).then_some(input))
+            .map(str::to_string);
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -310,6 +318,7 @@ impl PicoAgent for CodeAgent {
         });
         self.output.set_status(&status_line(
             session_name.as_deref(),
+            first_message.as_deref(),
             &self.provider,
             &self.model,
             None,
@@ -4157,6 +4166,7 @@ pub struct SessionStatsInfo {
 /// the tail (the context figure) rather than wrapping.
 pub fn status_line(
     session_name: Option<&str>,
+    first_message: Option<&str>,
     provider: &str,
     model: &str,
     level: Option<&str>,
@@ -4166,6 +4176,10 @@ pub fn status_line(
     let mut parts: Vec<String> = Vec::new();
     if let Some(name) = session_name.map(str::trim).filter(|n| !n.is_empty()) {
         parts.push(name.to_string());
+    } else if let Some(msg) = first_message.map(str::trim).filter(|m| !m.is_empty()) {
+        // With no name to show, the session's opening message stands in: the
+        // line should still say *which* session this is, not just which model.
+        parts.push(message_preview(msg));
     }
     if !provider.is_empty() || !model.is_empty() {
         parts.push(format!("{provider}:{model}"));
@@ -4187,7 +4201,205 @@ pub fn status_line(
         parts.extend(usage);
     }
     let line = parts.join(" | ");
-    crate::row_count::truncate_to_width(&line, width)
+    let line = crate::row_count::truncate_to_width(&line, width);
+    status_bar(&line, width)
+}
+
+/// The status line's furniture: the *table header's* background, so the bar
+/// reads as the same chrome as a menu's header rather than as another line of
+/// content, and a foreground dim enough to stay subordinate to it.
+const STATUS_BG: &str = "\x1b[48;5;237m";
+const STATUS_FG: &str = "\x1b[38;5;245m";
+const STATUS_RESET: &str = "\x1b[0m";
+
+/// The status as a full-width bar with the text against the right margin.
+///
+/// The background is set *before* the padding, so the row is one solid block
+/// that separates itself from the content above it, and the figure sits where a
+/// running one belongs instead of reading as the start of a line. Padding with
+/// the background rather than leaving the leading columns default is the whole
+/// point — a bar that only covers its own text is not a bar.
+fn status_bar(text: &str, width: usize) -> String {
+    let pad = width.saturating_sub(crate::row_count::display_width_ansi(text));
+    format!(
+        "{STATUS_BG}{STATUS_FG}{}{text}{STATUS_RESET}",
+        " ".repeat(pad)
+    )
+}
+
+/// How much of a first message the status line shows when the session has no
+/// name — enough to recognise the session by, no more.
+const PREVIEW_COLS: usize = 25;
+
+/// A first message as a single line of at most [`PREVIEW_COLS`] display columns,
+/// ellipsised by `truncate_to_width` when it does not fit.
+///
+/// Whitespace runs collapse, because a message that opens with a blank line, an
+/// indent, or a code fence would otherwise show as nothing at all. Escapes are
+/// stripped: this is untrusted text from a session file, and a pasted escape
+/// sequence should not be able to colour or reposition the bar.
+fn message_preview(msg: &str) -> String {
+    let first = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let flat = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = crate::output::strip_ansi(&flat);
+    crate::row_count::truncate_to_width(&flat, PREVIEW_COLS)
+}
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::{message_preview, status_line};
+
+    /// The bar is a full row: the background is set before the padding, the text
+    /// sits against the right margin, and the visible width is exactly the
+    /// terminal's. The width is what makes it a bar rather than a highlighted
+    /// fragment, and the right margin is what makes it read as a figure rather
+    /// than the start of a line.
+    #[test]
+    fn the_bar_fills_the_row_and_right_aligns_the_text() {
+        let s = status_line(Some("main"), None, "llamacpp", "test", None, 0, 40);
+        assert_eq!(
+            crate::row_count::display_width_ansi(&s),
+            40,
+            "the bar should be exactly one row wide: {s:?}"
+        );
+        // Leading padding is the point: the text is pushed to the right margin.
+        let visible = crate::output::strip_ansi(&s);
+        assert_eq!(
+            visible.trim(),
+            "main | llamacpp:test",
+            "the text should sit against the right margin, padded before: {visible:?}"
+        );
+        assert!(
+            visible.starts_with("  "),
+            "the bar should be padded on the left: {visible:?}"
+        );
+        assert!(
+            s.starts_with("\x1b[48;5;237m"),
+            "the background must precede the padding: {s:?}"
+        );
+        assert!(s.ends_with("\x1b[0m"), "the bar must be reset: {s:?}");
+    }
+
+    /// The bar is truncated to the terminal, so it never moves the cursor down
+    /// without a newline — the one row movement `paint_status` has to report
+    /// separately. Zero rows is the assertion, not one: writing a bar that fits
+    /// leaves the cursor *on* the row.
+    #[test]
+    fn the_bar_never_moves_the_cursor_down() {
+        let long = "x".repeat(200);
+        for w in [1_usize, 10, 40, 200] {
+            let s = status_line(Some(&long), None, "p", "m", None, 0, w);
+            assert_eq!(
+                crate::row_count::rows_of(&s, w),
+                0,
+                "width {w}: the bar should not wrap: {s:?}"
+            );
+        }
+    }
+
+    /// A long line is cut to the terminal, not spilled past it.
+    #[test]
+    fn a_long_bar_is_truncated_to_the_terminal() {
+        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", None, 0, 20);
+        assert_eq!(crate::row_count::display_width_ansi(&s), 20, "{s:?}");
+        assert!(crate::output::strip_ansi(&s).contains('…'), "{s:?}");
+    }
+
+    /// With no session name, the opening message stands in — so the line still
+    /// says which session this is. A name always wins: the user chose it.
+    #[test]
+    fn an_unnamed_session_shows_its_first_message() {
+        let s = status_line(
+            None,
+            Some("fix the flaky resize test"),
+            "llamacpp",
+            "test",
+            None,
+            0,
+            60,
+        );
+        let visible = crate::output::strip_ansi(&s);
+        assert!(visible.contains("fix the flaky resize test"), "{visible:?}");
+        let named = status_line(
+            Some("main"),
+            Some("fix the flaky resize test"),
+            "llamacpp",
+            "test",
+            None,
+            0,
+            60,
+        );
+        let named_visible = crate::output::strip_ansi(&named);
+        assert!(named_visible.contains("main"), "{named_visible:?}");
+        assert!(
+            !named_visible.contains("fix the flaky"),
+            "a named session must not also show the message: {named_visible:?}"
+        );
+    }
+
+    /// Neither present: no leading separator, and the model still identifies the
+    /// line.
+    #[test]
+    fn no_name_and_no_message_still_shows_the_model() {
+        let s = status_line(None, None, "llamacpp", "test", None, 0, 40);
+        let visible = crate::output::strip_ansi(&s);
+        assert!(visible.trim().starts_with("llamacpp:test"), "{visible:?}");
+    }
+
+    /// The preview is one line, collapsed, and about 25 columns — enough to
+    /// recognise a session by.
+    #[test]
+    fn the_preview_is_one_collapsed_line_of_about_25_columns() {
+        assert_eq!(message_preview("fix the bug"), "fix the bug");
+        // A leading blank line and indentation must not make it show nothing,
+        // and a multi-line message shows as its first line only — a preview is
+        // one row, and the bar is one row.
+        assert_eq!(
+            message_preview("\n\n    fn main() {\n        todo!()\n    }"),
+            "fn main() {",
+            "the first non-empty line, with its indentation collapsed away"
+        );
+        let cut = message_preview(&"a".repeat(40));
+        assert!(
+            cut.ends_with('\u{2026}'),
+            "a cut preview should be ellipsised: {cut:?}"
+        );
+        assert!(
+            crate::row_count::display_width_ansi(&cut) <= 25,
+            "the preview should fit 25 columns: {cut:?}"
+        );
+        // A wide glyph is counted as two columns, not cut mid-character.
+        let wide = message_preview(&"\u{4f60}\u{597d}".repeat(20));
+        assert!(
+            crate::row_count::display_width_ansi(&wide) <= 25,
+            "{wide:?}"
+        );
+        assert!(wide
+            .chars()
+            .all(|c| c == '\u{4f60}' || c == '\u{597d}' || c == '\u{2026}'));
+    }
+
+    /// The preview comes out of a session file, so it is untrusted: an escape
+    /// sequence in it must not colour or reposition the bar.
+    #[test]
+    fn the_preview_strips_escapes() {
+        let p = message_preview("\x1b[2J\x1b[31mred\x1b[0m");
+        assert_eq!(p, "red");
+        assert!(!p.contains('\u{1b}'), "{p:?}");
+    }
+}
+
+/// The first user message in a built context, as the status line's stand-in
+/// label for an unnamed session. `None` when the context is empty (the session's
+/// first turn) or opens with something that carries no text.
+fn first_user_text(prior: &[Message]) -> Option<&str> {
+    let Message::User { content } = prior.first()? else {
+        return None;
+    };
+    match content.first()? {
+        UserContent::Text(t) if !t.text.trim().is_empty() => Some(t.text.as_str()),
+        _ => None,
+    }
 }
 
 /// `78k` / `1.2M` — the same abbreviations `/stat` uses for token counts.

@@ -228,6 +228,33 @@ Live values (session name, provider:model, thinking level, ctx %) come from a
 `StatusHandle` of atomics the agent updates as it runs, read once per solve.
 A separate, small surface; its own paragraph when we get to phase A2.
 
+**As built (A2.1, tuned after):** `status_line` composes the text and also
+*renders* it, so `paint_status` stays a dumb writer. The bar is a full row —
+`48;5;237m`, the table header's own background, carried **before** the padding
+so the row is one solid block and not a highlighted fragment — with a `38;5;245m`
+foreground, the text against the right margin, and a reset. A named session shows
+its name; an unnamed one shows the first 25 columns of its opening user message
+(`prior`'s first user message, or this turn's prompt on turn one), whitespace
+collapsed, escapes stripped: it is untrusted text out of a session file, and a
+pasted escape must not colour or reposition the bar.
+
+Two consequences of a bar that is exactly the terminal's width:
+
+- It **cannot wrap**, which removes the one row movement `paint_status` had to
+  report through `rows_of` — a bar that fits leaves the cursor *on* the row
+  (`rows_of` 0), and truncation to the width keeps it that way.
+- It **leaves the cursor wrap-pending** in the last column, so `paint_status`
+  ends with a `CR`. Without it, whatever writes next starts in a state it does
+  not expect: a dialog's frame apply opens with bare LFs, and a pending wrap
+  makes the terminal complete the line first and move a row further than the
+  block asked for. `draw_frame` also clears the status now — content writes
+  already did, and a frame is the other way a row can be taken.
+
+The end-to-end test used to assert the status was "plain text up to its erase".
+That was a *proxy* for "not addressed", and styling made the proxy wrong rather
+than the behaviour: the assertion is now a real `CUP` scan, and the bar's `SGR`
+is checked to be geometry-free.
+
 ---
 
 ## 4. Padding, the cursor column, and ANSI

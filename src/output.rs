@@ -1587,6 +1587,14 @@ impl ConsoleOutput {
         // newline.
         let mut out = self.writer.lock().unwrap();
         let _ = out.write_all(text.as_bytes());
+        // The bar is exactly the terminal's width, so writing it leaves the
+        // cursor *wrap-pending* in the last column. A `CR` cancels that, and
+        // without it whatever writes next starts in a state it does not expect:
+        // a dialog's frame apply opens with bare LFs, and a pending wrap makes
+        // the terminal complete the line first and move a row further than the
+        // block asked for. `rows_of` is computed on the bar without this byte,
+        // which adds no row.
+        let _ = out.write_all(b"\r");
         let _ = out.flush();
         drop(out);
         let rows = crate::row_count::rows_of(&text, term_width());
@@ -1900,6 +1908,12 @@ impl Output for ConsoleOutput {
         // source for both phases of the frame (ui_draw_v2 §9 #3). Clamped
         // to what `plan_apply` stores as the live frame's `term_w`/`term_h`.
         let (tw, th) = (dims.0.max(1), dims.1.max(1));
+        // A transient status goes before the frame does: the frame is about to
+        // own these rows, and a full-width status bar left showing under a
+        // dialog is the most visible thing on screen. Content writes already do
+        // this (in `with_content_writer`); a frame apply is the other way a row
+        // can be taken. Ahead of the writer lock: `clear_status` takes it.
+        self.clear_status();
         // Lock the writer before the cache so the byte emission and the cache
         // advance are one atomic step, and so we never hold `draw` while
         // acquiring `writer` (matching `display_*`: writer, then `note_lines`).

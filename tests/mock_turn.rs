@@ -396,35 +396,83 @@ fn strip_ansi(l: &str) -> String {
     out
 }
 
-/// A turn writes the transient status line as plain text and erases it
-/// relatively, so the answer that follows lands on the same row with nothing
-/// left of it (doc/row_accounting.md zone 2). No `CUP` anywhere in between: an
-/// absolute write is what writes into a viewport the user scrolled back into.
+/// Every `CSI … H` (CUP) in a string: the parameters between the `ESC [` and
+/// the `H`. Scans for the real sequence rather than the letter, so the status
+/// text itself could contain an `H` without passing for an address.
+fn cups(s: &str) -> Vec<String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\x1b' && b.get(i + 1) == Some(&'[') {
+            let start = i + 2;
+            let mut j = start;
+            while j < b.len() && (b[j].is_ascii_digit() || b[j] == ';') {
+                j += 1;
+            }
+            if b.get(j) == Some(&'H') {
+                out.push(b[start..j].iter().collect());
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A turn writes the transient status line and erases it relatively, so the
+/// answer that follows lands on the same row with nothing left of it
+/// (doc/row_accounting.md zone 2). No `CUP` anywhere in between: an absolute
+/// write is what writes into a viewport the user scrolled back into.
+///
+/// The bar is styled — the table header's background and a dim foreground — so
+/// "no escape at all" is no longer the assertion. That was a *proxy* for "no
+/// address", and the address is the thing that matters: a styled bar is `SGR`
+/// only, which changes no geometry, while a `CUP` would write into a viewport
+/// the user scrolled back into.
 #[test]
 fn the_status_line_is_relative_and_transient_end_to_end() {
     let bytes = run_turn(2, "text-only", false);
     let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
-    let at = text
-        .find("llamacpp:test")
-        .unwrap_or_else(|| panic!("the status should be written: {text:?}"));
-    let tail = &text[at..];
-    let erase = tail
-        .find("\x1b[K")
-        .unwrap_or_else(|| panic!("the status should be erased: {tail:?}"));
     assert!(
-        !tail[..erase].contains('\u{1b}'),
-        "the status must be plain text up to its erase, not addressed: {:?}",
-        &tail[..erase]
+        text.contains("llamacpp:test"),
+        "the status should be written: {text:?}"
+    );
+    // The bar from its first `SGR` to *its* erase — the styling prefix has to be
+    // inside the span under test, and the keystroke echoes above erased their
+    // rows long before any bar existed, so the erase can only be searched for
+    // after the bar starts.
+    let start = text
+        .find("\x1b[48;5;237m")
+        .unwrap_or_else(|| panic!("the bar should be styled: {text:?}"));
+    let erase = start
+        + text[start..]
+            .find("\x1b[K")
+            .unwrap_or_else(|| panic!("the bar should be erased: {text:?}"));
+    let bar = &text[start..erase];
+    assert!(
+        cups(bar).is_empty(),
+        "the status must not be addressed before its erase: {bar:?}"
     );
     assert!(
-        tail[..erase].starts_with("llamacpp:test\r"),
-        "the erase should be a relative CR + EL: {:?}",
-        &tail[..erase]
+        bar.contains("\x1b[38;5;245m"),
+        "the bar should carry a dim foreground: {bar:?}"
+    );
+    // After the final reset, only carriage returns: the `CR` `paint_status` adds
+    // to cancel the wrap-pending state a full-width write leaves behind, and the
+    // erase's own `CR`. Pinning the count would couple the test to `clear_status`.
+    let (_, after_reset) = bar
+        .rsplit_once("\x1b[0m")
+        .unwrap_or_else(|| panic!("the bar should be reset: {bar:?}"));
+    assert!(
+        !after_reset.is_empty() && after_reset.chars().all(|c| c == '\r'),
+        "only CRs may follow the bar's reset: {bar:?}"
     );
     assert!(
-        tail[erase..].contains("Just a plain text answer"),
+        text[erase..].contains("Just a plain text answer"),
         "the content should overwrite the status row: {:?}",
-        &tail[erase..]
+        &text[erase..]
     );
 }
 
