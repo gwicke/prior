@@ -4366,10 +4366,14 @@ mod tests {
         let reasoning = crate::settings::default_show_reasoning_handle();
         *reasoning.lock().unwrap() = crate::settings::ShowReasoning::Content;
 
-        // The live path, exactly as the streaming loop drives it.
-        let live = ConsoleOutput::new(reasoning.clone());
+        // The live path, exactly as the streaming loop drives it. Reasoning is
+        // asked onto the captured stream so the comparison sees it (a test's
+        // stdout is not a terminal, and without this it would be routed to
+        // stderr by both sides and the test would prove nothing).
+        let mut live = ConsoleOutput::new(reasoning.clone());
+        live.reasoning_on_stderr = false;
         live.begin_capture();
-        live.begin_response_inner(true);
+        live.begin_response();
         for thinking in &turn.segments[0].thinking {
             live.stream_thinking(thinking);
         }
@@ -4388,41 +4392,22 @@ mod tests {
 
         // The same turn through replay. `render_turn` draws the user prompt and
         // a separator around the response, so the live output should be the
-        // *tail* of what replay paints — byte for byte.
-        let replay = ConsoleOutput::new(reasoning);
+        // *tail* of what replay paints — byte for byte, reasoning included.
+        let mut replay = ConsoleOutput::new(reasoning);
+        replay.reasoning_on_stderr = false;
         replay.begin_capture();
         render_turn(&replay, &turn, false);
         let replay_bytes = replay.end_capture();
 
         let live_text = String::from_utf8_lossy(&live_bytes).to_string();
         let replay_text = String::from_utf8_lossy(&replay_bytes).to_string();
-
-        // Measured: the *text* framing is already identical — the answer, the
-        // tool panel, the second segment and the trailing blanks all match byte
-        // for byte. So B3c is not re-framing anything; it is deleting the
-        // second render path.
-        let dim_start = live_text
-            .find("\x1b[2m")
-            .expect("the live path dims reasoning");
-        let dim_end = live_text[dim_start..]
-            .find("\x1b[0m")
-            .map(|i| dim_start + i + "\x1b[0m".len())
-            .unwrap();
-        let live_without_reasoning =
-            format!("{}{}", &live_text[..dim_start], &live_text[dim_end..]);
         assert!(
-            replay_text.ends_with(&live_without_reasoning),
-            "replay did not end with the live text framing.\n--- live (reasoning removed) ---\n{live_without_reasoning:?}\n--- replay ---\n{replay_text:?}"
+            replay_text.ends_with(&live_text),
+            "replay did not end with the live output.\n--- live ---\n{live_text:?}\n--- replay ---\n{replay_text:?}"
         );
-
-        // And measured: replay *drops the reasoning entirely* when stdout is not
-        // a terminal, because `stream_thinking` takes its stderr branch. B3c
-        // makes the reasoning stream go through `write_reasoning` like
-        // everything else, and this assertion flips to "replay contains the
-        // reasoning too".
         assert!(
-            !replay_text.contains("Weighing the options"),
-            "replay now shows reasoning — B3c landed; update this assertion"
+            replay_text.contains("Weighing the options"),
+            "replay lost the reasoning; the two render paths diverged again"
         );
     }
 

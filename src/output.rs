@@ -420,13 +420,16 @@ pub struct ConsoleOutput {
     /// Set `true` while `confirm` is reading a keystroke, so the background
     /// in-flight reader thread backs off and doesn't swallow the input.
     reader_paused: Arc<AtomicBool>,
-    /// Buffered assistant text while a response streams (non-TTY / pipe path;
-    /// rendered once at `end_response` via `display_markdown`). The TTY live
-    /// path uses the incremental `parser`/`renderer` instead.
-    text_buffer: Mutex<String>,
     /// Whether the current response is being rendered live (TTY) or buffered
     /// (non-TTY). Decided once per response in `begin_response`.
-    live: Mutex<bool>,
+    /// Where reasoning goes: `true` = stderr, so a consumer of
+    /// `picocode "q" | cat` can drop it (`2>/dev/null`) or merge it (`2>&1`)
+    /// without touching stdout. Decided once, here, because stdout does not
+    /// become a terminal mid-run — and because a per-call `is_terminal()`
+    /// scattered across the reasoning path is how the render path forked on
+    /// `live` in the first place (row_accounting_b3.md §4.1). `pub(crate)` so
+    /// the tests that pin the routing can ask for the other stream.
+    pub(crate) reasoning_on_stderr: bool,
     /// The destination for rendered output.  Defaults to `std::io::stdout()`;
     /// a `Vec<u8>` writer is used by the `/replay Nl` capture path so the
     /// fully-rendered ANSI output can be tailed and re-printed.
@@ -995,8 +998,7 @@ impl ConsoleOutput {
             spinner: Mutex::new(None),
             draw: Mutex::new(DrawCache::new(term_height())),
             reader_paused: Arc::new(AtomicBool::new(false)),
-            text_buffer: Mutex::new(String::new()),
-            live: Mutex::new(false),
+            reasoning_on_stderr: !std::io::stdout().is_terminal(),
             writer: Mutex::new(Box::new(io::stdout())),
             parser: Mutex::new(StreamParser::new_gfm_stream()),
             renderer: Mutex::new(Renderer::new(Theme::no_color(), 80)),
@@ -1023,46 +1025,6 @@ impl ConsoleOutput {
                 out.write_all(b"\x1b[0m")
             };
             *dim = on;
-        }
-    }
-
-    /// Render and clear the buffered assistant text (non-TTY / pipe path:
-    /// `live` is false so the TTY live renderer isn't used; this renders once
-    /// via `display_markdown`, matching the Phase 1/6 clean-output behavior).
-    fn flush_text(&self) {
-        let text = std::mem::take(&mut *self.text_buffer.lock().unwrap());
-        if !text.is_empty() {
-            self.display_markdown(&text);
-        }
-    }
-
-    /// Shared body of `begin_response`. Takes the live/TTY decision explicitly
-    /// so the non-TTY (buffered) path can be forced in tests without depending
-    /// on whether the test process's stdout is attached to a terminal.
-    pub(crate) fn begin_response_inner(&self, live: bool) {
-        *self.live.lock().unwrap() = live;
-        if live {
-            // Reset the incremental parser/renderer for a fresh response and
-            // print a leading blank to separate from the user prompt.
-            let current_width = current_term_width();
-            let mut parser = self.parser.lock().unwrap();
-            *parser = StreamParser::new_gfm_stream();
-            let mut theme = Theme::default();
-            theme.clickable_links = true; // real TTY path
-            let mut renderer = self.renderer.lock().unwrap();
-            *renderer = Renderer::new(theme, current_width);
-            // Reset the thinking parser/renderer and dim state for this response.
-            let mut tparser = self.thinking_parser.lock().unwrap();
-            *tparser = StreamParser::new_gfm_stream();
-            let mut trenderer = self.thinking_renderer.lock().unwrap();
-            *trenderer = Renderer::new(Theme::dimmed(), current_width);
-            *self.dim_on.lock().unwrap() = false;
-            // A content write like any other: the counter measures it (B2).
-            self.write_content(b"\n");
-            self.set_blank(true);
-            self.note_text();
-        } else {
-            *self.text_buffer.lock().unwrap() = String::new();
         }
     }
 
@@ -1237,6 +1199,22 @@ impl ConsoleOutput {
         // Advance the tracked cursor and drop the frame region — the write that
         // called us moved the cursor off the frame (plan §4.2).
         self.draw.lock().unwrap().note_lines(n, h as usize);
+    }
+
+    /// A `Write` for one block of reasoning. The bytes are routed when the
+    /// block is committed: to the screen (and counted, like any other
+    /// content) when there is a terminal, to stderr when there is not, so a
+    /// consumer of `picocode "q" | cat` can drop reasoning
+    /// (`2>/dev/null`) or merge it (`2>&1`) without touching stdout.
+    ///
+    /// The decision is made once, here, rather than at every reasoning call
+    /// site — which is what let the render path fork on `live` in the first
+    /// place (row_accounting_b3.md §4.1).
+    fn reasoning_sink(&self) -> ReasoningSink {
+        ReasoningSink {
+            buf: Vec::new(),
+            to_stderr: self.reasoning_on_stderr,
+        }
     }
 
     /// Write content bytes, then advance the draw cache by the number of
@@ -1432,6 +1410,58 @@ impl ConsoleOutput {
     }
 }
 
+/// The theme the answer renderer is built with: colours and clickable links on
+/// a terminal, plain otherwise. Shared with the tests, whose "what did the
+/// renderer alone produce" reference has to agree with it byte for byte or the
+/// comparison flags styling as host contribution.
+fn answer_theme() -> Theme {
+    if std::io::stdout().is_terminal() {
+        Theme {
+            clickable_links: true,
+            ..Theme::default()
+        }
+    } else {
+        Theme::no_color()
+    }
+}
+
+/// Buffered reasoning bytes awaiting routing. See
+/// [`ConsoleOutput::reasoning_sink`].
+pub(crate) struct ReasoningSink {
+    buf: Vec<u8>,
+    to_stderr: bool,
+}
+
+impl ReasoningSink {
+    /// Route what has been written: stderr when there is no terminal, else the
+    /// screen through the same counter every other content write uses (so the
+    /// draw cache learns the height). Idempotent — the buffer is taken.
+    fn commit(&mut self, out: &ConsoleOutput) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.buf);
+        if self.to_stderr {
+            let mut err = std::io::stderr();
+            let _ = err.write_all(&bytes);
+            let _ = err.flush();
+        } else {
+            out.write_content(&bytes);
+        }
+    }
+}
+
+impl io::Write for ReasoningSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Output for ConsoleOutput {
     fn cursor_row(&self) -> usize {
         // Prefer the real terminal cursor position (robust to wrapping,
@@ -1534,15 +1564,32 @@ impl Output for ConsoleOutput {
     }
 
     fn begin_response(&self) {
-        self.begin_response_inner(std::io::stdout().is_terminal());
+        // One render path for every run (B3c). There used to be a second one
+        // for a non-tty stdout: buffer the whole response and render it as one
+        // markdown block at the end. Two paths meant every replay test — a
+        // test's stdout is never a terminal — exercised the *other* one, so the
+        // incremental renderer, where the separator bugs live, went untested.
+        // Colour still follows the terminal: that is a property of the bytes,
+        // not of the render path.
+        let theme = answer_theme();
+        let current_width = current_term_width();
+        let mut parser = self.parser.lock().unwrap();
+        *parser = StreamParser::new_gfm_stream();
+        let mut renderer = self.renderer.lock().unwrap();
+        *renderer = Renderer::new(theme, current_width);
+        // Reset the thinking parser/renderer and dim state for this response.
+        let mut tparser = self.thinking_parser.lock().unwrap();
+        *tparser = StreamParser::new_gfm_stream();
+        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        *trenderer = Renderer::new(Theme::dimmed(), current_width);
+        *self.dim_on.lock().unwrap() = false;
+        // A content write like any other: the counter measures it.
+        self.write_content(b"\n");
+        self.set_blank(true);
+        self.note_text();
     }
 
     fn stream_text(&self, delta: &str) {
-        let live = *self.live.lock().unwrap();
-        if !live {
-            self.text_buffer.lock().unwrap().push_str(delta);
-            return;
-        }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
         let current_width = current_term_width();
@@ -1605,14 +1652,6 @@ impl Output for ConsoleOutput {
         if *self.show_reasoning.lock().unwrap() != ShowReasoning::Content {
             return;
         }
-        let live = *self.live.lock().unwrap();
-        if !live {
-            // Non-TTY: stream thinking to stderr so consumers can drop it
-            // (`2>/dev/null`) or merge it (`2>&1`) without touching stdout.
-            let mut err = std::io::stderr();
-            let _ = err.write_all(delta.as_bytes());
-            return;
-        }
         // Sync terminal width (updated by in-flight reader on resize) so
         // renderers reflow on the next feed.
         let current_width = current_term_width();
@@ -1626,118 +1665,111 @@ impl Output for ConsoleOutput {
         // renderer using a faded theme whose `reset` re-applies the dim SGR,
         // so inline formatting (bold/code) does not clear the fading. The
         // initial dim is turned on once per run via `ensure_dim`.
-        self.with_content_writer(current_width, |mut out| {
-            self.ensure_dim(true, &mut out);
-            let mut parser = self.thinking_parser.lock().unwrap();
-            let events = parser.write(delta.as_bytes());
-            let mut renderer = self.thinking_renderer.lock().unwrap();
-            let _ = renderer.feed(&events, &mut out);
-            // Streamed thinking is content, not a blank separator.
-            if !events.is_empty() {
-                self.set_blank(false);
-            }
-        });
+        //
+        // The dim toggle travels with the reasoning, not with the answer: it
+        // belongs to whichever stream the thinking went to, and the boundary
+        // that follows turns it off there.
+        let mut sink = self.reasoning_sink();
+        self.ensure_dim(true, &mut sink);
+        let mut parser = self.thinking_parser.lock().unwrap();
+        let events = parser.write(delta.as_bytes());
+        let mut renderer = self.thinking_renderer.lock().unwrap();
+        let _ = renderer.feed(&events, &mut sink);
+        sink.commit(self);
+        // Streamed thinking is content, not a blank separator.
+        if !events.is_empty() {
+            self.set_blank(false);
+        }
     }
 
     fn end_response_segment(&self) {
         self.stop_thinking();
-        let live = *self.live.lock().unwrap();
-        if live {
-            let current_width = current_term_width();
-            // One counted block: the answer commit, the thinking commit, the
-            // boundary blank and the dim reset.
-            self.with_content_writer(current_width, |mut out| {
-                // Commit any open answer paragraph so the tool call/result prints
-                // below, then start a *fresh* answer renderer for the next segment.
-                // This drops the renderer's `pending_gap`, which otherwise fires at
-                // the next answer segment's first block and would double the blank
-                // line at the thinking→answer boundary in multi-turn turns (the
-                // transition already emits one blank).
-                {
-                    let mut parser = self.parser.lock().unwrap();
-                    // `flush()` (not `write("\n\n")`) so a segment whose answer text
-                    // ends in a list/table is emitted now rather than stranded; then
-                    // start a fresh answer parser + renderer for the next segment.
-                    let events = parser.flush();
-                    *parser = StreamParser::new_gfm_stream();
-                    let mut renderer = self.renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
-                    if !events.is_empty() {
-                        // Committed answer text is content, not a blank separator.
-                        self.set_blank(false);
-                    }
-                    let mut theme = Theme::default();
-                    theme.clickable_links = true; // real TTY path
-                    *renderer = Renderer::new(theme, current_width);
+        let current_width = current_term_width();
+        // One counted block: the answer commit, the thinking commit, the
+        // boundary blank and the dim reset.
+        self.with_content_writer(current_width, |mut out| {
+            // Commit any open answer paragraph so the tool call/result prints
+            // below, then start a *fresh* answer renderer for the next segment.
+            // This drops the renderer's `pending_gap`, which otherwise fires at
+            // the next answer segment's first block and would double the blank
+            // line at the thinking→answer boundary in multi-turn turns (the
+            // transition already emits one blank).
+            {
+                let mut parser = self.parser.lock().unwrap();
+                // `flush()` (not `write("\n\n")`) so a segment whose answer text
+                // ends in a list/table is emitted now rather than stranded; then
+                // start a fresh answer parser + renderer for the next segment.
+                let events = parser.flush();
+                *parser = StreamParser::new_gfm_stream();
+                let mut renderer = self.renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+                if !events.is_empty() {
+                    // Committed answer text is content, not a blank separator.
+                    self.set_blank(false);
                 }
-                // Commit thinking (the thinking renderer is kept — post-tool
-                // thinking continues as one continuous faded stream; only the
-                // parser is reset, inside `commit_thinking`).
-                self.commit_thinking(&mut out);
-                self.ensure_dim(false, &mut out);
-                // Blank line between the answer/reasoning block and the tool
-                // panel below. Skipped when the stream already ends with a blank
-                // (an empty terminal `CompletionCall` follows a prior segment's
-                // blank), so stacked segment boundaries collapse to one empty
-                // line.
-                if !self.ended_blank() {
-                    let _ = out.write_all(b"\n");
-                    self.set_blank(true);
-                }
-                self.note_text();
-            });
-        } else {
-            self.flush_text();
-        }
+                let mut theme = Theme::default();
+                theme.clickable_links = true; // real TTY path
+                *renderer = Renderer::new(theme, current_width);
+            }
+            // Commit thinking (the thinking renderer is kept — post-tool
+            // thinking continues as one continuous faded stream; only the
+            // parser is reset, inside `commit_thinking`).
+            self.commit_thinking(&mut out);
+            self.ensure_dim(false, &mut out);
+            // Blank line between the answer/reasoning block and the tool
+            // panel below. Skipped when the stream already ends with a blank
+            // (an empty terminal `CompletionCall` follows a prior segment's
+            // blank), so stacked segment boundaries collapse to one empty
+            // line.
+            if !self.ended_blank() {
+                let _ = out.write_all(b"\n");
+                self.set_blank(true);
+            }
+            self.note_text();
+        });
     }
 
     fn end_response(&self) {
         self.stop_thinking();
-        let live = *self.live.lock().unwrap();
-        if live {
-            let current_width = current_term_width();
-            // One counted block: the answer and thinking flushes and the
-            // trailing blank.
-            self.with_content_writer(current_width, |mut out| {
-                // Finalize the answer document.
-                {
-                    let mut parser = self.parser.lock().unwrap();
-                    let events = parser.flush();
-                    let mut renderer = self.renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
-                    if !events.is_empty() {
-                        // Flushed answer text is content, not a blank separator.
-                        self.set_blank(false);
-                    }
+        let current_width = current_term_width();
+        // One counted block: the answer and thinking flushes and the
+        // trailing blank.
+        self.with_content_writer(current_width, |mut out| {
+            // Finalize the answer document.
+            {
+                let mut parser = self.parser.lock().unwrap();
+                let events = parser.flush();
+                let mut renderer = self.renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+                if !events.is_empty() {
+                    // Flushed answer text is content, not a blank separator.
+                    self.set_blank(false);
                 }
-                // Finalize thinking (it was rendered inline + dimmed as it streamed).
-                {
-                    let mut parser = self.thinking_parser.lock().unwrap();
-                    let events = parser.flush();
-                    let mut renderer = self.thinking_renderer.lock().unwrap();
-                    let _ = renderer.feed(&events, &mut out);
-                    if !events.is_empty() {
-                        // Flushed thinking is content, not a blank separator.
-                        self.set_blank(false);
-                    }
+            }
+            // Finalize thinking (it was rendered inline + dimmed as it streamed).
+            {
+                let mut parser = self.thinking_parser.lock().unwrap();
+                let events = parser.flush();
+                let mut renderer = self.thinking_renderer.lock().unwrap();
+                let _ = renderer.feed(&events, &mut out);
+                if !events.is_empty() {
+                    // Flushed thinking is content, not a blank separator.
+                    self.set_blank(false);
                 }
-                self.ensure_dim(false, &mut out);
-                // Trailing blank so the separator that opens the next loop
-                // iteration does not butt against the last line of the response.
-                // Skipped when the turn already ended with a blank (the terminal
-                // `CompletionCall`'s `end_response_segment` printed one),
-                // which is what collapses the previously observed double empty
-                // line to a single one.
-                if !self.ended_blank() {
-                    let _ = writeln!(out);
-                    self.set_blank(true);
-                }
-                self.note_text();
-            });
-        } else {
-            self.flush_text();
-            // Non-TTY thinking already streamed to stderr; stdout stays clean.
-        }
+            }
+            self.ensure_dim(false, &mut out);
+            // Trailing blank so the separator that opens the next loop
+            // iteration does not butt against the last line of the response.
+            // Skipped when the turn already ended with a blank (the terminal
+            // `CompletionCall`'s `end_response_segment` printed one),
+            // which is what collapses the previously observed double empty
+            // line to a single one.
+            if !self.ended_blank() {
+                let _ = writeln!(out);
+                self.set_blank(true);
+            }
+            self.note_text();
+        });
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
@@ -2251,7 +2283,7 @@ mod tests {
         // wider: the old `wrap(text).len()` count called both one row.
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         out.display_text(&"x".repeat(36)); // + "⏺ " = 38 columns
         out.display_text(&"y".repeat(39)); // + "⏺ " = 41 -> wraps
         let bytes = out.end_capture();
@@ -2267,7 +2299,7 @@ mod tests {
     fn display_text_counts_a_wide_character_as_two_columns() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         // 19 CJK chars = 38 columns, plus the 2-column marker: wraps at 40.
         out.display_text(&"漢".repeat(19));
         let bytes = out.end_capture();
@@ -2281,7 +2313,7 @@ mod tests {
         // tracked row where it was.
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         out.stream_text("First paragraph of the answer.\n\n");
         out.stream_text("Second paragraph, streamed.\n\n");
         out.end_response();
@@ -2299,7 +2331,7 @@ mod tests {
         let (out, reasoning) = capturing_output(40);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         out.stream_thinking("Thinking about the problem.\n\n");
         let bytes = out.end_capture();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
@@ -2310,7 +2342,7 @@ mod tests {
     fn tool_panel_is_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         out.display_tool_call("Bash", &serde_json::json!({"command": "ls -la"}));
         out.display_tool_result("a\nb\nc");
         let bytes = out.end_capture();
@@ -2322,7 +2354,7 @@ mod tests {
     fn markdown_and_error_and_plain_are_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
-        out.begin_response_inner(true);
+        out.begin_response();
         out.display_markdown("# Title\n\nA paragraph long enough to wrap at forty columns.\n");
         out.display_error("an error long enough to wrap onto a second row at forty");
         out.display_plain("plain text that is long enough to wrap at forty columns ok");
@@ -2426,14 +2458,19 @@ mod tests {
 
     /// Run a scripted response through the live render path; return the bytes.
     fn run_script(steps: &[Step], chunk: Chunking) -> Vec<u8> {
-        let (out, reasoning) = capturing_output(80);
+        let (mut out, reasoning) = capturing_output(80);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
+        // A test's stdout is not a terminal, so reasoning would be routed to
+        // stderr — out of the capture. Ask for it on the captured stream; the
+        // routing itself is what `reasoning_on_stderr` decides, and it is
+        // exercised by `reasoning_goes_to_stderr_without_a_terminal`.
+        out.reasoning_on_stderr = false;
         out.begin_capture();
         // Forced, because a test's stdout is not a tty and `begin_response`
         // would take the buffered path — which is why no replay test has ever
         // exercised the incremental renderer, and where this morning's spacing
         // bug lived. B3c removes the branch and this line with it.
-        out.begin_response_inner(true);
+        out.begin_response();
         for step in steps {
             match step {
                 Step::Tool(name) => out.display_tool_call(name, &serde_json::json!({})),
@@ -2452,14 +2489,9 @@ mod tests {
         let mut parser = StreamParser::new_gfm_stream();
         let mut events = parser.write(text.as_bytes());
         events.extend(parser.flush());
-        // The live path's theme (`begin_response_inner`): colours on, links
-        // clickable. A different theme would flag its own styling as host
-        // contribution, which is the opposite of what this measures.
-        let theme = Theme {
-            clickable_links: true,
-            ..Theme::default()
-        };
-        let mut r = Renderer::new(theme, 80);
+        // The same theme production builds the answer renderer with, or its
+        // styling would look like host contribution.
+        let mut r = Renderer::new(answer_theme(), 80);
         let mut out: Vec<u8> = Vec::new();
         let _ = r.feed(&events, &mut out);
         String::from_utf8_lossy(&out).into_owned()
@@ -2574,6 +2606,43 @@ mod tests {
                 chunk,
             );
         }
+    }
+
+    /// §4.1 of the plan: reasoning is routed at the output layer, so a
+    /// consumer of `picocode "q" | cat` can drop it, and the render path does
+    /// not fork on whether there is a terminal.
+    #[test]
+    #[serial]
+    fn reasoning_is_routed_by_the_output_layer() {
+        let script = [Step::Think("Weighing the options.\n\n"), Step::ResponseEnd];
+
+        // No terminal (the default for a test): reasoning leaves stdout — it
+        // shows up on the test runner's stderr, which is the divert working.
+        let (mut out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.begin_capture();
+        out.begin_response();
+        feed(&out, script[0], Chunking::Whole);
+        feed(&out, script[1], Chunking::Whole);
+        let piped = out.end_capture();
+        assert!(
+            !String::from_utf8_lossy(&piped).contains("Weighing the options"),
+            "reasoning must not reach stdout without a terminal"
+        );
+
+        // With a terminal: it is on the screen, and counted like any content.
+        let (mut out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.reasoning_on_stderr = false;
+        out.begin_capture();
+        out.begin_response();
+        feed(&out, script[0], Chunking::Whole);
+        feed(&out, script[1], Chunking::Whole);
+        let tty = out.end_capture();
+        assert!(
+            String::from_utf8_lossy(&tty).contains("Weighing the options"),
+            "reasoning belongs on the screen when there is one"
+        );
     }
 
     /// A tool round then the next segment's answer: one blank at the
@@ -3189,34 +3258,7 @@ mod tests {
         assert!(out.contains('│') && out.contains("quoted"));
     }
 
-    #[test]
-    fn console_output_streaming_buffers_and_flushes() {
-        let out = ConsoleOutput::default();
-        // Force the buffered (non-TTY) path this test exercises, so it does not
-        // depend on whether the test process's stdout is attached to a terminal.
-        out.begin_response_inner(false);
-        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
-
-        out.stream_text("hello ");
-        out.stream_text("world");
-        assert_eq!(out.text_buffer.lock().unwrap().clone(), "hello world");
-
-        // A tool-call boundary commits (flushes + clears) the text buffer so
-        // the next static line prints below the committed text.
-        out.end_response_segment();
-        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
-
-        out.stream_thinking("let me think");
-        // Non-TTY thinking is streamed to stderr, never buffered into the
-        // stdout answer path (so stdout stays clean for piping).
-        assert!(!out.text_buffer.lock().unwrap().contains("let me think"));
-
-        // End of response flushes remaining buffers.
-        out.end_response();
-        assert_eq!(out.text_buffer.lock().unwrap().clone(), "");
-    }
-
-    /// The TTY live path relies on the crate's *incremental* `Renderer` + `StreamParser`:
+    /// The renderer is the crate's *incremental* `Renderer` + `StreamParser`:
     /// completed blocks are emitted once (so scrollback stays clean) and code
     /// lines stream as they arrive, while an open paragraph is held back until
     /// it closes (coarse-grained). These tests pin that contract.
@@ -3498,7 +3540,7 @@ mod tests {
     #[test]
     fn tmp_repro_separator_blanks() {
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_response_inner(true); // live path
+        out.begin_response();
         out.begin_capture_inner();
 
         // Case A: turn ends with a tool result (no trailing answer text).
@@ -3513,7 +3555,7 @@ mod tests {
         eprintln!("=== Case A (tool-result end) ===\n{:?}", a);
 
         // Case B: turn ends with plain text answer.
-        out.begin_response_inner(true);
+        out.begin_response();
         out.begin_capture_inner();
         out.stream_text("All done.\n");
         out.end_response();
@@ -3523,7 +3565,7 @@ mod tests {
         eprintln!("=== Case B (text end) ===\n{:?}", b);
 
         // Case C: turn ends with trailing thinking after a tool result.
-        out.begin_response_inner(true);
+        out.begin_response();
         out.begin_capture_inner();
         out.stream_text("Let me sleep.\n");
         out.end_response_segment();
@@ -3544,7 +3586,7 @@ mod tests {
         // the live path (where each CompletionCall flushes) — the trailing text
         // is separated from the tool-result line by a blank line.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_response_inner(true);
+        out.begin_response();
         out.begin_capture_inner();
         out.stream_text("Let me edit.\n");
         out.end_response_segment();
@@ -3574,7 +3616,7 @@ mod tests {
         // Write tool result should render with path header and syntax-highlighted
         // content preview (first 10 lines), matching read_file's rendering.
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
-        out.begin_response_inner(true);
+        out.begin_response();
         out.begin_capture_inner();
 
         // Simulate a write tool call with structured result (as write_file returns)

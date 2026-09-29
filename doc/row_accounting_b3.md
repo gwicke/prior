@@ -185,6 +185,30 @@ The matrix landed and is green. Findings, in the order they matter:
 So B3d is a simplification, not a rescue: the rule it encodes is what the live
 path already does.
 
+## 2b. What B3c changed (2026-09-28)
+
+`live` is gone: `begin_response` always takes the incremental path, and
+`text_buffer` / `flush_text` with it. Colour still follows the terminal — that
+is a property of the bytes, not of the render path — and it now comes from one
+`answer_theme()` shared with the tests, so the matrix's "what did the renderer
+alone produce" reference cannot drift from production.
+
+Reasoning is routed at the output layer, as planned: `reasoning_sink()` hands
+back a `Write` that buffers and commits either to the screen (counted, like any
+content) or to stderr, decided once in `ConsoleOutput::new` because stdout does
+not become a terminal mid-run. The dim toggle travels with the reasoning, not
+with the answer, so the boundary that turns it off targets the same stream.
+
+**User-visible change:** `picocode "q" | cat` now streams block by block
+instead of emitting one markdown block at the end, and its reasoning goes to
+stderr consistently — including the *pending* reasoning committed at a segment
+boundary, which used to land on stdout.
+
+`replay_paints_what_the_live_path_paints` flipped from "text framing matches,
+reasoning diverges" to **byte-identical**, reasoning included. That is the
+whole point of the phase: one render path, so a test and a terminal run the same
+code.
+
 ## 3. What each commit is gated on
 
 | Commit | Gate |
