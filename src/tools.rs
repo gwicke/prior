@@ -3458,6 +3458,25 @@ mod rename_verification {
         );
     }
 
+    /// The rename must not break a caller that never saw it. This is the shape
+    /// the tool advertised for its whole life.
+    #[tokio::test]
+    #[serial]
+    async fn a_legacy_edits_string_applies_at_the_tool_boundary() {
+        let _cwd = super::edit_file_tests::CwdGuard::new();
+        tokio::fs::write("legacy.txt", "one\ntwo\n").await.unwrap();
+        let r = call(serde_json::json!({
+            "path": "legacy.txt",
+            "edits": "legacy.txt\n@@@OLD\none\n@@@NEW\n1\n@@@END"
+        }))
+        .await;
+        assert!(r.is_success(), "a pre-rename call must still work: {r:?}");
+        assert_eq!(
+            tokio::fs::read_to_string("legacy.txt").await.unwrap(),
+            "1\ntwo\n"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn a_blob_getting_the_file_from_a_header_alone_still_works() {

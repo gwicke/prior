@@ -20,18 +20,27 @@ use serde_json::{json, Value};
 ///
 /// Renamed from `edits`, which meant two different things at once: this string
 /// blob, and the canonical array. The split removes the overloading — `blocks`
-/// is the only field a model may send, `edits` is only the canonical array pi
-/// requires on disk.
+/// is what we advertise, and `edits` is only the canonical array pi requires
+/// on disk.
 pub const BLOCKS_FIELD: &str = "blocks";
+
+/// The pre-rename name for [`BLOCKS_FIELD`], still honoured on ingress.
+pub const LEGACY_BLOCKS_FIELD: &str = "edits";
 
 /// The blob string a raw `edit` call carries, or `None` when it carries none.
 ///
-/// Reads [`BLOCKS_FIELD`] only. A pre-rename session may hold a blob string
-/// under `edits`; it is inert here, and deliberately so — such a blob was
-/// stored raw precisely *because* it did not canonicalize (malformed, or
-/// multi-file), so it still cannot, and it is display-only either way.
+/// Reads [`BLOCKS_FIELD`], then falls back to a **string**
+/// [`LEGACY_BLOCKS_FIELD`]. `blocks` is the name we *ask* for, not one we
+/// *require*: a harness, a model, or a session written before the rename all
+/// still send the old one, and dead-ending those calls would break the very
+/// shape this tool exists to serve. An `edits` *array* is deliberately not
+/// read here — that is pi's canonical form, never a blob, and `from_wire`
+/// rejects it by name.
 pub fn blob_text(args: &Value) -> Option<&str> {
-    args.as_object()?.get(BLOCKS_FIELD)?.as_str()
+    let obj = args.as_object()?;
+    obj.get(BLOCKS_FIELD)
+        .and_then(Value::as_str)
+        .or_else(|| obj.get(LEGACY_BLOCKS_FIELD).and_then(Value::as_str))
 }
 
 /// Opening marker of an OLD region (`@@@OLD`).
@@ -882,12 +891,17 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_under_the_old_field_name_is_inert() {
-        // Pre-rename sessions can hold a blob string under `edits`. It is not a
-        // wire shape and not canonicalizable, so it is left exactly as found.
+    fn a_blob_under_the_old_field_name_is_still_read() {
+        // The rename must not break callers that have not seen it. `edits` as a
+        // *string* is the pre-rename blob, and it still parses and canonicalizes
+        // — a session recorded before the rename now normalizes on load, which
+        // is a small recovery the rename had thrown away.
         let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
-        assert_eq!(canonicalize_edit_value(&v), v);
-        assert_eq!(blob_text(&v), None);
+        assert!(blob_text(&v).is_some());
+        assert_eq!(
+            canonicalize_edit_value(&v),
+            json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}]})
+        );
     }
 
     #[test]

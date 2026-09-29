@@ -457,6 +457,44 @@ mod tests {
         assert_eq!(a.edits[0].start_line, None);
     }
 
+    /// The shape this tool advertised for its whole life, still arriving from a
+    /// harness or a model that has not seen the rename. It must keep working:
+    /// `blocks` is the name we *ask* for, not a name we *require*.
+    #[test]
+    fn a_legacy_edits_string_is_still_accepted() {
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.path, "src/x.rs");
+        assert_eq!(a.edits.len(), 1);
+        assert_eq!(a.edits[0].old_text, "a");
+        assert_eq!(a.edits[0].new_text, "b");
+    }
+
+    /// `blocks` wins when both are present, and a malformed `blocks` must not
+    /// silently fall through to a healthy `edits` — that would apply an edit the
+    /// model did not ask for.
+    #[test]
+    fn blocks_wins_over_a_legacy_edits_string() {
+        let a = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "blocks": "@@@OLD\nfrom-blocks\n@@@NEW\nB\n@@@END",
+            "edits":  "@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
+        }))
+        .unwrap();
+        assert_eq!(a.edits[0].old_text, "from-blocks");
+
+        // ...and a malformed `blocks` is an error, not a fallback.
+        let e = EditArgs::from_wire(&json!({
+            "path": "src/x.rs",
+            "blocks": "@@@OLD\nno end",
+            "edits":  "@@@OLD\nfrom-edits\n@@@NEW\nE\n@@@END"
+        }))
+        .unwrap_err();
+        assert!(e.starts_with("Invalid block:"), "{e}");
+    }
+
     #[test]
     fn the_edits_array_is_rejected_with_a_named_correction() {
         // The array is pi's storage form, not a wire one. A model that sends it

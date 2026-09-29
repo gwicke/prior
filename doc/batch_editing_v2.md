@@ -1177,7 +1177,8 @@ legacy-normalize (`session`), history blobification (`agent`). Full suite green.
 
 - `blockedit::blob`: `BLOCKS_FIELD` + `blob_text`, the one accessor every
   site uses to find the blob, so the field name is stated once. A blob string
-  under a pre-rename `edits` is deliberately inert.
+  under a pre-rename `edits` as a **string** is still read (`LEGACY_BLOCKS_FIELD`),
+  so the rename does not break callers that never saw it.
 - `array_to_blob_value` emits `blocks`; `canonicalize_edit_value` reads it.
   The canonical array keeps the name `edits` — that is pi's, and it stays.
 - `wire::EditArgs::from_wire` accepts **two** shapes: the `blocks` blob and the
@@ -1194,7 +1195,8 @@ legacy-normalize (`session`), history blobification (`agent`). Full suite green.
 - Tests: the array-on-wire test became `an_edits_array_is_rejected_and_writes_nothing`
   (it now proves the file is untouched); `canonical_multi_edit_applies_all` was
   deleted as a duplicate of `block_form_applies_all_edits`; new coverage for
-  field non-interchangeability and for the inert pre-rename blob.
+  field non-interchangeability, and for the legacy `edits` string winning only
+  when `blocks` is absent.
 - **Second rename**, `batches` → `blocks`, carried by the `sed` tool: the
   field, the constant, and the two description consts all moved together
   (`BLOCKS_FIELD`, `BLOCK_SYNTAX`, `BLOCK_POLICY`). See *Parameter name* for
@@ -1211,11 +1213,30 @@ that way. The refusal is the feature, not an obstacle: a rename that also
 rewrote a block-syntax example is exactly the change a block-based editor
 cannot represent safely.
 
-**Deliberate consequences.** A pre-rename session's raw blob string (stored
-only when it could not canonicalize) no longer normalizes on load; it is
-display-only either way. And a model that reaches for pi's array now spends a
+**Deliberate consequences.** A model that reaches for pi's array now spends a
 round trip on the correction — the intended trade, since the alternative is a
 batch that a harness may silently stringify into nothing.
+
+**Correction, after shipping.** The rename first shipped *requiring* the new
+name on ingress: `blob_text` read `blocks` only, and a pre-rename
+`{"edits": "<blob>"}` — the shape this tool had advertised for its whole life —
+fell through to the generic "no recognizable edit arguments". That was wrong, and
+it was the more likely caller of the two: a harness, a model, or a session
+recorded before the rename. `blocks` is the name we *ask* for, not one we
+*require*.
+
+`blob_text` now reads `blocks`, then falls back to a **string** `edits` via
+`LEGACY_BLOCKS_FIELD`, with the array deliberately excluded (that is pi's
+canonical form, and `from_wire` rejects it by name). Two rules, because both
+halves matter: `blocks` wins when both are present, and a malformed `blocks` is
+an error rather than a silent fall-through to a healthy `edits` — otherwise a
+typo in the new name would apply an edit the model did not ask for.
+
+The earlier justification ("a pre-rename blob was stored raw precisely because it
+did not canonicalize, so it is display-only either way") was a *storage*
+argument applied to the *wire*, where it does not hold. Keeping the alias
+recovers a small thing too: a session recorded before the rename now
+normalizes on load.
 
 ## Implementation status (anchors — done)
 
