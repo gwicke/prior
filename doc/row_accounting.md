@@ -355,6 +355,102 @@ Design below (§6a); the staging is:
 | **A1.3** | The two-region clear (§2.2) and the partial-predicate condition: a frame may only take the row-diff path if the content did not move since the last apply, or `live`'s row indices are stale by the scroll delta. The resize-replay path goes through the solve. | full suite; vt100 case: a live frame + a height change, asserting the old region is cleared and the frame lands below the replayed content |
 | **A1.4** | The cursor column (§4.1): `RenderContext { content_width }` + `RowCursor`, `paint_row` padding. Independent of the rest; its own commit, byte-identical output. | existing paint tests byte-identical; the `RenderContext` constructions updated |
 
+### Phase A3 — the frame without `CUP` (approved 2026-09-28)
+
+The frame is drawn from the cursor, relatively, so it can never address a row it
+did not mean to. This retires the whole *drift* class at once and collapses two
+planned designs into one.
+
+**Why it works.** A block does not need a row, only a starting point. Relative
+primitives (`CR`/`LF`, `CUU`, `CUD`, `CUF`, `CUB`, `EL`, `ED`) are enough:
+
+```
+paint row 1;  CUD 1;  paint row 2;  …  CUU (h-1-caret_row); CR; CUF col   ← the caret
+```
+
+Two cases carry a wrinkle, and both are handled:
+
+- **The erase walks bottom-up.** `CUD` does not scroll at the bottom row, so a
+  region clear cannot walk *down* out of the block. From the block's bottom:
+  `EL`, `CUU 1`, ×h. `CUU` clamps at row 1, so the loop is safe when the block
+  starts at the top.
+- **The block that does not fit.** Only reachable when the cursor *is* at the
+  bottom row, so `\n` ×k scrolls and `CUU k` reaches the top of the freed rows.
+  The scroll is relative too.
+
+**What stays absolute: one thing.** A resize reflows the screen and a foreign
+writer can move the cursor, so the frame asks where it is (`CPR`) and moves
+relatively from the answer. That is a *question*, not an address, and the two
+entry DSRs in `read_input` are already exactly that. `ED 0` covers the height
+change without addressing anything.
+
+**What it retires.**
+
+- `frame_anchor()` and `live.frame_top_row`. The frame is wherever the cursor is,
+  so its row is never computed, stored, or re-derived.
+- The **tracker-vs-real-cursor drift class** — the resume artifact, the
+  DSR/tracked disagreement, and the `llamacpp:testLet me run a command.` class
+  from A2.1 all come from the same root: addressing a row derived from tracking.
+  No address, no wrong row. B1's row counter stays (the content still needs it,
+  and the tests compare against it), but the frame stops being a second opinion.
+- **A2.2 and the streaming-input feature become configuration.** The block is
+  `[input (+ status on the right), divider?, menu?]` at the cursor — always,
+  streaming or not. No second render mode, no mode switch, and the "a frame owns
+  the tail rows" suppression in `paint_status` disappears, because the status
+  simply rides on the input row.
+
+**What it costs.**
+
+- **Arbitrary placement is gone.** The frame lives at the cursor. That is the
+  point, and it is what lets the input follow a stream — but `ApplyPolicy::Frame`
+  ("draw here") has nowhere to point, so the policy retires with the anchor.
+- **The block's height must be known** to walk and to erase. It is.
+- **A foreign writer's cursor is invisible to us** without the DSR. Concretely:
+  **indicatif's spinner is a foreign writer** — it writes `\r` + text at the
+  cursor 8×/s. The frame path and the spinner must be mutually exclusive (the
+  spinner stopped before any frame apply, or restored at the end), or the
+  relative erase will eat the rows above wherever the cursor actually is.
+- **That last point is the real trade-off, stated plainly**: relative addressing
+  is robust against *drift* for painting, but a *cursor-position* error now
+  propagates into the erase (h rows above wherever the cursor is) instead of
+  hitting a bounded, computed row range. The DSR escape hatch is what covers it,
+  which makes "when do we re-anchor" a real question rather than a formality.
+
+**Performance.** In bytes and in latency this is close to a wash, and the
+difference is not where intuition suggests:
+
+| | bytes | syscalls | cells painted |
+|---|---|---|---|
+| absolute, dense update | `k × (8 + row)` | 1 | same |
+| relative, dense update | `k × (6 + row)` + `O(h)` walk | 1 | same |
+| absolute, sparse in a tall block | `k × (8 + row)` | 1 | same |
+| relative, sparse in a tall block | `k × (6 + row)` + `O(h) × 4` | 1 | same |
+
+Addressing is 4–8 bytes against a row of 80–200, so it is 3–8% of a repaint, and
+every repaint is already a single buffered write (one syscall, flushed once).
+Relative is *better* for dense updates and worse only for a sparse update in a
+tall block — e.g. two changed rows in a 30-row menu costs ~116 bytes of walking
+against 16 bytes of `CUP`. Menu navigation is dense (a selection move repaints
+the list), so this is the rare case, and it is bounded.
+
+**The one real performance *gain*** is the caret fast path for typing, which is
+the reviewer’s own idea and worth building deliberately: the cursor already sits
+at the caret, so a plain insertion at the end of a single-line input needs
+nothing but the inserted characters — 1 byte per keystroke, against a full-row
+repaint today. Its preconditions are what make it an optimisation rather than
+the default: no wrap (we know the column and the width, so we can predict it),
+no styling in the row (a partial write would inherit the previous `SGR` state —
+or emit a reset), no selection, and no layout change (`Shift+Enter`, re-wrap).
+When any of those fails, fall back to repainting the changed rows and walking the
+caret back: `CUU`/`CUD` to the row, repaint, `CUU`/`CUD` back to the layout
+caret. That fallback is always correct and costs ~12 bytes of walking on top of
+what a repaint costs today.
+
+The caret is tracked as two positions, which is exactly the reviewer’s framing:
+the *layout* caret `(row, col)` the editor computes, and the terminal's cursor,
+which after a paint **is** the layout caret. A keystroke moves the editor's;
+the delta is the walk back.
+
 ## 6a. A1 in detail
 
 ### The screen, as the solve sees it
