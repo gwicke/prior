@@ -2244,10 +2244,35 @@ mod edit_file_tests {
     /// namespace. Point `TMPDIR` inside the repo for these tests, which is
     /// bound. (A real project under `/tmp` hits the same shadowing with `rg` and
     /// `bash`; it is a property of the sandbox, not of the `sed` tool.)
-    fn tmpdir_inside_repo() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+    fn tmpdir_inside_repo() -> TmpdirRedirect {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/t");
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TMPDIR", &dir);
+        TmpdirRedirect::set(&dir)
+    }
+
+    /// Restores `TMPDIR` on drop, panic or not.
+    ///
+    /// `TMPDIR` is process-global, so leaving it redirected leaks into every test
+    /// that runs afterwards: they all get their tempdirs from the repo, which
+    /// makes their paths long enough to be ellipsised when rendered — enough to
+    /// break an unrelated assertion elsewhere in the suite.
+    struct TmpdirRedirect(Option<std::ffi::OsString>);
+
+    impl TmpdirRedirect {
+        fn set(dir: &std::path::Path) -> Self {
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", dir);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TmpdirRedirect {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
     }
 
     /// The regression that matters for anyone who installed with
@@ -2284,7 +2309,7 @@ mod edit_file_tests {
     #[tokio::test]
     #[serial]
     async fn sed_preview_is_read_only_and_anchors_every_block() {
-        tmpdir_inside_repo();
+        let _tmpdir = tmpdir_inside_repo();
         // End-to-end through the real tool: path policy -> argv -> `bsed`. The
         // sandbox is not configured here (CwdGuard clears it), which exercises
         // the same code path minus the namespace, so the test runs anywhere.
@@ -2337,7 +2362,7 @@ mod edit_file_tests {
     #[tokio::test]
     #[serial]
     async fn sed_preview_reports_a_rejected_expression_without_failing() {
-        tmpdir_inside_repo();
+        let _tmpdir = tmpdir_inside_repo();
         // A refused expression is the model's to fix, so it comes back as a
         // normal result (exit 2), not as a tool error.
         let _cwd = CwdGuard::new();
