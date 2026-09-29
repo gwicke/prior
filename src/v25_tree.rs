@@ -431,17 +431,21 @@ fn bar_col(depth: usize) -> usize {
 /// What the bar cell draws. The vertical is per *branch*: it runs through
 /// the branch's rows and stops at its end, so a spur that forks in a new
 /// turn still shows one continuous pipe.
+///
+/// Heavy box-drawing throughout — over a saturated wash the thin strokes
+/// (U+2502 and friends) read as too faint, so the bar is carried by the
+/// stroke rather than by the colour behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bar {
-    /// `│` — the branch continues below.
+    /// `┃` — the branch continues below.
     Line,
-    /// `├` — a reply whose branch continues below (the arm points at it).
+    /// `┣` — a reply whose branch continues below (the arm points at it).
     Reply,
-    /// `└` — a reply on the branch's last row: the ladder turns off.
+    /// `┗` — a reply on the branch's last row: the ladder turns off.
     ReplyEnd,
-    /// `╵` — a non-reply on the branch's last row: the pipe ends.
+    /// `┻` — a non-reply on the branch's last row: the pipe ends.
     End,
-    /// `┐` — a spur's first visible row: the connector arrives from the
+    /// `┓` — a spur's first visible row: the connector arrives from the
     /// left and turns down into this branch.
     SpurStart,
 }
@@ -449,11 +453,11 @@ enum Bar {
 impl Bar {
     fn glyph(self) -> char {
         match self {
-            Bar::Line => '\u{2502}',      // │
-            Bar::Reply => '\u{251c}',     // ├
-            Bar::ReplyEnd => '\u{2514}',  // └
-            Bar::End => '\u{2575}',       // ╵
-            Bar::SpurStart => '\u{2510}', // ┐
+            Bar::Line => '\u{2503}',      // ┃ HEAVY VERTICAL
+            Bar::Reply => '\u{2523}',     // ┣ HEAVY VERTICAL AND RIGHT
+            Bar::ReplyEnd => '\u{2517}',  // ┗ HEAVY UP AND RIGHT
+            Bar::End => '\u{253b}',       // ┻ HEAVY UP AND HORIZONTAL
+            Bar::SpurStart => '\u{2513}', // ┓ HEAVY DOWN AND LEFT
         }
     }
 }
@@ -527,17 +531,20 @@ fn row_prefix(depth: usize, branch: u8, bar: Bar, assistant: bool) -> String {
     let bar_at = bar_col(depth);
     let mut out = String::new();
 
-    // Connector: an elbow in the parent's bar column, a run to our bar.
+    // Connector: a heavy elbow in the parent's bar column, then a heavy run
+    // to our bar. The block has no heavy *arc* (`╰` is a light-arc only), so
+    // the connector is told apart from the bar by its neutral ink rather
+    // than by its weight.
     if bar == Bar::SpurStart {
         let parent_at = bar_col(depth.saturating_sub(1));
         out.push_str(&" ".repeat(parent_at));
         let run = bar_at.saturating_sub(parent_at + 1);
         out.push_str(&format!(
-            "\x1b[38;2;{};{};{}m\u{2570}{}\x1b[0m",
+            "\x1b[38;2;{};{};{}m\u{2517}{}\x1b[0m",
             CONNECTOR_RGB.0,
             CONNECTOR_RGB.1,
             CONNECTOR_RGB.2,
-            "\u{2500}".repeat(run),
+            "\u{2501}".repeat(run),
         ));
     } else {
         out.push_str(&" ".repeat(bar_at));
@@ -2557,12 +2564,12 @@ mod tests {
         );
         let rows = plain_rows(&resp);
         for (id, want) in [
-            ("u1", "│"),
-            ("a1", "├ "),
-            ("u2", "│"),
-            ("a2", "├ "),
-            ("u3", "│"),
-            ("a3", "└ "),
+            ("u1", "┃"),
+            ("a1", "┣ "),
+            ("u2", "┃"),
+            ("a2", "┣ "),
+            ("u3", "┃"),
+            ("a3", "┗ "),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -2586,8 +2593,8 @@ mod tests {
         match result {
             MenuResult::Continue(plan, _) => {
                 assert_eq!(plan.rows.len(), 2);
-                assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "│");
-                assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "└ ");
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[0].0)), "┃");
+                assert_eq!(prefix_of(&strip_sgr(&plan.rows[1].0)), "┗ ");
             }
             other => panic!(
                 "expected Continue, got {:?}",
@@ -2627,7 +2634,7 @@ mod tests {
                 assert_eq!(plan.rows.len(), 6);
                 // Main line all the way: the bar is at column 0 for every
                 // row, and only the final reply turns the ladder off.
-                let expected = ["│", "├ ", "│", "├ ", "│", "└ "];
+                let expected = ["┃", "┣ ", "┃", "┣ ", "┃", "┗ "];
                 for (i, want) in expected.iter().enumerate() {
                     let got = prefix_of(&strip_sgr(&plan.rows[i].0));
                     assert_eq!(got, *want, "row {} prefix: {got:?}", i);
@@ -2793,14 +2800,14 @@ mod tests {
                 // tie-break picks the newest (mc4) for the margin; mc2/mc3
                 // open connectors and step right.
                 let expected = [
-                    "│",    // u1
-                    "├ ",   // a1
-                    "│",    // u2
-                    "├ ",   // a2
-                    "│",    // mc1, a non-reply marker on the main line
-                    "╰──┐", // mc2, spur
-                    "╰──┐", // mc3, spur
-                    "╵",    // mc4, the spine, and the branch's last row
+                    "┃",    // u1
+                    "┣ ",   // a1
+                    "┃",    // u2
+                    "┣ ",   // a2
+                    "┃",    // mc1, a non-reply marker on the main line
+                    "┗━━┓", // mc2, spur
+                    "┗━━┓", // mc3, spur
+                    "┻",    // mc4, the spine, and the branch's last row
                 ];
                 for (i, want) in expected.iter().enumerate() {
                     let got = prefix_of(&strip_sgr(&plan.rows[i].0));
@@ -2857,11 +2864,11 @@ mod tests {
         // A model-change marker is a non-reply row: it keeps the bar on the
         // main line, and the reply after it still gets its junction.
         for (id, want) in [
-            ("u1", "│"),
-            ("a1", "├ "),
-            ("mc1", "│"),
-            ("u2", "│"),
-            ("a2", "└ "),
+            ("u1", "┃"),
+            ("a1", "┣ "),
+            ("mc1", "┃"),
+            ("u2", "┃"),
+            ("a2", "┗ "),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -2971,8 +2978,8 @@ mod tests {
         // The invisible tool-call/tool-result chain must not break the turn:
         // both rows are still the main line, and the reply still gets the
         // junction arm.
-        assert_eq!(prefix_of(&plain_of(&rows, "u1")), "│");
-        assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "└ ");
+        assert_eq!(prefix_of(&plain_of(&rows, "u1")), "┃");
+        assert_eq!(prefix_of(&plain_of(&rows, "a_text")), "┗ ");
     }
 
     // --- Spine indentation (doc/tree_indent_refinement.md) ---
@@ -3204,16 +3211,16 @@ mod tests {
         }
         let rows = plain_rows(&resp);
         for (id, want) in [
-            ("u1", "│"),
-            ("a1", "├ "),
-            ("x1", "╰──┐"),   // spur: connector from the bar above
-            ("x2a", "   └ "), // …its reply turns the ladder off
-            ("u2", "│"),
-            ("y1", "╰──┐"),
-            ("y2", "   └ "),
-            ("a2", "├ "),
-            ("u3", "│"),
-            ("a3", "└ "),
+            ("u1", "┃"),
+            ("a1", "┣ "),
+            ("x1", "┗━━┓"),   // spur: connector from the bar above
+            ("x2a", "   ┗ "), // …its reply turns the ladder off
+            ("u2", "┃"),
+            ("y1", "┗━━┓"),
+            ("y2", "   ┗ "),
+            ("a2", "┣ "),
+            ("u3", "┃"),
+            ("a3", "┗ "),
         ] {
             assert_eq!(prefix_of(&plain_of(&rows, id)), want, "prefix of {id}");
         }
@@ -3257,7 +3264,7 @@ mod tests {
         // Still the main line: the bar is at column 0 and no connector is
         // drawn. `╵` because it is the branch's last visible row.
         assert_eq!(depth_of(&depths, "u2"), 0, "{rows:?}");
-        assert_eq!(prefix_of(&plain_of(&rows, "u2")), "╵", "{rows:?}");
+        assert_eq!(prefix_of(&plain_of(&rows, "u2")), "┻", "{rows:?}");
     }
 
     #[test]
@@ -3291,27 +3298,27 @@ mod tests {
         let rows = plain_rows(&resp);
         assert_eq!(
             prefix_of(&plain_of(&rows, "v1")),
-            "│",
+            "┃",
             "newest tie-winner keeps the margin"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "w1")),
-            "╰──┐",
+            "┗━━┓",
             "its spur connects from the bar above and steps right"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "x1")),
-            "╵",
+            "┻",
             "its own spine stays on the line, and it is the branch's last row"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "u2")),
-            "╰──┐",
+            "┗━━┓",
             "older equal-depth branch is a spur"
         );
         assert_eq!(
             prefix_of(&plain_of(&rows, "a2")),
-            "   └ ",
+            "   ┗ ",
             "spur keeps the reply cue"
         );
     }
@@ -3407,7 +3414,7 @@ mod tests {
         // of its own three children are spurs of *it* (a third level).
         assert_eq!(
             prefix_of(&plain_of(&rows, "v1")),
-            "╰──┐",
+            "┗━━┓",
             "bush steps right"
         );
         for id in ["d1", "d2"] {
@@ -3487,7 +3494,7 @@ mod tests {
             is_spur_start(&resp, "x1"),
             "the connector must land on the first visible spur row: {rows:?}"
         );
-        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "╰──┐");
+        assert_eq!(prefix_of(&plain_of(&rows, "x1")), "┗━━┓");
     }
 
     #[test]
@@ -3511,16 +3518,18 @@ mod tests {
     }
 
     #[test]
-    fn connector_is_thin_and_neutral() {
-        // Two adjacent sub-trees must not read as one pipe: the connector is
-        // light box-drawing in a neutral ink, never a branch hue, while the
-        // bar it runs into carries the wash.
+    fn connector_is_neutral() {
+        // Two adjacent sub-trees must not read as one pipe — the connector is
+        // heavy box-drawing in a neutral ink, never a branch hue, and it
+        // carries no wash of its own — the ink is now the only thing that
+        // separates a connector from the bar it runs into.
         let prefix = row_prefix(1, 1, Bar::SpurStart, false);
-        assert!(prefix.contains('\u{2570}'), "light elbow: {prefix:?}");
-        assert!(prefix.contains('\u{2500}'), "light run: {prefix:?}");
-        assert!(
-            !prefix.contains('\u{2502}'),
-            "no heavy vertical: {prefix:?}"
+        assert!(prefix.contains('\u{2517}'), "heavy elbow: {prefix:?}");
+        assert!(prefix.contains('\u{2501}'), "heavy run: {prefix:?}");
+        assert_eq!(
+            prefix.matches("48;2;").count(),
+            1,
+            "only the bar cell may be washed: {prefix:?}"
         );
         assert!(prefix.contains(&format!(
             "38;2;{};{};{}m",
@@ -3533,8 +3542,8 @@ mod tests {
             let at = prefix.find(needle).expect("glyph");
             crate::slashdot_menu::table::display_width(&prefix[..at])
         };
-        assert_eq!(col_of('\u{2570}'), bar_col(0), "elbow column");
-        assert_eq!(col_of('\u{2510}'), bar_col(1), "bar column");
+        assert_eq!(col_of('\u{2517}'), bar_col(0), "elbow column");
+        assert_eq!(col_of('\u{2513}'), bar_col(1), "bar column");
     }
 
     #[test]
@@ -3557,16 +3566,16 @@ mod tests {
             .map(|r| prefix_of(&strip_sgr(&r.0)))
             .collect();
         let want = vec![
-            "│",
-            "├ ",
-            "╰──┐",
-            "   └ ",
-            "│",
-            "╰──┐",
-            "   └ ",
-            "├ ",
-            "│",
-            "└ ",
+            "┃",
+            "┣ ",
+            "┗━━┓",
+            "   ┗ ",
+            "┃",
+            "┗━━┓",
+            "   ┗ ",
+            "┣ ",
+            "┃",
+            "┗ ",
         ];
         assert_eq!(got, want, "{plan:?}");
         // The wash must survive to the terminal too, not just the glyph —

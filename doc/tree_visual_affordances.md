@@ -63,7 +63,7 @@ Those are two different questions, and they want two different mechanisms.
 
 ## 2. The decisive constraint: adjacency
 
-A vertical rail (`│` at the excursion's column) asserts *contiguity*: it
+A vertical rail (`┃` at the excursion's column) asserts *contiguity*: it
 says "the rows above and below this one, in this column, are the same
 thread". That assertion is true only if the rows of a branch are adjacent,
 which chronological order deliberately breaks.
@@ -161,7 +161,7 @@ palette inherits that assumption, so `NO_COLOR` respect and a setting
 
 ### Option A — Vertical rails (continuous box drawing)
 
-`│` down the excursion's column, `├─`/`└─` at the fork.
+`┃` down the excursion's column, `┣━`/`┗━` at the fork.
 
 - **Pro:** the most information; standard tree idiom; shows nesting
   *within* an excursion, which the flattened indent deliberately hides.
@@ -176,9 +176,9 @@ palette inherits that assumption, so `NO_COLOR` respect and a setting
 A glyph on the rows that *are* a structural event, with no claim of
 continuity:
 
-- `╰` or `├` on the **first visible row of each spur** — "this line of work
+- `┗` or `┣` on the **first visible row of each spur** — "this line of work
   starts here";
-- optionally a dim `├` on the fork row itself (a row with ≥2 visible
+- optionally a dim `┣` on the fork row itself (a row with ≥2 visible
   children) — "this row is where the split is";
 - the existing `*` keeps meaning the active path, `>` selection.
 
@@ -252,25 +252,25 @@ depth. Three mechanisms, three questions, no overlap.
 The bar is **not** a left-edge column: it is drawn **at the indentation
 level of the branch it belongs to** — the main line's bar at the left edge,
 each spur's bar at that spur's own indent, with the text immediately
-after. All glyphs are box-drawing (no arrows, no block elements).
-
-All glyphs are **thin** box-drawing — the bar's presence comes from the
-wash, not the stroke:
+after. All glyphs are box-drawing (no arrows, no block elements), and all
+heavy — over a saturated wash the thin strokes (U+2502 and friends) read
+as too faint, so the bar is carried by the stroke rather than by the
+colour behind it.
 
 | role | glyph | ink |
 |---|---|---|
-| the line continues | `│` U+2502 | branch |
-| a reply, the line continues | `├` U+251C | branch |
-| a reply on the branch's last row | `└` U+2514 | branch |
-| a non-reply on the branch's last row (the pipe ends) | `╵` U+2575 | branch |
-| a spur's first visible row | `┐` U+2510 | branch |
-| connector: elbow at the parent's bar + run right | `╰` U+2570 + `─` U+2500 ×n | **neutral** |
+| the line continues | `┃` U+2503 | branch |
+| a reply, the line continues | `┣` U+2523 | branch |
+| a reply on the branch's last row | `┗` U+2517 | branch |
+| a non-reply on the branch's last row (the pipe ends) | `┻` U+253B | branch |
+| a spur's first visible row | `┓` U+2513 | branch |
+| connector: elbow at the parent's bar + run right | `┗` U+2517 + `━` U+2501 ×n | **neutral** |
 
 A row is:
 
 ```
 [indent: depth × SPUR_STEP spaces]
-[spur-start connector, only on a spur's first visible row: ╰ at the parent's bar column, ─ filling up to this bar]
+[spur-start connector, only on a spur's first visible row: ┗ at the parent's bar column, ━ filling up to this bar]
 [bar cell: 1 column, glyph from the table above, background = branch hue faded by depth]
 [1 space, assistant rows only]
 [text]
@@ -279,32 +279,32 @@ A row is:
 and it renders as:
 
 ```
-│kick off               main,  user               bar@0
-└ reply 1               main,  assistant           bar@0, branch ends
-╰──┐experiment prompt   spur1, user              ╰@0, ─@1..2, bar@3
-   └ experiment reply   spur1, assistant         bar@3, branch ends
-╰──┐a different idea   spur2, user              ╰@0, ─@1..2, bar@3
-   ├ its reply          spur2, assistant         bar@3
-   │last question       spur2, user              bar@3
-   └ last reply         spur2, assistant         bar@3, branch ends
-│third message          main,  user               bar@0
+┃kick off               main,  user               bar@0
+┗ reply 1               main,  assistant           bar@0, branch ends
+┗━━┓experiment prompt   spur1, user              ┗@0, ━@1..2, bar@3
+   ┗ experiment reply   spur1, assistant         bar@3, branch ends
+┗━━┓a different idea   spur2, user              ┗@0, ━@1..2, bar@3
+   ┣ its reply          spur2, assistant         bar@3
+   ┃last question       spur2, user              bar@3
+   ┗ last reply         spur2, assistant         bar@3, branch ends
+┃third message          main,  user               bar@0
 ```
 
-(The connector is drawn in neutral dim ink; the bar cells in branch ink —
-in a plain terminal they look identical.)
+(The connector is drawn in neutral dim ink with no wash; the bar cells in
+branch ink on a branch wash — in a plain terminal they look identical.)
 
 ### 5.1 The two connectors
 
 **The turn ladder.** The vertical runs per **branch**, not per turn: it
 stacks a branch's rows into one line with an arm pointing right at each
-reply, and turns off (`└` for a reply, `╵` for anything else) on the
+reply, and turns off (`┗` for a reply, `┻` for anything else) on the
 branch's *last* row. A branch that forks again in a new turn still shows
 one continuous pipe, which is what makes the two connectors safe to read
 together. The distinction is local and cheap — it is the `is_terminal`
 computation `visible_terminals` already does.
 
-**The spur connector.** A spur's first visible row draws `╰` in the
-*parent's* bar column with `─` running right into its own bar cell, so the
+**The spur connector.** A spur's first visible row draws `┗` in the
+*parent's* bar column with `━` running right into its own bar cell, so the
 line visibly comes down from the bar above and turns into the new branch.
 This is exactly "a line from the colour bar above, an angle below the
 colour bar, a horizontal line touching the new colour bar cell".
@@ -316,15 +316,15 @@ column, so two up-strokes stack and the eye can read a single vertical
 running from one excursion into the next — i.e. spur A continuing into spur
 B, when they are in fact siblings that both branch off the same parent.
 
-One rule kills it, and it is free:
+One rule kills it, and it is free — it was originally two (stroke weight
+and ink), but with every glyph drawn heavy the weight half went away:
 
-**The connector is drawn in *neutral dim* ink, never a branch hue.**
-Colour already means "this is branch X"; the connector is a structural
-   annotation, so leaving it uncoloured keeps the two from blending into a
-   single pipe when a connector sits directly above a sibling's bar.
-
-Together they mean a stacked pair of corners reads as "two branches leaving
-the same parent" — which is exactly what it is.
+**The connector is drawn in *neutral dim* ink, never a branch hue.** Colour
+already means "this is branch X"; the connector is a structural annotation,
+so leaving it uncoloured — and giving it no wash of its own — keeps the two
+from blending into a single pipe when a connector sits directly above a
+sibling's bar. A stacked pair of corners then reads as "two branches
+leaving the same parent", which is exactly what it is.
 
 It is also structurally honest, which is a happy accident of pre-order
 DFS: **a node's first child is always emitted on the row immediately after
@@ -335,9 +335,9 @@ bar. The exception is a spur hanging off an *invisible* entry (a tool-call
 segment), where the connector starts from the nearest visible row above
 instead — visually harmless, since it is still the row immediately above.
 
-The two connectors cannot be confused: the turn-off `└` occupies the
-*bar cell*, while the spur `╰` occupies the *parent's* column and is
-always followed by a `─` run into a `┐`.
+The two connectors cannot be confused: the turn-off `┗` occupies the
+*bar cell*, while the spur `┗` occupies the *parent's* column and is
+always followed by a `━` run into a `┓`.
 
 ### 5.2 Column arithmetic
 
@@ -365,7 +365,7 @@ cost 5 columns per level; not worth it, especially now that the main line
 sits at the margin and deep spurs are the only thing pushing right.)
 
 The assistant step is **1 column** (confirmed): the junction's arm is the
-horizontal step, so `│` + text for a user row and `├` + one space + text
+horizontal step, so `┃` + text for a user row and `┣` + one space + text
 for a reply.
 
 ### 5.3 Ink and wash
@@ -380,7 +380,7 @@ The connector of §5.1 is the exception: no wash, and a dim neutral ink.
 
 Fading the wash and *not* the ink means the lines stay crisp at every
 depth while the colour recedes — which is the whole point of encoding depth
-in saturation. The spur-start `┐` in the bar cell is black like every
+in saturation. The spur-start `┓` in the bar cell is black like every
 other glyph, as intended.
 
 The main line's bar is washed in the anchor orange at full saturation
@@ -404,7 +404,7 @@ So the row carries the *text* in one place and the *prefix* in another:
 | `text` | str | the bare entry text — the haystack, the header, the filter index. |
 | `depth` | int | spur level; `0` = main line. Replaces `FlatRow.indent`. |
 | `branch` | int | colour ordinal: `0` = main line, else a **global** per-spur counter handed out in descending-height order (§8.1). |
-| `spur_start` | flag | first **visible** row of a spur — the row that draws the connector and the `┐`. |
+| `spur_start` | flag | first **visible** row of a spur — the row that draws the connector and the `┓`. |
 | `role` | str | already emitted; retained for filters and `header()`. |
 
 The listing cell is `prefix + text`; `header()` reads `text`. `depth`,
@@ -494,9 +494,9 @@ across the session) was considered and dropped.
 | 1 | Rails, markers, or colour? | **Markers + colour, no rails** (§2: rails assert contiguity that interleaving breaks). |
 | 2 | Gutter | Owned by the generic render layer; the tree emits fields and does not know the gutter exists (§5.4). |
 | 3 | Bar geometry | Aligned to the branch's own indent, text immediately after (§5). |
-| 4 | Glyphs | Box-drawing only, no arrows, no block elements, and **all thin** — the bar's presence comes from the wash, not the stroke. `│` on the line, `┐` on a spur's first row. |
-| 5 | Assistant replies | `├` per reply, `└` on the last of a turn; the vertical is per **branch**, so the ladder turns off (or the pipe ends with `╵`) on the branch's last row, not at every turn boundary (§5.1). |
-| 6 | Spur marker | A line from the bar above: `╰` under the parent's bar, `─` touching the new bar cell, light weight and neutral ink; the bar cell's own glyph stays in branch ink (§5.1, §5.3). |
+| 4 | Glyphs | Box-drawing only, no arrows, no block elements, and **all heavy** — thin strokes are too faint over a saturated wash. `┃` on the line, `┓` on a spur's first row. |
+| 5 | Assistant replies | `┣` per reply, `┗` on the last of a turn; the vertical is per **branch**, so the ladder turns off (or the pipe ends with `┻`) on the branch's last row, not at every turn boundary (§5.1). |
+| 6 | Spur marker | A line from the bar above: `┗` under the parent's bar, `━` touching the new bar cell, in neutral ink with no wash; the bar cell's own glyph stays in branch ink (§5.1, §5.3). |
 | 7 | Hue | **Warm orange** anchor for the main line; rainbow rotated per level starting after the anchor, ordered by descending height; fade = depth; layout-relative (§6). |
 | 8 | Opt-out | A `tree_color` setting (`auto | on | off`) + `NO_COLOR`; neither exists today (§3.5). |
 | 9 | Defensive fix | Make `extract_snippet` escape-aware even though the recommended path does not reach it (§3.4). |
