@@ -16,6 +16,24 @@
 
 use serde_json::{json, Value};
 
+/// The **model-facing** field carrying the block blob.
+///
+/// Renamed from `edits`, which meant two different things at once: this string
+/// blob, and the canonical array. The split removes the overloading — `blocks`
+/// is the only field a model may send, `edits` is only the canonical array pi
+/// requires on disk.
+pub const BLOCKS_FIELD: &str = "blocks";
+
+/// The blob string a raw `edit` call carries, or `None` when it carries none.
+///
+/// Reads [`BLOCKS_FIELD`] only. A pre-rename session may hold a blob string
+/// under `edits`; it is inert here, and deliberately so — such a blob was
+/// stored raw precisely *because* it did not canonicalize (malformed, or
+/// multi-file), so it still cannot, and it is display-only either way.
+pub fn blob_text(args: &Value) -> Option<&str> {
+    args.as_object()?.get(BLOCKS_FIELD)?.as_str()
+}
+
 /// Opening marker of an OLD region (`@@@OLD`).
 pub const SEARCH_MARKER: &str = "@@@OLD";
 /// Divider between the OLD and NEW regions (`@@@NEW`).
@@ -437,10 +455,15 @@ fn edits_to_value(edits: &[ParsedEdit]) -> Value {
 /// Canonicalize a raw edit-call `arguments` value to the canonical array form,
 /// **best-effort**. Handles:
 ///
-/// - `edits` is a **string** (blob) → parse + merge → array;
-/// - `edits` is already an **array** → unchanged (legacy/replay);
+/// - `blocks` is a **string** (blob) → parse + merge → array;
+/// - `edits` is already an **array** → unchanged (the canonical form itself);
 /// - top-level `oldText`/`newText` → single-entry array;
 /// - legacy `old`/`new` → single-entry array.
+///
+/// The array branches are **storage-side only**. The array is not a wire shape
+/// any more — a model sends `blocks` (a string) or the single-edit scalars —
+/// so reaching those branches here means we are normalizing something we read
+/// back off disk, which is exactly what they are for.
 ///
 /// On a malformed blob (unparseable, or a conflicting path) the value is
 /// returned unchanged so replay degrades gracefully rather than erroring.
@@ -454,8 +477,8 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    // Blob string.
-    if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
+    // Blob string (the model-facing field).
+    if let Some(text) = blob_text(args) {
         if let Ok(parsed) = parse_blocks(text) {
             if let Ok((path, pairs)) = merge_path(json_path, parsed) {
                 return json!({ "path": path, "edits": edits_to_value(&pairs) });
@@ -492,8 +515,9 @@ pub fn canonicalize_edit_value(args: &Value) -> Value {
 }
 
 /// Inverse of [`canonicalize_edit_value`] for the model-facing form: rewrite a
-/// canonical-array edit call into the blob form. **Idempotent** — a value that
-/// is not a canonical array is returned unchanged.
+/// canonical-array edit call into the blob form, under [`BLOCKS_FIELD`].
+/// **Idempotent** — a value that is not a canonical array is returned unchanged,
+/// so a value already in blob form passes straight through.
 pub fn array_to_blob_value(args: &Value) -> Value {
     let Some(obj) = args.as_object() else {
         return args.clone();
@@ -520,7 +544,7 @@ pub fn array_to_blob_value(args: &Value) -> Value {
         })
         .collect();
     let blob = render_blob(path, &parsed);
-    json!({ "path": path, "edits": blob })
+    json!({ "path": path, "blocks": blob })
 }
 
 #[cfg(test)]
@@ -833,7 +857,7 @@ mod tests {
 
     #[test]
     fn canonicalize_blob_string() {
-        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        let v = json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let c = canonicalize_edit_value(&v);
         assert_eq!(
             c,
@@ -858,8 +882,36 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_under_the_old_field_name_is_inert() {
+        // Pre-rename sessions can hold a blob string under `edits`. It is not a
+        // wire shape and not canonicalizable, so it is left exactly as found.
+        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        assert_eq!(canonicalize_edit_value(&v), v);
+        assert_eq!(blob_text(&v), None);
+    }
+
+    #[test]
+    fn blob_text_reads_only_the_blocks_field() {
+        let v = json!({"path": "p", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+        assert!(blob_text(&v).is_some());
+        // The array is the canonical form, never a blob.
+        let arr = json!({"path": "p", "edits": [{"oldText": "a", "newText": "b"}]});
+        assert_eq!(blob_text(&arr), None);
+    }
+
+    #[test]
+    fn array_to_blob_emits_blocks_not_edits() {
+        // The rename's whole point: the two fields are no longer confusable.
+        let v = json!({"path": "p", "edits": [{"oldText": "a", "newText": "b"}]});
+        let out = array_to_blob_value(&v);
+        assert!(out.get("blocks").is_some(), "{out}");
+        assert!(out.get("edits").is_none(), "{out}");
+        assert_eq!(BLOCKS_FIELD, "blocks");
+    }
+
+    #[test]
     fn canonicalize_malformed_blob_is_identity() {
-        let v = json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@END"});
+        let v = json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@END"});
         assert_eq!(canonicalize_edit_value(&v), v);
     }
 
@@ -867,7 +919,7 @@ mod tests {
     fn array_to_blob_round_trips() {
         let v = json!({"path": "src/x.rs", "edits": [{"oldText": "a", "newText": "b"}, {"oldText": "c", "newText": "d"}]});
         let blob = array_to_blob_value(&v);
-        let text = blob.get("edits").and_then(|x| x.as_str()).unwrap();
+        let text = blob.get(BLOCKS_FIELD).and_then(|x| x.as_str()).unwrap();
         let parsed = parse_blocks(text).unwrap();
         assert_eq!(parsed.path.as_deref(), Some("src/x.rs"));
         assert_eq!(
@@ -878,8 +930,7 @@ mod tests {
 
     #[test]
     fn array_to_blob_is_idempotent_on_blob() {
-        let v =
-            json!({"path": "src/x.rs", "edits": "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE"});
+        let v = json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         assert_eq!(array_to_blob_value(&v), v);
     }
 

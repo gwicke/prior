@@ -2033,7 +2033,7 @@ For a change that spans many lines or the whole file (renames, deletions, range
 rewrites), do NOT run `sed -i` and do NOT hand-write one `edit` block per line.
 Instead call `sed` with one GNU sed expression per line. It never writes: it
 returns the change as `@@@OLD`/`@@@NEW` blocks, each anchored to a line. Read the
-blocks, then pass them to `edit` as its `edits` argument to apply. `sed` refuses
+blocks, then pass them to `edit` as its `blocks` argument to apply. `sed` refuses
 `w`, `e` and `q`; use `edit` or `bash` for those. Pass `context` if you need more
 than the ~2 lines of trailing context you get by default."#;
 
@@ -5451,7 +5451,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             })],
         };
 
-        // Array -> block.
+        // Canonical array -> blob, under the model-facing field name.
         let out = blob_edit_tool_calls(vec![mk(args)]);
         let Message::Assistant { content, .. } = &out[0] else {
             panic!("expected assistant")
@@ -5459,18 +5459,24 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
         let AssistantContent::ToolCall(tc) = &content[0] else {
             panic!("expected tool call")
         };
-        let edits = tc
+        let batches = tc
             .function
             .arguments
-            .get("edits")
+            .get("blocks")
             .and_then(|v| v.as_str())
             .unwrap();
-        assert!(edits.contains("@@@OLD"), "got: {edits}");
-        assert!(edits.contains("src/x.rs"), "got: {edits}");
+        assert!(batches.contains("@@@OLD"), "got: {batches}");
+        assert!(batches.contains("src/x.rs"), "got: {batches}");
+        // The canonical array must not survive into the model-facing form.
+        assert!(
+            tc.function.arguments.get("edits").is_none(),
+            "model form must not carry the array: {:?}",
+            tc.function.arguments
+        );
 
         // Idempotent: an already-block value is unchanged.
         let already =
-            serde_json::json!({"path": "src/x.rs", "edits": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
+            serde_json::json!({"path": "src/x.rs", "blocks": "@@@OLD\na\n@@@NEW\nb\n@@@END"});
         let out2 = blob_edit_tool_calls(vec![mk(already.clone())]);
         let Message::Assistant { content, .. } = &out2[0] else {
             panic!("expected assistant")
