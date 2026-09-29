@@ -198,12 +198,13 @@ aspirational: they are part of the composition, not side effects of a write.
 
 ### 3.3 What this does to the `Output` split
 
-The split sketched in the first draft (`ContentOut` / `UiOut`, two anchors) is
-still right, and this design is *why*: the frame's anchor and the content's
-caret are different facts about the same screen, and today they share one
-field. With the composition they are separate values with an explicit
-relationship (`frame_top = min(cb + 1, …)`), and `live` is invalidated whenever
-either moves.
+The frame's anchor and the content's caret are different facts about the same
+screen, and today they share one field. The composition separates them — with an
+explicit relationship (`frame_top = min(cb + 1, …)`) and `live` invalidated
+whenever either moves — and that separation is what `write_content` on the
+trait exposes. The full `ContentOut` / `UiOut` trait split is *not* part of this
+work (D4): the composition carries the two anchors internally, so the split's
+remaining value is explicitness rather than capability.
 
 ### 3.4 Revisions to settled design (ui_draw_v2)
 
@@ -292,49 +293,84 @@ choke point and `BlockKind` as the input, it becomes one function
 
 ---
 
-## 5. Open questions
+## 5. Settled decisions (2026-09-28, after review)
 
-**5.1 (blocking A2) Following or pinned?** `frame_top = min(cb + 1, …)` keeps
-today's look — the prompt sits directly under the last line of output, and a
-static status line slides down as a long turn accumulates, then pins. Dropping
-the `min` puts the frame at the bottom always: the status line is stable and the
-prompt sits at the bottom of the screen, with a gap after a short turn. The
-design discussion asked for a status line "in the last row" (pinned) and
-described the following behaviour for appends; both are the same solve, so the
-only cost of choosing is the look. Recommendation: pinned — a status line that
-moves is distracting, and it is what every comparable CLI does — but it is a
-visible change to where the prompt appears, so it is your call.
-
-**5.2 Does the menu case need the content's history, or only its bottom?**
-A tall menu pushes the content up; the solve needs to know how far to scroll,
-which needs the content's *height* (or just that it exceeds the live region —
-scroll by the difference). I believe the bottom row plus `live` is enough, but
-a menu taller than the whole live region needs the 2/3 budget to still hold
-(ui_draw_v2 §8 OQ1), and that is an argument for keeping the budget on the
-frame's *own* elements, not on the composition.
-
-**5.3 What is the cursor during a mid-turn compose?** The input's caret, by
-definition — but then the status line and the content are painted *around* a
-cursor the reader is not using, and Esc/Ctrl-C have to reach the compose area
-rather than the (absent) REPL. The confirm gate (§1 of ui_draw_v2 §9) is the
-existing precedent for "something else owns stdin", so the mechanism exists; the
-policy does not. Deferred to the queued-prompt document, but the phase A2
-prototype should at least not paint over a live caret.
-
----
-
-## 6. Phases
-
-| Phase | Work | Gate |
+| # | Question | Decision |
 |---|---|---|
-| **B** | `write_content` + the row counter across all writers (§9 #6, #10); the separator rule (§4.3); drop the compensating DSR; the two entry DSRs stay. A `tests/` pty case reproducing the session-resume artifact, asserted against the report, then shown fixed. | full suite green; a `note_lines`-drift unit test (wide-char and boundary-width messages) |
-| **A1** | The composition: `ContentOut`/`UiOut`, `content_bottom` + `frame_top` in the cache, the two-mutator solve, the two-region clear, the §3.4 revisions. A scoped re-anchor for replay. Cursor-column change (§4.1) as its own commit. | full suite green; the B artifact still fixed; existing paint tests byte-identical |
-| **A2** | `StatusHandle` + a static status line as the frame's bottom element, following or pinned per §5.1. | full suite green; a vt100 case pinning that a long turn stops above the line and the line survives |
+| D1 | Following or pinned? | **Following** — the frame is painted top-down from the scrollback and sits directly below the content; menus appear below the status line. `frame_top = min(cb + 1, term_h − H + 1)`. |
+| D2 | Keep the frame's 2/3 budget? | **Keep** (`allocate(elements, ⌈2/3·term_h⌉)`). The solve places the frame; the budget still bounds its height, and the top 1/3 stays scrollback. |
+| D3 | API shape | **Additive.** `write_content` is added to `Output`; `draw_frame` and `ApplyPolicy` stay, with the policy mapping onto the internal solve. A full migration to `set_frame`/`write_content` is a recorded follow-up, not this work. |
+| D4 | `ContentOut`/`UiOut` trait split | **Deferred** — the composition carries the two anchors internally; the split's payoff is explicitness, not capability. Revisit with the queued-prompt work. |
+| D5 | Order | **The row counter first.** `content_bottom` has to be *true* before a composition can be built on it, and the counter is also §9 #6 and §9 #10 plus the resume artifact. |
+| D6 | Frame element order | `[Status, Input?, Divider?, Menu?]`. The status line is the frame's top element. The input is present only when not streaming. The divider only when something is visible below it (a menu). The menu's own `detail` + `rows` are vertically balanced inside the painter and the menu as a whole is a flexible element of the frame's stack (`allocate`'s even surplus division) — both already true, now written down. |
+| D7 | Status line tone | The table-header background (`\x1b[48;5;237m`), not the data-row grey. |
+| D8 | Padding | The painter pads frame rows that arrive unpadded; content writers keep padding their own rows for consistent backgrounds, and the painter never touches content rows. |
+| D9 | Entry DSRs | **Keep** `read_input`'s and `ui::confirm`'s after the counter lands. They become unnecessary, but they are the documented guard for *foreign* writers (a tool's subprocess on the tty), and they cost one round trip per prompt. Removing them is a follow-up with its own justification. |
 
-A2 is what proves the tracking end to end; B is worth doing on its own merits —
-it is §9 #6 and #10 plus the artifact.
+### 5.1 What following buys
+
+`content_bottom` is a *derivation*, not a field:
+
+- `live.is_some()` (only right after a frame apply) → `cb = live.frame_top_row - 1`
+- `live.is_none()` (after any content write or re-anchor) → `cb = caret.0`
+
+so `DrawCache` keeps `caret`, `live`, `screen_bottom` and the §4.2 invalidation
+contract is unchanged. A *pinned* frame would break the derivation — a gap
+between content and frame means `cb ≠ live.top − 1` — and would need a third
+fact. D1 is therefore load-bearing for the state model, not just the look.
+
+### 5.2 Still open (A2, cheap to settle)
+
+- **Status line cadence.** Repaint on every streamed block (free under the
+  composition, since `write_content` re-applies the frame) or on a timer
+  (~10 Hz, cheaper, allows a spinner). Recommendation: per block; a 1-row
+  repaint is invisible and the code is simpler.
+- **Where ctx% comes from** mid-turn — the agent's usage accounting must be
+  published as it runs, not only at turn end.
+- **The exact status content** — `[session | provider:model | level | ctx XX%
+  · 234k]` is a starting point; which fields are always present, and whether
+  the line truncates or elides when the terminal is narrow.
 
 ---
+
+## 6. Plan
+
+### Phase B — the row counter (§9 #6, §9 #10, the resume artifact)
+
+| Commit | Work | Gate |
+|---|---|---|
+| **B1** | `RowCounter`: a `Write` adapter that accumulates the terminal rows its bytes occupy at a width — `1 + (display_width(segment) − 1) / width` per `\n`-separated segment, ANSI-transparent, display-column aware. Lives next to the existing text measurement in `output.rs`. Pure; unit tests for wrapping, wide chars, escapes, and a trailing newline. | crate unit tests |
+| **B2** | Every content writer renders into a local buffer and counts the bytes it is about to write: `display_text` (#6), `display_markdown`, `paint_panel`/`tool_panel` (per painted row), the 7 `Renderer::feed` sites (`stream_text`, `stream_thinking`, `commit_thinking`, the replay paths). One private `ConsoleOutput::write_content(bytes, kind)` becomes the single choke point. The compensating DSR at `repl.rs:770` goes. | full suite; **a screen-truth test**: drive one of each writer through a real `ConsoleOutput` and assert the tracked row equals the vt100 screen's cursor after each (this is the real safety net — the count is either right or the next frame lands wrong) |
+| **B3** | Separators: `BlockKind` + one `needs_separator(prev, next)` replacing `set_blank`/`ended_blank`/`last_was_tool` and the `ensure_dim` boundary. *Last in the phase*, so a diff in blank lines cannot obscure B2's fix. | full suite; before/after transcript check for a few shapes (text → tool → text, reasoning → answer, error after content) |
+| **B4** | The resume artifact, as a regression test. Most likely shape: a pty test that puts a dialog up, tears it down, replays a short turn and asserts no residue — which may need a test seam (an injectable writer on `ConsoleOutput`); the pty suites in `tests/` show the pattern. | the new test fails before B2 and passes after |
+
+### Phase A1 — the composition (additive)
+
+| Commit | Work | Gate |
+|---|---|---|
+| **A1.1** | `plan_solve(cache, screen, w, h) -> String` in `ui/frame.rs`, where `Screen { frame: Option<(Frame, focus)>, content: Option<ContentWrite> }`. One solve: derive `cb`, place the frame (`min(cb + 1, term_h − H + 1)`), emit clear-old-frame → scroll → content → frame at the new top. `draw_frame`'s policy maps onto it; `ApplyPolicy` is unchanged in the public API. | **no visible change**: the existing vt100 frame tests and the REPL resize suite pass unchanged |
+| **A1.2** | `write_content` promoted to the `Output` trait (`ContentBlock { bytes, kind }`) with a default that writes the bytes, so the five non-console impls do not change. B2's writers call it instead of writer + `note_lines`. | full suite |
+| **A1.3** | The two-region clear (§2.2) and the partial-predicate condition: a frame may only take the row-diff path if the content did not move since the last apply, or `live`'s row indices are stale by the scroll delta. The resize-replay path goes through the solve. | full suite; vt100 case: a live frame + a height change, asserting the old region is cleared and the frame lands below the replayed content |
+| **A1.4** | The cursor column (§4.1): `RenderContext { content_width }` + `RowCursor`, `paint_row` padding. Its own commit, byte-identical output. | existing paint tests byte-identical; the 12 `RenderContext` constructions updated |
+
+### Phase A2 — the status line
+
+| Commit | Work | Gate |
+|---|---|---|
+| **A2.1** | `StatusHandle`: atomics the agent publishes as it runs (session, provider:model, thinking level, ctx used/total), read once per solve. | unit tests on the handle |
+| **A2.2** | `Element::Lines` gains a style (`RowStyle` from the painter, header tone) so the status line is a real frame element; `compose_frame` builds `[Status, Input?, Divider?, Menu?]` with the D6 rules. | full suite; `Element::Lines`'s `#[allow(dead_code)]` retired |
+| **A2.3** | The status line during streaming: the frame is `[Status]` alone, repainted by `write_content` after each block — the case §2.2's two-region clear exists for. | **vt100 case**: a long streamed turn stops above the line, the line survives, and no residue remains above the content |
+
+### Follow-ups (recorded, not in this work)
+
+- Full migration of `draw_frame` → `set_frame`, and retiring `ApplyPolicy` (D3).
+- The `ContentOut`/`UiOut` split (D4).
+- Removing the two entry DSRs, with the foreign-writer argument retired (D9).
+- Queued follow-up prompts: a real editor while the turn runs, the cursor
+  policy (§5.3 of the previous revision, now the compose-area question), and
+  what a mid-turn prompt means semantically.
+- The separator/divider sweep beyond `needs_separator`: one place that decides
+  *all* vertical chrome.
 
 ## 7. Log
 
@@ -345,3 +381,9 @@ it is §9 #6 and #10 plus the artifact.
   subsumes it, explains `Append` as the content policy, and answers the cursor
   question the reserved band left open. Added §4 on the painter-owned cursor
   column and its ANSI rules.
+- 2026-09-28: plan finalised. Decisions D1–D9 recorded in §5, commits in §6:
+  the row counter first (it is also §9 #6, §9 #10 and the resume artifact),
+  then the composition, then the status line. A scoped re-anchor was dropped
+  from the scope: with the counter in place the entry DSRs are simply
+  unnecessary, and they are kept anyway as the documented guard for foreign
+  writers (D9) — one fewer primitive to design.
