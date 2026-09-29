@@ -565,10 +565,18 @@ impl Repl {
         output: &dyn Output,
     ) -> Option<InputAction> {
         // Re-anchor the draw cache to the real cursor (DSR) before the first
-        // paint: content streamed since the last prompt is not tracked row by
-        // row, and the input must start at the natural cursor row (plan §4.2).
-        // From here the frame follows the cursor, via the draw cache's tracked
-        // row — which is what this DSR corrects.
+        // paint (plan §4.2).
+        //
+        // **This is the starting row, not a correction.** Every content write is
+        // counted from the bytes on their way out (`RowCounter` →
+        // `note_lines`, checked against a vt100 replay by
+        // `streamed_answer_is_counted`), so from the second prompt onward the
+        // tracked row is already right and this DSR confirms it. What it is
+        // actually for is the *first* paint of a session: the cache starts at row
+        // 1 because nothing has been written yet, while the shell that launched
+        // picocode may have left its prompt three rows down. Every byte of the
+        // greeter would then be counted from the wrong place and the drift
+        // would be baked in before the first prompt is drawn.
         let _ = output.cursor_row();
         // Refresh the menu-facing view from this cycle's context. The loop
         // is the sole writer of these display fields (one acquisition);
@@ -799,11 +807,19 @@ impl Repl {
                     // prompt — back to normal operation.
                     V25Frame::DoneError(err, _) => {
                         // Clear the input region through the frame path, then
-                        // surface the error. The exact line `display_text`
-                        // consumed depends on inline-markdown wrapping, so
-                        // re-anchor (DSR) rather than trusting the wrap count
-                        // ("any uncertainty → clear it", plan §4.2): the next
-                        // iteration anchors below the error.
+                        // surface the error, then re-anchor (DSR) so the next
+                        // iteration anchors below it.
+                        //
+                        // This one used to be justified by "the exact line
+                        // `display_text` consumed depends on inline-markdown
+                        // wrapping, so re-anchor rather than trusting the wrap
+                        // count". That is no longer true: the count is *measured*
+                        // from the emitted bytes, and
+                        // `display_text_row_is_measured_not_predicted` pins it
+                        // against a terminal emulator. The DSR stays because this
+                        // is an error path — rare, and the cost of being wrong
+                        // is a stranded input region — not because the accounting
+                        // needs rescuing.
                         redraw(&LineEditor::new(), &[], sel, (cur_w, cur_h));
                         output.display_text(&err);
                         let _ = output.cursor_row();

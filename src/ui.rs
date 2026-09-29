@@ -81,10 +81,18 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
         gate.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    // Re-anchor (DSR): mid-turn the draw cache's caret does not follow
-    // streamed content row by row, so the dialog must start at the *real*
-    // cursor row — right below the output above it (plan §4.2/§5.3). The
-    // frame then scrolls itself into the live region if it does not fit.
+    // Re-anchor (DSR) so the dialog starts at the real cursor row — right below
+    // the output above it — and scrolls itself into the live region if it does
+    // not fit (plan §4.2/§5.3).
+    //
+    // The comment here used to say "mid-turn the draw cache's caret does not
+    // follow streamed content row by row". That stopped being true when the
+    // streaming path started counting from the bytes it emits; the streamed
+    // answer and streamed thinking are both checked against a vt100 replay. The
+    // DSR is kept as the cheap confirmation on a path where a wrong anchor
+    // strands the dialog over the output — the confirm tests assert *behaviour*
+    // (which option was chosen) and not the dialog's row, so a regression here
+    // would not be caught by them.
     let _ = out.cursor_row();
 
     let plan = build_confirm_plan(spec);

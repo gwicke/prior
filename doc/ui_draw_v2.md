@@ -597,22 +597,29 @@ A recommended order for what remains is at the end of the section.
    else, and keeping both halves in one step is what stops them drifting apart
    again.
 
-10. **Streaming still doesn't track rows** (promoted from the process
-    take-aways below; the prerequisite §4.5 needs). `stream_text` /
-    `stream_thinking` hand completed blocks to `Renderer::feed` and never call
-    `note_lines`, so `DrawCache::caret` drifts for the whole turn and the
-    entry DSRs in `read_input` / `ui::confirm` are the price. Fix sketch: count
-    at the write boundary rather than asking the upstream renderer — wrap the
-    writer in a thin counter that splits on `\n`, strips ANSI, and adds
-    `1 + (display_width - 1) / term_w` per segment, then `note_lines(count)`
-    once per `feed`. No dependency change: the count comes from the bytes, and
-    it is per *block*, not per delta, so the hot path barely notices (hoist the
-    width read into the already-available `current_term_width()` if the
-    `terminal::size()` inside `note_lines` shows up in a profile). Payoff: the
-    two entry DSRs become removable, and a mid-turn `frame_anchor()` unlocks
-    §4.5's fixed-bottom composition and a live status line.
-    **Verdict: only when a feature needs it** — nothing user-visible depends
-    on it today, so it should not preempt #5/#6.
+10. ~~**Streaming still doesn't track rows**~~ **DONE — the premise is stale,
+    and it has been for some time.** `stream_text` / `stream_thinking` no longer
+    hand completed blocks to `Renderer::feed` uncounted: every content write goes
+    through `with_content_writer`, which wraps the writer in a `RowCounter` and
+    calls `note_lines` with what the *bytes* moved the cursor by (row_accounting
+    §6 phase B). `streamed_answer_is_counted` and `streamed_thinking_is_counted`
+    compare the tracked row against a vt100 replay of the same bytes, so this is
+    checked against a terminal emulator and not merely against itself.
+    **The two entry DSRs are still here, for reasons that are not this one.**
+    `read_input`'s establishes the *starting* row — the cache begins at row 1
+    while the shell that launched picocode may have left its prompt further down,
+    and every byte of the greeter would be counted from the wrong place. The one
+    in `ui::confirm` is a cheap confirmation on a path where a wrong anchor
+    strands the dialog, and whose tests assert behaviour rather than position.
+    The other two re-anchors (Ctrl-Z resume, and the width-change `ESC[0J` +
+    replay) are about *foreign* writers and were never about row accounting.
+    All three comments that still blamed streaming drift have been corrected.
+
+    **What this did not buy, and it is worth being explicit:** the status bar's
+    hand-off at submit is *not* drift. The prompt-side bar is a row of the input
+    frame and the mid-turn bar is a content line, so the bar legitimately moves
+    from one to the other when the turn starts — §4.5's fixed-bottom composition
+    is what would make it continuous, and that is still open.
 
 11. **The painter does not wrap detail / table-header lines** (found while
     fixing #7 — same crate, same accounting). `render_logical_line` padded to
