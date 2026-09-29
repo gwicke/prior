@@ -448,3 +448,13 @@ fn count_spools(dir: &Path) -> usize {
         })
         .unwrap_or(0)
 }
+
+/// Bare `bsed` used to read expressions from stdin, so with nothing to read it
+/// looked like a hang — and `bsed` on its own is a thing people type.
+#[test]
+fn no_arguments_prints_usage_instead_of_blocking() {
+    let d = tempfile::tempdir().unwrap();
+    let o = run_in(d.path(), None, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("USAGE:"), "{}", stdout(&o));
+}

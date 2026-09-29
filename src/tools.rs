@@ -294,11 +294,31 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
 const SED_PREVIEW_BUDGET: usize = 50 * 1024;
 const SED_CAPTURE_SLACK: usize = 8 * 1024;
 
-/// Is the `bsed` binary on `$PATH`?
+/// The absolute path of the `bsed` binary, or `None` when it is not installed.
 ///
-/// The `sed` tool is advertised only when it is, because it is what executes the
-/// script. Probed once: a missing binary is a property of the install, not of
-/// the turn, and `cargo install --path .` places both binaries together.
+/// Resolved rather than passed by name, because the tool call goes through
+/// Bubblewrap, and the namespace does not inherit `$PATH` (it starts from a
+/// cleared environment) and only binds the workspace plus `/usr`, `/bin`,
+/// `/lib`, `/lib64`. A `cargo install --path .` puts `bsed` in `~/.cargo/bin`,
+/// which is neither on the namespace's default exec path nor bound — so by name
+/// it resolves on the host and then fails to exec inside the sandbox. The
+/// absolute path is also handed to the sandbox as an extra read-only bind, so the
+/// binary is actually reachable there.
+///
+/// Probed once: what is installed is a property of the machine, not of the turn.
+pub(crate) fn bsed_path() -> Option<std::path::PathBuf> {
+    static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let path = std::env::var_os("PATH")?;
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(BSED_BIN))
+                .find(|c| c.is_file())
+        })
+        .clone()
+}
+
+/// Whether the `sed` tool can run: the binary exists and answers `--version`.
 pub(crate) fn bsed_available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -348,8 +368,14 @@ pub async fn sed_preview(
 
     // Model-supplied text rides as ONE argv element: data, never structure. No
     // shell is involved, so a metacharacter in an expression is just a character.
+    let bin = bsed_path().ok_or_else(|| {
+        ToolError::Generic(format!(
+            "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
+             Install it with `cargo install --path .` (it ships alongside picocode)."
+        ))
+    })?;
     let argv = vec![
-        BSED_BIN.into(),
+        bin.to_string_lossy().to_string(),
         "preview".into(),
         "-c".into(),
         context.clamped().to_string(),
@@ -366,6 +392,7 @@ pub async fn sed_preview(
         &cfg,
         timeout,
         Some(SED_PREVIEW_BUDGET + SED_CAPTURE_SLACK),
+        std::slice::from_ref(&bin),
     )
     .await?;
 
@@ -567,7 +594,7 @@ pub(crate) fn sandbox_list_lines(dir: &str) -> Option<Vec<String>> {
     let cfg = sandbox_config();
     let mut cfg = (*cfg).clone()?;
     crate::sandbox_state::merge_into(&mut cfg);
-    let args = build_bwrap_args(&cfg, true).ok()?;
+    let args = build_bwrap_args(&cfg, true, &[]).ok()?;
 
     let output = std::process::Command::new("bwrap")
         .args(&args)
@@ -765,7 +792,7 @@ pub(crate) async fn run_sandboxed_ro(
     let cap = cfg.max_output_bytes();
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &[])?;
             // Stream merged stdout+stderr in bounded chunks (matches the shell
             // path: bwrap forwards stdio to inherited fds; stderr is merged in,
             // as `2>&1` would do). Output is capped to `cap` (configurable:
@@ -792,13 +819,15 @@ pub(crate) async fn run_sandboxed_ro_status(
     cfg: &SandboxConfig,
     timeout: Option<u64>,
     cap: Option<usize>,
+    extra_ro: &[PathBuf],
 ) -> Result<(String, Option<i32>), ToolError> {
     let argv = argv.to_vec();
     let cfg = cfg.clone();
+    let extra_ro = extra_ro.to_vec();
     let cap = cap.unwrap_or_else(|| cfg.max_output_bytes());
     let output =
         tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
-            let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true, &extra_ro)?;
             capture_bounded(expr, timeout, cap)
         })
         .await
@@ -1093,7 +1122,11 @@ fn memory_wrapped_target(
 /// capability isolation, and the sanitized environment. Callers append either
 /// the `sh -c` payload (shell path) or the program argv (direct path) after
 /// `--`.
-fn build_bwrap_args(cfg: &SandboxConfig, read_only: bool) -> Result<Vec<String>, ToolError> {
+fn build_bwrap_args(
+    cfg: &SandboxConfig,
+    read_only: bool,
+    extra_ro: &[PathBuf],
+) -> Result<Vec<String>, ToolError> {
     let cwd = std::env::current_dir().map_err(|e| ToolError::Io(e.to_string()))?;
     let home = dirs_home();
 
@@ -1111,6 +1144,19 @@ fn build_bwrap_args(cfg: &SandboxConfig, read_only: bool) -> Result<Vec<String>,
     binds.sort_by_key(|b| b.to.components().count());
 
     let mut args: Vec<String> = Vec::new();
+
+    // Extra read-only binds for programs we invoke by absolute path that live
+    // outside the workspace and the system directories — today just the `bsed`
+    // binary, which `cargo install` puts in `~/.cargo/bin`. Without this the
+    // namespace has no path to it at all: the environment starts cleared, so
+    // there is no `$PATH` to resolve the name by, and the bind is what makes the
+    // file itself exist inside. Read-only regardless of `read_only`: none of
+    // these is something a tool call should be able to rewrite.
+    for f in extra_ro {
+        args.push("--ro-bind".into());
+        args.push(f.to_string_lossy().to_string());
+        args.push(f.to_string_lossy().to_string());
+    }
 
     // Essential read-only system directories so the shell and common tools
     // (sh, ls, compilers, ...) can execute. These are read-only, so the host
@@ -1244,7 +1290,7 @@ fn build_bwrap_expr(
     cfg: &SandboxConfig,
     read_only: bool,
 ) -> Result<duct::Expression, ToolError> {
-    let mut args = build_bwrap_args(cfg, read_only)?;
+    let mut args = build_bwrap_args(cfg, read_only, &[])?;
 
     // The user command is a shell string, so it must run via `sh -c`. We use a
     // two-level shell: the outer `sh -c` `exec`s an inner `sh -c` that actually
@@ -1280,8 +1326,9 @@ fn build_bwrap_expr_argv(
     argv: &[String],
     cfg: &SandboxConfig,
     read_only: bool,
+    extra_ro: &[PathBuf],
 ) -> Result<duct::Expression, ToolError> {
-    let mut args = build_bwrap_args(cfg, read_only)?;
+    let mut args = build_bwrap_args(cfg, read_only, extra_ro)?;
     // `false`: no shell is involved, so the `ulimit` fallback cannot apply;
     // when `prlimit` is absent the cap is simply skipped (prior behavior).
     let post = memory_wrapped_target(cfg.memory_mb, argv.to_vec(), false);
@@ -2191,9 +2238,53 @@ mod edit_file_tests {
         }
     }
 
+    /// The sandbox mounts a scratch tmpfs over `/tmp`, which shadows the
+    /// read-only bind of the working directory when the two overlap — so a test
+    /// whose cwd is a `/tmp` tempdir cannot see its own files inside the
+    /// namespace. Point `TMPDIR` inside the repo for these tests, which is
+    /// bound. (A real project under `/tmp` hits the same shadowing with `rg` and
+    /// `bash`; it is a property of the sandbox, not of the `sed` tool.)
+    fn tmpdir_inside_repo() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TMPDIR", &dir);
+    }
+
+    /// The regression that matters for anyone who installed with
+    /// `cargo install --path .`: `bsed` lands in `~/.cargo/bin`, which is
+    /// neither on the namespace's default exec path (the environment starts
+    /// cleared, so there is no `$PATH`) nor bound. Resolving the absolute path is
+    /// only half the fix — the file has to be bound in, or `execvp` still fails.
+    #[test]
+    fn bsed_is_resolved_and_bound_into_the_namespace() {
+        let Some(bin) = super::bsed_path() else {
+            eprintln!("skipping: bsed is not installed");
+            return;
+        };
+        assert!(
+            bin.is_absolute(),
+            "bsed must be resolved to an absolute path"
+        );
+
+        let cfg = crate::config::SandboxConfig::default().with_defaults();
+        let want = bin.to_string_lossy().to_string();
+        let bound = |args: &[String], flag: &str| {
+            args.windows(3)
+                .filter(|w| w[0] == flag)
+                .any(|w| w[1] == want && w[2] == want)
+        };
+        let args = build_bwrap_args(&cfg, true, std::slice::from_ref(&bin)).expect("args");
+        assert!(bound(&args, "--ro-bind"), "bsed must be bound: {args:?}");
+        // Read-only even in a writable namespace: a tool call has no business
+        // rewriting the binary it is running.
+        let rw = build_bwrap_args(&cfg, false, std::slice::from_ref(&bin)).expect("args");
+        assert!(!bound(&rw, "--bind"), "bsed must never be writable: {rw:?}");
+    }
+
     #[tokio::test]
     #[serial]
     async fn sed_preview_is_read_only_and_anchors_every_block() {
+        tmpdir_inside_repo();
         // End-to-end through the real tool: path policy -> argv -> `bsed`. The
         // sandbox is not configured here (CwdGuard clears it), which exercises
         // the same code path minus the namespace, so the test runs anywhere.
@@ -2246,6 +2337,7 @@ mod edit_file_tests {
     #[tokio::test]
     #[serial]
     async fn sed_preview_reports_a_rejected_expression_without_failing() {
+        tmpdir_inside_repo();
         // A refused expression is the model's to fix, so it comes back as a
         // normal result (exit 2), not as a tool error.
         let _cwd = CwdGuard::new();

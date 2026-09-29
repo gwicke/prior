@@ -15,7 +15,7 @@
 //! Exit codes are a contract with the caller: `0` success, `2` the caller's
 //! problem (a rejected expression, an unresolvable block), `1` ours.
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -111,7 +111,6 @@ pub fn main() -> ExitCode {
 /// stdout is a pipe the caller is already capturing the bytes, so we leave the
 /// filesystem alone.
 fn emit(body: &str) {
-    use std::io::IsTerminal;
     print!("{body}");
     if !should_spool(body, std::io::stdout().is_terminal()) {
         return;
@@ -174,7 +173,9 @@ enum Failure {
 
 fn run(args: &[String]) -> Result<String, Failure> {
     match args.first().map(String::as_str) {
-        None => preview(&[]),
+        // No arguments at all: print usage rather than block forever waiting for
+        // expressions on stdin, which is what `bsed` on its own used to do.
+        None => Ok(USAGE.to_string()),
         Some("preview") => preview(&args[1..]),
         Some("apply") => apply(&args[1..]),
         Some("-h") | Some("--help") | Some("help") => Ok(USAGE.to_string()),
@@ -228,6 +229,13 @@ fn preview(args: &[String]) -> Result<String, Failure> {
     // file comes from -p, else from stdin. Both from stdin is ambiguous, so it
     // is a usage error rather than a guess.
     let (expressions, from_stdin_script) = if script.is_empty() {
+        // Nothing on the command line: take the script from stdin, but not on a
+        // terminal, where that just looks like a hang.
+        if std::io::stdin().is_terminal() {
+            return Err(Failure::Usage(
+                "no sed expressions given. Usage: bsed preview -p FILE 's/a/b/'".into(),
+            ));
+        }
         (read_stdin()?, true)
     } else {
         (script.join("\n"), false)

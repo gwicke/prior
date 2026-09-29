@@ -404,6 +404,18 @@ identical to the grep/`rg` path:
   excludes it, `bsed` reports a clear error: *file not visible inside the sandbox
   — add it to `[tool_config.bash.sandbox]` `ro` bindings*. (`grep` has the same
   constraint today.)
+* The *binary* has the same visibility problem as the file, and for a sharper
+  reason: the namespace starts from a cleared environment, so there is no `$PATH`
+  to resolve `bsed` by even if the host has one, and the default bindings cover
+  only the workspace plus `/usr`, `/bin`, `/lib`, `/lib64` — not
+  `~/.cargo/bin`, where `cargo install --path .` puts it. Passing the bare name
+  therefore works on a developer's machine (where a `bsed` may be on `/usr`) and
+  fails for everyone who installed it the documented way. Resolve the absolute
+  path once via `$PATH` on the host (`bsed_path`), pass that in argv, and add it
+  to the namespace as an extra `--ro-bind` at its own path — read-only even in a
+  writable namespace, since a tool call has no business rewriting the binary it
+  is running. `build_bwrap_args` takes `extra_ro: &[PathBuf]` for this; the bash
+  and grep paths pass `&[]`.
 * Output cap: `capture_bounded` truncates at `max_output_bytes` (default 20 KiB),
   which is *below* our 50 KB preview budget. Pass an explicit cap of
   `budget + 8 KiB` slack and treat a short read as an error rather than parsing a

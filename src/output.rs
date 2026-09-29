@@ -794,20 +794,26 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
             (format!("$ {}", cmd), Vec::new())
         }
         "sed" | "sed_preview" => {
-            // One line: the expressions are short, and the *result* is what the
-            // human wants to look at (the body below renders it as a diff).
+            // Like `bash`, show what was asked for: the path, then the script on
+            // one line, `$`-prefixed so it reads as a command. The long "review
+            // these and pass them to `edit`" sentence stays in the tool result,
+            // where the model reads it — putting it in the panel spent a human's
+            // screen on instructions meant for the model.
             let path = get_str("path").unwrap_or("");
-            let exprs = get_str("expressions").unwrap_or("").trim();
-            let n = exprs.lines().filter(|l| !l.trim().is_empty()).count();
+            let one_line = get_str("expressions")
+                .unwrap_or("")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            let mut label = format!("sed {path}");
+            if !one_line.is_empty() {
+                label.push_str(&format!("  $ {}", truncate(&one_line, 56)));
+            }
             // The body needs the *result* (the blocks), which this function does
             // not have; `display_tool_result` renders those instead.
-            (
-                format!(
-                    "sed {path} ({n} expression{})",
-                    if n == 1 { "" } else { "s" }
-                ),
-                Vec::new(),
-            )
+            (label, Vec::new())
         }
         s if s.starts_with("grep") => {
             // Grep tool: show pattern (from "pattern" or "pat") and path.
@@ -974,15 +980,24 @@ fn sed_preview_body(result: &str) -> Option<Vec<String>> {
     let parsed = crate::edit_blocks::parse_blocks(result).ok()?;
 
     let mut out: Vec<String> = Vec::new();
-    // The banner is everything before the first block header.
+    let mut summary = String::new();
+    // The banner is model-facing; only the parts a human needs are lifted out —
+    // the counts as a closing line, and any NOTE, which is a warning about what
+    // is *missing* from the preview and must not be scrolled past.
     if let Some(first) = result.find("@@@OLD") {
         for line in result[..first].lines() {
             let t = line.trim();
-            if !t.is_empty() {
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with("NOTE:") {
                 out.push(t.to_string());
+            } else if summary.is_empty() {
+                // "sed preview: 3 blocks for src/x.rs (1 expression). Review ..."
+                // → "3 blocks in src/x.rs from 1 expression"
+                summary = short_banner(t);
             }
         }
-        out.push(String::new());
     }
 
     for e in &parsed.edits {
@@ -997,12 +1012,60 @@ fn sed_preview_body(result: &str) -> Option<Vec<String>> {
             out.push(format!("+ {line}"));
         }
     }
+
+    if !summary.is_empty() {
+        out.push(String::new());
+        out.push(summary);
+    }
     Some(out)
+}
+
+/// Condense the model-facing banner into one line for a human.
+///
+/// The banner is written for the model — it ends with an instruction about
+/// passing the blocks to `edit`, which is noise to someone reading a panel —
+/// so keep the counts and the file, drop the instruction.
+fn short_banner(banner: &str) -> String {
+    // "sed preview: 3 blocks for src/x.rs (1 expression). Review the blocks ..."
+    let head = banner
+        .split(". ")
+        .next()
+        .unwrap_or(banner)
+        .trim_end_matches('.');
+    let head = head.strip_prefix("sed preview: ").unwrap_or(head);
+    let (counts, file) = match head.find(" for ") {
+        Some(i) => (&head[..i], head[i + 5..].trim()),
+        None => (head, ""),
+    };
+    // The parenthetical is moved out of the path rather than left to be printed
+    // twice.
+    let (file, exprs) = match file.split_once(" (") {
+        Some((f, rest)) => (f, rest.strip_suffix(')').unwrap_or(rest)),
+        None => (file, ""),
+    };
+    let mut out = String::new();
+    if !counts.is_empty() {
+        out.push_str(counts);
+        // "3 blocks for x" → "3 blocks in x"; keep the counts wording otherwise.
+        if !file.is_empty() {
+            out.push_str(" in");
+        }
+    }
+    if !file.is_empty() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(file);
+    }
+    if !exprs.is_empty() {
+        out.push_str(&format!(", from {exprs}"));
+    }
+    out
 }
 
 #[cfg(test)]
 mod sed_preview_body_tests {
-    use super::sed_preview_body;
+    use super::{get_preview, sed_preview_body, short_banner};
 
     const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `edits` argument.
 src/x.rs:5
@@ -1025,8 +1088,13 @@ src/x.rs:9
     fn renders_blocks_as_a_diff_with_anchors() {
         let lines = sed_preview_body(RESULT).expect("body");
         let joined = lines.join("\n");
-        // The banner survives, because it is what says how many blocks there are.
-        assert!(joined.contains("sed preview: 2 blocks"), "{joined}");
+        // The counts survive as a short closing line; the instruction telling the
+        // model to pass the blocks to `edit` is not something a human needs.
+        assert!(
+            joined.contains("2 blocks in src/x.rs, from 1 expression"),
+            "{joined}"
+        );
+        assert!(!joined.contains("pass them to the `edit` tool"), "{joined}");
         // Each block becomes a -/+ pair under its anchor.
         assert!(joined.contains("@@ -5,1 +5,1 @@"), "{joined}");
         assert!(joined.contains("-     run();"), "{joined}");
@@ -1038,11 +1106,73 @@ src/x.rs:9
     }
 
     #[test]
+    fn notes_survive_because_they_say_what_is_missing() {
+        // `bsed` emits NOTEs straight after the banner, before the first block
+        // (see the banner builder in crates/bsed/src/lib.rs).
+        let note = "NOTE: only 37 of 152 blocks are shown. The other 115 are NOT included.";
+        let with_note = RESULT.replacen("\nsrc/x.rs:5", &format!("\n{note}\nsrc/x.rs:5"), 1);
+        assert!(
+            with_note.contains(note),
+            "fixture must place the note in the banner"
+        );
+        let joined = sed_preview_body(&with_note).expect("body").join("\n");
+        assert!(joined.contains("only 37 of 152 blocks"), "{joined}");
+        // It is kept, and it is not mistaken for the one-line summary.
+        assert!(
+            joined.contains("2 blocks in src/x.rs, from 1 expression"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn short_banner_drops_the_model_instruction() {
+        assert_eq!(
+            short_banner(
+                "sed preview: 3 blocks for src/x.rs (2 expressions). Review the blocks below, \
+                 then pass them to the `edit` tool as its `edits` argument."
+            ),
+            "3 blocks in src/x.rs, from 2 expressions"
+        );
+        // A no-change banner has nothing to condense.
+        assert_eq!(
+            short_banner("no lines matched \u{2014} src/x.rs is unchanged by this 1 expression."),
+            "no lines matched \u{2014} src/x.rs is unchanged by this 1 expression"
+        );
+    }
+
+    #[test]
+    fn the_label_carries_the_expressions_on_one_line() {
+        let args = serde_json::json!({
+            "path": "./test_engine.rs",
+            "expressions": "s/pub fn /fn /\n    s/^    /        /",
+        });
+        let (label, extra) = get_preview("sed", &args);
+        assert!(label.starts_with("sed ./test_engine.rs  $ "), "{label}");
+        // Newlines collapse, so the whole script stays on the label's one line.
+        assert!(!label.contains('\n'), "{label}");
+        assert!(
+            label.contains("s/pub fn /fn /; s/^    /        /"),
+            "{label}"
+        );
+        assert!(extra.is_empty(), "{extra:?}");
+    }
+
+    #[test]
+    fn a_long_script_is_truncated_rather_than_wrapping_the_panel() {
+        let args = serde_json::json!({
+            "path": "x.rs",
+            "expressions": format!("s/{}/y/", "a".repeat(200)),
+        });
+        let (label, _) = get_preview("sed", &args);
+        assert!(label.ends_with("..."), "{label}");
+        assert!(label.lines().count() == 1, "{label}");
+    }
+
+    #[test]
     fn leaves_other_results_alone() {
+        // Not a sed preview: the caller falls through to the generic renderer.
         assert!(sed_preview_body("Replaced 1 block(s) in src/x.rs").is_none());
         assert!(sed_preview_body("").is_none());
-        // An unparseable blob is not rendered as if it were a preview.
-        assert!(sed_preview_body("@@@OLD\nunterminated").is_none());
     }
 }
 
@@ -1944,7 +2074,12 @@ impl Output for ConsoleOutput {
         // `-`/`+` lines rather than @@@ markers; the model still gets the
         // verbatim blob in its tool message.
         if let Some(lines) = sed_preview_body(result) {
-            self.tool_panel(&lines.join("\n"), true, true);
+            // Not an error: a preview is a *proposal*, and colouring the whole
+            // body red (as the edit-failure path does) says the opposite. The
+            // `- `/`+ ` prefixes carry the red/green, matching an applied edit.
+            for line in &lines {
+                self.tool_panel(line, false, true);
+            }
             return;
         }
 
