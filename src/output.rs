@@ -472,7 +472,7 @@ pub struct ConsoleOutput {
     /// blocks with a blank line. A flag written by hand disagrees with the
     /// screen at exactly those points, and the boundary then emits a second
     /// blank — which is the class of bug the separator matrix pinned.
-    stream_tail: Mutex<StreamTail>,
+    stream_tail: StreamTail,
     /// Stores the previous writer during a capture session (see
     /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
     saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
@@ -1235,7 +1235,7 @@ impl ConsoleOutput {
             show_reasoning,
 
             last_tool: Mutex::new(None),
-            stream_tail: Mutex::new(StreamTail::default()),
+            stream_tail: StreamTail::new(),
             saved_writer: Mutex::new(None),
         }
     }
@@ -1479,17 +1479,16 @@ impl ConsoleOutput {
         F: FnOnce(&mut dyn io::Write) -> T,
     {
         let mut out = self.writer.lock().unwrap();
-        // Seeded with the stream's tail and read back after, so the
-        // blank-line state spans the whole content stream rather than one
-        // block — the counter is the only thing that sees the bytes.
-        let mut counter = RowCounter::with_tail(&mut **out, width, self.stream_tail());
+        // The counter updates the shared tail per byte, so a boundary
+        // *inside* this block (a committed paragraph before the block that
+        // follows it) sees the state those bytes produced, not the state from
+        // before the block.
+        let mut counter = RowCounter::new(&mut **out, width, &self.stream_tail);
         let r = f(&mut counter);
         let rows = counter.rows();
         let _ = counter.flush();
-        let tail = counter.tail();
         drop(counter);
         drop(out);
-        *self.stream_tail.lock().unwrap() = tail;
         // Zero rows means nothing moved, and a frame stays live.
         if rows > 0 {
             self.note_lines(rows);
@@ -1524,11 +1523,6 @@ impl ConsoleOutput {
         self.write_content(format!("{}\n", style("─".repeat(width)).dim()).as_bytes());
     }
 
-    /// The content stream's blank-line tail, as measured from the bytes.
-    fn stream_tail(&self) -> StreamTail {
-        *self.stream_tail.lock().unwrap()
-    }
-
     /// Emit the blank line that separates this block from what came before —
     /// unless the stream already ends with one.
     ///
@@ -1546,7 +1540,36 @@ impl ConsoleOutput {
 
     /// Does the next block need a blank line above it?
     fn needs_boundary(&self) -> bool {
-        !self.stream_tail().ends_blank()
+        !self.stream_tail.ends_blank()
+    }
+
+    /// Start the renderers fresh, so the next block either of them renders
+    /// carries no gap of its own.
+    ///
+    /// A long-lived `Renderer` remembers that it has written something
+    /// (`wrote_any`) and opens its next block with a blank line. Inside one
+    /// document that is right; at a boundary the *host* already separated it is
+    /// a second blank. `end_response_segment` has always reset the answer
+    /// renderer for this reason; the tool boundary needs it for the *thinking*
+    /// renderer, which is where the doubled blank came from — a turn with
+    /// reasoning before the tool left that renderer mid-document, and its next
+    /// block (the post-tool reasoning) arrived with a gap of its own.
+    ///
+    /// The renderers hold no state the parser does not, so replacing them is
+    /// free: the parser keeps the document, the renderer starts a block.
+    fn reset_renderer_gaps(&self) {
+        let width = current_term_width();
+        let mut renderer = self.renderer.lock().unwrap();
+        *renderer = Renderer::new(answer_theme(), width);
+        let mut trenderer = self.thinking_renderer.lock().unwrap();
+        *trenderer = Renderer::new(Theme::dimmed(), width);
+    }
+
+    /// Close a tool block: the blank line above whatever comes next, and the
+    /// renderers starting fresh for it.
+    fn end_tool_block(&self) {
+        self.boundary();
+        self.reset_renderer_gaps();
     }
 
     /// [`Self::boundary`] for inside a [`Self::with_content_writer`] block,
@@ -1994,7 +2017,7 @@ impl Output for ConsoleOutput {
                 v.get("model_view").and_then(|x| x.as_str()),
             ) {
                 self.tool_panel(ui, true, true);
-                self.boundary();
+                self.end_tool_block();
                 return;
             }
         }
@@ -2045,7 +2068,7 @@ impl Output for ConsoleOutput {
 
         if lines.is_empty() {
             self.tool_panel("(empty)", false, true);
-            self.boundary();
+            self.end_tool_block();
             return;
         }
 
@@ -2097,7 +2120,7 @@ impl Output for ConsoleOutput {
                             true,
                         );
                     }
-                    self.boundary();
+                    self.end_tool_block();
                     return;
                 }
             }
@@ -2166,7 +2189,7 @@ impl Output for ConsoleOutput {
                 true,
             );
         }
-        self.boundary();
+        self.end_tool_block();
     }
 
     fn get_user_input(&self) -> String {
@@ -3640,8 +3663,79 @@ mod tests {
         );
     }
 
+    /// A tool block followed by reasoning showed **two** blank lines: the host
+    /// wrote the boundary blank, and the long-lived thinking renderer — which
+    /// remembered that it had written something — opened its next block with a
+    /// gap of its own. `end_tool_block` resets the renderers, so the host's
+    /// blank is the only one. Reasoning *before* the tool is what leaves the
+    /// renderer mid-document; without it the gap never fires and the bug hides,
+    /// which is why this case exists.
     #[test]
-    #[serial_test::serial]
+    #[serial]
+    fn one_blank_line_between_a_tool_block_and_reasoning() {
+        for (name, steps) in [
+            (
+                "tool, result, say, end",
+                vec![
+                    Step::Say("First.\n\n"),
+                    Step::SegmentEnd,
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    Step::Say("Done.\n\n"),
+                    Step::ResponseEnd,
+                ],
+            ),
+            (
+                "tool, result, think, say, end",
+                vec![
+                    Step::Say("First.\n\n"),
+                    Step::SegmentEnd,
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    Step::Think("Weighing again.\n\n"),
+                    Step::Say("Done.\n\n"),
+                    Step::ResponseEnd,
+                ],
+            ),
+            (
+                "tool, result, PENDING think, say, end",
+                vec![
+                    Step::Say("First.\n\n"),
+                    Step::SegmentEnd,
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    // No trailing newlines: the paragraph is still open when
+                    // the answer arrives, so it is committed at the boundary.
+                    Step::Think("Weighing again."),
+                    Step::Say("Done.\n\n"),
+                    Step::ResponseEnd,
+                ],
+            ),
+            (
+                "think, say, tool, result, think, say, end",
+                vec![
+                    // Reasoning *before* the tool: the thinking renderer has
+                    // written something, so it will want a leading gap for the
+                    // next block it renders.
+                    Step::Think("Before the tool.\n\n"),
+                    Step::Say("Running it.\n\n"),
+                    Step::SegmentEnd,
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    Step::Think("After the tool.\n\n"),
+                    Step::Say("Done.\n\n"),
+                    Step::ResponseEnd,
+                ],
+            ),
+        ] {
+            for chunk in Chunking::all() {
+                assert_no_doubled_blank(name, &steps, chunk);
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
     fn reasoning_list_before_answer_has_blank_line() {
         // Regression for two related bugs (see `doc/reasoning_order_opus.md`
         // §4 and §10):
