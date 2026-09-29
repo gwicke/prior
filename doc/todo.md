@@ -1,3 +1,8 @@
+- [x] `sed` preview tool (`bsed` binary): a preview-only GNU sed that emits
+  line-anchored `@@@OLD`/`@@@NEW`/`@@@END` blocks for the `edit` tool, so the
+  model never runs `sed -i` on uncommitted work. Design, decisions and the
+  corrections the build forced in ./doc/bsed.md. Block-edit core extracted to
+  `crates/blockedit`; the tool runs in `crates/bsed` + `src/bin/bsed.rs`.
 - [x] bash tool error return: report error code
 - [x] restore model on `/session <id> resume` (now via pre-fill, not silent)
 - [x] Compaction unification (Phase 7)

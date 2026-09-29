@@ -11,6 +11,8 @@ PROJECT_NAME="picocode"
 BINARY_NAME="picocode"
 GITHUB_OWNER="jondot"
 GITHUB_REPO="picocode"
+# Shipped alongside the main binary; a missing one only disables a tool.
+OPTIONAL_BINARIES="bsed"
 # ============================================================================
 
 # Some Linux distributions don't set HOME
@@ -152,43 +154,53 @@ install_binary() {
             ;;
     esac
     
-    # Verify binary exists
-    if [ ! -f "$BINARY_NAME" ]; then
-        echo "Error: Binary ${BINARY_NAME} not found in archive"
-        exit 1
-    fi
-    
-    # Make binary executable
-    chmod +x "$BINARY_NAME"
-    
     # Create installation directory if it doesn't exist
-    if [ ! -d "$INSTALL_DIR" ]; then
-        echo "Creating directory: $INSTALL_DIR"
-        mkdir -p "$INSTALL_DIR"
+    if [ ! -d "${INSTALL_DIR}" ]; then
+        echo "Creating directory: ${INSTALL_DIR}"
+        mkdir -p "${INSTALL_DIR}"
     fi
-    
-    # Install binary
-    echo "Installing ${BINARY_NAME} to ${INSTALL_DIR}..."
-    if ! mv "$BINARY_NAME" "$INSTALL_DIR/${BINARY_NAME}"; then
-        echo "Error: Failed to install ${BINARY_NAME} to ${INSTALL_DIR}"
-        echo "You may need to run with sudo: sudo sh -s -- -b ${INSTALL_DIR}"
-        exit 1
-    fi
-    
+
+    # ${BINARY_NAME} is required. The optional companions (today just `bsed`,
+    # the block-edit sed behind the agent's `sed` tool) only disable a tool when
+    # missing, so they are a warning rather than a failed install.
+    for name in "$BINARY_NAME" ${OPTIONAL_BINARIES}; do
+        if [ ! -f "$name" ]; then
+            if [ "$name" = "$BINARY_NAME" ]; then
+                echo "Error: Binary ${BINARY_NAME} not found in archive"
+                exit 1
+            fi
+            echo "Warning: ${name} is not in this archive; skipping (this only disables the"
+            echo "         matching agent tool)."
+            continue
+        fi
+        chmod +x "$name"
+        echo "Installing ${name} to ${INSTALL_DIR}..."
+        if ! mv "$name" "${INSTALL_DIR}/${name}"; then
+            echo "Error: Failed to install ${name} to ${INSTALL_DIR}"
+            echo "You may need to run with sudo: sudo sh -s -- -b ${INSTALL_DIR}"
+            exit 1
+        fi
+    done
+
     # Verify installation
-    if command -v "$BINARY_NAME" >/dev/null 2>&1; then
-        INSTALLED_VERSION=$("$BINARY_NAME" --version 2>/dev/null || echo "unknown")
-        echo "Successfully installed ${BINARY_NAME} to ${INSTALL_DIR}"
-        echo "Version: ${INSTALLED_VERSION}"
-    else
-        echo "Successfully installed ${BINARY_NAME} to ${INSTALL_DIR}"
-        echo ""
-        echo "Warning: ${BINARY_NAME} is not in your PATH."
-        echo "To use it, add ${INSTALL_DIR} to your PATH:"
-        echo ""
-        echo "  export PATH=\"\$PATH:${INSTALL_DIR}\""
-        echo ""
-    fi
+    for name in "$BINARY_NAME" ${OPTIONAL_BINARIES}; do
+        if [ ! -f "${INSTALL_DIR}/${name}" ]; then
+            continue
+        fi
+        if command -v "$name" >/dev/null 2>&1; then
+            INSTALLED_VERSION=$("${INSTALL_DIR}/${name}" --version 2>/dev/null | head -1)
+            echo "Successfully installed ${name} to ${INSTALL_DIR}"
+            [ -n "$INSTALLED_VERSION" ] && echo "Version: ${INSTALLED_VERSION}"
+        else
+            echo "Successfully installed ${name} to ${INSTALL_DIR}"
+            echo ""
+            echo "Warning: ${name} is not in your PATH."
+            echo "To use it, add ${INSTALL_DIR} to your PATH:"
+            echo ""
+            echo "  export PATH=\"\$PATH:${INSTALL_DIR}\""
+            echo ""
+        fi
+    done
 }
 
 # Main execution

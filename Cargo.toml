@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/slashdot_menu"]
+members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]
 resolver = "2"
 
 [package]
@@ -20,6 +20,8 @@ exclude = ["picocode.gif", ".github/"]
 [dependencies]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 slashdot_menu = { path = "crates/slashdot_menu" }
+blockedit = { path = "crates/blockedit" }
+bsed = { path = "crates/bsed" }
 rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
 tokio = { version = "1.0", features = ["full"] }
@@ -70,6 +72,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "picocode"
 path = "src/main.rs"
+
+# The `bsed` binary is a two-line shim over the bsed crate (src/bin/bsed.rs)
+# so that `cargo install --path .` installs both. The agent only ever runs
+# `bsed preview`; see doc/bsed.md.
+[[bin]]
+name = "bsed"
+path = "src/bin/bsed.rs"
 
 # Test-only binary used by the confirm_raw_mode integration test.
 # Gated behind `test-utils` so `cargo install --path .` does not install it.

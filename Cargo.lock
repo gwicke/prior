@@ -190,6 +190,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "blockedit"
+version = "0.1.0"
+dependencies = [
+ "path-clean",
+ "schemars",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "similar",
+]
+
+[[package]]
+name = "bsed"
+version = "0.1.0"
+dependencies = [
+ "blockedit",
+ "globset",
+ "ignore",
+ "portable-pty",
+ "sed-rs",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,6 +307,7 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+ "terminal_size",
 ]
 
 [[package]]
@@ -1624,6 +1652,8 @@ name = "picocode"
 version = "0.6.0"
 dependencies = [
  "async-trait",
+ "blockedit",
+ "bsed",
  "chrono",
  "clap",
  "codewandler-markdown-stream",
@@ -2306,6 +2336,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sed-rs"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf04c4dee52cf554352c6e60408d0161d207ad37a3deb5ae2991676088fc5bd4"
+dependencies = [
+ "clap",
+ "regex",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2737,6 +2779,16 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

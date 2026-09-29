@@ -793,6 +793,22 @@ fn get_preview(name: &str, args: &Value) -> (String, Vec<String>) {
                 .trim();
             (format!("$ {}", cmd), Vec::new())
         }
+        "sed" | "sed_preview" => {
+            // One line: the expressions are short, and the *result* is what the
+            // human wants to look at (the body below renders it as a diff).
+            let path = get_str("path").unwrap_or("");
+            let exprs = get_str("expressions").unwrap_or("").trim();
+            let n = exprs.lines().filter(|l| !l.trim().is_empty()).count();
+            // The body needs the *result* (the blocks), which this function does
+            // not have; `display_tool_result` renders those instead.
+            (
+                format!(
+                    "sed {path} ({n} expression{})",
+                    if n == 1 { "" } else { "s" }
+                ),
+                Vec::new(),
+            )
+        }
         s if s.starts_with("grep") => {
             // Grep tool: show pattern (from "pattern" or "pat") and path.
             let pat = get_str("pattern").or_else(|| get_str("pat")).unwrap_or("");
@@ -943,6 +959,91 @@ fn edit_preview(path: &str, edits: &[EditOp]) -> (Option<String>, Vec<String>) {
     })();
 
     (range, diff)
+}
+
+/// Render a `sed` preview result as diff lines, or `None` if it is not one.
+///
+/// The banner is kept verbatim (it is the part that says how many blocks are
+/// shown, whether growth ran, and what was *not* included) and each block's
+/// contents become `-`/`+` pairs under a hunk header carrying its anchor. An
+/// empty `NEW` — a deletion — simply has no `+` lines.
+fn sed_preview_body(result: &str) -> Option<Vec<String>> {
+    if !result.contains("@@@OLD") {
+        return None;
+    }
+    let parsed = crate::edit_blocks::parse_blocks(result).ok()?;
+
+    let mut out: Vec<String> = Vec::new();
+    // The banner is everything before the first block header.
+    if let Some(first) = result.find("@@@OLD") {
+        for line in result[..first].lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+        out.push(String::new());
+    }
+
+    for e in &parsed.edits {
+        let old_n = e.old_text.lines().count().max(1) as u64;
+        let new_n = e.new_text.lines().count().max(1) as u64;
+        let at = e.start_line.unwrap_or(0);
+        out.push(format!("@@ -{at},{old_n} +{at},{new_n} @@"));
+        for line in e.old_text.lines() {
+            out.push(format!("- {line}"));
+        }
+        for line in e.new_text.lines() {
+            out.push(format!("+ {line}"));
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod sed_preview_body_tests {
+    use super::sed_preview_body;
+
+    const RESULT: &str = "sed preview: 2 blocks for src/x.rs (1 expression). Review the blocks below, then pass them to the `edit` tool as its `edits` argument.
+src/x.rs:5
+@@@OLD
+    run();
+@@@NEW
+    walk();
+@@@END
+
+src/x.rs:9
+@@@OLD
+    drop();
+    // tail
+@@@NEW
+    // tail
+@@@END
+";
+
+    #[test]
+    fn renders_blocks_as_a_diff_with_anchors() {
+        let lines = sed_preview_body(RESULT).expect("body");
+        let joined = lines.join("\n");
+        // The banner survives, because it is what says how many blocks there are.
+        assert!(joined.contains("sed preview: 2 blocks"), "{joined}");
+        // Each block becomes a -/+ pair under its anchor.
+        assert!(joined.contains("@@ -5,1 +5,1 @@"), "{joined}");
+        assert!(joined.contains("-     run();"), "{joined}");
+        assert!(joined.contains("+     walk();"), "{joined}");
+        assert!(joined.contains("@@ -9,2 +9,1 @@"), "{joined}");
+        // A deletion keeps its removed lines and has no additions.
+        assert!(joined.contains("-     drop();"), "{joined}");
+        assert!(!joined.contains("+     drop();"), "{joined}");
+    }
+
+    #[test]
+    fn leaves_other_results_alone() {
+        assert!(sed_preview_body("Replaced 1 block(s) in src/x.rs").is_none());
+        assert!(sed_preview_body("").is_none());
+        // An unparseable blob is not rendered as if it were a preview.
+        assert!(sed_preview_body("@@@OLD\nunterminated").is_none());
+    }
 }
 
 /// Build a refined unified-diff preview of `old -> new`.
@@ -1836,6 +1937,15 @@ impl Output for ConsoleOutput {
                 self.tool_panel(ui, true, true);
                 return;
             }
+        }
+
+        // A `sed` preview result is a block blob behind a one-line banner.
+        // Render the blocks as a diff so the human reviewing the panel reads
+        // `-`/`+` lines rather than @@@ markers; the model still gets the
+        // verbatim blob in its tool message.
+        if let Some(lines) = sed_preview_body(result) {
+            self.tool_panel(&lines.join("\n"), true, true);
+            return;
         }
 
         // Check for successful edit_file result and render a diff preview

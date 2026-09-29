@@ -27,6 +27,7 @@ const CANONICAL_NAMES: &[(&str, &str)] = &[
     ("grep_text", "grep"),
     ("list_dir", "ls"),
     ("glob_files", "find"),
+    ("sed_preview", "sed"),
 ];
 
 /// Rename argument fields in `args` from old/pi names to canonical names.
@@ -60,6 +61,11 @@ fn normalize_args_in_place(name: &str, args: &mut serde_json::Value) {
                 obj.insert("pattern".into(), pat);
             }
             obj.remove("limit");
+        }
+        "sed" => {
+            // No legacy field names, but drop the `context` we normalize away
+            // so a replayed call does not look like a different edit.
+            obj.remove("context");
         }
         "edit" => {
             // Canonical is `edits:[{oldText,newText}]` (pi-compatible). Fold the
