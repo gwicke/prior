@@ -2116,6 +2116,23 @@ impl Output for ConsoleOutput {
 
         let is_error =
             unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");
+
+        // An `edit` argument error is one self-correcting message with a fixed
+        // `Expected:` / `Actual:` shape. Show it as two columns so the correct
+        // line and the line the model actually sent are on the same row, and so
+        // the block is half as tall (`Actual:` no longer falls below the fold).
+        // The *model* still receives the vertical form — see arg_error_view.
+        {
+            let width = term_width();
+            let avail = width.saturating_sub(1).max(1);
+            if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
+                for line in &table {
+                    self.tool_panel(line, false, true);
+                }
+                return;
+            }
+        }
+
         let lines: Vec<_> = cleaned.lines().collect();
 
         if lines.is_empty() {
@@ -3407,6 +3424,53 @@ mod tests {
         assert!(colored.contains('\x1b'), "color path must emit ANSI");
         // non-color path returns the line untouched
         assert_eq!(highlight_code_fg("let x = 1;", "rust", false), "let x = 1;");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn edit_arg_error_renders_as_two_columns() {
+        // The panel shows the model's correction as a table so the correct line
+        // and the line the model sent sit on the same row, and the block is half
+        // as tall (the model-facing form stays vertical — see arg_error_view).
+        let msg = "failed to parse tool arguments: Invalid edit tool arguments: \
+Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on its line.\n\
+\n\
+Expected:\n\
+some/path:1234\n\
+@@@OLD\n\
+old text\n\
+@@@NEW\n\
+new text\n\
+@@@END\n\
+\n\
+Actual:\n\
+src/x.rs\n\
+@@@OLD\n\
+… (2 lines elided) …\n\
+@@@NEW\n\
+… (2 lines elided) …\n\
+@@@NEWEND";
+        let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
+        out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
+        out.begin_capture_inner();
+        out.display_tool_result(msg);
+        let bytes = out.end_capture_inner();
+        let text = strip_ansi(&String::from_utf8_lossy(&bytes));
+
+        // The redundant prefixes are gone.
+        assert!(!text.contains("failed to parse tool arguments"), "{text}");
+        assert!(!text.contains("Invalid edit tool arguments"), "{text}");
+        // The two markers that differ share a row. Require the gutter so the
+        // problem statement — which also quotes the bad marker — is not mistaken
+        // for a table row.
+        let row = text
+            .lines()
+            .find(|l| l.contains('|') && l.contains("@@@NEWEND"))
+            .expect("row with the malformed marker");
+        assert!(row.contains("@@@END"), "{row}");
+        // And it is a table, not a stack: both column headers are present.
+        assert!(text.contains("Expected"), "{text}");
+        assert!(text.contains("Actual"), "{text}");
     }
 
     #[test]
