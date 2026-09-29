@@ -663,10 +663,19 @@ and re-arms correctly.
   level still goes out verbatim: P1 is behavior-preserving for existing
   configs, and P3 is the single function that turns remapping on.
 
-**P2 — `/temperature` + `/top_p` menu.** `NumberParamNode` with prefill, header
-hints, range validation; `/reasoning` rewired to it. *Tests:* submit/range/error
-paths through `eval_prompt`; `drill_rewrite` prefill for a set value, and
-*empty* for an unset one; empty submit clears back to `None`.
+**P2 — `/temperature` + `/top_p` menu.** **Done (2026-09-29).** One
+`NumberParamNode` serves both; what differs (name, range, effect wording) is
+data on `NumberParam`, not two near-identical nodes. Leaf nodes directly under
+the root, so each supplies its own root row from `data()`. *Tests:* parse and
+range boundaries, write/clear, field isolation, prefill for set vs unset, the
+header contract, and two engine-level walks through the real `build_menu`.
+
+**P2 addendum — what the node does *not* do yet.** The `header()` has a marked
+seam for the two catalog-derived facts (whether the model exposes this knob, and
+the provider's published default) and deliberately renders neither until P3
+supplies them. A guessed number is worse than silence, and guessing was already
+shown to be wrong: the published defaults are {0.3, 0.7, 0.9, 1.0} / {0.95, 1.0},
+not the 1.0/0.95 anyone would type from memory.
 
 **P3 — catalog enrichment.** `ModelEntry` fields; parse `description`,
 `supported_parameters` → two booleans, `reasoning.supported_efforts`, and

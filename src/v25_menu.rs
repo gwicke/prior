@@ -50,6 +50,16 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
         root.add_child(tl);
     }
 
+    // Sampling params: `/temperature` and `/top_p`. Leaf nodes directly under
+    // the root — each supplies its own root row from `data()`, prefills on
+    // drill, and takes a typed value on submit (doc/model_settings_v2.md A.8).
+    for param in [
+        crate::v25_number_param::NumberParam::Temperature,
+        crate::v25_number_param::NumberParam::TopP,
+    ] {
+        root.add_child(crate::v25_number_param::NumberParamNode::new(param, app_state).into());
+    }
+
     // Persona
     {
         let mut pl: SlashDotMenuNode = ListingNode::new(

@@ -27,6 +27,7 @@ pub mod v25_listing_node;
 pub mod v25_menu;
 pub mod v25_model;
 pub mod v25_new;
+pub mod v25_number_param;
 pub mod v25_persona;
 pub mod v25_quit;
 pub mod v25_reasoning;
