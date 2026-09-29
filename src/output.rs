@@ -1549,6 +1549,25 @@ impl ConsoleOutput {
         // block asked for. `rows_of` is computed on the bar without this byte,
         // which adds no row.
         let _ = out.write_all(b"\r");
+        // Put back the dim the bar's own reset just cleared.
+        //
+        // `ensure_dim` emits `\x1b[2m` / `\x1b[0m` only when the tracked
+        // `dim_on` *changes*, so a status bar in the middle of streamed
+        // reasoning used to break it in both directions: the bar inherited the
+        // terminal's dim (its `38;5;245m` sets a colour, not an attribute, so it
+        // did not clear dim) and its trailing reset then silenced the *next*
+        // reasoning write, which saw no change to re-assert. The bar opens with
+        // its own reset now, but the ambient state is still ours to restore, and
+        // it is the flag, not the terminal, that decides.
+        if *self.dim_on.lock().unwrap() {
+            let _ = out.write_all(b"\x1b[2m");
+        }
+        // Hide the cursor for as long as the bar is up. The bar annotates a turn
+        // in flight — there is nothing to type into — and a block cursor parked
+        // at column 0 of a dark full-width bar is the brightest thing on the
+        // screen. `draw_frame` shows it again when the input row comes back, and
+        // `TermGuard::stop` covers exiting while it is hidden.
+        let _ = out.write_all(HIDE_CURSOR);
         let _ = out.flush();
         drop(out);
         let rows = crate::row_count::rows_of(&text, term_width());
@@ -1745,6 +1764,13 @@ struct StatusSpot {
     rows: usize,
 }
 
+/// DECTCEM show/hide. The status line hides the cursor while a turn streams —
+/// the bar is an annotation, not a place to type — and a frame apply shows it
+/// again. `TermGuard::stop` emits `SHOW_CURSOR` unconditionally as the net for
+/// exiting while it is hidden.
+pub(crate) const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+
 /// The theme the answer renderer is built with: colours and clickable links on
 /// a terminal, plain otherwise. Shared with the tests, whose "what did the
 /// renderer alone produce" reference has to agree with it byte for byte or the
@@ -1865,6 +1891,9 @@ impl Output for ConsoleOutput {
             plan_apply(&mut cache, frame, anchor, policy, tw, th)
         };
         let _ = out.write_all(bytes.as_bytes());
+        // The status line hid the cursor; a frame is where the user types again,
+        // so this is where it comes back.
+        let _ = out.write_all(SHOW_CURSOR);
         let _ = out.flush();
         // A frame now owns the tail rows: the transient status must not paint
         // over them until content has moved past (see `frame_owns_tail`).
@@ -3806,6 +3835,79 @@ mod tests {
             text.contains(STATUS),
             "the status must be written as plain text: {text:?}"
         );
+    }
+
+    /// The bar must put back the dim its own reset clears.
+    ///
+    /// `ensure_dim` emits `\x1b[2m` / `\x1b[0m` only when the tracked `dim_on`
+    /// *changes*, so a bar written mid-reasoning used to break it in both
+    /// directions: the bar inherited the terminal's dim (a colour is not an
+    /// attribute, so `38;5;245m` did not clear it), and its trailing reset then
+    /// silenced the *next* reasoning write — which saw no change to re-assert.
+    /// So the bar looked dimmed or not depending on what was above it, and the
+    /// reasoning after it flickered back to full intensity.
+    ///
+    /// The flag is set directly rather than by streaming reasoning: the
+    /// reasoning goes to its own sink, which this harness captures apart, and
+    /// the contract under test is about the flag, not about the stream that
+    /// sets it.
+    #[test]
+    #[serial]
+    fn the_status_bar_puts_back_the_dim_it_clears() {
+        let (out, _reasoning) = capturing_output(60);
+        *out.dim_on.lock().unwrap() = true; // mid-reasoning
+        out.begin_capture();
+        out.set_status("\x1b[0m\x1b[48;5;237mdim-test\x1b[0m");
+        // Painted directly rather than through a content write: the answer
+        // renderer turns dim *off* before it writes, so a content write can
+        // never leave the flag on for the status to find. Reasoning can, and
+        // that is the case under test.
+        out.paint_status();
+        let bytes = out.end_capture();
+        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        let last_bar = text.rfind("dim-test").expect("the bar should be painted");
+        let after = &text[last_bar..];
+        let reset = after.find("\x1b[0m").expect("the bar resets");
+        assert!(
+            // reset, CR, then the dim back — and only then the cursor hide,
+            // which is about the cursor rather than the colours.
+            after[reset..].starts_with("\x1b[0m\r\x1b[2m\x1b[?25l"),
+            "the dim must come straight back after the bar's reset: {after:?}"
+        );
+        // And the flag is untouched — the bar restores, it does not toggle.
+        assert!(*out.dim_on.lock().unwrap(), "the tracked dim should still be on");
+    }
+
+    /// The cursor is hidden while the bar is up and shown when the input frame
+    /// comes back — a block cursor parked at column 0 of a dark full-width bar is
+    /// the brightest thing on the screen, and there is nothing to type into
+    /// mid-turn.
+    #[test]
+    #[serial]
+    fn the_bar_hides_the_cursor_and_a_frame_shows_it_again() {
+        let (out, _reasoning) = capturing_output(60);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status("bar");
+        out.stream_text("a block\n\n");
+        out.draw_frame(
+            &crate::repl::Repl::compose_frame(
+                &crate::repl::LineEditor::new(),
+                "",
+                &[],
+                0,
+                60,
+                20,
+            ),
+            3,
+            crate::ui::frame::ApplyPolicy::Frame,
+            (60, 20),
+        );
+        let bytes = out.end_capture();
+        let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+        let hide = text.find("\x1b[?25l").expect("the bar should hide it");
+        let show = text.find("\x1b[?25h").expect("the frame should show it");
+        assert!(hide < show, "hide then show, in that order: {text:?}");
     }
 
     /// The next content write erases the status, so it never survives as a line

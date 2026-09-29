@@ -265,6 +265,14 @@ impl PicoAgent for CodeAgent {
         let first_message: Option<String> = first_user_text(&prior)
             .or_else(|| (!input.trim().is_empty()).then_some(input))
             .map(str::to_string);
+        // The same shape, for the ctx figure: the first turn has no reported
+        // usage at all (the first completion call is still in flight), so the
+        // status line would have no context number for exactly the turn a new
+        // session is most likely to be watched. The estimate `/tree compact`
+        // already uses is computable from the messages in hand — `prior` plus
+        // this turn's prompt — so use it, and let the provider's own count
+        // replace it from the second turn on.
+        let estimated_ctx = estimate_ctx_with(&prior, input);
 
         // `stream_prompt(...).await` yields the item stream (rig 0.40's
         // `IntoFuture` returns the stream itself, not a collected response).
@@ -315,14 +323,27 @@ impl PicoAgent for CodeAgent {
             let index = s.index.try_lock().ok()?;
             index.header.name.clone()
         });
+        let reported_ctx = self.usage.lock().unwrap().last_input_tokens;
         self.output.set_status(&status_line(
             session_name.as_deref(),
             first_message.as_deref(),
             &self.provider,
             &self.model,
             None,
-            self.usage.lock().unwrap().last_input_tokens,
+            // Reported wins: it is the provider's own count of what it was
+            // sent. The estimate only stands in while there is none — turn
+            // one, where the alternative is no figure at all.
+            if reported_ctx > 0 {
+                reported_ctx
+            } else {
+                estimated_ctx
+            },
             crate::output::term_width(),
+            // The status line is only set for a turn in flight, so it is always
+            // streaming today. The flag is carried anyway: the prompt-side
+            // carrier (A2.2) shows the bar between turns, and the dot is what
+            // will tell the two states apart then.
+            true,
         ));
         self.output.begin_response();
         loop {
@@ -2239,13 +2260,38 @@ async fn build_session_ctx(
 /// Rough deterministic heuristic (chars/4 + per-message framing overhead);
 /// pi uses a real tokenizer. Good enough for the `[compaction: Nk tokens]`
 /// display and the `tokensBefore` field — no correctness dependency.
-pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
-    fn text_tokens(t: &str) -> u64 {
-        t.chars().count() as u64 / 4
+/// The per-message framing overhead [`estimate_context_tokens`] charges each
+/// message, named so [`estimate_ctx_with`] can account for the one message it
+/// is adding.
+const MESSAGE_FRAMING_TOKENS: u64 = 16;
+
+/// Text tokens at [`estimate_context_tokens`]'s rate (chars/4), shared so the
+/// one-message estimate below cannot drift from the whole-context one.
+fn estimate_text_tokens(t: &str) -> u64 {
+    t.chars().count() as u64 / 4
+}
+
+/// The estimated context for `prior` plus one more user message.
+///
+/// The status line's first-turn figure: no completion call has reported usage
+/// yet, but the messages in hand *are* the whole context. Adding the two
+/// figures rather than building a temporary `Vec` of `prior` plus a synthetic
+/// message keeps a long context from being cloned once per turn — and keeps the
+/// estimate identical to the one `/tree compact` reports, since both come from
+/// the same arithmetic.
+fn estimate_ctx_with(prior: &[Message], input: &str) -> u64 {
+    let n = estimate_context_tokens(prior);
+    if input.trim().is_empty() {
+        return n;
     }
+    n + MESSAGE_FRAMING_TOKENS + estimate_text_tokens(input)
+}
+
+pub(crate) fn estimate_context_tokens(messages: &[Message]) -> u64 {
+    let text_tokens = estimate_text_tokens;
     let mut n = 0u64;
     for m in messages {
-        n += 16; // per-message framing overhead (role, separators)
+        n += MESSAGE_FRAMING_TOKENS; // per-message framing overhead (role, separators)
         match m {
             Message::User { content } => {
                 for c in content.iter() {
@@ -4171,6 +4217,7 @@ pub fn status_line(
     level: Option<&str>,
     context_tokens: u64,
     width: usize,
+    streaming: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(name) = session_name.map(str::trim).filter(|n| !n.is_empty()) {
@@ -4190,18 +4237,36 @@ pub fn status_line(
         parts.push(level.to_string());
     }
     if context_tokens > 0 {
-        let usage = model_catalog::lookup(provider, model)
+        // The percentage needs the catalog's context window, and a model
+        // missing from it is normal (a local endpoint, a new release). So the
+        // count stands alone rather than the whole figure disappearing: no
+        // window known means no percentage, not no ctx.
+        let window = model_catalog::lookup(provider, model)
             .and_then(|e| e.context_length)
-            .filter(|max| *max > 0)
-            .map(|max| {
+            .filter(|max| *max > 0);
+        let figure = match window {
+            Some(max) => {
                 let pct = (context_tokens as f64 / max as f64) * 100.0;
                 format!("ctx {pct:.0}% · {}", compact_tokens(context_tokens))
-            });
-        parts.extend(usage);
+            }
+            None => format!("ctx {}", compact_tokens(context_tokens)),
+        };
+        parts.push(figure);
     }
     let line = parts.join(" | ");
-    let line = crate::row_count::truncate_to_width(&line, width);
-    status_bar(&line, width)
+    // Truncate against the width the *text* has, which is the row minus the dot
+    // cell: truncating against the row instead overflows by three columns on a
+    // narrow terminal, and the bar's width is its whole contract. A budget of
+    // zero has to drop the text rather than pass it through —
+    // `truncate_to_width(_, 0)` returns its input unchanged, which is right for
+    // a "no limit" caller and wrong here.
+    let budget = width.saturating_sub(dot_cell(width).1);
+    let line = if budget == 0 {
+        String::new()
+    } else {
+        crate::row_count::truncate_to_width(&line, budget)
+    };
+    status_bar(&line, width, streaming)
 }
 
 /// The status line's furniture: the *table header's* background, so the bar
@@ -4210,6 +4275,35 @@ pub fn status_line(
 const STATUS_BG: &str = "\x1b[48;5;237m";
 const STATUS_FG: &str = "\x1b[38;5;245m";
 const STATUS_RESET: &str = "\x1b[0m";
+/// The activity dot: green while a response is streaming, the text's own grey
+/// when it is not. This is what the spinner used to say, in one cell, on a row
+/// the user is already looking at.
+const DOT_STREAMING: &str = "\x1b[38;5;41m";
+const DOT_IDLE: &str = STATUS_FG;
+/// The dot, and the cell that leads the bar with it: a column of air, the dot,
+/// and the columns it takes off the text's end of the row.
+///
+/// The cell stops before the dot's colour escape, so the colour lands on the
+/// glyph and the text's own foreground is re-asserted after it — otherwise the
+/// dot's green becomes the text's colour.
+const DOT: &str = "\u{25cf}";
+const DOT_CELL: &str = " \u{25cf}";
+
+/// The dot cell for a row `width` columns wide, and its display width.
+///
+/// A terminal narrower than the cell gets the bare dot: the bar's width is its
+/// contract (a bar wider than the row wraps, and the wrap is the one row
+/// movement the status path has to report), so the cell gives way, not the
+/// invariant.
+fn dot_cell(width: usize) -> (&'static str, usize) {
+    if width >= 2 {
+        (DOT_CELL, 2)
+    } else if width >= 1 {
+        (DOT, 1)
+    } else {
+        ("", 0)
+    }
+}
 
 /// The status as a full-width bar with the text against the right margin.
 ///
@@ -4218,10 +4312,24 @@ const STATUS_RESET: &str = "\x1b[0m";
 /// running one belongs instead of reading as the start of a line. Padding with
 /// the background rather than leaving the leading columns default is the whole
 /// point — a bar that only covers its own text is not a bar.
-fn status_bar(text: &str, width: usize) -> String {
-    let pad = width.saturating_sub(crate::row_count::display_width_ansi(text));
+///
+/// The leading reset is load-bearing and independent of looks: streamed
+/// reasoning leaves the terminal in dim mode, and `dim` is an *attribute* that
+/// `38;5;245m` does not clear, so without it the bar rendered dimmed or not
+/// depending on what happened to be above it. (`paint_status` puts the ambient
+/// state back afterwards, so the bar cannot leak its own reset into the
+/// reasoning stream either.)
+fn status_bar(text: &str, width: usize, streaming: bool) -> String {
+    let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
+    let (cell, cell_cols) = dot_cell(width);
+    let pad = width
+        .saturating_sub(cell_cols)
+        .saturating_sub(crate::row_count::display_width_ansi(text));
+    // The text's foreground is re-asserted after the dot: `38;5;245m` and the
+    // dot's colour are the same attribute slot, so without it the whole line
+    // takes the dot's colour.
     format!(
-        "{STATUS_BG}{STATUS_FG}{}{text}{STATUS_RESET}",
+        "{STATUS_RESET}{STATUS_BG}{cell}{dot}{STATUS_FG}{}{text}{STATUS_RESET}",
         " ".repeat(pad)
     )
 }
@@ -4248,6 +4356,11 @@ fn message_preview(msg: &str) -> String {
 mod status_line_tests {
     use super::{message_preview, status_line};
 
+    /// A planned bar's visible width — its contract with the terminal.
+    fn display(s: &str) -> usize {
+        crate::row_count::display_width_ansi(s)
+    }
+
     /// The bar is a full row: the background is set before the padding, the text
     /// sits against the right margin, and the visible width is exactly the
     /// terminal's. The width is what makes it a bar rather than a highlighted
@@ -4255,27 +4368,32 @@ mod status_line_tests {
     /// than the start of a line.
     #[test]
     fn the_bar_fills_the_row_and_right_aligns_the_text() {
-        let s = status_line(Some("main"), None, "llamacpp", "test", None, 0, 40);
+        let s = status_line(Some("main"), None, "llamacpp", "test", None, 0, 40, true);
         assert_eq!(
             crate::row_count::display_width_ansi(&s),
             40,
             "the bar should be exactly one row wide: {s:?}"
         );
-        // Leading padding is the point: the text is pushed to the right margin.
+        // The dot cell leads, then padding, then the text against the right
+        // margin — the right margin is the point, the dot is the price of it.
         let visible = crate::output::strip_ansi(&s);
-        assert_eq!(
-            visible.trim(),
-            "main | llamacpp:test",
-            "the text should sit against the right margin, padded before: {visible:?}"
+        assert!(
+            visible.starts_with(" \u{25cf}  "),
+            "the bar should lead with the dot cell: {visible:?}"
         );
         assert!(
-            visible.starts_with("  "),
-            "the bar should be padded on the left: {visible:?}"
+            visible.ends_with("main | llamacpp:test"),
+            "the text should sit against the right margin: {visible:?}"
         );
+        // The background has to be set *before* the padding, or the bar is a
+        // highlighted fragment with default-coloured cells around it.
+        let padding = visible.find("main |").expect("the text");
+        let before = &s[..s.find("main |").expect("the text")];
         assert!(
-            s.starts_with("\x1b[48;5;237m"),
+            before.contains("\x1b[48;5;237m"),
             "the background must precede the padding: {s:?}"
         );
+        assert_eq!(padding, visible.len() - "main | llamacpp:test".len());
         assert!(s.ends_with("\x1b[0m"), "the bar must be reset: {s:?}");
     }
 
@@ -4287,7 +4405,7 @@ mod status_line_tests {
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);
         for w in [1_usize, 10, 40, 200] {
-            let s = status_line(Some(&long), None, "p", "m", None, 0, w);
+            let s = status_line(Some(&long), None, "p", "m", None, 0, w, true);
             assert_eq!(
                 crate::row_count::rows_of(&s, w),
                 0,
@@ -4299,7 +4417,7 @@ mod status_line_tests {
     /// A long line is cut to the terminal, not spilled past it.
     #[test]
     fn a_long_bar_is_truncated_to_the_terminal() {
-        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", None, 0, 20);
+        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", None, 0, 20, true);
         assert_eq!(crate::row_count::display_width_ansi(&s), 20, "{s:?}");
         assert!(crate::output::strip_ansi(&s).contains('…'), "{s:?}");
     }
@@ -4316,6 +4434,7 @@ mod status_line_tests {
             None,
             0,
             60,
+            true,
         );
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.contains("fix the flaky resize test"), "{visible:?}");
@@ -4327,6 +4446,7 @@ mod status_line_tests {
             None,
             0,
             60,
+            true,
         );
         let named_visible = crate::output::strip_ansi(&named);
         assert!(named_visible.contains("main"), "{named_visible:?}");
@@ -4340,9 +4460,55 @@ mod status_line_tests {
     /// line.
     #[test]
     fn no_name_and_no_message_still_shows_the_model() {
-        let s = status_line(None, None, "llamacpp", "test", None, 0, 40);
+        let s = status_line(None, None, "llamacpp", "test", None, 0, 40, true);
         let visible = crate::output::strip_ansi(&s);
-        assert!(visible.trim().starts_with("llamacpp:test"), "{visible:?}");
+        assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
+        assert_eq!(display(&s), 40, "{visible:?}");
+    }
+
+    /// The dot is the spinner's replacement: green while a response streams,
+    /// the bar's own grey when it is not. Two states because the prompt-side
+    /// carrier will show the bar between turns too, and the dot is what will
+    /// tell "working" from "idle" then.
+    #[test]
+    fn the_dot_is_green_while_streaming_and_grey_when_not() {
+        let streaming = status_line(Some("main"), None, "p", "m", None, 0, 40, true);
+        let idle = status_line(Some("main"), None, "p", "m", None, 0, 40, false);
+        assert!(
+            streaming.contains("\x1b[38;5;41m"),
+            "a streaming bar should carry a green dot: {streaming:?}"
+        );
+        assert!(streaming.contains('\u{25cf}'), "and a dot: {streaming:?}");
+        assert!(
+            !idle.contains("\x1b[38;5;41m"),
+            "an idle bar should not: {idle:?}"
+        );
+        assert!(
+            idle.contains("\u{25cf}"),
+            "but it still has a dot: {idle:?}"
+        );
+        // Same width either way: the dot is a cell, not a different layout.
+        assert_eq!(display(&streaming), display(&idle));
+    }
+
+    /// The bar's appearance must not depend on what was written above it.
+    ///
+    /// `dim` is an SGR *attribute* and `38;5;245m` sets a colour, not an
+    /// attribute — so a bar written while streamed reasoning has the terminal in
+    /// dim mode rendered dimmed, and one written after a plain block did not.
+    /// A leading full reset is what makes the bar self-contained.
+    #[test]
+    fn the_bar_resets_first_so_ambient_dim_cannot_reach_it() {
+        let s = status_line(Some("main"), None, "p", "m", None, 0, 40, true);
+        let body = s.trim_start_matches("\x1b[0m");
+        assert!(
+            s.starts_with("\x1b[0m"),
+            "the bar must open with a reset: {s:?}"
+        );
+        assert!(
+            body.starts_with("\x1b[48;5;237m"),
+            "and only then set its own colours: {body:?}"
+        );
     }
 
     /// The preview is one line, collapsed, and about 25 columns — enough to

@@ -204,6 +204,14 @@ impl TermGuard {
         } else {
             Self::csi("?2004l")?;
         }
+        // The status line hides the cursor while a turn streams, and
+        // `draw_frame` shows it again when the prompt returns. If the turn is
+        // interrupted instead — a tool error, a confirm, a panic — nothing shows
+        // it again, and an invisible cursor follows the user into their shell.
+        // Unconditional and idempotent: showing a cursor that was never hidden
+        // costs nothing, and this is the last writer before the tty is the
+        // user's again.
+        io::stdout().write_all(crate::output::SHOW_CURSOR)?;
         disable_raw_mode()?;
         self.active.store(false, Ordering::SeqCst);
         Ok(())

@@ -459,15 +459,25 @@ fn the_status_line_is_relative_and_transient_end_to_end() {
         bar.contains("\x1b[38;5;245m"),
         "the bar should carry a dim foreground: {bar:?}"
     );
-    // After the final reset, only carriage returns: the `CR` `paint_status` adds
-    // to cancel the wrap-pending state a full-width write leaves behind, and the
-    // erase's own `CR`. Pinning the count would couple the test to `clear_status`.
+    // After the final reset: no address, no visible cell, and the cursor hidden
+    // for as long as the bar is up (there is nothing to type into mid-turn). The
+    // `CR` that cancels the wrap-pending state a full-width write leaves behind
+    // is in there too, and so is the erase's own — so the assertion is about what
+    // may *not* appear, not about a byte count.
     let (_, after_reset) = bar
         .rsplit_once("\x1b[0m")
         .unwrap_or_else(|| panic!("the bar should be reset: {bar:?}"));
     assert!(
-        !after_reset.is_empty() && after_reset.chars().all(|c| c == '\r'),
-        "only CRs may follow the bar's reset: {bar:?}"
+        cups(after_reset).is_empty(),
+        "nothing after the bar may address a row: {bar:?}"
+    );
+    assert!(
+        after_reset.contains("\x1b[?25l"),
+        "the cursor should be hidden while the bar is up: {bar:?}"
+    );
+    assert!(
+        strip_ansi(after_reset).trim().is_empty(),
+        "no visible content may follow the bar: {bar:?}"
     );
     assert!(
         text[erase..].contains("Just a plain text answer"),
