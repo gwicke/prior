@@ -4272,26 +4272,28 @@ const STATUS_RESET: &str = "\x1b[0m";
 /// the user is already looking at.
 const DOT_STREAMING: &str = "\x1b[38;5;41m";
 const DOT_IDLE: &str = STATUS_FG;
-/// The dot, and the cell that leads the bar with it: a column of air, the dot,
-/// and the columns it takes off the text's end of the row.
+/// The dot, and the column of air that leads the bar with it.
 ///
-/// The cell stops before the dot's colour escape, so the colour lands on the
-/// glyph and the text's own foreground is re-asserted after it — otherwise the
-/// dot's green becomes the text's colour.
+/// The two are separate because the dot's colour has to be emitted *between*
+/// them: an `SGR` colours the cells written after it, so air-and-glyph as one
+/// literal paints the glyph in the default foreground and applies the colour to
+/// whatever follows. That is not a subtle version of the bug — the green ends up
+/// on nothing at all, and the dot reads as the default bright white.
 const DOT: &str = "\u{25cf}";
-const DOT_CELL: &str = " \u{25cf}";
+const DOT_AIR: &str = " ";
 
-/// The dot cell for a row `width` columns wide, and its display width.
+/// The air that leads the bar on a row `width` columns wide, and the dot's
+/// total width (air plus glyph).
 ///
-/// A terminal narrower than the cell gets the bare dot: the bar's width is its
+/// A terminal narrower than the pair gets the bare dot: the bar's width is its
 /// contract (a bar wider than the row wraps, and the wrap is the one row
 /// movement the status path has to report), so the cell gives way, not the
 /// invariant.
 fn dot_cell(width: usize) -> (&'static str, usize) {
     if width >= 2 {
-        (DOT_CELL, 2)
+        (DOT_AIR, 2)
     } else if width >= 1 {
-        (DOT, 1)
+        ("", 1)
     } else {
         ("", 0)
     }
@@ -4313,15 +4315,16 @@ fn dot_cell(width: usize) -> (&'static str, usize) {
 /// reasoning stream either.)
 fn status_bar(text: &str, width: usize, streaming: bool) -> String {
     let dot = if streaming { DOT_STREAMING } else { DOT_IDLE };
-    let (cell, cell_cols) = dot_cell(width);
+    let (air, dot_cols) = dot_cell(width);
     let pad = width
-        .saturating_sub(cell_cols)
+        .saturating_sub(dot_cols)
         .saturating_sub(crate::row_count::display_width_ansi(text));
-    // The text's foreground is re-asserted after the dot: `38;5;245m` and the
-    // dot's colour are the same attribute slot, so without it the whole line
-    // takes the dot's colour.
+    // Air, then the dot's colour, then the glyph, then the text's own
+    // foreground: the colour has to bracket the glyph exactly, and the text's
+    // has to follow it because `38;5;245m` and the dot's colour are the same
+    // attribute slot.
     format!(
-        "{STATUS_RESET}{STATUS_BG}{cell}{dot}{STATUS_FG}{}{text}{STATUS_RESET}",
+        "{STATUS_RESET}{STATUS_BG}{air}{dot}{DOT}{STATUS_FG}{}{text}{STATUS_RESET}",
         " ".repeat(pad)
     )
 }
@@ -4460,6 +4463,12 @@ mod status_line_tests {
     /// the bar's own grey when it is not. Two states because the prompt-side
     /// carrier will show the bar between turns too, and the dot is what will
     /// tell "working" from "idle" then.
+    ///
+    /// The order of the escape and the glyph is the substance of this test, not
+    /// a detail: an `SGR` colours the cells written *after* it, so a colour
+    /// emitted after the dot paints the dot in the default foreground and applies
+    /// the colour to the padding. That is not a subtle version of the bug — the
+    /// green lands on nothing, and the dot reads as default bright white.
     #[test]
     fn the_dot_is_green_while_streaming_and_grey_when_not() {
         let streaming = status_line(Some("main"), None, "p", "m", 0, 40, true);
@@ -4479,6 +4488,18 @@ mod status_line_tests {
         );
         // Same width either way: the dot is a cell, not a different layout.
         assert_eq!(display(&streaming), display(&idle));
+        // And the colour has to land *on* the glyph. The escape used to be
+        // emitted after it, so the dot was painted in the default foreground and
+        // the green was applied to nothing at all — and every assertion above
+        // passed straight over that, because they only asked whether the escape
+        // was present.
+        let glyph_at = streaming.find('\u{25cf}').expect("the dot");
+        let green_at = streaming.find("\x1b[38;5;41m").expect("the green");
+        assert_eq!(
+            glyph_at,
+            green_at + "\x1b[38;5;41m".len(),
+            "the green must be emitted immediately before the dot, not after it: {streaming:?}"
+        );
     }
 
     /// The bar's appearance must not depend on what was written above it.
