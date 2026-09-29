@@ -634,13 +634,34 @@ note that an old key should error:
 - The session journal keeps `thinking_level_change` / `thinkingLevel`: a
   compatibility surface, not part of this rename.
 
-**P1 — `ModelParams` + provider mapping.** `ModelParams` on `AgentConfig`;
+**P1 — `ModelParams` + provider mapping.** **Done (2026-09-29).** `ModelParams`
+on `AgentConfig` (replacing `reasoning_level: Option<String>`);
 `params::additional_params`; `AgentBuilder::temperature`; `top_p` map with the
 Gemini branch; effort remapping driven by a `ReasoningSupport` value; the
-`params_changed` arm in the rebuild gate. *Tests:* mapping table tests per
-provider (mirroring `thinking.rs:117-203`); remap cases from the real payloads
-(`["max","high","low"]`, `["high","low","none"]`, `xhigh`); rebuild-gate tests
-that a `temperature` change rebuilds once and re-arms correctly.
+`params_changed` arm in the rebuild gate. *Tests:* the existing per-provider
+mapping tables (unchanged — those payloads are provider contracts); remap cases
+from the real payloads; rebuild-gate tests that a param change rebuilds once
+and re-arms correctly.
+
+**P1 addendum — three shapes the implementation settled.**
+- **The rebuild gate is now a pure function.** `plan_rebuild(applied, target,
+  last_attempt) -> Option<RebuildFingerprint>` was extracted from the
+  convergence step, because both of its invariants ("only a real change
+  rebuilds", "one attempt per distinct target") were untestable inline in the
+  400-line loop. `model_changed` / `params_changed` / `persona_changed` stay as
+  locals — the rebuild body and the error message still branch on them.
+- **`mapping_opt` is gone.** `additional_params` takes the typed `ModelParams`;
+  a string-typed entry point would be a way to bypass the composed producer and
+  silently lose the `top_p` and remap handling. Two `ReasoningSupport` tie-breaks
+  are pinned by tests: an exact rank match keeps the model's own spelling, and
+  when a model publishes two spellings for one rank (`["max","xhigh"]`) the
+  first published wins.
+- **Temperature never appears in `additional_params`** — there is a test for it.
+  It rides `AgentBuilder::temperature`, so rig spells it per provider and only
+  one spelling of a given knob is ever in flight.
+- `model_catalog::reasoning_support()` returns `unknown()` until P3, so every
+  level still goes out verbatim: P1 is behavior-preserving for existing
+  configs, and P3 is the single function that turns remapping on.
 
 **P2 — `/temperature` + `/top_p` menu.** `NumberParamNode` with prefill, header
 hints, range validation; `/reasoning` rewired to it. *Tests:* submit/range/error

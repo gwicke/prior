@@ -95,7 +95,10 @@ mod tests {
                     reader.reasoning().unwrap_or_else(|| "off".to_string())
                 }),
                 submit_fn: Box::new(move |level| {
-                    writer.set_reasoning(Some(level.to_string()));
+                    let parsed = level
+                        .parse::<crate::params::ReasoningLevel>()
+                        .map_err(|e| e)?;
+                    writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),
             }
@@ -137,7 +140,7 @@ mod tests {
     #[test]
     fn reasoning_active_marker_on_current_level() {
         let app_state = test_app_state();
-        app_state.set_reasoning(Some("med".to_string()));
+        app_state.set_reasoning(Some(crate::params::ReasoningLevel::Med));
         let mut menu = build_reasoning_menu(&app_state);
         let mut h = menu.get_handle();
         match futures::executor::block_on(h.eval_prompt("reasoning ", HostKey::None, 80)) {

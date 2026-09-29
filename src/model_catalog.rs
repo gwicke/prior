@@ -1013,6 +1013,19 @@ pub fn lookup(provider: &str, model: &str) -> Option<ModelEntry> {
     })
 }
 
+/// The reasoning efforts this model accepts, for backend effort remapping
+/// (doc/model_settings_v2.md A.4).
+///
+/// Always `unknown()` today: `ModelEntry` does not yet carry the published
+/// `reasoning.supported_efforts` list, so there is nothing to remap against
+/// and every level is sent exactly as the provider spells it. P3 adds the
+/// field and fills this in — it is the one place that has to change, which is
+/// why the lookup exists as a function rather than an inline default.
+pub fn reasoning_support(provider: &str, model: &str) -> crate::params::ReasoningSupport {
+    let _ = (provider, model);
+    crate::params::ReasoningSupport::unknown()
+}
+
 /// Remove entries that share the same `id`. `extrapolate` keeps the
 /// OpenRouter-routed entry and adds a "direct" entry for every available
 /// provider namespace, so OpenRouter-native models (namespace `openrouter`)

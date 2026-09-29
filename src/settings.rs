@@ -324,12 +324,12 @@ impl SettingsStore {
             },
             tool_call_limit: cfg.tool_call_limit,
             default_persona: cfg.persona_name.clone(),
-            // A resolved "off" (i.e. `reasoning_level: None`) is stored as "no
-            // key" rather than a literal "off" — the two are the same effective
-            // state, and the absent form is what a file should carry.
+            // A resolved "off" (i.e. `params.reasoning: None`) is stored as
+            // "no key" rather than a literal "off" — the two are the same
+            // effective state, and the absent form is what a file should carry.
             default_reasoning_level: cfg
-                .reasoning_level
-                .clone()
+                .params
+                .reasoning_str()
                 .filter(|l| !l.eq_ignore_ascii_case("off")),
             show_reasoning: cfg
                 .show_reasoning_handle
@@ -388,10 +388,11 @@ impl SettingsStore {
             .and_then(|p| crate::persona::get_persona(p));
         // `None` (key absent) and an explicit "off" are the same effective
         // state; both mean "no reasoning requested".
-        cfg.reasoning_level = self
+        cfg.params.reasoning = self
             .default_reasoning_level
             .clone()
-            .filter(|l| !l.eq_ignore_ascii_case("off"));
+            .filter(|l| !l.eq_ignore_ascii_case("off"))
+            .and_then(|l| l.parse().ok());
         // Live-update the shared `show_reasoning` handle so the `Output` impl
         // (which holds a clone) honors the new mode on the very next response.
         if let Ok(mode) = self.show_reasoning.parse::<ShowReasoning>() {
@@ -819,7 +820,7 @@ mod tests {
             output: std::sync::Arc::new(crate::QuietOutput::new()),
             yolo: false,
             quiet: true,
-            reasoning_level: None,
+            params: Default::default(),
             tool_call_limit: 50,
             system_message_extension: None,
             persona_prompt: None,
@@ -857,7 +858,7 @@ mod tests {
             cfg.persona_prompt.is_some(),
             "persona prompt should resolve"
         );
-        assert_eq!(cfg.reasoning_level.as_deref(), Some("high"));
+        assert_eq!(cfg.params.reasoning_str().as_deref(), Some("high"));
         // `show_reasoning` is applied live via the shared handle.
         assert_eq!(
             *cfg.show_reasoning_handle.lock().unwrap(),
@@ -876,7 +877,7 @@ mod tests {
         // "off" thinking level maps back to `None`.
         s.set_value(SettingKey::DefaultReasoning, "off").unwrap();
         s.apply_to_config(&mut cfg);
-        assert_eq!(cfg.reasoning_level, None);
+        assert_eq!(cfg.params.reasoning, None);
 
         // Non-settings fields are preserved.
         assert!(cfg.quiet);

@@ -35,7 +35,13 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
                     reader.reasoning().unwrap_or_else(|| "off".to_string())
                 }),
                 submit_fn: Box::new(move |level| {
-                    writer.set_reasoning(Some(level.to_string()));
+                    // Rows are the canonical five, so this cannot fail in
+                    // practice — but the config is typed now, so an
+                    // unparsable value must be reported rather than stored.
+                    let parsed = level
+                        .parse::<crate::params::ReasoningLevel>()
+                        .map_err(|e| e)?;
+                    writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),
             }

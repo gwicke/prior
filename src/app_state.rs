@@ -225,12 +225,25 @@ impl AppState {
     }
 
     /// Canonical reasoning level of the target model.
-    pub fn reasoning(&self) -> Option<String> {
-        self.state.lock().config.reasoning_level.clone()
+    /// The live request params of the target model.
+    pub fn params(&self) -> crate::params::ModelParams {
+        self.state.lock().config.params
     }
 
-    pub fn set_reasoning(&self, level: Option<String>) {
-        self.state.lock().config.reasoning_level = level;
+    /// The target model's reasoning level as a string, for the menu's `*`
+    /// marker and the session layer.
+    pub fn reasoning(&self) -> Option<String> {
+        self.state.lock().config.params.reasoning_str()
+    }
+
+    /// Write one live param. A `None` clears it back to "leave the provider
+    /// alone" (doc/model_settings_v2.md A.5).
+    pub fn set_param(&self, set: impl FnOnce(&mut crate::params::ModelParams)) {
+        set(&mut self.state.lock().config.params);
+    }
+
+    pub fn set_reasoning(&self, level: Option<crate::params::ReasoningLevel>) {
+        self.state.lock().config.params.reasoning = level;
     }
 
     pub fn persona(&self) -> Option<String> {
@@ -499,7 +512,7 @@ impl AppState {
             output,
             yolo: false,
             quiet: true,
-            reasoning_level: None,
+            params: Default::default(),
             tool_call_limit: 10,
             system_message_extension: None,
             persona_prompt: None,
