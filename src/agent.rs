@@ -297,18 +297,6 @@ impl PicoAgent for CodeAgent {
         let mut cancelled_history: Option<Vec<Message>> = None;
         let mut aborted = false;
         self.output.begin_response();
-        // When reasoning/thinking is enabled, hold the assistant answer back and
-        // flush it only at the turn boundary. This guarantees that reasoning
-        // arriving *after* the answer (an occasional OpenRouter streaming order)
-        // is still shown above it instead of leaking below. See `output.rs`
-        // `answer_held` / `flush_held_answer`.
-        let _reasoning_expected = self
-            .thinking_level
-            .as_deref()
-            .and_then(|s| s.parse::<thinking::ThinkingLevel>().ok())
-            .map(|l| l != thinking::ThinkingLevel::Off)
-            .unwrap_or(false);
-        // self.output.set_answer_hold(reasoning_expected);
         loop {
             tokio::select! {
                 item = stream.next() => {
@@ -1336,7 +1324,6 @@ pub struct CodeAgent {
     /// when `<Esc>` is pressed; the streaming loop selects on `notified()`
     /// instead of polling with a sleep.
     cancel_notify: Arc<tokio::sync::Notify>,
-    thinking_level: Option<String>,
     reasoning_in_context: crate::settings::ReasoningInContextMode,
     /// Optional path to JSONL file for logging raw messages sent/received.
     /// Passed as `Some(Arc<MessageLogger>)` to `LoggingHook` if set.
@@ -1527,7 +1514,6 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.persona_name,
                 config.user_cancel.clone(),
                 config.cancel_notify.clone(),
-                config.thinking_level.clone(),
                 config.reasoning_in_context,
                 message_logger,
             ))
@@ -2450,7 +2436,6 @@ fn render_turn(output: &dyn Output, turn: &ConversationTurn, leading_separator: 
 
     output.display_separator();
     output.begin_response();
-    output.set_answer_hold(false);
 
     let seg_count = turn.segments.len();
     for (seg_idx, segment) in turn.segments.iter().enumerate() {
@@ -4212,7 +4197,6 @@ impl CodeAgent {
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
         cancel_notify: Arc<tokio::sync::Notify>,
-        thinking_level: Option<String>,
         reasoning_in_context: crate::settings::ReasoningInContextMode,
         message_logger: Option<Arc<MessageLogger>>,
     ) -> Self {
@@ -4226,7 +4210,6 @@ impl CodeAgent {
             persona_name,
             user_cancel,
             cancel_notify,
-            thinking_level,
             reasoning_in_context,
             message_logger,
             usage: Mutex::new(SessionUsage::default()),
@@ -6541,7 +6524,6 @@ mod tests {
         fn stream_thinking(&self, _d: &str) {}
         fn end_response_segment(&self) {}
         fn end_response(&self) {}
-        fn set_answer_hold(&self, _h: bool) {}
         fn display_tool_call(&self, _n: &str, _a: &JsonValue) {}
         fn display_tool_result(&self, _r: &str) {}
         fn get_user_input(&self) -> String {

@@ -2,6 +2,15 @@
 
 Status: **Investigation complete. No code change in this pass — plan only.**
 
+> **Superseded (row_accounting B3b).** The hold-back this document analyses and
+> recommends against has since been **disabled and removed**: `set_answer_hold`,
+> `answer_held`, `answer_buffer` and `flush_held_answer` are gone
+> (2026-09-28), and the answer renders inline. Everything below is kept as the
+> record of why — the ordering artefact is real, the analysis of `pi` still
+> applies, and the conclusion (hold-back is the wrong shape) is what the
+> removal acts on. Where this document names the removed symbols, read them as
+> history.
+
 This follows up on `thinking_order.md` (the client-side "hold the answer until the
 turn boundary" fix) and the observed artifact: *a final message that mentions a
 final tool call (e.g. a test run) reads as if it references a tool call that was
