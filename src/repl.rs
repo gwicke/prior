@@ -312,6 +312,13 @@ pub struct ReplCtx {
     pub model_filter: ModelFilter,
     /// Currently-active thinking level (for the `*` marker in `/thinking`).
     pub thinking_level: Option<String>,
+    /// The session's name, for the prompt-side status bar. `None` when unnamed,
+    /// in which case the bar falls back to the session's opening message — the
+    /// mid-turn bar reads the same two fields off the session index, and the two
+    /// bars must not be able to disagree about which session they are naming.
+    pub session_name: Option<String>,
+    /// The session's opening user message, for the same fallback.
+    pub session_first_message: Option<String>,
 }
 
 /// Model filter state for the `/model` overlay.
@@ -631,10 +638,35 @@ impl Repl {
         // they cannot disagree on the frame's size (ui_draw_v2 §9 #3), and
         // the applied pair `draw_frame` reports is what gets recorded — the
         // repaint bookkeeping is the engine's fact, not a secondhand read.
+        // The prompt-side status bar: the same `status_line` the mid-turn bar
+        // uses, with the dot **grey** — the two states are the whole reason the
+        // bar is permanent. Built once per `read_input`, not per keystroke: the
+        // pieces it needs (session name, model, thinking level, context tokens)
+        // cannot change while the input is being typed, and the frame's partial
+        // row-diff keeps the row itself current.
+        //
+        // `term_width` is read at paint time rather than here, so a resize that
+        // lands mid-edit re-flows the bar with the frame instead of leaving a
+        // bar sized for the old terminal.
         let redraw =
             |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
                 let dims = (dims.0.max(1), dims.1.max(1));
-                let frame = Self::compose_frame(editor, prompt, overlay, focus, dims.0, dims.1);
+                let bar = crate::agent::status_line(
+                    ctx.session_name.as_deref(),
+                    ctx.session_first_message.as_deref(),
+                    crate::agent::BarModel {
+                        provider: &ctx.provider,
+                        model: &ctx.model,
+                        thinking: ctx.thinking_level.as_deref(),
+                        context_tokens: ctx.context_tokens,
+                    },
+                    dims.0,
+                    // Grey: no turn is in flight while the input is open. The
+                    // mid-turn bar passes `true` and gets the green dot.
+                    false,
+                );
+                let frame =
+                    Self::compose_frame(editor, prompt, Some(&bar), overlay, focus, dims.0, dims.1);
                 let applied = output.draw_frame(&frame, ApplyPolicy::Frame, dims);
                 painted_size.set(applied);
             };
@@ -1144,6 +1176,7 @@ impl Repl {
     pub(crate) fn compose_frame(
         editor: &LineEditor,
         prompt: &str,
+        status: Option<&str>,
         overlay: &[String],
         focus: usize,
         term_w: usize,
@@ -1151,10 +1184,23 @@ impl Repl {
     ) -> Frame {
         let term_w = term_w.max(1);
         let layout = editor.layout(term_w, prompt);
-        let mut elements = vec![Element::Input {
+        let mut elements = Vec::new();
+        // The status line takes the **divider's row**, above the input — which is
+        // what makes it permanent and what makes it safe.
+        //
+        // Being in the frame is the whole trick. A bar written as content would
+        // need a relative erase at submit, and by then the cursor has moved into
+        // the frame region below it, so the erase would land on the wrong rows.
+        // Here the frame's own union clear takes it, at the one moment the cursor
+        // is where the frame says it is. And it is redrawn per keystroke by the
+        // same partial row-diff, so the figures are never stale.
+        if let Some(bar) = status {
+            elements.push(Element::Lines(vec![bar.to_string()]));
+        }
+        elements.push(Element::Input {
             layout,
             prompt: prompt.to_string(),
-        }];
+        });
         if !overlay.is_empty() {
             elements.push(Element::Divider);
             elements.push(Element::Overlay {
@@ -3199,7 +3245,7 @@ mod tests {
             overlay: &[String],
             focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
-            let frame = Repl::compose_frame(editor, prompt, overlay, focus, width, term_rows);
+            let frame = Repl::compose_frame(editor, prompt, None, overlay, focus, width, term_rows);
             let mut cache = DrawCache::new(term_rows);
             // The tracked row is the block's position (A3.2): the apply reads it
             // from the cache, so the test sets it the way content would.

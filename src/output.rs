@@ -4009,7 +4009,15 @@ mod tests {
         out.set_status("bar");
         out.stream_text("a block\n\n");
         out.draw_frame(
-            &crate::repl::Repl::compose_frame(&crate::repl::LineEditor::new(), "", &[], 0, 60, 20),
+            &crate::repl::Repl::compose_frame(
+                &crate::repl::LineEditor::new(),
+                "",
+                None,
+                &[],
+                0,
+                60,
+                20,
+            ),
             crate::ui::frame::ApplyPolicy::Frame,
             (60, 20),
         );
@@ -4094,8 +4102,15 @@ mod tests {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
         out.set_status("[sess | m]");
-        let frame =
-            crate::repl::Repl::compose_frame(&crate::repl::LineEditor::new(), "", &[], 0, 40, 10);
+        let frame = crate::repl::Repl::compose_frame(
+            &crate::repl::LineEditor::new(),
+            "",
+            None,
+            &[],
+            0,
+            40,
+            10,
+        );
         out.draw_frame(&frame, ApplyPolicy::Frame, (40, 24));
         out.display_text("a message");
         out.display_plain("more content");
@@ -4162,6 +4177,7 @@ mod tests {
         let frame = crate::repl::Repl::compose_frame(
             &crate::repl::LineEditor::new(),
             "",
+            None,
             &overlay,
             0,
             40,

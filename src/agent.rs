@@ -3619,11 +3619,32 @@ pub async fn run_interactive(
     loop {
         let action = match repl.as_mut() {
             Some(r) => {
-                config.output.display_separator();
+                // No separator here any more: the prompt-side status bar occupies
+                // the divider's row, above the input (it is a `Lines` element of
+                // the input frame). The bar separates the last turn from the
+                // prompt *and* says what is about to answer it, which a dim rule
+                // could not do — and it is the same bar the turn paints while it
+                // streams, so the dot is the only thing that changes between the
+                // two states.
+                //
+                // The spacing the rule provided is not lost: a response ends on
+                // a blank (`end_response`), and the greeter ends on one of its
+                // own, so the frame's first row still lands one row clear.
 
                 // Build session context data for REPL overlays.
                 let (_sessions, branch_messages, tree, leaf_id, context_tokens) =
                     build_session_ctx(&app_state.session()).await;
+                // The session's own name and opening message, for the prompt-side
+                // status bar. Off the same `branch_messages` the overlays read,
+                // so the two bars cannot disagree about which session they are
+                // naming — and off the *index* for the name, which is where the
+                // mid-turn bar reads it too.
+                let session_name = match app_state.session() {
+                    Some(session) => session.index.lock().await.header.name.clone(),
+                    None => None,
+                };
+                let session_first_message =
+                    branch_messages.first().map(|(_, preview)| preview.clone());
 
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
@@ -3644,6 +3665,13 @@ pub async fn run_interactive(
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
                     thinking_level: config.thinking_level.clone(),
+                    // The prompt-side bar names the session the same way the
+                    // mid-turn one does: off the session index, with the opening
+                    // message as the fallback when it has no name. Read here, at
+                    // the top of the cycle, so both bars are looking at one
+                    // snapshot rather than at whatever the index holds later.
+                    session_name,
+                    session_first_message,
                 };
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop
