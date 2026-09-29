@@ -99,6 +99,24 @@ fn serve(
         return write_response(stream, "200 OK", "text/event-stream", sse.as_bytes());
     }
 
+    // Scenario 4: a fenced code block, and the reason the status's gap exists.
+    //
+    // A fence is emitted line by line and its last byte is a single newline, so
+    // the last line of text sits *directly* above where the bar goes. A
+    // paragraph cannot show that: the blank-line rule swallows its second
+    // newline, so a paragraph's block already ends on a blank line and the
+    // status reuses it. Only the fence leaves the bar with nothing in between,
+    // which is why this scenario exists and why the screen assertion below needs
+    // it — against a paragraph the assertion passes with the gap switched off.
+    if scenario == 4 {
+        let sse = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"test","choices":[{"index":0,"delta":{"content":"```rust\nfn main() {}\n```\n"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        );
+        return write_response(stream, "200 OK", "text/event-stream", sse.as_bytes());
+    }
+
     let sse = if has_tool_result {
         if scenario == 1 {
             // Empty stop: turn ends right after the tool result.
@@ -110,7 +128,7 @@ fn serve(
             // Final plain-text answer, NO trailing newline.
             format!(
                 "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                r#"{"id":"chatcmpl-2","object":"chat.completion.chunk","created":2,"model":"test","choices":[{"index":0,"delta":{"content":"2. sleep 30 — done"},"finish_reason":null}]}"#,
+                r#"{"id":"chatcmpl-2","object":"chat.completion.chunk","created":2,"model":"test","choices":[{"index":0,"delta":{"content":"2. sleep 30 — done\n"},"finish_reason":null}]}"#,
                 r#"{"id":"chatcmpl-2","object":"chat.completion.chunk","created":2,"model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
             )
         }
@@ -309,27 +327,34 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
 
 /// Count the empty lines between the last non-empty content line and the
 /// horizontal separator (the line of `─` drawn at the top of the next loop).
+/// Blank screen rows between the last content row and the turn's separator.
+///
+/// Counted on the **screen**, not in the byte stream, and that is a correction
+/// rather than a style choice. The transient status paints a gap row of its own
+/// (`row_accounting` §3.5) and erases it again before the next write, so a model
+/// that splits the stream on newlines counts one blank per content block — three
+/// for a text/tool/text turn — none of which ever existed on screen. The screen
+/// is what the assertion is about, and it is immune to transient rows by
+/// construction.
 fn blanks_before_separator(data: &[u8]) -> usize {
-    let lines = ansi_lines(data);
-    // Find the last separator line.
-    let mut sep = None;
-    for (i, t) in lines.iter().enumerate() {
-        if t.chars().all(|c| c == '─') && t.len() >= 10 {
-            sep = Some(i);
-        }
-    }
-    let Some(sep) = sep else { return 0 };
-    // Walk up from the separator, counting empty lines until the first
-    // non-empty content line. The transient status line can sit in between
-    // (doc/row_accounting.md zone 2) — it is chrome, not content, so skip it
-    // rather than call it a missing blank.
+    let rows = screen_rows(data);
+    let Some(sep) = rows
+        .iter()
+        .rposition(|t| t.chars().all(|c| c == '─') && t.len() >= 10)
+    else {
+        return 0;
+    };
+    // Walk up from the separator, counting empty rows until the first non-empty
+    // content row. The transient status can sit in between (row_accounting §3.5)
+    // — it is chrome, not content, so skip it rather than call it a missing
+    // blank.
     let mut blanks = 0;
     let mut i = sep;
     while i > 0 {
         i -= 1;
-        if lines[i].trim().is_empty() {
+        if rows[i].trim().is_empty() {
             blanks += 1;
-        } else if is_status_row(&lines[i]) {
+        } else if is_status_row(&rows[i]) {
             continue;
         } else {
             break;
@@ -344,17 +369,42 @@ fn is_status_row(row: &str) -> bool {
     row.contains("llamacpp:test")
 }
 
-/// Count the empty lines directly above the first `⏺ Error:` line.
+/// The final screen, as trimmed rows.
+fn screen_rows(data: &[u8]) -> Vec<String> {
+    let mut p = Parser::new(ROWS, COLS, 1000);
+    p.process(data);
+    let screen = p.screen();
+    (0..ROWS)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| {
+                    screen
+                        .cell(r, c)
+                        .and_then(|x| x.contents().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Count the empty screen rows directly above the first `⏺ Error:` line.
+///
+/// Screen-based for the same reason as [`blanks_before_separator`]: the
+/// transient status's gap row is blank in the stream and absent from the screen,
+/// and this is a spacing assertion about what the reader sees.
 fn blanks_above_error(data: &[u8]) -> usize {
-    let lines = ansi_lines(data);
-    let Some(err) = lines.iter().position(|l| l.contains("Error:")) else {
+    let rows = screen_rows(data);
+    let Some(err) = rows.iter().position(|l| l.contains("Error:")) else {
         return usize::MAX;
     };
     let mut blanks = 0;
     let mut i = err;
     while i > 0 {
         i -= 1;
-        if lines[i].trim().is_empty() {
+        if rows[i].trim().is_empty() {
             blanks += 1;
         } else {
             break;
@@ -363,17 +413,11 @@ fn blanks_above_error(data: &[u8]) -> usize {
     blanks
 }
 
-fn ansi_lines(data: &[u8]) -> Vec<String> {
-    String::from_utf8_lossy(data)
-        .split("\r\n")
-        .map(strip_ansi)
-        // A bare `\r` starts overwriting the row from column 0 — which is how
-        // the transient status line is reused (the write is `status`, `\r`,
-        // `EL`, content). Keeping the last segment is what a terminal shows;
-        // without it every content line carries the dead status as a prefix.
-        .map(|l| l.split('\r').next_back().unwrap_or("").to_string())
-        .collect()
-}
+// (Removed: `ansi_lines` split the byte stream on newlines to model the screen.
+// The status's gap row is blank in the stream and absent from the screen, so
+// that model counted one blank per content block that never existed on screen —
+// three for a text/tool/text turn. The spacing assertions are screen-based now,
+// via `screen_rows`.)
 
 /// Remove ANSI escape sequences (CSI `ESC [ params final`) from a line.
 fn strip_ansi(l: &str) -> String {
@@ -483,6 +527,101 @@ fn the_status_line_is_relative_and_transient_end_to_end() {
         text[erase..].contains("Just a plain text answer"),
         "the content should overwrite the status row: {:?}",
         &text[erase..]
+    );
+}
+
+/// The bar keeps a blank row between itself and the last line of content, and
+/// exactly one — measured on the screen, mid-turn, with the bar up.
+///
+/// This is the requirement the whole gap is for, so it is asserted on the screen
+/// rather than on the byte stream. The lib tests count newlines, which is a
+/// proxy: a stream that splits on newlines cannot tell a row that was painted
+/// and erased from one that survived, and the gap is precisely a row that does
+/// not survive. So the transcript is replayed up to a paint and the rows are
+/// read off the screen.
+#[test]
+fn the_status_line_keeps_one_blank_row_above_it() {
+    let bytes = run_turn(4, "fenced-code", false);
+    // The offsets index the **raw transcript**, so the search is a byte search:
+    // `\r\n` collapsing shifts every position after the first line, and
+    // `from_utf8_lossy` shifts them again wherever a byte is not valid UTF-8.
+    // Either one and the slice below is cut in the wrong place.
+    let all = |needle: &[u8]| {
+        bytes
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, w)| *w == needle)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    };
+    // The **second** paint, not the first. The first one goes up right after the
+    // greeter, and the greeter has left a blank row above it on its own — so
+    // that one passes with the gap switched off entirely, which is exactly the
+    // kind of test that looks like it is covering something and is not.
+    let paints = all(b"\x1b[48;5;237m");
+    let bar_start = *paints
+        .get(1)
+        .unwrap_or_else(|| panic!("expected two bar paints, got {}", paints.len()));
+    // Stop just after that bar's own trailing reset: mid-turn, bar up, nothing
+    // painted after it yet. The search is *after* the bar's `SGR` — the
+    // transcript is full of resets from earlier styling, and the first one in the
+    // whole stream belongs to something else.
+    let stop = bar_start
+        + bytes[bar_start..]
+            .windows(4)
+            .position(|w| w == b"\x1b[0m")
+            .expect("the bar should be reset")
+        + 4;
+    let mut p = Parser::new(ROWS, COLS, 1000);
+    p.process(&bytes[..stop]);
+    let screen = p.screen();
+    let rows: Vec<String> = (0..ROWS)
+        .map(|r| {
+            (0..COLS)
+                .map(|c| {
+                    screen
+                        .cell(r, c)
+                        .and_then(|x| x.contents().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    let bar_row = rows
+        .iter()
+        .position(|r| is_status_row(r))
+        .unwrap_or_else(|| panic!("the bar should be on screen: {rows:?}"));
+    // Exactly one blank row above the bar, and the row above *that* is content.
+    // Zero would be the bar jammed against the text; two or more is the gap
+    // stacking on a blank the content path had already written.
+    assert!(
+        rows[bar_row - 1].trim().is_empty(),
+        "one blank row between the last content and the bar: {rows:?}"
+    );
+    assert!(
+        is_status_row(&rows[bar_row - 1]) || !rows[bar_row - 2].trim().is_empty(),
+        "and only one — the row above the gap is content, not another blank: {rows:?}"
+    );
+    // **Blank is not enough — the gap has to be unpainted.** A tool panel paints
+    // its background across every row it spans, so a row that is empty but still
+    // carries the panel's grey is part of the panel as far as the eye is
+    // concerned, and the bar still reads as jammed against it. This is the whole
+    // point of the gap, so it is the part worth asserting: a row is only a gap if
+    // its cells are back to the terminal's default background.
+    let gap_bg = screen.cell((bar_row - 1) as u16, 4).map(|c| c.bgcolor());
+    assert_eq!(
+        gap_bg,
+        Some(vt100::Color::Default),
+        "the gap row must be unpainted, not an empty row inside the panel: {rows:?}"
+    );
+    // And the bar's own row is a solid block, which is what makes it read as a
+    // separate surface rather than another line of the transcript.
+    assert_eq!(
+        screen.cell(bar_row as u16, 4).map(|c| c.bgcolor()),
+        Some(vt100::Color::Idx(237)),
+        "the bar's background should be the dark grey: {rows:?}"
     );
 }
 
