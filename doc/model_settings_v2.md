@@ -242,7 +242,8 @@ Composition, in order:
 
 **Effort remapping** (data-driven, no per-model code). Two tables: a rank over
 the *internal* levels, and an alias set per rank so a backend spelling is
-recognized however the provider spells it:
+recognized however the provider spells it. A **third** source sits in front of
+the ladder: a provider's own documented request table (§A.4.1).
 
 ```
 internal:      off=0  low=1  med=2  high=3  max=4
@@ -267,6 +268,51 @@ So `/reasoning med` on `["max","high","low"]` sends `low`, and on
 `["high","low","none"]` sends `high`. The frontend never learns about it: the
 menu keeps the static five-level list, and the *model header* is the only
 place the backend's view surfaces (`supported efforts: low, high, max`).
+
+### A.4.1 The provider's own request table
+
+The step-down ladder is wrong for a provider that *accepts* an effort it does
+not advertise. DeepSeek documents exactly that
+(`api-docs.deepseek.com/guides/thinking_mode/`):
+
+```
+requested   served
+minimal  →  low
+low      →  low
+medium   →  high      ← the ladder would have sent `low` here
+high     →  high
+xhigh    →  high
+max      →  max
+ultra    →  max
+```
+
+`deepseek/v4.1-flash` advertises `["max","high","low"]` — no `medium` — so the
+ladder alone would downgrade a `med` request to `low` and take away reasoning
+the user asked for *and* the provider was willing to give.
+
+**Resolution: a static per-provider table, consulted first, and disclosed.**
+`PROVIDER_EFFORT_MAPPINGS` in `params.rs` holds `(request, served)` pairs read
+from the provider's own docs. Two jobs, both data rather than code:
+
+1. **Never downgrade a documented request.** If the provider's table covers the
+   level's rank, the request goes out as `mapping()` spelled it and the service
+   applies its own mapping. The ladder is skipped entirely.
+2. **Tell the user, so the choice stays theirs.** `/reasoning`'s `header()`
+   shows the provider's table, the model's published list, and where each of
+   our five presets actually lands — so someone who wants DeepSeek's `high`
+   reads `med → high` and picks `med` deliberately rather than discovering the
+   substitution. Working backwards from the desired effort is the point.
+
+Rank-matched, not string-matched: our `med` finds their `medium`, and their
+`xhigh` is understood as our `max`. Only providers whose docs we have read
+appear in the table — `xiaomimimo` shares DeepSeek's wire shape and is
+deliberately **absent**, since assuming parity is the same guess that produced
+the wrong idea about temperature defaults, and an unmapped provider degrades
+to the ladder rather than to a wrong effort.
+
+The header reads its answer through `params::resolve_effort_for`, which derives
+the on-the-wire spelling from `mapping()` itself rather than re-deriving it, so
+the disclosed mapping cannot drift from the request that is sent.
 
 ## A.5 Settings storage
 
@@ -769,13 +815,19 @@ Settled in design review (2026-09-29), in the order they were taken:
 14. **Track shape A for all three tracks** (single `ModelParams` + one
     `additional_params` producer; a `ModelSettings` record plus a reusable TOML
     editor; a pure `split()` applied per request).
-15. **Provider defaults are shown, never sent.** The catalog's
+15. **Reasoning effort mappings are shown, not silently applied.** A static
+    per-provider table (A.4.1) carries what each service actually does with a
+    request, it is consulted before the step-down ladder so a documented
+    request is never downgraded, and `/reasoning`'s header discloses where
+    every preset lands. The user picks working backwards from the effort they
+    want; the frontend never learns provider vocabularies.
+16. **Provider defaults are shown, never sent.** The catalog's
     `default_parameters` feeds the `header()` only. No hardcoded "typical"
     1.0 / 0.95 — the measured spread is {0.3, 0.7, 0.9, 1.0} / {0.95, 1.0}
     and only a third of models publish one. Sending a known default would put
     an explicit `temperature` on the wire for every model and break the
     reasoning models that reject it.
-16. **`default_reasoning_level` is optional**, and the pre-rename
+17. **`default_reasoning_level` is optional**, and the pre-rename
     `default_thinking_level` auto-migrates into it on load (P0 addendum).
     Chosen over failing on the old key: a rename that makes the tool refuse to
     start is a different class of breakage from a command that changed name.

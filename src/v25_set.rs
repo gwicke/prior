@@ -210,6 +210,9 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             submit_fn: Box::new(move |level| {
                 writer.set_setting(SettingKey::DefaultReasoning, level)
             }),
+            // A *default* is not the running model, so there is nothing to
+            // report effort mappings for.
+            active_model_fn: None,
         };
         let mut wrapper: SlashDotMenuNode = ListingNode::new(
             app_state,

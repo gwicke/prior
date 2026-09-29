@@ -67,6 +67,50 @@ impl ReasoningLevel {
     }
 }
 
+/// A provider that accepts a requested effort it does not advertise, and
+/// documents what it serves instead.
+///
+/// A different mechanism from [`ReasoningSupport`]: the support list says
+/// "these are the levels this *model* advertises", while this says "this
+/// *service* takes the request in another shape and maps it". The DeepSeek
+/// table is the case that matters — it accepts `medium` and serves `high`, so
+/// stepping `med` *down* to `low` (because `medium` is absent from the model's
+/// advertised list) would take away reasoning the user asked for *and* the
+/// provider was willing to give.
+pub struct ProviderEffortMapping {
+    pub provider: &'static str,
+    /// `(request spelling, effort actually served)`, from the provider's docs.
+    pub served: &'static [(&'static str, &'static str)],
+}
+
+/// Service-side effort mappings, as published. Keyed by provider, consulted
+/// before the step-down fallback so a legitimate request is never downgraded.
+///
+/// Only providers whose docs we have actually read appear here. `xiaomimimo`
+/// shares DeepSeek's wire shape and is deliberately **absent**: assuming it
+/// behaves the same is exactly the guess that produced the wrong idea about
+/// temperature defaults, and an unmapped provider degrades to the level list
+/// rather than to a wrong effort.
+pub const PROVIDER_EFFORT_MAPPINGS: &[ProviderEffortMapping] = &[ProviderEffortMapping {
+    provider: "deepseek",
+    // https://api-docs.deepseek.com/guides/thinking_mode/
+    served: &[
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "high"),
+        ("max", "max"),
+        ("ultra", "max"),
+    ],
+}];
+
+fn mapping_for(provider: &str) -> Option<&'static ProviderEffortMapping> {
+    PROVIDER_EFFORT_MAPPINGS
+        .iter()
+        .find(|m| m.provider.eq_ignore_ascii_case(provider))
+}
+
 /// The set of reasoning efforts a model accepts, as published by the catalog
 /// (`data[].reasoning.supported_efforts`). `Unknown` (the empty list) means we
 /// have no data for this model, so the static per-provider spelling is sent
@@ -148,6 +192,116 @@ impl ReasoningSupport {
             .iter()
             .min_by_key(|(_, r)| *r)
             .map(|(l, _)| (*l).to_string())
+    }
+}
+
+/// Does this provider's documented table cover the level's rank?
+///
+/// Rank-matched rather than string-matched, so our `med` finds their `medium`
+/// (both rank 2) and their `xhigh` is understood as our `max`. This is a
+/// *permission* check, not a spelling chooser: the request that goes on the
+/// wire is whatever `mapping()` produces, and this only says "the service
+/// accepts it, so do not step it down".
+pub fn provider_recognizes(provider: &str, level: ReasoningLevel) -> bool {
+    let Some(table) = mapping_for(provider) else {
+        return false;
+    };
+    if level == ReasoningLevel::Off {
+        return false;
+    }
+    let target = level.rank();
+    table
+        .served
+        .iter()
+        .any(|(request, _)| rank_of(request) == Some(target))
+}
+
+/// The effort this provider actually runs for a request spelling. Display only
+/// — the service does the mapping, we just tell the user what to expect.
+pub fn provider_served_effort(provider: &str, request: &str) -> Option<&'static str> {
+    let table = mapping_for(provider)?;
+    table
+        .served
+        .iter()
+        .find(|(r, _)| r.eq_ignore_ascii_case(request))
+        .map(|(_, served)| *served)
+}
+
+/// Human-readable `request → served` list for a provider's header, e.g.
+/// `minimal→low, medium→high, xhigh→high`.
+pub fn provider_effort_mapping_summary(provider: &str) -> Option<String> {
+    let table = mapping_for(provider)?;
+    Some(
+        table
+            .served
+            .iter()
+            .map(|(r, s)| format!("{r}→{s}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// The effort spelling that goes on the wire for `level` on this
+/// provider+model, or `None` when the provider has no effort vocabulary.
+///
+/// Public so the UI can show the user the same answer the sender computes —
+/// the header must never describe a different mapping than the request uses.
+/// Derived from `mapping()` rather than re-deriving the spelling, so the two
+/// cannot drift.
+pub fn resolve_effort_for(
+    provider: &str,
+    level: ReasoningLevel,
+    support: &ReasoningSupport,
+) -> Option<String> {
+    // `Off` is not an effort: the provider's payload says "disabled", and
+    // there is nothing to disclose about it.
+    if level == ReasoningLevel::Off {
+        return None;
+    }
+    // The spelling this provider's own mapping produces.
+    let canonical = effort_of(&mapping(provider, level)?)?;
+    // The service accepts it as written; its own mapping applies.
+    if provider_recognizes(provider, level) {
+        return Some(canonical);
+    }
+    support.resolve(level).or(Some(canonical))
+}
+
+/// The effort a reasoning payload names, whatever shape the provider uses:
+/// `reasoning: {effort}` (OpenRouter) or a bare `reasoning_effort`
+/// (OpenAI, DeepSeek).
+fn effort_of(payload: &Value) -> Option<String> {
+    if let Some(effort) = payload
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(effort.to_string());
+    }
+    payload
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Overwrite the effort in a reasoning payload, in place, keeping the
+/// provider's own key shape.
+fn set_effort(payload: &mut Value, effort: &str) {
+    if payload
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .is_some()
+    {
+        if let Some(slot) = payload
+            .get_mut("reasoning")
+            .and_then(|r| r.get_mut("effort"))
+        {
+            *slot = Value::String(effort.to_string());
+        }
+        return;
+    }
+    if payload.get("reasoning_effort").is_some() {
+        payload["reasoning_effort"] = Value::String(effort.to_string());
     }
 }
 
@@ -253,43 +407,37 @@ pub fn mapping(provider: &str, level: ReasoningLevel) -> Option<Value> {
 // `ModelParams` instead, and a string-typed entry point would be a way to skip
 // the composed producer and lose the top_p / remap handling.
 
-/// Rewrite a provider payload's reasoning effort through the model's published
-/// level list, when the provider spells its effort the way we can rank it.
+/// Rewrite a provider payload's reasoning effort so it names an effort this
+/// model actually serves. Two sources, in order:
+///
+/// 1. **The provider's documented request table** — if this service accepts
+///    the request we are about to send, it is left alone and the service
+///    applies its own mapping. Keeps DeepSeek's `medium → high` intact.
+/// 2. **The model's advertised level list** — the step-down ladder, used only
+///    when the model does not advertise the effort at all.
 ///
 /// Only the reasoning keys are touched, so each provider keeps its own shape
 /// (`reasoning: {effort}` for OpenRouter, a bare `reasoning_effort` for
 /// OpenAI, `reasoning_effort` beside `thinking` for DeepSeek). An effort we
 /// cannot rank leaves the payload untouched rather than guessing.
-fn remap_effort(payload: &mut Value, support: &ReasoningSupport) {
+fn remap_effort(
+    provider: &str,
+    payload: &mut Value,
+    support: &ReasoningSupport,
+    requested: ReasoningLevel,
+) {
     if !support.is_known() {
         return;
     }
-    // `reasoning: {effort}` — OpenRouter and friends.
-    if let Some(effort) = payload
-        .get_mut("reasoning")
-        .and_then(|r| r.get_mut("effort"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-    {
-        if let Some(mapped) = resolve_spelling(&effort, support) {
-            if let Some(slot) = payload
-                .get_mut("reasoning")
-                .and_then(|r| r.get_mut("effort"))
-            {
-                *slot = Value::String(mapped);
-            }
-        }
+    // The provider takes this request as written; its own mapping applies.
+    if provider_recognizes(provider, requested) {
         return;
     }
-    // A bare `reasoning_effort` — OpenAI, DeepSeek, xiaomimimo.
-    if let Some(effort) = payload
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-    {
-        if let Some(mapped) = resolve_spelling(&effort, support) {
-            payload["reasoning_effort"] = Value::String(mapped);
-        }
+    let Some(effort) = effort_of(payload) else {
+        return;
+    };
+    if let Some(mapped) = resolve_spelling(&effort, support) {
+        set_effort(payload, &mapped);
     }
 }
 
@@ -329,7 +477,7 @@ pub fn additional_params(
 
     if let Some(level) = params.reasoning {
         if let Some(mut payload) = mapping(provider, level) {
-            remap_effort(&mut payload, support);
+            remap_effort(provider, &mut payload, support, level);
             if let Some(obj) = payload.as_object() {
                 out.extend(obj.clone());
             }
@@ -632,9 +780,9 @@ mod tests {
         );
     }
 
-    /// The end-to-end case the remapper exists for: `/reasoning med` on a
-    /// model that publishes no `medium` sends an effort it accepts, keeping
-    /// the provider's own payload shape.
+    /// With no provider table in play, `/reasoning med` on a model that
+    /// publishes no `medium` steps down to the nearest effort it does accept,
+    /// keeping each provider's own payload shape.
     #[test]
     fn additional_params_remaps_a_level_the_model_lacks() {
         // deepseek/deepseek-v4.1-flash: ["max","high","low"].
@@ -652,7 +800,16 @@ mod tests {
             additional_params("openai", &params(Some(ReasoningLevel::Med), None, None), &s),
             Some(json!({"reasoning_effort": "low"}))
         );
-        // DeepSeek shape: the effort is remapped, the `thinking` block is not.
+    }
+
+    /// DeepSeek accepts `medium` and serves `high` (its published request
+    /// table), so the step-down must NOT fire: the request goes out as
+    /// `medium` and the service does the mapping. Sending `low` here would
+    /// take away reasoning the user asked for *and* the provider offered.
+    #[test]
+    fn a_documented_provider_request_is_never_downgraded() {
+        // Even though the model advertises no `medium` at all.
+        let s = support(&["max", "high", "low"]);
         assert_eq!(
             additional_params(
                 "deepseek",
@@ -661,8 +818,74 @@ mod tests {
             ),
             Some(json!({
                 "thinking": {"type": "enabled"},
-                "reasoning_effort": "low"
+                "reasoning_effort": "medium"
+            })),
+            "DeepSeek maps medium->high itself; we must not pre-empt it"
+        );
+        // Our `max` is their `max`.
+        assert_eq!(
+            additional_params(
+                "deepseek",
+                &params(Some(ReasoningLevel::Max), None, None),
+                &s
+            ),
+            Some(json!({
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "max"
             }))
+        );
+    }
+
+    /// An unmapped provider with the same model list still steps down — the
+    /// DeepSeek table must not leak to a provider that never published one.
+    #[test]
+    fn a_documented_table_does_not_leak_to_other_providers() {
+        let s = support(&["max", "high", "low"]);
+        // xiaomimimo shares DeepSeek's wire shape but has no published table.
+        assert_eq!(
+            additional_params(
+                "xiaomimimo",
+                &params(Some(ReasoningLevel::Med), None, None),
+                &s
+            ),
+            Some(json!({
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": "low"
+            })),
+            "an unverified provider must degrade, not guess"
+        );
+    }
+
+    /// The lookups behind the header, which must report the same answer the
+    /// sender computes.
+    #[test]
+    fn provider_mapping_lookups_agree_with_the_sender() {
+        assert!(
+            provider_recognizes("deepseek", ReasoningLevel::Med),
+            "our `med` must be recognized by rank as their `medium`"
+        );
+        assert!(provider_recognizes("deepseek", ReasoningLevel::Max));
+        assert!(!provider_recognizes("deepseek", ReasoningLevel::Off));
+        assert!(!provider_recognizes("openai", ReasoningLevel::Med));
+        assert_eq!(provider_served_effort("deepseek", "medium"), Some("high"));
+        assert_eq!(provider_served_effort("deepseek", "xhigh"), Some("high"));
+        assert_eq!(provider_served_effort("openai", "medium"), None);
+        let summary = provider_effort_mapping_summary("deepseek").unwrap();
+        assert!(summary.contains("medium\u{2192}high"), "{summary}");
+
+        // resolve_effort_for is what the header calls; it must match the wire.
+        let s = support(&["max", "high", "low"]);
+        assert_eq!(
+            resolve_effort_for("deepseek", ReasoningLevel::Med, &s).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            resolve_effort_for("openai", ReasoningLevel::Med, &s).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            resolve_effort_for("deepseek", ReasoningLevel::Off, &s),
+            None
         );
     }
 

@@ -16,6 +16,7 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
     // Thinking: listing + single enum node (returns all levels via data()).
     {
         let reader = app_state.clone();
+        let reader2 = app_state.clone();
         let writer = app_state.clone();
         let mut tl: SlashDotMenuNode = ListingNode::new(
             app_state,
@@ -44,6 +45,9 @@ pub fn build_menu(app_state: &Arc<AppState>) -> SlashDotMenu {
                     writer.set_reasoning(Some(parsed));
                     Ok(())
                 }),
+                // The live node reports the active model, so `header()` can
+                // disclose what each preset runs as on it.
+                active_model_fn: Some(Box::new(move || reader2.model())),
             }
             .into(),
         );
