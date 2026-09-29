@@ -1465,7 +1465,16 @@ impl Repl {
         // (plan §4.2). Clear the input region, then echo the line
         // at the caret the frame apply left.
         redraw(&LineEditor::new(), &[], sel, dims);
+        // Bracketed by rules, the way a turn is. A committed line is a real
+        // event in the transcript — `/thinking high` changed a setting the reader
+        // will want to find again after scrolling — and a bare `/thinking high`
+        // between two answers is easy to read as something the model said. The
+        // status bar follows underneath, because the next `redraw` repaints the
+        // frame below whatever was just written: content written at the caret
+        // pushes the tracked row down, and the next apply clears from *there*.
+        output.display_separator();
         output.display_plain(line);
+        output.display_separator();
         editor.set(next_input);
     }
 

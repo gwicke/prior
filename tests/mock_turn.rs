@@ -243,6 +243,15 @@ fn wait_for(bytes: &Arc<Mutex<Vec<u8>>>, needle: &str, timeout: Duration) -> boo
 /// Returns the raw byte stream for analysis. When `thinking` is set, the agent
 /// runs with `default_thinking_level = "high"` (answer-hold / reasoning path).
 fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
+    run_turn_typing(scenario, label, thinking, "run the command")
+}
+
+/// As [`run_turn`], but types `typed` instead of a prompt.
+///
+/// A slash command is a different path through the same loop: it commits a line
+/// and never reaches the LLM, so `want` is 0 requests — the transcript has to end
+/// for the assertions to mean anything.
+fn run_turn_typing(scenario: u32, label: &str, thinking: bool, typed: &str) -> Vec<u8> {
     let llm = MockLlm::start(scenario);
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -297,12 +306,18 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(150));
     // Submit a prompt (Enter submits the typed line in the REPL).
-    let _ = writer.write_all(b"run the command\r");
+    let _ = writer.write_all(format!("{typed}\r").as_bytes());
     let _ = writer.flush();
 
     // Wait until the mock has served the expected turns, then a beat for the
     // separator + next prompt redraw.
-    let want = if scenario == 2 { 1 } else { 2 };
+    let want = if typed.starts_with('/') {
+        0
+    } else if scenario == 2 {
+        1
+    } else {
+        2
+    };
     let deadline = Instant::now() + Duration::from_secs(30);
     while llm.count() < want && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
@@ -781,5 +796,39 @@ fn the_idle_bar_is_frame_owned_so_submit_leaves_nothing_behind() {
     assert!(
         echo < bar,
         "the echo should sit above the bar, not be overwritten by it: {rows:?}"
+    );
+}
+
+/// A committed slash line is bracketed by rules, with the status bar below it.
+///
+/// `/thinking high` is a real event in the transcript — it changed a setting the
+/// reader will want to find again — and a bare `/thinking high` between two
+/// answers is easy to misread as something the model said. So it gets the same
+/// `─────` treatment a turn does.
+#[test]
+fn a_committed_line_is_bracketed_by_rules_with_the_bar_below() {
+    let bytes = run_turn_typing(2, "commit-thinking", false, "/thinking high");
+    let rows = screen_rows(&bytes);
+    let line = rows
+        .iter()
+        .position(|r| r.contains("/thinking"))
+        .unwrap_or_else(|| panic!("the committed line should be on screen: {rows:?}"));
+    assert!(
+        rows[line - 1].chars().all(|c| c == '─') && rows[line - 1].len() >= 10,
+        "a rule above the committed line: {rows:?}"
+    );
+    assert!(
+        rows[line + 1].chars().all(|c| c == '─') && rows[line + 1].len() >= 10,
+        "and one below it: {rows:?}"
+    );
+    // The bar is the frame's first row, so it lands below whatever the commit
+    // wrote: the ordering is content, then bar, then the prompt.
+    let bar = rows
+        .iter()
+        .position(|r| is_status_row(r))
+        .unwrap_or_else(|| panic!("the bar should be on screen: {rows:?}"));
+    assert!(
+        bar > line + 1,
+        "the bar follows the bracketed line: {rows:?}"
     );
 }
