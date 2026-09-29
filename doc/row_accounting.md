@@ -465,45 +465,81 @@ visible only where the old behaviour was wrong.
 - The content's own rendering is untouched: B1–B3e made the bytes and the
   separators correct, and the solve only decides *where* they land.
 
-### A2's one real constraint: scrollback while streaming
+### A2's rendering model: three zones, and only one of them may use `CUP`
 
-Checked before implementing, because it decides what the status line can be.
+Settled by review (2026-09-28), and it replaces the reserved-band design of §2
+for the status line. The three zones:
 
-**Today**, while a turn streams, nothing is written but appended content — no
-frame exists, so scrolling up to read scrollback works. (At the *prompt* it
-already does not: the REPL repaints the frame on every keystroke with absolute
-addressing, so typing while scrolled back yanks the viewport. In *Indicator*
-mode the spinner also ticks 8×/s, but it writes relatively — CR + erase-line at
-the cursor, i.e. the bottom of the logical screen — which stays out of a
-scrolled-back view.)
+| Zone | What | How it writes |
+|---|---|---|
+| **1. Scrollback** | assistant text, reasoning, tool panels | append-only, LF-driven — unchanged, and unchanged by A1 |
+| **2. The status line** | one transient readout line at the cursor | **cursor-relative only** |
+| **3. Below it** | the input line, its divider, a menu | absolute (`CUP`) — and only re-rendered on a keystroke, a resize, or a dialog |
 
-**With a status line repainted per streamed block**, the repaint is
-`CUP row, col` — absolute addressing, which targets the *viewport*. Scrolled
-back, that paints the status line over the content the user is reading, and
-most terminals also pull the viewport to the bottom. So a live footer does not
-merely interrupt scrollback reading, it writes into the scrolled-back view.
+**Why zone 2 cannot be absolute.** `CUP row;colH` addresses the *viewport*. A
+user scrolled back is looking at older rows, so an absolute status repaint
+overwrites what they are reading — and most terminals pull the viewport to the
+bottom anyway. A cursor-relative write always targets the logical cursor, which
+when scrolled back is *below* the viewport: invisible, never corrupting. That
+degradation is the whole point, and it is why the rule is "relative or nothing".
 
-**There is no portable way to detect it.** No query reports the viewport
-position: `CPR` answers for the cursor, whose reported row when scrolled back is
-terminal-dependent, and it costs a round trip per check. So "repaint only when
-the user is at the bottom" is not implementable, and neither is "freeze the line
-when they scroll away".
+**Why zone 3 is safe.** Its repaints are user-driven: the frame changes when the
+user types, resizes, or opens a menu. A user who has scrolled back is not
+typing, so no absolute write happens — *except* for a **confirm dialog**, which
+pops up because the *agent* asked, not the user. That is zone 3's one exception
+and it is not new (dialogs have always used the frame path); worth knowing,
+not worth redesigning.
 
-Two honest variants, both buildable on the same element:
+**The status line is transient, not a region.** It occupies the content's last
+row and is overwritten by the next content write:
 
-- **(a) Live footer — the viewport follows output while a turn streams.** One
-  absolute repaint per streamed block. What every comparable tool does, and
-  what a live ctx%/model readout costs. Read scrollback between turns.
-- **(b) Prompt-only footer — streaming stays append-only.** The frame exists at
-  the prompt (where a repaint per keystroke already happens, so it inherits the
-  existing yank-on-type and adds nothing), and there is no frame mid-turn.
-  Scrollback stays readable while a turn streams; the line is static during it.
+```
+content block … LF        cursor at column 0 of a fresh line
+write_status(text)        relative: the text, no trailing LF   → cursor at its end
+  … the turn ends, the user reads, the frame is drawn …
+next content write:  CR + ESC[2K   (erase the status line)
+                     boundary()   (one blank, if the stream owes one)
+                     the content
+```
 
-Recommendation: ship (b) first — it is the cheaper variant, it is the "static
-footer as a way to prove the tracking works" that was originally asked for, and
-it leaves (a) a one-line policy decision rather than a redesign. A1 is unaffected
-either way: with no frame during streaming, the solve's content path is
-byte-identical to today's.
+Nothing is reserved, so the "live region ends above the footer" invariant of §2
+—and with it `ApplyPolicy::Reserve`, the footer as a frame element, and the
+placement half of the solve — all disappear. The status is a line the content
+stream owns, not a rectangle the screen reserves.
+
+Two preconditions, both already available:
+
+- **The status may only be written with the cursor at column 0**, or the next
+  content write's line-erase would destroy a partial content line.
+  `StreamTail` already tracks exactly that bit (`last_nl`), so the check is
+  free, and `write_status` is a no-op when it does not hold.
+- **Erase before the boundary check.** The status text has no newline, so the
+  tail reads "not blank"; if the next write did not erase it first, the
+  boundary would emit a blank and leave the status stranded as its own line in
+  the scrollback. Erasing first also puts the tail back where the boundary
+  expects it.
+
+**Cadence.** `ctx` only moves at end of turn, so the status is rewritten at
+turn boundaries (`end_response`) and when the frame changes — not per streamed
+block. The per-content cost is the 4-byte erase.
+
+**This removes most of A1.** The composition's purpose was to reserve space for
+a bottom element. With a transient line there is nothing to reserve, so the
+placement solve, `Reserve`, and the status as an `Element::Lines` all go. What
+survives is the part that was never about placement:
+
+- the **two-region clear** — a content write while a frame is live must clear
+  the frame's old region (above the content) first, or a replay's `ESC[0J`
+  leaves frame residue above the cursor. That is the resume artifact, and it is
+  a *clear*, not a placement.
+- the **partial-predicate condition** — a frame may only take the row-diff path
+  if the content did not move, or `live`'s row indices are stale.
+
+**And an input line cannot join zone 2**, which is the right answer to the
+uncertainty in the review: an input needs a stable caret that editing redraws
+around, and rewriting a line *above* the cursor needs absolute moves. The input
+stays in zone 3, where its only redraw trigger is the user — so it inherits the
+yank-on-type that already exists and adds nothing.
 
 ### Open, for A1 specifically
 
