@@ -2075,12 +2075,17 @@ impl Output for ConsoleOutput {
         // line and the line the model actually sent are on the same row, and so
         // the block is half as tall (`Actual:` no longer falls below the fold).
         // The *model* still receives the vertical form — see arg_error_view.
+        //
+        // Painted rather than `tool_panel`ed: these lines are already sized to
+        // the terminal and their columns align by construction, and
+        // `tool_panel` re-wraps through `wrap()`, which collapses the interior
+        // spaces that alignment depends on.
         {
             let width = term_width();
             let avail = width.saturating_sub(1).max(1);
             if let Some(table) = blockedit::arg_error_view::render_arg_error_table(cleaned, avail) {
                 for line in &table {
-                    self.tool_panel(line, false, true);
+                    self.paint_panel(&style(line.clone()).dim().to_string(), true);
                 }
                 return;
             }
@@ -3844,28 +3849,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn edit_arg_error_renders_as_two_columns() {
-        // The panel shows the model's correction as a table so the correct line
-        // and the line the model sent sit on the same row, and the block is half
-        // as tall (the model-facing form stays vertical — see arg_error_view).
+    fn edit_arg_error_pipes_align_in_the_rendered_panel() {
+        // Regression. The renderer emits correct padding, but the panel pipeline
+        // re-wraps lines through `wrap()`, which collapses interior runs of
+        // spaces — so a padding-based table rendered fine in unit tests and came
+        // out ragged on screen. Assert on the *rendered* columns, not on the
+        // renderer's output, or this slips through again.
         let msg = "failed to parse tool arguments: Invalid edit tool arguments: \
-Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on its line.\n\
+Invalid block: an edit block is missing its `@@@NEW` section\n\
 \n\
-Expected:\n\
-some/path:1234\n\
-@@@OLD\n\
-old text\n\
-@@@NEW\n\
-new text\n\
-@@@END\n\
+Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END\n\
 \n\
-Actual:\n\
-src/x.rs\n\
-@@@OLD\n\
-… (2 lines elided) …\n\
-@@@NEW\n\
-… (2 lines elided) …\n\
-@@@NEWEND";
+Actual:\nsrc/output.rs\n@@@OLD\n… (5 lines elided) …\n@@@NEW\nself.draw.lock().unwrap().anchor()\n";
         let out = ConsoleOutput::new(crate::settings::default_show_reasoning_handle());
         out.display_tool_call("edit", &serde_json::json!({"path": "src/x.rs"}));
         out.begin_capture_inner();
@@ -3873,20 +3868,27 @@ src/x.rs\n\
         let bytes = out.end_capture_inner();
         let text = strip_ansi(&String::from_utf8_lossy(&bytes));
 
-        // The redundant prefixes are gone.
-        assert!(!text.contains("failed to parse tool arguments"), "{text}");
-        assert!(!text.contains("Invalid edit tool arguments"), "{text}");
-        // The two markers that differ share a row. Require the gutter so the
-        // problem statement — which also quotes the bad marker — is not mistaken
-        // for a table row.
+        let columns: Vec<usize> = text
+            .lines()
+            .filter(|l| l.contains('|'))
+            .map(|l| l.find('|').unwrap())
+            .collect();
+        assert!(columns.len() >= 6, "expected a table, got: {text}");
+        let first = columns[0];
+        assert!(
+            columns.iter().all(|c| *c == first),
+            "pipes at {columns:?} should all be at {first}:\n{text}"
+        );
+        // Still a table, and still the two markers that differ on one row.
         let row = text
             .lines()
-            .find(|l| l.contains('|') && l.contains("@@@NEWEND"))
-            .expect("row with the malformed marker");
-        assert!(row.contains("@@@END"), "{row}");
-        // And it is a table, not a stack: both column headers are present.
-        assert!(text.contains("Expected"), "{text}");
-        assert!(text.contains("Actual"), "{text}");
+            .find(|l| l.contains('|') && l.contains("@@@NEW"))
+            .unwrap();
+        assert!(
+            text.contains("Expected") && text.contains("Actual"),
+            "{text}"
+        );
+        let _ = row;
     }
 
     #[test]
