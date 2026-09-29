@@ -16,8 +16,11 @@ use std::sync::{Arc, Mutex};
 /// How model reasoning/thinking is surfaced to the user.
 ///
 /// * `Content`   (default) — stream the thinking/reasoning text inline, dimmed.
-/// * `Indicator`          — show only a "Thinking…" spinner (no reasoning text).
-/// * `Disabled`           — show neither the indicator nor the reasoning text.
+/// * `Disabled`           — show no reasoning text.
+///
+/// There is no third mode: "something is happening" is the status line's job
+/// (its dot), not a separate spinner, so the only question left is whether the
+/// reasoning text itself is shown.
 ///
 /// Driven by the `show_reasoning` setting (editable via `/set`). The live value
 /// lives in a [`ShowReasoningHandle`] shared by the `Output` impl and the running
@@ -28,9 +31,7 @@ pub enum ShowReasoning {
     /// Stream the thinking/reasoning text inline (dimmed).
     #[default]
     Content,
-    /// Show only a "Thinking…" spinner; suppress the reasoning text.
-    Indicator,
-    /// Show neither the indicator nor the reasoning text.
+    /// Show no reasoning text.
     Disabled,
 }
 
@@ -39,7 +40,6 @@ impl ShowReasoning {
     pub fn as_str(self) -> &'static str {
         match self {
             ShowReasoning::Content => "content",
-            ShowReasoning::Indicator => "indicator",
             ShowReasoning::Disabled => "disabled",
         }
     }
@@ -47,11 +47,18 @@ impl ShowReasoning {
     /// Map a stored/parsed string to the mode. Tolerant of case and a few
     /// common synonyms; returns `None` for anything unrecognized so callers
     /// can fall back to the default and reject invalid `/set` input.
+    ///
+    /// The removed `indicator`/`spinner`/`status` values map to `Disabled`, not
+    /// to the default: someone who chose the spinner chose it *to not see the
+    /// reasoning text*, and that is the half of the behaviour that still
+    /// exists. Mapping them to `Content` would start showing them text they had
+    /// asked not to see. The activity signal they also got — the spinner — is
+    /// now the status line's dot.
     pub fn parse_opt(s: &str) -> Option<ShowReasoning> {
         match s.trim().to_ascii_lowercase().as_str() {
             "content" | "on" | "true" | "reasoning" => Some(ShowReasoning::Content),
-            "indicator" | "spinner" | "status" => Some(ShowReasoning::Indicator),
             "disabled" | "off" | "none" | "false" => Some(ShowReasoning::Disabled),
+            "indicator" | "spinner" | "status" => Some(ShowReasoning::Disabled),
             _ => None,
         }
     }
@@ -62,7 +69,7 @@ impl FromStr for ShowReasoning {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse_opt(s).ok_or_else(|| {
             format!(
-                "unknown show_reasoning value: '{}' (use disabled | indicator | content)",
+                "unknown show_reasoning value: '{}' (use disabled | content)",
                 s.trim()
             )
         })
@@ -250,8 +257,8 @@ pub static SETTINGS: &[SettingMeta] = &[
     SettingMeta {
         key: SettingKey::ShowReasoning,
         name: "show_reasoning",
-        description: "How reasoning is shown: disabled | indicator | content",
-        kind: ValueKind::Enum(&["disabled", "indicator", "content"]),
+        description: "How reasoning is shown: disabled | content",
+        kind: ValueKind::Enum(&["disabled", "content"]),
     },
     SettingMeta {
         key: SettingKey::ReasoningInContext,
@@ -756,17 +763,18 @@ mod tests {
             ShowReasoning::Disabled
         );
         assert_eq!(
-            "INDICATOR".parse::<ShowReasoning>().unwrap(),
-            ShowReasoning::Indicator
-        );
-        assert_eq!(
             "content".parse::<ShowReasoning>().unwrap(),
             ShowReasoning::Content
         );
         assert!("bogus".parse::<ShowReasoning>().is_err());
+        // The removed spinner values survive as a parse, and mean "no text".
         assert_eq!(
             ShowReasoning::parse_opt("spinner"),
-            Some(ShowReasoning::Indicator)
+            Some(ShowReasoning::Disabled)
+        );
+        assert_eq!(
+            ShowReasoning::parse_opt("indicator"),
+            Some(ShowReasoning::Disabled)
         );
         assert_eq!(ShowReasoning::as_str(ShowReasoning::Disabled), "disabled");
     }
@@ -807,7 +815,7 @@ mod tests {
         s.set_value(SettingKey::DefaultPersona, "architect")
             .unwrap();
         s.set_value(SettingKey::DefaultThinking, "high").unwrap();
-        s.set_value(SettingKey::ShowReasoning, "indicator").unwrap();
+        s.set_value(SettingKey::ShowReasoning, "disabled").unwrap();
         s.set_value(SettingKey::ReasoningInContext, "always")
             .unwrap();
         s.apply_to_config(&mut cfg);
@@ -824,7 +832,7 @@ mod tests {
         // `show_reasoning` is applied live via the shared handle.
         assert_eq!(
             *cfg.show_reasoning_handle.lock().unwrap(),
-            crate::settings::ShowReasoning::Indicator
+            crate::settings::ShowReasoning::Disabled
         );
 
         // reasoning_in_context is applied from the store value.

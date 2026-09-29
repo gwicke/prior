@@ -80,7 +80,6 @@ pub fn confirm(out: &dyn Output, spec: &ConfirmSpec<'_>) -> ConfirmResult {
     if let Some(gate) = out.confirm_gate() {
         gate.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    out.stop_thinking();
 
     // Re-anchor (DSR): mid-turn the draw cache's caret does not follow
     // streamed content row by row, so the dialog must start at the *real*
@@ -339,8 +338,6 @@ mod tests {
             Confirmation::No
         }
         fn display_separator(&self) {}
-        fn display_thinking(&self, _message: &str) {}
-        fn stop_thinking(&self) {}
         fn display_header(
             &self,
             _provider: &str,

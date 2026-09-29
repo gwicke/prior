@@ -124,8 +124,7 @@ fn enum_value_descs(key: SettingKey) -> &'static [(&'static str, &'static str)] 
             ("yolo", "run tools without prompts"),
         ],
         SettingKey::ShowReasoning => &[
-            ("disabled", "show neither indicator nor reasoning text"),
-            ("indicator", "show only a Thinking… spinner"),
+            ("disabled", "show no reasoning text"),
             ("content", "show the reasoning text (default)"),
         ],
         SettingKey::ReasoningInContext => crate::settings::ReasoningInContextMode::variants(),

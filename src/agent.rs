@@ -225,7 +225,6 @@ impl PicoAgent for CodeAgent {
         session: Option<&Session>,
         turn: &TurnPersistence,
     ) -> Result<String> {
-        self.output.display_thinking("Thinking...");
         // Fresh request: clear any stale cancel flag from a previous abort so a
         // prior `Esc` doesn't silently cancel this prompt. The REPL's in-flight
         // reader sets `cancel` on `<Esc>` and is always joined (after `done` is
@@ -5421,7 +5420,7 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             tool_call_limit: 10,
             default_persona: None,
             default_thinking_level: "off".into(),
-            show_reasoning: "indicator".into(),
+            show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::from("default prompt"),
@@ -6363,8 +6362,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             fn confirm(&self, _: &str) -> Confirmation {
                 Confirmation::No
             }
-            fn display_thinking(&self, _: &str) {}
-            fn stop_thinking(&self) {}
             fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
         }
 
@@ -6476,8 +6473,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             fn confirm(&self, _: &str) -> Confirmation {
                 Confirmation::No
             }
-            fn display_thinking(&self, _: &str) {}
-            fn stop_thinking(&self) {}
             fn display_header(&self, _: &str, _: &str, _: bool, _: usize, _: Option<&str>) {}
         }
 
@@ -6896,8 +6891,6 @@ Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on 
             Confirmation::No
         }
         fn display_separator(&self) {}
-        fn display_thinking(&self, _m: &str) {}
-        fn stop_thinking(&self) {}
         fn display_header(&self, _p: &str, _m: &str, _y: bool, _l: usize, _pn: Option<&str>) {}
     }
 

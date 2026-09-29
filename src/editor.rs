@@ -419,8 +419,6 @@ mod tests {
             crate::output::Confirmation::No
         }
         fn display_separator(&self) {}
-        fn display_thinking(&self, _message: &str) {}
-        fn stop_thinking(&self) {}
         fn display_header(
             &self,
             _provider: &str,
@@ -536,8 +534,6 @@ mod tests {
             crate::output::Confirmation::No
         }
         fn display_separator(&self) {}
-        fn display_thinking(&self, _message: &str) {}
-        fn stop_thinking(&self) {}
         fn display_header(
             &self,
             _provider: &str,

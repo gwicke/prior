@@ -95,7 +95,7 @@ mod tests {
             tool_call_limit: 10,
             default_persona: None,
             default_thinking_level: "off".into(),
-            show_reasoning: "indicator".into(),
+            show_reasoning: "content".into(),
             reasoning_in_context: crate::settings::ReasoningInContextMode::Never,
             session_resume_replay_turns: 3,
             llm_compact_prompt: String::new(),

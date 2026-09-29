@@ -3,7 +3,6 @@ use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
 use crate::ui::frame::{plan_apply, plan_clear_live_frame, ApplyPolicy, DrawCache, Frame};
 use console::{style, StyledObject};
-use indicatif::{ProgressBar, ProgressStyle};
 use libc;
 use markdown_stream::{Parser, StreamParser};
 use markdown_terminal::{Renderer, Theme};
@@ -122,8 +121,6 @@ pub trait Output: Send + Sync {
     ///
     /// Default no-op: outputs with no cursor to write at have no status line.
     fn set_status(&self, _text: &str) {}
-    fn display_thinking(&self, message: &str);
-    fn stop_thinking(&self);
     fn display_header(
         &self,
         provider: &str,
@@ -205,28 +202,12 @@ pub trait Output: Send + Sync {
 }
 
 pub struct QuietOutput {
-    spinner: Mutex<Option<ProgressBar>>,
     show_reasoning: ShowReasoningHandle,
 }
 
 impl QuietOutput {
     pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
-        Self {
-            spinner: Mutex::new(None),
-            show_reasoning,
-        }
-    }
-
-    fn create_spinner(message: &str) -> ProgressBar {
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(Duration::from_millis(120));
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.blue} {msg}")
-                .unwrap(),
-        );
-        pb.set_message(message.to_string());
-        pb
+        Self { show_reasoning }
     }
 }
 
@@ -238,12 +219,10 @@ impl Output for QuietOutput {
         String::new()
     }
     fn display_error(&self, error: &str) {
-        self.stop_thinking();
         eprintln!("Error: {}", error);
     }
     fn display_system(&self, _text: &str) {}
     fn confirm(&self, message: &str) -> Confirmation {
-        self.stop_thinking();
         eprintln!("Confirm: {} [y/n/s]", message);
         let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);
@@ -254,21 +233,6 @@ impl Output for QuietOutput {
         }
     }
     fn display_separator(&self) {}
-    fn display_thinking(&self, message: &str) {
-        // Indicator mode => show the spinner; otherwise suppress it.
-        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Indicator {
-            return;
-        }
-        let mut spinner_lock = self.spinner.lock().unwrap();
-        if spinner_lock.is_none() {
-            *spinner_lock = Some(Self::create_spinner(message));
-        }
-    }
-    fn stop_thinking(&self) {
-        if let Some(pb) = self.spinner.lock().unwrap().take() {
-            pb.finish_and_clear();
-        }
-    }
     fn display_header(
         &self,
         _provider: &str,
@@ -295,8 +259,6 @@ impl Output for NoOutput {
         Confirmation::Yes
     }
     fn display_separator(&self) {}
-    fn display_thinking(&self, _message: &str) {}
-    fn stop_thinking(&self) {}
     fn display_header(
         &self,
         _provider: &str,
@@ -362,8 +324,6 @@ impl Output for RecordingOutput {
         Confirmation::Yes
     }
     fn display_separator(&self) {}
-    fn display_thinking(&self, _message: &str) {}
-    fn stop_thinking(&self) {}
     fn display_header(
         &self,
         _provider: &str,
@@ -408,10 +368,6 @@ impl Output for LogOutput {
 
     fn display_separator(&self) {}
 
-    fn display_thinking(&self, _message: &str) {}
-
-    fn stop_thinking(&self) {}
-
     fn display_header(
         &self,
         provider: &str,
@@ -425,7 +381,6 @@ impl Output for LogOutput {
 }
 
 pub struct ConsoleOutput {
-    spinner: Mutex<Option<ProgressBar>>,
     /// Live-screen bookkeeping for the frame pipeline (plan §4): tracked cursor
     /// row, the clear floor, and the last applied frame. Always updated together
     /// with a write under the same lock order (writer, then `draw`).
@@ -1248,7 +1203,6 @@ fn refined_diff_lines(old: &str, new: &str) -> Vec<String> {
 impl ConsoleOutput {
     pub fn new(show_reasoning: ShowReasoningHandle) -> Self {
         Self {
-            spinner: Mutex::new(None),
             draw: Mutex::new(DrawCache::new(term_height())),
             reader_paused: Arc::new(AtomicBool::new(false)),
             reasoning_on_stderr: !std::io::stdout().is_terminal(),
@@ -1782,18 +1736,6 @@ impl ConsoleOutput {
             self.paint_panel(&content, indent);
         }
     }
-
-    fn create_spinner(message: &str) -> ProgressBar {
-        let pb = ProgressBar::new_spinner();
-        pb.enable_steady_tick(Duration::from_millis(120));
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.blue} {msg}")
-                .unwrap(),
-        );
-        pb.set_message(message.to_string());
-        pb
-    }
 }
 
 /// How many rows the transient status line took — more than one when it wrapped
@@ -1936,14 +1878,12 @@ impl Output for ConsoleOutput {
     }
 
     fn display_plain(&self, text: &str) {
-        self.stop_thinking();
         // The count comes from the bytes: `writeln!` adds the newline, and a
         // caller-supplied line is padded or not as it likes.
         self.write_content(format!("{}\n", text).as_bytes());
     }
 
     fn display_markdown(&self, text: &str) {
-        self.stop_thinking();
         let color = std::io::stdout().is_terminal();
         let rendered = render_markdown(text, term_width(), color);
         // One blank line above the block, unless the stream already ends with
@@ -1960,7 +1900,6 @@ impl Output for ConsoleOutput {
     }
 
     fn display_text(&self, text: &str) {
-        self.stop_thinking();
         // One blank line above the message, unless the stream already ends with
         // one (e.g. the error path, where `end_response` left a trailing blank),
         // so the message sits exactly one empty line below the prior block.
@@ -2078,7 +2017,6 @@ impl Output for ConsoleOutput {
     }
 
     fn end_response_segment(&self) {
-        self.stop_thinking();
         let current_width = current_term_width();
         // One counted block: the answer commit, the thinking commit, the
         // boundary blank and the dim reset.
@@ -2115,7 +2053,6 @@ impl Output for ConsoleOutput {
     }
 
     fn end_response(&self) {
-        self.stop_thinking();
         let current_width = current_term_width();
         // One counted block: the answer and thinking flushes and the
         // trailing blank.
@@ -2144,7 +2081,6 @@ impl Output for ConsoleOutput {
     }
 
     fn display_tool_call(&self, name: &str, args: &Value) {
-        self.stop_thinking();
         // Purpose-built label (+ optional trailing lines such as an edit diff)
         // from `get_preview`. One blank line above the panel, unless the stream
         // already ends with one — which is what used to need a "was the last
@@ -2177,7 +2113,6 @@ impl Output for ConsoleOutput {
     /// ends the block with it, which is the knowledge the `last_was_tool` flag
     /// used to carry, stated by the block that has it.
     fn display_tool_result(&self, result: &str) {
-        self.stop_thinking();
         // Edit-tool failures are emitted as a structured JSON object with
         // separate `ui_view` (short, no file text) and `model_view` (rich,
         // with diff). The UI must render only the short view so we don't
@@ -2392,7 +2327,6 @@ impl Output for ConsoleOutput {
     }
 
     fn get_user_input(&self) -> String {
-        self.stop_thinking();
         use std::io;
         // Through the counter like every other content write: it measures zero
         // rows (the prompt does not move the cursor down) but it does close any
@@ -2408,14 +2342,12 @@ impl Output for ConsoleOutput {
     }
 
     fn display_error(&self, error: &str) {
-        self.stop_thinking();
         // Measured: a long error wraps, and the message carries a 2-column
         // prefix the row count has to include.
         self.write_content(format!("{} Error: {}\n", style("⏺").red(), error).as_bytes());
     }
 
     fn display_system(&self, text: &str) {
-        self.stop_thinking();
         self.write_content(format!("{}\n", style(text).bold().dim()).as_bytes());
     }
 
@@ -2451,28 +2383,9 @@ impl Output for ConsoleOutput {
     }
 
     fn display_separator(&self) {
-        self.stop_thinking();
         // `separator` writes through the row counter; noting again here would
         // count the same row twice.
         self.separator();
-    }
-
-    fn display_thinking(&self, message: &str) {
-        // Indicator mode => show the spinner; otherwise suppress it (content
-        // mode shows the reasoning text, disabled shows nothing).
-        if *self.show_reasoning.lock().unwrap() != ShowReasoning::Indicator {
-            return;
-        }
-        let mut spinner_lock = self.spinner.lock().unwrap();
-        if spinner_lock.is_none() {
-            *spinner_lock = Some(Self::create_spinner(message));
-        }
-    }
-
-    fn stop_thinking(&self) {
-        if let Some(pb) = self.spinner.lock().unwrap().take() {
-            pb.finish_and_clear();
-        }
     }
 
     fn display_header(
@@ -2621,12 +2534,7 @@ impl Output for ScrollbackOutput {
         self.append(&line);
         self.inner.display_separator();
     }
-    fn display_thinking(&self, message: &str) {
-        self.inner.display_thinking(message);
-    }
-    fn stop_thinking(&self) {
-        self.inner.stop_thinking();
-    }
+
     fn display_header(
         &self,
         provider: &str,
