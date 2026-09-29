@@ -8,7 +8,7 @@ use tokio::fs;
 
 #[allow(unused_imports)]
 use crate::config::{
-    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, EditStartLine, ReadLimit,
+    env_vars_to_keep, resolve_path_policy, resolve_paths, BashTimeout, ContextLines, ReadLimit,
     ReadOffset, SandboxConfig, SandboxMaxOutputBytes, SandboxMemoryMb, SandboxTimeoutSecs,
     SandboxTmpSizeMb,
 };
@@ -284,6 +284,108 @@ pub async fn edit_file(path: String, edits: Vec<EditOp>) -> Result<String, ToolE
     let shown = relativize_path(&sandbox_path, &cwd);
     Ok(blockedit::success_note(&edits, &matched_lines, &shown))
 }
+
+/// Budget for a `sed` preview's block payload, in bytes.
+///
+/// The `bsed` process is run with a capture cap just above this so a truncated
+/// read is detectable rather than silently acted on.
+const SED_PREVIEW_BUDGET: usize = 50 * 1024;
+const SED_CAPTURE_SLACK: usize = 8 * 1024;
+
+/// Is the `bsed` binary on `$PATH`?
+///
+/// The `sed` tool is advertised only when it is, because it is what executes the
+/// script. Probed once: a missing binary is a property of the install, not of
+/// the turn, and `cargo install --path .` places both binaries together.
+pub(crate) fn bsed_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new(BSED_BIN)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// The `bsed` binary name. Kept in one place so the probe and the call agree.
+const BSED_BIN: &str = "bsed";
+
+#[rig_tool(
+    name = "sed",
+    description = "Preview what GNU sed expressions would change in a file, as editable blocks. \
+This tool NEVER writes the file: it returns the change as @@@OLD / @@@NEW blocks, each \
+anchored to a line with a `path:LINE` header. Review them, then pass them to the `edit` tool \
+as its `edits` argument to apply. One expression per line, GNU sed syntax (s///, d, a, c, y///, \
+addresses, ranges). `w`, `e` and `q` are refused: use the `edit` or `bash` tools for those.",
+    required(path, expressions)
+)]
+pub async fn sed_preview(
+    path: String,
+    expressions: String,
+    context: ContextLines,
+) -> Result<String, ToolError> {
+    if !bsed_available() {
+        return Err(ToolError::Generic(format!(
+            "the `{BSED_BIN}` binary is not on PATH, so the sed tool cannot run. \
+             Install it with `cargo install --path .` (it ships alongside picocode)."
+        )));
+    }
+    // Same policy as `edit`: the path is resolved and bounds-checked here, and
+    // handed to the child as a cwd-relative path so the sandbox sees the same
+    // file the model named.
+    let resolved = get_path_with(&path, true)?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| resolved.clone());
+    let rel = relativize_path(&resolved, &cwd);
+
+    let cfg = sandbox_config();
+    let cfg = cfg.as_ref().as_ref().cloned().unwrap_or_default();
+    let timeout: Option<u64> = cfg.timeout_secs.map(|v| v.into());
+
+    // Model-supplied text rides as ONE argv element: data, never structure. No
+    // shell is involved, so a metacharacter in an expression is just a character.
+    let argv = vec![
+        BSED_BIN.into(),
+        "preview".into(),
+        "-c".into(),
+        context.clamped().to_string(),
+        "-t".into(),
+        SAFE_SED_TRAILING.to_string(),
+        "-b".into(),
+        SED_PREVIEW_BUDGET.to_string(),
+        "-p".into(),
+        rel,
+        expressions,
+    ];
+    let (raw, code) = run_sandboxed_ro_status(
+        &argv,
+        &cfg,
+        timeout,
+        Some(SED_PREVIEW_BUDGET + SED_CAPTURE_SLACK),
+    )
+    .await?;
+
+    // `bsed` writes its error text to stderr, which is merged into stdout above.
+    // Exit 2 is the caller's problem (a refused expression, an unappliable
+    // block) and is returned as a normal result so the model can read and fix it;
+    // anything else is ours.
+    match code {
+        Some(0) | Some(2) | None => Ok(raw),
+        Some(n) => Err(ToolError::Generic(format!(
+            "sed preview failed (exit {n}): {}",
+            cap_lines(raw.trim(), 40)
+        ))),
+    }
+}
+
+/// Unchanged lines the `sed` preview always adds *after* a change.
+///
+/// Two is deliberate: it lifts a one-line change to a three-line `OLD`, which
+/// is what buys the `edit` tool a ±1 anchor tolerance instead of zero. See
+/// `doc/safe_sed.md` §4.1.
+const SAFE_SED_TRAILING: &str = "2";
 
 #[rig_tool(
     name = "find",
@@ -674,6 +776,33 @@ pub(crate) async fn run_sandboxed_ro(
     // (grep/list_dir etc. treat a non-zero status as a non-error "no match").
     let (output, _exit) = output;
     Ok(String::from_utf8_lossy(&output).to_string())
+}
+
+/// Like [`run_sandboxed_ro`] but also returns the child's exit code, so the
+/// caller can tell "the tool said no" from "the tool could not run".
+///
+/// `cap` overrides the sandbox's `max_output_bytes`: `capture_bounded` silently
+/// truncates, and a caller that parses its output (the `sed` tool parses a
+/// block blob) must treat a short read as a failure rather than act on half a
+/// payload. `None` uses the configured default.
+pub(crate) async fn run_sandboxed_ro_status(
+    argv: &[String],
+    cfg: &SandboxConfig,
+    timeout: Option<u64>,
+    cap: Option<usize>,
+) -> Result<(String, Option<i32>), ToolError> {
+    let argv = argv.to_vec();
+    let cfg = cfg.clone();
+    let cap = cap.unwrap_or_else(|| cfg.max_output_bytes());
+    let output =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Option<i32>), ToolError> {
+            let expr = build_bwrap_expr_argv(&argv, &cfg, true)?;
+            capture_bounded(expr, timeout, cap)
+        })
+        .await
+        .map_err(|e| ToolError::Generic(e.to_string()))??;
+    let (output, exit) = output;
+    Ok((String::from_utf8_lossy(&output).to_string(), exit))
 }
 
 /// Trim combined output and normalize empty results.
@@ -2058,6 +2187,87 @@ mod edit_file_tests {
         fn drop(&mut self) {
             let _ = std::env::set_current_dir(&self.prev);
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sed_preview_is_read_only_and_anchors_every_block() {
+        // End-to-end through the real tool: path policy -> argv -> `bsed`. The
+        // sandbox is not configured here (CwdGuard clears it), which exercises
+        // the same code path minus the namespace, so the test runs anywhere.
+        let _cwd = CwdGuard::new();
+        tokio::fs::write(
+            "a.txt",
+            "fn main() {\n    let x = 1;\n    let y = 2;\n    run();\n}\n",
+        )
+        .await
+        .unwrap();
+
+        if !super::bsed_available() {
+            eprintln!("skipping: bsed is not on PATH");
+            return;
+        }
+
+        let out = sed_preview("a.txt".into(), "4s/run/walk/".into(), ContextLines(0))
+            .await
+            .expect("preview");
+
+        // The file is untouched: this is the whole point of the tool.
+        assert_eq!(
+            tokio::fs::read_to_string("a.txt").await.unwrap(),
+            "fn main() {\n    let x = 1;\n    let y = 2;\n    run();\n}\n"
+        );
+        assert!(out.contains("@@@OLD"), "{out}");
+        assert!(out.contains("walk();"), "{out}");
+
+        // And the preview applies: the anchor resolves against the unchanged
+        // file, which is the claim the whole design rests on.
+        let parsed = crate::edit_blocks::parse_blocks(&out).expect("preview parses");
+        let edits: Vec<EditOp> = parsed
+            .edits
+            .iter()
+            .map(|e| EditOp {
+                old_text: e.old_text.clone(),
+                new_text: e.new_text.clone(),
+                start_line: e.start_line.map(crate::config::EditStartLine),
+            })
+            .collect();
+        assert_eq!(parsed.edits[0].start_line, Some(4));
+        let applied = edit_file("a.txt".into(), edits).await.unwrap();
+        assert!(applied.starts_with("Replaced 1 block(s)"), "{applied}");
+        assert!(tokio::fs::read_to_string("a.txt")
+            .await
+            .unwrap()
+            .contains("walk();"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sed_preview_reports_a_rejected_expression_without_failing() {
+        // A refused expression is the model's to fix, so it comes back as a
+        // normal result (exit 2), not as a tool error.
+        let _cwd = CwdGuard::new();
+        tokio::fs::write("a.txt", "x\n").await.unwrap();
+        if !super::bsed_available() {
+            return;
+        }
+        let out = sed_preview("a.txt".into(), "1w /tmp/pwned".into(), ContextLines(0))
+            .await
+            .expect("preview returns the message");
+        assert!(out.contains("never writes"), "{out}");
+        assert!(!std::path::Path::new("/tmp/pwned").exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sed_preview_rejects_a_path_outside_cwd() {
+        // Same policy as `edit`: the sandbox bounds are enforced here, before
+        // the child ever sees the path.
+        let _cwd = CwdGuard::new();
+        let err = sed_preview("/etc/hostname".into(), "s/a/b/".into(), ContextLines(0))
+            .await
+            .expect_err("outside cwd");
+        assert!(err.to_string().to_lowercase().contains("path"), "{err}");
     }
 
     #[tokio::test]

@@ -1,7 +1,8 @@
 # `sed` tool — a preview-only GNU sed (`bsed`) that emits `edit`-tool blocks
 
-*Status: research + proposal, reviewed. Nothing implemented yet. Decisions in
-§12, open tuning questions in §12, deferred work in §13.*
+*Status: implemented. Decisions in §12, deferred work in §13. §14 records where
+the implementation corrected the design, which is the part worth reading if you
+are comparing this document to the code.*
 
 ## 1. The problem this solves
 
@@ -142,10 +143,11 @@ the blocks are anchored.** Reading `edit`'s anchored pass (Pass 1,
 * If `old_text` occurs exactly once, the anchor is not consulted at all
   (`src/tools.rs:676`).
 
-So a mass rename — 40 identical lines, each previewed as its own 1-line block with
-its own `path:LINE` — applies correctly with **zero** context and no uniqueness
-requirement. The uniqueness rules (`src/tools.rs:767`, `:781`) bind only
-*unanchored* blocks, a shape `bsed` never emits.
+So a mass rename applies correctly with **zero** context and no uniqueness
+requirement: every block carries its own `path:LINE`, and the uniqueness rules
+(`src/tools.rs:767`, `:781`) bind only *unanchored* blocks, a shape `bsed` never
+emits. How *many* blocks a mass rename produces depends on spacing, and both
+answers are good — see §4.4.
 
 What `context` then buys is three things, none of which is "makes the edit apply":
 
@@ -212,12 +214,25 @@ likewise for NEW. Measured:
 | prepend 2 lines | `old_range (0,0)` — **empty OLD** | `(0,1)` | `(0,2)` |
 | truncate last line | `old_range (2,3)`, `new_range (2,2)` — **empty NEW** | `(1,3)/(1,2)` | — |
 
-`similar` merges ops whose gap is `<= 2*ctx` into one group, so separate groups
-are always more than `2*context` apart — **symmetric context cannot make
-neighbouring hunks overlap**, which matters because the `edit` tool rejects
-overlapping claims (`src/tools.rs:719`). That guarantee covers `similar`'s own
-context but *not* the asymmetric trailing floor added afterwards, which is what
-rule 8 has to clamp.
+Two consequences of how `similar` groups, both verified against it and both
+better than this document originally claimed:
+
+* **Adjacent changes merge into one block.** `grouped_ops` folds ops whose gap
+  is `<= 2*ctx` into a single group, so a *contiguous* rewrite — 40 consecutive
+  identical lines — is **one** block of 40 lines, not 40 blocks. That is the
+  better outcome: a mass rename arrives as one reviewable hunk and is applied
+  atomically. The 40-separate-blocks case needs the duplicates *scattered*
+  (every third line), which is what the tests use.
+* **We ask `similar` for no context at all** (`grouped_ops(0)`) and pad both
+  directions ourselves. `grouped_ops(n)` pads symmetrically, which would apply
+  the caller's `context` twice — once as the floor, once as `similar`'s — so an
+  asymmetric contract cannot be routed through a symmetric knob.
+
+Because both padding directions are ours now, every bound is clamped in one
+place: the leading pad stops at the previous block's end, the trailing pad at the
+next block's start, and growth at that same ceiling plus its own cap. That is
+what guarantees blocks never overlap — the `edit` tool rejects overlapping
+claims (`src/tools.rs:719`), and a rejected batch helps nobody.
 
 ### 4.5 Hunk → block rules
 
@@ -519,11 +534,12 @@ Three details make it safe rather than merely clever:
 * **Nonce the sentinels.** Generate a per-run random token (private-use
   codepoints plus a nonce) and regenerate it if it occurs in the input, so a file
   cannot forge one.
-* **Verify they survived.** If a case-escape command was present and the nonce is
-  *absent* from the output, a later command in the script ate it. That is a hard
-  error, not a silent wrong preview. This guard is what makes step 1 trustworthy
-  in a multi-expression script, where a subsequent `s/…/…/g` could otherwise
-  match the sentinel bytes and corrupt the transform.
+* **Verify none survived unbalanced.** A *lone leftover* marker is a hard error:
+  it means a later command in the script rewrote one half of a pair, and writing
+  that private-use codepoint into the user's file — or dropping the transform
+  they asked for — is the one way this can go wrong. Absence of markers is
+  **not** an error: a substitution that never matched simply emits nothing, and
+  refusing that would break the commonest case there is.
 * **Order.** Collapse *after* the full script has run and *before* the trailing
   newline normalization and the diff, so nothing downstream ever sees a sentinel.
 
@@ -720,3 +736,54 @@ Still open — small tuning decisions, not architecture:
   git checkout.
 * A `--json` output mode for `bsed preview`, for tooling that wants the blocks
   without parsing the blob text.
+
+## 14. Where the implementation corrected this document
+
+Four things the design got wrong or left open, found while building it, and
+settled in the code. Each is covered by a test that fails if it regresses.
+
+**1. A contiguous rewrite is one block, not many.** §4.1's "40 identical lines
+→ 40 one-line blocks" only holds for *scattered* duplicates. `similar` folds ops
+whose gap is `<= 2*ctx` into one group, so 40 *consecutive* identical lines become
+a single 40-line block. This is better than what was claimed: a mass rename shows
+up as one reviewable hunk, applied atomically. (See also §4.4.)
+
+**2. Growth is measured from the change, not from the block.** As first written,
+growth scanned the block's whole `OLD`. That is wrong in both directions, and both
+directions bit during development:
+
+* with leading context, a context line that opens a brace (`fn main() {`) dragged
+  the block out to the end of the function;
+* with the trailing floor, *our own padding* triggered growth — a change on
+  `let x = 1;` followed by `if count > 0 {` pulled in the closing brace four
+  lines later, which is the opposite of what the caller asked for.
+
+Growth now scans exactly `[first changed line, block end)`, so only an imbalance
+sed itself introduced can trigger it. The mid-construct note in the banner was
+narrowed to match: it fires when growth ran and could not reach the closer, not
+when the caller's own context ends inside a brace.
+
+**3. `grouped_ops(0)`, then pad both directions ourselves.** Passing `context` to
+`grouped_ops` applies it symmetrically, which double-counts against the
+asymmetric trailing floor: `-c 1` came out as 1 before and 2 after. Since the
+contract is asymmetric, the padding has to be too — and doing both sides in one
+place means every bound is clamped in one place (§4.4).
+
+**4. The case-escape guard watches for imbalance, not absence.** §6.1 specified
+failing when "no markers survived", on the theory that a later command ate them.
+That fails on every substitution that never matched, which is the commonest case
+in the corpus. A lone *leftover* marker is the real signal and is still a hard
+error; absence is a no-op. Verified byte-identical to GNU sed 4.9 across seven
+scripts, including backreferences, `\u`/`\l` and `\E`.
+
+Two smaller notes on what shipped:
+
+* **`bsed apply` is in v1.** The question was whether to defer it, but it fell out
+  of the `blockedit` extraction for free — it is `apply_to_text` plus a file
+  write — and without `-i` it writes to stdout, so `bsed apply f.rs < blocks.txt |
+  diff f.rs -` is a review loop that cannot touch the file. It is how the
+  round-trip property is tested.
+* **The trailing floor is a tool-side constant.** The `sed` tool passes
+  `-t 2` explicitly rather than relying on the CLI default, so the value the
+  agent depends on (and the ±1 anchor tolerance it buys) is stated at the call
+  site in `src/tools.rs` rather than implied by a default three layers down.

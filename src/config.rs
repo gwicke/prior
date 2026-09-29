@@ -739,6 +739,141 @@ impl From<SandboxMaxOutputBytes> for Option<usize> {
 /// `crate::config::EditStartLine` call sites.
 pub use blockedit::EditStartLine;
 
+/// How many unchanged lines the `sed` preview attaches around each change.
+///
+/// Accepts an integer or a numeric string, like [`ReadOffset`], because weak
+/// tool-call harnesses stringify numbers often enough that rejecting `"2"` would
+/// cost more than tolerating it. Clamped to `MAX_CONTEXT` — past that the block
+/// stops being reviewable and starts being the file.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    schemars::JsonSchema,
+    Default,
+    serde::Serialize,
+)]
+pub struct ContextLines(pub u16);
+
+/// Upper bound on [`ContextLines`].
+pub const MAX_CONTEXT: u16 = 20;
+
+impl ContextLines {
+    pub fn map<U, F: FnOnce(u16) -> U>(self, f: F) -> U {
+        f(self.0)
+    }
+
+    /// The value clamped to [`MAX_CONTEXT`].
+    pub fn clamped(self) -> u16 {
+        self.0.min(MAX_CONTEXT)
+    }
+}
+
+impl From<ContextLines> for u16 {
+    fn from(w: ContextLines) -> u16 {
+        w.0
+    }
+}
+
+impl From<ContextLines> for usize {
+    fn from(w: ContextLines) -> usize {
+        w.0 as usize
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextLines {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = u16;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer for context lines (not a string)")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u16::try_from(value)
+                    .map_err(|_| E::custom(format!("invalid context: {value} - too large")))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("invalid context: negative value not allowed"));
+                }
+                u16::try_from(value as u64)
+                    .map_err(|_| E::custom(format!("invalid context: {value} - too large")))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value.trim().parse::<u16>() {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(E::custom(format!(
+                        "invalid context: '{value}' - must be number"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor).map(ContextLines)
+    }
+}
+
+#[cfg(test)]
+mod context_lines_tests {
+    use super::*;
+
+    fn parse(v: serde_json::Value) -> Result<ContextLines, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn accepts_integer_and_numeric_string() {
+        assert_eq!(parse(serde_json::json!(0)).unwrap(), ContextLines(0));
+        assert_eq!(parse(serde_json::json!(4)).unwrap(), ContextLines(4));
+        // Harnesses stringify numbers often enough that rejecting "4" would
+        // cost more than tolerating it.
+        assert_eq!(parse(serde_json::json!("4")).unwrap(), ContextLines(4));
+        assert_eq!(parse(serde_json::json!(" 4 ")).unwrap(), ContextLines(4));
+    }
+
+    #[test]
+    fn rejects_negative_and_non_numeric() {
+        assert!(parse(serde_json::json!(-1)).is_err());
+        assert!(parse(serde_json::json!("two")).is_err());
+    }
+
+    #[test]
+    fn clamps_to_max() {
+        // Silently accepted but bounded: past 20 the "block" is the file.
+        let big = parse(serde_json::json!(9999)).unwrap();
+        assert_eq!(big.0, 9999);
+        assert_eq!(big.clamped(), MAX_CONTEXT);
+    }
+
+    #[test]
+    fn defaults_to_zero() {
+        assert_eq!(ContextLines::default(), ContextLines(0));
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
     #[serde(default)]

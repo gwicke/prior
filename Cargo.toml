@@ -73,6 +73,13 @@ path = "src/lib.rs"
 name = "picocode"
 path = "src/main.rs"
 
+# The `bsed` binary is a two-line shim over the safe_sed crate (src/bin/bsed.rs)
+# so that `cargo install --path .` installs both. The agent only ever runs
+# `bsed preview`; see doc/safe_sed.md.
+[[bin]]
+name = "bsed"
+path = "src/bin/bsed.rs"
+
 # Test-only binary used by the confirm_raw_mode integration test.
 # Gated behind `test-utils` so `cargo install --path .` does not install it.
 [[bin]]

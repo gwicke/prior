@@ -224,6 +224,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blockedit::{apply::ApplyOutcome, EditOp};
 
     const FILE: &str = "fn main() {\n    let x = 1;\n    let y = 2;\n    if count > 0 {\n        run();\n    }\n    // trailing\n    let z = 3;\n}\n";
 
@@ -346,6 +347,77 @@ mod tests {
         let file = "a\nb";
         let (_banner, blob) = preview_text(file, "f.rs", "s/zzz/yyy/", opts()).unwrap();
         assert!(blob.is_empty());
+    }
+
+    /// The contract the whole tool exists for: what `bsed preview` prints, fed
+    /// to the same parser the `edit` tool uses, applies back to the original and
+    /// produces exactly what sed would have written. If this fails, the preview
+    /// is a lie and the tool is worse than no tool.
+    #[test]
+    fn preview_applies_back_to_exactly_what_sed_produced() {
+        let cases: &[&str] = &[
+            "5s/run/walk/",
+            "7,8d",
+            "2s/1/11/",
+            r"s/^    /\t/g",
+            r"/\/\//d",
+            "1a\\n// generated",
+            "9c\\n    let z = 4;",
+            "s/2/2/g",
+            "1,3s/;/;/",
+        ];
+        for script in cases {
+            // GNU sed is the reference; skip the case if it is not GNU or the
+            // script is invalid there.
+            let reference = std::process::Command::new("sed")
+                .arg(script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(FILE.as_bytes())
+                        .unwrap();
+                    c.wait_with_output()
+                })
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+            let Some(reference) = reference else {
+                continue;
+            };
+
+            let (banner, blob) = preview_text(FILE, "src/foo.rs", script, opts()).unwrap();
+            if blob.is_empty() {
+                // A script that changes nothing must say so *and* mean it: the
+                // banner reports no match and there is nothing to apply.
+                assert!(banner.contains("no lines matched"), "{script}: {banner}");
+                assert_eq!(
+                    reference, FILE,
+                    "{script}: claimed a no-op but sed changed it"
+                );
+                continue;
+            }
+            let parsed = blockedit::parse_blocks(&blob)
+                .unwrap_or_else(|e| panic!("{script}: preview did not parse: {e}\n{blob}"));
+            let edits: Vec<EditOp> = parsed
+                .edits
+                .iter()
+                .map(|e| EditOp {
+                    old_text: e.old_text.clone(),
+                    new_text: e.new_text.clone(),
+                    start_line: e.start_line.map(blockedit::EditStartLine),
+                })
+                .collect();
+            let applied = match blockedit::apply_to_text(FILE, &edits) {
+                ApplyOutcome::Applied { text, .. } => text,
+                ApplyOutcome::Failed { report } => panic!("{script}: {report}"),
+            };
+            assert_eq!(applied, reference, "{script}: preview did not round-trip");
+        }
     }
 
     #[test]

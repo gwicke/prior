@@ -8,8 +8,8 @@ use crate::session::Session;
 use crate::settings::SettingsStore;
 use crate::thinking;
 use crate::tools::{
-    set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText, ListDir, MakeDir,
-    MoveFile, ReadFile, Remove, WriteFile,
+    bsed_available, set_sandbox, AgentBrowser, Bash, CopyFile, EditFile, GlobFiles, GrepText,
+    ListDir, MakeDir, MoveFile, ReadFile, Remove, SedPreview, WriteFile,
 };
 use crate::Output;
 use crate::Result;
@@ -1936,6 +1936,21 @@ Your mission is to assist the user in their development tasks by utilizing a set
 - **Communication**: Keep explanations brief and focused on the "how" and "why" of your technical decisions. If you are unsure, do not guess or over-analyze - ask.
 "#;
 
+/// Appended to the system message when the `sed` tool is available.
+///
+/// This replaces, rather than supplements, the standing advice to avoid sed: a
+/// preview tool makes `sed -i` unnecessary for the cases that advice was guarding
+/// against (line ranges computed against a stale read), while `sed -i` itself
+/// remains exactly as dangerous as it was.
+const SED_TOOL_PROMPT: &str = r#"### Bulk edits: preview with `sed`, apply with `edit`
+For a change that spans many lines or the whole file (renames, deletions, range
+rewrites), do NOT run `sed -i` and do NOT hand-write one `edit` block per line.
+Instead call `sed` with one GNU sed expression per line. It never writes: it
+returns the change as `@@@OLD`/`@@@NEW` blocks, each anchored to a line. Read the
+blocks, then pass them to `edit` as its `edits` argument to apply. `sed` refuses
+`w`, `e` and `q`; use `edit` or `bash` for those. Pass `context` if you need more
+than the ~2 lines of trailing context you get by default."#;
+
 fn build_rig_agent(
     builder: AgentBuilder<NoToolConfig>,
     yolo: bool,
@@ -1963,6 +1978,12 @@ fn build_rig_agent(
         system_message.push_str("\n\n");
         system_message.push_str(&ext);
     }
+    // Only describe the `sed` tool when it is actually registered below, so the
+    // prompt never advertises a tool the model cannot call.
+    if bsed_available() {
+        system_message.push_str("\n\n");
+        system_message.push_str(SED_TOOL_PROMPT);
+    }
 
     let mut builder = builder
         .preamble(&system_message)
@@ -1972,6 +1993,15 @@ fn build_rig_agent(
         .tool(GlobFiles)
         .tool(GrepText)
         .tool(ListDir);
+
+    // `sed` previews changes; it never writes. Advertised only when the `bsed`
+    // binary is present, because that binary is what runs the script -- a tool
+    // that cannot run is worse than no tool. A separate tool, not another mode
+    // of `edit`, so the model has an explicit review step between "describe the
+    // change" and "apply it".
+    if bsed_available() {
+        builder = builder.tool(SedPreview);
+    }
 
     if let Some(params) = additional_params {
         builder = builder.additional_params(params);

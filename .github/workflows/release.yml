@@ -117,16 +117,26 @@ jobs:
         if: matrix.archive_format == 'tar.gz'
         run: |
           # Create tar.gz archive: standard format for Linux and macOS
-          tar czf ${{ steps.names.outputs.archive_name }} -C target/${{ matrix.target }}/release ${{ steps.names.outputs.binary_name }}
+          # Both binaries ship in every archive: `bsed` is what the agent's
+          # `sed` tool executes, and it is a two-line shim over the safe_sed
+          # crate that `cargo build` already built alongside picocode.
+          tar czf ${{ steps.names.outputs.archive_name }} \
+            -C target/${{ matrix.target }}/release \
+            ${{ steps.names.outputs.binary_name }} bsed
         shell: bash
 
       - name: Create archive (Windows)
         if: matrix.archive_format == 'zip'
         run: |
           # Create zip archive: standard format for Windows using PowerShell
-          $binaryPath = "target\${{ matrix.target }}\release\${{ steps.names.outputs.binary_name }}"
+          $releaseDir = "target\${{ matrix.target }}\release"
+          $binaryPath = "$releaseDir\${{ steps.names.outputs.binary_name }}"
           $archivePath = "${{ steps.names.outputs.archive_name }}"
-          Compress-Archive -Path $binaryPath -DestinationPath $archivePath -Force
+          # `bsed` is optional here: the archive is valid without it, and the
+          # agent simply does not advertise the `sed` tool.
+          $paths = @($binaryPath)
+          if (Test-Path "$releaseDir\bsed.exe") { $paths += "$releaseDir\bsed.exe" }
+          Compress-Archive -Path $paths -DestinationPath $archivePath -Force
         shell: pwsh
 
       - name: Upload artifact
