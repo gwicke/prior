@@ -36,6 +36,10 @@ PREVIEW (never writes; the default):
                           skipped) and preview every file, emitting one blob
                           with a header per file. No budget: a human is reading
                           this, not a model.
+    -g, --glob <PATTERN>  With -r, only files whose path relative to the root
+                          matches. Repeatable, and any match wins. Same
+                          semantics as the `find` tool, so use **/*.rs for a
+                          recursive match.
     -c, --context <N>     Unchanged lines each side; trailing is always at
                           least 2 (default 0)
     -t, --trailing <N>    Minimum unchanged lines after a change (default 2)
@@ -66,7 +70,7 @@ pub fn main() -> ExitCode {
     match run(&args) {
         Ok(out) => {
             if !out.is_empty() {
-                print!("{out}");
+                emit(&out);
             }
             ExitCode::SUCCESS
         }
@@ -78,14 +82,16 @@ pub fn main() -> ExitCode {
             eprintln!("{m}");
             ExitCode::from(2)
         }
-        Err(Failure::Partial(m)) => {
+        Err(Failure::Partial {
+            report,
+            failed_files,
+        }) => {
             // The report is the *result* of the run -- which files applied, and
             // the blocks to fix for the ones that did not -- so it goes to
             // stdout where a redirect or a pager will catch it. stderr carries
             // only the one-line signal a script needs to notice.
-            print!("{m}");
-            let failed = m.matches("FAILED").count();
-            eprintln!("bsed: {failed} file(s) failed; see the report above");
+            emit(&report);
+            eprintln!("bsed: {failed_files} file(s) failed; see the report above");
             ExitCode::from(2)
         }
         Err(Failure::Internal(m)) => {
@@ -95,13 +101,70 @@ pub fn main() -> ExitCode {
     }
 }
 
+/// Print `body` to stdout, and when stdout is a terminal also leave a copy in
+/// the temp directory and say where.
+///
+/// The case this exists for: a recursive preview over a few hundred files, or a
+/// failure report with blocks in it, read on a screen. Scrolling back through
+/// a terminal to copy a block verbatim is exactly the mistake that produces a
+/// wrong edit, and the report is meant to be re-piped rather than retyped. When
+/// stdout is a pipe the caller is already capturing the bytes, so we leave the
+/// filesystem alone.
+fn emit(body: &str) {
+    use std::io::IsTerminal;
+    print!("{body}");
+    if !should_spool(body, std::io::stdout().is_terminal()) {
+        return;
+    }
+    match spool(body) {
+        Some(path) => eprintln!(
+            "bsed: wrote a copy to {}\n      edit it, then apply with: bsed apply -i < {}",
+            path.display(),
+            path.display()
+        ),
+        None => {}
+    }
+}
+
+/// Whether this run should leave a copy on disk.
+///
+/// Only when the output is *only* going to a screen (a pipe means the caller
+/// already has the bytes) and only when it carries blocks, since a copy is only
+/// useful if there is something in it to edit and re-pipe.
+fn should_spool(body: &str, is_tty: bool) -> bool {
+    is_tty && body.contains(blockedit::SEARCH_MARKER)
+}
+
+/// Write `body` to a fresh temp file whose name says what it is.
+///
+/// `BSED_SPOOL_DIR` overrides the location, which is mostly for tests (a global
+/// /tmp counter is not hermetic) and for anyone who would rather these landed
+/// somewhere they are going to clean up.
+fn spool(body: &str) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let dir = std::env::var_os("BSED_SPOOL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = dir.join(format!("bsed-{}-{nanos}.blocks", std::process::id()));
+    let mut f = std::fs::File::create(&path).ok()?;
+    f.write_all(body.as_bytes()).ok()?;
+    Some(path)
+}
+
 /// Why a run stopped, and who has to fix it.
 enum Failure {
     /// Bad invocation: wrong flags, missing argument.
     Usage(String),
-    /// Some files applied and some did not. The message says both; the exit
-    /// code is 2, because a caller that ignores it now has a half-done tree.
-    Partial(String),
+    /// Some files applied and some did not. Carries the report and how many
+    /// files failed: the report is the run's result and goes to stdout, the
+    /// count is a one-line signal for stderr. The exit code is 2, because a
+    /// caller that ignores it now has a half-done tree.
+    Partial { report: String, failed_files: usize },
     /// The caller's input is wrong (a rejected expression, an unresolvable
     /// block). Model-fixable.
     User(String),
@@ -129,6 +192,7 @@ fn run(args: &[String]) -> Result<String, Failure> {
 fn preview(args: &[String]) -> Result<String, Failure> {
     let mut path: Option<PathBuf> = None;
     let mut recursive = false;
+    let mut globs: Vec<String> = Vec::new();
     let mut context: usize = 0;
     let mut trailing: Option<usize> = None;
     let mut grow = true;
@@ -148,6 +212,7 @@ fn preview(args: &[String]) -> Result<String, Failure> {
             "--version" | "-V" => return Ok(format!("bsed {}\n", env!("CARGO_PKG_VERSION"))),
             "-p" | "--path" => path = Some(PathBuf::from(need(it.next(), "-p")?)),
             "-r" | "--recursive" => recursive = true,
+            "-g" | "--glob" => globs.push(need(it.next(), "-g")?.to_string()),
             "-c" | "--context" => context = need_num(it.next(), "-c")?,
             "-t" | "--trailing" => trailing = Some(need_num(it.next(), "-t")?),
             "-b" | "--budget" => budget = need_num(it.next(), "-b")?,
@@ -201,11 +266,16 @@ fn preview(args: &[String]) -> Result<String, Failure> {
                 p.display()
             )));
         }
-        return recursive_preview(p, &expressions, ctx);
+        return recursive_preview(p, &expressions, ctx, &globs);
     }
     if recursive {
         return Err(Failure::Usage(
             "--recursive needs a directory; -p named a file".into(),
+        ));
+    }
+    if !globs.is_empty() {
+        return Err(Failure::Usage(
+            "--glob only applies with --recursive".into(),
         ));
     }
     let text = std::fs::read_to_string(p)
@@ -225,12 +295,19 @@ fn single(
         context: ctx,
         max_preview_bytes: budget,
     };
-    let (banner, blob) = crate::preview_text(text, shown, expressions, opts)
+    let p = crate::preview_text(text, shown, expressions, opts)
         .map_err(|e| Failure::User(e.to_string()))?;
-    if blob.is_empty() {
-        return Ok(format!("{banner}\n"));
+    // A block the `edit` tool would misread is a real limit, not a formatting
+    // nit: refuse it here rather than hand back a blob that cannot be applied.
+    if let Some(why) = p.blocked {
+        return Err(Failure::User(format!(
+            "the sed preview could not be expressed as appliable blocks for {shown}:\n{why}"
+        )));
     }
-    Ok(format!("{banner}\n{blob}\n"))
+    if p.blob.is_empty() {
+        return Ok(format!("{}\n", p.banner));
+    }
+    Ok(format!("{}\n{}\n", p.banner, p.blob))
 }
 
 /// Preview every file under `root`, emitting one blob with a header per file.
@@ -239,7 +316,19 @@ fn single(
 /// a model paying per token, and a silently truncated tree refactor is the worst
 /// possible outcome. Files that cannot be read as UTF-8 are skipped and counted
 /// rather than failing the run — a tree is allowed to contain binaries.
-fn recursive_preview(root: &Path, expressions: &str, ctx: Context) -> Result<String, Failure> {
+fn recursive_preview(
+    root: &Path,
+    expressions: &str,
+    ctx: Context,
+    globs: &[String],
+) -> Result<String, Failure> {
+    // Same matcher and the same semantics as picocode's `find` tool: the pattern
+    // is matched against the path *relative to the walk root*, so a recursive
+    // match is written `**/*.rs`.
+    let matcher = match build_matcher(globs) {
+        Ok(m) => m,
+        Err(e) => return Err(e),
+    };
     let opts = Options {
         context: ctx,
         // Unbounded: see above. `Options` still needs *a* value; the renderer
@@ -267,22 +356,33 @@ fn recursive_preview(root: &Path, expressions: &str, ctx: Context) -> Result<Str
         .collect();
     // Deterministic order, so two runs over the same tree are diffable.
     files.sort();
+    if let Some(m) = &matcher {
+        files.retain(|f| m.is_match(&relative_to(root, f)));
+    }
 
     let mut blob = String::new();
     let mut changed_files = 0usize;
     let mut blocks = 0usize;
     let mut skipped = 0usize;
+    let mut blocked: Vec<(String, String)> = Vec::new();
 
     for f in &files {
         let Ok(text) = std::fs::read_to_string(f) else {
             skipped += 1; // binary or unreadable
             continue;
         };
-        let (_, b) = crate::preview_text(&text, &f.display().to_string(), expressions, opts)
+        let p = crate::preview_text(&text, &f.display().to_string(), expressions, opts)
             .map_err(|e| Failure::User(e.to_string()))?;
-        if b.is_empty() {
+        if p.blob.is_empty() {
             continue;
         }
+        if let Some(why) = p.blocked {
+            // One unrepresentable file must not sink the tree, but it must be
+            // named: silence here would read as "that file needed no change".
+            blocked.push((f.display().to_string(), why));
+            continue;
+        }
+        let b = p.blob;
         if !blob.is_empty() {
             blob.push('\n');
         }
@@ -293,13 +393,21 @@ fn recursive_preview(root: &Path, expressions: &str, ctx: Context) -> Result<Str
 
     if changed_files == 0 {
         return Ok(format!(
-            "no lines matched — none of the {} file(s) under {} changed{}\n",
+            "no lines matched — none of the {} file(s) under {} changed{}{}\n",
             files.len() - skipped,
             root.display(),
             if skipped > 0 {
                 format!(" ({skipped} skipped: not UTF-8 text)")
             } else {
                 String::new()
+            },
+            if blocked.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} matched but not expressible as blocks — re-run on those files alone)",
+                    blocked.len()
+                )
             }
         ));
     }
@@ -315,9 +423,40 @@ fn recursive_preview(root: &Path, expressions: &str, ctx: Context) -> Result<Str
             "NOTE: {skipped} file(s) skipped (not UTF-8 text).\n"
         ));
     }
+    if !blocked.is_empty() {
+        out.push_str(&format!(
+            "NOTE: {} file(s) matched but cannot be expressed as appliable blocks, and are \
+             NOT in the output:\n",
+            blocked.len()
+        ));
+        for (path, why) in &blocked {
+            out.push_str(&format!("  {path}: {why}\n"));
+        }
+    }
     out.push_str(&blob);
     out.push('\n');
     Ok(out)
+}
+
+/// Compile the `--glob` patterns into one allow-list matcher.
+fn build_matcher(globs: &[String]) -> Result<Option<globset::GlobSet>, Failure> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut b = globset::GlobSetBuilder::new();
+    for g in globs {
+        let glob = globset::Glob::new(g)
+            .map_err(|e| Failure::Usage(format!("invalid --glob `{g}`: {e}")))?;
+        b.add(glob);
+    }
+    b.build()
+        .map(Some)
+        .map_err(|e| Failure::Usage(format!("invalid --glob set: {e}")))
+}
+
+/// A path relative to the walk root, for glob matching and display.
+fn relative_to(root: &Path, f: &Path) -> std::path::PathBuf {
+    f.strip_prefix(root).unwrap_or(f).to_path_buf()
 }
 
 /// How many blocks a rendered blob carries: one `@@@OLD` per block.
@@ -417,22 +556,43 @@ fn apply(args: &[String]) -> Result<String, Failure> {
         }
     }
 
+    // The report is written so that it is *itself a valid blocks file*: the
+    // diagnosis goes in prose, and the blocks come out bare at the end. That
+    // means `bsed apply -i < report.txt` re-applies exactly the failed blocks
+    // once they are fixed -- no detangling, and nothing lost but the failures
+    // themselves. Prose between blocks is ignored by the parser, and `prose()`
+    // guarantees no line we emit can be mistaken for a `path:LINE` header.
     let mut out = String::new();
     for (path, n) in &written {
         out.push_str(&format!("{path}: {n} block(s) applied\n"));
     }
-    for (path, why, echo) in &failed {
-        out.push_str(&format!("{path}: FAILED — {why}\n"));
-        if !echo.is_empty() {
-            out.push_str(&format!(
-                "  the {n} block(s) below did not apply to {path}; fix them (or re-preview \
-                 with a narrower expression) and re-pipe this file:\n",
-                n = echo.len()
-            ));
-            // Re-render with the *anchored* headers `preview` emits, so the
-            // failed blocks can be fixed and re-piped through `apply` exactly as
-            // they came out — anchors included, or a duplicate would resolve by
-            // content alone on the retry.
+    for p in &problems {
+        out.push_str(&format!("{p}\n"));
+    }
+    if out.is_empty() && failed.is_empty() {
+        out.push_str("nothing to do\n");
+    }
+
+    if !failed.is_empty() {
+        let total: usize = failed.iter().map(|(_, _, echo)| echo.len()).sum();
+        out.push_str(&prose(&format!(
+            "{written_len} file(s) applied, {} failed; nothing was written for the failures.\n\
+             The blocks below are the {total} that did not apply, as a valid blocks file: edit \
+             them (or re-preview with a narrower expression) and re-pipe with \
+             `bsed apply -i < this file`.",
+            failed.len(),
+            written_len = written.len(),
+        )));
+        for (path, why, _) in &failed {
+            out.push_str(&prose(&format!("--- {path}: {why}\n")));
+        }
+        out.push('\n');
+        // Anchored headers, exactly as `preview` emits them, so a re-pipe
+        // resolves a duplicated line by its anchor and not by content alone.
+        for (path, _, echo) in &failed {
+            if echo.is_empty() {
+                continue;
+            }
             let blocks: Vec<crate::Block> = echo
                 .iter()
                 .map(|e| crate::Block {
@@ -441,25 +601,15 @@ fn apply(args: &[String]) -> Result<String, Failure> {
                     new_text: e.new_text.clone(),
                 })
                 .collect();
-            let blob = crate::blocks::render(path, &blocks, usize::MAX).blob;
-            out.push_str(&indent(&blob));
-            out.push('\n');
+            out.push_str(&crate::blocks::render(path, &blocks, usize::MAX).blob);
+            out.push_str("\n\n");
         }
+        return Err(Failure::Partial {
+            failed_files: failed.len(),
+            report: out,
+        });
     }
-    for p in &problems {
-        out.push_str(&format!("{p}\n"));
-    }
-    if out.is_empty() {
-        out.push_str("nothing to do\n");
-    }
-    if !failed.is_empty() || !problems.is_empty() {
-        out.push_str(&format!(
-            "{} file(s) applied, {} file(s) failed. Nothing was written for the failures.\n",
-            written.len(),
-            failed.len()
-        ));
-        return Err(Failure::Partial(out));
-    }
+
     // Single file, no -i: the result itself is the output, so it can be diffed.
     if !in_place && batches.len() == 1 {
         let path = &batches[0].path;
@@ -494,12 +644,27 @@ fn human_reason(report: &str) -> String {
         .join(" ")
 }
 
-/// Indent a rendered blob so it reads as quoted text under its error line.
-fn indent(blob: &str) -> String {
-    blob.lines()
-        .map(|l| format!("    {l}\n"))
-        .collect::<Vec<_>>()
-        .join("")
+/// Emit a diagnostic line that the blob parser cannot mistake for structure.
+///
+/// `parse_blocks` treats a whitespace-free line above a block as that block's
+/// `path:LINE` header, and a line that is exactly `@@@OLD`/`@@@NEW`/`@@@END` as
+/// a delimiter. Keeping every diagnostic line out of both classes is what lets
+/// the failure report double as a blocks file, so the rule is enforced here
+/// rather than trusted to the wording.
+fn prose(line: &str) -> String {
+    let mut out = String::new();
+    for (i, l) in line.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // Empty lines are ignored by the parser; a lone token is not.
+        if !l.trim().is_empty() && l.chars().all(|c| !c.is_whitespace()) {
+            out.push(' ');
+        }
+        out.push_str(l);
+    }
+    out.push('\n');
+    out
 }
 fn to_ops(edits: Vec<blockedit::ParsedEdit>) -> Vec<EditOp> {
     edits
@@ -522,4 +687,56 @@ fn need_num(v: Option<&String>, flag: &str) -> Result<usize, Failure> {
     raw.trim()
         .parse()
         .map_err(|_| Failure::Usage(format!("{flag} needs a number, got `{raw}`")))
+}
+
+#[cfg(test)]
+mod emit_tests {
+    use super::{should_spool, spool};
+
+    #[test]
+    fn spools_only_to_a_terminal_and_only_with_blocks() {
+        // The rules, without needing a pty: a screen means the bytes would
+        // otherwise be lost to a scrollback, and there has to be something
+        // worth re-piping in the file.
+        assert!(should_spool("@@@OLD\na\n@@@END", true));
+        assert!(!should_spool("@@@OLD\na\n@@@END", false));
+        assert!(!should_spool("no lines matched -- nothing changed", true));
+    }
+
+    #[test]
+    fn spool_respects_the_directory_override() {
+        let dir = tempfile::tempdir().unwrap();
+        // Safety: single-threaded test, and the variable is only read by a
+        // child process this test makes itself.
+        std::env::set_var("BSED_SPOOL_DIR", dir.path());
+        let p = spool("body").expect("spooled");
+        std::env::remove_var("BSED_SPOOL_DIR");
+        assert_eq!(p.parent(), Some(dir.path()));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "body");
+    }
+
+    #[test]
+    fn a_poem_of_prose_lines_cannot_be_read_as_headers() {
+        // The invariant that lets the failure report double as a blocks file: no
+        // diagnostic line may be a bare token, which the parser would take for a
+        // `path:LINE` header.
+        use super::prose;
+        for line in [
+            "one.rs",
+            "@@@OLD",
+            "no-blocks-here",
+            "",
+            "  leading and trailing  ",
+        ] {
+            for out in prose(line).lines() {
+                if out.trim().is_empty() {
+                    continue; // ignored by the parser
+                }
+                assert!(
+                    out.chars().any(char::is_whitespace),
+                    "{out:?} could be read as a block header"
+                );
+            }
+        }
+    }
 }

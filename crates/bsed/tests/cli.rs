@@ -123,7 +123,11 @@ fn recursive_apply_is_atomic_per_file_and_echoes_the_failures() {
     assert!(std::fs::read_to_string(root.join("one.rs"))
         .unwrap()
         .contains("MOVED_ON"));
-    assert!(out.contains("one.rs: FAILED"), "{out}");
+    assert!(
+        out.contains("one.rs:"),
+        "the failure must name its file: {out}"
+    );
+    assert!(out.contains("oldText not found"), "{out}");
     assert!(
         out.contains("2 file(s)") || out.contains("1 file(s) applied"),
         "{out}"
@@ -227,4 +231,220 @@ fn recursive_preview_then_apply_reproduces_sed_over_the_tree() {
             assert_eq!(&got, want, "{rel}");
         }
     }
+}
+
+#[test]
+fn glob_narrows_the_recursive_walk() {
+    let d = tree();
+    let root = d.path().to_path_buf();
+    // Only .rs files, which is every walked file here, so the *count* proves the
+    // walk happened and a non-matching pattern proves the filter.
+    let o = run_in(
+        &root,
+        None,
+        &[
+            "preview",
+            "-r",
+            "-g",
+            "**/*.rs",
+            "-p",
+            ".",
+            "s/old_name/new_name/g",
+        ],
+    );
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    assert!(stdout(&o).contains("one.rs:2"), "{}", stdout(&o));
+
+    // A pattern nothing matches yields an empty, successful preview.
+    let o = run_in(
+        &root,
+        None,
+        &[
+            "preview",
+            "-r",
+            "-g",
+            "**/*.py",
+            "-p",
+            ".",
+            "s/old_name/new_name/g",
+        ],
+    );
+    assert_eq!(code(&o), 0);
+    assert!(stdout(&o).contains("no lines matched"), "{}", stdout(&o));
+}
+
+#[test]
+fn glob_without_recursive_is_a_usage_error() {
+    let d = tree();
+    let o = run_in(
+        d.path(),
+        None,
+        &["preview", "-g", "*.rs", "-p", "one.rs", "s/a/b/"],
+    );
+    assert_eq!(code(&o), 2);
+    assert!(stderr(&o).contains("--glob"), "{}", stderr(&o));
+}
+
+/// A file whose own content is a blocks file cannot be previewed as blocks: the
+/// marker lines would be read as structure. The single-file path refuses, and
+/// the recursive path names the file instead of silently dropping it.
+#[test]
+fn a_file_containing_block_markers_is_refused_not_mangled() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().to_path_buf();
+    write(
+        &root,
+        "self.rs",
+        "sed preview: 1 block\nf:1\n@@@OLD\nold\n@@@NEW\nnew\n@@@END\n",
+    );
+    write(&root, "plain.rs", "let old = 1;\n");
+
+    let o = run_in(&root, None, &["preview", "-p", "self.rs", "s/old/new/g"]);
+    assert_eq!(code(&o), 2);
+    let err = stderr(&o);
+    assert!(err.contains("appliable blocks"), "{err}");
+    assert!(err.contains("@@@NEW"), "{err}");
+
+    // Recursively, the un-representable file is named and the other still works.
+    let o = run_in(&root, None, &["preview", "-r", "-p", ".", "s/old/new/g"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let out = stdout(&o);
+    assert!(out.contains("plain.rs:1"), "{out}");
+    assert!(out.contains("self.rs"), "the bad file must be named: {out}");
+    assert!(!out.contains("@@@OLD\nold"), "{out}");
+}
+
+/// The point of the report being a valid blocks file: after fixing the block,
+/// re-piping the report applies it, with no detangling.
+#[test]
+fn the_failure_report_is_itself_a_repipable_blocks_file() {
+    let d = tree();
+    let root = d.path().to_path_buf();
+    let blocks = stdout(&run_in(
+        &root,
+        None,
+        &["preview", "-r", "-p", ".", "s/old_name/new_name/g"],
+    ));
+    // Retire one file's content so its block cannot apply.
+    write(&root, "one.rs", "fn a() {\n    let CHANGED = 1;\n}\n");
+
+    let first = run_in(&root, Some(&blocks), &["apply", "-i"]);
+    assert_eq!(code(&first), 2);
+    let report = stdout(&first);
+
+    // The report parses: re-piping it is accepted, and it reports the same
+    // failure rather than "no blocks found" or a parse error.
+    let second = run_in(&root, Some(&report), &["apply", "-i"]);
+    assert_eq!(code(&second), 2);
+    let again = stdout(&second);
+    assert!(
+        again.contains("one.rs: FAILED") || again.contains("one.rs:"),
+        "{again}"
+    );
+    assert!(!again.contains("no blocks"), "{again}");
+
+    // Fix the block the way a user would: the report is the file to edit.
+    let fixed = report.replace("let old_name = 1;", "let CHANGED = 1;");
+    let third = run_in(&root, Some(&fixed), &["apply", "-i"]);
+    assert_eq!(code(&third), 0, "{}", stdout(&third));
+    assert!(
+        std::fs::read_to_string(root.join("one.rs"))
+            .unwrap()
+            .contains("new_name"),
+        "the fixed block should have applied"
+    );
+}
+
+/// A tty run leaves a re-pipable copy on disk; a piped run does not litter.
+///
+/// Driven over a real pty (via portable-pty, already in the tree) because
+/// "is stdout a terminal" is exactly the question, and shelling out to a python
+/// pty driver would make the test depend on python being installed.
+#[test]
+fn a_terminal_run_spools_the_output_to_a_file() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::Read;
+
+    let d = tree();
+    let root = d.path().to_path_buf();
+    // A private spool dir, so this test does not race other tests or whatever
+    // a previous run left in /tmp.
+    let spool_dir = tempfile::tempdir().unwrap();
+    let before = count_spools(spool_dir.path());
+
+    let bin = env!("CARGO_BIN_EXE_bsed");
+    let mut cmd = CommandBuilder::new(bin);
+    cmd.args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"]);
+    cmd.cwd(&root);
+    cmd.env("BSED_SPOOL_DIR", spool_dir.path());
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut seen = String::new();
+    reader.read_to_string(&mut seen).expect("read pty");
+    let _ = child.wait();
+
+    // On a pty, stdout and stderr share one stream.
+    assert!(seen.contains("@@@OLD"), "{seen}");
+    assert!(seen.contains("wrote a copy to"), "{seen}");
+    assert_eq!(
+        count_spools(spool_dir.path()),
+        before + 1,
+        "expected one spool file"
+    );
+
+    // The spooled copy is a usable blocks file: preview, apply.
+    let spooled = std::fs::read_dir(spool_dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("bsed-") && n.ends_with(".blocks"))
+        })
+        .max()
+        .expect("a spool file");
+    let body = std::fs::read_to_string(&spooled).unwrap();
+    let o = run_in(&root, Some(&body), &["apply", "-i"]);
+    assert_eq!(code(&o), 0, "{}", stdout(&o));
+    assert!(std::fs::read_to_string(root.join("one.rs"))
+        .unwrap()
+        .contains("new_name"));
+
+    // A piped run leaves none behind.
+    let mut c2 = Command::new(bin);
+    c2.current_dir(&root)
+        .args(["preview", "-r", "-p", ".", "s/old_name/new_name/g"])
+        .env("BSED_SPOOL_DIR", spool_dir.path())
+        .stdout(std::process::Stdio::piped());
+    c2.output().expect("piped preview");
+    assert_eq!(
+        count_spools(spool_dir.path()),
+        before + 1,
+        "a piped run must not spool"
+    );
+}
+
+fn count_spools(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name().to_string_lossy().starts_with("bsed-")
+                        && e.file_name().to_string_lossy().ends_with(".blocks")
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }

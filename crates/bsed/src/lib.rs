@@ -163,17 +163,39 @@ pub fn preview(
     opts: Options,
 ) -> Result<String, Error> {
     let original = std::fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
-    let (banner, blob) = preview_text(&original, shown_path, expressions, opts)?;
-    Ok(format!("{banner}\n{blob}\n"))
+    let p = preview_text(&original, shown_path, expressions, opts)?;
+    if let Some(why) = p.blocked {
+        return Err(Error::Blocked(why));
+    }
+    if p.blob.is_empty() {
+        return Ok(format!("{}\n", p.banner));
+    }
+    Ok(format!("{}\n{}\n", p.banner, p.blob))
 }
 
-/// The same preview over text already in hand. Returns `(banner, blob)`.
+/// A preview of one file's worth of text.
+#[derive(Debug, Clone)]
+pub struct TextPreview {
+    /// The one-line summary (plus any notes), for a human.
+    pub banner: String,
+    /// The block blob: the `edits` payload, verbatim.
+    pub blob: String,
+    /// Set when the diff produced blocks the `edit` tool cannot accept — today
+    /// only when a block would contain a line that is exactly a block marker,
+    /// which would be read as structure instead of content.
+    ///
+    /// The blob is still returned, because seeing the problem is more useful
+    /// than an error, but callers must not present it as appliable.
+    pub blocked: Option<String>,
+}
+
+/// The same preview over text already in hand.
 pub fn preview_text(
     original: &str,
     shown_path: &str,
     expressions: &str,
     opts: Options,
-) -> Result<(String, String), Error> {
+) -> Result<TextPreview, Error> {
     let scr = script::build(expressions).map_err(Error::Script)?;
     let new = engine::run(&scr.text, original, scr.used_case_sentinels)
         .map_err(|e| Error::Engine(e.0))?;
@@ -190,11 +212,15 @@ pub fn preview_text(
     // The contract with `edit`: what we emit must parse back into what we built.
     let r = blocks::render(shown_path, &p.blocks, opts.max_preview_bytes);
     p.truncated = r.truncated;
-    if let Err(why) = blocks::verify(&r.blob) {
+    if let Err(why) = blocks::verify(&p.blocks, &r.blob) {
         p.blocked = Some(why);
     }
     let banner = p.banner(shown_path, &r);
-    Ok((banner, r.blob))
+    Ok(TextPreview {
+        banner,
+        blob: r.blob,
+        blocked: p.blocked,
+    })
 }
 
 /// Everything that can go wrong, kept distinct so the caller can map each to an
@@ -206,6 +232,8 @@ pub enum Error {
     Script(script::ScriptError),
     /// The engine refused to run a screened script.
     Engine(String),
+    /// The diff is real but cannot be expressed as an appliable block set.
+    Blocked(String),
     Io(String),
 }
 
@@ -214,6 +242,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Script(e) => write!(f, "{e}"),
             Error::Engine(e) => write!(f, "{e}"),
+            Error::Blocked(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }
@@ -242,7 +271,8 @@ mod tests {
 
     #[test]
     fn substitution_previews_as_one_anchored_block() {
-        let (banner, blob) = preview_text(FILE, "src/foo.rs", "5s/run/walk/", opts()).unwrap();
+        let TextPreview { banner, blob, .. } =
+            preview_text(FILE, "src/foo.rs", "5s/run/walk/", opts()).unwrap();
         assert!(banner.contains("1 block"), "{banner}");
         assert!(blob.starts_with("src/foo.rs:5\n@@@OLD"), "{blob}");
         assert!(blob.contains("run();"), "{blob}");
@@ -251,7 +281,8 @@ mod tests {
 
     #[test]
     fn no_op_says_so_and_returns_no_blocks() {
-        let (banner, blob) = preview_text(FILE, "src/foo.rs", "999s/zzz/yyy/", opts()).unwrap();
+        let TextPreview { banner, blob, .. } =
+            preview_text(FILE, "src/foo.rs", "999s/zzz/yyy/", opts()).unwrap();
         assert!(blob.is_empty());
         assert!(banner.contains("no lines matched"), "{banner}");
         assert!(banner.contains("src/foo.rs"), "{banner}");
@@ -286,7 +317,7 @@ mod tests {
         // Use a file we wrote, so the test does not depend on host contents.
         let f = std::env::temp_dir().join("bsed-r-test.txt");
         std::fs::write(&f, "SPLICED LINE\n").unwrap();
-        let (_banner, blob) =
+        let TextPreview { blob, .. } =
             preview_text(FILE, "f.rs", &format!("1r {}", f.display()), opts()).unwrap();
         std::fs::remove_file(&f).ok();
         assert!(blob.contains("SPLICED LINE"), "{blob}");
@@ -296,14 +327,14 @@ mod tests {
 
     #[test]
     fn two_expressions_on_one_line_behave_like_two() {
-        let a = preview_text(FILE, "f.rs", "2d;3d", opts()).unwrap().1;
-        let b = preview_text(FILE, "f.rs", "2d\n3d", opts()).unwrap().1;
+        let a = preview_text(FILE, "f.rs", "2d;3d", opts()).unwrap().blob;
+        let b = preview_text(FILE, "f.rs", "2d\n3d", opts()).unwrap().blob;
         assert_eq!(a, b);
     }
 
     #[test]
     fn trailing_floor_is_applied_by_default() {
-        let (_banner, blob) = preview_text(
+        let TextPreview { blob, .. } = preview_text(
             FILE,
             "src/foo.rs",
             "2s/1/11/",
@@ -330,7 +361,8 @@ mod tests {
         let file: String = (0..40)
             .map(|i| if i % 3 == 0 { "run();\n" } else { "other();\n" })
             .collect();
-        let (_banner, blob) = preview_text(&file, "src/x.rs", "s/run/walk/g", opts()).unwrap();
+        let TextPreview { blob, .. } =
+            preview_text(&file, "src/x.rs", "s/run/walk/g", opts()).unwrap();
         let parsed = blockedit::parse_blocks(&blob).unwrap();
         assert_eq!(parsed.edits.len(), 14);
         for (i, e) in parsed.edits.iter().enumerate() {
@@ -345,7 +377,7 @@ mod tests {
     #[test]
     fn file_without_trailing_newline_is_unchanged_by_a_no_op() {
         let file = "a\nb";
-        let (_banner, blob) = preview_text(file, "f.rs", "s/zzz/yyy/", opts()).unwrap();
+        let TextPreview { blob, .. } = preview_text(file, "f.rs", "s/zzz/yyy/", opts()).unwrap();
         assert!(blob.is_empty());
     }
 
@@ -390,7 +422,8 @@ mod tests {
                 continue;
             };
 
-            let (banner, blob) = preview_text(FILE, "src/foo.rs", script, opts()).unwrap();
+            let TextPreview { banner, blob, .. } =
+                preview_text(FILE, "src/foo.rs", script, opts()).unwrap();
             if blob.is_empty() {
                 // A script that changes nothing must say so *and* mean it: the
                 // banner reports no match and there is nothing to apply.
@@ -422,7 +455,7 @@ mod tests {
 
     #[test]
     fn case_escapes_preview_as_uppercase() {
-        let (_banner, blob) = preview_text(FILE, "f.rs", "s/run/\\U&/", opts()).unwrap();
+        let TextPreview { blob, .. } = preview_text(FILE, "f.rs", "s/run/\\U&/", opts()).unwrap();
         assert!(blob.contains("RUN();"), "{blob}");
         assert!(!blob.contains("\\U"), "{blob}");
     }

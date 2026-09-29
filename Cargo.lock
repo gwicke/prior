@@ -206,7 +206,9 @@ name = "bsed"
 version = "0.1.0"
 dependencies = [
  "blockedit",
+ "globset",
  "ignore",
+ "portable-pty",
  "sed-rs",
  "serde_json",
  "similar",

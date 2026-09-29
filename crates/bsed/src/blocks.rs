@@ -51,21 +51,44 @@ pub fn structural_marker_in(text: &str) -> Option<&'static str> {
     None
 }
 
-/// The `edit` tool's own parser, run over the blob we are about to emit.
+/// Check that the blocks we built can be expressed in the blob format, and say
+/// precisely why not when they cannot.
 ///
-/// This is the contract: if `parse_blocks` does not recover our blocks with the
-/// same texts and anchors, the preview is not applicable, and saying so here is
-/// far cheaper for the model than the failure it would hit after applying.
-pub fn verify(blob: &str) -> Result<(), String> {
-    let parsed = blockedit::parse_blocks(blob).map_err(|e| e.to_string())?;
-    for (i, e) in parsed.edits.iter().enumerate() {
-        if let Some(marker) =
-            structural_marker_in(&e.old_text).or_else(|| structural_marker_in(&e.new_text))
-        {
+/// The in-memory check comes first on purpose: a marker line inside a block body
+/// makes the blob *unparseable*, so asking the parser first would report its
+/// generic "unexpected delimiter" instead of naming the block and the line the
+/// caller has to deal with. Parsing afterwards is the belt to that pair of
+/// braces: if the round-trip does not recover our own blocks, something else is
+/// wrong and we want to hear about it now rather than at apply time.
+pub fn verify(blocks: &[Block], blob: &str) -> Result<(), String> {
+    for (i, b) in blocks.iter().enumerate() {
+        let found = structural_marker_in(&b.old_text).or_else(|| structural_marker_in(&b.new_text));
+        if let Some(marker) = found {
             return Err(format!(
-                "block {} contains the marker line `{marker}`, which the edit tool reads as \
-                 structure. Re-run against a file without that line, or apply the change with \
-                 the edit tool's oldText/newText form instead of block syntax.",
+                "block {} contains the line `{marker}`, which the edit tool reads as block \
+                 structure rather than content. Re-run against a file without that line, or \
+                 apply the change with the edit tool's oldText/newText form instead of block \
+                 syntax.",
+                i + 1
+            ));
+        }
+    }
+
+    let parsed = blockedit::parse_blocks(blob).map_err(|e| {
+        format!("the blocks could not be rendered in the edit tool's block format: {e}")
+    })?;
+    if parsed.edits.len() != blocks.len() {
+        return Err(format!(
+            "internal: rendered {} blocks but the edit tool's parser recovered {}",
+            blocks.len(),
+            parsed.edits.len()
+        ));
+    }
+    for (i, (e, b)) in parsed.edits.iter().zip(blocks.iter()).enumerate() {
+        if e.old_text != b.old_text || e.new_text != b.new_text {
+            return Err(format!(
+                "internal: block {} did not survive the round-trip through the edit tool's \
+                 block format",
                 i + 1
             ));
         }
@@ -139,7 +162,7 @@ mod tests {
     fn empty_new_renders_as_an_empty_section() {
         let r = render("src/x.rs", &[b(6, "gone", "")], 50_000);
         assert!(r.blob.contains("@@@NEW\n\n@@@END"), "{}", r.blob);
-        assert!(verify(&r.blob).is_ok());
+        assert!(verify(&[b(6, "gone", "")], &r.blob).is_ok());
     }
 
     #[test]
