@@ -143,13 +143,44 @@ pub struct CompletionRows {
     pub match_indices: Option<HashMap<usize, HashMap<String, Vec<usize>>>>,
 }
 
+/// Row id of the confirm dialog's accept arm (§9). Fixed by the
+/// engine — a node phrases the option via
+/// [`SubmitResult::Prepared`]'s payload, never renames the row. The
+/// row is always first, so it carries the dialog's initial cursor.
+pub const CONFIRM_ACCEPT: &str = "accept";
+
+/// Row id of the confirm dialog's cancel arm (§9). Fixed by the
+/// engine; see [`CONFIRM_ACCEPT`].
+pub const CONFIRM_CANCEL: &str = "cancel";
+
+/// Default description for [`CONFIRM_ACCEPT`].
+pub const CONFIRM_ACCEPT_LABEL: &str = "Accept";
+
+/// Default description for [`CONFIRM_CANCEL`].
+pub const CONFIRM_CANCEL_LABEL: &str = "Cancel";
+
+/// Confirm-dialog arm descriptions — `(accept, cancel)`, the text the
+/// engine renders beside the engine-owned [`CONFIRM_ACCEPT`] /
+/// [`CONFIRM_CANCEL`] row ids. Carried by
+/// [`SubmitResult::Prepared`] so a node can say what accepting will do
+/// ("Delete this session and its history, permanently") without the
+/// engine needing a per-node hook.
+pub type ConfirmLabels = (String, String);
+
 /// Outcome of `submit()` / `prepare()`.
 pub enum SubmitResult {
     /// Action completed; close the menu. Optional message.
     Done(Option<String>),
-    /// Prep step done; engine shows confirm dialog. Subsequent Enter
-    /// calls `submit()` again.
-    Prepared,
+    /// Prep step done; engine shows confirm dialog (§9). Subsequent
+    /// Enter calls `submit()` if the `accept` arm is selected, or
+    /// cancels in place if `cancel` is.
+    ///
+    /// `None` takes the engine's defaults (`CONFIRM_ACCEPT_LABEL` /
+    /// `CONFIRM_CANCEL_LABEL`); `Some((accept, cancel))` phrases them
+    /// for this confirm — the place a node names the action, since it
+    /// is the same call that decided the action. Phrasing should read
+    /// as the effect itself, not a bare label.
+    Prepared(Option<ConfirmLabels>),
     /// Handled, stay open — nothing to commit. The engine re-derives the
     /// current frame exactly as a `HostKey::None` eval would and the menu
     /// stays up. `edit()`'s default returns this: a no-op edit.

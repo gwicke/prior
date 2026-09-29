@@ -416,6 +416,22 @@ values for modifiers without a pre-defined enum (D7).
    confirm dialog (non-overridable service) → `submit()` on yea. State
    machine is handler-local (node-private, §2). Cancel (Esc / buffer rewrite)
    drops staged payload.
+
+   **As built** (`NodeEntry::confirm_pass` / `confirm_plan`): the dialog is
+   the node's `header()` as detail plus two arm rows on the engine's shared
+   dialog view — the same `RowView` the completion dialog uses, which the
+   two never occupy at once (a confirm arms only from a key completion does
+   not own, and suppresses the pass while armed). `accept` is first and
+   carries the initial cursor; Enter resolves the cursor row, Esc cancels,
+   cursor keys move, and a rewritten prompt disarms the engine's arm (§9's
+   "buffer rewrite cancels" — the node still owns its own staged payload and
+   invalidates that itself). Arm *values* are engine-owned
+   (`CONFIRM_ACCEPT` / `CONFIRM_CANCEL`); a node phrases them in the
+   `SubmitResult::Prepared` payload — `Some((accept, cancel))`, or `None`
+   for the `("Accept", "Cancel")` defaults. No per-node hook: the arm is
+   phrased by the same call that decided the action, and the engine
+   captures the text at arm time. A listing can arm one too (from
+   `edit()` → `Prepared`), and the same arm is what makes it resolvable.
 2. **Editor handoff**: the node's `prepare()` opens an external editor
    via a callback captured at construction (the engine crate is
    generic; the picocode-side node impl captures `open_editor` as

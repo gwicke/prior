@@ -179,7 +179,9 @@ This action cannot be undone.
 ```
 
 **`prepare()`**: Returns `SubmitResult::Prepared` — the engine renders
-the yea/nay confirm dialog (§9). If this is the current session, returns
+the accept/cancel confirm dialog (§9); the arms are phrased here
+("Delete this session and its history, permanently" / "Keep the
+session"). If this is the current session, returns
 `Done(Some("Cannot delete the current session"))` instead.
 
 **`submit()`**: Sets `AsyncOp::Delete { session_id }` on

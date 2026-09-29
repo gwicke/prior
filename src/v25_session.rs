@@ -710,7 +710,10 @@ impl SlashDotNode for SessionDeleteNode {
                 return SubmitResult::Done(Some("Cannot delete the current session.".to_string()));
             }
         }
-        SubmitResult::Prepared
+        SubmitResult::Prepared(Some((
+            "Delete this session and its history, permanently".into(),
+            "Keep the session".into(),
+        )))
     }
 
     async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
@@ -1145,7 +1148,7 @@ mod tests {
         };
         let result = crate::agent::block_on_test(node.prepare(1, &path_args));
         assert!(
-            matches!(result, SubmitResult::Prepared),
+            matches!(result, SubmitResult::Prepared(_)),
             "should allow delete of non-current session"
         );
     }

@@ -203,8 +203,9 @@ The three nodes share `compact_prepare` / `edit_draft` / `compact_submit`
 - `prepare()` validates and drafts via `agent::generate_compaction`,
   opens `$EDITOR` (`AppState::edit_text`), stashes the result under
   `(target, epoch)` and returns `SubmitResult::Prepared` — the engine's
-  `NodeEntry` confirm then gates `submit()` behind Enter (apply via
-  `agent::apply_compaction`) / Esc (cancel in place).
+  `NodeEntry` then renders the confirm dialog and gates `submit()` behind
+  the `accept` arm (apply via `agent::apply_compaction`); `cancel` / Esc
+  drops it in place.
 - Non-REPL hosts (in-process / scripted input) run the same nodes through
   `Repl::batch_slash` — a batch eval (passive derive + virtual Enter,
   `Prepared` confirms take a second press) with no overlay drawing; the

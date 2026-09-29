@@ -113,7 +113,11 @@ child.
   - active config bind → `{id:"remove", desc:"exclude this config mapping"}`
 - `header()`: binding detail; for a config bind add a note that the action
   only *excludes* it (reversible via `restore`).
-- `prepare()`: `Prepared` (two-phase confirm).
+- `prepare()`: `Prepared(Some(arms))` (two-phase confirm) — the labels
+  are resolved from the same binding lookup `submit()` does, so the
+  dialog names the effect that will actually have ("Remove this session
+  mapping (deletes it)" vs "Exclude this config mapping for this
+  session" vs "Re-enable this mapping").
 - `submit()`: `restore` → `AsyncOp::Sandbox(Restore)`;
   `remove` → `Remove` for a session bind, `Exclude` for a config bind.
   Binding resolved by `ids[1]`, not `ids.last()` (`last()` is the action).
