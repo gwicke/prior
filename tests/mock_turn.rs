@@ -325,37 +325,37 @@ fn run_turn(scenario: u32, label: &str, thinking: bool) -> Vec<u8> {
     data
 }
 
-/// Count the empty lines between the last non-empty content line and the
-/// horizontal separator (the line of `─` drawn at the top of the next loop).
-/// Blank screen rows between the last content row and the turn's separator.
+// (Removed: `blanks_before_separator` counted the blank rows above the divider
+// that opened each turn, and the `screen_rows` doc comment that explained the
+// screen-based counting went with it — the helper those notes belonged to is
+// still here, under its own doc comment below.)
+
+/// The final screen, as trimmed rows.
 ///
 /// Counted on the **screen**, not in the byte stream, and that is a correction
 /// rather than a style choice. The transient status paints a gap row of its own
 /// (`row_accounting` §3.5) and erases it again before the next write, so a model
 /// that splits the stream on newlines counts one blank per content block — three
 /// for a text/tool/text turn — none of which ever existed on screen. The screen
-/// is what the assertion is about, and it is immune to transient rows by
+/// is what these assertions are about, and it is immune to transient rows by
 /// construction.
-fn blanks_before_separator(data: &[u8]) -> usize {
+/// Blank screen rows between the last content row and the **status bar**.
+///
+/// The bar is the row that now separates a finished turn from the input area, so
+/// this is where "one empty line at the end of a turn" is now decided. It
+/// replaces `blanks_before_separator`, which counted the same thing against the
+/// divider that opened each turn — a divider the bar has since taken the row of.
+fn blanks_before_status(data: &[u8]) -> usize {
     let rows = screen_rows(data);
-    let Some(sep) = rows
-        .iter()
-        .rposition(|t| t.chars().all(|c| c == '─') && t.len() >= 10)
-    else {
+    let Some(bar) = rows.iter().position(|r| is_status_row(r)) else {
         return 0;
     };
-    // Walk up from the separator, counting empty rows until the first non-empty
-    // content row. The transient status can sit in between (row_accounting §3.5)
-    // — it is chrome, not content, so skip it rather than call it a missing
-    // blank.
     let mut blanks = 0;
-    let mut i = sep;
+    let mut i = bar;
     while i > 0 {
         i -= 1;
         if rows[i].trim().is_empty() {
             blanks += 1;
-        } else if is_status_row(&rows[i]) {
-            continue;
         } else {
             break;
         }
@@ -363,13 +363,22 @@ fn blanks_before_separator(data: &[u8]) -> usize {
     blanks
 }
 
-/// Is this row the transient status line? It always carries the qualified model
-/// id, which is what the mock runs on (`-p llamacpp -m test`).
+/// Is this row the status bar? It always carries the qualified model id, which is
+/// what the mock runs on (`-p llamacpp -m test`) — and the prompt-side bar and the
+/// transient one are the same text, so this matches either.
 fn is_status_row(row: &str) -> bool {
     row.contains("llamacpp:test")
 }
 
 /// The final screen, as trimmed rows.
+///
+/// Counted on the **screen**, not in the byte stream, and that is a correction
+/// rather than a style choice. The transient status paints a gap row of its own
+/// (`row_accounting` §3.5) and erases it again before the next write, so a model
+/// that splits the stream on newlines counts one blank per content block — three
+/// for a text/tool/text turn — none of which ever existed on screen. The screen
+/// is what these assertions are about, and it is immune to transient rows by
+/// construction.
 fn screen_rows(data: &[u8]) -> Vec<String> {
     let mut p = Parser::new(ROWS, COLS, 1000);
     p.process(data);
@@ -483,13 +492,19 @@ fn the_status_line_is_relative_and_transient_end_to_end() {
         text.contains("llamacpp:test"),
         "the status should be written: {text:?}"
     );
-    // The bar from its first `SGR` to *its* erase — the styling prefix has to be
-    // inside the span under test, and the keystroke echoes above erased their
+    // The **streaming** bar, identified by its green dot. There are two bars now
+    // and they are different objects: the prompt-side one is a row of the input
+    // frame (painted, never erased, no cursor hide), and this test is about the
+    // transient one that annotates a turn in flight. The dot colour is the
+    // discriminator, which is the reason it is worth having.
+    //
+    // The span runs from the bar's first `SGR` to *its* erase — the styling
+    // prefix has to be inside it, and the keystroke echoes above erased their
     // rows long before any bar existed, so the erase can only be searched for
     // after the bar starts.
     let start = text
-        .find("\x1b[48;5;237m")
-        .unwrap_or_else(|| panic!("the bar should be styled: {text:?}"));
+        .find("\x1b[48;5;237m \x1b[38;5;41m")
+        .unwrap_or_else(|| panic!("a streaming bar should be painted: {text:?}"));
     let erase = start
         + text[start..]
             .find("\x1b[K")
@@ -546,6 +561,9 @@ fn the_status_line_keeps_one_blank_row_above_it() {
     // `\r\n` collapsing shifts every position after the first line, and
     // `from_utf8_lossy` shifts them again wherever a byte is not valid UTF-8.
     // Either one and the slice below is cut in the wrong place.
+    // Streaming bars only — see the note in the transient test above. The
+    // prompt-side bar is a frame row, so the *first* bar in the transcript is no
+    // longer the one this is about.
     let all = |needle: &[u8]| {
         bytes
             .windows(needle.len())
@@ -554,6 +572,7 @@ fn the_status_line_keeps_one_blank_row_above_it() {
             .map(|(i, _)| i)
             .collect::<Vec<_>>()
     };
+    let green = b"\x1b[48;5;237m \x1b[38;5;41m";
     // The **first** paint after content — and with a fence, the first paint is
     // the one that reproduces the bug, which is why this scenario exists.
     //
@@ -564,7 +583,7 @@ fn the_status_line_keeps_one_blank_row_above_it() {
     // paints too late. So a test that samples a later paint passes with the gap
     // switched off — which is exactly what mine did before this scenario was
     // driven through every paint.
-    let paints = all(b"\x1b[48;5;237m");
+    let paints = all(green);
     let bar_start = *paints
         .first()
         .unwrap_or_else(|| panic!("the bar should be painted at all"));
@@ -631,38 +650,47 @@ fn the_status_line_keeps_one_blank_row_above_it() {
     );
 }
 
+/// One blank row between the last content of a turn and the status bar that now
+/// sits where the next turn's separator used to.
+///
+/// This is what `end_to_end_separator_layout` measured, against a different row:
+/// the divider that opened each turn is gone, and the bar took its place. The
+/// invariant is the same — a turn ends one blank line before the input area —
+/// and it is worth keeping in the same shape (one screen-based count per
+/// scenario) because it is the thing that regresses when a block's trailing blank
+/// goes missing.
 #[test]
-fn end_to_end_separator_layout() {
+fn end_to_end_input_mode_layout() {
     // Scenario 0: text + tool + final text answer (the user's example).
     let a = run_turn(0, "text-tool-finaltext", false);
-    let blanks = blanks_before_separator(&a);
+    let blanks = blanks_before_status(&a);
     assert_eq!(
         blanks, 1,
-        "text+tool+final-answer turn must end with exactly ONE empty line before the separator (got {blanks})"
+        "text+tool+final-answer turn must end with exactly ONE empty line before the bar (got {blanks})"
     );
 
     // Scenario 2: single text-only turn.
     let b = run_turn(2, "text-only", false);
-    let blanks = blanks_before_separator(&b);
+    let blanks = blanks_before_status(&b);
     assert_eq!(
         blanks, 1,
-        "text-only turn must end with exactly ONE empty line before the separator (got {blanks})"
+        "text-only turn must end with exactly ONE empty line before the bar (got {blanks})"
     );
 
     // Scenario 1: turn ends right after the tool result.
     let c = run_turn(1, "tool-result-end", false);
-    let blanks = blanks_before_separator(&c);
+    let blanks = blanks_before_status(&c);
     assert_eq!(
         blanks, 1,
-        "tool-result-ended turn must end with exactly ONE empty line before the separator (got {blanks})"
+        "tool-result-ended turn must end with exactly ONE empty line before the bar (got {blanks})"
     );
 
     // Scenario 0 + thinking on: answer-hold path (reasoning model).
     let h = run_turn(0, "held-answer", true);
-    let blanks = blanks_before_separator(&h);
+    let blanks = blanks_before_status(&h);
     assert_eq!(
         blanks, 1,
-        "answer-held (reasoning) turn must end with exactly ONE empty line before the separator (got {blanks})"
+        "answer-held (reasoning) turn must end with exactly ONE empty line before the bar (got {blanks})"
     );
 
     // Scenario 3: second request 429 -> display_text("Error: ...").
@@ -672,10 +700,86 @@ fn end_to_end_separator_layout() {
         above, 1,
         "error message must sit exactly ONE empty line below the prior block (got {above})"
     );
-    // And the error line itself sits directly above the separator (0 blanks).
-    let before = blanks_before_separator(&d);
+    // The error gets the same one-blank gap as every other block. It used to be
+    // the exception — the error line sat *directly* above the divider, because
+    // the loop-top rule was written into the blank the error path left behind.
+    // With the bar in the frame there is nothing to consume that blank, so the
+    // error is spaced like the rest instead of being the one block that butts
+    // against the input area.
+    let before = blanks_before_status(&d);
     assert_eq!(
-        before, 0,
-        "error line must sit directly above the separator (got {before} blanks)"
+        before, 1,
+        "error line must get the same ONE blank line as any other block (got {before} blanks)"
+    );
+}
+
+/// The bar is on screen in input mode, between turns, with a **grey** dot — and
+/// mid-turn the same bar is painted at the live edge with a **green** one.
+///
+/// This is the point of the whole exercise: the bar is permanent, so the dot is
+/// what says whether a turn is in flight. Before the prompt-side bar existed the
+/// green state had nowhere to be seen, because the bar only existed mid-turn.
+#[test]
+fn the_status_bar_is_permanent_and_the_dot_says_which_state() {
+    let bytes = run_turn(2, "text-only", false);
+    let text = String::from_utf8_lossy(&bytes);
+    let grey = "\x1b[48;5;237m \x1b[38;5;245m●";
+    let green = "\x1b[48;5;237m \x1b[38;5;41m●";
+    assert!(
+        text.contains(grey),
+        "the idle bar should be on screen with a grey dot"
+    );
+    assert!(
+        text.contains(green),
+        "and the streaming bar with a green one"
+    );
+    // The idle one is *last*: the turn is over, so the bar the reader is left
+    // looking at is the idle one. This is what "permanent" means in practice —
+    // the bar the session ends on is the one that stays.
+    assert!(
+        text.rfind(grey) > text.rfind(green),
+        "the final bar should be the idle one: grey at rest, green while working"
+    );
+}
+
+/// The prompt-side bar is a row of the input frame, so the frame's own clear
+/// takes it when the input is submitted — and it is *not* a transient line that a
+/// content write has to erase.
+///
+/// A transient bar would need a relative erase at submit, and by then the cursor
+/// has moved into the frame region below it, so that erase would land on the
+/// wrong rows. Being in the frame is what makes it safe, and the proof is that
+/// the next turn's content starts clean: the input echo, immediately below where
+/// the bar was, with no bar left stranded above it.
+#[test]
+fn the_idle_bar_is_frame_owned_so_submit_leaves_nothing_behind() {
+    let bytes = run_turn(2, "text-only", false);
+    let rows = screen_rows(&bytes);
+    let bar = rows
+        .iter()
+        .position(|r| is_status_row(r))
+        .expect("the idle bar should be on the final screen");
+    // Nothing above it but the turn's content and one blank — no *second* bar
+    // stranded where a transient one would have been left.
+    let bars: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| is_status_row(r))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        bars,
+        vec![bar],
+        "exactly one bar on the final screen: {rows:?}"
+    );
+    // And the input echo is on screen below the bar's former row, i.e. the
+    // submit wrote content where the frame's caret was, not over the bar.
+    let echo = rows
+        .iter()
+        .position(|r| r.contains("run the command") && !is_status_row(r))
+        .expect("the input echo should be on screen");
+    assert!(
+        echo < bar,
+        "the echo should sit above the bar, not be overwritten by it: {rows:?}"
     );
 }

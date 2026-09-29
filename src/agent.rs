@@ -327,15 +327,18 @@ impl PicoAgent for CodeAgent {
         self.output.set_status(&status_line(
             session_name.as_deref(),
             first_message.as_deref(),
-            &self.provider,
-            &self.model,
-            // Reported wins: it is the provider's own count of what it was
-            // sent. The estimate only stands in while there is none — turn
-            // one, where the alternative is no figure at all.
-            if reported_ctx > 0 {
-                reported_ctx
-            } else {
-                estimated_ctx
+            BarModel {
+                provider: &self.provider,
+                model: &self.model,
+                thinking: self.thinking_level.as_deref(),
+                // Reported wins: it is the provider's own count of what it was
+                // sent. The estimate only stands in while there is none — turn
+                // one, where the alternative is no figure at all.
+                context_tokens: if reported_ctx > 0 {
+                    reported_ctx
+                } else {
+                    estimated_ctx
+                },
             },
             crate::output::term_width(),
             // The status line is only set for a turn in flight, so it is always
@@ -1365,6 +1368,11 @@ pub struct CodeAgent {
     tool_call_limit: usize,
     provider: String,
     model: String,
+    /// The active thinking level, for the status readout. A snapshot taken when
+    /// the agent is built: the level only changes on an explicit commit, and the
+    /// bar is painted once per content block, so reading the config per block
+    /// would only add a lock to a path that has no reason to be fresh.
+    thinking_level: Option<String>,
     yolo: bool,
     persona_name: Option<String>,
     user_cancel: Arc<AtomicBool>,
@@ -1558,6 +1566,7 @@ pub async fn create_agent(config: AgentConfig) -> Result<Box<dyn PicoAgent>> {
                 config.tool_call_limit,
                 config.provider,
                 model,
+                config.thinking_level,
                 config.yolo,
                 config.persona_name,
                 config.user_cancel.clone(),
@@ -3610,11 +3619,32 @@ pub async fn run_interactive(
     loop {
         let action = match repl.as_mut() {
             Some(r) => {
-                config.output.display_separator();
+                // No separator here any more: the prompt-side status bar occupies
+                // the divider's row, above the input (it is a `Lines` element of
+                // the input frame). The bar separates the last turn from the
+                // prompt *and* says what is about to answer it, which a dim rule
+                // could not do — and it is the same bar the turn paints while it
+                // streams, so the dot is the only thing that changes between the
+                // two states.
+                //
+                // The spacing the rule provided is not lost: a response ends on
+                // a blank (`end_response`), and the greeter ends on one of its
+                // own, so the frame's first row still lands one row clear.
 
                 // Build session context data for REPL overlays.
                 let (_sessions, branch_messages, tree, leaf_id, context_tokens) =
                     build_session_ctx(&app_state.session()).await;
+                // The session's own name and opening message, for the prompt-side
+                // status bar. Off the same `branch_messages` the overlays read,
+                // so the two bars cannot disagree about which session they are
+                // naming — and off the *index* for the name, which is where the
+                // mid-turn bar reads it too.
+                let session_name = match app_state.session() {
+                    Some(session) => session.index.lock().await.header.name.clone(),
+                    None => None,
+                };
+                let session_first_message =
+                    branch_messages.first().map(|(_, preview)| preview.clone());
 
                 let ctx = ReplCtx {
                     provider: config.provider.clone(),
@@ -3635,6 +3665,13 @@ pub async fn run_interactive(
                     context_tokens,
                     model_filter: ModelFilter::default_for_coding(),
                     thinking_level: config.thinking_level.clone(),
+                    // The prompt-side bar names the session the same way the
+                    // mid-turn one does: off the session index, with the opening
+                    // message as the fallback when it has no name. Read here, at
+                    // the top of the cycle, so both bars are looking at one
+                    // snapshot rather than at whatever the index holds later.
+                    session_name,
+                    session_first_message,
                 };
                 // Pop the pending prefill (if any); the read_input call below
                 // uses it to seed the LineEditor, after which the next loop
@@ -4200,63 +4237,151 @@ pub struct SessionStatsInfo {
 /// and the agent's accumulated [`SessionUsage`] for the per-turn / session
 /// totals. Returns plain lines so the REPL can render them in the `/stat`
 /// overlay (`render_plain` display).
-/// The transient status line: `[session | provider:model | level | ctx 34% · 78k]`.
+/// What separates the name from the model group, and the width it costs.
+const BAR_SEPARATOR: &str = " | ";
+
+/// The model half of the bar — everything to the right of the pipe.
+///
+/// A struct rather than four more positional arguments because those four are
+/// two strings, an `Option` and a number in a row: nothing at the call site says
+/// which `Option<&str>` is the thinking level and which is the first message, and
+/// getting that wrong compiles. The field names are the documentation.
+pub struct BarModel<'a> {
+    pub provider: &'a str,
+    pub model: &'a str,
+    /// The active thinking level, if any.
+    pub thinking: Option<&'a str>,
+    /// Context tokens in use. `0` means "not known yet" and drops the figure
+    /// rather than showing a zero.
+    pub context_tokens: u64,
+}
+
+/// The transient status line: `● session | provider:model thinking 34% 78k`.
 ///
 /// The mid-turn readout (doc/row_accounting.md, zone 2). Built from the same
 /// pieces `session_stats_lines` uses — `model_catalog` for the context window,
 /// the caller's token count for the usage — so the two cannot disagree about
-/// what "ctx" means. Fields that are unknown are dropped rather than shown
-/// empty, and the result is truncated to `width` so a narrow terminal loses
-/// the tail (the context figure) rather than wrapping.
+/// what the context figure means. Fields that are unknown are dropped rather
+/// than shown empty.
+///
+/// One pipe, and single spaces between the model fields. The labels went
+/// ("ctx 34% · 78k" → "34% 78k") because on a 120-column bar they were most of
+/// the line, and because the fields sit in a fixed order that does not change —
+/// `model thinking pct size` reads without them once you have seen it twice.
+///
+/// The name is the elastic part and it *fills* what is left: it is truncated to
+/// the columns between the dot and the pipe rather than to a fixed preview
+/// width, so a long session name uses the whole gap and ends in an ellipsis
+/// instead of stopping short and leaving a hole. The model group is measured
+/// first, because it is the part with nothing to give.
 pub fn status_line(
     session_name: Option<&str>,
     first_message: Option<&str>,
-    provider: &str,
-    model: &str,
-    context_tokens: u64,
+    m: BarModel<'_>,
     width: usize,
     streaming: bool,
 ) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(name) = session_name.map(str::trim).filter(|n| !n.is_empty()) {
-        parts.push(name.to_string());
-    } else if let Some(msg) = first_message.map(str::trim).filter(|m| !m.is_empty()) {
-        // With no name to show, the session's opening message stands in: the
-        // line should still say *which* session this is, not just which model.
-        parts.push(message_preview(msg));
-    }
+    let BarModel {
+        provider,
+        model,
+        thinking,
+        context_tokens,
+    } = m;
+    // The model group, as separate fields so a narrow terminal can drop whole
+    // ones rather than being cut mid-word. The drop order below is the order
+    // they are pushed.
+    let mut fields: Vec<String> = Vec::new();
     if !provider.is_empty() || !model.is_empty() {
-        parts.push(format!("{provider}:{model}"));
+        fields.push(format!("{provider}:{model}"));
+    }
+    if let Some(level) = thinking.map(str::trim).filter(|l| !l.is_empty()) {
+        fields.push(level.to_string());
     }
     if context_tokens > 0 {
         // The percentage needs the catalog's context window, and a model
         // missing from it is normal (a local endpoint, a new release). So the
         // count stands alone rather than the whole figure disappearing: no
-        // window known means no percentage, not no ctx.
+        // window known means no percentage, not no context figure.
         let window = model_catalog::lookup(provider, model)
             .and_then(|e| e.context_length)
             .filter(|max| *max > 0);
-        let figure = match window {
+        fields.push(match window {
             Some(max) => {
                 let pct = (context_tokens as f64 / max as f64) * 100.0;
-                format!("ctx {pct:.0}% · {}", compact_tokens(context_tokens))
+                format!("{pct:.0}% {}", compact_tokens(context_tokens))
             }
-            None => format!("ctx {}", compact_tokens(context_tokens)),
-        };
-        parts.push(figure);
+            None => compact_tokens(context_tokens),
+        });
     }
-    let line = parts.join(" | ");
-    // Truncate against the width the *text* has, which is the row minus the dot
-    // cell: truncating against the row instead overflows by three columns on a
-    // narrow terminal, and the bar's width is its whole contract. A budget of
-    // zero has to drop the text rather than pass it through —
-    // `truncate_to_width(_, 0)` returns its input unchanged, which is right for
-    // a "no limit" caller and wrong here.
-    let budget = width.saturating_sub(dot_cell(width).1);
-    let line = if budget == 0 {
+
+    // The dot cell is not negotiable, and the bar's width is its whole contract —
+    // it is written full-width, so one column too many wraps, and the wrap is the
+    // one row movement the status path does not report.
+    let dot_cols = dot_cell(width).1;
+    let avail = width.saturating_sub(dot_cols);
+    // The separator costs columns only while there *is* a group to separate from.
+    // It is re-read rather than cached, because a group that drops to empty must
+    // not leave the name three columns short of a pipe that is no longer there.
+    let sep_cols = |g: &str| {
+        if g.is_empty() {
+            0
+        } else {
+            BAR_SEPARATOR.len()
+        }
+    };
+    // The group is fitted first, and gives way from the right: the context figure
+    // first, because it is the field that changes every turn and a missing one
+    // reads as "no context yet" rather than as a wrong model; then the thinking
+    // level; the model name last, because it is what identifies who is answering.
+    let mut group = fields.join(" ");
+    while !fields.is_empty()
+        && crate::row_count::display_width_ansi(&group) + sep_cols(&group) > avail
+    {
+        fields.pop();
+        group = fields.join(" ");
+    }
+    // A model name alone can still be too wide for a tiny terminal. Cut it —
+    // `truncate_to_width(_, 0)` returns its input unchanged, so a zero budget has
+    // to become an empty string rather than the whole name.
+    let group_room = avail.saturating_sub(sep_cols(&group));
+    let group = if crate::row_count::display_width_ansi(&group) > group_room {
+        if group_room == 0 {
+            String::new()
+        } else {
+            crate::row_count::truncate_to_width(&group, group_room)
+        }
+    } else {
+        group
+    };
+
+    // With no name to show, the session's opening message stands in: the line
+    // should still say *which* session this is, not just which model.
+    let name = session_name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            first_message
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(message_preview)
+        })
+        .unwrap_or_default();
+    // What is left of the row belongs to the name, and the ellipsis is the
+    // point: it takes every column the model group did not.
+    let name_room = group_room.saturating_sub(crate::row_count::display_width_ansi(&group));
+    // A name with no room goes rather than being cut to a single ellipsis, which
+    // identifies nothing and costs the reader a column to skip over.
+    let name = if name.is_empty() || name_room == 0 {
         String::new()
     } else {
-        crate::row_count::truncate_to_width(&line, budget)
+        crate::row_count::truncate_to_width(&name, name_room)
+    };
+
+    let line = match (name.is_empty(), group.is_empty()) {
+        (true, _) => group,
+        (false, true) => name,
+        (false, false) => format!("{name}{BAR_SEPARATOR}{group}"),
     };
     status_bar(&line, width, streaming)
 }
@@ -4329,27 +4454,45 @@ fn status_bar(text: &str, width: usize, streaming: bool) -> String {
     )
 }
 
-/// How much of a first message the status line shows when the session has no
-/// name — enough to recognise the session by, no more.
-const PREVIEW_COLS: usize = 25;
-
-/// A first message as a single line of at most [`PREVIEW_COLS`] display columns,
-/// ellipsised by `truncate_to_width` when it does not fit.
+/// A first message as a single line, flattened, for the status line to truncate
+/// to whatever the bar has left.
 ///
 /// Whitespace runs collapse, because a message that opens with a blank line, an
 /// indent, or a code fence would otherwise show as nothing at all. Escapes are
 /// stripped: this is untrusted text from a session file, and a pasted escape
 /// sequence should not be able to colour or reposition the bar.
+///
+/// No width cap of its own — `status_line` truncates to the columns the model
+/// group left, and a cap here would be a second opinion that is wrong exactly
+/// when the bar is widest. What used to be a fixed 25 columns showed a third of
+/// a long message on a 120-column bar and left a hole before the pipe.
 fn message_preview(msg: &str) -> String {
     let first = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let flat = first.split_whitespace().collect::<Vec<_>>().join(" ");
-    let flat = crate::output::strip_ansi(&flat);
-    crate::row_count::truncate_to_width(&flat, PREVIEW_COLS)
+    crate::output::strip_ansi(&flat)
 }
 
 #[cfg(test)]
 mod status_line_tests {
-    use super::{message_preview, status_line};
+    use super::{message_preview, status_line, BarModel, BAR_SEPARATOR};
+
+    /// A [`BarModel`] for the tests. Positional on purpose: every test wants the
+    /// same four things, and the field names at each of the twenty-odd call sites
+    /// would be noise. The names are still checked, because the layout test is
+    /// about the order they render in.
+    fn model<'a>(
+        provider: &'a str,
+        model: &'a str,
+        thinking: Option<&'a str>,
+        context_tokens: u64,
+    ) -> BarModel<'a> {
+        BarModel {
+            provider,
+            model,
+            thinking,
+            context_tokens,
+        }
+    }
 
     /// A planned bar's visible width — its contract with the terminal.
     fn display(s: &str) -> usize {
@@ -4363,7 +4506,13 @@ mod status_line_tests {
     /// than the start of a line.
     #[test]
     fn the_bar_fills_the_row_and_right_aligns_the_text() {
-        let s = status_line(Some("main"), None, "llamacpp", "test", 0, 40, true);
+        let s = status_line(
+            Some("main"),
+            None,
+            model("llamacpp", "test", None, 0),
+            40,
+            true,
+        );
         assert_eq!(
             crate::row_count::display_width_ansi(&s),
             40,
@@ -4400,7 +4549,7 @@ mod status_line_tests {
     fn the_bar_never_moves_the_cursor_down() {
         let long = "x".repeat(200);
         for w in [1_usize, 10, 40, 200] {
-            let s = status_line(Some(&long), None, "p", "m", 0, w, true);
+            let s = status_line(Some(&long), None, model("p", "m", None, 0), w, true);
             assert_eq!(
                 crate::row_count::rows_of(&s, w),
                 0,
@@ -4412,7 +4561,13 @@ mod status_line_tests {
     /// A long line is cut to the terminal, not spilled past it.
     #[test]
     fn a_long_bar_is_truncated_to_the_terminal() {
-        let s = status_line(Some(&"n".repeat(100)), None, "p", "m", 0, 20, true);
+        let s = status_line(
+            Some(&"n".repeat(100)),
+            None,
+            model("p", "m", None, 0),
+            20,
+            true,
+        );
         assert_eq!(crate::row_count::display_width_ansi(&s), 20, "{s:?}");
         assert!(crate::output::strip_ansi(&s).contains('…'), "{s:?}");
     }
@@ -4424,9 +4579,7 @@ mod status_line_tests {
         let s = status_line(
             None,
             Some("fix the flaky resize test"),
-            "llamacpp",
-            "test",
-            0,
+            model("llamacpp", "test", None, 0),
             60,
             true,
         );
@@ -4435,9 +4588,7 @@ mod status_line_tests {
         let named = status_line(
             Some("main"),
             Some("fix the flaky resize test"),
-            "llamacpp",
-            "test",
-            0,
+            model("llamacpp", "test", None, 0),
             60,
             true,
         );
@@ -4449,11 +4600,173 @@ mod status_line_tests {
         );
     }
 
+    /// The whole shape in one assertion: one pipe, the model fields in order
+    /// separated by single spaces, no labels.
+    ///
+    /// The labels are the substance of this, not the spacing. `ctx 34% · 78k`
+    /// spends eight columns saying what three digits and a suffix already say,
+    /// and on a narrow bar those columns are the difference between a session
+    /// name that fits and one that is ellipsised.
+    #[test]
+    fn the_model_group_is_unlabelled_and_space_separated() {
+        // `ollama:llama3` is in the curated static fallback with an 8k window,
+        // and ollama needs no API key, so the percentage is real here. The
+        // `None` window arm — a local endpoint or a new release — is a different
+        // shape and has its own test below.
+        let s = status_line(
+            Some("main"),
+            None,
+            model("ollama", "llama3", Some("high"), 5_000),
+            60,
+            true,
+        );
+        let visible = crate::output::strip_ansi(&s);
+        assert!(
+            visible.ends_with("main | ollama:llama3 high 61% 5k"),
+            "one pipe, model then level then the figure, single spaces: {visible:?}"
+        );
+        assert_eq!(
+            visible.matches('|').count(),
+            1,
+            "exactly one separator: {visible:?}"
+        );
+        assert!(
+            !visible.contains("ctx") && !visible.contains('·'),
+            "no labels left: {visible:?}"
+        );
+    }
+
+    /// A model the catalog does not know: the count stands alone rather than the
+    /// whole figure disappearing, because no window known means no percentage,
+    /// not no context figure.
+    #[test]
+    fn an_unknown_model_still_shows_its_token_count() {
+        let s = status_line(
+            Some("main"),
+            None,
+            model("llamacpp", "test", Some("high"), 78_000),
+            60,
+            true,
+        );
+        let visible = crate::output::strip_ansi(&s);
+        assert!(
+            visible.ends_with("main | llamacpp:test high 78k"),
+            "the count alone when there is no window to take a percentage of: {visible:?}"
+        );
+    }
+
+    /// The name fills the gap between the dot and the pipe, and is ellipsised
+    /// when it does not fit.
+    ///
+    /// "Fills" is the part that is easy to get wrong: a fixed preview width
+    /// truncates early and leaves a hole before the pipe, so the bar reads as
+    /// though the name were short. The assertion is that the name reaches the
+    /// pipe — the row is full to the last text column on both sides.
+    #[test]
+    fn the_name_fills_the_space_the_model_group_leaves() {
+        let group = "ollama:llama3 high 61% 5k";
+        for w in [40_usize, 60, 100] {
+            let long = "a".repeat(400);
+            let s = status_line(
+                Some(&long),
+                None,
+                model("ollama", "llama3", Some("high"), 5_000),
+                w,
+                true,
+            );
+            let visible = crate::output::strip_ansi(&s);
+            assert_eq!(display(&s), w, "width {w}: the bar is one row: {visible:?}");
+            assert!(
+                visible.ends_with(group),
+                "width {w}: the model group keeps the right margin: {visible:?}"
+            );
+            // The bar is `\u{25a0} name | group` with the dot cell in front, so
+            // the name is what is left once both ends are taken off.
+            let name = visible
+                .trim_start()
+                .strip_prefix('\u{25cf}')
+                .and_then(|r| r.strip_suffix(group))
+                .and_then(|r| r.strip_suffix(BAR_SEPARATOR))
+                .unwrap_or_else(|| panic!("width {w}: cannot find the name in {visible:?}"));
+            assert_eq!(
+                display(name),
+                w - 2 - group.len() - BAR_SEPARATOR.len(),
+                "width {w}: the name should take the whole gap: {visible:?}"
+            );
+            assert!(name.ends_with('…'), "width {w}: {name:?}");
+        }
+    }
+
+    /// On a narrow terminal the model group gives way **as whole fields**, from
+    /// the right: the context figure first, then the thinking level, and the
+    /// model name last.
+    ///
+    /// Field-at-a-time rather than a character cut, because the alternative is a
+    /// bar ending in `78` or `llamacpp:te` — figures and identifiers cut in half
+    /// read as data, not as truncation. The order is the priority order: the
+    /// figure changes every turn, so losing it is unremarkable, while losing the
+    /// model name leaves a bar that cannot say who is answering.
+    #[test]
+    fn a_narrow_bar_drops_whole_model_fields_from_the_right() {
+        // The only shapes the group may take, widest first. Anything else is a
+        // character cut or a field in the wrong order.
+        const ALLOWED: [&str; 4] = [
+            "ollama:llama3 high 61% 5k",
+            "ollama:llama3 high",
+            "ollama:llama3",
+            "",
+        ];
+        // Owned, because the borrow is out of the `visible` it came from by the
+        // time the next iteration rebinds it.
+        let mut seen: Vec<String> = Vec::new();
+        // Narrow enough that the group itself has to give. Above ~30 columns the
+        // *name* is the only thing shrinking, so a wider sweep would see one
+        // shape and pass without ever exercising the drop order.
+        // Downward, so `seen` reads in the order the fields drop.
+        for w in (4_usize..=40).rev() {
+            // No name and no message on purpose: with a name present the bar is
+            // `name | group` and the *name* is what shrinks first, so a sweep
+            // wide enough to matter would read a mixture of the two and could not
+            // say which one it was looking at. The name's own give-way has its
+            // own test.
+            let s = status_line(
+                None,
+                None,
+                model("ollama", "llama3", Some("high"), 5_000),
+                w,
+                true,
+            );
+            let visible = crate::output::strip_ansi(&s);
+            assert_eq!(display(&s), w, "width {w}: one row: {visible:?}");
+            // The dot cell leads and the padding is all that is left over, so
+            // what remains in the middle is the group and nothing else.
+            let group = visible
+                .trim()
+                .strip_prefix('\u{25cf}')
+                .unwrap_or(visible.trim())
+                .trim();
+            assert!(
+                ALLOWED.contains(&group),
+                "width {w}: the group must be whole fields, got {group:?} in {visible:?}"
+            );
+            if seen.last().map(String::as_str) != Some(group) {
+                seen.push(group.to_string());
+            }
+        }
+        // The transitions are the point: every field was exercised on the way
+        // down, so a regression that drops the wrong one is visible here.
+        assert_eq!(
+            seen,
+            ALLOWED.map(str::to_string),
+            "each field should drop in turn as the terminal narrows"
+        );
+    }
+
     /// Neither present: no leading separator, and the model still identifies the
     /// line.
     #[test]
     fn no_name_and_no_message_still_shows_the_model() {
-        let s = status_line(None, None, "llamacpp", "test", 0, 40, true);
+        let s = status_line(None, None, model("llamacpp", "test", None, 0), 40, true);
         let visible = crate::output::strip_ansi(&s);
         assert!(visible.ends_with("llamacpp:test"), "{visible:?}");
         assert_eq!(display(&s), 40, "{visible:?}");
@@ -4471,8 +4784,8 @@ mod status_line_tests {
     /// green lands on nothing, and the dot reads as default bright white.
     #[test]
     fn the_dot_is_green_while_streaming_and_grey_when_not() {
-        let streaming = status_line(Some("main"), None, "p", "m", 0, 40, true);
-        let idle = status_line(Some("main"), None, "p", "m", 0, 40, false);
+        let streaming = status_line(Some("main"), None, model("p", "m", None, 0), 40, true);
+        let idle = status_line(Some("main"), None, model("p", "m", None, 0), 40, false);
         assert!(
             streaming.contains("\x1b[38;5;41m"),
             "a streaming bar should carry a green dot: {streaming:?}"
@@ -4510,7 +4823,7 @@ mod status_line_tests {
     /// A leading full reset is what makes the bar self-contained.
     #[test]
     fn the_bar_resets_first_so_ambient_dim_cannot_reach_it() {
-        let s = status_line(Some("main"), None, "p", "m", 0, 40, true);
+        let s = status_line(Some("main"), None, model("p", "m", None, 0), 40, true);
         let body = s.trim_start_matches("\x1b[0m");
         assert!(
             s.starts_with("\x1b[0m"),
@@ -4522,10 +4835,12 @@ mod status_line_tests {
         );
     }
 
-    /// The preview is one line, collapsed, and about 25 columns — enough to
-    /// recognise a session by.
+    /// The preview is one line and collapsed. It is *not* capped here — the bar
+    /// truncates it to the columns the model group left, so a preview that came
+    /// back already cut would be a second opinion, and a wrong one on exactly the
+    /// widest bars.
     #[test]
-    fn the_preview_is_one_collapsed_line_of_about_25_columns() {
+    fn the_preview_is_one_flattened_line_and_caps_itself_nowhere() {
         assert_eq!(message_preview("fix the bug"), "fix the bug");
         // A leading blank line and indentation must not make it show nothing,
         // and a multi-line message shows as its first line only — a preview is
@@ -4535,24 +4850,55 @@ mod status_line_tests {
             "fn main() {",
             "the first non-empty line, with its indentation collapsed away"
         );
-        let cut = message_preview(&"a".repeat(40));
-        assert!(
-            cut.ends_with('\u{2026}'),
-            "a cut preview should be ellipsised: {cut:?}"
+        assert_eq!(
+            message_preview(&"a".repeat(40)),
+            "a".repeat(40),
+            "the whole line comes through; `status_line` is what cuts it"
         );
-        assert!(
-            crate::row_count::display_width_ansi(&cut) <= 25,
-            "the preview should fit 25 columns: {cut:?}"
+    }
+
+    /// …and the bar does cut it, at whatever width is left, ellipsised and never
+    /// mid-glyph.
+    #[test]
+    fn a_long_message_is_cut_to_the_bar_with_an_ellipsis() {
+        // No name and no model group at all: the preview has the whole row, so
+        // the cut is the bar's doing and nothing else.
+        let s = status_line(
+            None,
+            Some(&"a".repeat(80)),
+            model("", "", None, 0),
+            20,
+            true,
         );
+        let visible = crate::output::strip_ansi(&s);
+        let text = visible.trim().strip_prefix('\u{25cf}').unwrap().trim_end();
+        assert_eq!(display(&s), 20, "{visible:?}");
+        assert!(
+            text.ends_with('…'),
+            "a cut preview should be ellipsised: {text:?}"
+        );
+        // 20 columns less the dot cell: with no model group there is no separator
+        // to pay for, so the name gets the whole remainder.
+        assert_eq!(display(text), 18, "{visible:?}");
         // A wide glyph is counted as two columns, not cut mid-character.
-        let wide = message_preview(&"\u{4f60}\u{597d}".repeat(20));
-        assert!(
-            crate::row_count::display_width_ansi(&wide) <= 25,
-            "{wide:?}"
+        let wide = status_line(
+            None,
+            Some(&"\u{4f60}\u{597d}".repeat(20)),
+            model("", "", None, 0),
+            20,
+            true,
         );
-        assert!(wide
-            .chars()
-            .all(|c| c == '\u{4f60}' || c == '\u{597d}' || c == '\u{2026}'));
+        let text = crate::output::strip_ansi(&wide);
+        // `trim` first: the dot cell is a space and a glyph, and the space would
+        // otherwise be the first character the assertion looks at.
+        // `trim` again after the strip: the text is right-aligned, so the
+        // padding the dot cell leaves is between the glyph and the name.
+        let text = text.trim().strip_prefix('\u{25cf}').unwrap().trim();
+        assert!(
+            text.chars()
+                .all(|c| matches!(c, '\u{4f60}' | '\u{597d}' | '\u{2026}')),
+            "no half glyphs: {text:?}"
+        );
     }
 
     /// The preview comes out of a session file, so it is untrusted: an escape
@@ -4713,6 +5059,7 @@ impl CodeAgent {
         tool_call_limit: usize,
         provider: String,
         model: String,
+        thinking_level: Option<String>,
         yolo: bool,
         persona_name: Option<String>,
         user_cancel: Arc<AtomicBool>,
@@ -4726,6 +5073,7 @@ impl CodeAgent {
             tool_call_limit,
             provider,
             model,
+            thinking_level,
             yolo,
             persona_name,
             user_cancel,
