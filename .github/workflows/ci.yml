@@ -38,5 +38,9 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
-        run: cargo test --verbose
+        # `--features test-utils` is not optional: `confirm_raw_mode` is gated
+        # behind it, and plain `cargo test` silently skips it — which is how a
+        # missing quick key survived three implementation phases (ui_draw_v2
+        # §9 #9). Keep the two in one step so they cannot drift apart.
+        run: cargo test --verbose --features test-utils
 

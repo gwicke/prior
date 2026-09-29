@@ -88,6 +88,46 @@ mod tests {
         assert_eq!(Marker::CursorActive.as_str(), "* ");
         assert_eq!(Marker::None.as_str(), "  ");
     }
+
+    /// Plan of `rows` data rows, each wrapping to `lines` visual rows.
+    fn wrapped_plan(rows: usize, lines: usize) -> RenderPlan {
+        let row = |i: usize| -> LogicalLine {
+            let mut sub: Vec<String> = Vec::with_capacity(lines);
+            sub.push(format!("r{i}"));
+            for j in 1..lines {
+                sub.push(format!("w{i}-{j}"));
+            }
+            LogicalLine::new(sub.join("\n"))
+        };
+        RenderPlan {
+            table_header: None,
+            detail: vec![],
+            rows: Rc::new((0..rows).map(row).collect()),
+            selected: Some(0),
+            active_rows: vec![],
+        }
+    }
+
+    /// The user-visible form of ui_draw_v2 §9 #7: painted lines must never
+    /// *decrease* as the terminal grows. Budgeting wrapped rows as single
+    /// lines made a bigger terminal show less — 15 painted lines at
+    /// term_h 24 but only 9 at term_h 30, 40 and 80 for this plan.
+    #[test]
+    fn paint_plan_shows_more_as_the_terminal_grows() {
+        let plan = wrapped_plan(9, 3);
+        let mut prev = 0;
+        for term_h in [20usize, 24, 30, 40, 80] {
+            let painted = paint_plan(&plan, 60, term_h).lines().count();
+            assert!(
+                painted >= prev,
+                "term_h {term_h} painted {painted} lines, fewer than the {prev} \
+                 painted at a smaller height (budgets must be visual)"
+            );
+            prev = painted;
+        }
+        // A terminal tall enough for the whole plan shows all of it.
+        assert_eq!(prev, 27, "9 rows x 3 visual lines");
+    }
 }
 
 use crate::table::display_width;
@@ -138,27 +178,48 @@ pub fn render_logical_line(
     parts.join("\n")
 }
 
+/// Visual rows a `LogicalLine` occupies: its `\n`-separated sub-lines
+/// (table wrapping puts them in the line's text). One shared definition —
+/// the budget, the row window and the page scroll all measure rows this
+/// way, so a wrapped row is never counted as one line in one place and
+/// three in another.
+pub fn visual_height(line: &LogicalLine) -> usize {
+    line.0.split('\n').count().max(1)
+}
+
 /// Compute vertical space budgets for detail and data rows within the
-/// overlay. Returns `(detail_budget, rows_budget)` in visual lines.
+/// overlay. Returns `(detail_budget, rows_budget)`, **both in visual
+/// lines** — the unit `paint_plan` then hands to `visual_row_window`.
 ///
 /// When both sections overflow, they split available space 50:50.
 /// If one section fits in its half, the other gets the surplus.
-/// Rows always get at least `min_rows` (capped at `total_rows`).
+/// Rows always get at least `min_row_lines` (capped at their total
+/// visual height).
+///
+/// Everything is measured in visual lines, from the plan: the earlier
+/// form took a *logical* row count and returned it as a *visual* budget,
+/// so every wrapped row was budgeted as one line and the window clipped
+/// plans that the terminal had room for — a bigger terminal could then
+/// show *less* (ui_draw_v2 §9 #7). `min_row_lines` is a visual floor
+/// (3 rows of 3 lines each get 9, not 3), which is the one semantic
+/// change beyond the unit fix.
 pub fn compute_space_budget(
+    plan: &RenderPlan,
     overlay_budget: usize, // total overlay lines (e.g. 2/3 terminal)
-    table_header_lines: usize,
-    total_detail_vis: usize, // visual lines all detail items consume
-    total_rows: usize,
-    min_rows: usize,
+    min_row_lines: usize,
 ) -> (usize, usize) {
+    let table_header_lines = usize::from(plan.table_header.is_some());
+    let total_detail_vis: usize = plan.detail.iter().map(visual_height).sum();
+    let total_rows_vis: usize = plan.rows.iter().map(visual_height).sum();
+
     let available = overlay_budget.saturating_sub(table_header_lines);
     let half = available / 2;
-    let min_rows_guaranteed = min_rows.min(total_rows);
+    let min_rows_guaranteed = min_row_lines.min(total_rows_vis);
 
     // When rows overflow their half, detail is capped at half so rows
     // are not starved.  When rows fit, detail may use up to
-    // `available - min_rows` (the surplus flows from rows' unused half).
-    let detail_limit = if total_rows > half {
+    // `available - min_row_lines` (the surplus flows from rows' unused half).
+    let detail_limit = if total_rows_vis > half {
         // Both overflow (or rows do): detail capped at half.
         half
     } else {
@@ -168,15 +229,15 @@ pub fn compute_space_budget(
     let detail_budget = total_detail_vis.min(detail_limit);
 
     // Rows get the remaining space, at least `min_rows_guaranteed`.
-    // When rows fit in their half, cap at total_rows (the renderer
-    // shows `min(total, budget)` anyway, but a tighter budget is
-    // clearer for callers).
-    let rows_budget = if total_rows > half {
+    // When rows fit in their half, cap at their total visual height (the
+    // renderer shows `min(total, budget)` anyway, but a tighter budget
+    // is clearer for callers).
+    let rows_budget = if total_rows_vis > half {
         available
             .saturating_sub(detail_budget)
             .max(min_rows_guaranteed)
     } else {
-        total_rows
+        total_rows_vis
     };
 
     (detail_budget, rows_budget)
@@ -190,10 +251,7 @@ pub fn visual_row_window(rows: &[LogicalLine], selected: usize, budget: usize) -
     if total == 0 || budget == 0 {
         return (0, 0);
     }
-    let heights: Vec<usize> = rows
-        .iter()
-        .map(|r| r.0.split('\n').count().max(1))
-        .collect();
+    let heights: Vec<usize> = rows.iter().map(visual_height).collect();
     let total_vis: usize = heights.iter().sum();
     if total_vis <= budget {
         return (0, total);
@@ -257,26 +315,15 @@ pub fn paint_plan(plan: &RenderPlan, term_w: usize, term_h: usize) -> String {
     // --- Space allocation ---
     // `term_h` is the full terminal height; 2/3 is the overlay budget.
     let max_pop = ((term_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-    let table_header_lines = if plan.table_header.is_some() { 1 } else { 0 };
     let min_rows = 3usize;
 
-    // Count visual lines each detail item occupies (LogicalLine
-    // may contain embedded \n for wrapped sub-lines).
-    let detail_visual: Vec<usize> = plan
-        .detail
-        .iter()
-        .map(|d| d.0.split('\n').count())
-        .collect();
-    let total_detail_vis: usize = detail_visual.iter().sum();
-    let total_rows = plan.rows.len();
+    // Visual lines each detail item occupies (a `LogicalLine` may contain
+    // embedded \n for wrapped sub-lines).
+    let detail_visual: Vec<usize> = plan.detail.iter().map(visual_height).collect();
 
-    let (detail_budget, data_budget) = compute_space_budget(
-        max_pop,
-        table_header_lines,
-        total_detail_vis,
-        total_rows,
-        min_rows,
-    );
+    // Both budgets come back in visual lines, so `data_budget` is the unit
+    // `visual_row_window` below windows in (ui_draw_v2 §9 #7).
+    let (detail_budget, data_budget) = compute_space_budget(plan, max_pop, min_rows);
 
     // 1. Detail (header() output — no background, stands out).
     let mut detail_vis_used = 0usize;
@@ -354,7 +401,7 @@ pub fn page_delta(rows: &[LogicalLine], selected: usize, budget: usize, directio
         // PageDown: count forward from selected+1
         let mut i = selected + 1;
         while i < total {
-            let h = rows[i].0.lines().count().max(1);
+            let h = visual_height(&rows[i]);
             if visual_used + h > budget && delta > 0 {
                 break;
             }
@@ -366,7 +413,7 @@ pub fn page_delta(rows: &[LogicalLine], selected: usize, budget: usize, directio
         // PageUp: count backward from selected
         let mut i = selected;
         while i > 0 {
-            let h = rows[i - 1].0.lines().count().max(1);
+            let h = visual_height(&rows[i - 1]);
             if visual_used + h > budget && delta < 0 {
                 break;
             }

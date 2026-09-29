@@ -1,6 +1,8 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
-**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅)
+**Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅).
+Post-implementation follow-ups (§9): 5 done, 5 open, 1 accepted limitation —
+audited 2026-09-28, recommended order at the end of §9.
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
 ---
@@ -41,7 +43,7 @@ without an input segment".
 | Caret | Absolute `(row, col)` in the cache (row authoritative, col best-effort); frame-relative `(row_idx, display_col)` inside `Frame`; applied with `CUP` + `CHA` (`\x1b[{col}G`) |
 | Draw state | `DrawCache { caret, screen_bottom, live: Option<LiveFrame> }` in `ConsoleOutput`; all writers maintain it before returning |
 | Screen position | Stored rows are absolute (everything emitted/consumed is); bottom-relative quantities (`delta`, 2/3 budget, clear floor) are computed per apply. No reflow-model invariance is assumed |
-| UI surface | `Output::draw_frame(frame, anchor, policy)` + `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides. Content-out (`display_*`) and UI-out stay separate |
+| UI surface | `Output::draw_frame(frame, anchor, policy, dims)` + `frame_anchor()`; default drops UI drawing; `ConsoleOutput` overrides and applies exactly `dims` (the size the frame was composed for — §9 #3), returning what it applied. Content-out (`display_*`) and UI-out stay separate |
 | DSR | Only via the explicit `cursor_row()` re-anchor primitive (foreign-process / size-change / dialog-entry sites); steady state uses the cache |
 | Dialogs | Same pipeline, no input segment; entry DSR re-anchor, then `frame_anchor()`; `ConfirmSpec.divider` separates mid-turn dialogs from streamed output. Resolve = `Frame::empty()` union-clear; the optional decision line is written at the cleared first row |
 | Commit lines | Clear the region with a Frame apply, then write the line where the caret lands (`emit_commit`, dialog decision line). `Append` stays reserved for §4.5's chunked/fixed-bottom writes |
@@ -274,8 +276,20 @@ step may unify content output under the same pipeline):
 
 ```rust
 /// Draw a composed UI frame with its top row at `anchor` (1-based).
+/// `dims` is the (width, height) the frame was composed for: the apply
+/// uses exactly these, so the frame's bounding box can never disagree
+/// with its content (§9 #3). Returns the dims applied (clamped), for
+/// the caller's repaint bookkeeping.
 /// Default: drop it — non-console outputs carry no interactive UI.
-fn draw_frame(&self, _frame: &Frame, _anchor: usize, _policy: ApplyPolicy) {}
+fn draw_frame(
+    &self,
+    _frame: &Frame,
+    _anchor: usize,
+    _policy: ApplyPolicy,
+    _dims: (usize, usize),
+) -> (usize, usize) {
+    (dims.0.max(1), dims.1.max(1))
+}
 
 /// Where the next frame belongs: the intact frame's top row when there is
 /// one, else the current cursor row. Default: `cursor_row()`.
@@ -409,6 +423,14 @@ emit logic" into a real safety net for P2–P3.
 Recorded while implementing P0–P5. None of these block the shipped pipeline;
 the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 
+**Audit 2026-09-28** (after the editor cleanups, with the v2.5 engine now
+driving every `/` command in the REPL): #1–#3 re-verified done, pins still
+green; #7 and #9 audited and then **fixed** the same day (see below). #4, #5,
+#6 and #10 are still open — each carries a re-check with file/line evidence,
+what a fix involves, and a verdict. #8 stays an accepted limitation, and the
+audit surfaced one adjacent defect as #11 (also open). A recommended order for
+what remains is at the end of the section.
+
 ### Latent issues (both fixed)
 
 1. **The confirm gate is never released.** `ui::confirm` stores `true` into
@@ -457,18 +479,63 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
    header. If the `agent.rs` message wording ever changes, the line silently
    degrades to the full header (correct, just noisy). An explicit subject
    parameter threaded through `Output::confirm` would drop the coupling.
+   **Still open** (audited 2026-09-28). There is exactly *one* production
+   caller — `agent.rs:2075` builds `Confirm tool {NAME} call?` — and
+   `ConsoleOutput::confirm` (`output.rs:2046`) strips the convention back off
+   it. So the coupling is a two-site round trip, not a spread convention.
+   Fix, cheapest first: add
+   `fn confirm_with_subject(&self, message: &str, subject: Option<&str>) -> Confirmation`
+   defaulting to `self.confirm(message)`, override it in `ConsoleOutput` to
+   build the spec with the given subject, and have `agent.rs:2075` pass
+   `Some(&format!("tool {}", Self::NAME.to_uppercase()))`;
+   `confirm_subject` survives as the documented fallback. The thorough form
+   changes `Output::confirm` itself: 4 impls + 1 delegating wrapper + 3 test
+   impls + `src/bin/confirm_probe.rs`, all mechanical.
+   **Verdict: bundle it.** The failure mode is cosmetic (a noisy line, never a
+   wrong decision), so it does not earn a change on its own.
 
 5. **`draw_dialog` sniffs the `> ` marker** to find the overlay's windowing
    focus. Fine for today's specs (no detail line starts with `> `), but a
    spec whose detail ever does would window around the wrong row. Robust
    form: `focus = plan.detail visual height + selected row's height offset`,
    the same arithmetic the REPL's pre-computed `focus` uses.
+   **Still open** (audited 2026-09-28), at `ui.rs:174`. Worth noting the REPL's
+   own arithmetic (`repl.rs:832-837`) is approximate in the same *and worse*
+   ways: it assumes the detail block is exactly one visual row and ignores the
+   table header, so both call sites can window around the wrong row — one by
+   sniffing, one by assuming. Fix: make the painter report the focus instead of
+   having each host re-derive it. Add
+   `pub fn paint_plan_with_focus(plan, term_w, term_h) -> PaintedPlan { text, focus }`
+   to `slashdot_menu::render`, computed *while painting* (ground truth: it
+   survives detail truncation, table headers, multi-line rows and `*` markers),
+   and keep `paint_plan` as a wrapper returning `.text` so the crate's other
+   callers and all its tests are untouched. `ui.rs` and `repl.rs` then both
+   delete their focus math. ~40 lines in the crate, 2 production call sites,
+   plus a test that a truncated-detail plan still focuses the selected row.
+   **Verdict: worth doing** — it removes a sniff *and* a duplicated heuristic,
+   and closes a bug class for a small diff.
 
 6. **`display_text` line counts can drift.** The count comes from
    `wrap(text)` while the bytes include the `⏺ ` prefix and
    `termimad::inline` output — which is the only reason the DoneError path
    re-anchors (DSR) after `display_text`. Accurate accounting would let that
    DSR go.
+   **Still open** (audited 2026-09-28), at `output.rs:1558`
+   (`wrap(text, term_width()).len() + …`) with the compensating DSR at
+   `repl.rs:770` (`V25Frame::DoneError` → `display_text` → `cursor_row()`) —
+   so the claim above still holds exactly. Three drift sources, not one: the
+   2-column `⏺ ` prefix is never counted; `wrap` counts *chars*, while the
+   terminal wraps on *display columns* (CJK/emoji undercount); and
+   `termimad::inline` rewrites the text (markers out, styling in) before it
+   reaches the terminal. Fix: measure what was written — render the message
+   into a local `String` first (`⏺ ` + `termimad::inline(text)`), derive the
+   row count from *that* buffer with the display-width helper already in the
+   tree (`strip_ansi` + `display_width`, as `display_plain` uses) at
+   `term_width() - 2`, then write it. Deletes the DSR. Pin with a
+   width-boundary case (a message of exactly `term_width - 2` columns must
+   count 1 row) and a wide-char case.
+   **Verdict: worth doing** — small, local, and it removes a DSR round trip
+   from a real (if rare) path.
 
 ### Known limitations
 
@@ -481,18 +548,91 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
    painted lines = **15 at term_h 24, but 9 at term_h 40 and 80** — a bigger
    terminal shows *less*. The fit branch should return the rows' visual
    height sum. Single-line rows (the normal menu case) are unaffected.
+   **Fixed** (2026-09-28). `compute_space_budget` now takes the `RenderPlan`
+   and measures the rows' *visual* height throughout, so the budget it returns
+   is in the unit `visual_row_window` consumes:
+   `compute_space_budget(plan, overlay_budget, min_row_lines)`. The fit branch
+   returns the rows' visual height sum, the overflow branch compares and
+   budgets in visual lines, and `min_rows` became `min_row_lines` — a *visual*
+   floor, the one semantic change beyond the unit fix (single-line plans, the
+   normal case, are unaffected). Both call sites were updated, which also
+   deleted the hand-rolled duplicate of the same five numbers in the
+   page-scroll path (`repl.rs`), and a shared `visual_height(line)` now defines
+   row height for the budget, the row window and the page scroll alike (they
+   had three slightly different copies, one of them using `lines()` where the
+   others used `split('\n')`). Pinned by `budget_wrapped_rows_are_measured_visually`
+   and, at the painter level, `paint_plan_shows_more_as_the_terminal_grows` —
+   painted lines must never *decrease* as the terminal grows (this plan: 12 at
+   `term_h` 20, 15 at 24, 18 at 30, 27 at 40 and 80; before the fix, 9 at 30+).
+   The 7 pre-existing budget tests are single-line plans and pass unchanged,
+   which is the point of having kept them. One duplicate was removed in the
+   rewrite: `budget_min_rows_enforced_even_when_detail_wants_more` had the same
+   arguments *and* the same expectations as `budget_detail_overflows_rows_dont`
+   (only the comments differed); its intent is folded into that test.
 
 8. **Tiny terminals lose the pop-up, not the input.** Allocation serves
    floors in element order (input → divider → overlay), so on a ~2-row
    terminal the menu gets zero rows while the input keeps its row. Intended
    (budget ≥ 1, input floor first); just worth knowing when testing in tiny
-   windows.
+   windows. Re-checked 2026-09-28: still the designed behavior, still the
+   right trade. **No action** — recorded so a future reader doesn't mistake it
+   for a bug when testing in a 2-row window.
+
+### Added by the audit
+
+9. **The feature-gated suite is still not in CI** (promoted from the process
+   take-aways below, audited 2026-09-28). `.github/workflows/ci.yml` ran
+   `cargo test --verbose` only, so `tests/confirm_raw_mode.rs` (8 tests,
+   including the `confirm_releases_reader_gate_on_resolve` pin for latent issue
+   #1) never ran on a push or PR.
+   **Fixed** (2026-09-28): the test step is now
+   `cargo test --verbose --features test-utils`. The feature is empty — it only
+   carries the `[[bin]]`/`[[test]]` `required-features` — so it gates nothing
+   else, and keeping both halves in one step is what stops them drifting apart
+   again.
+
+10. **Streaming still doesn't track rows** (promoted from the process
+    take-aways below; the prerequisite §4.5 needs). `stream_text` /
+    `stream_thinking` hand completed blocks to `Renderer::feed` and never call
+    `note_lines`, so `DrawCache::caret` drifts for the whole turn and the
+    entry DSRs in `read_input` / `ui::confirm` are the price. Fix sketch: count
+    at the write boundary rather than asking the upstream renderer — wrap the
+    writer in a thin counter that splits on `\n`, strips ANSI, and adds
+    `1 + (display_width - 1) / term_w` per segment, then `note_lines(count)`
+    once per `feed`. No dependency change: the count comes from the bytes, and
+    it is per *block*, not per delta, so the hot path barely notices (hoist the
+    width read into the already-available `current_term_width()` if the
+    `terminal::size()` inside `note_lines` shows up in a profile). Payoff: the
+    two entry DSRs become removable, and a mid-turn `frame_anchor()` unlocks
+    §4.5's fixed-bottom composition and a live status line.
+    **Verdict: only when a feature needs it** — nothing user-visible depends
+    on it today, so it should not preempt #5/#6.
+
+11. **The painter does not wrap detail / table-header lines** (found while
+    fixing #7 — same crate, same accounting). `render_logical_line` pads to
+    `term_w` but never wraps, so a header longer than the terminal width is
+    emitted as one over-long line that the *terminal* wraps — while
+    `paint_plan` counts it once. Probe: a 100-column detail line at `term_w` 60
+    paints as 1 line of 102 columns. Consequence: the frame's row accounting
+    (and the REPL's focus math) understate the overlay by a row, so a stale
+    wrap remainder can survive a partial apply. Data rows are unaffected — the
+    engine pre-wraps them into embedded `\n`, which is what #7 was about.
+    Fix: wrap (or truncate) detail and table-header lines in the painter with
+    the same `crate::wrap` the engine uses for rows, and count the result with
+    `visual_height` — the accounting then matches what the terminal shows.
+    **Verdict: fix together with #5**, since both say the same thing: the
+    painter should report the geometry it produced. `paint_plan_with_focus` is
+    the natural place to also return the painted height.
 
 ### Deferred design pieces (allowed for in code)
 
+All four re-checked 2026-09-28: still deferred, still test-only users, allows
+still targeted (no blanket `allow(dead_code)` came back).
+
 - **`Element::Lines`** — §3.2's fixed-row element carries a targeted
-  `#[allow(dead_code)]`: commit lines go through `display_plain` today; the
-  §4.5 fixed-bottom/status-line composition is its first production user.
+  `#[allow(dead_code)]`: commit lines go through `display_plain` today (both
+  `emit_commit` and the new `batch_commit`); the §4.5 fixed-bottom/status-line
+  composition is its first production user. Blocked on #10.
 - **`Frame::spans`** — §4.4's dirty-span refinement; the row diff is
   deliberately the sole reader until profiling asks for more.
 - **`ApplyPolicy::Append`** — built and vt100-tested in P2, no production
@@ -507,7 +647,8 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
   `--features test-utils`, so plain `cargo test` skipped it through P0–P3 —
   which is how the missing `('n', 1)` quick key survived until P4's gate run
   (it failed at baseline too). Run `cargo test --features test-utils` in CI,
-  or drop the gate.
+  or drop the gate. *(Now #9, and done: the CI test step carries
+  `--features test-utils`.)*
 - **The P0 bet paid off.** Keeping the vt100 suite on production bytes meant
   the P3 pipeline swap was validated by the same carefully-tuned assertions.
   Exactly one intentional behavior change needed a re-pin — the frame-wide
@@ -518,3 +659,20 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
   dialogs and `read_input` keep an entry DSR. Anything that wants a
   mid-turn `frame_anchor()` with no DSR (e.g. a live status line drawn
   while streaming) needs row accounting in the streaming writers first.
+  *(Now tracked as #10, with a fix sketch.)*
+
+### Recommended order (audit 2026-09-28)
+
+#9 and #7 are done. What remains, in order:
+
+1. **#5 + #11 — make the painter report its geometry.** `paint_plan` grows a
+   `with_focus` variant returning the focus row *and* the painted height:
+   deletes the `> ` sniff in `ui.rs`, the duplicated (and more wrong) focus
+   heuristic in `repl.rs`, and — with detail/table-header wrapping — the
+   row-accounting gap in #11. One change, three closed items; the tests in
+   `repl.rs`/`settings.rs` that call `paint_plan` stay on the wrapper.
+2. **#6 — `display_text` row accounting.** Small and local; removes a DSR.
+3. **#10 — streaming row accounting.** Only when a feature needs it; it is
+   the gate on §4.5 and on a live status line.
+4. **#4 — explicit confirm subject.** Bundle with any of the above; on its
+   own it only buys a quieter line.

@@ -985,22 +985,18 @@ impl Repl {
                                         continue; // V25 overlay without its handle
                                     }
                                     let cur_sel = plan.selected.unwrap_or(0);
-                                    // Compute page budget (same formula as overlay rendering).
+                                    // Page budget in *visual* rows — the very
+                                    // budget `paint_plan` windows the overlay
+                                    // with, so a PageDown moves by the rows
+                                    // actually on screen (ui_draw_v2 §9 #7).
                                     let (cur_h, _) =
                                         crossterm::terminal::size().unwrap_or((80, 24));
-                                    let cur_h = cur_h.max(1) as usize;
-                                    let max_pop =
-                                        ((cur_h as f64 * 2.0 / 3.0).ceil() as usize).max(1);
-                                    let dv: usize =
-                                        plan.detail.iter().map(|d| d.0.split('\n').count()).sum();
-                                    let th_lines = if plan.table_header.is_some() { 1 } else { 0 };
+                                    let max_pop = ((f64::from(cur_h.max(1)) * 2.0 / 3.0).ceil()
+                                        as usize)
+                                        .max(1);
                                     let (_, data_budget) =
                                         crate::slashdot_menu::render::compute_space_budget(
-                                            max_pop,
-                                            th_lines,
-                                            dv,
-                                            plan.rows.len(),
-                                            3,
+                                            plan, max_pop, 3,
                                         );
                                     let direction = if matches!(key.code, KeyCode::PageDown) {
                                         1
@@ -3507,12 +3503,59 @@ mod tests {
     }
 
     // --- compute_space_budget tests ---
+    //
+    // The budget is derived from a `RenderPlan` and counts *visual* rows
+    // throughout (ui_draw_v2 §9 #7), so these build plans. Every line below
+    // is a single visual row, so the expected numbers are the pre-visual
+    // ones unchanged — the wrapped cases are the new pins.
+
+    use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
+    use std::rc::Rc;
+
+    /// `detail` single-line header rows, `rows` single-line data rows, and a
+    /// table-header line when `header` is set.
+    fn budget_plan(detail: usize, rows: usize, header: bool) -> RenderPlan {
+        RenderPlan {
+            table_header: header.then(|| LogicalLine::new("cols")),
+            detail: (0..detail)
+                .map(|i| LogicalLine::new(format!("d{i}")))
+                .collect(),
+            rows: Rc::new(
+                (0..rows)
+                    .map(|i| LogicalLine::new(format!("r{i}")))
+                    .collect(),
+            ),
+            selected: None,
+            active_rows: vec![],
+        }
+    }
+
+    /// `rows` data rows, each wrapping to `lines` visual rows (the shape
+    /// table wrapping produces).
+    fn wrapped_plan(rows: usize, lines: usize) -> RenderPlan {
+        let row = |i: usize| -> LogicalLine {
+            let mut sub: Vec<String> = Vec::with_capacity(lines);
+            sub.push(format!("r{i}"));
+            for j in 1..lines {
+                sub.push(format!("w{i}-{j}"));
+            }
+            LogicalLine::new(sub.join("\n"))
+        };
+        RenderPlan {
+            table_header: None,
+            detail: vec![],
+            rows: Rc::new((0..rows).map(row).collect()),
+            selected: None,
+            active_rows: vec![],
+        }
+    }
 
     #[test]
     fn budget_both_fit() {
         // Both detail (5 vis lines) and rows (3) fit in overlay.
         // overlay_budget=20, table_header=1, available=19, half=9.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 5, 3, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(5, 3, true), 20, 3);
         assert_eq!(d, 5, "detail gets what it needs");
         assert_eq!(r, 3, "rows get what they need");
     }
@@ -3521,45 +3564,40 @@ mod tests {
     fn budget_both_overflow_50_50() {
         // Detail has 30 vis lines, rows has 30. available=39, half=19.
         // Both overflow: detail capped at 19, rows get 20.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(40, 1, 30, 30, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(30, 30, true), 40, 3);
         assert_eq!(d, 19);
         assert_eq!(r, 20);
     }
 
     #[test]
     fn budget_detail_overflows_rows_dont() {
-        // Detail has 20 vis lines, rows has 2. available=19, half=9.
-        // Rows fit (2 < 9), min_rows_guaranteed=min(3,2)=2.
-        // detail gets available - 2 = 17.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 20, 2, 3);
+        // Detail has 20 vis lines, rows have 2. available=19, half=9.
+        // Rows fit (2 < 9), and their floor is min(3, 2) = 2.
+        // detail gets available - 2 = 17; rows capped at their total.
+        // (This also pins the min-rows floor: detail wanting all 20 lines
+        // still cannot squeeze rows below what they actually need.)
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(20, 2, true), 20, 3);
         assert_eq!(d, 17, "detail uses rows' surplus");
-        assert_eq!(r, 2, "rows capped at total_rows");
+        assert_eq!(r, 2, "rows capped at their total visual height");
     }
 
     #[test]
     fn budget_rows_overflow_detail_doesnt() {
         // Detail has 3 vis lines, rows has 30. available=19, half=9.
         // Detail fits (3 < 9): detail gets 3, rows get 16.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 3, 30, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(3, 30, true), 20, 3);
         assert_eq!(d, 3, "detail gets what it needs");
         assert_eq!(r, 16, "rows get the rest");
     }
 
     #[test]
-    fn budget_min_rows_enforced_even_when_detail_wants_more() {
-        // Detail wants all 20 lines, rows have 2 (less than min_rows=3).
-        // min_rows_guaranteed = min(3, 2) = 2.
-        // available = 19. detail_limit = 19 - 2 = 17. detail = min(20, 17) = 17.
-        // rows = max(19 - 17, 2) = 2.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 20, 2, 3);
-        assert_eq!(d, 17);
-        assert_eq!(r, 2, "rows capped at total_rows");
-    }
-
-    #[test]
     fn budget_no_rows() {
         // No rows: all space goes to detail.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(20, 1, 15, 0, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(15, 0, true), 20, 3);
         assert_eq!(d, 15);
         assert_eq!(r, 0, "no rows to allocate");
     }
@@ -3567,7 +3605,8 @@ mod tests {
     #[test]
     fn budget_no_table_header() {
         // No table header: available = overlay_budget.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(18, 0, 5, 5, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(5, 5, false), 18, 3);
         assert_eq!(d, 5);
         assert_eq!(r, 5);
     }
@@ -3576,9 +3615,26 @@ mod tests {
     fn budget_small_terminal() {
         // Tiny terminal: overlay_budget=6, table_header=1, available=5.
         // Both overflow: half=2, detail=2, rows=3.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(6, 1, 10, 10, 3);
+        let (d, r) =
+            crate::slashdot_menu::render::compute_space_budget(&budget_plan(10, 10, true), 6, 3);
         assert_eq!(d, 2);
-        assert_eq!(r, 3, "min_rows enforced");
+        assert_eq!(r, 3, "min rows enforced");
+    }
+
+    /// §9 #7: the rows budget is the rows' *visual* height, not their count.
+    /// 9 rows of 3 lines each are 27 lines — budgeting them as 9 was the
+    /// bug (a bigger terminal then showed *less*).
+    #[test]
+    fn budget_wrapped_rows_are_measured_visually() {
+        let plan = wrapped_plan(9, 3);
+        // Room for the whole plan: rows get all 27 visual lines.
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(&plan, 27, 3);
+        assert_eq!(d, 0);
+        assert_eq!(r, 27, "wrapped rows are not budgeted as 9 single lines");
+        // Tight: the budget is whatever space is left, still visual.
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(&plan, 16, 3);
+        assert_eq!(d, 0);
+        assert_eq!(r, 16);
     }
 
     // --- visual_row_window tests ---
