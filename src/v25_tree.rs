@@ -336,6 +336,71 @@ fn visible_terminals(
     terminals
 }
 
+/// Columns added when a node hangs off the main line instead of continuing
+/// it. Same scale as the pre-refinement fork step, so a one-level spur
+/// looks exactly like a fork did.
+const SPUR_STEP: usize = 4;
+
+/// Entry IDs that continue their parent's main line: for every node, the
+/// child with the deepest visible path downward, ties going to the newest
+/// branch — the same policy applied recursively at every level, so the
+/// leftmost branch at each fork is the longest one and spurs shorten the
+/// further right you go. One ID per forking node; empty for a purely
+/// linear tree.
+///
+/// Height is the number of visible rows on the longest downward path,
+/// measured over the *visible* projection: invisible entries (tool
+/// results, tool-call-only assistant segments) must not make a spur look
+/// deep. Ties are broken by slice position, which IS recency — siblings
+/// are stored in write order (`SessionIndex::children`), so a later child
+/// is the newer branch. Heights and slice positions are both distinct
+/// per sibling, so the key is a total order and the layout is a pure
+/// function of the tree.
+///
+/// Iterative post-order — a 1000-entry linear session overflows recursion
+/// (same constraint as `visible_terminals`).
+fn spine_children<'a>(
+    nodes: &'a [SessionTreeNode],
+    labels: &HashMap<String, String>,
+) -> HashSet<&'a str> {
+    let visible = |n: &SessionTreeNode| -> bool {
+        !entry_display_label_ext(&n.entry, n.label.as_deref(), labels).is_empty()
+    };
+    let mut height: HashMap<&'a str, usize> = HashMap::new();
+    let mut spine: HashSet<&'a str> = HashSet::new();
+
+    let mut stack: Vec<(&'a SessionTreeNode, bool)> = Vec::new();
+    for n in nodes.iter().rev() {
+        stack.push((n, false));
+    }
+    while let Some((node, expanded)) = stack.pop() {
+        if !expanded {
+            stack.push((node, true));
+            for child in node.children.iter().rev() {
+                stack.push((child, false));
+            }
+            continue;
+        }
+        let vis = usize::from(visible(node));
+        let mut h = vis;
+        let mut best: Option<(usize, usize, &'a str)> = None;
+        for (i, child) in node.children.iter().enumerate() {
+            let id = child.entry.id.as_str();
+            let ch = height.get(id).copied().unwrap_or(0);
+            h = h.max(vis + ch);
+            let key = (ch, i);
+            if best.is_none_or(|(bh, bi, _)| key > (bh, bi)) {
+                best = Some((ch, i, id));
+            }
+        }
+        height.insert(node.entry.id.as_str(), h);
+        if let Some((_, _, id)) = best {
+            spine.insert(id);
+        }
+    }
+    spine
+}
+
 /// Recursively flatten the tree into rows.
 fn flatten_turns(
     nodes: &[SessionTreeNode],
@@ -346,6 +411,18 @@ fn flatten_turns(
     terminals: &HashSet<String>,
     out: &mut Vec<FlatRow>,
 ) {
+    let spine = spine_children(nodes, labels);
+    // The spine child continues the parent's line; every other child is a
+    // spur and steps right. Single-child nodes are always the spine, so a
+    // linear chain stays at column 0 regardless of length.
+    let child_indent = |child: &SessionTreeNode, cur: usize| {
+        if spine.contains(child.entry.id.as_str()) {
+            cur
+        } else {
+            cur + SPUR_STEP
+        }
+    };
+
     // Iterative DFS to avoid stack overflow on deep linear sessions.
     // Push root nodes in reverse so the first sibling is processed first.
     let mut stack: Vec<(&SessionTreeNode, usize)> = Vec::new();
@@ -356,19 +433,12 @@ fn flatten_turns(
     while let Some((node, cur_indent)) = stack.pop() {
         let label = entry_display_label_ext(&node.entry, node.label.as_deref(), labels);
 
-        // Children indent: visible multi-child nodes get +4 indent;
-        // everything else keeps current level.
-        let is_branch = node.children.len() > 1;
-        let child_indent = if is_branch {
-            cur_indent + 4
-        } else {
-            cur_indent
-        };
-
         if label.is_empty() {
-            // Meta entry: skip visual row but descend into children.
+            // Meta entry: skip visual row but descend into children. The
+            // spine rule applies here too — a meta entry can be a fork
+            // point even though it has no row of its own.
             for child in node.children.iter().rev() {
-                stack.push((child, cur_indent));
+                stack.push((child, child_indent(child, cur_indent)));
             }
             continue;
         }
@@ -400,7 +470,7 @@ fn flatten_turns(
 
         // Push children in reverse so first child is processed first.
         for child in node.children.iter().rev() {
-            stack.push((child, child_indent));
+            stack.push((child, child_indent(child, cur_indent)));
         }
     }
 }
@@ -2511,15 +2581,20 @@ mod tests {
                     eprintln!("  row {}: indent={} {:?}", i, indent, row.0);
                 }
                 assert_eq!(plan.rows.len(), 8);
+                // Spine rule (doc/tree_indent_refinement.md): one child of a
+                // fork continues the parent's line at the same column, the
+                // rest are spurs (+SPUR_STEP). mc1's three children are all
+                // leaves, so heights tie and the recency tie-break picks the
+                // newest one (mc4) for the margin; mc2/mc3 step right.
                 let expected = vec![
                     ("u1", 0),
                     ("a1", 2),
                     ("u2", 0),
                     ("a2", 2),
-                    ("mc1", 0), // model change: Boundary at base
-                    ("mc2", 4), // branch: mc1 has 3 children → indent+4
-                    ("mc3", 4),
-                    ("mc4", 4),
+                    ("mc1", 0), // fork point: own column, not a boundary reset
+                    ("mc2", 4), // spur
+                    ("mc3", 4), // spur
+                    ("mc4", 0), // spine: newest of three equal-height children
                 ];
                 for (i, (exp_id, exp_indent)) in expected.iter().enumerate() {
                     let text = &plan.rows[i].0;
@@ -2718,6 +2793,357 @@ mod tests {
             "assistant should have indent 2 after tool chain: {:?}",
             a_desc
         );
+    }
+
+    // --- Spine indentation (doc/tree_indent_refinement.md) ---
+
+    /// (entry id, indent) for every row, in listing order.
+    fn row_indents(resp: &DataResponse) -> Vec<(String, usize)> {
+        resp.rows
+            .iter()
+            .map(|r| {
+                let desc = r.description.clone().unwrap_or_default();
+                (r.id.clone(), desc.len() - desc.trim_start().len())
+            })
+            .collect()
+    }
+
+    fn indent_of(rows: &[(String, usize)], id: &str) -> usize {
+        rows.iter()
+            .find(|(rid, _)| rid == id)
+            .map(|(_, i)| *i)
+            .unwrap_or_else(|| panic!("no row for {id}"))
+    }
+
+    /// Rows + indents for a tree with the given leaf.
+    fn indents_for(tree: Vec<SessionTreeNode>, leaf: Option<&str>) -> Vec<(String, usize)> {
+        let app_state = app_state_with_tree(tree);
+        app_state.set_leaf_id(leaf.map(|s| s.to_string()));
+        let mut node = TreeListNode::new(app_state);
+        let resp = futures::executor::block_on(node.data(0, &tree_path(&["tree"]))).expect("data");
+        row_indents(&resp)
+    }
+
+    /// The §1 session: a 6-row main flow, an experiment spur off `a1` and a
+    /// 2-row side quest off `u2`. `spur_turns` grows the experiment spur so
+    /// a test can check that the main flow does not move when it does.
+    fn main_flow_with_spur(spur_turns: usize) -> Vec<SessionTreeNode> {
+        // x1 → x2a → x2 → x3a → … one user/assistant pair per turn, built
+        // back to front.
+        let mut spur = node(
+            make_entry("x1", Some("a1"), "user", "experiment prompt"),
+            vec![node(
+                make_entry("x2a", Some("x1"), "assistant", "experiment reply 1"),
+                vec![],
+            )],
+        );
+        for turn in 2..=spur_turns {
+            let prev = spur.entry.id.clone();
+            let cur = format!("x{turn}");
+            spur = node(
+                make_entry(&cur, Some(&prev), "user", &format!("experiment {turn}")),
+                vec![node(
+                    make_entry(
+                        &format!("x{}a", turn),
+                        Some(&cur),
+                        "assistant",
+                        &format!("experiment reply {turn}"),
+                    ),
+                    vec![],
+                )],
+            );
+        }
+        vec![node(
+            make_entry("u1", None, "user", "kick off"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply 1"),
+                vec![
+                    spur,
+                    node(
+                        make_entry("u2", Some("a1"), "user", "second message"),
+                        vec![
+                            node(
+                                make_entry("y1", Some("u2"), "user", "side quest"),
+                                vec![node(
+                                    make_entry("y2", Some("y1"), "assistant", "side reply"),
+                                    vec![],
+                                )],
+                            ),
+                            node(
+                                make_entry("a2", Some("u2"), "assistant", "reply 2"),
+                                vec![node(
+                                    make_entry("u3", Some("a2"), "user", "third message"),
+                                    vec![node(
+                                        make_entry("a3", Some("u3"), "assistant", "reply 3"),
+                                        vec![],
+                                    )],
+                                )],
+                            ),
+                        ],
+                    ),
+                ],
+            )],
+        )]
+    }
+
+    /// A tool-call-only assistant segment: an entry with no displayable text.
+    fn tool_call_entry(id: &str, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(|s| s.into()),
+            timestamp: "2025-01-01T00:00:00.000Z".into(),
+            content: SessionEntryContent::Message {
+                message: serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "name": "bash", "input": {}}]
+                }),
+            },
+        }
+    }
+
+    /// A long fork-free chain — the pre-refinement rule and the spine rule
+    /// agree on it, and building it exercises the iterative traversals.
+    fn linear_chain(n: usize) -> Vec<SessionTreeNode> {
+        let mut acc = node(make_entry("e0", None, "user", "last"), vec![]);
+        for i in 1..n {
+            let id = format!("e{i}");
+            acc = node(
+                make_entry(&id, None, "user", &format!("msg {i}")),
+                vec![acc],
+            );
+        }
+        vec![acc]
+    }
+
+    #[test]
+    fn linear_session_indent_unchanged() {
+        // No forks ⇒ every node is its parent's spine ⇒ column 0 forever,
+        // at any length. 1000 entries also covers the stack-safety
+        // constraint on the post-order pass.
+        let rows = indents_for(linear_chain(1000), Some("e0"));
+        assert_eq!(rows.len(), 1000);
+        assert!(
+            rows.iter().all(|(_, indent)| *indent == 0),
+            "a fork-free chain must stay at column 0"
+        );
+    }
+
+    #[test]
+    fn longest_branch_stays_at_left_margin() {
+        // The main flow owns the left margin; both spurs step right.
+        let rows = indents_for(main_flow_with_spur(1), Some("a3"));
+        assert_eq!(rows.len(), 10);
+        for (id, indent) in [
+            ("u1", 0),
+            ("a1", 2), // assistant turn cue, on the margin
+            ("u2", 0),
+            ("a2", 2),
+            ("u3", 0),
+            ("a3", 2),
+            ("x1", 4),  // experiment spur
+            ("x2a", 6), // …its assistant reply
+            ("y1", 4),  // side-quest spur
+            ("y2", 6),
+        ] {
+            assert_eq!(indent_of(&rows, id), indent, "indent of {id}");
+        }
+    }
+
+    #[test]
+    fn short_spur_does_not_outrank_long_flow() {
+        // Growing a spur must not move the main flow — the spur is still
+        // the shorter path, however many turns it gains.
+        let flow = ["u1", "a1", "u2", "a2", "u3", "a3"];
+        let short = indents_for(main_flow_with_spur(1), Some("a3"));
+        for turns in 2..6 {
+            let longer = indents_for(main_flow_with_spur(turns), Some("a3"));
+            for id in flow {
+                assert_eq!(
+                    indent_of(&longer, id),
+                    indent_of(&short, id),
+                    "main-flow row {id} moved when the spur grew to {turns} turns"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invisible_children_do_not_fork() {
+        // The parent has two children but only one is visible: the
+        // pre-spine rule counted `children.len() > 1` and indented by 4.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "first"),
+            vec![node(
+                tool_call_entry("tc1", Some("u1")),
+                vec![node(
+                    make_entry("u2", Some("tc1"), "user", "second"),
+                    vec![],
+                )],
+            )],
+        )];
+        let rows = indents_for(tree, Some("u2"));
+        assert_eq!(
+            indent_of(&rows, "u2"),
+            0,
+            "an invisible sibling is not a fork: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn spine_prefers_newest_on_height_tie() {
+        // u2→a2 (older, 2 rows deep) vs v1 with two children (newer, also
+        // 2 deep, 3 rows). Heights tie, so recency decides: the newer
+        // branch holds the margin even though the older one is narrower.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "kick off"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply 1"),
+                vec![
+                    node(
+                        make_entry("u2", Some("a1"), "user", "older branch"),
+                        vec![node(
+                            make_entry("a2", Some("u2"), "assistant", "older reply"),
+                            vec![],
+                        )],
+                    ),
+                    node(
+                        make_entry("v1", Some("a1"), "user", "newer branch"),
+                        vec![
+                            node(make_entry("w1", Some("v1"), "user", "first try"), vec![]),
+                            node(make_entry("x1", Some("v1"), "user", "second try"), vec![]),
+                        ],
+                    ),
+                ],
+            )],
+        )];
+        let rows = indents_for(tree, Some("v1"));
+        assert_eq!(indent_of(&rows, "v1"), 0, "newest tie-winner at margin");
+        assert_eq!(indent_of(&rows, "w1"), 4, "its spur steps right");
+        assert_eq!(indent_of(&rows, "x1"), 0, "its own spine stays on the line");
+        assert_eq!(
+            indent_of(&rows, "u2"),
+            4,
+            "older equal-depth branch is a spur"
+        );
+        assert_eq!(indent_of(&rows, "a2"), 6, "spur keeps the assistant cue");
+    }
+
+    #[test]
+    fn layout_survives_navigation() {
+        // The spine key does not read the leaf, so moving the leaf (a
+        // `/tree <id> switch`) must not re-lay-out the listing.
+        let with_leaf = indents_for(main_flow_with_spur(1), Some("a3"));
+        let in_spur = indents_for(main_flow_with_spur(1), Some("x2a"));
+        let at_root = indents_for(main_flow_with_spur(1), None);
+        assert_eq!(with_leaf, in_spur, "navigation into a spur moved columns");
+        assert_eq!(with_leaf, at_root, "no-leaf layout differs");
+    }
+
+    #[test]
+    fn chain_beats_bush_recursively() {
+        // §4.3: a 5-row chain vs a 7-row bush forking off the same parent.
+        // The chain is deeper, so it holds the margin and no row to its
+        // right is deeper than the row beside it.
+        let tree = vec![node(
+            make_entry("u1", None, "user", "kick off"),
+            vec![node(
+                make_entry("a1", Some("u1"), "assistant", "reply 1"),
+                vec![
+                    node(
+                        make_entry("u2", Some("a1"), "user", "main 1"),
+                        vec![node(
+                            make_entry("a2", Some("u2"), "assistant", "main reply 1"),
+                            vec![node(
+                                make_entry("u3", Some("a2"), "user", "main 2"),
+                                vec![node(
+                                    make_entry("a3", Some("u3"), "assistant", "main reply 2"),
+                                    vec![node(
+                                        make_entry("u4", Some("a3"), "user", "main 3"),
+                                        vec![],
+                                    )],
+                                )],
+                            )],
+                        )],
+                    ),
+                    node(
+                        make_entry("v1", Some("a1"), "user", "explore"),
+                        vec![
+                            node(
+                                make_entry("b1", Some("v1"), "user", "try 1"),
+                                vec![node(
+                                    make_entry("b2", Some("b1"), "assistant", "tried 1"),
+                                    vec![],
+                                )],
+                            ),
+                            node(
+                                make_entry("c1", Some("v1"), "user", "try 2"),
+                                vec![node(
+                                    make_entry("c2", Some("c1"), "assistant", "tried 2"),
+                                    vec![],
+                                )],
+                            ),
+                            node(
+                                make_entry("d1", Some("v1"), "user", "try 3"),
+                                vec![node(
+                                    make_entry("d2", Some("d1"), "assistant", "tried 3"),
+                                    vec![],
+                                )],
+                            ),
+                        ],
+                    ),
+                ],
+            )],
+        )];
+        let rows = indents_for(tree, Some("u4"));
+        // The chain holds the margin.
+        for (id, indent) in [("u2", 0), ("a2", 2), ("u3", 0), ("a3", 2), ("u4", 0)] {
+            assert_eq!(indent_of(&rows, id), indent, "chain row {id}");
+        }
+        // The bush is a spur: it steps right at its root and never comes
+        // back left (its own spine, `d1`, inherits the spur's column).
+        assert_eq!(indent_of(&rows, "v1"), 4, "bush steps right");
+        assert!(
+            rows.iter()
+                .filter(|(id, _)| ["b1", "b2", "c1", "c2", "d1", "d2"].contains(&id.as_str()))
+                .all(|(_, indent)| *indent >= 4),
+            "no bush row returns left of the spur column: {rows:?}"
+        );
+        // …and the chain is the deeper branch, which is why it won the
+        // margin: its last row is at 0 while the bush only reaches column 4.
+        assert_eq!(indent_of(&rows, "u4"), 0);
+        assert!(rows
+            .iter()
+            .all(|(_, indent)| *indent == 0 || *indent == 2 || *indent >= 4));
+    }
+
+    #[test]
+    fn layout_is_deterministic() {
+        // Same tree ⇒ same layout, from a cold cache each time.
+        let a = indents_for(main_flow_with_spur(1), Some("a3"));
+        let b = indents_for(main_flow_with_spur(1), Some("a3"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn spine_indent_survives_render_plan() {
+        // The data rows carry the indent; this checks it still reaches the
+        // terminal through the table (the generic leading-space case is
+        // covered by `indent_survives_table_render` — this is the spine
+        // shape, where the margin and the spur columns coexist).
+        let app_state = app_state_with_tree(main_flow_with_spur(1));
+        let mut menu = build_tree_menu(&app_state);
+        let mut handle = menu.get_handle();
+        let (plan, _) = expect_continue(futures::executor::block_on(handle.eval_prompt(
+            "tree ",
+            HostKey::None,
+            72,
+        )));
+        let indents: Vec<usize> = plan
+            .rows
+            .iter()
+            .map(|r| r.0.len() - r.0.trim_start().len())
+            .collect();
+        assert_eq!(indents, vec![0, 2, 4, 6, 0, 4, 6, 2, 0, 2], "{plan:?}");
     }
 
     // --- drill_rewrite tests ---

@@ -129,23 +129,49 @@ the listing to terminal nodes with no filter code at all.
 
 ## Indentation
 
-The indent rule in `flatten_turns` is:
+Indentation measures **distance from the main line**, not distance from
+the root. Every node has a *spine* child that continues its parent's
+column; every other child is a *spur* and steps right by `SPUR_STEP` (4).
+The same rule is applied recursively at every level, so the branch at the
+left margin is the longest one and spurs shorten the further right you go.
+
+The row's own column in `flatten_turns` is:
 
 ```
-assistant  → indent + 2
-all others → indent     (user, compaction, model change, etc.)
+assistant  → level + 2
+all others → level       (user, compaction, model change, etc.)
 ```
 
-Branch forks (nodes with >1 child) add +4 via `child_indent`.
+where `level` is the spur depth carried down the DFS.
 
-**Key design decision:** Invisible entries (tool results, tool-call-only
-assistant segments) do NOT affect turn state. They are skipped without
-modifying any mutable state, so a chain of invisible entries between a
-user message and the visible assistant text does not break the +2 indent.
+**Spine selection** (`spine_children`): for each node, the child with the
+greatest *height* — the number of visible rows on its longest downward path
+— wins, ties going to the newest branch (later position in `children`,
+which is write order). One iterative post-order pass produces the set.
 
-This differs from the original v1 code, which mutated `in_turn` for
-invisible entries (causing the assistant to lose its +2 indent after tool
-chains).
+Consequences worth knowing:
+
+- A fork-free chain is all spine, so it stays at column 0 at any length.
+  Indent is a function of the *forks* on the path, not of turns — the
+  pre-refinement rule (`children.len() > 1 → +4`, applied to both sides
+  of every fork) drifted the main flow right by 4 per fork.
+- Heights are measured over the **visible** projection, so a spur of tool
+  results never out-ranks a real conversation, and a parent with an
+  invisible child and a visible child is no longer treated as a fork by
+  inference.
+- The key never reads the leaf, so navigating (`switch`) does not re-lay-out
+  the listing.
+- Invisible entries (tool results, tool-call-only assistant segments) do NOT
+  affect turn state: they are skipped without modifying any mutable state,
+  so a chain of them between a user message and the visible assistant text
+  does not break the +2 indent. This differs from the original v1 code,
+  which mutated `in_turn` for invisible entries (causing the assistant to
+  lose its +2 indent after tool chains). They are also skipped when
+  descending, but the spine rule still applies to their children.
+
+Rationale, alternatives considered and the measurements behind the choice
+are in `doc/tree_indent_refinement.md`. Markers and box-drawing connectors
+are deferred to a follow-up design.
 
 ---
 
