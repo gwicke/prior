@@ -57,18 +57,16 @@ impl std::fmt::Display for ParseError {
 
 /// Whether a line is exactly one of the three structural markers.
 ///
-/// Each marker must be at the start of a line (no leading whitespace),
-/// and must be followed by nothing (for @@@END at end of text) or a newline.
-/// No trailing characters are accepted.
+/// The line comes from `str::lines`, so any trailing newline — and a CRLF's
+/// `\r` — is already stripped. A marker must therefore be the whole line: no
+/// leading whitespace, no trailing characters.
 fn marker_of(line: &str) -> Option<&'static str> {
-    // @@@OLD and @@@NEW must be exact line with nothing after
     if line == SEARCH_MARKER {
         return Some(SEARCH_MARKER);
     }
     if line == DIVIDER {
         return Some(DIVIDER);
     }
-    // @@@END can be exact line or at end of text (handled by caller)
     if line == REPLACE_MARKER {
         return Some(REPLACE_MARKER);
     }
@@ -213,7 +211,7 @@ pub fn parse_blocks(text: &str) -> Result<ParsedBlocks, ParseError> {
                 }
                 // Any other delimiter (@@@OLD or @@@NEW) is invalid in NEW section
                 return Err(ParseError(format!(
-                    "unexpected delimiter `{m}` in @@@OLD section; expected `@@@END`"
+                    "unexpected delimiter `{m}` in @@@NEW section; expected `@@@END`"
                 )));
             }
             replace_lines.push(&lines[k]);
@@ -707,7 +705,7 @@ mod tests {
         let err = parse_blocks(text).unwrap_err();
         assert!(err
             .0
-            .contains("unexpected delimiter `@@@OLD` in NEW section"));
+            .contains("unexpected delimiter `@@@OLD` in @@@NEW section"));
     }
 
     #[test]
@@ -718,7 +716,7 @@ mod tests {
         let err = parse_blocks(text).unwrap_err();
         assert!(err
             .0
-            .contains("unexpected delimiter `@@@NEW` in NEW section"));
+            .contains("unexpected delimiter `@@@NEW` in @@@NEW section"));
     }
 
     #[test]
@@ -728,7 +726,7 @@ mod tests {
         let err = parse_blocks(text).unwrap_err();
         assert!(err
             .0
-            .contains("unexpected delimiter `@@@END` in OLD section"));
+            .contains("unexpected delimiter `@@@END` in @@@OLD section"));
     }
 
     #[test]
@@ -745,6 +743,58 @@ mod tests {
         let text = "@@@OLD\nold\n@@@NEW\n  @@@OLD\n@@@END";
         let parsed = parse_blocks(text).unwrap();
         assert_eq!(parsed.edits[0].new_text, "  @@@OLD");
+    }
+
+    #[test]
+    fn end_marker_accepts_trailing_newlines() {
+        // `str::lines` strips the terminator (and a CRLF's \r), so a closing
+        // @@@END followed by any number of newlines must still match.
+        for text in [
+            "@@@OLD\nold\n@@@NEW\nnew\n@@@END",
+            "@@@OLD\nold\n@@@NEW\nnew\n@@@END\n",
+            "@@@OLD\nold\n@@@NEW\nnew\n@@@END\n\n\n",
+            "@@@OLD\nold\n@@@NEW\nnew\n@@@END\r\n",
+        ] {
+            let parsed = parse_blocks(text).unwrap();
+            assert_eq!(parsed.edits, vec![plain("old", "new")], "text: {text:?}");
+        }
+    }
+
+    #[test]
+    fn multi_block_adjacent_without_blank_line() {
+        // A block may be followed immediately by the next @@@OLD.
+        let text = "@@@OLD\na\n@@@NEW\nA\n@@@END\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
+    }
+
+    #[test]
+    fn multi_block_second_gets_blank_line_separator() {
+        // Blank lines between blocks are not swallowed into the next OLD text.
+        let text = "src/x.rs\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/x.rs"));
+        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
+    }
+
+    #[test]
+    fn multi_block_second_may_carry_its_own_header() {
+        // Each block may name the file; agreement is what makes it single-file.
+        let text =
+            "src/x.rs:1\n@@@OLD\na\n@@@NEW\nA\n@@@END\n\nsrc/x.rs:40\n@@@OLD\nb\n@@@NEW\nB\n@@@END";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.path.as_deref(), Some("src/x.rs"));
+        assert!(!p.multi_file);
+        assert_eq!(p.edits[0].start_line, Some(1));
+        assert_eq!(p.edits[1].start_line, Some(40));
+    }
+
+    #[test]
+    fn multi_block_trailing_newlines_after_last_end() {
+        // Trailing newlines after the final @@@END do not create a phantom block.
+        let text = "@@@OLD\na\n@@@NEW\nA\n@@@END\n\n\n@@@OLD\nb\n@@@NEW\nB\n@@@END\n\n";
+        let p = parse_blocks(text).unwrap();
+        assert_eq!(p.edits, vec![plain("a", "A"), plain("b", "B")]);
     }
 
     #[test]
