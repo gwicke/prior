@@ -9,7 +9,7 @@
 //! on each one — the exact format picocode's `edit` tool consumes. The model
 //! reviews the blocks, then hands them to `edit`.
 //!
-//! Layers of safety, each sufficient on its own (see `doc/safe_sed.md`):
+//! Layers of safety, each sufficient on its own (see `doc/bsed.md`):
 //!
 //! 1. **Deny-list** ([`script`]) — `w`/`W`/`s///w`, `e`, and `q`/`Q` are
 //!    rejected from the parsed AST before evaluation, so they cannot reach the

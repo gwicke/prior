@@ -1,4 +1,4 @@
-# `sed` tool — a preview-only GNU sed (`bsed`) that emits `edit`-tool blocks
+# `bsed` — a preview-only GNU sed that emits `edit`-tool blocks
 
 *Status: implemented. Decisions in §12, deferred work in §13. §14 records where
 the implementation corrected the design, which is the part worth reading if you
@@ -40,7 +40,7 @@ compiler**: a preview, in the one format the agent already knows how to apply.
 ## 2. Architecture (agreed shape)
 
 ```
- picocode (agent)                          crates/safe_sed
+ picocode (agent)                          crates/bsed
  ┌────────────────────────┐                ┌──────────────────────────────┐
  │ tool `sed`             │                │ lib: script → engine → diff  │
  │  path / expressions    │   argv         │      → hunks → blocks        │
@@ -575,14 +575,14 @@ target of `picocode`, as a two-line shim that delegates to the crate:
 
 ```rust
 // picocode/src/bin/bsed.rs
-fn main() -> std::process::ExitCode { safe_sed::cli::main() }
+fn main() -> std::process::ExitCode { bsed::cli::main() }
 ```
 
-with `safe_sed = { path = "crates/safe_sed" }` as a dependency.
+with `bsed = { path = "crates/bsed" }` as a dependency.
 
-Then `cargo install --path .` installs **both** binaries, while `crates/safe_sed`
+Then `cargo install --path .` installs **both** binaries, while `crates/bsed`
 stays self-contained and separately installable later (`cargo install --path
-crates/safe_sed`, or published and installed by name). The release build already
+crates/bsed`, or published and installed by name). The release build already
 produces both, so `release.yml` needs only the archive step updated and
 `install.sh` only two names. The cost is honest and small: `picocode` gains a
 compile-time dependency on `sed-rs`, and the tarball grows by one binary — worth
@@ -593,7 +593,7 @@ feature most users never get.
 ## 8. Crate layout
 
 ```
-crates/safe_sed/            # package: lib + bin bsed. No dependency from picocode.
+crates/bsed/            # package: lib + bin bsed. No dependency from picocode.
   Cargo.toml                # sed-rs = "2", similar = "2", thiserror = "2", clap? (hand-rolled argv is fine)
   src/lib.rs                # pub fn preview(req) -> Result<Preview, Error>
   src/script.rs             # split lines, parse each, walk the AST (deny-list), join
@@ -615,7 +615,7 @@ it is the risky part of this proposal: `src/edit_blocks.rs` (759 lines),
 `src/edit_match.rs` (928 lines) and `edit_file`/`resolve_edits` in `src/tools.rs`
 must move with their tests, keeping the persisted JSON shape
 (`{"oldText","newText","startLine"}`) byte-identical for session replay.
-`picocode` re-exports the types; `safe_sed` depends on `blockedit` for the markers
+`picocode` re-exports the types; `bsed` depends on `blockedit` for the markers
 and to self-validate the blob it emits.
 
 The extraction should be its own PR, before any `sed` work: it is a refactor with
@@ -625,7 +625,7 @@ no behaviour change, and it de-risks the crate work.
 
 | Where | Change |
 | --- | --- |
-| `Cargo.toml` | `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/safe_sed"]`; `blockedit = { path = … }`. add `safe_sed` as a dep, purely for the `bsed` shim binary (§7). |
+| `Cargo.toml` | `members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]`; `blockedit = { path = … }`. add `bsed` as a dep, purely for the `bsed` shim binary (§7). |
 | `src/tools.rs` | `#[rig_tool(name = "sed", required(path, expressions))] async fn sed_preview(path, expressions, context: ContextLines)`: `get_path` → relativize → argv `["bsed","preview","-c",n,"-p",rel,"-e",expressions]` → `run_sandboxed_ro_with_status` (new, §5.3) with an explicit cap → map exit 2 to `Ok(message)`, 1 to `Err`. New `ContextLines` in `src/config.rs` cloned from `ReadLimit`. |
 | `src/tools.rs` | `bsed_available()` probe (`LazyLock<bool>` = `Command::new("bsed").arg("--version").status().is_ok()`), mirroring `is_executable` in `src/main.rs:97`. |
 | `src/agent.rs:1967` | register conditionally: `if bsed_available() { builder = builder.tool(SedPreview) }` — same conditional-advertisement shape as `guard(..., yolo, …)` for the mutating tools. |
@@ -706,7 +706,7 @@ row points to.
 | 2 | `q` / `Q` | **reject** — no useful form exists once the whole file is loaded, and its only effect is a maximally misleading preview | §5.4 |
 | 3 | `r` / `R` | **allow** — the sandbox already exposes those files to the model; the deny-list is for write/exec/early-exit only | §5.4 |
 | 4 | `\u \l \U \L \E` | **implement** via the sentinel method (~80 lines, not a second `s///` engine) | §6.1 |
-| 5 | Distribution | one `cargo install --path .` installs both, via a `[[bin]]` shim; `crates/safe_sed` stays independently installable | §7 |
+| 5 | Distribution | one `cargo install --path .` installs both, via a `[[bin]]` shim; `crates/bsed` stays independently installable | §7 |
 | 6 | `crates/blockedit` | **separate crate** — keeps the binary separable later | §8 |
 | 7 | Per-expression detail | **deferred**, low priority | §13 |
 | 8 | Balance growth | **ship growth in v1** (~300 lines), keeping the hint for what growth cannot fix | §4.6 |
@@ -732,7 +732,7 @@ Still open — small tuning decisions, not architecture:
   `--explain` or a config flag. The banner's aggregate covers the common case.
 * `bsed replace -r` — recursive search/replace emitting the same block format, with
   the balance scanner reused for whole-file syntax checks.
-* Publishing `safe_sed` to crates.io, so `cargo install bsed` works without a
+* Publishing `bsed` to crates.io, so `cargo install bsed` works without a
   git checkout.
 * A `--json` output mode for `bsed preview`, for tooling that wants the blocks
   without parsing the blob text.

@@ -118,7 +118,7 @@ jobs:
         run: |
           # Create tar.gz archive: standard format for Linux and macOS
           # Both binaries ship in every archive: `bsed` is what the agent's
-          # `sed` tool executes, and it is a two-line shim over the safe_sed
+          # `sed` tool executes, and it is a two-line shim over the bsed
           # crate that `cargo build` already built alongside picocode.
           tar czf ${{ steps.names.outputs.archive_name }} \
             -C target/${{ matrix.target }}/release \

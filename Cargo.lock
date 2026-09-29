@@ -202,6 +202,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsed"
+version = "0.1.0"
+dependencies = [
+ "blockedit",
+ "sed-rs",
+ "similar",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1638,6 +1648,7 @@ version = "0.6.0"
 dependencies = [
  "async-trait",
  "blockedit",
+ "bsed",
  "chrono",
  "clap",
  "codewandler-markdown-stream",
@@ -1661,7 +1672,6 @@ dependencies = [
  "rig-agent",
  "rig-core",
  "rig-reqwest",
- "safe_sed",
  "schemars",
  "serde",
  "serde_json",
@@ -2247,16 +2257,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "safe_sed"
-version = "0.1.0"
-dependencies = [
- "blockedit",
- "sed-rs",
- "similar",
- "thiserror 2.0.20",
-]
 
 [[package]]
 name = "same-file"

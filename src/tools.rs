@@ -384,7 +384,7 @@ pub async fn sed_preview(
 ///
 /// Two is deliberate: it lifts a one-line change to a three-line `OLD`, which
 /// is what buys the `edit` tool a ±1 anchor tolerance instead of zero. See
-/// `doc/safe_sed.md` §4.1.
+/// `doc/bsed.md` §4.1.
 const SAFE_SED_TRAILING: &str = "2";
 
 #[rig_tool(

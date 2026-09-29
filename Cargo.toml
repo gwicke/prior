@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/safe_sed"]
+members = [".", "crates/slashdot_menu", "crates/blockedit", "crates/bsed"]
 resolver = "2"
 
 [package]
@@ -21,7 +21,7 @@ exclude = ["picocode.gif", ".github/"]
 rig-core = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 slashdot_menu = { path = "crates/slashdot_menu" }
 blockedit = { path = "crates/blockedit" }
-safe_sed = { path = "crates/safe_sed" }
+bsed = { path = "crates/bsed" }
 rig-agent = { git = "https://github.com/gwicke/rig", rev = "1c2f4405", features = ["derive"] }
 rig-reqwest = { git = "https://github.com/gwicke/rig", rev = "1c2f4405" }
 tokio = { version = "1.0", features = ["full"] }
@@ -73,9 +73,9 @@ path = "src/lib.rs"
 name = "picocode"
 path = "src/main.rs"
 
-# The `bsed` binary is a two-line shim over the safe_sed crate (src/bin/bsed.rs)
+# The `bsed` binary is a two-line shim over the bsed crate (src/bin/bsed.rs)
 # so that `cargo install --path .` installs both. The agent only ever runs
-# `bsed preview`; see doc/safe_sed.md.
+# `bsed preview`; see doc/bsed.md.
 [[bin]]
 name = "bsed"
 path = "src/bin/bsed.rs"
