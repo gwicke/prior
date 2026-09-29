@@ -465,6 +465,46 @@ visible only where the old behaviour was wrong.
 - The content's own rendering is untouched: B1–B3e made the bytes and the
   separators correct, and the solve only decides *where* they land.
 
+### A2's one real constraint: scrollback while streaming
+
+Checked before implementing, because it decides what the status line can be.
+
+**Today**, while a turn streams, nothing is written but appended content — no
+frame exists, so scrolling up to read scrollback works. (At the *prompt* it
+already does not: the REPL repaints the frame on every keystroke with absolute
+addressing, so typing while scrolled back yanks the viewport. In *Indicator*
+mode the spinner also ticks 8×/s, but it writes relatively — CR + erase-line at
+the cursor, i.e. the bottom of the logical screen — which stays out of a
+scrolled-back view.)
+
+**With a status line repainted per streamed block**, the repaint is
+`CUP row, col` — absolute addressing, which targets the *viewport*. Scrolled
+back, that paints the status line over the content the user is reading, and
+most terminals also pull the viewport to the bottom. So a live footer does not
+merely interrupt scrollback reading, it writes into the scrolled-back view.
+
+**There is no portable way to detect it.** No query reports the viewport
+position: `CPR` answers for the cursor, whose reported row when scrolled back is
+terminal-dependent, and it costs a round trip per check. So "repaint only when
+the user is at the bottom" is not implementable, and neither is "freeze the line
+when they scroll away".
+
+Two honest variants, both buildable on the same element:
+
+- **(a) Live footer — the viewport follows output while a turn streams.** One
+  absolute repaint per streamed block. What every comparable tool does, and
+  what a live ctx%/model readout costs. Read scrollback between turns.
+- **(b) Prompt-only footer — streaming stays append-only.** The frame exists at
+  the prompt (where a repaint per keystroke already happens, so it inherits the
+  existing yank-on-type and adds nothing), and there is no frame mid-turn.
+  Scrollback stays readable while a turn streams; the line is static during it.
+
+Recommendation: ship (b) first — it is the cheaper variant, it is the "static
+footer as a way to prove the tracking works" that was originally asked for, and
+it leaves (a) a one-line policy decision rather than a redesign. A1 is unaffected
+either way: with no frame during streaming, the solve's content path is
+byte-identical to today's.
+
 ### Open, for A1 specifically
 
 1. **A scroll moves content that nobody asked to move.** In the
