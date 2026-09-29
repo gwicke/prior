@@ -726,7 +726,6 @@ impl Repl {
                             (cur_w, cur_h),
                             &committed,
                             "",
-                            false,
                             history,
                         );
                         if let Some(text) = msg {
@@ -749,7 +748,6 @@ impl Repl {
                             (cur_w, cur_h),
                             &committed,
                             "",
-                            false,
                             history,
                         );
                         output.display_text(&err);
@@ -1386,13 +1384,12 @@ impl Repl {
     /// pipeline, after which `display_plain` writes the line at the frame's
     /// caret (plan §5.2).
     ///
-    /// `sep` controls whether this helper draws the separator itself:
-    /// `/set` value commits *stay in the `read_input` loop* (they revert
-    /// to the list rather than returning an action), so no other separator
-    /// will follow the emitted line — pass `true`. `/model` and `/thinking`
-    /// *return* an `InputAction`, so `agent.rs` draws a separator before the
-    /// next `read_input` (its per-prompt framing); passing `false` here avoids
-    /// a doubled separator.
+    /// No separator is drawn here. A v2.5 menu commit always leaves the
+    /// `read_input` loop (`MenuDone`), and the next prompt's frame draws its
+    /// own divider, so a rule above the committed line would double it. The
+    /// `sep` parameter that used to choose this is gone: both call sites
+    /// passed `false` once `/set` moved into the menu engine, and the
+    /// `/set`-stays-in-the-loop case it documented no longer exists.
     fn emit_commit<F: Fn(&LineEditor, &[String], usize, (usize, usize))>(
         output: &dyn Output,
         editor: &mut LineEditor,
@@ -1401,7 +1398,6 @@ impl Repl {
         dims: (usize, usize),
         line: &str,
         next_input: &str,
-        sep: bool,
         history: &mut History,
     ) {
         // v2.5 menu commits (`/replay 1`, `/thinking low`, …) return
@@ -1416,9 +1412,6 @@ impl Repl {
         // at the caret the frame apply left.
         redraw(&LineEditor::new(), &[], sel, dims);
         output.display_plain(line);
-        if sep {
-            output.display_separator();
-        }
         editor.set(next_input);
     }
 
