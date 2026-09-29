@@ -550,23 +550,88 @@ which is also GNU's per-command scoping.
 ## 7. `bsed` — the standalone tool
 
 ```
-bsed preview [-c N] [-p PATH] <expressions>     # print the block blob (default)
-bsed apply  [-p PATH] [-i] [FILE]               # read blob from stdin, apply, write
-bsed apply  [-p PATH] -f blob.txt               # ...or from a file
-bsed --version                                 # "bsed 0.1.0" (probe + handshake)
+bsed preview [-c N] [-p PATH] <expressions>   # print the block blob (default)
+bsed preview -r -p DIR <expressions>          # walk a tree, one blob for all of it
+bsed apply  [-p PATH] [-i] [FILE]             # read a blob from stdin, apply
+bsed --version                                # "bsed 0.1.0" (probe + handshake)
 ```
 
 * `preview` never writes. It is what the agent calls, always inside the sandbox.
-* `apply` is for humans (and for the future `picocode edit` backend if it ever
-  wants to). `--in-place` mirrors GNU `sed -i`; without it, the result goes to
-  stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review loop.
+* `apply` is for humans. Without `-i` a **single-file** blob writes its result to
+  stdout, so `bsed apply f.rs < blocks.txt | diff f.rs -` is a review loop that
+  cannot touch the file. A **multi-file** blob requires `-i`, since there is no
+  single result to print.
 * `preview -p -` reads the file from stdin and writes the blob to stdout (for
   pipelines). Not used by the agent.
-* Exit codes: `0` ok, `2` model/user-fixable, `1` internal.
-* No dependencies on an external `sed` binary, no shell, no config file. Later:
-  `bsed replace -r 'old' 'new' [dir]` (recursive search/replace emitting the same
-  block format) — the natural third mode, and the reason the block core is worth
-  extracting.
+* Exit codes: `0` ok, `2` the caller's problem (a refused expression, an
+  unresolvable block, a partial apply), `1` ours.
+* No dependency on an external `sed` binary, no shell, no config file.
+
+### 7.1 The recursive flow
+
+```
+bsed preview -r -p src 's/foo/bar/g' > blocks.txt   # review
+bsed apply -i < blocks.txt                          # commit it
+```
+
+One preview format and one write path, for a tree as well as a file — which is
+the whole reason this is a *flag* and not a separate `replace` subcommand. A
+second mode would either duplicate the diff→block machinery or become a second
+way to write files, and a second writer is exactly what this design removes.
+
+* **No budget in `-r` mode.** A human is reading the output, not a model paying
+  per token, and a silently truncated tree refactor is the worst outcome
+  available. The 50 KiB budget is for the agent's single-file preview; `-b` does
+  not apply here.
+* **The walk** uses `ignore` (already in the tree via picocode): `.gitignore` is
+  honoured *without* requiring a git repository — skipping `node_modules` should
+  not depend on whether the tree is under version control — hidden files are
+  skipped, and files are visited in **sorted order** so two runs over one tree are
+  diffable. Files that are not UTF-8 text are counted and named in the banner
+  rather than failing the run; a tree is allowed to contain binaries.
+* **The banner** reports files, not blocks: `2 of 4 file(s) under src changed,
+  3 block(s) total`, plus a note when files were skipped.
+
+### 7.2 Apply is atomic *per file*
+
+This is the one place the design changed under contact with a real use case. The
+original plan was all-or-nothing across the whole blob, on the grounds that a
+half-applied refactor is the failure mode this tool exists to prevent. For a
+single file that is exactly right. For a tree it is unusable: one stale file
+would block two hundred others, and "apply the rest, tell me what did not work" is
+the only workflow that scales. So:
+
+* each file is applied on its own — **all-or-nothing per file**;
+* a file whose blocks no longer resolve is reported and **left untouched**, while
+  every other file still goes through;
+* the **failed blocks are echoed back**, with their paths and their anchors
+  intact, so they can be fixed and re-piped through `apply` unchanged. This is
+  what `ApplyOutcome::Failed { failed }` carries: the rendered report says *what*
+  went wrong, the indices say *which* blocks, and a caller can hand back exactly
+  those. (The `edit` tool does not need the indices — it shows the model
+  everything — but it is the same type either way.)
+* the run's report goes to **stdout**, because it is the result: which files
+  applied, and the blocks to fix for the ones that did not. stderr carries the
+  one-line failure count, and the exit code is 2, so a script that reads neither
+  stream still cannot miss a partial run.
+
+**Note the anchor in the echo.** It is re-rendered with the anchored headers
+`preview` emits, not with `render_blob` — which writes one bare path line above
+the first block. Re-piping a bare-path block for a duplicated line would resolve
+by content alone on the retry, and fail.
+
+### 7.3 The multi-file seam
+
+`blockedit::group_by_file(parsed, fallback_path)` is where "a blob may span
+files" meets "a write is atomic per file": it splits a parsed blob into one batch
+per file, in first-seen order, with header-less blocks falling back to the
+caller's `path` argument. It is the single place that knowledge lives, and it is
+what the recursive apply uses.
+
+It is also the seam the agent's multi-file `edit` will need. Splitting a
+multi-file batch into per-file, pi-compatible tool calls for session storage is
+the same operation, and it now has one tested implementation to call rather than
+a second one to write.
 
 **Distribution: one `cargo install --path .`, two binaries.** Cargo installs every
 `[[bin]]` target of the package you point it at, so the only question is whether
@@ -712,6 +777,15 @@ row points to.
 | 8 | Balance growth | **ship growth in v1** (~300 lines), keeping the hint for what growth cannot fix | §4.6 |
 | 9 | Default `context` | `0` with a free 2-line trailing floor; symmetric on request | §4.1 |
 
+Resolved since (reasoning in §7):
+
+| # | Question | Decision | Where |
+| --- | --- | --- | --- |
+| 10 | Separate `replace -r` mode, or a flag on `preview`? | a **flag** — one output format, one write path | §7.1 |
+| 11 | Scope of atomicity for a tree | **per file**: a stale file is reported and skipped, the rest apply | §7.2 |
+| 12 | Budget in `-r` mode | **none** — a human is reading it, and silent truncation is the worst outcome | §7.1 |
+| 13 | How do you see which replacements did not apply? | the **failed blocks are echoed back**, with paths and anchors, ready to re-pipe | §7.2 |
+
 Still open — small tuning decisions, not architecture:
 
 1. **`TAIL` value.** Is 2 right for `[tool_config.sed].trailing_context`? 2 buys
@@ -730,8 +804,12 @@ Still open — small tuning decisions, not architecture:
 
 * Per-expression match report (`expression 2 's/a/b/g' changed 12 lines`), behind
   `--explain` or a config flag. The banner's aggregate covers the common case.
-* `bsed replace -r` — recursive search/replace emitting the same block format, with
-  the balance scanner reused for whole-file syntax checks.
+* A `--glob` filter for `preview -r`. `.gitignore` handles the common noise
+  (`target`, `node_modules`), but "only `*.rs`" is a one-line addition on top of
+  the same `ignore` walk and would make a tree refactor much less noisy.
+* Multi-file `edit` in the agent. The plumbing is in place (§7.3); what remains is
+  splitting a batch into per-file tool calls and re-joining the results, which is
+  a session-storage question rather than a matching one.
 * Publishing `bsed` to crates.io, so `cargo install bsed` works without a
   git checkout.
 * A `--json` output mode for `bsed preview`, for tooling that wants the blocks
@@ -775,6 +853,22 @@ That fails on every substitution that never matched, which is the commonest case
 in the corpus. A lone *leftover* marker is the real signal and is still a hard
 error; absence is a no-op. Verified byte-identical to GNU sed 4.9 across seven
 scripts, including backreferences, `\u`/`\l` and `\E`.
+
+### 7.4 Two more corrections from the recursive round
+
+**`ParsedEdit` was throwing away the one field a multi-file blob needs.** The
+header path was used for the single-file agreement check and then dropped — the
+anchor survived, the file did not. Multi-file was unreachable only because
+`merge_path` rejects it, which is a policy decision wearing a data-structure
+costume. `ParsedEdit` now carries `header: Option<String>`, and
+`group_by_file` is the one place that knows how to split a blob by file.
+
+**Per-file atomicity, not all-or-nothing.** The original reasoning was that a
+half-applied refactor is the failure mode to prevent, and that is right for one
+file. It does not survive contact with a tree: one stale file blocking two
+hundred is not a safety property, it is a dead end. Splitting the difference by
+file keeps both halves of the claim — no file is ever half-written, and the ones
+that failed come back as blocks to fix.
 
 Two smaller notes on what shipped:
 
