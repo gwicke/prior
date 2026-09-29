@@ -161,6 +161,11 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
             Box::new(move |model| writer.set_setting(SettingKey::DefaultModel, model)),
             None, // no recent models for /set
         );
+        // Same actions as the live `/model`, minus `save`: here "activate"
+        // already writes the setting, and a default is not a live model with
+        // params to save.
+        let mut child_menu: crate::slashdot_menu::menu::SlashDotMenuNode = child.into();
+        crate::v25_model::add_model_actions(&mut child_menu, app_state, false, 2);
         let mut wrapper: SlashDotMenuNode = ListingNode::new(
             app_state,
             &[StaticRow::new(
@@ -171,7 +176,7 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         .with_columns(crate::v25_model::model_columns())
         .into();
         wrapper = wrapper.with_value_forwarding();
-        wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
+        wrapper.add_child(child_menu);
         set_node.add_child(wrapper);
     }
 
@@ -195,7 +200,7 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         )
         .into();
         wrapper = wrapper.with_value_forwarding();
-        wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
+        wrapper.add_child(SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);
     }
 
@@ -223,7 +228,7 @@ pub fn build_set_node(app_state: &Arc<AppState>) -> SlashDotMenuNode {
         )
         .into();
         wrapper = wrapper.with_value_forwarding();
-        wrapper.add_child(crate::slashdot_menu::SlashDotMenuNode::new(child));
+        wrapper.add_child(SlashDotMenuNode::new(child));
         set_node.add_child(wrapper);
     }
 

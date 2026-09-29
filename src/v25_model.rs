@@ -12,7 +12,7 @@ use crate::app_state::AppState;
 use crate::slashdot_menu::fields::ColumnDef;
 use crate::slashdot_menu::fields::Row;
 use crate::slashdot_menu::node_impl::{
-    DataResponse, DataResult, PathArgs, SlashDotNode, StaticRow, SubmitResult,
+    DataResponse, DataResult, PathArgs, RenderContext, SlashDotNode, StaticRow, SubmitResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -29,11 +29,67 @@ pub struct ModelNode {
     /// `/set default_model` — a settings write is not a model change and
     /// must not journal a `ModelChange`.
     live: Option<Arc<AppState>>,
+    /// A Ctrl-E edit awaiting the confirm's accept arm, keyed by epoch and
+    /// model id like the compaction draft. A stale stash means the data epoch
+    /// moved under us, and writing it would store settings against a model
+    /// the user is no longer looking at.
+    pending_edit: std::cell::RefCell<Option<PendingEdit>>,
     /// Last generated DataResponse, reused via Rc::ptr_eq when the catalog
     /// generation hasn't changed.
     cached_response: Option<Rc<DataResponse>>,
     /// The catalog generation at the time cached_response was built.
     cached_generation: u64,
+}
+
+/// A Ctrl-E result waiting to be committed by the confirm's accept arm.
+///
+/// Ctrl-E is two-phase, like compaction: the editor is the *review*, the
+/// dialog is the *commit point*. The engine calls `submit()` on the node that
+/// armed it — for a listing, that is this node — so this stash is what tells
+/// `submit()` to write settings rather than activate a model.
+struct PendingEdit {
+    epoch: u64,
+    model: String,
+    settings: crate::model_settings::ModelSettings,
+}
+
+/// The model a path is about, or `None` when none has been drilled.
+///
+/// `above` is how many path segments sit above the model node: 1 for the live
+/// `/model` (`["model", ...]`), 2 for `/set default_model`
+/// (`["set", "default_model", ...]`). Depth is the only reliable signal. The
+/// engine threads ids rather than structure, and the last id at the *undrilled*
+/// level is the command's own name (`"model"`, `"default_model"`) — which is
+/// indistinguishable from a model id if you only look at the tail. That is
+/// exactly the bug a first cut made: every catalog row grew the same two
+/// actions.
+///
+/// With a model drilled, its id sits directly above our own action names
+/// (`["model", "<id>"]` at the action level, `["model", "<id>", "save"]` one
+/// level deeper).
+fn drilled_model(path_args: &PathArgs, above: usize) -> Option<String> {
+    if path_args.ids.len() <= above {
+        return None;
+    }
+    path_args
+        .ids
+        .iter()
+        .rev()
+        .find(|id| !is_action_id(id))
+        .cloned()
+}
+
+/// True for the action row ids this node's children contribute.
+fn is_action_id(id: &str) -> bool {
+    matches!(id, "activate" | "save")
+}
+
+/// A value for display, or a dash when unset. The provider's own default is
+/// deliberately not shown: the live value is the question, and printing a
+/// known-but-unsent default would read as "this is what will be sent".
+fn fmt_opt(v: Option<f64>) -> String {
+    v.map(crate::v25_number_param::fmt_value)
+        .unwrap_or_else(|| "—".to_string())
 }
 
 impl ModelNode {
@@ -48,6 +104,7 @@ impl ModelNode {
             live,
             cached_response: None,
             cached_generation: u64::MAX, // force first rebuild
+            pending_edit: std::cell::RefCell::new(None),
         }
     }
 }
@@ -94,8 +151,149 @@ impl SlashDotNode for ModelNode {
         Ok(response)
     }
 
-    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
-        let qualified = path_args.ids.last().cloned().unwrap_or_default();
+    /// What this model is, and what it is set to right now.
+    ///
+    /// The resolved view — catalog overlaid with the stored per-model
+    /// overrides — so these are the figures the app actually uses rather than
+    /// what OpenRouter last published. Absent facts read as absent.
+    async fn header(&mut self, path_args: &PathArgs, render_ctx: &RenderContext) -> Vec<String> {
+        let Some(model) = drilled_model(path_args, 1) else {
+            return vec![
+                "Pick a model to see its details, its settings, and its actions.".to_string(),
+            ];
+        };
+        let stored = self
+            .live
+            .as_ref()
+            .and_then(|app| app.with_settings(|s| s.model_settings(&model).cloned()));
+        let entry = crate::model_catalog::resolved_entry(&model, stored.as_ref());
+        let mut lines = vec![format!("model: {model}")];
+        if let Some(e) = entry.as_ref() {
+            if let Some(d) = e.description.as_deref() {
+                let width = render_ctx.term_width.saturating_sub(4).max(20);
+                lines.extend(
+                    crate::output::wrap(d, width)
+                        .into_iter()
+                        .map(|l| format!("  {l}")),
+                );
+            }
+            lines.push(format!(
+                "  ctx {}   cost ${:.2}/${:.2} per M",
+                e.context_length
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "—".into()),
+                e.prompt_cost.unwrap_or(0.0),
+                e.completion_cost.unwrap_or(0.0),
+            ));
+            let idx = |v: Option<f32>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
+            lines.push(format!(
+                "  coding {}   intel {}   agentic {}",
+                idx(e.coding_index),
+                idx(e.intelligence_index),
+                idx(e.agentic_index)
+            ));
+            lines.push(if e.reasoning_levels.is_empty() {
+                "  reasoning: not published".to_string()
+            } else {
+                format!("  reasoning: {}", e.reasoning_levels.join(", "))
+            });
+        } else {
+            lines.push("  (no catalog entry — details unknown)".to_string());
+        }
+
+        // Current settings: live for the active model, stored for an inactive
+        // one, since "what would using this do" is the question being asked.
+        if let Some(app) = self.live.as_ref() {
+            if app.model() == model {
+                let p = app.params();
+                lines.push(format!(
+                    "  now: reasoning {}   temperature {}   top_p {}",
+                    p.reasoning
+                        .map(|l| l.as_str().to_string())
+                        .unwrap_or_else(|| "off".into()),
+                    fmt_opt(p.temperature),
+                    fmt_opt(p.top_p),
+                ));
+            } else {
+                lines.push(format!(
+                    "  defaults: {}",
+                    stored
+                        .as_ref()
+                        .map(crate::settings_editor::summarize)
+                        .unwrap_or_else(|| "not configured".to_string())
+                ));
+            }
+            lines.push("  ctrl-e to edit these settings".to_string());
+        }
+        lines
+    }
+
+    /// Ctrl-E: edit this model's stored settings in `$EDITOR`, then arm the
+    /// confirm. Two phases, as agreed — the editor is the review, the dialog is
+    /// the commit point, because this writes the user's settings file and there
+    /// is no undo.
+    ///
+    /// Works for an **inactive** model too: the store is the source either way,
+    /// and a model not yet activated this session simply has no live values to
+    /// be overwritten.
+    async fn edit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let Some(app) = self.live.as_ref() else {
+            return SubmitResult::Handled;
+        };
+        let Some(model) = drilled_model(path_args, 1) else {
+            return SubmitResult::Handled;
+        };
+        let current = app
+            .with_settings(|s| s.model_settings(&model).cloned())
+            .unwrap_or_default();
+        let hints = match model.split_once(':') {
+            Some((p, m)) => crate::model_settings::hints_for(p, m),
+            None => Default::default(),
+        };
+        match crate::settings_editor::edit_fragment(app, &model, &current, &hints) {
+            // Nothing changed, so there is nothing to confirm.
+            crate::settings_editor::EditOutcome::Unchanged => SubmitResult::Handled,
+            crate::settings_editor::EditOutcome::Invalid(msg) => SubmitResult::Error(msg),
+            crate::settings_editor::EditOutcome::Unavailable(msg) => {
+                SubmitResult::Error(format!("cannot edit settings: {msg}"))
+            }
+            crate::settings_editor::EditOutcome::Updated(settings) => {
+                *self.pending_edit.borrow_mut() = Some(PendingEdit {
+                    epoch,
+                    model: model.clone(),
+                    settings,
+                });
+                SubmitResult::Prepared(Some((
+                    format!("Save these settings for {model}"),
+                    "Discard the edit".to_string(),
+                )))
+            }
+        }
+    }
+
+    async fn submit(&mut self, epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        // Two jobs, told apart by what is pending. A stashed Ctrl-E means the
+        // confirm's accept arm fired: write the settings. With nothing stashed
+        // this is the legacy activate path.
+        if let Some(pending) = self.pending_edit.borrow_mut().take() {
+            if pending.epoch != epoch {
+                return SubmitResult::Error(
+                    "the model list changed while editing — nothing was saved".to_string(),
+                );
+            }
+            let Some(app) = self.live.as_ref() else {
+                return SubmitResult::Handled;
+            };
+            return match app.update_settings(|s| {
+                s.apply_model_settings(&pending.model, &pending.settings);
+                Ok(())
+            }) {
+                Ok(()) => SubmitResult::Done(Some(format!("saved settings for {}", pending.model))),
+                Err(e) => SubmitResult::Error(format!("cannot save settings: {e}")),
+            };
+        }
+
+        let qualified = drilled_model(path_args, 1).unwrap_or_default();
         if qualified.is_empty() {
             return SubmitResult::Done(None);
         }
@@ -380,23 +578,210 @@ pub fn build_model_node(app_state: &Arc<AppState>) -> crate::slashdot_menu::menu
     // records the explicit user commit in one place.
     let reader = app_state.clone();
     let writer = app_state.clone();
+    let mut model_menu: crate::slashdot_menu::menu::SlashDotMenuNode = ModelNode::new(
+        Box::new(move || reader.model()),
+        Box::new(move |model| {
+            writer.set_model(model);
+            Ok(())
+        }),
+        Some(app_state.clone()),
+    )
+    .into();
+    add_model_actions(&mut model_menu, app_state, true, 1);
+    node.add_child(model_menu);
+    node
+}
+
+/// Attach the action rows to a model node.
+///
+/// `activate` goes first so it carries the initial cursor: `/model <id>` +
+/// Enter still activates in one keystroke, exactly as it did before the
+/// actions existed.
+///
+/// `with_save` is false for `/set default_model`, which reuses this same node:
+/// there "activate" already writes the setting, and a default is not a live
+/// model with params to save.
+pub fn add_model_actions(
+    node: &mut crate::slashdot_menu::menu::SlashDotMenuNode,
+    app_state: &Arc<AppState>,
+    with_save: bool,
+    above: usize,
+) {
+    let writer = app_state.clone();
     node.add_child(
-        ModelNode::new(
-            Box::new(move || reader.model()),
+        ModelActionNode::activate(
+            Some(app_state.clone()),
             Box::new(move |model| {
                 writer.set_model(model);
                 Ok(())
             }),
-            Some(app_state.clone()),
+            above,
         )
         .into(),
     );
-    node
+    if with_save {
+        node.add_child(ModelActionNode::save(app_state.clone(), above).into());
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Model actions — the children of a drilled `/model <id>`
+// ---------------------------------------------------------------------------
+
+/// One action on a drilled model. Both live in one node because they differ
+/// only in the row they contribute and what Enter does; a type each would be
+/// two near-identical `data()`s to keep in step.
+pub struct ModelActionNode {
+    action: ModelAction,
+    /// Journal the model switch. `None` under `/set default_model`, where
+    /// "activate" means "set as the default model" — a settings write, not a
+    /// session event.
+    live: Option<Arc<AppState>>,
+    /// Write the chosen id on activate. `None` for `save`, which writes
+    /// settings rather than a model id.
+    activate_fn: Option<Box<dyn FnMut(&str) -> Result<(), String>>>,
+    /// The store handle `save` needs. `None` hides the row entirely: there is
+    /// no meaningful "save live settings" under `/set default_model`.
+    store: Option<Arc<AppState>>,
+    /// Path segments above the model node — see [`drilled_model`]. 1 for the
+    /// live `/model`, 2 for `/set default_model`.
+    above: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelAction {
+    Activate,
+    Save,
+}
+
+impl ModelAction {
+    fn id(self) -> &'static str {
+        match self {
+            ModelAction::Activate => "activate",
+            ModelAction::Save => "save",
+        }
+    }
+
+    fn desc(self) -> &'static str {
+        match self {
+            ModelAction::Activate => "use this model",
+            ModelAction::Save => "save this model's live settings as its defaults",
+        }
+    }
+}
+
+impl ModelActionNode {
+    pub fn activate(
+        live: Option<Arc<AppState>>,
+        activate_fn: Box<dyn FnMut(&str) -> Result<(), String>>,
+        above: usize,
+    ) -> Self {
+        ModelActionNode {
+            action: ModelAction::Activate,
+            live,
+            activate_fn: Some(activate_fn),
+            store: None,
+            above,
+        }
+    }
+
+    pub fn save(live: Arc<AppState>, above: usize) -> Self {
+        ModelActionNode {
+            action: ModelAction::Save,
+            live: Some(live.clone()),
+            activate_fn: None,
+            store: Some(live),
+            above,
+        }
+    }
+
+    /// Persist the active model's live params as its stored defaults.
+    ///
+    /// Starts from the stored record rather than a fresh one, so `save` cannot
+    /// wipe a metadata override the user set through Ctrl-E — it owns the three
+    /// params, not the whole table (A.5).
+    fn save_live(&self, model: &str) -> SubmitResult {
+        let Some(app) = self.store.as_ref() else {
+            return SubmitResult::Handled;
+        };
+        if app.model() != model {
+            return SubmitResult::Done(Some(format!(
+                "{model} is not the active model — there are no live settings to save"
+            )));
+        }
+        let live = app.params();
+        // Only what differs from the built-in default: reasoning is never
+        // `None` (it seeds from the global) so it is always written, while
+        // temperature and top_p are written only when set, leaving a model the
+        // user never touched without keys for them.
+        let mut record = app
+            .with_settings(|s| s.model_settings(model).cloned())
+            .unwrap_or_default();
+        record.reasoning = live.reasoning;
+        record.temperature = live.temperature;
+        record.top_p = live.top_p;
+        let summary = crate::settings_editor::summarize(&record);
+        match app.update_settings(|s| {
+            s.apply_model_settings(model, &record);
+            Ok(())
+        }) {
+            Ok(()) => SubmitResult::Done(Some(format!("saved {summary} for {model}"))),
+            Err(e) => SubmitResult::Error(format!("cannot save settings: {e}")),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl SlashDotNode for ModelActionNode {
+    /// One row, and only once a model is drilled. At the `/model` level these
+    /// rows must not appear: every catalog row carrying the same two actions
+    /// would make the picker unusable.
+    async fn data(&mut self, _epoch: u64, path_args: &PathArgs) -> DataResult {
+        if drilled_model(path_args, self.above).is_none() {
+            return Ok(Rc::new(DataResponse {
+                rows: Vec::new(),
+                active_ids: Vec::new(),
+            }));
+        }
+        Ok(Rc::new(DataResponse {
+            rows: vec![Row::new(self.action.id()).desc(self.action.desc())],
+            active_ids: Vec::new(),
+        }))
+    }
+
+    async fn submit(&mut self, _epoch: u64, path_args: &PathArgs) -> SubmitResult {
+        let Some(model) = drilled_model(path_args, self.above) else {
+            return SubmitResult::Done(None);
+        };
+        match self.action {
+            ModelAction::Activate => {
+                let Some(write) = self.activate_fn.as_mut() else {
+                    return SubmitResult::Handled;
+                };
+                match write(&model) {
+                    Ok(()) => {
+                        // Journaled at the commit, not on rebuild: the explicit
+                        // user action is what is worth recording, and the
+                        // helper skips a value the session already holds, so
+                        // re-commits stay idempotent.
+                        if let Some(app) = self.live.as_ref() {
+                            if let Some(s) = app.session() {
+                                crate::agent::record_model_change(&s, &model).await;
+                            }
+                        }
+                        SubmitResult::Done(None)
+                    }
+                    Err(msg) => SubmitResult::Done(Some(msg)),
+                }
+            }
+            ModelAction::Save => self.save_live(&model),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -712,5 +1097,374 @@ mod tests {
             }
             other => panic!("expected Continue, got {:?}", other),
         }
+    }
+
+    // ---- P5: the action listing, header, and two-phase Ctrl-E ----
+
+    /// A model that is present in the test catalog. Only providers with no API
+    /// key survive `static_fallback`, so this cannot assume a real one.
+    const TEST_MODEL: &str = "ollama:llama3";
+
+    fn model_menu(app_state: &Arc<AppState>) -> crate::slashdot_menu::SlashDotMenu {
+        crate::v25_menu::build_menu(app_state)
+    }
+
+    fn rows_at(
+        h: &mut crate::slashdot_menu::SlashDotHandle<'_>,
+        prompt: &str,
+        key: crate::slashdot_menu::HostKey,
+    ) -> (String, Vec<String>) {
+        match futures::executor::block_on(h.eval_prompt_resolved(prompt, key, 80)) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(plan, p) => (
+                p,
+                plan.rows
+                    .iter()
+                    .map(|l| l.0.split_whitespace().next().unwrap_or("").to_string())
+                    .collect(),
+            ),
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// At the top level the listing is the catalog, not the actions — every
+    /// model row carrying `activate`/`save` would make it unusable.
+    #[test]
+    fn the_top_level_listing_shows_models_not_actions() {
+        let app_state = test_app_state();
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        // A passive key, not Tab: Tab *drills* into the first catalog row and
+        // lands on the actions, which is the next level's job.
+        let (_, rows) = rows_at(&mut h, "model ", crate::slashdot_menu::HostKey::None);
+        assert!(
+            !rows.is_empty(),
+            "the catalog must list models; got {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r == "activate" || r == "save"),
+            "the top level is the catalog, not the actions: {rows:?}"
+        );
+    }
+
+    /// Drilling a model offers its actions, and typing the id reaches the same
+    /// place as a Tab drill — the id is consumed as a path segment, not
+    /// fuzzy-filtered against the action rows.
+    #[test]
+    fn a_drill_offers_activate_and_save() {
+        let app_state = test_app_state();
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        for prompt in [format!("model {TEST_MODEL} ")] {
+            let (_, rows) = rows_at(&mut h, &prompt, crate::slashdot_menu::HostKey::None);
+            assert_eq!(rows, vec!["activate".to_string(), "save".to_string()]);
+        }
+    }
+
+    /// The one-keystroke path is preserved: the cursor starts on `activate`, so
+    /// `/model <id>` + Enter switches model exactly as it did before the
+    /// actions existed.
+    #[test]
+    fn enter_on_the_drill_activates_the_model() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:something-else");
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let prompt = format!("model {TEST_MODEL} ");
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::Enter,
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {}
+            _ => panic!("expected the activate action to commit"),
+        }
+        assert_eq!(app_state.model(), TEST_MODEL);
+    }
+
+    fn settings_store(app_state: &Arc<AppState>) -> crate::settings::SettingsStore {
+        app_state.with_settings(|s| s.clone())
+    }
+
+    /// `save` copies the live params into the stored record.
+    #[test]
+    fn save_writes_the_live_params() {
+        let app_state = test_app_state();
+        app_state.set_model(TEST_MODEL);
+        app_state.set_param(|p| {
+            p.temperature = Some(0.4);
+            p.top_p = Some(0.9);
+        });
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        // Drill to the model, move down from `activate` to `save`, commit.
+        let prompt = format!("model {TEST_MODEL} ");
+        let _ = futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::None,
+            80,
+        ));
+        match futures::executor::block_on(h.eval_prompt_resolved(
+            &prompt,
+            crate::slashdot_menu::HostKey::MoveCursor(1),
+            80,
+        )) {
+            crate::slashdot_menu::node_impl::MenuResult::Continue(_, saved_prompt) => {
+                match futures::executor::block_on(h.eval_prompt_resolved(
+                    &saved_prompt,
+                    crate::slashdot_menu::HostKey::Enter,
+                    80,
+                )) {
+                    crate::slashdot_menu::node_impl::MenuResult::DoneSuccess(..) => {}
+                    _ => panic!("expected save to commit"),
+                }
+            }
+            _ => panic!("expected the cursor move to stay open"),
+        }
+        let stored = settings_store(&app_state)
+            .model_settings(TEST_MODEL)
+            .cloned()
+            .expect("save must write a record");
+        assert_eq!(stored.temperature, Some(0.4));
+        assert_eq!(stored.top_p, Some(0.9));
+    }
+
+    /// `save` owns the three params, not the whole table: a metadata override
+    /// the user set through Ctrl-E must survive it.
+    #[test]
+    fn save_preserves_stored_metadata() {
+        let app_state = test_app_state();
+        app_state.set_model(TEST_MODEL);
+        app_state.set_param(|p| p.temperature = Some(0.3));
+        app_state
+            .update_settings(|s| {
+                s.apply_model_settings(
+                    TEST_MODEL,
+                    &crate::model_settings::ModelSettings {
+                        context_length: Some(4096),
+                        temperature: Some(0.1),
+                        ..Default::default()
+                    },
+                );
+                Ok(())
+            })
+            .unwrap();
+        let mut node = ModelActionNode::save(app_state.clone(), 1);
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        let outcome = futures::executor::block_on(node.submit(1, &pa));
+        assert!(matches!(outcome, SubmitResult::Done(..)));
+        let stored = settings_store(&app_state)
+            .model_settings(TEST_MODEL)
+            .cloned()
+            .unwrap();
+        assert_eq!(stored.temperature, Some(0.3), "live wins for params");
+        assert_eq!(stored.context_length, Some(4096), "metadata untouched");
+    }
+
+    /// There are no live params for a model that is not running, and saying so
+    /// beats writing an empty record.
+    #[test]
+    fn save_on_an_inactive_model_explains_itself() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:not-this-one");
+        let mut node = ModelActionNode::save(app_state.clone(), 1);
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        match futures::executor::block_on(node.submit(1, &pa)) {
+            SubmitResult::Done(Some(msg)) => {
+                assert!(msg.contains("not the active model"), "{msg}");
+            }
+            _ => panic!("expected Done with an explanation"),
+        }
+        assert!(
+            settings_store(&app_state)
+                .model_settings(TEST_MODEL)
+                .is_none(),
+            "nothing must be written for a model with no live settings"
+        );
+    }
+
+    /// `/set default_model` reuses the node, so it offers `activate` but not
+    /// `save` — there are no live params for a default.
+    #[test]
+    fn the_set_default_model_node_offers_activate_but_not_save() {
+        let app_state = test_app_state();
+        // Through the real root menu: mounting the `/set` subtree as the root
+        // of a test tree would drop the leading `set` segment from the path,
+        // which is exactly what the depth argument keys on.
+        let mut menu = model_menu(&app_state);
+        let mut h = menu.get_handle();
+        let (_, rows) = rows_at(
+            &mut h,
+            &format!("set default_model {TEST_MODEL} "),
+            crate::slashdot_menu::HostKey::None,
+        );
+        assert_eq!(rows, vec!["activate".to_string()], "no save under /set");
+    }
+
+    /// The header names the model, its published facts, and — the part that
+    /// matters — what it is set to right now.
+    #[test]
+    fn the_header_shows_details_and_current_settings() {
+        let app_state = test_app_state();
+        app_state.set_model(TEST_MODEL);
+        app_state.set_param(|p| p.temperature = Some(0.6));
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        );
+        let lines = futures::executor::block_on(node.header(
+            &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
+            &RenderContext { term_width: 80 },
+        ));
+        let joined = lines.join("\n");
+        assert!(joined.contains(TEST_MODEL), "{joined}");
+        assert!(joined.contains("ctx"), "{joined}");
+        assert!(joined.contains("now: reasoning"), "{joined}");
+        assert!(joined.contains("0.6"), "the live value must show: {joined}");
+        assert!(joined.contains("ctrl-e"), "{joined}");
+    }
+
+    /// An inactive model has no live settings, so the header reports the
+    /// stored defaults — which is the question "what would using this do".
+    #[test]
+    fn the_header_reports_stored_defaults_for_an_inactive_model() {
+        let app_state = test_app_state();
+        app_state.set_model("anthropic:another");
+        let reader = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(|_| Ok(())),
+            Some(app_state.clone()),
+        );
+        let lines = futures::executor::block_on(node.header(
+            &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
+            &RenderContext { term_width: 80 },
+        ));
+        let joined = lines.join("\n");
+        assert!(joined.contains("defaults: not configured"), "{joined}");
+    }
+
+    /// Without a tty the editor cannot run, and that must be an error on the
+    /// frame — not a silent success that looks like it saved.
+    #[test]
+    fn ctrl_e_without_a_tty_reports_instead_of_writing() {
+        let app_state = test_app_state();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        );
+        let outcome = futures::executor::block_on(node.edit(
+            1,
+            &PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " "),
+        ));
+        match outcome {
+            SubmitResult::Error(msg) => assert!(msg.contains("cannot edit"), "{msg}"),
+            _ => panic!("expected an error without a tty"),
+        }
+        assert!(
+            settings_store(&app_state)
+                .model_settings(TEST_MODEL)
+                .is_none(),
+            "a failed edit must not write"
+        );
+    }
+
+    /// The accept arm of the confirm calls `submit()` on the node that armed
+    /// it, so the stashed record is what `submit()` commits.
+    #[test]
+    fn submit_commits_the_stashed_ctrl_e_edit() {
+        let app_state = test_app_state();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        );
+        *node.pending_edit.borrow_mut() = Some(PendingEdit {
+            epoch: 7,
+            model: TEST_MODEL.to_string(),
+            settings: crate::model_settings::ModelSettings {
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+        });
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        let outcome = futures::executor::block_on(node.submit(7, &pa));
+        match outcome {
+            SubmitResult::Done(Some(msg)) => assert!(msg.contains(TEST_MODEL), "{msg}"),
+            _ => panic!("expected Done with a message"),
+        }
+        let stored = settings_store(&app_state)
+            .model_settings(TEST_MODEL)
+            .cloned()
+            .expect("the stashed record must be written");
+        assert_eq!(stored.temperature, Some(0.25));
+        // Stash consumed, so a second Enter cannot write it twice.
+        assert!(node.pending_edit.borrow().is_none());
+    }
+
+    /// A stash from another epoch means the data moved under us; writing it
+    /// would store settings against a model the user is no longer looking at.
+    #[test]
+    fn submit_refuses_a_stale_stash() {
+        let app_state = test_app_state();
+        let reader = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(|_| Ok(())),
+            Some(app_state.clone()),
+        );
+        *node.pending_edit.borrow_mut() = Some(PendingEdit {
+            epoch: 3,
+            model: TEST_MODEL.to_string(),
+            settings: crate::model_settings::ModelSettings {
+                temperature: Some(0.25),
+                ..Default::default()
+            },
+        });
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        match futures::executor::block_on(node.submit(9, &pa)) {
+            SubmitResult::Error(msg) => assert!(msg.contains("nothing was saved"), "{msg}"),
+            _ => panic!("expected a refusal"),
+        }
+        assert!(settings_store(&app_state)
+            .model_settings(TEST_MODEL)
+            .is_none());
+    }
+
+    /// With nothing stashed, `submit()` is still the activate path — the
+    /// legacy behaviour the action listing must not break.
+    #[test]
+    fn submit_without_a_stash_still_activates() {
+        let app_state = test_app_state();
+        let reader = app_state.clone();
+        let writer = app_state.clone();
+        let mut node = ModelNode::new(
+            Box::new(move || reader.model()),
+            Box::new(move |m| {
+                writer.set_model(m);
+                Ok(())
+            }),
+            Some(app_state.clone()),
+        );
+        let pa = PathArgs::new(vec!["model".into(), TEST_MODEL.into()], " ");
+        let outcome = futures::executor::block_on(node.submit(1, &pa));
+        assert!(matches!(outcome, SubmitResult::Done(None)));
+        assert_eq!(app_state.model(), TEST_MODEL);
     }
 }

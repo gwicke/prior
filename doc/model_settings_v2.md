@@ -756,12 +756,36 @@ hand-written `settings.toml` with comments + `[recipes.*]` and assert both
 survive; delete-a-key clears a stored value; error messages for typo / type /
 range; the fragment prefill contains the catalog suggestions.
 
-**P5 — `/model` action listing.** `ModelNode` children (`activate`, `save`);
-`header()` with details + current settings; `edit()` wired to A.9 for active
-*and* inactive models; `save` hidden under `/set default_model`. *Tests:*
-traversal test that `/model <id>` + Enter still activates; `save` writes
-`reasoning` always and `temperature`/`top_p` only when set; a full-menu
-traversal for each action; header content.
+**P5 — `/model` action listing.** **Done (2026-09-29).** `ModelNode` gains
+`activate` and `save` children; `header()` with details + current settings;
+`edit()` wired to A.9 for active *and* inactive models; `save` hidden under
+`/set default_model`. *Tests:* 13 new — the one-keystroke activate path, `save`
+writing live params, `save` preserving stored metadata, the inactive-model
+message, the `/set` row set, both header states, the no-tty Ctrl-E path, and
+both halves of the two-phase commit.
+
+**P5 addendum — three things the implementation settled.**
+- **Ctrl-E and `save` both confirm, per the review decision.** §A.9's "the
+  editor round-trip *is* the confirmation" was written when the confirm was a
+  bare `bool`; the engine's own shipped precedent (compaction: editor, stash,
+  *then* `Prepared`) guards irreversible writes, and both of these write
+  `settings.toml`. So `edit()` stashes the record and arms
+  `Prepared(Some((accept, cancel)))`; the engine calls `submit()` on the node
+  that armed it, which for a listing is `ModelNode` itself — the stash is what
+  tells `submit()` "write settings" rather than its other job, activating.
+- **`save` owns the three params, not the whole table.** It starts from the
+  stored record and overwrites only reasoning/temperature/top_p, so a metadata
+  override set through Ctrl-E survives it.
+- **Depth, not the path tail, is the "is a model drilled?" signal.** The engine
+  threads ids rather than structure, and the last id at the *undrilled* level
+  is the command's own name (`"model"`, `"default_model"`) — indistinguishable
+  from a model id by looking at the tail. A first cut used that, and every
+  catalog row grew the same two actions; a test caught it. Each action node now
+  carries the number of segments above it (1 live, 2 under `/set`).
+
+A real `edited settings` dialog is reachable for the first time: `ModelNode` is
+the first *listing* node to use Ctrl-E, and the engine only added that routing
+in the same upstream commit that introduced the dialog.
 
 **P6 — per-turn overrides.** `turn_overrides::split`; `PicoAgent::prompt`
 signature change; the `Submit`-arm wiring; warnings. *Tests:* parser table

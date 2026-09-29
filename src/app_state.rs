@@ -277,6 +277,25 @@ impl AppState {
         f(&self.state.lock().settings)
     }
 
+    /// Mutate the settings store and persist the result.
+    ///
+    /// The mutation runs under the lock; the TOML write runs **outside** it —
+    /// the store is cloned out first, exactly as `set_setting` does, so no file
+    /// IO ever happens under the coarse lock. This is the path for any
+    /// settings change that needs `&mut SettingsStore` — a per-model record,
+    /// rather than one scalar.
+    pub fn update_settings(
+        &self,
+        f: impl FnOnce(&mut SettingsStore) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let snapshot = {
+            let mut st = self.state.lock();
+            f(&mut st.settings)?;
+            st.settings.clone()
+        };
+        snapshot.save().map_err(|e| e.to_string())
+    }
+
     /// Mutate + persist a setting. Validate + in-memory apply under the
     /// lock; the TOML write runs **outside** it — the coarse lock is
     /// never held across file IO (an async facade was considered and

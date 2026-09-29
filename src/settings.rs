@@ -681,18 +681,33 @@ impl SettingsStore {
         Ok(())
     }
 
-    /// Store one model's settings and persist. Used by `/model <id> save` and
-    /// by the `$EDITOR` round-trip.
+    /// Record one model's settings **in memory**, without persisting — the
+    /// `apply_value` half of the `apply_value`/`set_value` pair. The write
+    /// belongs to
+    /// [`AppState::update_settings`](crate::app_state::AppState::update_settings),
+    /// which runs this under the store's lock and writes the file outside it.
     ///
     /// A record with nothing set **removes** the table: "not configured" and
     /// "configured to nothing" are the same state, and keeping an empty table
     /// would only invite the reader to wonder what it was for.
+    pub fn apply_model_settings(
+        &mut self,
+        id: &str,
+        settings: &crate::model_settings::ModelSettings,
+    ) {
+        self.models.insert(id.to_string(), settings.clone());
+    }
+
+    /// `apply_model_settings` + `save`, for callers that already hold the
+    /// store by value (tests, and the startup path with no lock involved).
+    /// Anything reached through `AppState` must use `update_settings` instead,
+    /// so the file write never happens under the coarse lock.
     pub fn put_model_settings(
         &mut self,
         id: &str,
         settings: &crate::model_settings::ModelSettings,
     ) -> Result<(), String> {
-        self.models.insert(id.to_string(), settings.clone());
+        self.apply_model_settings(id, settings);
         self.save().map_err(|e| e.to_string())
     }
 
