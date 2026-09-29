@@ -1,7 +1,7 @@
 use crate::repl::current_term_width;
 use crate::settings::{ShowReasoning, ShowReasoningHandle};
 use crate::tools::EditOp;
-use crate::ui::frame::{plan_apply, ApplyPolicy, DrawCache, Frame};
+use crate::ui::frame::{plan_apply, plan_clear_live_frame, ApplyPolicy, DrawCache, Frame};
 use console::{style, StyledObject};
 use indicatif::{ProgressBar, ProgressStyle};
 use libc;
@@ -1484,6 +1484,16 @@ impl ConsoleOutput {
         // follows it) sees the state those bytes produced, not the state from
         // before the block.
         let mut counter = RowCounter::new(&mut **out, width, &self.stream_tail);
+        // Every content write starts at the cursor, which is inside the live
+        // frame when there is one. Erase that frame first, or the write strands
+        // the rows it does not cover (`plan_clear_live_frame`).
+        let clear = {
+            let mut cache = self.draw.lock().unwrap();
+            plan_clear_live_frame(&mut cache)
+        };
+        if !clear.is_empty() {
+            let _ = counter.write_all(clear.as_bytes());
+        }
         let r = f(&mut counter);
         let rows = counter.rows();
         let _ = counter.flush();
@@ -3661,6 +3671,93 @@ mod tests {
             !lines[idx - 2].trim().is_empty(),
             "exactly ONE blank line before answer two (no double gap)"
         );
+    }
+
+    /// Content written while a frame is live must not leave any of it behind
+    /// (ui_draw_v2 §1.1). This is the reported resume artefact: a menu's table
+    /// header and rows left on screen *underneath* replayed content, because the
+    /// content started at a cursor inside the still-live frame and only
+    /// overwrote the rows below it.
+    #[test]
+    #[serial]
+    fn content_over_a_live_frame_erases_the_frame() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        // A menu frame, as `/session` has open when a commit happens: the
+        // input, a divider, and overlay rows — the table header is what the
+        // report saw survive.
+        let overlay = vec![
+            "MODEL            CTX    PRICE".to_string(),
+            "  gpt-5          400k   1.00".to_string(),
+            "  claude-opus    200k   3.00".to_string(),
+        ];
+        let frame = crate::repl::Repl::compose_frame(
+            &crate::repl::LineEditor::new(),
+            "",
+            &overlay,
+            0,
+            40,
+            10,
+        );
+        out.draw_frame(&frame, 3, ApplyPolicy::Frame, (40, 24));
+        out.display_text("Cannot start agent: Missing API key for provider.");
+        let bytes = out.end_capture();
+
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        let rows: Vec<String> = (0..10)
+            .map(|r| {
+                (0..40)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r, c)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("Missing API key")),
+            "the message should be on screen: {rows:?}"
+        );
+        for leftover in ["MODEL", "CTX", "gpt-5", "claude-opus", "PRICE"] {
+            assert!(
+                !rows.iter().any(|r| r.contains(leftover)),
+                "frame row {leftover:?} survived the content write: {rows:?}"
+            );
+        }
+    }
+
+    /// The clear only applies when a frame is live: streamed blocks just
+    /// append, so the tracked row stays in step with the screen and a
+    /// scrolled-back viewport is never written into.
+    #[test]
+    #[serial]
+    fn content_without_a_live_frame_is_untouched() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response();
+        out.stream_text("a streamed paragraph.\n\n");
+        out.stream_text("another one.\n\n");
+        out.end_response();
+        let bytes = out.end_capture();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("\x1b[K"),
+            "nothing to clear while streaming: {:?}",
+            String::from_utf8_lossy(&bytes).escape_debug().to_string()
+        );
+        assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
     }
 
     /// A tool block followed by reasoning showed **two** blank lines: the host

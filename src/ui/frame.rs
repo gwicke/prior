@@ -560,6 +560,47 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
     s
 }
 
+/// Erase the live frame's rows so a content write cannot leave any of it behind,
+/// and put the caret back where it was.
+///
+/// A content write starts at the cursor, and the cursor is *inside* the live
+/// frame (the REPL's input row, or a dialog's caret). The content grows
+/// downward from there, overwriting the frame from the caret down — and
+/// stranding the rest, which nothing else reclaims: the next frame apply's
+/// union clear reaches the previous frame's rows only while `live` is set, and
+/// this write is what clears it. That is the shape of the reported resume
+/// artefact (ui_draw_v2 §1.1): a menu's table header and rows left on screen
+/// underneath replayed content, because the replay wrote while the menu's frame
+/// was still live.
+///
+/// Whole-region rather than "the rows the content will miss": a content line
+/// shorter than the terminal leaves the frame's background to its right, and
+/// the input row is padded to the full width. Empty when no frame is live,
+/// which is the case for every streamed block, so this costs nothing while a
+/// turn runs.
+///
+/// Absolute addressing is correct here because a live frame means a user
+/// keystroke (or a dialog) put it there — the one case where the terminal is
+/// not merely showing scrollback (doc/row_accounting.md, zone 3).
+pub(crate) fn plan_clear_live_frame(cache: &mut DrawCache) -> String {
+    let Some(live) = cache.live.as_ref() else {
+        return String::new();
+    };
+    let top = live.frame_top_row;
+    let bottom = top + live.frame.height().saturating_sub(1);
+    let (caret_row, caret_col) = cache.caret;
+    let mut s = String::new();
+    for r in top..=bottom {
+        s.push_str(&cup(r, 1));
+        s.push_str("\x1b[K");
+    }
+    // The clear walked the cursor to the last row; put it back, since the
+    // content write is about to start from it.
+    s.push_str(&cup(caret_row, caret_col + 1));
+    cache.live = None;
+    s
+}
+
 /// Append apply (plan §2, commit lines): write the rows at the anchor as
 /// content, scrolling the overflow into scrollback, and leave the caret on the
 /// row just below the block. No region clear; `live` is cleared so the next
