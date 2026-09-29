@@ -209,6 +209,40 @@ reasoning diverges" to **byte-identical**, reasoning included. That is the
 whole point of the phase: one render path, so a test and a terminal run the same
 code.
 
+## 2c. B3d and B3e (2026-09-28) — the phase is done
+
+**B3d: the separator state is derived, not kept.** `RowCounter` tracks the
+stream's tail (two booleans over the last byte) and `write_content` carries it
+across writes, so `boundary()` asks the stream rather than a flag. Gone:
+`last_blank`, `last_was_tool`, `set_blank`, `ended_blank`, `note_text`,
+`note_tool` — and the twelve bookkeeping calls with them.
+
+Two places needed the knowledge to *move* rather than disappear, and the first
+attempt got it wrong in a way the matrix caught:
+
+- **The reasoning→answer boundary is a transition, and the bytes cannot see
+  transitions.** Writing `boundary()` unconditionally per `stream_text` call
+  put a blank line in the middle of a byte-at-a-time streamed paragraph: the
+  tail mid-block looks exactly like "after a tool panel". The authoritative
+  signal for that boundary is the dim state (`was_thinking`), and it stays.
+- **A tool block has to announce that it ended without a blank.** That is the
+  one thing the bytes genuinely cannot distinguish, so the knowledge moves
+  from the *next* block (`last_was_tool`, "was the last block a tool?") to the
+  block that ends: `display_tool_result` closes every one of its four exits
+  with a separator, and `display_tool_call` asks for one unconditionally — a
+  text segment leaves the renderer's trailing blank behind and a panel does
+  not, so the stream tells them apart without a flag.
+
+**B3e: the commit divider was already dead.** `emit_commit`'s `sep` parameter
+is gone along with the comment that explained it: both call sites passed
+`false` once `/set` moved into the menu engine, and a v2.5 commit always leaves
+the `read_input` loop, so the next prompt's frame draws its own divider. A
+rule above the committed line would double it.
+
+Net for the phase: the separator rule is one function and one derived fact, the
+render path is one path, and the reason they can be is that the row counter
+already sees every byte.
+
 ## 3. What each commit is gated on
 
 | Commit | Gate |
