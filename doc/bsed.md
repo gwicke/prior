@@ -907,7 +907,7 @@ in the corpus. A lone *leftover* marker is the real signal and is still a hard
 error; absence is a no-op. Verified byte-identical to GNU sed 4.9 across seven
 scripts, including backreferences, `\u`/`\l` and `\E`.
 
-### 7.4 Two more corrections from the recursive round
+### Corrections from the recursive round
 
 **`ParsedEdit` was throwing away the one field a multi-file blob needs.** The
 header path was used for the single-file agreement check and then dropped — the
@@ -915,6 +915,13 @@ anchor survived, the file did not. Multi-file was unreachable only because
 `merge_path` rejects it, which is a policy decision wearing a data-structure
 costume. `ParsedEdit` now carries `header: Option<String>`, and
 `group_by_file` is the one place that knows how to split a blob by file.
+
+**A file that cannot be expressed as blocks was not being caught at all.**
+`blocks::verify` was correct, but `preview_text` built its own banner and dropped
+the result, so both preview paths described a block set as appliable when it was
+not. The check now runs first over the in-memory blocks — so the message names
+the block, not the parser's generic complaint — and re-parses as confirmation
+(§7.3).
 
 **Per-file atomicity, not all-or-nothing.** The original reasoning was that a
 half-applied refactor is the failure mode to prevent, and that is right for one
