@@ -2108,6 +2108,11 @@ impl Output for ConsoleOutput {
                 cleaned = stripped;
             }
         }
+        // Same treatment as the model: drop the redundant arg-error wrappers so
+        // the panel shows the problem, the expected block, and the offending
+        // structure — not a wall of prefixes. (Display is secondary to the model
+        // here, but the same text, so the same cleanup.)
+        cleaned = blockedit::strip_arg_error_prefixes(cleaned);
 
         let is_error =
             unquoted.starts_with("Toolset error") || unquoted.starts_with("ToolCallError");

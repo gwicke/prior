@@ -24,6 +24,7 @@ pub mod blob;
 pub mod diagnose;
 pub mod path;
 pub mod resolve;
+pub mod tool_errors;
 pub mod types;
 pub mod wire;
 
@@ -33,5 +34,6 @@ pub use blob::{
     render_blob, split_line_anchor, FileBatch, ParseError, ParsedBlocks, ParsedEdit, DIVIDER,
     REPLACE_MARKER, SEARCH_MARKER,
 };
+pub use tool_errors::strip_arg_error_prefixes;
 pub use types::{EditOp, EditStartLine};
 pub use wire::EditArgs;

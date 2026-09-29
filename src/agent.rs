@@ -1910,8 +1910,36 @@ impl AgentHook for LoggingHook {
         }
         self.output
             .display_tool_result(&event.raw_result.output().render());
+        if let Some(text) = event.raw_result.output().as_text() {
+            if let Some(cleaned) = model_facing_tool_text(event.tool_name, text) {
+                return ToolResultAction::rewrite(cleaned);
+            }
+        }
         ToolResultAction::Keep
     }
+}
+
+/// The text the model should see for a tool result, or `None` for "leave it
+/// alone".
+///
+/// The `edit` tool's argument errors are a self-correcting message meant to be
+/// read by the model, but they arrive wrapped in two redundant prefixes (rig's
+/// `"failed to parse tool arguments: "` and the tool's own `"Invalid edit tool
+/// arguments: "`). Stripping them leaves the model only the problem, the
+/// expected block shape, and the offending structure — a weak model is
+/// measurably likelier to self-correct from a terse message than from one buried
+/// in ceremony, and the "something went wrong, let me try python" fallback starts
+/// with exactly such a wall.
+///
+/// Only the *text* changes. The result's kind, retryability, and raw structured
+/// form are untouched, and a non-`edit` tool (or a message without the known
+/// prefixes) is returned unchanged, so this can never swallow content.
+fn model_facing_tool_text<'a>(tool_name: &str, text: &'a str) -> Option<&'a str> {
+    if tool_name != "edit" {
+        return None;
+    }
+    let cleaned = blockedit::strip_arg_error_prefixes(text);
+    (cleaned != text).then_some(cleaned)
 }
 
 const DEFAULT_AGENT_PROMPT: &str = r#"You are picocode, a software engineering agent. You are direct, technical, and highly efficient.
@@ -4381,11 +4409,41 @@ mod tests {
         reasoning_text, record_model_change, record_thinking_change, retry_summarization,
         session_recorded_model_id, session_recorded_thinking, MessageLogger,
     };
-    use super::{CompactSummaryMode, ReplayUnit};
+    use super::{model_facing_tool_text, CompactSummaryMode, ReplayUnit};
     use crate::session::storage::SessionStorage;
     use crate::session::Session;
     use crate::SettingsStore;
     use rig_core::message::{AssistantContent, Message, Text};
+
+    /// The model-facing text for a malformed `edit` block must lead with the
+    /// problem and drop the two redundant wrappers. This is the single highest-
+    /// value behavior in the change: it is what a weak model actually reads when
+    /// it gets a marker wrong.
+    #[test]
+    fn model_text_strips_redundant_arg_error_wrappers() {
+        let raw = "failed to parse tool arguments: Invalid edit tool arguments: \
+Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on its line";
+        let cleaned = model_facing_tool_text("edit", raw).expect("edit errors are rewritten");
+        assert_eq!(
+            cleaned,
+            "Invalid block: malformed `@@@NEW` marker `@@@NEWEND`: a marker must be alone on its line"
+        );
+        assert!(!cleaned.contains("failed to parse tool arguments"));
+        assert!(!cleaned.contains("Invalid edit tool arguments"));
+    }
+
+    #[test]
+    fn model_text_rewrites_nothing_else() {
+        // A non-edit tool is never rewritten.
+        let args_err = "failed to parse tool arguments: bad integer";
+        assert_eq!(model_facing_tool_text("bash", args_err), None);
+        // An edit success (or any message without the wrappers) is untouched.
+        let ok = "Replaced 1 block(s) in src/x.rs";
+        assert_eq!(model_facing_tool_text("edit", ok), None);
+        // A call-time error the model sees is passed through as-is.
+        let call_err = "the tool failed";
+        assert_eq!(model_facing_tool_text("edit", call_err), None);
+    }
 
     #[test]
     fn blob_edit_tool_calls_renders_block_form_and_is_idempotent() {

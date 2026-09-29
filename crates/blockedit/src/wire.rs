@@ -1,6 +1,16 @@
 //! Wire-format decoding for the `edit` tool: the raw `arguments` JSON into a
 //! resolved path plus a batch of [`EditOp`]s.
 //!
+//! # The error text is model-facing
+//!
+//! The self-correcting error built by [`EditArgs::invalid`] is the *only* signal
+//! the model gets about a malformed block, and it is passed through verbatim —
+//! rig's arg-parse path does not redact it, and the agent's result hook
+//! forwards it unchanged. So this is copy written for the model, not for a
+//! human log: state the one problem, show the one correct shape, echo the
+//! offending structure. Anything decorative (the tool name, an apology about
+//! sed, three near-identical JSON examples) costs tokens and buries the fix.
+//!
 //! The advertised shape is a **flat bag of optional fields** (see the tool's
 //! `parameters()`), so variant selection happens here, on the raw JSON, and no
 //! `anyOf` union is ever advertised. Accepted shapes:
@@ -35,9 +45,14 @@ const ELIDE_FIELD_BUDGET: usize = 160;
 /// eliding a blob, so the block shape reads clearly.
 const ELIDE_CONTEXT: usize = 1;
 
-const EDIT_ARGS_EXAMPLE: &str = r#"Single edit: {"path": "some/path", "oldText": "original text", "newText": "replacement text"}
-Multiple edits: {"path": "some/path", "edits": "@@@OLD\noriginal text\n@@@NEW\nreplacement text\n@@@END"}
-Anchored block (when the text repeats): {"path": "some/path", "edits": "some/path:120\n@@@OLD\noriginal text\n@@@NEW\nreplacement text\n@@@END"}"#;
+/// The accepted shape, rendered the way the model should write it: line-based
+/// block syntax, one line per marker, with the anchor shown. A single anchored
+/// block covers every case the tool takes (the header is optional when `path` is
+/// given as an argument), and line-based form is far easier to get right than a
+/// JSON string full of `\n` escapes. Kept short on purpose — this is the
+/// model-facing correction, and a wall of examples buries the one thing that
+/// matters (which marker is malformed).
+const EDIT_ARGS_EXAMPLE: &str = "some/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END";
 
 /// Arguments accepted by the `edit` tool, after normalization to the execution
 /// form (a resolved single-file `path` plus one or more [`EditOp`]s).
@@ -151,14 +166,82 @@ fn truncate_wire_repr(raw: &Value) -> String {
     char_truncate(&picked, MAX_ECHOED_ARGS)
 }
 
+/// Render the `edits` blob the way the model should have written it: real
+/// newlines, one marker per line, and every content line collapsed to a bare
+/// `…`.
+///
+/// The point is comparability. `Actual:` and `Expected:` are then the same *kind*
+/// of thing — two line-based blocks stacked vertically — so the model's eye goes
+/// straight to the structural difference (a marker that is not alone on its
+/// line) instead of mentally un-escaping a JSON string full of `\n` to find it.
+/// Only headers (`path:LINE`) and markers are kept verbatim; *every* other
+/// non-empty run of content collapses to a single `…`. The bad marker — the one
+/// thing the model must see — is a marker, so it always survives; the file text
+/// around it is the part that is noise.
+fn render_blob_structure(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut run = 0usize;
+    for line in text.lines() {
+        let t = line.trim();
+        let keep = is_structural_line(line) || is_path_header(line);
+        if keep {
+            if run > 0 {
+                out.push(elision_notice(run));
+                run = 0;
+            }
+            out.push(t.to_string());
+        } else if !t.is_empty() {
+            run += 1;
+        }
+    }
+    if run > 0 {
+        out.push(elision_notice(run));
+    }
+    out.join("\n")
+}
+
+/// Whether a line is a block header (`some/path.rs`, `some/path.rs:123`), kept
+/// in the skeleton so the model can see which file and anchor it aimed at.
+///
+/// Deliberately stricter than [`blob::header_candidate`], which accepts *any*
+/// whitespace-free token — the real parser only *considers* a token a header at
+/// particular positions, but here we are scanning every line, so a permissive
+/// test would present ordinary content words (`return`, `more`) and braces as
+/// if they were headers. Requiring an extension or a directory separator is
+/// enough to recognize the header and nothing else.
+fn is_path_header(line: &str) -> bool {
+    blob::header_candidate(line).is_some_and(|h| h.contains('.') || h.contains('/'))
+}
+
+/// The `Actual:` echo: the offending `edits` blob rendered line-based (see
+/// [`render_blob_structure`]) so it is directly comparable to the `Expected:`
+/// block above it. Any other shape (the single-edit fields, a non-object) is
+/// short, so it is shown as-is via [`truncate_wire_repr`].
+fn actual_summary(raw: &Value) -> String {
+    if let Some(text) = raw
+        .get("edits")
+        .and_then(|v| v.as_str())
+        .filter(|_| raw.get("oldText").is_none() && raw.get("newText").is_none())
+    {
+        return char_truncate(&render_blob_structure(text), MAX_ECHOED_ARGS);
+    }
+    truncate_wire_repr(raw)
+}
+
 impl EditArgs {
-    /// Build the self-correcting error: what went wrong, the accepted shapes,
-    /// and the (truncated) parameters actually received.
+    /// Build the self-correcting error: what went wrong, the one accepted shape
+    /// (line-based block syntax), and the structure actually received.
+    ///
+    /// Deliberately terse. This string is the *model's* correction, and every
+    /// token spent on ceremony — restating the tool name, listing the
+    /// single-edit JSON shape, apologizing about sed — competes with the one
+    /// fact the model must act on (which marker is malformed). The model-facing
+    /// text is a raw, unredacted copy of this (see the note in the module
+    /// docs); keep it free of anything the model does not need to self-correct.
     fn invalid(raw: &Value, why: &str) -> String {
         format!(
-            "Invalid edit tool arguments: {why}\n\nExpected one of these formats:\n{}\nActual parameters received: {}\nPlease do NOT use sed or python for editing, they lack the protections of this tool.",
-            EDIT_ARGS_EXAMPLE,
-            truncate_wire_repr(raw),
+            "{why}\n\nExpected:\n{EDIT_ARGS_EXAMPLE}\n\nActual:\n{}",
+            actual_summary(raw),
         )
     }
 
@@ -218,7 +301,7 @@ impl EditArgs {
         // Anchors come solely from each block's `path:LINE` header.
         if let Some(text) = obj.get("edits").and_then(|v| v.as_str()) {
             let parsed = blob::parse_blocks(text)
-                .map_err(|e| Self::invalid(raw, &format!("Invalid @@@OLD / @@@NEW block: {e}")))?;
+                .map_err(|e| Self::invalid(raw, &format!("Invalid block: {e}")))?;
             let (path, blocks) =
                 blob::merge_path(json_path, parsed).map_err(|e| Self::invalid(raw, &e))?;
             let edits = blocks
@@ -405,6 +488,38 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.contains("@@@OLD section"), "{e}");
-        assert!(e.contains("Actual parameters received:"), "{e}");
+        assert!(e.contains("Actual:"), "{e}");
+    }
+
+    #[test]
+    fn model_error_is_terse_and_line_based() {
+        // The message below is what the *model* reads. It must lead with the
+        // one problem, show the block format line-based, and show the offending
+        // blob the same way — no JSON string full of `\n` escapes, no ceremony.
+        let e = EditArgs::from_wire(&json!({
+            "edits": "src/x.rs\n@@@OLD\nold\n@@@NEWEND@@@OLD2@@@NEW2"
+        }))
+        .unwrap_err();
+        assert!(e.starts_with("Invalid block:"), "{e}");
+        // The bad marker is quoted verbatim and called out.
+        assert!(e.contains("@@@NEWEND@@@OLD2@@@NEW2"), "{e}");
+        // Line-based Expected, one marker per line.
+        assert!(
+            e.contains("Expected:\nsome/path:1234\n@@@OLD\nold text\n@@@NEW\nnew text\n@@@END"),
+            "{e}"
+        );
+        // Line-based Actual: markers on their own lines, content elided.
+        assert!(e.contains("Actual:\nsrc/x.rs\n@@@OLD\n"), "{e}");
+        // No escaped newlines, no JSON blob examples, no sed/python lecture.
+        // (The guidance prose may name the single-edit fields, so target the
+        // JSON-example shape specifically, not the word "oldText".)
+        assert!(!e.contains("\\n"), "no escaped newlines: {e}");
+        assert!(!e.contains("\"path\""), "no JSON example: {e}");
+        assert!(!e.contains("Expected one of these"), "no format list: {e}");
+        assert!(!e.contains("sed or python"), "no sed/python lecture: {e}");
+        // Bounded: a huge blob cannot blow up the message.
+        let big = format!("@@@OLD\n{}\n@@@NEWEND", "x".repeat(50_000));
+        let e2 = EditArgs::from_wire(&json!({ "edits": big })).unwrap_err();
+        assert!(e2.len() < 4 * MAX_ECHOED_ARGS, "len {}", e2.len());
     }
 }

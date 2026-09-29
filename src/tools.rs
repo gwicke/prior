@@ -2759,20 +2759,20 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(result.is_error(), "malformed args must fail: {result:?}");
-        let msg = result.output().render();
-        // Error should contain the canonical example and echo the input
+        // What the *model* sees: the redundant wrappers stripped, leaving the
+        // problem, the line-based `Expected:` block, and the echo. (The raw
+        // result still carries rig's wrapper; the agent hook removes it.)
+        let raw = result.output().render();
+        let msg = blockedit::strip_arg_error_prefixes(&raw);
         assert!(
-            msg.contains("Invalid edit tool arguments:"),
-            "must indicate parse failure, got: {msg}"
+            msg.contains("Expected:"),
+            "must show expected shape, got: {msg}"
         );
         assert!(
-            msg.contains("Expected one of these formats:"),
-            "must show expected formats, got: {msg}"
+            msg.contains("@@@OLD"),
+            "must show the block example, got: {msg}"
         );
-        assert!(
-            msg.contains("edits"),
-            "must show the canonical example, got: {msg}"
-        );
+        assert!(!msg.contains("Expected one of these"), "terse, got: {msg}");
         // Echo of the actual (bad) input so the model can see what it sent.
         assert!(
             msg.contains("wrong field names entirely"),
@@ -2792,10 +2792,10 @@ mod edit_args_wire_tests {
         }))
         .await;
         assert!(result.is_error(), "missing newText must fail: {result:?}");
-        let msg = result.output().render();
-        assert!(msg.contains("Invalid edit tool arguments:"), "got: {msg}");
-        assert!(msg.contains("Expected one of these formats:"), "got: {msg}");
-        assert!(msg.contains("edits"), "got: {msg}");
+        let raw = result.output().render();
+        let msg = blockedit::strip_arg_error_prefixes(&raw);
+        assert!(msg.contains("Expected:"), "got: {msg}");
+        assert!(msg.contains("@@@OLD"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -2803,8 +2803,9 @@ mod edit_args_wire_tests {
     async fn non_object_args_error_informatively() {
         let result = execute_edit(serde_json::json!("just a string")).await;
         assert!(result.is_error());
-        let msg = result.output().render();
-        assert!(msg.contains("Invalid edit tool arguments:"), "got: {msg}");
+        let raw = result.output().render();
+        let msg = blockedit::strip_arg_error_prefixes(&raw);
+        assert!(msg.contains("must be a JSON object"), "got: {msg}");
     }
 
     #[tokio::test]
