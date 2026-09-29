@@ -16,6 +16,20 @@
 //! the cursor to the last row by answering `picocode`'s cursor-position query
 //! (a DSR, `ESC[6n`) with `ESC[<ROWS>;1R` before it reads it. That makes the
 //! input sit on the bottom row, exactly the reported condition.
+//!
+//! Two `/set` integration tests live here. `settings_string_hierarchy_saves_and_errors`
+//! was revived after the v2.5 port (its ignore was stale): the *driving
+//! sequence* and the expected error rendering were v2.0-shaped, not the
+//! behaviour. Its sibling `settings_change_triggers_deferred_rebuild` was
+//! removed rather than revived: its subject — a `/set` change setting a
+//! `dirty` flag, with the agent rebuilt at the *next* `Submit` — no longer
+//! exists. A v2.5 menu commit is `MenuDone` and the convergence step applies
+//! the config snapshot in the same cycle, and `/set default_model` opens a
+//! model picker instead of accepting a typed id, so the "unsupported provider"
+//! rebuild failure it used to provoke is not reachable through `/set` at all.
+//! What it uniquely asserted — that a commit reaches the config file — is now
+//! asserted at the end of `settings_string_hierarchy_saves_and_errors`, and the
+//! apply/validate behaviour itself is covered by the `v25_set` unit tests.
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -318,11 +332,17 @@ fn shift_enter_inserts_newline_without_kitty() {
 
 /// Phase 2 integration: the `/set` string hierarchy — the list
 /// appears, a valid value is saved (and the overlay reverts to top
-/// `/set`), and an invalid value shows the red error header
+/// `/set`), and an invalid value shows the error message
 /// (and is NOT saved). Uses a temp config so the save side-effect
 /// never touches the repo.
+///
+/// Revived after the v2.5 port (the ignore was stale): the driving
+/// sequence and the expected error rendering were v2.0-shaped, not the
+/// behaviour. A v2.5 menu commit is `MenuDone`, so the editor is empty
+/// afterwards and the next command needs its own `/set ` prefix; and a
+/// leaf failure comes back as a plain `⏺ …` message rather than a red
+/// `error: …` header.
 #[test]
-#[ignore = "v2.0 /set not yet ported to v2.5 engine"]
 fn settings_string_hierarchy_saves_and_errors() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = tmp.path().join("picocode.toml");
@@ -403,13 +423,14 @@ fn settings_string_hierarchy_saves_and_errors() {
     let _ = writer.write_all(b"\r");
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(400));
-    // Re-open the list; security_mode should now show `yolo`.
-    for ch in " ".chars() {
-        let _ = writer.write_all(&[ch as u8]);
-        let _ = writer.flush();
-        thread::sleep(Duration::from_millis(150));
-    }
+    // The commit returns to the prompt with an empty editor (a v2.5 menu
+    // commit is `MenuDone`, doc/editor_cleanup.md §10.9), so there is no list
+    // to re-open — and the next command must not start on top of a leftover
+    // character, or `/set …` becomes ` /set …` and is submitted as a prompt.
+    let _ = writer.write_all(b"\x1b");
+    let _ = writer.flush();
     thread::sleep(Duration::from_millis(300));
+    // security_mode should now show `yolo`.
     {
         let data = bytes.lock().unwrap().clone();
         let mut p = Parser::new(20, 100, 1000);
@@ -427,8 +448,11 @@ fn settings_string_hierarchy_saves_and_errors() {
         );
     }
 
-    // Invalid value -> red error header, NOT saved.
-    for ch in "tool_call_limit 0".chars() {
+    // Invalid value -> red error, NOT saved. The commit above left
+    // `read_input` (a v2.5 menu commit is `MenuDone`, doc/editor_cleanup.md
+    // §10.9), so this command needs its own `/set ` prefix — the v2.0 flow
+    // stayed inside the menu and could type the bare setting name.
+    for ch in "/set tool_call_limit 0".chars() {
         let _ = writer.write_all(&[ch as u8]);
         let _ = writer.flush();
         thread::sleep(Duration::from_millis(70));
@@ -438,19 +462,29 @@ fn settings_string_hierarchy_saves_and_errors() {
     thread::sleep(Duration::from_millis(400));
     {
         let data = bytes.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&data);
+        // v2.0 rendered this as a red `error: …` header, which the old
+        // assertion could find in the raw byte stream because only the
+        // `error:` word was styled. A v2.5 leaf failure comes back through the
+        // `DoneError` path as an ordinary `⏺ …` message, styled around the
+        // marker, so the assertion reads the *screen* instead of the bytes.
+        let mut p = Parser::new(20, 100, 1000);
+        p.process(&data);
+        let visible: Vec<String> = p
+            .screen()
+            .rows(0, 100)
+            .map(|r| r.trim().to_string())
+            .collect();
         assert!(
-            s.contains("error: tool_call_limit must be greater than 0"),
-            "invalid value did not show red error; tail={}",
-            s.replace('\x1b', "ESC")
-                .chars()
-                .rev()
-                .take(300)
-                .collect::<String>()
+            visible
+                .iter()
+                .any(|r| r.contains("tool_call_limit must be greater than 0")),
+            "invalid value did not show the error message: {visible:?}"
         );
     }
-    // Nit 3: the red error is tied to value mode — Escaping back to the list
-    // must clear it (no stale error line in the current screen).
+    // The error is a committed message, so it stays in scrollback by design —
+    // what must *not* happen is a second copy lingering in the input region
+    // after the editor is cleared. (v2.0 tied the error to its "value mode"
+    // and could clear it with Esc; there is no value mode any more.)
     let _ = writer.write_all(b"\x1b");
     let _ = writer.flush();
     thread::sleep(Duration::from_millis(400));
@@ -463,130 +497,15 @@ fn settings_string_hierarchy_saves_and_errors() {
             .rows(0, 100)
             .map(|r| r.trim().to_string())
             .collect();
+        let first = visible
+            .iter()
+            .position(|r| r.contains("must be greater than 0"))
+            .unwrap_or_else(|| panic!("error line vanished from scrollback: {visible:?}"));
         assert!(
-            !visible.iter().any(|r| r.contains("error:")),
-            "red error must clear when leaving value mode: {:?}",
-            visible
-        );
-    }
-
-    drop(writer);
-    let _ = child.kill();
-    stop.store(true, Ordering::SeqCst);
-}
-
-/// Live-apply wiring: a `/set` change flips `dirty`; the agent rebuild
-/// is attempted at the next `Submit` (without hanging the REPL). Offline the
-/// rebuild fails on a missing API key, but the `Submit` arm must still return
-/// to a responsive prompt — proving the deferred rebuild ran and the loop
-/// continued. The change is also persisted to the temp config file.
-#[test]
-#[ignore = "v2.0 /set not yet ported to v2.5 engine"]
-fn settings_change_triggers_deferred_rebuild() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = tmp.path().join("picocode.toml");
-    std::fs::write(&cfg, "\n").expect("write temp config");
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 20,
-            cols: 100,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("open pty");
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_picocode"));
-    cmd.args([
-        "-p",
-        "openrouter",
-        "-m",
-        "tencent/hy3:free",
-        "-c",
-        cfg.to_str().unwrap(),
-    ]);
-    // Use a temp directory for XDG_CONFIG_HOME to avoid littering user's config with test sessions.
-    let config_tempdir = tempfile::tempdir().expect("tempdir for XDG_CONFIG_HOME");
-    cmd.env("XDG_CONFIG_HOME", config_tempdir.path());
-    let mut child = pair.slave.spawn_command(cmd).expect("spawn picocode");
-    // Keep the tempdir alive for the duration of the run.
-    let _config_tempdir = config_tempdir;
-
-    let reader = pair.master.try_clone_reader().expect("clone reader");
-    let (bytes, stop) = spawn_reader(reader);
-    let mut writer = pair.master.take_writer().expect("take writer");
-
-    assert!(
-        wait_for(&bytes, "picocode -", Duration::from_secs(5)),
-        "REPL did not start"
-    );
-    let _ = writer.write_all(b"\x1b[3;1R");
-    let _ = writer.flush();
-    thread::sleep(Duration::from_millis(400));
-
-    // Change default_model (exact name -> value mode), then Enter. Use an
-    // unsupported provider so the deferred rebuild *always* fails (env-independent),
-    // giving a deterministic proof that the rebuild was attempted at the next Submit.
-    for ch in "/set default_model ".chars() {
-        let _ = writer.write_all(&[ch as u8]);
-        let _ = writer.flush();
-        thread::sleep(Duration::from_millis(60));
-    }
-    for ch in "definitelynotarealprovider:model".chars() {
-        let _ = writer.write_all(&[ch as u8]);
-        let _ = writer.flush();
-        thread::sleep(Duration::from_millis(40));
-    }
-    let _ = writer.write_all(b"\r");
-    let _ = writer.flush();
-    thread::sleep(Duration::from_millis(500));
-
-    // The commit reverts the editor to `/set`; clear it (Esc on a
-    // space-less buffer empties the input) so the next text is a real prompt.
-    let _ = writer.write_all(b"\x1b");
-    let _ = writer.flush();
-    thread::sleep(Duration::from_millis(300));
-
-    // The committed `/set <key> <value>` line must have been emitted.
-    {
-        let data = bytes.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&data);
-        assert!(
-            s.contains("/set default_model definitelynotarealprovider:model"),
-            "committed /settings line not emitted; tail={}",
-            s.replace('\x1b', "ESC")
-                .chars()
-                .rev()
-                .take(300)
-                .collect::<String>()
-        );
-    }
-
-    // Submit a chat prompt -> the dirty rebuild is attempted at this Submit.
-    for ch in "hello".chars() {
-        let _ = writer.write_all(&[ch as u8]);
-        let _ = writer.flush();
-        thread::sleep(Duration::from_millis(80));
-    }
-    let _ = writer.write_all(b"\r");
-    let _ = writer.flush();
-    thread::sleep(Duration::from_millis(1500));
-
-    // The deferred rebuild must have been attempted: an unsupported-provider
-    // error (wrapped as "Cannot apply settings: ...") proves `dirty` was set in
-    // `read_input` and the rebuild ran here in `run_interactive`. The `Submit`
-    // arm then continues (the loop returns to a responsive prompt).
-    {
-        let data = bytes.lock().unwrap().clone();
-        let s = String::from_utf8_lossy(&data);
-        assert!(
-            s.contains("Unsupported provider: definitelynotarealprovider"),
-            "deferred rebuild was not attempted at next Submit; tail={}",
-            s.replace('\x1b', "ESC")
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<String>()
+            !visible[first + 1..]
+                .iter()
+                .any(|r| r.contains("must be greater")),
+            "error must not reappear below itself in the input region: {visible:?}"
         );
     }
 
@@ -594,11 +513,13 @@ fn settings_change_triggers_deferred_rebuild() {
     let _ = child.kill();
     stop.store(true, Ordering::SeqCst);
 
-    // The change was persisted to the temp config (set_value side-effect).
-    let saved = std::fs::read_to_string(&cfg).unwrap();
+    // The value reached the temp config file, not just the in-memory state:
+    // this is the end-to-end save proof (it used to live in
+    // `settings_change_triggers_deferred_rebuild`, deleted with that test —
+    // see the note at the top of this file).
+    let saved = std::fs::read_to_string(&cfg).expect("read temp config");
     assert!(
-        saved.contains("default_model = \"definitelynotarealprovider:model\""),
-        "setting not persisted to temp config: {}",
-        saved
+        saved.contains("security_mode = \"yolo\""),
+        "setting not persisted to the temp config: {saved}"
     );
 }
