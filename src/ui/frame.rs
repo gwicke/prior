@@ -404,26 +404,51 @@ impl DrawCache {
         self.live = None;
     }
 
-    /// Record a re-anchor attempt (plan §4.2) and invalidate the frame region:
-    /// a caller asking for the real cursor position cannot trust the cached
-    /// frame coordinates — DSR answer or not ("any uncertainty → clear it",
-    /// plan §9 latent issue 2). With an answer (`Some`) the tracked row is
-    /// replaced by it; on fallback (`None` — a terminal that never answered,
-    /// e.g. a headless pty) the tracked row stands but `live` is cleared
-    /// all the same, so the next apply takes the full path. Returns the row
-    /// to use.
-    pub(crate) fn reanchor(&mut self, row: Option<usize>) -> usize {
+    /// Record a re-anchor attempt (plan §4.2) and retire the frame region,
+    /// returning the row to use and the bytes that erase it.
+    ///
+    /// This is the one sanctioned absolute path (row_accounting §6b). A resize
+    /// or a foreign writer can leave the cursor *outside* the live block, and
+    /// then no relative walk can reach the block's rows — the erase that
+    /// precedes every paint walks up from the cursor, so it would erase the
+    /// wrong rows entirely. Here the block's row is still known and a DSR has
+    /// just confirmed where the cursor went, so the old region is addressed
+    /// and the cursor parked where the anchor says.
+    ///
+    /// "Any uncertainty → clear it" still holds: with an answer (`Some`) the
+    /// tracked row is replaced by it, and on fallback (`None` — a terminal that
+    /// never answered, e.g. a headless pty) the tracked row stands and the old
+    /// region is still erased, because a silent terminal offers no more
+    /// guarantee than an answering one (plan §9 latent issue 2).
+    pub(crate) fn reanchor(&mut self, row: Option<usize>) -> (usize, String) {
+        let mut s = String::new();
+        if let Some(live) = self.live.as_ref() {
+            let top = live.frame_top_row;
+            let bottom = top + live.frame.height().saturating_sub(1);
+            for r in top..=bottom {
+                s.push_str(&cup(r, 1));
+                s.push_str(EL);
+            }
+        }
         if let Some(r) = row {
             self.caret.0 = r.max(1);
         }
         self.live = None;
-        self.caret.0
+        s.push_str(&cup(self.caret.0, self.caret.1 + 1));
+        (self.caret.0, s)
     }
 }
 
-/// Plan the escape bytes that apply `frame` with its top row at absolute row
-/// `anchor` (1-based) under `policy`, advancing `cache` to the post-apply state
-/// (plan §4.3–4.4). Pure: the caller writes the returned bytes.
+/// Plan the escape bytes that apply `frame` at the cursor under `policy`,
+/// advancing `cache` to the post-apply state (plan §4.3–4.4). Pure: the caller
+/// writes the returned bytes.
+///
+/// The bytes are **relative**: nothing in a frame apply addresses an absolute
+/// row, so the plan cannot land on a row it did not mean to
+/// (row_accounting §6b). `anchor` and the `top`/`delta` arithmetic that follows
+/// it survive only to keep `cache`'s row bookkeeping — the tracked cursor row
+/// row accounting compares against a terminal, and the partial-apply predicate
+/// — and are never used for addressing.
 pub(crate) fn plan_apply(
     cache: &mut DrawCache,
     frame: &Frame,
@@ -441,7 +466,9 @@ pub(crate) fn plan_apply(
         return plan_append(cache, frame, anchor, th);
     }
 
-    // `delta` rows must scroll off the top to fit the frame's bottom on screen.
+    // Bookkeeping only: the block's top row, for the tracked cursor row and the
+    // partial predicate below. The `delta` this computes is no longer emitted —
+    // step 2 of `plan_full` gets the terminal to do the scrolling instead.
     let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
     let top = anchor.saturating_sub(delta).max(1);
 
@@ -451,57 +478,94 @@ pub(crate) fn plan_apply(
     if partial {
         plan_partial(cache, frame, top, th)
     } else {
-        plan_full(cache, frame, top, delta, tw, th)
+        plan_full(cache, frame, top, tw, th)
     }
 }
 
-/// Full apply (plan §4.3): scroll the overflow into scrollback, paint the frame
-/// rows absolutely, clear the rest of the live region (bounded by the clear
-/// floor), then place the caret.
-fn plan_full(
-    cache: &mut DrawCache,
-    frame: &Frame,
-    top: usize,
-    delta: usize,
-    tw: usize,
-    th: usize,
-) -> String {
+/// Full apply: retire the previous frame's rows, descend to the block's last
+/// row, clear what the block leaves below, paint it bottom-up, place the caret.
+/// Every step is a walk from wherever the cursor already is.
+fn plan_full(cache: &mut DrawCache, frame: &Frame, top: usize, tw: usize, th: usize) -> String {
     let h = frame.height();
     let mut s = String::new();
 
-    // 1. Scroll `delta` lines off the top. Bare LF at the bottom row scrolls and
-    //    pushes the top lines into scrollback — never `CSI S`, which deletes.
-    if delta > 0 {
-        s.push_str(&cup(th, 1));
-        for _ in 0..delta {
-            s.push('\n');
+    // 1. Retire the previous frame, if one is still live.
+    //
+    //    `live` is set exactly when the cursor is still at that frame's caret,
+    //    so the walk to its first row is `CUU` by the caret's own offset — and
+    //    it is what the new block's top is measured from. Without it the block
+    //    creeps down by one row on every full apply, because the cursor rests
+    //    at the caret and a caret on the last row is a row below the top the
+    //    next apply would assume. (A cursor that has *left* the block is the
+    //    re-anchor's case, and `reanchor` clears `live`.)
+    //
+    //    Erasing here, before the scroll, also removes the residue the absolute
+    //    path reached by arithmetic: a scroll pushes the old rows *above* the
+    //    new block's top, where nothing can reach them afterwards. That was the
+    //    union clear's other job.
+    let old_cur = match cache.live.as_ref() {
+        Some(live) => {
+            let h_old = live.frame.height();
+            let (cur, _col) = frame_caret(&live.frame);
+            cuu(&mut s, cur);
+            erase_down(&mut s, h_old);
+            cuu(&mut s, h_old.saturating_sub(1));
+            cur
         }
-    }
+        None => 0,
+    };
 
-    // 2. Paint the frame rows (absolute addressing; can no longer scroll).
-    for i in 0..h {
-        s.push_str(&cup(top + i, 1));
-        s.push_str(frame.row(i));
+    // 2. Make room for the block and land on its last row. `h-1` bare LFs do
+    //    both: an LF at the bottom row scrolls, anywhere else it moves down
+    //    one. So the block's last row is the cursor's row afterwards, and
+    //    exactly `delta` lines reach scrollback — the same split the absolute
+    //    path computed from the tracked row, except the *terminal* decides it,
+    //    so the block fits even when the tracked row was wrong.
+    for _ in 0..h.saturating_sub(1) {
+        s.push('\n');
     }
 
     // 3. Clear the rest of the live region, floored so a maximize's revealed
-    //    rows survive. Include the old frame's rows the scroll left above the
-    //    new top, so a re-anchor without invalidation leaves nothing stale.
+    //    rows survive. Nothing the block paints is touched — these are the rows
+    //    below its bottom. Done before the paint so the only walk back is the
+    //    one that follows.
     let floor = th.min(cache.screen_bottom);
-    let from = match cache.live.as_ref() {
-        Some(live) => top.min(live.frame_top_row.saturating_sub(delta).max(1)),
-        None => top + h,
-    };
-    for r in from..=floor {
-        if r >= top && r < top + h {
-            continue; // painted above
+    let below = (floor + 1).saturating_sub(top + h);
+    if below > 0 {
+        // Step down first: the cursor is on the block's *last* row, and the row
+        // about to be cleared is the one below it.
+        cud(&mut s, 1);
+        for i in 0..below {
+            s.push_str(EL);
+            if i + 1 < below {
+                cud(&mut s, 1);
+            }
         }
-        s.push_str(&cup(r, 1));
-        s.push_str("\x1b[K");
+        cuu(&mut s, below);
     }
 
-    // 4. Caret, then 5. cache update.
-    let caret = push_caret(&mut s, frame, top, th);
+    // 4. Paint bottom-up: the cursor is on the block's last row, so every row
+    //    is one `CUU 1` below the one to paint. Walking down instead would not
+    //    work — `CUD` clamps at the bottom row rather than scrolling — and
+    //    painting down would need a walk to the top first.
+    for i in (0..h).rev() {
+        if i + 1 < h {
+            cuu(&mut s, 1);
+        }
+        s.push('\r');
+        s.push_str(frame.row(i));
+    }
+
+    // 5. Caret (absolute row returned for bookkeeping only), then the cache.
+    //    An empty frame is the "erase the region" operation: it parks the
+    //    cursor on the region's first row, so whatever the caller appends next
+    //    lands where the frame was (plan §5.3).
+    let caret = if h == 0 {
+        cuu(&mut s, old_cur);
+        (top, 0)
+    } else {
+        push_caret(&mut s, frame, top, th)
+    };
     cache.live = Some(LiveFrame {
         frame_top_row: top,
         term_w: tw,
@@ -513,13 +577,25 @@ fn plan_full(
     s
 }
 
-/// Partial apply (plan §4.4): repaint only the rows whose bytes changed, clear
-/// rows an orphaned (shrunken) frame left behind, and reposition the caret. One
-/// batched write with no newlines — it can never scroll.
+/// Partial apply: repaint only the rows whose bytes changed, clear rows an
+/// orphaned (shrunken) frame left behind, and walk the caret back. One batched
+/// write with no newlines — it can never scroll, and every row is reached from
+/// the previous one rather than addressed.
 fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> String {
     let h_new = frame.height();
-    let h_old = cache.live.as_ref().map_or(0, |l| l.frame.height());
+    // Where the previous apply left the cursor: *its* caret, which is a
+    // frame-relative quantity — no absolute row, and no dependence on the
+    // tracked row agreeing with the terminal. This is the walk's starting
+    // point; the caret the new frame wants is where the walk must end, and the
+    // two differ whenever the frame grew or shrank around the caret (a
+    // Shift+Enter, an editor re-wrap).
+    let (from, h_old) = {
+        let live = cache.live.as_ref().expect("partial needs a live frame");
+        (frame_caret(&live.frame), live.frame.height())
+    };
+    let (to_r, to_c) = frame_caret(frame);
     let mut s = String::new();
+    let mut at = from.0;
     {
         let old = &cache
             .live
@@ -527,25 +603,25 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
             .expect("partial needs a live frame")
             .frame;
         for i in 0..h_new.max(h_old) {
-            match (i < h_new, i < h_old) {
-                (true, true) if frame.row(i) != old.row(i) => {
-                    s.push_str(&cup(top + i, 1));
-                    s.push_str(frame.row(i));
-                }
-                (true, false) => {
-                    s.push_str(&cup(top + i, 1));
-                    s.push_str(frame.row(i));
-                }
-                (false, true) => {
-                    // Frame shrank: erase the orphaned row.
-                    s.push_str(&cup(top + i, 1));
-                    s.push_str("\x1b[K");
-                }
-                _ => {}
-            }
+            let bytes: Option<&str> = match (i < h_new, i < h_old) {
+                (true, true) if frame.row(i) != old.row(i) => Some(frame.row(i)),
+                (true, false) => Some(frame.row(i)),
+                // Frame shrank: erase the orphaned row.
+                (false, true) => Some(EL),
+                _ => None,
+            };
+            let Some(bytes) = bytes else { continue };
+            move_rows(&mut s, at, i);
+            s.push('\r');
+            s.push_str(bytes);
+            at = i;
         }
     }
-    let caret = push_caret(&mut s, frame, top, th);
+    move_rows(&mut s, at, to_r);
+    // `CR` first, for the same reason as `push_caret`: the last repainted row
+    // left the cursor at its end, and `CUF` walks from the current column.
+    s.push('\r');
+    cuf(&mut s, to_c);
     let (term_w, term_h) = {
         let live = cache.live.as_ref().expect("partial needs a live frame");
         (live.term_w, live.term_h)
@@ -556,22 +632,22 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
         term_h,
         frame: frame.clone(),
     });
-    cache.caret = caret;
+    cache.caret = ((top + to_r).clamp(1, th), to_c);
     s
 }
 
 /// Erase the live frame's rows so a content write cannot leave any of it behind,
-/// and put the caret back where it was.
+/// and leave the caret where it was.
 ///
 /// A content write starts at the cursor, and the cursor is *inside* the live
 /// frame (the REPL's input row, or a dialog's caret). The content grows
 /// downward from there, overwriting the frame from the caret down — and
 /// stranding the rest, which nothing else reclaims: the next frame apply's
-/// union clear reaches the previous frame's rows only while `live` is set, and
-/// this write is what clears it. That is the shape of the reported resume
-/// artefact (ui_draw_v2 §1.1): a menu's table header and rows left on screen
-/// underneath replayed content, because the replay wrote while the menu's frame
-/// was still live.
+/// clear only reaches the previous frame's rows while `live` is set, and this
+/// write is what clears it. That is the shape of the reported resume artefact
+/// (ui_draw_v2 §1.1): a menu's table header and rows left on screen underneath
+/// replayed content, because the replay wrote while the menu's frame was still
+/// live.
 ///
 /// Whole-region rather than "the rows the content will miss": a content line
 /// shorter than the terminal leaves the frame's background to its right, and
@@ -579,78 +655,168 @@ fn plan_partial(cache: &mut DrawCache, frame: &Frame, top: usize, th: usize) -> 
 /// which is the case for every streamed block, so this costs nothing while a
 /// turn runs.
 ///
-/// Absolute addressing is correct here because a live frame means a user
-/// keystroke (or a dialog) put it there — the one case where the terminal is
-/// not merely showing scrollback (doc/row_accounting.md, zone 3).
+/// The rows are walked from the cursor, so this is correct regardless of where
+/// the terminal thinks the block is — there is no row to get wrong
+/// (row_accounting §6b).
 pub(crate) fn plan_clear_live_frame(cache: &mut DrawCache) -> String {
     let Some(live) = cache.live.as_ref() else {
         return String::new();
     };
-    let top = live.frame_top_row;
-    let bottom = top + live.frame.height().saturating_sub(1);
-    let (caret_row, caret_col) = cache.caret;
+    let h = live.frame.height();
+    let (cur, col) = frame_caret(&live.frame);
     let mut s = String::new();
-    for r in top..=bottom {
-        s.push_str(&cup(r, 1));
-        s.push_str("\x1b[K");
-    }
-    // The clear walked the cursor to the last row; put it back, since the
-    // content write is about to start from it.
-    s.push_str(&cup(caret_row, caret_col + 1));
+    erase_block(&mut s, h, cur, col);
     cache.live = None;
     s
 }
 
-/// Append apply (plan §2, commit lines): write the rows at the anchor as
-/// content, scrolling the overflow into scrollback, and leave the caret on the
-/// row just below the block. No region clear; `live` is cleared so the next
-/// frame re-anchors at the cursor.
+/// Append apply (plan §2, commit lines): write the rows as content — the
+/// natural form, a row and a newline each, so the terminal wraps and scrolls on
+/// its own terms and no row is addressed. The caret lands just below the block.
+/// No region clear; `live` is cleared so the next frame re-anchors at the
+/// cursor.
 fn plan_append(cache: &mut DrawCache, frame: &Frame, anchor: usize, th: usize) -> String {
     let h = frame.height();
     let delta = (anchor + h).saturating_sub(1).saturating_sub(th);
     let top = anchor.saturating_sub(delta).max(1);
     let mut s = String::new();
-    if delta > 0 {
-        s.push_str(&cup(th, 1));
-        for _ in 0..delta {
-            s.push('\n');
-        }
-    }
     for i in 0..h {
-        s.push_str(&cup(top + i, 1));
+        s.push('\r');
         s.push_str(frame.row(i));
+        // A bare LF at the last row scrolls the block into scrollback — exactly
+        // the commit-line behavior. Bare, because the tty's OPOST/ONLCR maps it
+        // to CRLF; the explicit `CR` above keeps this correct without it.
+        s.push('\n');
     }
-    // Move to the row just below the block. A bare LF at the last row scrolls
-    // the block into scrollback — exactly the commit-line behavior.
-    s.push('\n');
     cache.live = None;
     cache.screen_bottom = th;
     cache.caret = ((top + h).min(th), 0);
     s
 }
 
-/// Emit the caret move (`CUP` to the row, `CHA` to the column) and return the
-/// absolute `(row, col)` to store. Frames without a caret rest at the frame's
-/// bottom-left.
+/// Emit the caret move from the block's *first* row and return the absolute
+/// `(row, col)` to store. The row is bookkeeping only — it is what row
+/// accounting compares against a terminal, and it is never addressed.
 fn push_caret(s: &mut String, frame: &Frame, top: usize, th: usize) -> (usize, usize) {
+    let (r, c) = frame_caret(frame);
+    // `CR` first: the paint left the cursor at the end of the block's first
+    // row, and `CUF` is relative — so the column it walks from has to be known
+    // rather than assumed.
+    s.push('\r');
+    cud(s, r);
+    cuf(s, c);
+    ((top + r).clamp(1, th), c)
+}
+
+/// Where the cursor rests once a block is painted: the frame's own caret, or
+/// the block's last row column 0 for a frame without one (a dialog with no
+/// caret, the input with the caret windowed off).
+///
+/// Both components are frame-relative, which is the point: they survive a
+/// re-anchor, a resize, or any disagreement about the absolute row, because no
+/// absolute row is involved. `cache.caret` is the absolute restatement, for
+/// row accounting alone.
+fn frame_caret(frame: &Frame) -> (usize, usize) {
+    let h = frame.height();
     match frame.caret {
-        Some((r, c)) if top + r <= th => {
-            let row = top + r;
-            s.push_str(&cup(row, 1));
-            s.push_str(&format!("\x1b[{}G", c + 1));
-            (row, c)
-        }
-        _ => {
-            let row = (top + frame.height().saturating_sub(1)).clamp(1, th);
-            s.push_str(&cup(row, 1));
-            (row, 0)
+        Some((r, c)) if r < h => (r, c),
+        _ => (h.saturating_sub(1), 0),
+    }
+}
+
+// --- relative cursor moves -------------------------------------------------
+//
+// The frame is drawn from the cursor and never addressed (row_accounting §6b).
+// A count of 0 emits nothing, so a caller can compute its walk unconditionally.
+//
+// `CUU` clamps at the top row and `CUD` at the bottom row — neither scrolls —
+// so a walk that must stay inside a block is bounded by that block's height,
+// and a walk that may leave it (the clear below) is bounded by the floor.
+
+/// `CSI K` — erase from the cursor to the end of the row.
+const EL: &str = "\x1b[K";
+
+/// Absolute cursor position, `CSI {row};{col} H`, both 1-based.
+///
+/// The *only* addressing left in a frame apply, and it is confined to
+/// [`DrawCache::reanchor`] — the one path where the cursor may have left the
+/// live block and the block's row is the only way back to its rows. Everything
+/// that paints, erases, or places a caret is a walk from the cursor, so a
+/// tracked row that disagrees with the terminal costs a bookkeeping error and
+/// never a wrong row on screen (row_accounting §6b).
+fn cup(row: usize, col: usize) -> String {
+    format!("\x1b[{row};{col}H")
+}
+
+// CSI {n} A — up `n` rows.
+fn cuu(s: &mut String, n: usize) {
+    if n > 0 {
+        s.push_str(&format!("\x1b[{n}A"));
+    }
+}
+
+// CSI {n} B — down `n` rows.
+fn cud(s: &mut String, n: usize) {
+    if n > 0 {
+        s.push_str(&format!("\x1b[{n}B"));
+    }
+}
+
+// CSI {n} C — right `n` columns.
+fn cuf(s: &mut String, n: usize) {
+    if n > 0 {
+        s.push_str(&format!("\x1b[{n}C"));
+    }
+}
+
+/// Walk the cursor from block row `from` to block row `to`.
+fn move_rows(s: &mut String, from: usize, to: usize) {
+    if to >= from {
+        cud(s, to - from)
+    } else {
+        cuu(s, from - to)
+    }
+}
+
+/// Erase the `h` rows of the block the cursor is inside — the cursor sitting at
+/// block row `cur`, column `col` — and leave it back at that caret.
+///
+/// Bottom-up, because a walk *down* out of the block is impossible: `CUD`
+/// clamps at the bottom row instead of scrolling. Up is safe, and the count is
+/// the block's own height, so the walk stops on its first row without clamping
+/// at row 1.
+fn erase_block(s: &mut String, h: usize, cur: usize, col: usize) {
+    if h == 0 {
+        return;
+    }
+    let cur = cur.min(h - 1);
+    cud(s, h - 1 - cur);
+    erase_up(s, h);
+    cud(s, cur);
+    // `CR` before the `CUF`: the walks above preserve the column, and the
+    // postcondition is the caret's column whatever the cursor arrived on.
+    s.push('\r');
+    cuf(s, col);
+}
+
+/// Erase `h` rows *upward* from the cursor's row, ending on the first of them.
+fn erase_up(s: &mut String, h: usize) {
+    for i in 0..h {
+        s.push_str(EL);
+        if i + 1 < h {
+            cuu(s, 1);
         }
     }
 }
 
-/// Absolute cursor position (CUP): `CSI {row};{col} H`, both 1-based.
-fn cup(row: usize, col: usize) -> String {
-    format!("\x1b[{row};{col}H")
+/// Erase `h` rows *downward* from the cursor's row, ending on the last of them.
+fn erase_down(s: &mut String, h: usize) {
+    for i in 0..h {
+        s.push_str(EL);
+        if i + 1 < h {
+            cud(s, 1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -943,13 +1109,22 @@ mod apply_tests {
         s.replace('\n', "\r\n").into_bytes()
     }
 
-    /// A fresh emulator fed each chunk in order.
-    fn run(rows: usize, cols: usize, chunks: &[&str]) -> Parser {
+    /// A fresh emulator with the cursor `n` rows down, as a run of content
+    /// lines leaves it.
+    ///
+    /// This is how a test now says "put the block at row n": a frame apply is
+    /// relative to the cursor (row_accounting §6b), so the cursor has to be
+    /// there first — and in production it gets there by content writing lines,
+    /// which is what these newlines stand in for.
+    fn at(rows: usize, cols: usize, n: usize) -> Parser {
         let mut p = Parser::new(rows as u16, cols as u16, 2000);
-        for c in chunks {
-            p.process(&onlcr(c));
-        }
+        p.process(&onlcr(&"\n".repeat(n)));
         p
+    }
+
+    /// Feed one more chunk to an existing emulator.
+    fn feed(p: &mut Parser, chunk: &str) {
+        p.process(&onlcr(chunk));
     }
 
     /// Screen contents as trimmed strings, one per row.
@@ -980,12 +1155,101 @@ mod apply_tests {
         render(&[Element::Lines(rows)], &[h], tw)
     }
 
+    /// The parameters of every `CSI … H` (CUP) in a planned byte string.
+    ///
+    /// Scans for the real escape sequence rather than looking for an `H`, so
+    /// frame *content* containing a letter `H` cannot pass for an address.
+    fn cups(s: &str) -> Vec<String> {
+        let b: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == '\x1b' && b.get(i + 1) == Some(&'[') {
+                let start = i + 2;
+                let mut j = start;
+                while j < b.len() && (b[j].is_ascii_digit() || b[j] == ';') {
+                    j += 1;
+                }
+                if b.get(j) == Some(&'H') {
+                    out.push(b[start..j].iter().collect());
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// A3.1's invariant: **a frame apply never addresses a row.** Every path
+    /// — first paint, in-place repaint, shrink, scroll, the content-write
+    /// clear, and the append — paints, erases and places its caret by walking
+    /// from the cursor, so a tracked row that disagrees with the terminal costs
+    /// a bookkeeping error and never a wrong row on screen
+    /// (row_accounting §6b).
+    #[test]
+    fn no_apply_addresses_a_row() {
+        let mut cache = DrawCache::new(24);
+        let f3 = lines_frame(&["aa", "bb", "cc"], 20);
+        let mut plans = Vec::new();
+        // First paint, from the cursor.
+        plans.push(plan_apply(&mut cache, &f3, 5, ApplyPolicy::Frame, 20, 24));
+        // In-place repaint of one row.
+        let f3b = lines_frame(&["aa", "XX", "cc"], 20);
+        plans.push(plan_apply(&mut cache, &f3b, 5, ApplyPolicy::Frame, 20, 24));
+        // Shrink: the orphaned rows are erased by a walk, not by addressing.
+        let f1 = lines_frame(&["aa"], 20);
+        plans.push(plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24));
+        // A frame too tall for the screen, so the apply must scroll.
+        let mut tall = DrawCache::new(10);
+        plans.push(plan_apply(
+            &mut tall,
+            &lines_frame(&["a", "b", "c", "d", "e"], 20),
+            8,
+            ApplyPolicy::Frame,
+            20,
+            10,
+        ));
+        // The content-write clear.
+        plans.push(plan_clear_live_frame(&mut cache));
+        // Append, which writes the rows as content.
+        let mut app = DrawCache::new(24);
+        plans.push(plan_apply(&mut app, &f3, 5, ApplyPolicy::Append, 20, 24));
+        for p in &plans {
+            assert!(cups(p).is_empty(), "apply addressed a row: {p:?}");
+        }
+    }
+
+    /// The other half of the invariant: the re-anchor *is* allowed to address,
+    /// and must keep doing so — a cursor that left the block puts its rows out
+    /// of reach of every relative walk, so the erase that precedes every paint
+    /// would clear the wrong rows (row_accounting §6b).
+    #[test]
+    fn reanchor_is_the_one_addressing_path() {
+        let mut cache = DrawCache::new(24);
+        let f = lines_frame(&["one", "two"], 20);
+        let mut p = at(24, 20, 4);
+        feed(
+            &mut p,
+            &plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24),
+        );
+        let (_, clear) = cache.reanchor(Some(9));
+        // Erase the block's rows where they are, then park on the new row.
+        assert_eq!(cups(&clear), vec!["5;1", "6;1", "9;1"], "{clear:?}");
+        // And with no frame live it is only the cursor park — which is why it is
+        // safe to run on every `cursor_row()` call, including mid-stream.
+        let mut idle = DrawCache::new(24);
+        let (_, park) = idle.reanchor(Some(7));
+        assert_eq!(cups(&park), vec!["7;1"], "{park:?}");
+    }
+
     #[test]
     fn full_paints_rows_and_clears_below() {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
         let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
-        let p = run(24, 20, &[&s]);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "one");
         assert_eq!(rows[5], "two");
@@ -1001,9 +1265,12 @@ mod apply_tests {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
         let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
-        // Seed stale content the frame must erase.
-        let seed = "\x1b[8;1Hstale8\x1b[9;1Hstale9";
-        let p = run(24, 20, &[seed, &s]);
+        // Seed stale content the frame must erase, then put the cursor back on
+        // row 5: the frame applies relative to wherever the cursor is.
+        let seed = "\x1b[8;1Hstale8\x1b[9;1Hstale9\x1b[5;1H";
+        let mut p = at(24, 20, 4);
+        feed(&mut p, seed);
+        feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[7], "");
         assert_eq!(rows[8], "");
@@ -1018,7 +1285,9 @@ mod apply_tests {
         let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
         assert!(s2.contains("XX"), "changed row repainted");
         assert!(!s2.contains("aa"), "unchanged rows skipped");
-        let p = run(24, 20, &[&s1, &s2]);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s1);
+        feed(&mut p, &s2);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "aa");
         assert_eq!(rows[5], "XX");
@@ -1032,11 +1301,75 @@ mod apply_tests {
         let s1 = plan_apply(&mut cache, &f1, 5, ApplyPolicy::Frame, 20, 24);
         let f2 = lines_frame(&["aa"], 20);
         let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 20, 24);
-        let p = run(24, 20, &[&s1, &s2]);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s1);
+        feed(&mut p, &s2);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "aa");
         assert_eq!(rows[5], "");
         assert_eq!(rows[6], "");
+    }
+
+    /// The caret must follow the **new** frame, not the one it replaces.
+    ///
+    /// A frame that grows a row below the caret — Shift+Enter, an editor
+    /// re-wrap — used to leave the cursor on the previous frame's caret row, so
+    /// the next keystroke painted the *second* row where the first one was and
+    /// the first row's text vanished. The pty test
+    /// `shift_enter_inserts_newline_without_kitty` catches it end to end, but
+    /// nothing in this module could, so it is pinned here in the three applies
+    /// that actually happen: type, Shift+Enter, type again.
+    #[test]
+    fn a_frame_that_grows_below_the_caret_takes_the_caret_with_it() {
+        let mut e = LineEditor::new();
+        let input = |e: &LineEditor, rows: &[usize]| {
+            render(
+                &[Element::Input {
+                    layout: e.layout(20, "> "),
+                    prompt: "> ".to_string(),
+                }],
+                rows,
+                20,
+            )
+        };
+        let mut cache = DrawCache::new(24);
+        e.insert_str("abc");
+        let s1 = plan_apply(&mut cache, &input(&e, &[1]), 5, ApplyPolicy::Frame, 20, 24);
+        // Shift+Enter: a second row appears and the caret moves onto it.
+        e.insert_newline();
+        let anchor = cache.anchor();
+        let s2 = plan_apply(
+            &mut cache,
+            &input(&e, &[2]),
+            anchor,
+            ApplyPolicy::Frame,
+            20,
+            24,
+        );
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s1);
+        feed(&mut p, &s2);
+        assert_eq!(screen(&p, 24, 20)[4], "> abc", "first row survives");
+        assert_eq!(
+            p.screen().cursor_position(),
+            (5, 0),
+            "the caret follows the caret onto the new row"
+        );
+        // The next keystroke lands on the new row, and the first keeps its text.
+        e.insert_str("d");
+        let anchor = cache.anchor();
+        let s3 = plan_apply(
+            &mut cache,
+            &input(&e, &[2]),
+            anchor,
+            ApplyPolicy::Frame,
+            20,
+            24,
+        );
+        feed(&mut p, &s3);
+        let rows = screen(&p, 24, 20);
+        assert_eq!(rows[4], "> abc");
+        assert_eq!(rows[5], "d");
     }
 
     #[test]
@@ -1045,7 +1378,8 @@ mod apply_tests {
         let f = lines_frame(&["a", "b", "c"], 20);
         // anchor 9 + 3 rows = row 11 > 10 → delta 1.
         let s = plan_apply(&mut cache, &f, 9, ApplyPolicy::Frame, 20, 10);
-        let p = run(10, 20, &[&s]);
+        let mut p = at(10, 20, 8);
+        feed(&mut p, &s);
         let rows = screen(&p, 10, 20);
         assert_eq!(rows[7], "a");
         assert_eq!(rows[8], "b");
@@ -1059,12 +1393,19 @@ mod apply_tests {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["head"], 20);
         let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 40);
-        assert!(
-            !s.contains("\x1b[25;1H"),
-            "clear must stop at the old bottom (24)"
+        // 19 rows below the block (6..=24) plus the painted row's own `EL` —
+        // and not the 35 down to 40, which is what a clear to the new bottom
+        // would have been. The absolute path expressed the same floor as
+        // "does not touch row 25".
+        assert_eq!(
+            s.matches("\x1b[K").count(),
+            20,
+            "clear must stop at the old bottom (24): {s:?}"
         );
-        let seed = "\x1b[25;1Hkeep25\x1b[30;1Hkeep30";
-        let p = run(40, 20, &[seed, &s]);
+        let seed = "\x1b[25;1Hkeep25\x1b[30;1Hkeep30\x1b[5;1H";
+        let mut p = at(40, 20, 4);
+        feed(&mut p, seed);
+        feed(&mut p, &s);
         let rows = screen(&p, 40, 20);
         assert_eq!(rows[24], "keep25");
         assert_eq!(rows[29], "keep30");
@@ -1075,14 +1416,24 @@ mod apply_tests {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["one", "two"], 20);
         let s1 = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
-        // Same size/shape, different anchor → full apply, old rows cleared.
-        let s2 = plan_apply(&mut cache, &f, 8, ApplyPolicy::Frame, 20, 24);
-        let p = run(24, 20, &[&s1, &s2]);
+        // A foreign writer moved the cursor to row 8. The re-anchor both records
+        // where it went and erases the block's old rows — the one absolute
+        // address in a frame apply, and the reason it exists: from row 8 a
+        // relative walk cannot reach rows 5 and 6 at all.
+        let (row, clear) = cache.reanchor(Some(8));
+        let s2 = plan_apply(&mut cache, &f, row, ApplyPolicy::Frame, 20, 24);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s1);
+        feed(&mut p, &clear);
+        feed(&mut p, &s2);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "");
         assert_eq!(rows[5], "");
         assert_eq!(rows[7], "one");
         assert_eq!(rows[8], "two");
+        // A block painted *over* the old one would leave nothing to assert: the
+        // erase is what makes rows 5 and 6 blank rather than overwritten.
+        assert_eq!(p.screen().cursor_position(), (8, 0));
     }
 
     #[test]
@@ -1093,6 +1444,8 @@ mod apply_tests {
         let f2 = lines_frame(&["aa"], 20);
         let s2 = plan_apply(&mut cache, &f2, 5, ApplyPolicy::Frame, 40, 24);
         assert!(s2.contains("aa"), "width change repaints the row");
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s2);
     }
 
     #[test]
@@ -1101,7 +1454,8 @@ mod apply_tests {
         let f = lines_frame(&["div", "line"], 20);
         let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Append, 20, 24);
         assert!(s.ends_with('\n'), "append ends on a fresh line");
-        let p = run(24, 20, &[&s]);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
         let rows = screen(&p, 24, 20);
         assert_eq!(rows[4], "div");
         assert_eq!(rows[5], "line");
@@ -1115,7 +1469,8 @@ mod apply_tests {
         let mut cache = DrawCache::new(24);
         let f = lines_frame(&["x"], 20);
         let s = plan_apply(&mut cache, &f, 999, ApplyPolicy::Frame, 20, 24);
-        let p = run(24, 20, &[&s]);
+        let mut p = at(24, 20, 23);
+        feed(&mut p, &s);
         assert_eq!(screen(&p, 24, 20)[23], "x");
     }
 
@@ -1134,7 +1489,8 @@ mod apply_tests {
             20,
         );
         let s = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 24);
-        let p = run(24, 20, &[&s]);
+        let mut p = at(24, 20, 4);
+        feed(&mut p, &s);
         // "> hi" at 1-based row 5; caret after "hi" → col 4.
         assert_eq!(p.screen().cursor_position(), (4, 4));
         assert_eq!(cache.anchor(), 5);
@@ -1158,7 +1514,7 @@ mod apply_tests {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
         let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(Some(3)), 3);
+        assert_eq!(cache.reanchor(Some(3)).0, 3);
         assert_eq!(cache.anchor(), 3);
     }
 
@@ -1172,7 +1528,7 @@ mod apply_tests {
         let mut cache = DrawCache::new(10);
         let f = lines_frame(&["x"], 20);
         let _ = plan_apply(&mut cache, &f, 5, ApplyPolicy::Frame, 20, 10);
-        assert_eq!(cache.reanchor(None), 5, "tracked row stands");
+        assert_eq!(cache.reanchor(None).0, 5, "tracked row stands");
         assert!(cache.live.is_none(), "live frame must be invalidated");
         // Identical frame, same anchor: the partial path would emit nothing
         // but the caret; the full path clears the region below the frame.
@@ -1200,7 +1556,9 @@ mod apply_tests {
         let anchor = cache.anchor();
         let s = plan_apply(&mut cache, &short, anchor, ApplyPolicy::Frame, 20, 40);
         assert_eq!(cache.anchor(), 37, "shrink must not scroll back down");
-        let p = run(40, 20, &[&s1, &s]);
+        let mut p = at(40, 20, 37);
+        feed(&mut p, &s1);
+        feed(&mut p, &s);
         let rows = screen(&p, 40, 20);
         assert_eq!(rows[36], "a");
         assert_eq!(rows[37], "", "shrunken rows cleared in place");
@@ -1222,7 +1580,8 @@ mod apply_tests {
             1,
             "only the painted row erases itself: {s:?}"
         );
-        let p = run(40, 20, &[&s]);
+        let mut p = at(40, 20, 39);
+        feed(&mut p, &s);
         assert_eq!(screen(&p, 40, 20)[39], "here");
     }
 }

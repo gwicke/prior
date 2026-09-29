@@ -1853,12 +1853,36 @@ impl Output for ConsoleOutput {
         // ANSI escapes, and termimad-rendered responses). Fall back
         // to the tracked/ANSI-stripped prediction if the terminal
         // does not answer the Device Status Report (e.g. a headless pty).
-        // Both paths re-anchor and invalidate the frame region — the
+        // Both paths re-anchor and retire the frame region — the
         // fallback too: a silent terminal offers no more guarantee than an
         // answering one, so §4.2's "any uncertainty → clear it" applies to
         // it as well (plan §9 latent issue 2).
         let row = query_real_cursor_row();
-        self.draw.lock().unwrap().reanchor(row)
+        // The re-anchor erases the live frame's rows, which is why it returns
+        // bytes: a resize or a foreign writer can leave the cursor outside the
+        // block, and the relative walks the frame path uses cannot reach rows
+        // above the cursor from there. This is the one absolute address in a
+        // frame apply (row_accounting §6b), and it costs nothing when no frame
+        // is live — every streamed block, and every commit — because the bytes
+        // are then just the cursor park. So it belongs here rather than at the
+        // call sites: all of them already treat this as a side-effecting
+        // re-anchor, and none of them writes.
+        //
+        // Writer before cache, as in `draw_frame`: one atomic step for the
+        // emission and the cache advance, and never `draw` held while
+        // acquiring `writer`.
+        let mut out = self.writer.lock().unwrap();
+        let (row, bytes) = {
+            let mut cache = self.draw.lock().unwrap();
+            cache.reanchor(row)
+        };
+        let _ = out.write_all(bytes.as_bytes());
+        let _ = out.flush();
+        // A frame no longer owns the tail rows: it was just retired, so the
+        // transient status may paint there again.
+        self.frame_owns_tail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        row
     }
 
     fn frame_size(&self) -> (usize, usize) {
@@ -4014,6 +4038,11 @@ mod tests {
         let bytes = out.end_capture();
 
         let mut p = vt100::Parser::new(24, 40, 1000);
+        // The capture starts at the terminal's first row, but the frame apply is
+        // relative to the cursor (row_accounting §6b) and is told the anchor is
+        // row 3 — which in production is where a run of content lines left the
+        // cursor. Stand those two lines in before replaying.
+        p.process(b"\r\n\r\n");
         let onlcr: Vec<u8> = bytes
             .iter()
             .flat_map(|&b| {

@@ -416,6 +416,70 @@ change without addressing anything.
   hitting a bounded, computed row range. The DSR escape hatch is what covers it,
   which makes "when do we re-anchor" a real question rather than a formality.
 
+#### A3.1 — the frame path goes relative (done)
+
+`plan_full`, `plan_partial`, `plan_clear_live_frame` and `plan_append` emit no
+absolute address. `cup` survives in exactly one function, `DrawCache::reanchor`,
+and `no_apply_addresses_a_row` / `reanchor_is_the_one_addressing_path` hold both
+halves of that: every apply path is scanned for a real `CSI … H` (scanning the
+escape, not the letter, so frame content containing an `H` cannot pass for an
+address), and the re-anchor is asserted to keep using one.
+
+Five things had to be worked out, and each was a bug first:
+
+- **The scroll is `h-1` bare LFs.** An LF scrolls at the bottom row and moves
+  down one anywhere else, so `h-1` of them put the block's last row on the
+  cursor and pushed exactly `delta` lines into scrollback — the same split
+  `plan_full` used to compute from the tracked row, except the *terminal*
+  decides it, so the block fits even when the tracked row was wrong. This is
+  what removes the last need to know the row in order to place a block.
+- **The invariant is `live` set ⟺ the cursor is at that frame's caret**, which
+  holds because every other exit (`plan_clear_live_frame`, a content write's
+  `note_lines`, `reanchor`) drops `live`. It is what makes the walks
+  well-defined — and it is load-bearing, because a full apply *starts* by
+  walking to the block's top. Missing that walk made the block creep down one
+  row per redraw whenever the caret sat on the block's last row.
+- **Erase directions are not interchangeable.** `CUD` clamps at the bottom row
+  (no scroll) and `CUU` clamps at the top, so a block's own rows must be erased
+  bottom-up from its last row, while a caller already standing on the first row
+  walks down. Factoring the two into one helper is how `erase_block` briefly
+  erased the wrong rows — hence `erase_up` / `erase_down` as separate names. A
+  downward clear also has to step down *before* its first `EL`, or it erases the
+  block's own last row.
+- **`CUF` is relative, so the column has to be known.** After painting a row
+  the cursor is at that row's end, so every caret move is `CR` first. Guessing
+  put the caret at the end of the row *plus* the caret's column.
+- **A partial apply must follow the *new* frame's caret, not the old one's.**
+  A frame that grows a row below the caret (Shift+Enter, a re-wrap) left the
+  cursor on the previous caret's row, so the next keystroke painted the second
+  row where the first was and the first row's text vanished. The pty test caught
+  it; nothing in the module could, so
+  `a_frame_that_grows_below_the_caret_takes_the_caret_with_it` pins the three
+  applies that produce it.
+
+`frame_caret` is the piece the rest leans on: the frame's caret as a
+frame-relative `(row, col)`, or the block's last row column 0 when there is
+none. Every walk is anchored to it, so it survives a re-anchor, a resize, or any
+disagreement about the absolute row — `cache.caret` remains the absolute
+restatement, for row accounting alone.
+
+**The re-anchor changed shape, and it fixed a hole.** It now returns the bytes
+that erase the live block's rows, because a cursor that has *left* the block
+puts those rows out of reach of every relative walk — the erase that precedes
+every paint walks up from the cursor and would clear the wrong rows entirely.
+The old code had the same gap and did not close it: `reanchor` cleared `live`,
+and the next full apply's union clear measured from `live`, so the old rows were
+never reached. `cursor_row()` writes those bytes, which is why it is the one
+`Output` method with a side effect beyond its name — and it costs nothing when
+no frame is live, since the bytes are then just the cursor park, so it is right
+at every one of its thirteen call sites.
+
+Not yet done, deliberately: `frame_anchor` and `live.frame_top_row` still exist
+and still carry the bookkeeping, so `plan_apply` still takes an `anchor` and
+still computes `top`/`delta` — none of it is used for addressing, and
+`no_apply_addresses_a_row` is what keeps that true. A3.2 removes them.
+
+
 **Performance.** In bytes and in latency this is close to a wash, and the
 difference is not where intuition suggests:
 

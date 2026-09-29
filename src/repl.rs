@@ -3202,6 +3202,11 @@ mod tests {
                 term_rows,
             );
             let mut p = Parser::new(term_rows as u16, term_cols as u16, 1000);
+            // A frame apply is relative to the cursor (row_accounting §6b), so
+            // the cursor has to be where the tracked anchor says the block
+            // goes. In production it gets there by content writing lines, which
+            // is what these newlines stand in for.
+            p.process(&onlcr(&"\n".repeat(anchor.saturating_sub(1))));
             p.process(&onlcr(&s));
             let screen = p.screen();
             let (cr, cc) = screen.cursor_position();
