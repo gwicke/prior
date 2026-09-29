@@ -1525,17 +1525,38 @@ impl ConsoleOutput {
             return;
         }
         // Straight to the writer, **not** through the row counter: the status is
-        // transparent to the blank-line rule. It sits on the row the content's
-        // trailing newline left, and the next block must not find that row
-        // "not blank" and add a second one above itself — routing it through
-        // the counter made it opaque and grew a blank line per block.
+        // transparent to the blank-line rule, and now to the row count too (see
+        // the gap note below).
+        //
+        // The **gap**: one blank row between the last content line and the bar,
+        // so the two are never adjacent — which is what makes the bar readable
+        // below a grey tool panel.
+        //
+        // `ends_blank()` is the blank-line rule's own bit, and it already answers
+        // the only question there is: it is true when the row the stream *just
+        // closed* was itself empty. When it is, that row **is** the gap and the
+        // bar takes the current row — the status reuses the blank the content
+        // path already wrote instead of stacking a second one on top of it. When
+        // it is false the last line of the block is directly above, so the status
+        // opens a blank row of its own.
+        //
+        // Reusing the rule's bit rather than keeping a second opinion is the whole
+        // trick. The two features used to disagree and the screen showed it: a
+        // tool call's boundary blank and the gap were two different rows, so a
+        // boundary followed by a bar left *two* blank lines where one was meant.
+        // One source of truth cannot disagree with itself.
+        //
+        // The status therefore *owns* the gap when it needs one, instead of
+        // borrowing the content's trailing newline: a chunk that does not end on
+        // a newline does not leave a row to borrow.
         //
         // The write is relative and needs no row: `at_line_start` above is what
-        // admits us here, so the status starts a fresh line. A *wrapped* status
-        // does move the cursor down, and that is the one row movement to
-        // report — `rows_of` counts it, since a terminal wraps without a
-        // newline.
+        // admits us here, so the status starts a fresh line.
+        let gap = !self.stream_tail.ends_blank();
         let mut out = self.writer.lock().unwrap();
+        if gap {
+            let _ = out.write_all(b"\n");
+        }
         let _ = out.write_all(text.as_bytes());
         // The bar is exactly the terminal's width, so writing it leaves the
         // cursor *wrap-pending* in the last column. A `CR` cancels that, and
@@ -1566,11 +1587,19 @@ impl ConsoleOutput {
         let _ = out.write_all(HIDE_CURSOR);
         let _ = out.flush();
         drop(out);
-        let rows = crate::row_count::rows_of(&text, term_width());
+        // The gap row, when the paint opened one, plus the bar's own row. The
+        // bar is truncated to the terminal, so it cannot wrap and the `max(1)`
+        // is its single row — kept explicit so a future change that lets it wrap
+        // widens the erase instead of leaving a row behind.
+        let rows = usize::from(gap) + crate::row_count::rows_of(&text, term_width()).max(1);
         *self.status.lock().unwrap() = Some(StatusSpot { rows });
-        if rows > 0 {
-            self.note_lines(rows);
-        }
+        // **No `note_lines` here**, and the gap is why that is now structural
+        // rather than incidental. The cursor physically sits on the bar, one row
+        // below where the stream logically is; `clear_status` walks it back to
+        // the gap row before the next write, so every writer sees the row the
+        // content actually ended on. Counting the gap would push the tracked row
+        // one too far and the *next* block's blank-line rule would then see a
+        // row that is not blank.
     }
 
     /// Erase a transient status line, if one is showing, leaving the cursor at
@@ -3825,6 +3854,101 @@ mod tests {
         assert!(
             text.contains(STATUS),
             "the status must be written as plain text: {text:?}"
+        );
+    }
+
+    /// The bar never sits directly against the content: a blank row separates
+    /// them.
+    ///
+    /// A fenced block is the case that shows it, because a fence emits line by
+    /// line and its last byte is a single newline — the last line of text sits
+    /// directly above where the bar goes. A paragraph cannot show this: the
+    /// blank-line rule *swallows* the second newline and records the blank as
+    /// owed rather than written, so `"text\n\n"` reaches the screen as one
+    /// newline, and the text is above the bar there too.
+    #[test]
+    #[serial]
+    fn the_status_leaves_one_blank_row_above_itself() {
+        /// Escapes out: the bar is painted behind a cursor-hide, and the count
+        /// of newlines is the whole point.
+        fn visible(bytes: &[u8]) -> String {
+            strip_ansi(&String::from_utf8_lossy(bytes)).replace('\r', "")
+        }
+
+        let (out, _reasoning) = capturing_output(60);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status("[bar]");
+        out.stream_text("```\nalpha\n```\n");
+        let text = visible(&out.end_capture());
+        assert!(
+            text.contains("alpha\n\n[bar]"),
+            "one blank row between the last line of content and the bar: {text:?}"
+        );
+        assert!(!text.contains("alpha\n\n\n[bar]"), "and only one: {text:?}");
+    }
+
+    /// The status **reuses** a blank that is already on screen instead of
+    /// stacking a second one on top of it.
+    ///
+    /// `ends_blank()` is the blank-line rule's own bit, and it is the right
+    /// signal precisely because the rule swallows the second newline: a blank
+    /// line exists on screen only once a second `\n` has really been written, so
+    /// the bit flips exactly when a row above the bar is genuinely empty. The
+    /// two features used to keep separate opinions and the screen showed it — a
+    /// boundary blank and a gap of the bar's own are two different rows, so a
+    /// boundary followed by a bar left *two* blank lines where one was meant.
+    ///
+    /// The blank is written raw, because that is the only way to get two
+    /// consecutive newlines onto the screen: every high-level entry point routes
+    /// through the rule, which eats the second one.
+    #[test]
+    #[serial]
+    fn the_status_reuses_a_blank_that_is_already_on_screen() {
+        let (out, _reasoning) = capturing_output(60);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status("[bar]");
+        out.write_content(b"alpha\n");
+        out.write_content(b"\n"); // the blank line, really written
+        let text = String::from_utf8_lossy(&out.end_capture()).replace('\r', "");
+        assert!(
+            text.contains("alpha\n\n[bar]"),
+            "the blank already on screen is the gap: {text:?}"
+        );
+        assert!(
+            !text.contains("alpha\n\n\n[bar]"),
+            "the bar must not add a second one: {text:?}"
+        );
+    }
+
+    /// The erase has to cover the gap as well as the bar, and it has to leave the
+    /// cursor where the next block writes.
+    ///
+    /// The gap is the status's own row when it opened one, and the next content
+    /// write lands *there* — so an erase that only covered the bar would leave
+    /// the blank line behind, once per block, for the rest of the session.
+    #[test]
+    #[serial]
+    fn erasing_the_status_also_erases_its_gap() {
+        let (out, _reasoning) = capturing_output(60);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status("[bar]");
+        out.stream_text("```\nalpha\n```\n");
+        out.stream_text("```\nbeta\n```\n");
+        let text = String::from_utf8_lossy(&out.end_capture()).into_owned();
+        // The erase walks up over the bar and the gap: two erase-in-line, and
+        // the `CUU` is what makes it a walk rather than a single row.
+        assert_eq!(
+            text.matches("\x1b[K").count(),
+            2,
+            "the bar and its gap, one erase each: {text:?}"
+        );
+        assert_eq!(
+            text.matches("\x1b[1A").count(),
+            1,
+            "one row up, from the bar to the gap: {text:?}"
         );
     }
 
