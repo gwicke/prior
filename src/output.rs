@@ -109,6 +109,19 @@ pub trait Output: Send + Sync {
         self.confirm(message)
     }
     fn display_separator(&self);
+    /// Set the transient status line the output should paint after each content
+    /// block while a turn runs — the session / model / context readout.
+    ///
+    /// Transient and *relative* (never `CUP`, so a viewport scrolled back into
+    /// the scrollback is never written into — the write lands below it,
+    /// invisible). It occupies the content's last row and the next content
+    /// write erases it, so the policy of when to paint it lives in the output
+    /// and the caller only supplies the text. Empty disables it. A live frame
+    /// (the prompt's input, a dialog) owns the last rows instead, so nothing is
+    /// painted then.
+    ///
+    /// Default no-op: outputs with no cursor to write at have no status line.
+    fn set_status(&self, _text: &str) {}
     fn display_thinking(&self, message: &str);
     fn stop_thinking(&self);
     fn display_header(
@@ -473,6 +486,19 @@ pub struct ConsoleOutput {
     /// screen at exactly those points, and the boundary then emits a second
     /// blank — which is the class of bug the separator matrix pinned.
     stream_tail: StreamTail,
+    /// Where the transient status line currently sits, so the next content
+    /// write can erase it (`None` when none is showing).
+    status: Mutex<Option<StatusSpot>>,
+    /// The status text to paint after each content block (empty = off).
+    status_text: Mutex<String>,
+    /// A frame has claimed the tail rows since the last status paint.
+    ///
+    /// Sticky on purpose: one content *burst* is often several writes (a
+    /// block's boundary, then its body), and the first erases the frame, so a
+    /// per-write "is a frame live?" would let the second paint a status onto
+    /// rows the frame owned. The flag clears on the first successful paint,
+    /// which is by definition after the content has moved past the frame.
+    frame_owns_tail: std::sync::atomic::AtomicBool,
     /// Stores the previous writer during a capture session (see
     /// [`ConsoleOutput::begin_capture`] / [`ConsoleOutput::end_capture`]).
     saved_writer: Mutex<Option<Box<dyn io::Write + Send>>>,
@@ -1236,6 +1262,9 @@ impl ConsoleOutput {
 
             last_tool: Mutex::new(None),
             stream_tail: StreamTail::new(),
+            status: Mutex::new(None),
+            status_text: Mutex::new(String::new()),
+            frame_owns_tail: std::sync::atomic::AtomicBool::new(false),
             saved_writer: Mutex::new(None),
         }
     }
@@ -1478,6 +1507,10 @@ impl ConsoleOutput {
     where
         F: FnOnce(&mut dyn io::Write) -> T,
     {
+        // A transient status line goes before anything is written over it, and
+        // the cursor returns to where it was — which is where this write
+        // starts. Ahead of the writer lock: `clear_status` takes it.
+        self.clear_status();
         let mut out = self.writer.lock().unwrap();
         // The counter updates the shared tail per byte, so a boundary
         // *inside* this block (a committed paragraph before the block that
@@ -1503,7 +1536,87 @@ impl ConsoleOutput {
         if rows > 0 {
             self.note_lines(rows);
         }
+        // The status line rides at the tail of the content, so it is live for
+        // the whole turn rather than only at its end. After the writer lock: it
+        // writes to the writer itself, deliberately outside the counter.
+        self.paint_status();
         r
+    }
+
+    /// Paint the transient status line at the cursor, if it is time.
+    ///
+    /// Called at the tail of every content write, so the readout is live for
+    /// the whole turn rather than only at its end. Three conditions are the
+    /// whole contract:
+    ///
+    /// - **Relative only** — the bytes are the text, no `CUP` — so a viewport
+    ///   scrolled back into the scrollback is never written into; the write
+    ///   lands below it, invisible. That is why this is not a frame element
+    ///   (doc/row_accounting.md, zone 2).
+    /// - **At column 0** — the line is transient and the next content write
+    ///   erases it, so starting it mid-line would take a partially written
+    ///   content line with it. `StreamTail::at_line_start` is that check, free.
+    /// - **No frame was live** — a frame owns the last rows (the prompt's
+    ///   input, a dialog), and the prompt-side status is a frame concern.
+    fn paint_status(&self) {
+        let text = self.status_text.lock().unwrap().clone();
+        if text.is_empty() || !self.stream_tail.at_line_start() {
+            return;
+        }
+        if self
+            .frame_owns_tail
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            // A frame claimed these rows, and this write only just erased them
+            // (see `plan_clear_live_frame`) — so the status waits for the next
+            // one, which lands below the content rather than among them. Held
+            // across a *burst*: the boundary write and the body write are two
+            // calls, and only the second is past the frame.
+            return;
+        }
+        // Straight to the writer, **not** through the row counter: the status is
+        // transparent to the blank-line rule. It sits on the row the content's
+        // trailing newline left, and the next block must not find that row
+        // "not blank" and add a second one above itself — routing it through
+        // the counter made it opaque and grew a blank line per block.
+        //
+        // The write is relative and needs no row: `at_line_start` above is what
+        // admits us here, so the status starts a fresh line. A *wrapped* status
+        // does move the cursor down, and that is the one row movement to
+        // report — `rows_of` counts it, since a terminal wraps without a
+        // newline.
+        let mut out = self.writer.lock().unwrap();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+        drop(out);
+        let rows = crate::row_count::rows_of(&text, term_width());
+        *self.status.lock().unwrap() = Some(StatusSpot { rows });
+        if rows > 0 {
+            self.note_lines(rows);
+        }
+    }
+
+    /// Erase a transient status line, if one is showing, leaving the cursor at
+    /// its first cell — which is where the next content write starts. Called at
+    /// the head of every content write, so the status never outlives the block
+    /// it annotated.
+    ///
+    /// Relative, like the write: the cursor has not moved since the status was
+    /// painted, so `CR` + `EL` is the whole of it and `CUU` covers the rows a
+    /// wrapped status took. No row is addressed at all, which matters twice
+    /// over — it cannot land on the wrong row, and it cannot write into a
+    /// viewport the user has scrolled back into.
+    fn clear_status(&self) {
+        let Some(spot) = self.status.lock().unwrap().take() else {
+            return;
+        };
+        let mut bytes = String::from("\r\x1b[K");
+        for _ in 1..spot.rows.max(1) {
+            bytes.push_str("\x1b[1A\r\x1b[K");
+        }
+        let mut out = self.writer.lock().unwrap();
+        let _ = out.write_all(bytes.as_bytes());
+        let _ = out.flush();
     }
 
     /// Commit all buffered *thinking* to the (dimmed) thinking renderer and
@@ -1675,6 +1788,13 @@ impl ConsoleOutput {
     }
 }
 
+/// How many rows the transient status line took — more than one when it wrapped
+/// at a narrow terminal. That is all the erase needs: the cursor is still where
+/// the status ended, so the erase is relative, exactly like the write.
+struct StatusSpot {
+    rows: usize,
+}
+
 /// The theme the answer renderer is built with: colours and clickable links on
 /// a terminal, plain otherwise. Shared with the tests, whose "what did the
 /// renderer alone produce" reference has to agree with it byte for byte or the
@@ -1766,6 +1886,10 @@ impl Output for ConsoleOutput {
         };
         let _ = out.write_all(bytes.as_bytes());
         let _ = out.flush();
+        // A frame now owns the tail rows: the transient status must not paint
+        // over them until content has moved past (see `frame_owns_tail`).
+        self.frame_owns_tail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         (tw, th)
     }
 
@@ -2350,6 +2474,13 @@ impl Output for ConsoleOutput {
 
     fn begin_capture(&self) {
         self.begin_capture_inner();
+    }
+
+    /// Remember the status line to paint after each content block; see
+    /// [`ConsoleOutput::paint_status`] for the three conditions that decide
+    /// whether it actually goes out.
+    fn set_status(&self, text: &str) {
+        *self.status_text.lock().unwrap() = text.to_string();
     }
 
     fn end_capture(&self) -> Vec<u8> {
@@ -3670,6 +3801,158 @@ mod tests {
         assert!(
             !lines[idx - 2].trim().is_empty(),
             "exactly ONE blank line before answer two (no double gap)"
+        );
+    }
+
+    /// The transient status line: painted after each content block, relative
+    /// only, and erased by the next content write.
+    #[test]
+    #[serial]
+    fn status_line_is_transient_and_relative() {
+        const STATUS: &str = "[sess | openrouter:some/model | ctx 12% · 8k]";
+        let (out, _reasoning) = capturing_output(60);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status(STATUS);
+        out.stream_text("first block.\n\n");
+        out.stream_text("second block.\n\n");
+        let bytes = out.end_capture();
+        let text = String::from_utf8_lossy(&bytes).replace('\r', "");
+
+        // Painted after each block, so the readout tracks the whole turn.
+        assert_eq!(
+            text.matches(STATUS).count(),
+            2,
+            "the status should follow each content block: {text:?}"
+        );
+        // *Relative*: the status goes out as contiguous text with nothing
+        // injected — an absolute write would put a `CUP` in the middle of it.
+        // (The erase that follows it is absolute, and lands on the same
+        // physical line, which is why this is a containment check.)
+        assert!(
+            text.contains(STATUS),
+            "the status must be written as plain text: {text:?}"
+        );
+    }
+
+    /// The next content write erases the status, so it never survives as a line
+    /// of its own in the scrollback.
+    #[test]
+    #[serial]
+    fn the_next_content_write_erases_the_status() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.begin_response();
+        out.set_status("[sess | m | ctx 5%]");
+        out.stream_text("alpha.\n\n");
+        out.stream_text("beta.\n\n");
+        let bytes = out.end_capture();
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        let rows: Vec<String> = (0..12)
+            .map(|r| {
+                (0..40)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r, c)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        // The status sits on the last written row, and no earlier row repeats it.
+        assert!(
+            rows.iter().any(|r| r.contains("[sess |")),
+            "the status should be on screen: {rows:?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("[sess |")).count(),
+            1,
+            "exactly one status line, not one per block: {rows:?}"
+        );
+    }
+
+    /// A status only goes out at the start of a line, so this is asserted
+    /// where the fact lives — the tail the counter maintains. (No current
+    /// writer can produce a mid-line tail: every content write ends with a
+    /// newline. It is the guard for a writer that does not, and for the status
+    /// itself, which by design has no trailing newline.)
+    #[test]
+    fn the_tail_reports_whether_the_cursor_is_at_a_line_start() {
+        let tail = crate::row_count::StreamTail::new();
+        let mut counter = RowCounter::new(Vec::new(), 40, &tail);
+        counter.write_all(b"alpha").unwrap();
+        assert!(!tail.at_line_start(), "mid-line: the status must wait");
+        counter.write_all(b"\n").unwrap();
+        assert!(tail.at_line_start());
+    }
+
+    /// The status never lands among a frame's rows. A frame owns the tail, so
+    /// the first content write suppresses the status and the next one paints it
+    /// *below* the content — the frame's region is already erased by then.
+    #[test]
+    #[serial]
+    fn status_lands_below_a_frame_rather_than_among_its_rows() {
+        let (out, _reasoning) = capturing_output(40);
+        out.begin_capture();
+        out.set_status("[sess | m]");
+        let frame =
+            crate::repl::Repl::compose_frame(&crate::repl::LineEditor::new(), "", &[], 0, 40, 10);
+        out.draw_frame(&frame, 3, ApplyPolicy::Frame, (40, 24));
+        out.display_text("a message");
+        out.display_plain("more content");
+        let bytes = out.end_capture();
+
+        let mut p = vt100::Parser::new(24, 40, 1000);
+        let onlcr: Vec<u8> = bytes
+            .iter()
+            .flat_map(|&b| {
+                if b == b'\n' {
+                    vec![b'\r', b'\n']
+                } else {
+                    vec![b]
+                }
+            })
+            .collect();
+        p.process(&onlcr);
+        let rows: Vec<String> = (0..12)
+            .map(|r| {
+                (0..40)
+                    .map(|c| {
+                        p.screen()
+                            .cell(r, c)
+                            .and_then(|x| x.contents().chars().next())
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let status_row = rows
+            .iter()
+            .position(|r| r.contains("[sess |"))
+            .unwrap_or_else(|| panic!("the status should be on screen: {rows:?}"));
+        let content_row = rows
+            .iter()
+            .position(|r| r.contains("more content"))
+            .unwrap_or_else(|| panic!("the content should be on screen: {rows:?}"));
+        assert!(
+            status_row > content_row,
+            "the status belongs below the content, not among the frame's rows: {rows:?}"
         );
     }
 

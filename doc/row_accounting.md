@@ -519,9 +519,36 @@ Two preconditions, both already available:
   the scrollback. Erasing first also puts the tail back where the boundary
   expects it.
 
-**Cadence.** `ctx` only moves at end of turn, so the status is rewritten at
-turn boundaries (`end_response`) and when the frame changes — not per streamed
-block. The per-content cost is the 4-byte erase.
+**Cadence and data.** `ctx` only moves at end of turn, so the text is set once
+at the start of a turn and painted by the output after *each* content block —
+the readout is live for the whole turn, and the context figure is the previous
+turn's (the only one available then). `CodeAgent::prompt` sets it from the
+session name, `provider:model` and `usage.last_input_tokens`, reusing
+`model_catalog` for the window the way `session_stats_lines` does so the two
+cannot disagree about what "ctx" means. The thinking level is *not* in it: the
+agent carries none (it went with the hold-back in B3b), and it only changes on
+an explicit commit, so it belongs to the prompt-side carrier.
+
+**The status is transparent to the blank-line rule.** It sits on the row the
+content's trailing newline left, so the next block must not find that row "not
+blank" and add a second blank above itself. That is why it is written straight
+to the writer, *outside* the row counter: routed through the counter it became
+opaque, and every block grew a blank line (visible in the mock transcript as
+`end_to_end_separator_layout` going from 1 blank to 2). Its one real row
+movement — a status wider than the terminal wrapping, which the terminal does
+without a newline — is reported with `rows_of`.
+
+**The erase is relative too**, `CR` + `EL` (+ `CUU` per wrapped row), and it
+needs no row at all: the cursor has not moved since the status was painted. An
+earlier version addressed the *tracked* row, which is the wrong row whenever the
+tracker and the real cursor disagree by one — and then the content landed beside
+the status (`llamacpp:testLet me run a command.`) instead of over it. Relative
+is also what keeps the erase out of a scrolled-back viewport.
+
+A frame suppresses the paint, and the suppression is *sticky across a burst*:
+one block is often two writes (a boundary, then a body) and only the first
+erases the frame, so a per-write "is a frame live?" would let the second paint
+onto the frame's rows.
 
 **This removes most of A1** — and the piece that remains turned out to be the
 resume artifact itself. The composition's purpose was to reserve space for a

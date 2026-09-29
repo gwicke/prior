@@ -100,6 +100,27 @@ fn wrap_rows(width_cols: usize, term_w: usize) -> usize {
     }
 }
 
+/// Truncate `text` to `width` display columns, appending an ellipsis when it
+/// does not fit. Display-width aware, so a wide tail is not cut mid-character.
+pub fn truncate_to_width(text: &str, width: usize) -> String {
+    if width == 0 || display_width_ansi(text) <= width {
+        return text.to_string();
+    }
+    let budget = width.saturating_sub(1); // room for the ellipsis
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// How far the cursor moves down when `text` is written at `term_w` columns —
 /// the count for a writer that has its bytes in hand (a message, a rendered
 /// markdown block, a pre-wrapped panel line).
@@ -176,6 +197,17 @@ impl StreamTail {
     /// row nothing was written to?
     pub fn ends_blank(&self) -> bool {
         (self.bits.load(std::sync::atomic::Ordering::SeqCst) & 0b10) != 0
+    }
+
+    /// Is the cursor at the start of a line? True when nothing has been written
+    /// yet, or the last byte was a newline.
+    ///
+    /// The precondition for writing a *transient* line (the status readout):
+    /// it is erased by the next content write, and erasing a line that holds
+    /// part of a block would destroy that block. So the check is the whole
+    /// guard, and it is free — it is the same bit the counter maintains.
+    pub fn at_line_start(&self) -> bool {
+        (self.bits.load(std::sync::atomic::Ordering::SeqCst) & 0b01) != 0
     }
 }
 
