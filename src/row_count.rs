@@ -119,6 +119,53 @@ pub fn rows_of(text: &str, term_w: usize) -> usize {
     rows
 }
 
+/// The tail of the content stream: does it currently end with a blank line?
+///
+/// This is the separator state, and it is *derived from the bytes* rather than
+/// maintained by hand (row_accounting_b3.md, B3d). A writer cannot forget to
+/// update it, and it cannot disagree with the screen — which matters because
+/// the markdown renderer also ends blocks with blank lines, so a hand-kept
+/// flag drifts out of step with what the terminal shows and the boundary writes
+/// a second blank.
+///
+/// A stream that has not written anything does not yet end in a blank line, so
+/// the first `\n` a response writes is its leading separator rather than a
+/// second one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamTail {
+    /// Was the previous byte a newline?
+    last_nl: bool,
+    /// Does the stream end on a blank line?
+    blank: bool,
+}
+
+impl Default for StreamTail {
+    fn default() -> Self {
+        StreamTail {
+            last_nl: true,
+            blank: false,
+        }
+    }
+}
+
+impl StreamTail {
+    /// Fold one byte into the tail.
+    fn note(&mut self, b: u8) {
+        if b == b'\n' {
+            self.blank = self.last_nl;
+        } else {
+            self.blank = false;
+        }
+        self.last_nl = b == b'\n';
+    }
+
+    /// Does the stream end with a blank line — i.e. is the cursor sitting on a
+    /// row nothing was written to?
+    pub fn ends_blank(&self) -> bool {
+        self.blank
+    }
+}
+
 /// A writer that counts the terminal rows passing through it.
 ///
 /// Wrap the real writer, render into this, and ask [`RowCounter::rows`] for
@@ -140,17 +187,33 @@ pub struct RowCounter<W: Write> {
     col: usize,
     /// Bytes of an incomplete character or escape sequence, carried forward.
     pending: Vec<u8>,
+    /// The stream's blank-line tail, seeded from the previous write.
+    tail: StreamTail,
 }
 
 impl<W: Write> RowCounter<W> {
     pub fn new(inner: W, term_w: usize) -> Self {
+        RowCounter::with_tail(inner, term_w, StreamTail::default())
+    }
+
+    /// As [`RowCounter::new`], continuing a stream whose tail is already
+    /// `tail`. The host seeds it from the last write and reads it back after
+    /// this one, so the tail spans the whole content stream rather than one
+    /// block.
+    pub fn with_tail(inner: W, term_w: usize, tail: StreamTail) -> Self {
         RowCounter {
             inner,
             term_w: term_w.max(1),
             rows: 0,
             col: 0,
             pending: Vec::new(),
+            tail,
         }
+    }
+
+    /// The stream's tail after everything written so far.
+    pub fn tail(&self) -> StreamTail {
+        self.tail
     }
 
     /// How far the cursor moved down over the whole stream. Call once, after
@@ -187,9 +250,10 @@ impl<W: Write> RowCounter<W> {
                     self.pending = buf[i..].to_vec();
                     return;
                 }
-                i = end; // zero width
+                i = end; // zero width, and no effect on the tail
                 continue;
             }
+            self.tail.note(buf[i]);
             match std::str::from_utf8(&buf[i..]) {
                 Ok(rest) => {
                     let ch = rest.chars().next().unwrap_or('\0');
@@ -331,6 +395,48 @@ mod tests {
                 "width mismatch for {s:?}"
             );
         }
+    }
+
+    #[test]
+    fn tail_tracks_whether_the_stream_ends_blank() {
+        let mut counter = RowCounter::new(Vec::new(), 80);
+        assert!(
+            !counter.tail().ends_blank(),
+            "an empty stream is not yet a blank line"
+        );
+        counter.write_all(b"text\n").unwrap();
+        assert!(!counter.tail().ends_blank(), "one newline closes the line");
+        counter.write_all(b"\n").unwrap();
+        assert!(counter.tail().ends_blank(), "two in a row leave a blank");
+        counter.write_all(b"more").unwrap();
+        assert!(!counter.tail().ends_blank(), "text closes the blank");
+        // An escape is zero width, so it must not close a blank line either.
+        counter.write_all(b"\x1b[0m").unwrap();
+        assert!(!counter.tail().ends_blank());
+    }
+
+    #[test]
+    fn a_fresh_streams_first_newline_is_its_leading_separator() {
+        // A response that starts with `\n` (its leading blank) must leave the
+        // tail blank, so the first block's boundary adds nothing on top.
+        let mut counter = RowCounter::new(Vec::new(), 80);
+        counter.write_all(b"\n").unwrap();
+        assert!(counter.tail().ends_blank());
+    }
+
+    #[test]
+    fn the_tail_spans_the_whole_stream_when_seeded() {
+        // The host seeds each block's counter with the previous tail, so the
+        // state is a property of the stream and not of one write.
+        let mut first = RowCounter::new(Vec::new(), 80);
+        first.write_all(b"a\n\n").unwrap();
+        let mut second = RowCounter::with_tail(Vec::new(), 80, first.tail());
+        assert!(
+            second.tail().ends_blank(),
+            "carried over from the first block"
+        );
+        second.write_all(b"b\n").unwrap();
+        assert!(!second.tail().ends_blank());
     }
 
     #[test]
