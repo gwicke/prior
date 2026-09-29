@@ -622,13 +622,14 @@ impl Repl {
         // they cannot disagree on the frame's size (ui_draw_v2 §9 #3), and
         // the applied pair `draw_frame` reports is what gets recorded — the
         // repaint bookkeeping is the engine's fact, not a secondhand read.
-        let redraw = |editor: &LineEditor, overlay: &[&str], focus: usize, dims: (usize, usize)| {
-            let dims = (dims.0.max(1), dims.1.max(1));
-            let frame = Self::compose_frame(editor, prompt, overlay, focus, dims.0, dims.1);
-            let applied =
-                output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame, dims);
-            painted_size.set(applied);
-        };
+        let redraw =
+            |editor: &LineEditor, overlay: &[String], focus: usize, dims: (usize, usize)| {
+                let dims = (dims.0.max(1), dims.1.max(1));
+                let frame = Self::compose_frame(editor, prompt, overlay, focus, dims.0, dims.1);
+                let applied =
+                    output.draw_frame(&frame, output.frame_anchor(), ApplyPolicy::Frame, dims);
+                painted_size.set(applied);
+            };
         loop {
             // On resume from Ctrl-Z (editing phase; the in-flight reader thread
             // is not running then), re-enter raw mode so the next keystroke is
@@ -822,21 +823,22 @@ impl Repl {
             if sel > max_sel {
                 sel = max_sel;
             }
-            let overlay_text = match &overlay {
-                ActiveOverlay::None => String::new(),
-                ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => {
-                    crate::slashdot_menu::render::paint_plan(plan, cur_w, cur_h)
-                }
+            // The painter reports the geometry it produced: terminal rows to
+            // show, and the windowing focus among them. The focus used to be
+            // re-derived here — `1 + Σ(1 + newlines(opts[..sel]))` — which
+            // assumed a one-row header and no table header, so it pointed at
+            // the wrong row for any menu with either (ui_draw_v2 §9 #5).
+            let painted = match &overlay {
+                ActiveOverlay::None => None,
+                ActiveOverlay::V25Menu { plan } | ActiveOverlay::PathComplete { plan } => Some(
+                    crate::slashdot_menu::render::paint_overlay(plan, cur_w, cur_h),
+                ),
             };
-            let overlay_vec: Vec<&str> = overlay_text.lines().collect();
-            let focus = {
-                let sc = sel.min(opts.len());
-                1 + opts[..sc]
-                    .iter()
-                    .map(|o| o.matches('\n').count() + 1)
-                    .sum::<usize>()
-            };
-            redraw(&editor, &overlay_vec, focus, (cur_w, cur_h));
+            // A plan whose selection did not fit falls back to 0 — window from
+            // the top — which is what the frame's focus means there.
+            let focus = painted.as_ref().and_then(|p| p.focus).unwrap_or(0);
+            let overlay_rows: &[String] = painted.as_ref().map_or(&[], |p| p.rows.as_slice());
+            redraw(&editor, overlay_rows, focus, (cur_w, cur_h));
 
             // --- Wait for a key (or a prose-completion wake). While a
             // prose request is armed/in flight, poll with a deadline so
@@ -985,28 +987,29 @@ impl Repl {
                                         continue; // V25 overlay without its handle
                                     }
                                     let cur_sel = plan.selected.unwrap_or(0);
-                                    // Page budget in *visual* rows — the very
-                                    // budget `paint_plan` windows the overlay
-                                    // with, so a PageDown moves by the rows
-                                    // actually on screen (ui_draw_v2 §9 #7).
+                                    // Page in the units the painter works in:
+                                    // ask it what it painted and move the
+                                    // cursor by the rows that fit on one
+                                    // screen (ui_draw_v2 §9 #5, #7). A row the
+                                    // painter split across terminal rows
+                                    // counts for all of them, so a PageDown
+                                    // moves a page and not a page and a half.
                                     let (cur_h, _) =
                                         crossterm::terminal::size().unwrap_or((80, 24));
-                                    let max_pop = ((f64::from(cur_h.max(1)) * 2.0 / 3.0).ceil()
-                                        as usize)
-                                        .max(1);
-                                    let (_, data_budget) =
-                                        crate::slashdot_menu::render::compute_space_budget(
-                                            plan, max_pop, 3,
-                                        );
+                                    let painted = crate::slashdot_menu::render::paint_overlay(
+                                        plan,
+                                        crate::output::term_width().max(1),
+                                        cur_h.max(1) as usize,
+                                    );
                                     let direction = if matches!(key.code, KeyCode::PageDown) {
                                         1
                                     } else {
                                         -1
                                     };
-                                    let delta = crate::slashdot_menu::render::page_delta(
-                                        &plan.rows,
+                                    let delta = crate::slashdot_menu::render::page_delta_heights(
+                                        &painted.data_heights,
                                         cur_sel,
-                                        data_budget,
+                                        painted.data_budget,
                                         direction,
                                     );
                                     if delta != 0 {
@@ -1135,7 +1138,7 @@ impl Repl {
     pub(crate) fn compose_frame(
         editor: &LineEditor,
         prompt: &str,
-        overlay: &[&str],
+        overlay: &[String],
         focus: usize,
         term_w: usize,
         term_h: usize,
@@ -1149,7 +1152,7 @@ impl Repl {
         if !overlay.is_empty() {
             elements.push(Element::Divider);
             elements.push(Element::Overlay {
-                rows: overlay.iter().map(|s| (*s).to_string()).collect(),
+                rows: overlay.to_vec(),
                 focus,
             });
         }
@@ -1390,7 +1393,7 @@ impl Repl {
     /// *return* an `InputAction`, so `agent.rs` draws a separator before the
     /// next `read_input` (its per-prompt framing); passing `false` here avoids
     /// a doubled separator.
-    fn emit_commit<F: Fn(&LineEditor, &[&str], usize, (usize, usize))>(
+    fn emit_commit<F: Fn(&LineEditor, &[String], usize, (usize, usize))>(
         output: &dyn Output,
         editor: &mut LineEditor,
         redraw: &F,
@@ -3192,7 +3195,7 @@ mod tests {
             term_rows: usize,
             term_cols: usize,
             anchor: usize,
-            overlay: &[&str],
+            overlay: &[String],
             focus: usize,
         ) -> (usize, usize, Vec<String>, usize) {
             let frame = Repl::compose_frame(editor, prompt, overlay, focus, width, term_rows);
@@ -3416,7 +3419,7 @@ mod tests {
             // return to the input, and the live frame's anchor must not move.
             let mut e = LineEditor::new();
             e.insert_str("hi");
-            let overlay = ["one", "two", "three"];
+            let overlay = ["one", "two", "three"].map(String::from);
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 10, &overlay, 0);
             assert!(rows[9].starts_with("> hi"), "input row: {:?}", rows[9]);
@@ -3446,7 +3449,7 @@ mod tests {
             // catch.
             let mut e = LineEditor::new();
             e.insert_str("hi");
-            let overlay = ["one", "two", "three", "four", "five", "six"];
+            let overlay = ["one", "two", "three", "four", "five", "six"].map(String::from);
             let (cr, cc, rows, anchor) =
                 render_overlay_through_vt100(&e, 80, "> ", 24, 80, 20, &overlay, 0);
             // delta = (20 + 8) - 1 - 24 = 3 → frame lands at row 17 (1-indexed).
@@ -3479,9 +3482,8 @@ mod tests {
             // stays scrollback.
             let e = LineEditor::new();
             let overlay: Vec<String> = (0..100).map(|i| format!("item {i}")).collect();
-            let refs: Vec<&str> = overlay.iter().map(|s| s.as_str()).collect();
             let (cr, cc, rows, anchor) =
-                render_overlay_through_vt100(&e, 80, "> ", 24, 80, 8, &refs, 50);
+                render_overlay_through_vt100(&e, 80, "> ", 24, 80, 8, &overlay, 50);
             // allocate: [input 1, divider 1, overlay 14] of budget 16.
             // The overlay window (14 rows, prefer 7 of context) centers on
             // focus=50: start = 50 - 7 = 43, so rows 43..=56 are shown.
@@ -3504,49 +3506,20 @@ mod tests {
 
     // --- compute_space_budget tests ---
     //
-    // The budget is derived from a `RenderPlan` and counts *visual* rows
-    // throughout (ui_draw_v2 §9 #7), so these build plans. Every line below
-    // is a single visual row, so the expected numbers are the pre-visual
-    // ones unchanged — the wrapped cases are the new pins.
+    // The budget is computed from *painted* row counts (ui_draw_v2 §9 #7,
+    // #11): the painter supplies what it painted, the rule splits it. These
+    // pass the counts directly, so the numbers below are the original
+    // single-line expectations unchanged.
 
-    use crate::slashdot_menu::render::{LogicalLine, RenderPlan};
-    use std::rc::Rc;
+    use crate::slashdot_menu::render::SectionHeights;
 
-    /// `detail` single-line header rows, `rows` single-line data rows, and a
-    /// table-header line when `header` is set.
-    fn budget_plan(detail: usize, rows: usize, header: bool) -> RenderPlan {
-        RenderPlan {
-            table_header: header.then(|| LogicalLine::new("cols")),
-            detail: (0..detail)
-                .map(|i| LogicalLine::new(format!("d{i}")))
-                .collect(),
-            rows: Rc::new(
-                (0..rows)
-                    .map(|i| LogicalLine::new(format!("r{i}")))
-                    .collect(),
-            ),
-            selected: None,
-            active_rows: vec![],
-        }
-    }
-
-    /// `rows` data rows, each wrapping to `lines` visual rows (the shape
-    /// table wrapping produces).
-    fn wrapped_plan(rows: usize, lines: usize) -> RenderPlan {
-        let row = |i: usize| -> LogicalLine {
-            let mut sub: Vec<String> = Vec::with_capacity(lines);
-            sub.push(format!("r{i}"));
-            for j in 1..lines {
-                sub.push(format!("w{i}-{j}"));
-            }
-            LogicalLine::new(sub.join("\n"))
-        };
-        RenderPlan {
-            table_header: None,
-            detail: vec![],
-            rows: Rc::new((0..rows).map(row).collect()),
-            selected: None,
-            active_rows: vec![],
+    /// Painted heights of a plan with `detail` header rows, a table-header
+    /// line when `header` is set, and `rows` single-row data rows.
+    fn budget_heights(detail: usize, rows: usize, header: bool) -> SectionHeights {
+        SectionHeights {
+            detail,
+            table_header: usize::from(header),
+            data: rows,
         }
     }
 
@@ -3555,7 +3528,7 @@ mod tests {
         // Both detail (5 vis lines) and rows (3) fit in overlay.
         // overlay_budget=20, table_header=1, available=19, half=9.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(5, 3, true), 20, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(5, 3, true), 20, 3);
         assert_eq!(d, 5, "detail gets what it needs");
         assert_eq!(r, 3, "rows get what they need");
     }
@@ -3565,7 +3538,7 @@ mod tests {
         // Detail has 30 vis lines, rows has 30. available=39, half=19.
         // Both overflow: detail capped at 19, rows get 20.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(30, 30, true), 40, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(30, 30, true), 40, 3);
         assert_eq!(d, 19);
         assert_eq!(r, 20);
     }
@@ -3578,7 +3551,7 @@ mod tests {
         // (This also pins the min-rows floor: detail wanting all 20 lines
         // still cannot squeeze rows below what they actually need.)
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(20, 2, true), 20, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(20, 2, true), 20, 3);
         assert_eq!(d, 17, "detail uses rows' surplus");
         assert_eq!(r, 2, "rows capped at their total visual height");
     }
@@ -3588,7 +3561,7 @@ mod tests {
         // Detail has 3 vis lines, rows has 30. available=19, half=9.
         // Detail fits (3 < 9): detail gets 3, rows get 16.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(3, 30, true), 20, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(3, 30, true), 20, 3);
         assert_eq!(d, 3, "detail gets what it needs");
         assert_eq!(r, 16, "rows get the rest");
     }
@@ -3597,7 +3570,7 @@ mod tests {
     fn budget_no_rows() {
         // No rows: all space goes to detail.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(15, 0, true), 20, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(15, 0, true), 20, 3);
         assert_eq!(d, 15);
         assert_eq!(r, 0, "no rows to allocate");
     }
@@ -3606,7 +3579,7 @@ mod tests {
     fn budget_no_table_header() {
         // No table header: available = overlay_budget.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(5, 5, false), 18, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(5, 5, false), 18, 3);
         assert_eq!(d, 5);
         assert_eq!(r, 5);
     }
@@ -3616,23 +3589,28 @@ mod tests {
         // Tiny terminal: overlay_budget=6, table_header=1, available=5.
         // Both overflow: half=2, detail=2, rows=3.
         let (d, r) =
-            crate::slashdot_menu::render::compute_space_budget(&budget_plan(10, 10, true), 6, 3);
+            crate::slashdot_menu::render::compute_space_budget(budget_heights(10, 10, true), 6, 3);
         assert_eq!(d, 2);
         assert_eq!(r, 3, "min rows enforced");
     }
 
-    /// §9 #7: the rows budget is the rows' *visual* height, not their count.
-    /// 9 rows of 3 lines each are 27 lines — budgeting them as 9 was the
-    /// bug (a bigger terminal then showed *less*).
+    /// §9 #7: the rows budget is measured in painted rows. 9 rows of 3
+    /// terminal rows each are 27 rows — budgeting them as 9 was the bug (a
+    /// bigger terminal then showed *less*).
     #[test]
     fn budget_wrapped_rows_are_measured_visually() {
-        let plan = wrapped_plan(9, 3);
-        // Room for the whole plan: rows get all 27 visual lines.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(&plan, 27, 3);
+        // 9 rows, 3 visual rows each.
+        let heights = SectionHeights {
+            detail: 0,
+            table_header: 0,
+            data: 27,
+        };
+        // Room for the whole plan: rows get all 27 rows.
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(heights, 27, 3);
         assert_eq!(d, 0);
-        assert_eq!(r, 27, "wrapped rows are not budgeted as 9 single lines");
-        // Tight: the budget is whatever space is left, still visual.
-        let (d, r) = crate::slashdot_menu::render::compute_space_budget(&plan, 16, 3);
+        assert_eq!(r, 27, "wrapped rows are not budgeted as 9 single rows");
+        // Tight: the budget is whatever space is left, still in rows.
+        let (d, r) = crate::slashdot_menu::render::compute_space_budget(heights, 16, 3);
         assert_eq!(d, 0);
         assert_eq!(r, 16);
     }

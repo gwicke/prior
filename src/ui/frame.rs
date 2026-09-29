@@ -55,7 +55,7 @@ pub(crate) enum Element {
     },
     /// Dim horizontal rule spanning the full terminal width.
     Divider,
-    /// Pre-painted overlay rows (from `paint_plan`), windowed around the
+    /// Pre-painted overlay rows (from `paint_overlay`), windowed around the
     /// selection `focus`. Rows must be single-line and are padded to
     /// `term_w` at render time.
     Overlay { rows: Vec<String>, focus: usize },

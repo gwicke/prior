@@ -931,8 +931,11 @@ mod tests {
             table.add_row(&[meta.name, value.as_str(), meta.description]);
         }
         // Render wide enough that nothing ellipsizes (no multi-byte '…' to
-        // confuse byte-based find); `render` never wraps.
-        let opts: Vec<String> = table.render(200);
+        // confuse byte-based find); `render` never wraps. The layout width
+        // is the terminal width *minus the marker column*: the painter adds
+        // `> ` back to reach the full width, and splits anything wider than
+        // that (the same `tw - 2` the v25 nodes lay their tables out at).
+        let opts: Vec<String> = table.render(198);
         let plan = crate::slashdot_menu::render::RenderPlan {
             detail: vec![crate::slashdot_menu::render::LogicalLine::new("Settings")],
             rows: std::rc::Rc::new(
@@ -1047,7 +1050,9 @@ mod tests {
             selected: Some(0),
             ..Default::default()
         };
-        let out = crate::slashdot_menu::render::paint_plan(&plan, 78, 40);
+        // Painted at 80 = the 78-column layout plus the 2-column marker, so
+        // every laid-out line fits the painter's content width untouched.
+        let out = crate::slashdot_menu::render::paint_plan(&plan, 80, 40);
         let lines: Vec<&str> = out.lines().collect();
         assert!(
             lines.iter().any(|l| l.contains(first_opt_lines[0].trim())),

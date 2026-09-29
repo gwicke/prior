@@ -16,7 +16,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 
 use crate::output::{Confirmation, Output};
 use crate::slashdot_menu::node_impl::StaticRow;
-use crate::slashdot_menu::render::{paint_plan, LogicalLine, RenderPlan};
+use crate::slashdot_menu::render::{paint_overlay, LogicalLine, RenderPlan};
 use crate::ui::frame::{allocate, live_budget, render, ApplyPolicy, Element, Extent, Frame};
 use std::rc::Rc;
 
@@ -167,16 +167,22 @@ fn draw_dialog(
     size: (usize, usize),
 ) {
     let (term_w, term_h) = size;
-    let painted = paint_plan(&update_plan_sel(plan, sel), term_w, term_h);
-    let rows: Vec<String> = painted.lines().map(str::to_string).collect();
-    // Windowing focus = the cursor-marked row; only consulted when the
-    // frame budget squeezes the overlay below its painted height.
-    let focus = rows.iter().position(|r| r.starts_with("> ")).unwrap_or(0);
+    // The painter reports the geometry it produced: `rows` are the terminal
+    // rows (each already a full-width screen row) and `focus` is where the
+    // selected option landed among them. Neither is re-derived here — the
+    // old `> `-marker sniff broke if a header line began with `> `, and the
+    // REPL's own arithmetic missed table headers and multi-row options
+    // (ui_draw_v2 §9 #5). `focus` is only consulted when the frame budget
+    // squeezes the overlay below its painted height.
+    let painted = paint_overlay(&update_plan_sel(plan, sel), term_w, term_h);
     let mut elements = Vec::new();
     if spec.divider {
         elements.push(Element::Divider);
     }
-    elements.push(Element::Overlay { rows, focus });
+    elements.push(Element::Overlay {
+        rows: painted.rows,
+        focus: painted.focus.unwrap_or(0),
+    });
     let extents: Vec<Extent> = elements.iter().map(Element::extent).collect();
     let heights = allocate(&extents, live_budget(term_h));
     let frame = render(&elements, &heights, term_w);

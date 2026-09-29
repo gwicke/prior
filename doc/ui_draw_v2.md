@@ -1,7 +1,7 @@
 # UI Draw v2 — unified frame composition for REPL, menus & dialogs
 
 **Status:** Design settled — implemented (P0 ✅, P1 ✅, P2 ✅, P3 ✅, P4 ✅, P5 ✅).
-Post-implementation follow-ups (§9): 5 done, 5 open, 1 accepted limitation —
+Post-implementation follow-ups (§9): 7 done, 3 open, 1 accepted limitation —
 audited 2026-09-28, recommended order at the end of §9.
 **Supersedes:** the ad-hoc dialog renderer in `src/ui.rs`, the `redraw` closure in `src/repl.rs`
 
@@ -75,7 +75,7 @@ enum Element {
     Input { layout: Layout, prompt: String, caret: (usize, usize) },
     /// Dim horizontal rule. must == might == 1.
     Divider,
-    /// Pre-painted overlay rows (from `paint_plan`), focus row for windowing.
+    /// Pre-painted overlay rows (from `paint_overlay`), focus row for windowing.
     Overlay { rows: Vec<String>, focus: usize },
     /// Fixed text rows (commit lines, future status line).
     Lines(Vec<String>),
@@ -100,7 +100,7 @@ struct Frame {
 ```
 
 Renderers return `Vec<String>` (one string per **screen** row; multi-line `LogicalLine`s
-already expand to screen rows inside `paint_plan`). The frame builder concatenates and
+already expand to screen rows inside `paint_overlay`). The frame builder concatenates and
 records ranges. Overlay rows are padded to `term_w`; input rows get a trailing `EL`.
 
 ### 3.4 Windowing
@@ -425,11 +425,10 @@ the first two were latent bugs that pre-date ui_draw_v2 — both since fixed.
 
 **Audit 2026-09-28** (after the editor cleanups, with the v2.5 engine now
 driving every `/` command in the REPL): #1–#3 re-verified done, pins still
-green; #7 and #9 audited and then **fixed** the same day (see below). #4, #5,
-#6 and #10 are still open — each carries a re-check with file/line evidence,
-what a fix involves, and a verdict. #8 stays an accepted limitation, and the
-audit surfaced one adjacent defect as #11 (also open). A recommended order for
-what remains is at the end of the section.
+green; #5, #7, #9 and #11 audited and then **fixed** the same day (see below).
+#4, #6 and #10 are still open — each carries a re-check with file/line
+evidence, what a fix involves, and a verdict. #8 stays an accepted limitation.
+A recommended order for what remains is at the end of the section.
 
 ### Latent issues (both fixed)
 
@@ -499,21 +498,24 @@ what remains is at the end of the section.
    spec whose detail ever does would window around the wrong row. Robust
    form: `focus = plan.detail visual height + selected row's height offset`,
    the same arithmetic the REPL's pre-computed `focus` uses.
-   **Still open** (audited 2026-09-28), at `ui.rs:174`. Worth noting the REPL's
-   own arithmetic (`repl.rs:832-837`) is approximate in the same *and worse*
-   ways: it assumes the detail block is exactly one visual row and ignores the
-   table header, so both call sites can window around the wrong row — one by
-   sniffing, one by assuming. Fix: make the painter report the focus instead of
-   having each host re-derive it. Add
-   `pub fn paint_plan_with_focus(plan, term_w, term_h) -> PaintedPlan { text, focus }`
-   to `slashdot_menu::render`, computed *while painting* (ground truth: it
-   survives detail truncation, table headers, multi-line rows and `*` markers),
-   and keep `paint_plan` as a wrapper returning `.text` so the crate's other
-   callers and all its tests are untouched. `ui.rs` and `repl.rs` then both
-   delete their focus math. ~40 lines in the crate, 2 production call sites,
-   plus a test that a truncated-detail plan still focuses the selected row.
-   **Verdict: worth doing** — it removes a sniff *and* a duplicated heuristic,
-   and closes a bug class for a small diff.
+   **Fixed** (2026-09-28), together with #11. The painter now returns a
+   `PaintedOverlay { rows, focus, data_heights, data_budget }` — the rows to
+   show plus the geometry it produced — and `focus` is the *painted* index of
+   the selection, recorded while painting. Ground truth by construction: it
+   survives a truncated detail section, a table header, a multi-row selection,
+   and the `*` active marker that hides the `>` cursor marker (the old sniff
+   found nothing there and fell back to row 0). The REPL's own guess —
+   `1 + Σ(1 + newlines(opts[..sel]))`, which assumed a one-row header and no
+   table header — is deleted with the sniff, so neither host derives geometry
+   anymore. `paint_plan` survives as the text wrapper (`rows.join("\n")`) for
+   callers that want a string. Pinned by
+   `focus_is_the_painted_row_of_the_selection`,
+   `focus_follows_a_truncated_detail_section`, and
+   `focus_is_reported_even_when_the_active_marker_hides_the_cursor`.
+   Side effect worth keeping: the frame's overlay rows are now handed over as
+   one `String` per terminal row — the shape `Element::Overlay` asserts — so
+   no host re-splits a painted string into a row count that can disagree with
+   the screen.
 
 6. **`display_text` line counts can drift.** The count comes from
    `wrap(text)` while the bytes include the `⏺ ` prefix and
@@ -548,27 +550,31 @@ what remains is at the end of the section.
    painted lines = **15 at term_h 24, but 9 at term_h 40 and 80** — a bigger
    terminal shows *less*. The fit branch should return the rows' visual
    height sum. Single-line rows (the normal menu case) are unaffected.
-   **Fixed** (2026-09-28). `compute_space_budget` now takes the `RenderPlan`
-   and measures the rows' *visual* height throughout, so the budget it returns
-   is in the unit `visual_row_window` consumes:
-   `compute_space_budget(plan, overlay_budget, min_row_lines)`. The fit branch
-   returns the rows' visual height sum, the overflow branch compares and
-   budgets in visual lines, and `min_rows` became `min_row_lines` — a *visual*
+   **Fixed** (2026-09-28). The budget is now computed from *painted* row
+   counts, supplied by the painter as a `SectionHeights { detail,
+   table_header, data }`:
+   `compute_space_budget(heights, overlay_budget, min_row_lines)`. The fit
+   branch returns the rows' height sum, the overflow branch compares and
+   budgets in the same unit, and `min_rows` became `min_row_lines` — a *row*
    floor, the one semantic change beyond the unit fix (single-line plans, the
-   normal case, are unaffected). Both call sites were updated, which also
-   deleted the hand-rolled duplicate of the same five numbers in the
-   page-scroll path (`repl.rs`), and a shared `visual_height(line)` now defines
-   row height for the budget, the row window and the page scroll alike (they
-   had three slightly different copies, one of them using `lines()` where the
-   others used `split('\n')`). Pinned by `budget_wrapped_rows_are_measured_visually`
-   and, at the painter level, `paint_plan_shows_more_as_the_terminal_grows` —
-   painted lines must never *decrease* as the terminal grows (this plan: 12 at
-   `term_h` 20, 15 at 24, 18 at 30, 27 at 40 and 80; before the fix, 9 at 30+).
-   The 7 pre-existing budget tests are single-line plans and pass unchanged,
-   which is the point of having kept them. One duplicate was removed in the
-   rewrite: `budget_min_rows_enforced_even_when_detail_wants_more` had the same
+   normal case, are unaffected). A shared `visual_height(line)` defines a row's
+   height as the engine wrote it, for the wrappers that measure a raw plan;
+   `window_heights` / `page_delta_heights` are the real forms the painter uses
+   (they take heights), with `visual_row_window` / `page_delta` kept as
+   `LogicalLine`-shaped wrappers for callers reasoning about an unpainted plan.
+   Pinned by `budget_wrapped_rows_are_measured_visually` and, at the painter
+   level, `paint_overlay_shows_more_as_the_terminal_grows` — painted lines must
+   never *decrease* as the terminal grows (this plan: 12 at `term_h` 20, 15 at
+   24, 18 at 30, 27 at 40 and 80; before the fix, 9 at 30+). The 7 pre-existing
+   budget tests are single-row plans and pass unchanged, which is the point of
+   having kept them; they now pass painted counts directly. One duplicate was
+   removed in the rewrite:
+   `budget_min_rows_enforced_even_when_detail_wants_more` had the same
    arguments *and* the same expectations as `budget_detail_overflows_rows_dont`
    (only the comments differed); its intent is folded into that test.
+   *Follow-on (same day):* the page-scroll path stopped recomputing the budget
+   and asks the painter for `data_budget` / `data_heights` instead, so a
+   PageUp/PageDown moves exactly one screen of painted rows.
 
 8. **Tiny terminals lose the pop-up, not the input.** Allocation serves
    floors in element order (input → divider → overlay), so on a ~2-row
@@ -609,20 +615,37 @@ what remains is at the end of the section.
     on it today, so it should not preempt #5/#6.
 
 11. **The painter does not wrap detail / table-header lines** (found while
-    fixing #7 — same crate, same accounting). `render_logical_line` pads to
-    `term_w` but never wraps, so a header longer than the terminal width is
-    emitted as one over-long line that the *terminal* wraps — while
-    `paint_plan` counts it once. Probe: a 100-column detail line at `term_w` 60
-    paints as 1 line of 102 columns. Consequence: the frame's row accounting
+    fixing #7 — same crate, same accounting). `render_logical_line` padded to
+    `term_w` but never wrapped, so a header longer than the terminal width was
+    emitted as one over-long line that the *terminal* wrapped — while
+    `paint_plan` counted it once. Probe: a 100-column detail line at `term_w` 60
+    painted as 1 line of 102 columns. Consequence: the frame's row accounting
     (and the REPL's focus math) understate the overlay by a row, so a stale
-    wrap remainder can survive a partial apply. Data rows are unaffected — the
-    engine pre-wraps them into embedded `\n`, which is what #7 was about.
-    Fix: wrap (or truncate) detail and table-header lines in the painter with
-    the same `crate::wrap` the engine uses for rows, and count the result with
-    `visual_height` — the accounting then matches what the terminal shows.
-    **Verdict: fix together with #5**, since both say the same thing: the
-    painter should report the geometry it produced. `paint_plan_with_focus` is
-    the natural place to also return the painted height.
+    wrap remainder could survive a partial apply.
+    **Fixed** (2026-09-28), with #5. The painter now owns the fitting for
+    every section: `paint_row` splits its content at the width via a new
+    `wrap::split_to_width` — the content-preserving counterpart to `wrap`,
+    which *reflows* and would collapse the column gaps of a table row and the
+    alignment of an engine help header (`"  10      last 10 turns"`). Every
+    painted row is therefore exactly `term_w` wide and holds no newline, and
+    `rows.len()` is the number of terminal rows the overlay occupies. The
+    budget, the row window and the page size are all computed from those
+    painted counts, so nothing is measured in one unit and painted in another.
+    `render_logical_line` is gone — `paint_row(content, RowStyle, tw)` replaces
+    it, and `RowStyle` absorbs the three (marker, background) conventions the
+    old flag arguments and the data-row painter each spelled out separately.
+    Pinned by `over_long_detail_line_is_split_into_terminal_rows`,
+    `every_painted_row_is_one_full_width_terminal_row` and
+    `data_heights_are_the_painted_heights`, plus six unit tests on
+    `split_to_width` (space preservation, blank lines, display width, the
+    content-preserving cut).
+    **Consequence found while fixing it — a contract, now documented:** the
+    painter's marker column means row text must be laid out for
+    `term_w - 2`, and the engine's tables already are
+    (`render_multiline(tw - 2)`). Two P5 tests in `settings.rs` were pinning
+    the *old* relationship (laid out at the full width, painted at the full
+    width) — i.e. they pinned the over-wide row #11 is about — and were
+    re-pinned to the real contract (lay out at `tw - 2`, paint at `tw`).
 
 ### Deferred design pieces (allowed for in code)
 
@@ -663,16 +686,17 @@ still targeted (no blanket `allow(dead_code)` came back).
 
 ### Recommended order (audit 2026-09-28)
 
-#9 and #7 are done. What remains, in order:
+#5, #7, #9 and #11 are done. What remains, in order:
 
-1. **#5 + #11 — make the painter report its geometry.** `paint_plan` grows a
-   `with_focus` variant returning the focus row *and* the painted height:
-   deletes the `> ` sniff in `ui.rs`, the duplicated (and more wrong) focus
-   heuristic in `repl.rs`, and — with detail/table-header wrapping — the
-   row-accounting gap in #11. One change, three closed items; the tests in
-   `repl.rs`/`settings.rs` that call `paint_plan` stay on the wrapper.
-2. **#6 — `display_text` row accounting.** Small and local; removes a DSR.
-3. **#10 — streaming row accounting.** Only when a feature needs it; it is
+1. **#6 — `display_text` row accounting.** Small and local; removes a DSR.
+2. **#10 — streaming row accounting.** Only when a feature needs it; it is
    the gate on §4.5 and on a live status line.
-4. **#4 — explicit confirm subject.** Bundle with any of the above; on its
+3. **#4 — explicit confirm subject.** Bundle with any of the above; on its
    own it only buys a quieter line.
+
+One theme across the fixed ones: every fix moved a piece of knowledge to
+where the truth is, instead of re-deriving it downstream. The painter learned
+the geometry (#5, #7, #11) so neither host has to guess it; the next natural
+step in that direction is #6 (let `display_text` measure the bytes it wrote
+instead of predicting them) and #10 (let the streaming writers account for
+their rows).
