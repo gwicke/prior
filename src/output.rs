@@ -1057,7 +1057,7 @@ impl ConsoleOutput {
     /// Shared body of `begin_response`. Takes the live/TTY decision explicitly
     /// so the non-TTY (buffered) path can be forced in tests without depending
     /// on whether the test process's stdout is attached to a terminal.
-    fn begin_response_inner(&self, live: bool) {
+    pub(crate) fn begin_response_inner(&self, live: bool) {
         *self.live.lock().unwrap() = live;
         // Reset per-response answer-holding state. `set_answer_hold` is called
         // afterwards (from the agent) to re-enable it for reasoning turns.
@@ -1079,10 +1079,8 @@ impl ConsoleOutput {
             let mut trenderer = self.thinking_renderer.lock().unwrap();
             *trenderer = Renderer::new(Theme::dimmed(), current_width);
             *self.dim_on.lock().unwrap() = false;
-            let mut w = self.writer.lock().unwrap();
-            let _ = writeln!(w);
-            drop(w);
-            self.note_lines(1);
+            // A content write like any other: the counter measures it (B2).
+            self.write_content(b"\n");
             self.set_blank(true);
             self.note_text();
         } else {
@@ -2295,6 +2293,9 @@ impl Output for ScrollbackOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `TERMINAL_WIDTH` is a process-global (the in-flight reader owns it in
+    // production), so every test that pins the width must run alone.
+    use serial_test::serial;
 
     // --- Row accounting: the tracked cursor vs. the real one (phase B) ---
     //
@@ -2344,6 +2345,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn display_text_row_is_measured_not_predicted() {
         // A message that exactly fills the width, and one that is a column
         // wider: the old `wrap(text).len()` count called both one row.
@@ -2361,6 +2363,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn display_text_counts_a_wide_character_as_two_columns() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -2372,6 +2375,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn streamed_answer_is_counted() {
         // The untracked path (§9 #10): a streamed paragraph used to leave the
         // tracked row where it was.
@@ -2390,6 +2394,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn streamed_thinking_is_counted() {
         let (out, reasoning) = capturing_output(40);
         *reasoning.lock().unwrap() = ShowReasoning::Content;
@@ -2401,6 +2406,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn tool_panel_is_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -2412,6 +2418,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn markdown_and_error_and_plain_are_counted() {
         let (out, _reasoning) = capturing_output(40);
         out.begin_capture();
@@ -2422,6 +2429,301 @@ mod tests {
         out.display_system("a system line long enough to wrap at forty columns");
         let bytes = out.end_capture();
         assert_eq!(tracked_row(&out), screen_row(&bytes, 40));
+    }
+
+    // --- B3a: the separator matrix (characterization) ---
+    //
+    // The rule under test (row_accounting_b3.md §1): one blank line at every
+    // segment boundary, and inside a segment nothing but what the markdown
+    // renderer wrote. The second half is the checkable one — the renderer is
+    // available directly, so the *host's* contribution is whatever the painted
+    // bytes have that a fresh renderer does not produce. This suite measures
+    // today's behavior; it changes nothing.
+
+    /// One step of a response, in the order the live path delivers it.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// A reasoning delta (one chunk of it).
+        Think(&'static str),
+        /// An answer delta.
+        Say(&'static str),
+        Tool(&'static str),
+        Result(&'static str),
+        /// `end_response_segment` — the segment boundary.
+        SegmentEnd,
+        /// `end_response`.
+        ResponseEnd,
+    }
+
+    /// How the deltas are split on their way in. `stream_text` sees deltas live
+    /// and whole blocks in replay, so any rule that depends on how *often* it
+    /// is called is a bug waiting for a different chunk boundary.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Chunking {
+        /// One call per step.
+        Whole,
+        /// One call per byte.
+        Bytes,
+        /// One call per word, whitespace dropped.
+        Words,
+    }
+
+    impl Chunking {
+        fn all() -> [Chunking; 3] {
+            [Chunking::Whole, Chunking::Bytes, Chunking::Words]
+        }
+        fn name(self) -> &'static str {
+            match self {
+                Chunking::Whole => "whole",
+                Chunking::Bytes => "bytes",
+                Chunking::Words => "words",
+            }
+        }
+    }
+
+    /// Deliver one `Say`/`Think` delta in this chunking.
+    fn feed(out: &ConsoleOutput, step: Step, chunk: Chunking) {
+        let (text, stream): (&str, fn(&ConsoleOutput, &str)) = match step {
+            Step::Say(t) => (t, |o, t| o.stream_text(t)),
+            Step::Think(t) => (t, |o, t| o.stream_thinking(t)),
+            _ => return,
+        };
+        match chunk {
+            Chunking::Whole => stream(out, text),
+            Chunking::Bytes => {
+                for b in text.as_bytes() {
+                    stream(out, std::str::from_utf8(&[*b]).unwrap_or(""));
+                }
+            }
+            Chunking::Words => {
+                // Split at whitespace *runs*, keeping them: a chunk boundary
+                // must not eat the paragraph breaks, or the test would be
+                // measuring the harness instead of the code.
+                let mut rest = text;
+                while !rest.is_empty() {
+                    let end = rest
+                        .find(char::is_whitespace)
+                        .map(|i| {
+                            rest[i..]
+                                .find(|c: char| !c.is_whitespace())
+                                .map_or(i, |j| i + j)
+                        })
+                        .unwrap_or(rest.len());
+                    if end == 0 {
+                        let ws = rest
+                            .find(|c: char| !c.is_whitespace())
+                            .unwrap_or(rest.len());
+                        stream(out, &rest[..ws]);
+                        rest = &rest[ws..];
+                    } else {
+                        stream(out, &rest[..end]);
+                        rest = &rest[end..];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run a scripted response through the live render path; return the bytes.
+    fn run_script(steps: &[Step], chunk: Chunking) -> Vec<u8> {
+        let (out, reasoning) = capturing_output(80);
+        *reasoning.lock().unwrap() = ShowReasoning::Content;
+        out.begin_capture();
+        // Forced, because a test's stdout is not a tty and `begin_response`
+        // would take the buffered path — which is why no replay test has ever
+        // exercised the incremental renderer, and where this morning's spacing
+        // bug lived. B3c removes the branch and this line with it.
+        out.begin_response_inner(true);
+        for step in steps {
+            match step {
+                Step::Tool(name) => out.display_tool_call(name, &serde_json::json!({})),
+                Step::Result(text) => out.display_tool_result(text),
+                Step::SegmentEnd => out.end_response_segment(),
+                Step::ResponseEnd => out.end_response(),
+                other => feed(&out, *other, chunk),
+            }
+        }
+        out.end_capture()
+    }
+
+    /// What the markdown renderer alone produces for `text`: the reference for
+    /// "the host adds nothing inside a segment".
+    fn renderer_alone(text: &str) -> String {
+        let mut parser = StreamParser::new_gfm_stream();
+        let mut events = parser.write(text.as_bytes());
+        events.extend(parser.flush());
+        // The live path's theme (`begin_response_inner`): colours on, links
+        // clickable. A different theme would flag its own styling as host
+        // contribution, which is the opposite of what this measures.
+        let theme = Theme {
+            clickable_links: true,
+            ..Theme::default()
+        };
+        let mut r = Renderer::new(theme, 80);
+        let mut out: Vec<u8> = Vec::new();
+        let _ = r.feed(&events, &mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Visible lines of painted output, ANSI stripped, *without* the row the
+    /// cursor rests on: a stream ending in `\n` leaves the cursor on a row
+    /// nothing was written to, and that row reads as blank.
+    fn painted_lines(bytes: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(bytes).replace("\r", "");
+        let mut lines: Vec<String> = text
+            .split('\n')
+            .map(|l| strip_ansi(l).trim_end().to_string())
+            .collect();
+        if text.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+    }
+
+    /// Indices of blank lines, and the longest run of consecutive ones.
+    fn blank_runs(lines: &[String]) -> (Vec<usize>, usize) {
+        let mut runs: Vec<usize> = Vec::new();
+        let mut longest = 0;
+        let mut cur = 0;
+        for (i, l) in lines.iter().enumerate() {
+            if l.trim().is_empty() {
+                runs.push(i);
+                cur += 1;
+                longest = longest.max(cur);
+            } else {
+                cur = 0;
+            }
+        }
+        (runs, longest)
+    }
+
+    /// The core of the rule: no two consecutive blank lines, ever. One blank
+    /// at a boundary, and the renderer's own spacing nowhere doubled.
+    #[track_caller]
+    fn assert_no_doubled_blank(name: &str, steps: &[Step], chunk: Chunking) {
+        let bytes = run_script(steps, chunk);
+        let lines = painted_lines(&bytes);
+        let (_, longest) = blank_runs(&lines);
+        assert_eq!(
+            longest,
+            1,
+            "{name} [{}]: {longest} consecutive blank lines\n{:#?}",
+            chunk.name(),
+            lines
+        );
+    }
+
+    /// One segment, one answer block: the painted output is the leading blank
+    /// from `begin_response` and then *exactly* what the renderer produced.
+    /// Anything else is a byte the host contributed on its own.
+    #[test]
+    #[serial]
+    fn host_adds_nothing_inside_a_segment() {
+        for text in [
+            "A single paragraph answer.\n\n",
+            "Two paragraphs.\n\nThe second one.\n\n",
+            "A paragraph, then a list:\n\n- one\n- two\n\n",
+            "Text with `inline code` and a [link](https://x.example).\n\n",
+        ] {
+            for chunk in Chunking::all() {
+                let bytes = run_script(&[Step::Say(text), Step::ResponseEnd], chunk);
+                let painted = String::from_utf8_lossy(&bytes).to_string();
+                // `begin_response`'s leading blank, the renderer's own output,
+                // and `end_response`'s trailing blank. Nothing else.
+                let alone = renderer_alone(text);
+                assert_eq!(
+                    painted,
+                    format!("\n{alone}\n"),
+                    "host contributed extra bytes for {text:?} [{}]",
+                    chunk.name()
+                );
+            }
+        }
+    }
+
+    /// The same answer split across deltas must paint identically to the
+    /// one-call version: chunking is not allowed to be visible.
+    #[test]
+    #[serial]
+    fn chunking_is_not_visible() {
+        let text = "First paragraph of the answer.\n\nSecond paragraph here.\n\n";
+        let whole = run_script(&[Step::Say(text), Step::ResponseEnd], Chunking::Whole);
+        for chunk in [Chunking::Bytes, Chunking::Words] {
+            assert_eq!(
+                run_script(&[Step::Say(text), Step::ResponseEnd], chunk),
+                whole,
+                "[{}] painted differently from the one-call version",
+                chunk.name()
+            );
+        }
+    }
+
+    /// At a segment boundary, exactly one blank line — not zero, not two.
+    #[test]
+    #[serial]
+    fn one_blank_line_at_a_segment_boundary() {
+        for chunk in Chunking::all() {
+            assert_no_doubled_blank(
+                "answer, boundary, answer",
+                &[
+                    Step::Say("The first answer.\n\n"),
+                    Step::SegmentEnd,
+                    Step::Say("After the tool.\n\n"),
+                    Step::ResponseEnd,
+                ],
+                chunk,
+            );
+        }
+    }
+
+    /// A tool round then the next segment's answer: one blank at the
+    /// boundary, with the panel rows above it.
+    #[test]
+    #[serial]
+    fn one_blank_line_after_a_tool_block() {
+        for chunk in Chunking::all() {
+            assert_no_doubled_blank(
+                "tool, boundary, answer",
+                &[
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    Step::SegmentEnd,
+                    Step::Say("Done.\n\n"),
+                    Step::ResponseEnd,
+                ],
+                chunk,
+            );
+            assert_no_doubled_blank(
+                "tool, tool",
+                &[
+                    Step::Tool("Bash"),
+                    Step::Result("ok\n"),
+                    Step::Tool("Bash"),
+                    Step::Result("ok2\n"),
+                    Step::ResponseEnd,
+                ],
+                chunk,
+            );
+        }
+    }
+
+    /// Reasoning then answer: the boundary blank and the dim reset, in the
+    /// order the renderer can accept (a `\n` before the reset would be
+    /// swallowed as a block's closing newline).
+    #[test]
+    #[serial]
+    fn reasoning_then_answer_has_one_blank() {
+        for chunk in Chunking::all() {
+            assert_no_doubled_blank(
+                "reasoning then answer",
+                &[
+                    Step::Think("Weighing the options.\n\n"),
+                    Step::Say("The answer is 42.\n\n"),
+                    Step::ResponseEnd,
+                ],
+                chunk,
+            );
+        }
     }
 
     #[test]

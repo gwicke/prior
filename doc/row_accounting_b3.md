@@ -152,6 +152,39 @@ frame, not to the content.
 
 ---
 
+## 2a. What B3a measured (2026-09-28)
+
+The matrix landed and is green. Findings, in the order they matter:
+
+1. **The live path already obeys the rule.** For every sequence probed —
+   reasoning→answer, answer→boundary→answer, tool→boundary→answer,
+   tool→tool, text→text — the painted output is exactly the renderer's own
+   output plus one blank at each boundary, and *nothing else*. The
+   "host adds nothing inside a segment" assertion is byte-exact against a
+   fresh parser+renderer using the live path's own theme, so the host's
+   contribution is provably zero there.
+2. **Chunking is not visible.** The same answer delivered whole, byte at a
+   time, and word at a time paints identically. (The first version of the
+   word chunker ate the paragraph breaks and *did* differ — a reminder that a
+   bad matrix is worse than none.)
+3. **The doubled blank I first saw was the *buffered* path, not the live one.**
+   Probing before forcing `live` showed a doubled blank at a segment boundary;
+   on the live path it is one. The divergence is `begin_response` choosing the
+   buffered renderer whenever stdout is not a terminal — which is every test.
+4. **Replay drops the reasoning entirely, in a test.** `stream_thinking`
+   takes its stderr branch off a tty, so the captured bytes have no reasoning
+   at all. The text framing around it matches the live path byte for byte, so
+   B3c is not re-framing anything — it is deleting the second render path, and
+   the reasoning routing with it.
+5. **The separator flags are one edit away from being wrong, and the matrix
+   is what makes that visible.** `set_blank` is maintained by hand at ~12
+   sites while the *renderer* also ends blocks with blank lines. Nothing
+   reconciles the two, which is why the rule has to be derived from the bytes
+   (B3d) rather than kept in a flag.
+
+So B3d is a simplification, not a rescue: the rule it encodes is what the live
+path already does.
+
 ## 3. What each commit is gated on
 
 | Commit | Gate |

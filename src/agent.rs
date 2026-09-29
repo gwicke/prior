@@ -4341,6 +4341,108 @@ pub(crate) fn test_session_with_entries(
 
 #[cfg(test)]
 mod tests {
+    // B3a: live vs replay (row_accounting_b3.md §1). The two paths drive the
+    // same Output methods, so they should paint the same bytes; today they do
+    // not, because `begin_response` picks the buffered path whenever stdout is
+    // not a tty — which is every test — and the buffered path frames the output
+    // differently. B3c deletes the branch and this test becomes the gate that
+    // keeps them identical.
+    use super::*;
+    use crate::output::ConsoleOutput;
+    use serial_test::serial;
+
+    /// One turn: reasoning, an answer, a tool round, then a second answer.
+    fn two_segment_turn() -> ConversationTurn {
+        ConversationTurn {
+            user_text: "what is the answer?".into(),
+            segments: vec![
+                AssistantSegment {
+                    thinking: vec!["Weighing the options.".into()],
+                    text: vec!["Let me check.".into()],
+                    tool_calls: vec![(
+                        "c1".into(),
+                        "Bash".into(),
+                        serde_json::json!({"command": "echo hi"}),
+                    )],
+                    tool_results: vec![("c1".into(), "hi\n".into())],
+                },
+                AssistantSegment {
+                    thinking: vec![],
+                    text: vec!["The answer is 42.".into()],
+                    tool_calls: vec![],
+                    tool_results: vec![],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn replay_paints_what_the_live_path_paints() {
+        let turn = two_segment_turn();
+        let reasoning = crate::settings::default_show_reasoning_handle();
+        *reasoning.lock().unwrap() = crate::settings::ShowReasoning::Content;
+
+        // The live path, exactly as the streaming loop drives it.
+        let live = ConsoleOutput::new(reasoning.clone());
+        live.begin_capture();
+        live.begin_response_inner(true);
+        for thinking in &turn.segments[0].thinking {
+            live.stream_thinking(thinking);
+        }
+        for text in &turn.segments[0].text {
+            live.stream_text(text);
+        }
+        live.end_response_segment();
+        live.display_tool_call("Bash", &serde_json::json!({"command": "echo hi"}));
+        live.display_tool_result("hi\n");
+        live.end_response_segment();
+        for text in &turn.segments[1].text {
+            live.stream_text(text);
+        }
+        live.end_response();
+        let live_bytes = live.end_capture();
+
+        // The same turn through replay. `render_turn` draws the user prompt and
+        // a separator around the response, so the live output should be the
+        // *tail* of what replay paints — byte for byte.
+        let replay = ConsoleOutput::new(reasoning);
+        replay.begin_capture();
+        render_turn(&replay, &turn, false);
+        let replay_bytes = replay.end_capture();
+
+        let live_text = String::from_utf8_lossy(&live_bytes).to_string();
+        let replay_text = String::from_utf8_lossy(&replay_bytes).to_string();
+
+        // Measured: the *text* framing is already identical — the answer, the
+        // tool panel, the second segment and the trailing blanks all match byte
+        // for byte. So B3c is not re-framing anything; it is deleting the
+        // second render path.
+        let dim_start = live_text
+            .find("\x1b[2m")
+            .expect("the live path dims reasoning");
+        let dim_end = live_text[dim_start..]
+            .find("\x1b[0m")
+            .map(|i| dim_start + i + "\x1b[0m".len())
+            .unwrap();
+        let live_without_reasoning =
+            format!("{}{}", &live_text[..dim_start], &live_text[dim_end..]);
+        assert!(
+            replay_text.ends_with(&live_without_reasoning),
+            "replay did not end with the live text framing.\n--- live (reasoning removed) ---\n{live_without_reasoning:?}\n--- replay ---\n{replay_text:?}"
+        );
+
+        // And measured: replay *drops the reasoning entirely* when stdout is not
+        // a terminal, because `stream_thinking` takes its stderr branch. B3c
+        // makes the reasoning stream go through `write_reasoning` like
+        // everything else, and this assertion flips to "replay contains the
+        // reasoning too".
+        assert!(
+            !replay_text.contains("Weighing the options"),
+            "replay now shows reasoning — B3c landed; update this assertion"
+        );
+    }
+
     use rig_core::message::Reasoning;
 
     use super::TurnPersistence;
