@@ -296,6 +296,26 @@ impl PicoAgent for CodeAgent {
         // partial assistant text). Persisting it is root cause #2's fix.
         let mut cancelled_history: Option<Vec<Message>> = None;
         let mut aborted = false;
+        // The transient status line (doc/row_accounting.md zone 2) is set before
+        // the turn's first content write, because that is where the output
+        // paints it — after each block, for the whole turn. The context figure
+        // is the *previous* turn's, which is the best available at this point
+        // and honest about being one turn behind; the next turn's start
+        // refreshes it. The thinking level is not in it: the agent carries none
+        // (it went with the hold-back in B3b) and it only changes on an
+        // explicit commit, so it belongs to the prompt-side carrier.
+        let session_name = session.and_then(|s| {
+            let index = s.index.try_lock().ok()?;
+            index.header.name.clone()
+        });
+        self.output.set_status(&status_line(
+            session_name.as_deref(),
+            &self.provider,
+            &self.model,
+            None,
+            self.usage.lock().unwrap().last_input_tokens,
+            crate::output::term_width(),
+        ));
         self.output.begin_response();
         loop {
             tokio::select! {
@@ -4127,6 +4147,60 @@ pub struct SessionStatsInfo {
 /// and the agent's accumulated [`SessionUsage`] for the per-turn / session
 /// totals. Returns plain lines so the REPL can render them in the `/stat`
 /// overlay (`render_plain` display).
+/// The transient status line: `[session | provider:model | level | ctx 34% · 78k]`.
+///
+/// The mid-turn readout (doc/row_accounting.md, zone 2). Built from the same
+/// pieces `session_stats_lines` uses — `model_catalog` for the context window,
+/// the caller's token count for the usage — so the two cannot disagree about
+/// what "ctx" means. Fields that are unknown are dropped rather than shown
+/// empty, and the result is truncated to `width` so a narrow terminal loses
+/// the tail (the context figure) rather than wrapping.
+pub fn status_line(
+    session_name: Option<&str>,
+    provider: &str,
+    model: &str,
+    level: Option<&str>,
+    context_tokens: u64,
+    width: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(name) = session_name.map(str::trim).filter(|n| !n.is_empty()) {
+        parts.push(name.to_string());
+    }
+    if !provider.is_empty() || !model.is_empty() {
+        parts.push(format!("{provider}:{model}"));
+    }
+    if let Some(level) = level
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && *l != "off")
+    {
+        parts.push(level.to_string());
+    }
+    if context_tokens > 0 {
+        let usage = model_catalog::lookup(provider, model)
+            .and_then(|e| e.context_length)
+            .filter(|max| *max > 0)
+            .map(|max| {
+                let pct = (context_tokens as f64 / max as f64) * 100.0;
+                format!("ctx {pct:.0}% · {}", compact_tokens(context_tokens))
+            });
+        parts.extend(usage);
+    }
+    let line = parts.join(" | ");
+    crate::row_count::truncate_to_width(&line, width)
+}
+
+/// `78k` / `1.2M` — the same abbreviations `/stat` uses for token counts.
+fn compact_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
 pub fn session_stats_lines(
     provider: &str,
     model: &str,

@@ -320,18 +320,28 @@ fn blanks_before_separator(data: &[u8]) -> usize {
     }
     let Some(sep) = sep else { return 0 };
     // Walk up from the separator, counting empty lines until the first
-    // non-empty content line.
+    // non-empty content line. The transient status line can sit in between
+    // (doc/row_accounting.md zone 2) — it is chrome, not content, so skip it
+    // rather than call it a missing blank.
     let mut blanks = 0;
     let mut i = sep;
     while i > 0 {
         i -= 1;
         if lines[i].trim().is_empty() {
             blanks += 1;
+        } else if is_status_row(&lines[i]) {
+            continue;
         } else {
             break;
         }
     }
     blanks
+}
+
+/// Is this row the transient status line? It always carries the qualified model
+/// id, which is what the mock runs on (`-p llamacpp -m test`).
+fn is_status_row(row: &str) -> bool {
+    row.contains("llamacpp:test")
 }
 
 /// Count the empty lines directly above the first `⏺ Error:` line.
@@ -357,6 +367,11 @@ fn ansi_lines(data: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(data)
         .split("\r\n")
         .map(strip_ansi)
+        // A bare `\r` starts overwriting the row from column 0 — which is how
+        // the transient status line is reused (the write is `status`, `\r`,
+        // `EL`, content). Keeping the last segment is what a terminal shows;
+        // without it every content line carries the dead status as a prefix.
+        .map(|l| l.split('\r').next_back().unwrap_or("").to_string())
         .collect()
 }
 
@@ -379,6 +394,38 @@ fn strip_ansi(l: &str) -> String {
         }
     }
     out
+}
+
+/// A turn writes the transient status line as plain text and erases it
+/// relatively, so the answer that follows lands on the same row with nothing
+/// left of it (doc/row_accounting.md zone 2). No `CUP` anywhere in between: an
+/// absolute write is what writes into a viewport the user scrolled back into.
+#[test]
+fn the_status_line_is_relative_and_transient_end_to_end() {
+    let bytes = run_turn(2, "text-only", false);
+    let text = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    let at = text
+        .find("llamacpp:test")
+        .unwrap_or_else(|| panic!("the status should be written: {text:?}"));
+    let tail = &text[at..];
+    let erase = tail
+        .find("\x1b[K")
+        .unwrap_or_else(|| panic!("the status should be erased: {tail:?}"));
+    assert!(
+        !tail[..erase].contains('\u{1b}'),
+        "the status must be plain text up to its erase, not addressed: {:?}",
+        &tail[..erase]
+    );
+    assert!(
+        tail[..erase].starts_with("llamacpp:test\r"),
+        "the erase should be a relative CR + EL: {:?}",
+        &tail[..erase]
+    );
+    assert!(
+        tail[erase..].contains("Just a plain text answer"),
+        "the content should overwrite the status row: {:?}",
+        &tail[erase..]
+    );
 }
 
 #[test]

@@ -346,12 +346,260 @@ fact. D1 is therefore load-bearing for the state model, not just the look.
 
 ### Phase A1 — the composition (additive)
 
+Design below (§6a); the staging is:
+
 | Commit | Work | Gate |
 |---|---|---|
-| **A1.1** | `plan_solve(cache, screen, w, h) -> String` in `ui/frame.rs`, where `Screen { frame: Option<(Frame, focus)>, content: Option<ContentWrite> }`. One solve: derive `cb`, place the frame (`min(cb + 1, term_h − H + 1)`), emit clear-old-frame → scroll → content → frame at the new top. `draw_frame`'s policy maps onto it; `ApplyPolicy` is unchanged in the public API. | **no visible change**: the existing vt100 frame tests and the REPL resize suite pass unchanged |
-| **A1.2** | `write_content` promoted to the `Output` trait (`ContentBlock { bytes, kind }`) with a default that writes the bytes, so the five non-console impls do not change. B2's writers call it instead of writer + `note_lines`. | full suite |
+| **A1.1** | `plan_solve(cache, screen, w, h) -> String` in `ui/frame.rs`, with `plan_apply` kept as the frame-only adapter so the byte stream is *identical*. The shape lands; nothing consults it yet. | **no visible change, byte for byte**: the vt100 frame tests and the REPL resize suite pass unchanged |
+| **A1.2** | `write_content` promoted to the `Output` trait (`ContentBlock { bytes, kind }`, default = write the bytes, so the other impls do not change) and routed through the solve. Content now places itself *below a live frame* instead of over it. | full suite; the resume-artifact case (§1.1) as a regression test — this is the commit that closes it |
 | **A1.3** | The two-region clear (§2.2) and the partial-predicate condition: a frame may only take the row-diff path if the content did not move since the last apply, or `live`'s row indices are stale by the scroll delta. The resize-replay path goes through the solve. | full suite; vt100 case: a live frame + a height change, asserting the old region is cleared and the frame lands below the replayed content |
-| **A1.4** | The cursor column (§4.1): `RenderContext { content_width }` + `RowCursor`, `paint_row` padding. Its own commit, byte-identical output. | existing paint tests byte-identical; the 12 `RenderContext` constructions updated |
+| **A1.4** | The cursor column (§4.1): `RenderContext { content_width }` + `RowCursor`, `paint_row` padding. Independent of the rest; its own commit, byte-identical output. | existing paint tests byte-identical; the `RenderContext` constructions updated |
+
+## 6a. A1 in detail
+
+### The screen, as the solve sees it
+
+```rust
+/// What changed since the last solve. Either side may be absent: a frame-only
+/// update is a keystroke, a content-only update is a streamed block, and both
+/// at once is a menu commit (content already written, frame about to be torn
+/// down and replaced).
+pub(crate) struct Screen<'a> {
+    pub content: Option<ContentWrite<'a>>,
+    pub frame: Option<&'a Frame>,
+}
+
+/// Content bytes and the height they occupy — measured by `row_count` at the
+/// point of writing, never predicted.
+pub(crate) struct ContentWrite<'a> {
+    pub bytes: &'a [u8],
+    pub rows: usize,
+}
+```
+
+`focus` is already inside the frame (`Element::Overlay { focus }`), so it does
+not travel separately.
+
+### One solve
+
+```
+cb        = content_bottom(cache)            // derivation, §5.1
+H         = frame.map_or(0, Frame::height)
+frame_top = min(cb + 1, term_h - H + 1)      // D1: following
+live_end  = cb + H
+over      = live_end.saturating_sub(term_h) // rows the content must give up
+delta     = over + content_rows              // the content always lands whole
+```
+
+then, in order:
+
+1. **Clear the frame's old region** if it is moving or shrinking. It is
+   contiguous and directly above the content, and it may extend *below* the new
+   content start (§2.2), so this has to happen before the content is written.
+2. **Scroll `delta`** — bare LFs from the bottom row, never `CSI S`.
+3. **Write the content** at `cb' = min(cb + content_rows, live_end)` and
+   `content_bottom = cb'`.
+4. **Paint the frame** at `frame_top`, or take the row-diff path when nothing
+   below the caret moved: same `frame_top`, same size, and `content_bottom`
+   unchanged since the last apply.
+5. **Update the cache**: `live` (with the new top), `caret`, `screen_bottom`.
+
+Steps 1–2 are the *only* place the composition emits clearing and scrolling;
+`plan_full`'s existing `from..=floor` union clear and `plan_partial`'s shrink
+remainder both fall out of step 1 + step 4. `floor` becomes
+`min(term_h, screen_bottom)` for now and `min(frame_top - 1, screen_bottom)`
+once `Reserve` exists (A2.3) — one term.
+
+### `content_bottom` is a derivation, not a field
+
+```
+fn content_bottom(cache: &DrawCache) -> usize {
+    match cache.live {
+        // A frame is always a contiguous block directly below the content
+        // (D1), so its top row *is* the content's bottom + 1.
+        Some(live) => live.frame_top_row.saturating_sub(1),
+        // No frame: the cursor is where the content ended.
+        None => cache.caret.0,
+    }
+}
+```
+
+So `DrawCache` keeps `caret`, `screen_bottom`, `live` and the §4.2 invalidation
+contract is untouched. A *pinned* frame would break this (a gap between content
+and frame means `cb ≠ live.top − 1`) and would need a third fact; that is D1
+again, and it is why "following" is load-bearing rather than cosmetic.
+
+### Two mutators, and what A1.2 changes on screen
+
+```rust
+fn write_content(&self, block: &ContentBlock<'_>)   // → solve(Screen { content, frame: None })
+fn draw_frame(&self, frame: &Frame, anchor: usize, policy: ApplyPolicy, dims) -> (usize, usize)
+```
+
+`draw_frame` keeps its signature for now (D3): it builds
+`Screen { content: None, frame: Some(frame) }` and the policy maps onto the
+path, so the public `Output` surface is unchanged by A1.1–A1.3.
+
+**A1.2 is the first commit that changes what is on screen, and deliberately
+so.** Today a content write lands wherever the cursor is, *over* a live frame
+(the REPL's empty input frame is live at the prompt), and the frame is
+invalidated — which is how a replay after a menu can paint over content that
+was never cleared. With the composition, the content goes below the frame and
+the frame is repainted beneath it: no overlap is possible, and the old frame's
+rows are cleared first. That is the resume artifact (§1.1) closing at the
+structural level rather than by re-anchoring harder.
+
+It also *moves* content in that one case: after a menu commit, the replayed
+turn starts one row lower than it used to (below the frame's height) and the
+frame's rows are repainted rather than overwritten. Nothing in the current test
+suite observes that; the artifact is the thing being fixed, so the change is
+visible only where the old behaviour was wrong.
+
+### What this does *not* change
+
+- The 2/3 budget stays on the frame's own elements (D2), and
+  `allocate`/`window`/`render` are untouched — A1 changes where the frame goes,
+  not how it is composed.
+- `ApplyPolicy` keeps its public meaning; internally the solve picks the path.
+- Nothing re-anchors by DSR. The entry DSRs stay (D9).
+- The content's own rendering is untouched: B1–B3e made the bytes and the
+  separators correct, and the solve only decides *where* they land.
+
+### A2's rendering model: three zones, and only one of them may use `CUP`
+
+Settled by review (2026-09-28), and it replaces the reserved-band design of §2
+for the status line. The three zones:
+
+| Zone | What | How it writes |
+|---|---|---|
+| **1. Scrollback** | assistant text, reasoning, tool panels | append-only, LF-driven — unchanged, and unchanged by A1 |
+| **2. The status line** | one transient readout line at the cursor | **cursor-relative only** |
+| **3. Below it** | the input line, its divider, a menu | absolute (`CUP`) — and only re-rendered on a keystroke, a resize, or a dialog |
+
+**Why zone 2 cannot be absolute.** `CUP row;colH` addresses the *viewport*. A
+user scrolled back is looking at older rows, so an absolute status repaint
+overwrites what they are reading — and most terminals pull the viewport to the
+bottom anyway. A cursor-relative write always targets the logical cursor, which
+when scrolled back is *below* the viewport: invisible, never corrupting. That
+degradation is the whole point, and it is why the rule is "relative or nothing".
+
+**Why zone 3 is safe.** Its repaints are user-driven: the frame changes when the
+user types, resizes, or opens a menu. A user who has scrolled back is not
+typing, so no absolute write happens — *except* for a **confirm dialog**, which
+pops up because the *agent* asked, not the user. That is zone 3's one exception
+and it is not new (dialogs have always used the frame path); worth knowing,
+not worth redesigning.
+
+**The status line is transient, not a region.** It occupies the content's last
+row and is overwritten by the next content write:
+
+```
+content block … LF        cursor at column 0 of a fresh line
+write_status(text)        relative: the text, no trailing LF   → cursor at its end
+  … the turn ends, the user reads, the frame is drawn …
+next content write:  CR + ESC[2K   (erase the status line)
+                     boundary()   (one blank, if the stream owes one)
+                     the content
+```
+
+Nothing is reserved, so the "live region ends above the footer" invariant of §2
+—and with it `ApplyPolicy::Reserve`, the footer as a frame element, and the
+placement half of the solve — all disappear. The status is a line the content
+stream owns, not a rectangle the screen reserves.
+
+Two preconditions, both already available:
+
+- **The status may only be written with the cursor at column 0**, or the next
+  content write's line-erase would destroy a partial content line.
+  `StreamTail` already tracks exactly that bit (`last_nl`), so the check is
+  free, and `write_status` is a no-op when it does not hold.
+- **Erase before the boundary check.** The status text has no newline, so the
+  tail reads "not blank"; if the next write did not erase it first, the
+  boundary would emit a blank and leave the status stranded as its own line in
+  the scrollback. Erasing first also puts the tail back where the boundary
+  expects it.
+
+**Cadence and data.** `ctx` only moves at end of turn, so the text is set once
+at the start of a turn and painted by the output after *each* content block —
+the readout is live for the whole turn, and the context figure is the previous
+turn's (the only one available then). `CodeAgent::prompt` sets it from the
+session name, `provider:model` and `usage.last_input_tokens`, reusing
+`model_catalog` for the window the way `session_stats_lines` does so the two
+cannot disagree about what "ctx" means. The thinking level is *not* in it: the
+agent carries none (it went with the hold-back in B3b), and it only changes on
+an explicit commit, so it belongs to the prompt-side carrier.
+
+**The status is transparent to the blank-line rule.** It sits on the row the
+content's trailing newline left, so the next block must not find that row "not
+blank" and add a second blank above itself. That is why it is written straight
+to the writer, *outside* the row counter: routed through the counter it became
+opaque, and every block grew a blank line (visible in the mock transcript as
+`end_to_end_separator_layout` going from 1 blank to 2). Its one real row
+movement — a status wider than the terminal wrapping, which the terminal does
+without a newline — is reported with `rows_of`.
+
+**The erase is relative too**, `CR` + `EL` (+ `CUU` per wrapped row), and it
+needs no row at all: the cursor has not moved since the status was painted. An
+earlier version addressed the *tracked* row, which is the wrong row whenever the
+tracker and the real cursor disagree by one — and then the content landed beside
+the status (`llamacpp:testLet me run a command.`) instead of over it. Relative
+is also what keeps the erase out of a scrolled-back viewport.
+
+A frame suppresses the paint, and the suppression is *sticky across a burst*:
+one block is often two writes (a boundary, then a body) and only the first
+erases the frame, so a per-write "is a frame live?" would let the second paint
+onto the frame's rows.
+
+**This removes most of A1** — and the piece that remains turned out to be the
+resume artifact itself. The composition's purpose was to reserve space for a
+bottom element; with a transient line there is nothing to reserve, so the
+placement solve, `Reserve`, and the status as an `Element::Lines` all go.
+
+What survived is the part that was never about placement, and it is **done**
+(2026-09-28): a content write while a frame is live now erases that frame
+first (`ui::frame::plan_clear_live_frame`). Reproduced before the fix — a menu
+frame plus one `display_text` left
+
+```
+⏺ Cannot start agent: Missing API key fo
+r provider.      CTX    PRICE
+  gpt-5          400k   1.00
+```
+
+i.e. the message with the menu's table header and rows *underneath* it. The
+replay that runs while `/session`'s menu is still up is the real path:
+`emit_commit`'s frame collapse happens *after* the node's submit, so it is too
+late. The clear is the whole region (EL per row) plus a caret restore, because
+a content line shorter than the terminal also leaves the frame's background to
+its right; and it costs nothing while a turn runs, since streaming has no live
+frame to clear.
+
+The **partial-predicate condition** turned out to be unnecessary: `note_lines`
+already cleared `live` on every content write, so the row-diff path was
+unreachable once content moved. The condition was implied by the very
+invalidation that made this bug possible in the other direction.
+
+**And an input line cannot join zone 2**, which is the right answer to the
+uncertainty in the review: an input needs a stable caret that editing redraws
+around, and rewriting a line *above* the cursor needs absolute moves. The input
+stays in zone 3, where its only redraw trigger is the user — so it inherits the
+yank-on-type that already exists and adds nothing.
+
+### Open, for A1 specifically
+
+1. **A scroll moves content that nobody asked to move.** In the
+   frame-live + content case, the content above gives up `delta` rows. Today
+   that only happens when the frame does not fit; with the composition it also
+   happens when a short frame sits above a lot of content. Visually: the top of
+   a long turn scrolls off slightly earlier. The alternative — refuse to push
+   content and let the frame overlay it — is the bug. Recommendation: accept,
+   and pin it with a vt100 case so the amount is visible in a test rather than
+   discovered by eye.
+2. **Does `Frame::empty()` (the dialog resolve) still work through the
+   solve?** It is a zero-height frame; `H = 0` makes `frame_top = min(cb + 1,
+   th + 1) = cb + 1`, and step 1 clears the old region. That is exactly the
+   current union-clear behaviour, so it should be a no-op change — worth
+   confirming against the confirm pty suite rather than assuming.
 
 ### Phase A2 — the status line
 
