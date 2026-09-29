@@ -20,6 +20,7 @@
 //! - [`path`] — lexical path helpers (the blob parser compares paths).
 
 pub mod apply;
+pub mod arg_error_view;
 pub mod blob;
 pub mod diagnose;
 pub mod path;
